@@ -138,6 +138,93 @@ pub(super) fn emit_file_attached(
     let _ = ledger.append_notification(notification);
 }
 
+/// Emit one `file/attached` envelope per delivered artefact when a
+/// `spawn_only` background tool's `BackgroundResultPayload` lands on
+/// the AppUI WS path.
+///
+/// Coalesces the payload's persist-media (`media`, lives on the
+/// `message/persisted` row) and envelope-only-media (`envelope_media`,
+/// surfaced on the `turn/spawn_complete` envelope) into a single
+/// deduplicated stream of paths — clients receive ONE `file/attached`
+/// per unique artefact regardless of which path source carried it. A
+/// path that appears in both sources still emits exactly one envelope.
+///
+/// Defensive against the production failure mode the slides soak
+/// captured (2026-05-24): PPTX artefacts that landed on disk and were
+/// verified by the workspace contract never surfaced a clickable
+/// button on the SPA because `turn/spawn_complete` and the
+/// `message/persisted` row's `media` field both required the SPA's
+/// content-bearing-envelope reducers to fire correctly. A dedicated
+/// per-file envelope is the redundant signal that keeps the user-
+/// visible delivery resilient against placement / sticky-thread bugs
+/// in those richer reducers.
+///
+/// Best-effort: ledger append failures are logged inside the ledger
+/// and do not propagate. Callers MUST run this after the persist /
+/// `turn/spawn_complete` block so the placement context (turn_id,
+/// session_id) is stable. No-op when both source lists are empty.
+pub(super) fn emit_files_attached_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    media: &[String],
+    envelope_media: &[String],
+    tool_call_id: Option<String>,
+) {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for path in media.iter().chain(envelope_media.iter()) {
+        if path.is_empty() {
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let mime = mime_from_path(path);
+        emit_file_attached(
+            ledger,
+            session_id,
+            turn_id,
+            path.clone(),
+            tool_call_id.clone(),
+            mime,
+        );
+    }
+}
+
+/// Lightweight extension-based MIME sniffer used by
+/// [`emit_files_attached_from_background`].
+///
+/// `file/attached` clients render attachments from the `mime` hint
+/// when present and fall back to extension parsing otherwise. We
+/// populate it with the artefact families the spawn_only producers
+/// actually emit — `.pptx`, `.html`, `.md`, `.mp3`, `.mp4`, `.png`,
+/// `.jpg`. Anything else returns `None` and clients fall back to
+/// extension-based rendering. We deliberately do NOT crack open the
+/// file (no I/O on the dispatch hot path); the wire shape is best-
+/// effort so extension drift is recovered by the client.
+fn mime_from_path(path: &str) -> Option<String> {
+    let lower = path.to_lowercase();
+    let suffix = lower.rsplit('.').next()?;
+    let mime = match suffix {
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "html" | "htm" => "text/html",
+        "md" | "markdown" => "text/markdown",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => return None,
+    };
+    Some(mime.to_owned())
+}
+
 /// Bridge a legacy `/api/sessions/:id/events/stream` SSE frame onto the
 /// WS surface as a `session/event.v1` envelope.
 ///
