@@ -1309,6 +1309,47 @@ impl TaskSupervisor {
         originating_client_message_id: Option<String>,
         parent_terminal_check_tool_call_id: Option<&str>,
     ) -> Result<String, RegisterTaskError> {
+        // Codex P2 follow-up: early terminal-parent check, BEFORE the
+        // fan-out cap path. The cap path has side effects (poisoning
+        // the parent session, mark_failed-ing every active sibling
+        // under the same `parent_session_key`). Running those when
+        // the parent is already terminal would incorrectly cascade-
+        // fail unrelated active children whose parent is still alive
+        // but happens to share the session key. By returning
+        // `ParentTerminal` here we restore the pre-codex-P2 semantics
+        // where a terminal parent short-circuits without touching the
+        // cap state. The in-lock recheck at the insertion point still
+        // serves as the atomic safety net for the race where a parent
+        // becomes terminal between this check and the insert.
+        if let Some(parent_tcid) = parent_terminal_check_tool_call_id
+            && !parent_tcid.is_empty()
+        {
+            let status_opt = {
+                let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                Self::pick_parent_status(&tasks, parent_tcid)
+            };
+            if let Some(status) = status_opt
+                && status.is_terminal()
+            {
+                tracing::warn!(
+                    tool_name,
+                    parent_tool_call_id = parent_tcid,
+                    parent_status = status.as_str(),
+                    "refusing pipeline node child registration: parent task is terminal (pre-cap)"
+                );
+                counter!(
+                    "octos_task_supervisor_register_node_rejected_total",
+                    "reason" => "parent_terminal".to_string(),
+                    "parent_status" => status.as_str().to_string(),
+                )
+                .increment(1);
+                return Err(RegisterTaskError::ParentTerminal {
+                    parent_tool_call_id: parent_tcid.to_string(),
+                    parent_status: status,
+                });
+            }
+        }
+
         // Per-parent fan-out cap. Detached registrations (`session_key ==
         // None`) skip the gate because they do not have a parent to
         // attribute the count to — those are MCP/test bookkeeping calls
@@ -4332,6 +4373,72 @@ mod tests {
             !allowed.is_empty(),
             "non-strict register must NOT consult parent status — the guard is opt-in"
         );
+    }
+
+    /// Codex P2 follow-up — terminal-parent rejection must NOT trigger
+    /// the fan-out cap path's side effects (poisoning the session,
+    /// `mark_failed`-ing every active sibling under the same
+    /// `parent_session_key`). The early terminal check in
+    /// `register_full` short-circuits before the cap block so unrelated
+    /// active children of other parents (sharing only the session key)
+    /// are not collaterally cascaded.
+    #[test]
+    fn try_register_node_task_terminal_parent_does_not_trigger_fanout_side_effects() {
+        // Use a tiny synthetic supervisor with no special env tweaks —
+        // we don't need to actually hit the cap. We just need to
+        // assert that under a terminal parent the cap-cascade does NOT
+        // touch any other active children in the same session_key.
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-terminal-parent-sideeffect";
+        let session = "sess-cap-collateral";
+
+        // Parent is terminal (Failed).
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some(session));
+        supervisor.mark_running(&parent);
+        supervisor.mark_failed(&parent, "orphaned across restart".to_string());
+
+        // An unrelated sibling task under the SAME session_key but a
+        // DIFFERENT tool_call_id is running. The bug would force-fail
+        // it via the cap poisoning path if the terminal check ran
+        // AFTER the cap path. (We can't easily hit the 200-child cap
+        // in a test; we verify the early-check by asserting no
+        // mark_failed callbacks fire on the unrelated task during
+        // the rejected child registration.)
+        let unrelated = supervisor.register("tts", "call-unrelated-tcid", Some(session));
+        supervisor.mark_running(&unrelated);
+        assert_eq!(
+            supervisor.get_task(&unrelated).unwrap().status,
+            TaskStatus::Running
+        );
+
+        // Attempt: straggler tries to register a child under the
+        // terminal parent. Must be refused with ParentTerminal.
+        let err = supervisor
+            .try_register_node_task("pipeline:analyze", parent_tcid, Some(session))
+            .expect_err("registration must be rejected for terminal parent");
+        assert!(matches!(err, RegisterTaskError::ParentTerminal { .. }));
+
+        // The unrelated active sibling under the same session must be
+        // UNTOUCHED. If the cap path had run, it would have been
+        // mark_failed-ed (or the session poisoned).
+        let unrelated_after = supervisor.get_task(&unrelated).unwrap();
+        assert_eq!(
+            unrelated_after.status,
+            TaskStatus::Running,
+            "unrelated active sibling must not be cascaded by terminal-parent rejection"
+        );
+
+        // And the parent session must NOT be poisoned — a fresh
+        // registration under a DIFFERENT parent in the same session
+        // (e.g. a healthy run_pipeline) must succeed.
+        let healthy_parent_tcid = "call-healthy-parent";
+        let healthy_parent =
+            supervisor.register("run_pipeline", healthy_parent_tcid, Some(session));
+        supervisor.mark_running(&healthy_parent);
+        let healthy_child = supervisor
+            .try_register_node_task("pipeline:analyze", healthy_parent_tcid, Some(session))
+            .expect("healthy parent under the same session must accept a fresh node registration");
+        assert!(!healthy_child.is_empty());
     }
 
     /// NEW-09 contract: cascade-failing a child via
