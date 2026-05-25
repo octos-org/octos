@@ -123,6 +123,7 @@ impl DoraToolBridge {
             mapping.description.clone(),
             mapping.bridge_base_url.clone(),
             schema,
+            mapping.timeout_secs,
         )?;
         Ok(Self { mapping, inner })
     }
@@ -348,6 +349,41 @@ mod tests {
         let result = bridge.execute(&serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("deadline_ms"));
+    }
+
+    #[tokio::test]
+    async fn dora_bridge_respects_mapping_timeout() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(3))
+                    .set_body_json(
+                        serde_json::json!({"ok": true, "code": "0", "msg": "", "data": {}}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let mapping = DoraToolMapping {
+            tool_name: "slow".into(),
+            description: "slow".into(),
+            bridge_base_url: server.uri(),
+            safety_tier: SafetyTier::Observe,
+            input_schema: None,
+            timeout_secs: 1, // 1 s < 3 s server delay
+            concurrency_class: None,
+            dora_node_id: None,
+            dora_output_id: None,
+        };
+        let bridge = DoraToolBridge::new(mapping).unwrap();
+        let result = bridge.execute(&serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "expected timeout failure, got success");
     }
 
     // Config-side tests previously in octos-dora-mcp::config::tests —

@@ -24,7 +24,13 @@ use url::Url;
 
 use crate::tools::{Tool, ToolResult};
 
+#[cfg(test)]
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum HTTP response body size for the per-call tool path. Bridge tools
+/// returning more than this are treated as an error (BRIDGE_HTTP) rather
+/// than allowing OOM. 1 MiB matches the agent's general response budget.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// A Tool that dispatches calls over HTTP to a local bridge process.
 #[derive(Debug)]
@@ -34,7 +40,10 @@ pub struct HttpTool {
     base_url: String,
     input_schema: Value,
     client: reqwest::Client,
-    #[allow(dead_code)] // reserved for per-call timeout override later
+    /// Per-call timeout. Sourced from `DoraToolMapping::timeout_secs` at
+    /// construction time. Retained for inspection / future per-call override
+    /// pathways; the actual enforcement happens inside `client` via
+    /// `reqwest::Client::builder().timeout(...)`.
     timeout: Duration,
 }
 
@@ -45,10 +54,12 @@ impl HttpTool {
         description: String,
         base_url: String,
         input_schema: Value,
+        timeout_secs: u64,
     ) -> Result<Self> {
         validate_loopback_url(&base_url)?;
+        let timeout = Duration::from_secs(timeout_secs);
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .timeout(timeout)
             .build()
             .map_err(|e| eyre!("reqwest client build failed: {e}"))?;
         Ok(Self {
@@ -57,8 +68,14 @@ impl HttpTool {
             base_url: base_url.trim_end_matches('/').to_string(),
             input_schema,
             client,
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            timeout,
         })
+    }
+
+    /// Per-call timeout this tool was constructed with.
+    #[allow(dead_code)] // exposed for diagnostics / future per-call override pathways
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -155,7 +172,29 @@ impl Tool for HttpTool {
                 body_text
             )));
         }
-        let envelope: Value = match resp.json().await {
+        // Pre-flight Content-Length check: short-circuit before reading the
+        // body when the server advertises an over-cap size.
+        if let Some(declared) = resp.content_length() {
+            if declared as usize > MAX_RESPONSE_BYTES {
+                return Ok(error_result(format!(
+                    "BRIDGE_HTTP response too large: declared size {declared} > {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
+        }
+        // Post-read check: also enforce on the actual byte count to handle
+        // chunked responses without `Content-Length` and lying servers.
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return Ok(error_result(format!("BRIDGE_HTTP read: {e}"))),
+        };
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Ok(error_result(format!(
+                "BRIDGE_HTTP response too large: {} > {} bytes",
+                bytes.len(),
+                MAX_RESPONSE_BYTES
+            )));
+        }
+        let envelope: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(e) => return Ok(error_result(format!("BRIDGE_HTTP parse: {e}"))),
         };
@@ -212,6 +251,7 @@ mod tests {
             "desc".into(),
             "http://example.com".into(),
             json!({"type": "object"}),
+            DEFAULT_TIMEOUT_SECS,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -225,6 +265,7 @@ mod tests {
             "desc".into(),
             "ftp://localhost/x".into(),
             json!({}),
+            DEFAULT_TIMEOUT_SECS,
         )
         .unwrap_err();
         assert!(err.to_string().contains("http"));
@@ -237,8 +278,14 @@ mod tests {
             "http://[::1]:8765",
             "http://localhost:8765",
         ] {
-            HttpTool::new("t".into(), "d".into(), url.into(), json!({}))
-                .unwrap_or_else(|e| panic!("rejected loopback url {url}: {e}"));
+            HttpTool::new(
+                "t".into(),
+                "d".into(),
+                url.into(),
+                json!({}),
+                DEFAULT_TIMEOUT_SECS,
+            )
+            .unwrap_or_else(|e| panic!("rejected loopback url {url}: {e}"));
         }
     }
 
@@ -262,6 +309,7 @@ mod tests {
             "heartbeat".into(),
             server.uri(),
             json!({"type": "object"}),
+            DEFAULT_TIMEOUT_SECS,
         )
         .unwrap();
         let result = tool.execute(&json!({})).await.unwrap();
@@ -288,12 +336,45 @@ mod tests {
             "estop".into(),
             server.uri(),
             json!({}),
+            DEFAULT_TIMEOUT_SECS,
         )
         .unwrap();
         let result = tool.execute(&json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.output.contains("VENDOR_ERROR"));
         assert!(result.output.contains("RPC timeout"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_oversized_response() {
+        let server = MockServer::start().await;
+        let huge = "a".repeat(2 * 1024 * 1024); // 2 MiB > 1 MiB cap
+        Mock::given(method("POST"))
+            .and(path("/tools/big"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(huge.as_bytes(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpTool::new(
+            "big".into(),
+            "d".into(),
+            server.uri(),
+            json!({}),
+            DEFAULT_TIMEOUT_SECS,
+        )
+        .unwrap();
+        let result = tool.execute(&json!({})).await.unwrap();
+        assert!(!result.success, "expected failure on oversized body");
+        let out_lc = result.output.to_lowercase();
+        assert!(
+            out_lc.contains("size")
+                || out_lc.contains("too large")
+                || out_lc.contains("bridge_http"),
+            "expected size-related error, got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -305,8 +386,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool =
-            HttpTool::new("something".into(), "desc".into(), server.uri(), json!({})).unwrap();
+        let tool = HttpTool::new(
+            "something".into(),
+            "desc".into(),
+            server.uri(),
+            json!({}),
+            DEFAULT_TIMEOUT_SECS,
+        )
+        .unwrap();
         let result = tool.execute(&json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.output.contains("500") || result.output.contains("BRIDGE_HTTP"));

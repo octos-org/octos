@@ -20,6 +20,10 @@ use crate::tools::{Tool, ToolRegistry, robot_groups};
 /// Timeout for the discovery HTTP call.
 const DISCOVERY_TIMEOUT_SECS: u64 = 15;
 
+/// Cap on the catalog response size to bound startup memory for a
+/// misbehaving bridge. 1 MiB matches the per-call HTTP tool body cap.
+const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+
 /// A single tool entry returned by `GET <base_url>/tools`.
 #[derive(Debug, Deserialize)]
 pub struct HttpToolEntry {
@@ -70,9 +74,29 @@ pub async fn fetch_http_tool_catalog(base_url: &str) -> Result<Vec<HttpToolEntry
         ));
     }
 
-    let entries: Vec<HttpToolEntry> = resp
-        .json()
+    // Pre-flight Content-Length cap (best-effort: many servers don't advertise
+    // a length on streamed bodies).
+    if let Some(declared) = resp.content_length() {
+        if declared as usize > MAX_CATALOG_BYTES {
+            return Err(eyre!(
+                "catalog response too large: declared size {declared} > {MAX_CATALOG_BYTES} bytes"
+            ));
+        }
+    }
+
+    let bytes = resp
+        .bytes()
         .await
+        .map_err(|e| eyre!("failed to read tool catalog from {url}: {e}"))?;
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(eyre!(
+            "catalog response too large: {} > {} bytes",
+            bytes.len(),
+            MAX_CATALOG_BYTES
+        ));
+    }
+
+    let entries: Vec<HttpToolEntry> = serde_json::from_slice(&bytes)
         .map_err(|e| eyre!("failed to parse tool catalog from {url}: {e}"))?;
 
     Ok(entries)
@@ -189,6 +213,26 @@ mod tests {
 
         let err = fetch_http_tool_catalog(&server.uri()).await.unwrap_err();
         assert!(err.to_string().contains("parse"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_oversized_catalog() {
+        let server = MockServer::start().await;
+        let huge = "a".repeat(2 * 1024 * 1024); // 2 MiB > 1 MiB cap
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(huge.as_bytes(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let err = fetch_http_tool_catalog(&server.uri()).await.unwrap_err();
+        let s = err.to_string().to_lowercase();
+        assert!(
+            s.contains("size") || s.contains("too large"),
+            "expected size error, got: {err}"
+        );
     }
 
     #[tokio::test]
