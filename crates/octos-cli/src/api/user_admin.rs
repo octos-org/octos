@@ -55,6 +55,26 @@ pub struct ActionResponse {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ErrorBody {
+    pub code: &'static str,
+    pub message: String,
+}
+
+fn error_body(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorBody>) {
+    (
+        status,
+        Json(ErrorBody {
+            code,
+            message: message.into(),
+        }),
+    )
+}
+
 /// GET /api/admin/users
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
@@ -104,28 +124,51 @@ pub async fn list_allowed_emails(
 pub async fn add_allowed_email(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AllowlistRequest>,
-) -> Result<(StatusCode, Json<AllowlistEntryResponse>), StatusCode> {
-    let allowlist = state
-        .allowlist_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+) -> Result<(StatusCode, Json<AllowlistEntryResponse>), (StatusCode, Json<ErrorBody>)> {
+    let allowlist = state.allowlist_store.as_ref().ok_or_else(|| {
+        error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_not_configured",
+            "admin allowlist is not configured",
+        )
+    })?;
     let email = crate::login_allowlist::normalize_email(&req.email);
-    super::admin::validate_email(&email).map_err(|_| StatusCode::BAD_REQUEST)?;
+    super::admin::validate_email(&email)
+        .map_err(|message| error_body(StatusCode::BAD_REQUEST, "invalid_email", message))?;
 
-    if allowlist
-        .contains(&email)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        return Err(StatusCode::CONFLICT);
+    if allowlist.contains(&email).map_err(|error| {
+        tracing::error!(error = %error, "failed to check allowlist entry");
+        error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "allowlist_lookup_failed",
+            "failed to check allowlist entry",
+        )
+    })? {
+        return Err(error_body(
+            StatusCode::CONFLICT,
+            "allowed_email_exists",
+            format!("email '{email}' is already on the allowlist"),
+        ));
     }
 
     if let Some(user_store) = state.user_store.as_ref() {
         if user_store
             .get_by_email(&email)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|error| {
+                tracing::error!(error = %error, "failed to check registered users");
+                error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "user_lookup_failed",
+                    "failed to check registered users",
+                )
+            })?
             .is_some()
         {
-            return Err(StatusCode::CONFLICT);
+            return Err(error_body(
+                StatusCode::CONFLICT,
+                "registered_email_exists",
+                format!("email '{email}' is already registered"),
+            ));
         }
     }
 
@@ -143,9 +186,14 @@ pub async fn add_allowed_email(
         claimed_user_id: None,
         claimed_at: None,
     };
-    allowlist
-        .save(&entry)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    allowlist.save(&entry).map_err(|error| {
+        tracing::error!(error = %error, "failed to save allowlist entry");
+        error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "allowlist_save_failed",
+            "failed to save allowlist entry",
+        )
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -224,6 +272,21 @@ pub async fn delete_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::login_allowlist::LoginAllowlistStore;
+    use crate::user_store::{User, UserRole, UserStore};
+
+    fn state_with_stores(
+        allowlist_store: Arc<LoginAllowlistStore>,
+        user_store: Option<Arc<UserStore>>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            allowlist_store: Some(allowlist_store),
+            user_store,
+            ..AppState::empty_for_tests()
+        })
+    }
 
     #[test]
     fn users_list_response_serialize() {
@@ -252,5 +315,93 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["message"], "not found");
+    }
+
+    #[test]
+    fn error_body_serializes_code_and_message() {
+        let body = ErrorBody {
+            code: "registered_email_exists",
+            message: "email 'alice@example.com' is already registered".into(),
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(json["code"], "registered_email_exists");
+        assert_eq!(
+            json["message"],
+            "email 'alice@example.com' is already registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_allowed_email_returns_json_conflict_for_existing_allowlist_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
+        allowlist
+            .save(&AllowedLogin {
+                email: "alice@example.com".into(),
+                note: None,
+                created_at: Utc::now(),
+                claimed_user_id: None,
+                claimed_at: None,
+            })
+            .unwrap();
+        let state = state_with_stores(allowlist, None);
+
+        let result = add_allowed_email(
+            State(state),
+            Json(AllowlistRequest {
+                email: "ALICE@example.com".into(),
+                note: None,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = result else {
+            panic!("expected duplicate allowlist entry to return a conflict");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, "allowed_email_exists");
+        assert_eq!(
+            body.message,
+            "email 'alice@example.com' is already on the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_allowed_email_returns_json_conflict_for_existing_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        user_store
+            .save(&User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: "Alice".into(),
+                role: UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        let state = state_with_stores(allowlist, Some(user_store));
+
+        let result = add_allowed_email(
+            State(state),
+            Json(AllowlistRequest {
+                email: "alice@example.com".into(),
+                note: None,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = result else {
+            panic!("expected registered user email to return a conflict");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, "registered_email_exists");
+        assert_eq!(
+            body.message,
+            "email 'alice@example.com' is already registered"
+        );
     }
 }
