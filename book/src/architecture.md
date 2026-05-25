@@ -807,14 +807,16 @@ Plugins extend the agent with external tools via standalone executables. Each pl
 #### Directory Layout
 
 ```
-.octos/plugins/           # local (project-level)
-~/.octos/plugins/         # global (user-level)
+<octos_home>/plugins/                 # deployment-scoped plugins
+<octos_home>/skills/                  # deployment-scoped skills
+<octos_home>/bundled-app-skills/      # bundled app skills
+~/.octos/profiles/<profile>/data/skills/
   └── my-plugin/
       ├── manifest.json  # plugin metadata + tool definitions
       └── my-plugin      # executable (or "main" as fallback)
 ```
 
-**Discovery order**: local `.octos/plugins/` first, then global `~/.octos/plugins/`. Both are scanned by `Config::plugin_dirs()`.
+**Discovery order**: `Config::plugin_dirs_from_project()` scans deployment-scoped `<octos_home>/plugins`, `<octos_home>/skills`, `<octos_home>/bundled-app-skills`, and `OCTOS_SKILLS_PATH`; managed profile gateways then layer platform skills and the active profile's `data/skills/` directory on top. Legacy HOME-rooted globals (`~/.octos/plugins`, `~/.octos/skills`) are no longer scanned except for a one-shot migration warning.
 
 #### PluginManifest
 
@@ -1169,9 +1171,9 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
 
-**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost:3000/8080. **Max message**: 1MB.
+**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 
-**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, SSE streaming, dark theme. Vanilla HTML/CSS/JS (no build tools).
+**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, UI Protocol WebSocket streaming, and dashboard/admin surfaces share the same `octos serve` process.
 
 **Prometheus Metrics**: `octos_tool_calls_total` (counter, labels: tool, success), `octos_tool_call_duration_seconds` (histogram, label: tool), `octos_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
 

@@ -807,14 +807,16 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
 #### 目录布局
 
 ```
-.octos/plugins/           # 本地（项目级）
-~/.octos/plugins/         # 全局（用户级）
+<octos_home>/plugins/                 # 部署级插件
+<octos_home>/skills/                  # 部署级技能
+<octos_home>/bundled-app-skills/      # 内置应用技能
+~/.octos/profiles/<profile>/data/skills/
   └── my-plugin/
       ├── manifest.json  # 插件元数据 + 工具定义
       └── my-plugin      # 可执行文件（或 "main" 作为回退）
 ```
 
-**发现顺序**：先本地 `.octos/plugins/`，再全局 `~/.octos/plugins/`。两者均由 `Config::plugin_dirs()` 扫描。
+**发现顺序**：`Config::plugin_dirs_from_project()` 扫描部署级 `<octos_home>/plugins`、`<octos_home>/skills`、`<octos_home>/bundled-app-skills` 和 `OCTOS_SKILLS_PATH`；托管 profile gateway 再叠加平台技能和当前 profile 的 `data/skills/` 目录。旧的 HOME 全局目录（`~/.octos/plugins`、`~/.octos/skills`）不再作为常规扫描路径，只会触发一次迁移警告。
 
 #### PluginManifest
 
@@ -1163,17 +1165,17 @@ JSON 持久化位于 `.octos/cron.json`。
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/api/chat` | POST | 发送消息 → 获取响应 |
-| `/api/chat/stream` | GET | ProgressEvent 的 SSE 流 |
-| `/api/sessions` | GET | 列出所有会话 |
-| `/api/sessions/{id}/messages` | GET | 分页历史（?limit=100&offset=0，最大 500） |
-| `/api/status` | GET | 版本、模型、提供商、运行时间 |
+| `/api/chat` | POST | 发送消息 → 获取响应（同步；流式内容走 WS） |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1（聊天流、`session/list`、`session/messages_page`、`system/status.get` 等） |
+| `/health` | GET | 存活探针（原 `/api/status`；结构化状态已迁移到 WS `system/status.get`） |
+| `/metrics` | GET | Prometheus 文本指标（无需认证） |
+| `/*`（回退） | GET | 内嵌 Web UI（通过 rust-embed 提供静态文件） |
 | `/metrics` | GET | Prometheus 文本格式（无需认证） |
 | `/*`（回退） | GET | 嵌入式 Web UI（通过 rust-embed 的静态文件） |
 
-**认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost:3000/8080。**最大消息**：1MB。
+**认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost 开发源加已配置的 base domain。**最大消息**：1MB。
 
-**Web UI**：通过 `rust-embed` 嵌入的 SPA，作为回退处理器提供服务。会话侧边栏、聊天界面、SSE 流式推送、暗色主题。原生 HTML/CSS/JS（无构建工具）。
+**Web UI**：通过 `rust-embed` 嵌入的 SPA，作为回退处理器提供服务。会话侧边栏、聊天界面、UI Protocol WebSocket 流式传输以及 dashboard/admin 页面共用同一个 `octos serve` 进程。
 
 **Prometheus 指标**：`octos_tool_calls_total`（计数器，标签：tool, success）、`octos_tool_call_duration_seconds`（直方图，标签：tool）、`octos_llm_tokens_total`（计数器，标签：direction）。由 `metrics` + `metrics-exporter-prometheus` crate 驱动。
 

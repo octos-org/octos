@@ -307,7 +307,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # Install into a specific profile
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 The installer tries to download a pre-built binary from the skill registry (SHA-256 verified), falls back to `cargo build --release` if a `Cargo.toml` is present, or runs `npm install` if a `package.json` is present.
@@ -325,16 +325,15 @@ octos skills search "web scraping"   # Search the online registry
 
 ### Skill Resolution Order
 
-Skills are loaded from these directories (highest priority first):
+Profile gateways load skills from these directories (highest priority first):
 
-1. `.octos/plugins/` (legacy)
-2. `.octos/skills/` (user-installed custom skills)
-3. `.octos/bundled-app-skills/` (bundled app skills)
-4. `.octos/platform-skills/` (platform: ASR/TTS)
-5. `~/.octos/plugins/` (global legacy)
-6. `~/.octos/skills/` (global custom)
+1. `~/.octos/profiles/<profile>/data/skills/` (profile-scoped custom skills)
+2. `<octos_home>/bundled-app-skills/` (bundled app skills)
+3. `<octos_home>/platform-skills/` (admin-loaded platform skills)
 
-User-installed skills override bundled skills with the same name.
+Standalone project runs can also load `<project>/.octos/plugins/` and
+`<project>/.octos/skills/`. The old HOME-rooted global directories are
+migration-only and are no longer part of the normal scan path.
 
 ---
 

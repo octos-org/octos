@@ -363,7 +363,7 @@ This restricts shell command reads at the kernel level to the profile's data, sh
 
 #### project_dir decoupled from cwd
 
-Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.octos/config.json`), bundled app-skills -- are loaded from `--octos-home` (the `project_dir`), not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
+Shared resources such as deployment-scoped skills, platform skills, global config (`~/.octos/config.json`), and bundled app-skills are loaded from `--octos-home` (the `project_dir`) plus the active profile's `data/skills/` directory, not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
 
 #### Remaining gaps
 

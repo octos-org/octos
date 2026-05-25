@@ -611,7 +611,7 @@ The other workspace `app-skills/*` crates (`harness-starter-{audio,coding,generi
 
 ### Bootstrap (`bootstrap.rs`)
 
-`bootstrap.rs` writes the contents of each `BUNDLED_APP_SKILLS` entry into `~/.octos/bundled-app-skills/<dir>/` (constant: `BUNDLED_APP_SKILLS_DIR = "bundled-app-skills"`) at gateway startup, then drops the matching binary alongside it. The runtime resolves these in addition to user-installed skills under `~/.octos/skills/` and per-profile `~/.octos/profiles/<id>/data/skills/`. Operators or sideloaded user skills go into `~/.octos/skills/` so they aren't overwritten on next bootstrap.
+`bootstrap.rs` writes the contents of each `BUNDLED_APP_SKILLS` entry into `<octos_home>/bundled-app-skills/<dir>/` (constant: `BUNDLED_APP_SKILLS_DIR = "bundled-app-skills"`) at gateway startup, then drops the matching binary alongside it. Platform skills live under `<octos_home>/platform-skills/`, while operator or sideloaded custom skills are installed per profile under `~/.octos/profiles/<id>/data/skills/`. Legacy HOME-rooted globals such as `~/.octos/skills/` are migration-only; current profile gateways no longer scan them as a normal install location.
 
 ### Sub-Agent Output Router (M8.7)
 
@@ -873,14 +873,16 @@ Plugins extend the agent with external tools via standalone executables. Each pl
 #### Directory Layout
 
 ```
-.octos/plugins/           # local (project-level)
-~/.octos/plugins/         # global (user-level)
+<octos_home>/plugins/                 # deployment-scoped plugins
+<octos_home>/skills/                  # deployment-scoped skills
+<octos_home>/bundled-app-skills/      # bundled app skills
+~/.octos/profiles/<profile>/data/skills/
   └── my-plugin/
       ├── manifest.json  # plugin metadata + tool definitions
       └── my-plugin      # executable (or "main" as fallback)
 ```
 
-**Discovery order**: local `.octos/plugins/` first, then global `~/.octos/plugins/`. Both are scanned by `Config::plugin_dirs()`.
+**Discovery order**: `Config::plugin_dirs_from_project()` scans deployment-scoped `<octos_home>/plugins`, `<octos_home>/skills`, `<octos_home>/bundled-app-skills`, and `OCTOS_SKILLS_PATH`; managed profile gateways then layer platform skills and the active profile's `data/skills/` directory on top. Legacy HOME-rooted globals (`~/.octos/plugins`, `~/.octos/skills`) are no longer scanned except for a one-shot migration warning.
 
 #### PluginManifest
 
@@ -1261,9 +1263,9 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
 
-**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost:3000/8080. **Max message**: 1MB.
+**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 
-**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, SSE streaming, dark theme. Vanilla HTML/CSS/JS (no build tools).
+**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, UI Protocol WebSocket streaming, and dashboard/admin surfaces share the same `octos serve` process.
 
 **Prometheus Metrics**: `octos_tool_calls_total` (counter, labels: tool, success), `octos_tool_call_duration_seconds` (histogram, label: tool), `octos_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
 
@@ -1344,7 +1346,7 @@ crates/octos-plugin/src/
 
 **InstallSpec**: Declarative install steps with `kind` (brew, apt, cargo, url), platform-specific formulas/packages, and provided binary names.
 
-**Discovery** (`discovery.rs`): Scans plugin directories with precedence (local `.octos/plugins/` before global `~/.octos/plugins/`).
+**Discovery** (`discovery.rs`): Loads the directories supplied by `Config::plugin_dirs_from_project()` plus the profile/platform layers added by the serving runtime; HOME-rooted global plugin directories are deprecated migration remnants, not part of normal discovery.
 
 **Plugin Protocol v2** (`protocol_v2.rs`): Skills can opt in to a richer reporting protocol by setting `protocol_version: 2` in the manifest. In addition to the v1 stdin/stdout JSON contract, v2 plugins emit structured **events on stderr**, one JSON object per line:
 
