@@ -44,6 +44,11 @@ pub struct Config {
     #[serde(default)]
     pub api_key_env: Option<String>,
 
+    /// Auth credential store path. Defaults to `~/.octos/auth.json`;
+    /// overridden by `OCTOS_AUTH_STORE_PATH` when that env var is set.
+    #[serde(default)]
+    pub auth_store_path: Option<PathBuf>,
+
     /// Profile-scoped environment values, including API keys persisted by the dashboard/AppUI.
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
@@ -1104,6 +1109,10 @@ impl Config {
         if let Some(ref mut provider) = self.provider {
             *provider = Self::expand_env_var(provider);
         }
+        if let Some(ref mut auth_store_path) = self.auth_store_path {
+            *auth_store_path =
+                PathBuf::from(Self::expand_env_var(&auth_store_path.to_string_lossy()));
+        }
     }
 
     /// Expand ${VAR_NAME} patterns in a string.
@@ -1132,7 +1141,7 @@ impl Config {
     /// Get the API key: auth store first, then environment variable.
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Check auth store first.
-        if let Ok(store) = crate::auth::AuthStore::load() {
+        if let Ok(store) = crate::auth::AuthStore::load_for_config(self) {
             if let Some(cred) = store.get(provider) {
                 if !cred.is_expired() {
                     return Ok(cred.access_token.clone());
@@ -1410,6 +1419,17 @@ mod tests {
     }
 
     #[test]
+    fn auth_store_path_deserializes_from_config_json() {
+        let config: Config =
+            serde_json::from_str(r#"{"auth_store_path":"/tmp/octos-auth.json"}"#).unwrap();
+
+        assert_eq!(
+            config.auth_store_path.as_deref(),
+            Some(Path::new("/tmp/octos-auth.json"))
+        );
+    }
+
+    #[test]
     fn test_gateway_max_history_default() {
         let json = r#"{"channels": [{"type": "cli"}]}"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
@@ -1494,6 +1514,48 @@ mod tests {
         };
         let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("Unknown channel type")));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn get_api_key_uses_configured_auth_store_path() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os(crate::auth::store::AUTH_STORE_PATH_ENV);
+        // SAFETY: serialized by `LOCK` and restored before returning.
+        unsafe { std::env::remove_var(crate::auth::store::AUTH_STORE_PATH_ENV) };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("configured-auth.json");
+        let mut store = crate::auth::AuthStore::load_from_path(&path).unwrap();
+        store
+            .set(
+                "openai",
+                crate::auth::AuthCredential {
+                    access_token: "sk-configured-store".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    provider: "openai".to_string(),
+                    auth_method: "paste_token".to_string(),
+                },
+            )
+            .unwrap();
+
+        let config = Config {
+            auth_store_path: Some(path),
+            ..Default::default()
+        };
+        let resolved = config.get_api_key("openai").unwrap();
+
+        // SAFETY: serialized by `LOCK`.
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var(crate::auth::store::AUTH_STORE_PATH_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(crate::auth::store::AUTH_STORE_PATH_ENV) },
+        }
+
+        assert_eq!(resolved, "sk-configured-store");
     }
 
     #[test]

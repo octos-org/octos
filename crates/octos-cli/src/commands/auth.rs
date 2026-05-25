@@ -1,13 +1,15 @@
 //! Auth command: login, logout, status, and keychain management.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 
 use super::Executable;
 use crate::auth::{AuthStore, keychain, oauth, token};
+use crate::config::Config;
 use crate::profiles::ProfileStore;
 
 /// Manage authentication for LLM providers.
@@ -121,7 +123,7 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
         _ => token::paste_token_flow(provider)?,
     };
 
-    let mut store = AuthStore::load()?;
+    let mut store = load_auth_store()?;
     store.set(provider, cred)?;
 
     println!(
@@ -133,7 +135,7 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
 }
 
 fn logout(provider: &str) -> Result<()> {
-    let mut store = AuthStore::load()?;
+    let mut store = load_auth_store()?;
     if store.remove(provider)? {
         println!("{} Logged out from {}", "OK".green().bold(), provider);
     } else {
@@ -143,7 +145,7 @@ fn logout(provider: &str) -> Result<()> {
 }
 
 fn status() -> Result<()> {
-    let store = AuthStore::load()?;
+    let store = load_auth_store()?;
     let creds: Vec<_> = store.list().collect();
 
     if creds.is_empty() {
@@ -169,6 +171,23 @@ fn status() -> Result<()> {
         println!("  {name}: {status} [{method}]{expiry}");
     }
     Ok(())
+}
+
+fn auth_config_data_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("OCTOS_HOME") {
+        Ok(PathBuf::from(path))
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join(".octos"))
+            .ok_or_else(|| eyre::eyre!("cannot determine home directory"))
+    }
+}
+
+fn load_auth_store() -> Result<AuthStore> {
+    let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
+    let data_dir = auth_config_data_dir()?;
+    let config = Config::load(&cwd, &data_dir)?;
+    AuthStore::load_for_config(&config)
 }
 
 // ── Keychain subcommands ───────────────────────────────────────────────────

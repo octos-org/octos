@@ -1519,6 +1519,7 @@ pub(crate) fn config_from_profile(
                 .as_ref()
                 .and_then(|route| route.api_key_env.clone())
         }),
+        auth_store_path: None,
         env_vars: profile.config.env_vars.clone(),
         api_type: primary.and_then(|selection| {
             selection

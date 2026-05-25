@@ -166,6 +166,9 @@ impl ConfigWatcher {
         if old.api_key_env != new.api_key_env {
             restart_fields.push("api_key_env".into());
         }
+        if old.auth_store_path != new.auth_store_path {
+            restart_fields.push("auth_store_path".into());
+        }
         if old.sandbox != new.sandbox {
             restart_fields.push("sandbox".into());
         }
@@ -368,6 +371,28 @@ mod tests {
                 "provider change should not require restart, got fields: {:?}",
                 fields
             );
+        }
+    }
+
+    #[test]
+    fn auth_store_path_change_requires_restart() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, r#"{"auth_store_path": "/tmp/old-auth.json"}"#);
+        let old_config = Config::from_file(&path).unwrap();
+
+        std::fs::write(&path, r#"{"auth_store_path": "/tmp/new-auth.json"}"#).unwrap();
+        let new_config = Config::from_file(&path).unwrap();
+
+        let (tx, rx) = watch::channel(None);
+        let watcher = ConfigWatcher::new(vec![path], old_config, tx);
+        watcher.diff_and_emit(&new_config);
+
+        let change = rx.borrow().clone();
+        match change {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(fields.contains(&"auth_store_path".to_string()));
+            }
+            other => panic!("expected RestartRequired, got {other:?}"),
         }
     }
 }

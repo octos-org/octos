@@ -6,4 +6,4 @@ pub mod store;
 pub mod token;
 
 pub use keychain::KEYCHAIN_MARKER;
-pub use store::{AuthCredential, AuthStore};
+pub use store::{AUTH_STORE_PATH_ENV, AuthCredential, AuthStore};

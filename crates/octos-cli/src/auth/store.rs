@@ -1,4 +1,7 @@
-//! Auth credential storage at ~/.octos/auth.json (mode 0600).
+//! Auth credential storage.
+//!
+//! Defaults to `~/.octos/auth.json` and can be overridden with
+//! `OCTOS_AUTH_STORE_PATH` or `auth_store_path` in config.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -6,6 +9,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
+
+/// Environment override for the auth store file path.
+pub const AUTH_STORE_PATH_ENV: &str = "OCTOS_AUTH_STORE_PATH";
 
 /// A stored authentication credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +47,17 @@ pub struct AuthStore {
 impl AuthStore {
     /// Load the auth store from disk (or create empty).
     pub fn load() -> Result<Self> {
-        let path = Self::store_path()?;
+        Self::load_from_path(Self::store_path()?)
+    }
+
+    /// Load the auth store using config/env path resolution.
+    pub fn load_for_config(config: &crate::config::Config) -> Result<Self> {
+        Self::load_from_path(Self::store_path_for_config(Some(config))?)
+    }
+
+    /// Load the auth store from an explicit path.
+    pub fn load_from_path(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
         let data = if path.exists() {
             let content = std::fs::read_to_string(&path).wrap_err("failed to read auth store")?;
             serde_json::from_str(&content).wrap_err("failed to parse auth store")?
@@ -108,8 +124,31 @@ impl AuthStore {
         Ok(())
     }
 
-    /// Path: ~/.octos/auth.json
+    /// Resolve the auth store path.
+    ///
+    /// Precedence: `OCTOS_AUTH_STORE_PATH` > `auth_store_path` in config >
+    /// `~/.octos/auth.json`.
     fn store_path() -> Result<PathBuf> {
+        Self::store_path_for_config(None)
+    }
+
+    fn store_path_for_config(config: Option<&crate::config::Config>) -> Result<PathBuf> {
+        if let Some(path) = std::env::var_os(AUTH_STORE_PATH_ENV) {
+            if !path.as_os_str().is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+
+        if let Some(path) = config.and_then(|config| config.auth_store_path.as_ref()) {
+            if !path.as_os_str().is_empty() {
+                return Ok(path.clone());
+            }
+        }
+
+        Self::default_store_path()
+    }
+
+    fn default_store_path() -> Result<PathBuf> {
         let home =
             dirs::home_dir().ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
         Ok(home.join(".octos").join("auth.json"))
@@ -120,6 +159,12 @@ impl AuthStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn auth_store_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn test_store(dir: &TempDir) -> AuthStore {
         let path = dir.path().join("auth.json");
@@ -146,6 +191,55 @@ mod tests {
         let got = store.get("anthropic").unwrap();
         assert_eq!(got.access_token, "sk-test-123");
         assert_eq!(got.auth_method, "paste_token");
+    }
+
+    #[test]
+    fn load_from_path_reads_explicit_store_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("custom-auth.json");
+
+        let mut store = AuthStore::load_from_path(&path).unwrap();
+        store
+            .set(
+                "openai",
+                AuthCredential {
+                    access_token: "sk-custom-store".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    provider: "openai".to_string(),
+                    auth_method: "paste_token".to_string(),
+                },
+            )
+            .unwrap();
+
+        let reloaded = AuthStore::load_from_path(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .get("openai")
+                .map(|cred| cred.access_token.as_str()),
+            Some("sk-custom-store")
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn store_path_prefers_env_override() {
+        let _guard = auth_store_env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let expected = tmp.path().join("env-auth.json");
+        let previous = std::env::var_os(AUTH_STORE_PATH_ENV);
+
+        // SAFETY: serialized by `auth_store_env_lock` and restored below.
+        unsafe { std::env::set_var(AUTH_STORE_PATH_ENV, &expected) };
+        let resolved = AuthStore::store_path().unwrap();
+
+        // SAFETY: serialized by `auth_store_env_lock`.
+        match previous {
+            Some(value) => unsafe { std::env::set_var(AUTH_STORE_PATH_ENV, value) },
+            None => unsafe { std::env::remove_var(AUTH_STORE_PATH_ENV) },
+        }
+
+        assert_eq!(resolved, expected);
     }
 
     #[test]
