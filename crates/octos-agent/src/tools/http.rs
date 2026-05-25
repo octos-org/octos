@@ -7,6 +7,12 @@
 //! Security: the constructor rejects any base_url that does not resolve
 //! to a loopback host. This bridge is designed for co-located bridge
 //! processes only; cross-host transport is out of scope.
+//!
+//! **Operator note:** prefer literal `127.0.0.1` or `[::1]` over `localhost`
+//! or any other hostname in skill manifests. The constructor pins loopback
+//! at build time via DNS resolution, but `reqwest` re-resolves at request
+//! time, so a hostname whose DNS later rebinds to a public IP would bypass
+//! the build-time guard. Literal IPs eliminate this TOCTOU window.
 
 use std::net::ToSocketAddrs;
 use std::time::Duration;
@@ -154,11 +160,16 @@ impl Tool for HttpTool {
             Err(e) => return Ok(error_result(format!("BRIDGE_HTTP parse: {e}"))),
         };
         let ok = envelope.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        // SPEC-V1 says `code` is a string, but some vendors emit numeric codes.
+        // Accept both: string passes through; integer becomes its decimal form.
         let code = envelope
             .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("0")
-            .to_string();
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .unwrap_or_else(|| "0".to_string());
         let msg = envelope
             .get("msg")
             .and_then(Value::as_str)
