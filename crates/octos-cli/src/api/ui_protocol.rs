@@ -16169,28 +16169,84 @@ async fn run_standalone_turn(
                             // not apply) and its content equals
                             // `response.content` (so it is the
                             // final-assistant carrier).
-                            let to_save =
-                                pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
-                            let saved_for_context = to_save.clone();
-                            let session_id_for_persist = agent_session_id.clone();
-                            let commit = sessions
-                                .add_message_with_seq(&session_id_for_persist, to_save)
-                                .await;
-                            if let Ok(seq) = commit {
-                                record_appui_context_manager_message(
-                                    &context_data_dir_for_result,
-                                    &context_manager_for_result,
-                                    &agent_session_id,
-                                    &saved_for_context,
-                                    seq,
+                            //
+                            // NEW-16 codex review P1: extend the per-turn
+                            // cursor guard to cover the synthesised final
+                            // assistant row too. Treat it as VIRTUAL
+                            // index `response.messages.len()` — the slot
+                            // immediately past the last log row. If a
+                            // re-entry into this persist block sees the
+                            // cursor advanced to `messages.len() + 1`,
+                            // the final row has already been written and
+                            // the second invocation must skip.
+                            let final_virtual_index = response.messages.len();
+                            let cursor_already_at_final = {
+                                let c = persist_cursors.lock().await;
+                                c.get(&cursor_key).copied().unwrap_or(0) > final_virtual_index
+                            };
+                            if cursor_already_at_final {
+                                tracing::debug!(
+                                    session = %agent_session_id.0,
+                                    turn = %turn_thread_id_for_persist,
+                                    final_virtual_index,
+                                    "NEW-16 cursor guard skipped already-persisted synthetic \
+                                     final assistant row in this turn"
                                 );
-                                cursor = Some(UiCursor {
-                                    stream: agent_session_id.0.clone(),
-                                    seq: seq as u64,
-                                });
+                                // The final row was committed by an earlier
+                                // invocation. Flip `final_assistant_persisted`
+                                // so downstream signalling (oneshot send)
+                                // sees the same state as the original
+                                // successful path.
                                 final_assistant_persisted = true;
+                            } else {
+                                let to_save =
+                                    pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                                let saved_for_context = to_save.clone();
+                                let session_id_for_persist = agent_session_id.clone();
+                                let commit = sessions
+                                    .add_message_with_seq(&session_id_for_persist, to_save)
+                                    .await;
+                                if let Ok(seq) = commit {
+                                    // Advance the cursor past the virtual
+                                    // final-row index so a re-entry skips it.
+                                    {
+                                        let mut c = persist_cursors.lock().await;
+                                        let entry = c.entry(cursor_key.clone()).or_insert(0);
+                                        if final_virtual_index + 1 > *entry {
+                                            *entry = final_virtual_index + 1;
+                                        }
+                                    }
+                                    record_appui_context_manager_message(
+                                        &context_data_dir_for_result,
+                                        &context_manager_for_result,
+                                        &agent_session_id,
+                                        &saved_for_context,
+                                        seq,
+                                    );
+                                    cursor = Some(UiCursor {
+                                        stream: agent_session_id.0.clone(),
+                                        seq: seq as u64,
+                                    });
+                                    final_assistant_persisted = true;
+                                }
                             }
                         }
+                    }
+                    // NEW-16 codex review P2: garbage-collect the cursor
+                    // entry for this `(session, turn)` pair now that the
+                    // persist block has completed. The cursor is a
+                    // re-entry guard; once both the indexed-log loop and
+                    // the synthetic-final-row branch are done, the entry
+                    // is no longer needed. Without this, the map would
+                    // grow unbounded with every turn on a long-running
+                    // server. Eviction happens under the existing
+                    // session lock so it cannot race a concurrent
+                    // re-entry from THIS turn — and the keying is
+                    // `(session, turn)` so it cannot collide with
+                    // distinct turns either.
+                    {
+                        let mut c = persist_cursors.lock().await;
+                        c.remove(&cursor_key);
                     }
                 }
                 // #1158 codex P2 rev3 follow-up: distinguish two
@@ -31203,6 +31259,92 @@ ignore = []
             c.get(&key).copied().unwrap_or(0)
         };
         assert_eq!(cursor_after, 4, "cursor should advance to next index");
+    }
+
+    /// NEW-16 codex review P1: the cursor guard MUST cover the
+    /// synthesised final assistant row too. When the cursor is
+    /// advanced to `response.messages.len() + 1`, the synthesised
+    /// final row has already been persisted in a prior invocation
+    /// and must be skipped on re-entry.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_covers_synthesised_final_assistant_row() {
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        // Simulate first invocation: 3 indexed log rows + 1 synthetic
+        // final row all persisted. Cursor advances to
+        // `messages.len() + 1` = 3 + 1 = 4.
+        let log_row_count = 3usize;
+        let final_virtual_index = log_row_count; // == messages.len()
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key.clone(), final_virtual_index + 1);
+        }
+
+        // Second invocation (re-entry on SAME (session, turn)):
+        // - All indexed rows < final_virtual_index must skip.
+        // - The synthetic final row check: cursor > final_virtual_index?
+        //   Yes (4 > 3), so the synthetic final row is also skipped.
+        let cursor_already_advanced = {
+            let c = cursors.lock().await;
+            c.get(&key).copied().unwrap_or(0)
+        };
+        for message_index in 0..log_row_count {
+            assert!(
+                message_index < cursor_already_advanced,
+                "indexed row {message_index} must be skipped on re-entry"
+            );
+        }
+        let final_row_already_persisted = cursor_already_advanced > final_virtual_index;
+        assert!(
+            final_row_already_persisted,
+            "the synthetic final assistant row MUST also be skipped on re-entry — \
+             this is the codex round-1 P1 contract on NEW-16"
+        );
+
+        // Cleanup so this test is hermetic.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
+    }
+
+    /// NEW-16 codex review P2: cursor entries MUST be removed from
+    /// the registry once the persist block completes so the map does
+    /// not grow unbounded on a long-running server.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_is_evicted_after_turn_completes() {
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        // Simulate the persist loop populating the cursor.
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key.clone(), 5);
+        }
+        // Confirm it landed.
+        {
+            let c = cursors.lock().await;
+            assert_eq!(c.get(&key).copied(), Some(5));
+        }
+        // Simulate the GC at end of persist loop.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
+        // The entry is gone.
+        {
+            let c = cursors.lock().await;
+            assert!(
+                c.get(&key).is_none(),
+                "cursor entry MUST be evicted after persist block completes \
+                 (codex round-1 P2 — prevents unbounded map growth)"
+            );
+        }
     }
 
     /// NEW-16: cursor entries are keyed by `(session, turn)`. Two
