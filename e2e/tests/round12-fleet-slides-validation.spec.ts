@@ -55,7 +55,16 @@ const HOSTS: HostSpec[] = [
   { key: 'ocean', baseUrl: 'https://dspfac.ocean.ominix.io', displayHost: 'ocean.ominix.io' },
 ];
 
-const PROMPT = 'Make a 2-slide intro deck about quasars — title + 1 content';
+// Round-13 v2 update: the slides skill is two-phase (outline first, then
+// `generate`/`go` to invoke `mofa_slides`). v2 sent only this PROMPT and
+// the validator never saw `mofa_slides` because the model stopped after
+// proposing the outline. Now we explicitly request "outline only" and add
+// a follow-up `generate`/`go` phase below.
+const PROMPT =
+  'Make a 2-slide intro deck about quasars — title + 1 content. Show the outline only. Do not generate yet — wait for me to reply "generate" or "go".';
+// Sent after the assistant returns the outline (or after a short delay if
+// the outline phase stalls). Triggers the actual `mofa_slides` invocation.
+const GENERATE_TRIGGERS = ['generate', 'go'] as const;
 // Slug fed to `/new slides <slug>`. Keep it short, no spaces — the server
 // stores this as the session topic (`slides:<slug>`) which is what PR
 // #1265's per-session allowlist checks via `topic.starts_with("slides")`.
@@ -232,6 +241,33 @@ async function runOneHost(host: HostSpec, page: Page): Promise<HostResult> {
   // so this turn's tool resolution runs against the slides-filtered
   // registry.
   await sendPrompt(page, PROMPT);
+
+  // Round-13 v2 fix: wait for the outline phase to settle, then send the
+  // confirmation triggers ("generate", "go") to drive the model into the
+  // mofa_slides invocation. Without these triggers, v2 saw the outline
+  // bubble + `mofa_list_styles` etc., but never saw `mofa_slides` itself
+  // because the assistant stopped awaiting confirmation.
+  //
+  // Strategy:
+  //   1. Wait up to 90s for the assistant bubble count to grow OR a
+  //      `turn/completed` to fire (outline turn done).
+  //   2. Send "generate".
+  //   3. Wait up to 30s more, send "go" as belt+suspenders. The slides
+  //      flow tolerates extra "go" — see live-slides-site.spec.ts:316.
+  const outlineDeadline = Date.now() + 90_000;
+  const bubbleBaseline = await countAssistantBubbles(page).catch(() => 0);
+  while (Date.now() < outlineDeadline) {
+    const bubbleNow = await countAssistantBubbles(page).catch(() => 0);
+    const completed = frames.some((f) => f.method === 'turn/completed');
+    if (bubbleNow > bubbleBaseline || completed) break;
+    await page.waitForTimeout(3_000);
+  }
+  for (const trigger of GENERATE_TRIGGERS) {
+    await sendPrompt(page, trigger).catch(() => undefined);
+    // Brief delay so each trigger has a chance to drive a fresh turn
+    // before the next "go" is queued.
+    await page.waitForTimeout(15_000);
+  }
 
   // Wait for completion: EITHER a `file/attached` frame whose path ends
   // in `.pptx`, OR a DOM pptx button. Poll every 3s up to 6 min.
