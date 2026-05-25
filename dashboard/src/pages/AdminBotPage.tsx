@@ -1,17 +1,28 @@
 import { useState, useEffect, useCallback } from 'react'
+import { Link } from 'react-router-dom'
 import { api } from '../api'
+import StatusBadge from '../components/StatusBadge'
 import { useToast } from '../components/Toast'
-import type { MonitorStatus } from '../types'
+import type { MonitorStatus, ProfileResponse } from '../types'
+
+function isAdminProfile(profile: ProfileResponse) {
+  return profile.config.admin_mode === true
+}
 
 export default function AdminBotPage() {
   const { toast } = useToast()
   const [loading, setLoading] = useState(true)
   const [monitorStatus, setMonitorStatus] = useState<MonitorStatus>({ watchdog_enabled: false, alerts_enabled: false })
+  const [adminProfiles, setAdminProfiles] = useState<ProfileResponse[]>([])
 
   const loadData = useCallback(async () => {
     try {
-      const monitor = await api.monitorStatus().catch(() => ({ watchdog_enabled: false, alerts_enabled: false }))
+      const [monitor, profiles] = await Promise.all([
+        api.monitorStatus().catch(() => ({ watchdog_enabled: false, alerts_enabled: false })),
+        api.listProfiles(),
+      ])
       setMonitorStatus(monitor)
+      setAdminProfiles(profiles.filter(isAdminProfile))
     } catch (e: any) {
       toast(e.message, 'error')
     } finally {
@@ -51,6 +62,8 @@ export default function AdminBotPage() {
     )
   }
 
+  const activeProfiles = adminProfiles.filter((profile) => profile.status.running)
+
   return (
     <div className="max-w-3xl">
       <div className="mb-6">
@@ -79,12 +92,55 @@ export default function AdminBotPage() {
       </div>
 
       <div className="bg-surface rounded-xl border border-gray-700/50 p-5">
-        <h2 className="text-sm font-semibold text-white mb-2">Admin Bot Profile</h2>
-        <p className="text-sm text-gray-400">
-          To set up an admin bot, create a regular profile and enable <strong className="text-white">Admin Mode</strong> in
-          its settings. Admin mode restricts the gateway to admin-only tools (profile management,
-          monitoring, logs) and uses a built-in admin system prompt.
-        </p>
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <h2 className="text-sm font-semibold text-white">Admin Bot Profiles</h2>
+            <p className="text-xs text-gray-500 mt-1">
+              Active admin: <span className="text-gray-300">
+                {activeProfiles.length > 0
+                  ? activeProfiles.map((profile) => profile.name).join(', ')
+                  : 'None running'}
+              </span>
+            </p>
+          </div>
+          <Link
+            to="/profiles/new?adminMode=true"
+            className="shrink-0 px-3 py-1.5 text-xs font-medium rounded-lg bg-accent text-white hover:bg-accent-light transition"
+          >
+            Create admin profile
+          </Link>
+        </div>
+
+        {adminProfiles.length > 0 ? (
+          <div className="divide-y divide-gray-700/50">
+            {adminProfiles.map((profile) => (
+              <div key={profile.id} className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <Link
+                    to={`/profile/${profile.id}`}
+                    className="text-sm font-medium text-white hover:text-accent transition-colors truncate block"
+                  >
+                    {profile.name}
+                  </Link>
+                  <p className="text-xs text-gray-500 font-mono truncate">{profile.id}</p>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <StatusBadge running={profile.status.running} />
+                  <Link
+                    to={`/profile/${profile.id}`}
+                    className="px-3 py-1.5 text-xs font-medium rounded-lg bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white border border-gray-700/50 transition"
+                  >
+                    Open
+                  </Link>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-gray-700/70 p-4 text-sm text-gray-400">
+            No admin bot profiles yet.
+          </div>
+        )}
       </div>
     </div>
   )
