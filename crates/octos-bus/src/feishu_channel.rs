@@ -1837,6 +1837,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_use_reply_endpoint_when_reply_to_present() {
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            http::HeaderMap,
+            routing::post,
+        };
+
+        #[derive(Debug)]
+        struct CapturedReply {
+            parent_message_id: String,
+            authorization: Option<String>,
+            body: serde_json::Value,
+        }
+
+        async fn capture_reply(
+            State(tx): State<mpsc::Sender<CapturedReply>>,
+            Path(parent_message_id): Path<String>,
+            headers: HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            tx.send(CapturedReply {
+                parent_message_id,
+                authorization,
+                body,
+            })
+            .await
+            .ok();
+            Json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_reply_child" }
+            }))
+        }
+
+        let (tx, mut rx) = mpsc::channel::<CapturedReply>(1);
+        let app = Router::new()
+            .route(
+                "/open-apis/im/v1/messages/{message_id}/reply",
+                post(capture_reply),
+            )
+            .with_state(tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut ch = make_channel(vec![]);
+        ch.base_url = format!("http://{addr}/open-apis");
+        *ch.token_cache.lock().await = Some(("tenant-token".to_string(), Instant::now()));
+
+        let outbound = OutboundMessage {
+            channel: "feishu".into(),
+            chat_id: "oc_chat_should_not_drive_reply_route".into(),
+            content: "threaded response".into(),
+            reply_to: Some("om_parent_message".into()),
+            media: vec![],
+            metadata: serde_json::json!({}),
+        };
+
+        let message_id = ch.send_with_id(&outbound).await.unwrap();
+        assert_eq!(message_id.as_deref(), Some("om_reply_child"));
+
+        let captured = rx.recv().await.expect("reply endpoint should be called");
+        assert_eq!(captured.parent_message_id, "om_parent_message");
+        assert_eq!(
+            captured.authorization.as_deref(),
+            Some("Bearer tenant-token")
+        );
+        assert_eq!(captured.body.get("receive_id"), None);
+        assert_eq!(
+            captured.body.get("msg_type").and_then(|v| v.as_str()),
+            Some("interactive")
+        );
+        assert!(
+            captured
+                .body
+                .get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|content| content.contains("threaded response"))
+        );
+
+        server.abort();
+    }
+
     #[test]
     fn test_with_mode() {
         let ch = FeishuChannel::new(
