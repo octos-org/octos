@@ -370,6 +370,12 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
     // Build binary if needed
     maybe_install_binary(&dest)?;
 
+    // Run hardware lifecycle phases (preflight → init → ready_check) if the
+    // skill has a manifest.json. Best-effort: only skills with manifest.json
+    // and a `hardware_lifecycle` section are affected. Failure is fatal here so
+    // the user gets a clear error and re-install starts from a clean state.
+    run_activate_lifecycle(&dest, &name)?;
+
     println!("  {} Installed '{}' from local path", "OK".green(), name);
     Ok(InstallResult {
         installed: vec![name],
@@ -398,6 +404,22 @@ pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
         // Idempotent: already removed.
         return Ok(());
     }
+
+    // Run shutdown lifecycle phase (best-effort — failure is logged but does
+    // not block removal). Only runs if the skill has manifest.json with a
+    // `hardware_lifecycle.shutdown` section.
+    {
+        use octos_agent::plugins::run_shutdown_phase;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
+        if let Some(rt) = runtime {
+            rt.block_on(run_shutdown_phase(&dest));
+        }
+    }
+
     std::fs::remove_dir_all(&dest)?;
     Ok(())
 }
@@ -1011,6 +1033,14 @@ fn install_via_git_result(
     for name in installed.iter().chain(deps_installed.iter()) {
         let dest = skills_dir.join(name);
         write_source_info(&dest, spec, branch)?;
+    }
+
+    // Run hardware lifecycle phases for each installed skill that has a
+    // manifest.json. Skills without manifest.json (SKILL.md-only, shared dep
+    // dirs) are silently skipped inside `run_activate_lifecycle`.
+    for name in installed.iter().chain(deps_installed.iter()) {
+        let dest = skills_dir.join(name);
+        run_activate_lifecycle(&dest, name)?;
     }
 
     Ok(InstallResult {
@@ -1722,6 +1752,42 @@ fn install_main_to_cargo_bin(dir: &Path, name: &str) {
     );
 }
 
+/// Run `activate_skill` lifecycle phases for a freshly-installed skill directory.
+///
+/// Only fires when `manifest.json` is present (i.e. skills installed via git or
+/// local path, not the HTTP-only SKILL.md-only fallback). On failure the skill
+/// directory is removed so re-install starts clean.
+fn run_activate_lifecycle(skill_dir: &Path, name: &str) -> Result<()> {
+    // Skip if no manifest.json — HTTP-only installs have only SKILL.md.
+    if !skill_dir.join("manifest.json").exists() {
+        return Ok(());
+    }
+
+    use eyre::eyre;
+    use octos_agent::plugins::activate_skill;
+    use octos_agent::tools::ToolRegistry;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| eyre!("failed to build runtime for skill activation: {e}"))?;
+
+    let mut registry = ToolRegistry::new();
+    let activation = runtime.block_on(activate_skill(&mut registry, skill_dir, &[]));
+
+    if let Err(e) = activation {
+        // Best-effort cleanup: remove the partially-installed skill dir so
+        // re-install starts from a clean state.
+        let _ = std::fs::remove_dir_all(skill_dir);
+        return Err(eyre!("skill '{name}' activation failed: {e}"));
+    }
+
+    // The `registry` is intentionally discarded here — we call `activate_skill`
+    // for its side effects (lifecycle phases start the dataflow). At runtime,
+    // agent startup's PluginLoader scan re-registers tools via the same path.
+    Ok(())
+}
+
 fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
     remove_skill(skills_dir, name)?;
     println!("{} Removed skill '{}'", "OK".green(), name.cyan());
@@ -1887,5 +1953,102 @@ fi
         std::fs::write(skill_dir.join("main"), "#!/usr/bin/env bash\necho ok\n").unwrap();
 
         assert!(has_installed_skill_executable(&skill_dir, "mofa-fm"));
+    }
+
+    /// Installing a local skill with `hardware_lifecycle.init` containing
+    /// `touch $OCTOS_SKILL_DIR/init_marker` must produce `init_marker` in the
+    /// installed skill directory.
+    ///
+    /// Uses a fake skill source (local temp dir) so no network or git is needed.
+    #[cfg(unix)]
+    #[test]
+    fn should_run_init_lifecycle_when_installing_local_skill_with_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // ── Build a fake skill source directory ───────────────────────────
+        let src_dir = tmp.path().join("hw-test-skill");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        // SKILL.md (required by install_from_local)
+        std::fs::write(src_dir.join("SKILL.md"), "# hw-test-skill\n").unwrap();
+
+        // manifest.json with a hardware_lifecycle.init step that writes a
+        // sentinel file into $OCTOS_SKILL_DIR.
+        let manifest = r#"{
+            "name": "hw-test-skill",
+            "version": "0.1.0",
+            "tools": [],
+            "hardware_lifecycle": {
+                "init": [
+                    {"label": "write-marker", "command": "touch \"$OCTOS_SKILL_DIR/init_marker\""}
+                ]
+            }
+        }"#;
+        std::fs::write(src_dir.join("manifest.json"), manifest).unwrap();
+
+        // ── Install into a temp skills dir ────────────────────────────────
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let result = install_from_local(&skills_dir, &src_dir, false);
+        assert!(
+            result.is_ok(),
+            "install_from_local failed: {:?}",
+            result.err()
+        );
+
+        // ── Verify init_marker was created by the lifecycle step ──────────
+        let marker = skills_dir.join("hw-test-skill").join("init_marker");
+        assert!(
+            marker.exists(),
+            "init_marker should exist after lifecycle init phase, but was not found at {}",
+            marker.display()
+        );
+    }
+
+    /// Removing a skill with `hardware_lifecycle.shutdown` must run the
+    /// shutdown phase before deleting the directory.
+    #[cfg(unix)]
+    #[test]
+    fn should_run_shutdown_lifecycle_when_removing_skill_with_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        let skill_dir = skills_dir.join("shutdown-test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        // Sentinel file path — the shutdown step will touch a sibling marker
+        // that we can detect *before* remove_dir_all runs.
+        // We write it outside the skill dir so it survives the removal.
+        let sentinel = tmp.path().join("shutdown_ran.txt");
+        let sentinel_str = sentinel.to_string_lossy().to_string();
+
+        std::fs::write(skill_dir.join("SKILL.md"), "# shutdown-test-skill\n").unwrap();
+        let manifest = format!(
+            r#"{{
+                "name": "shutdown-test-skill",
+                "version": "0.1.0",
+                "tools": [],
+                "hardware_lifecycle": {{
+                    "shutdown": [
+                        {{"label": "write-sentinel", "command": "touch \"{sentinel_str}\""}}
+                    ]
+                }}
+            }}"#
+        );
+        std::fs::write(skill_dir.join("manifest.json"), manifest).unwrap();
+
+        // Remove the skill — should trigger shutdown then delete.
+        let result = remove_skill(&skills_dir, "shutdown-test-skill");
+        assert!(result.is_ok(), "remove_skill failed: {:?}", result.err());
+
+        // Skill directory should be gone.
+        assert!(!skill_dir.exists(), "skill dir should have been removed");
+
+        // Sentinel should exist (shutdown phase ran before removal).
+        assert!(
+            sentinel.exists(),
+            "shutdown sentinel should exist after remove_skill, but was not found at {}",
+            sentinel.display()
+        );
     }
 }
