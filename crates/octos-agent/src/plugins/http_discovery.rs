@@ -27,6 +27,11 @@ pub struct HttpToolEntry {
     /// JSON Schema for tool arguments.
     #[serde(default = "default_schema")]
     pub input_schema: serde_json::Value,
+    /// New in SPEC-V1 1.1 — the bridge propagates safety_tier from the
+    /// vendor advert. When absent, the loader falls back to manifest defaults
+    /// (`tool_overrides[name]` then `required_safety_tier`).
+    #[serde(default)]
+    pub safety_tier: Option<crate::permissions::SafetyTier>,
 }
 
 fn default_schema() -> serde_json::Value {
@@ -144,5 +149,26 @@ mod tests {
 
         let err = fetch_http_tool_catalog(&server.uri()).await.unwrap_err();
         assert!(err.to_string().contains("parse"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_includes_safety_tier_when_provided() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"name": "robot.estop", "description": "Estop", "safety_tier": "emergency_override"},
+                {"name": "robot.read", "description": "Read sensor"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let entries = fetch_http_tool_catalog(&server.uri()).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].safety_tier,
+            Some(crate::permissions::SafetyTier::EmergencyOverride)
+        );
+        assert_eq!(entries[1].safety_tier, None);
     }
 }

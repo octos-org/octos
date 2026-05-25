@@ -48,9 +48,7 @@ mod tests {
                 {
                     "tool_name": "scan_station",
                     "description": "Scan station for objects",
-                    "dora_node_id": "moveit-skills",
-                    "dora_output_id": "skill_request",
-                    "parameters": {"station": "Station ID to scan"},
+                    "bridge_base_url": "http://127.0.0.1:8765",
                     "safety_tier": "full_actuation",
                     "timeout_secs": 120
                 }
@@ -83,9 +81,7 @@ mod tests {
             "mappings": [{
                 "tool_name": "x",
                 "description": "x",
-                "dora_node_id": "n",
-                "dora_output_id": "o",
-                "parameters": {},
+                "bridge_base_url": "http://127.0.0.1:8765",
                 "safety_tier": "kind_of_dangerous",
                 "timeout_secs": 1
             }]
@@ -98,14 +94,12 @@ mod tests {
     fn should_default_safety_tier_when_field_omitted() {
         // Omitting `safety_tier` falls back to `Observe` (the safest default
         // for an explicitly-not-declared tool); only an explicit unknown
-        // string fails. Mirrors `default_tier()` in lib.rs.
+        // string fails. Mirrors `SafetyTier::default()`.
         let json = r#"{
             "mappings": [{
                 "tool_name": "x",
                 "description": "x",
-                "dora_node_id": "n",
-                "dora_output_id": "o",
-                "parameters": {},
+                "bridge_base_url": "http://127.0.0.1:8765",
                 "timeout_secs": 1
             }]
         }"#;

@@ -7,8 +7,6 @@
 //! `group:robot:<tier>` `ToolPolicy` machinery actually applies — without
 //! that registration the tier metadata would be decorative.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use octos_agent::tools::ConcurrencyClass;
 use octos_agent::tools::robot_groups::{self, RobotToolRegistry};
@@ -18,33 +16,41 @@ use serde::{Deserialize, Serialize};
 pub mod config;
 pub use config::BridgeConfig;
 
-/// Mapping from a dora-rs node output to an MCP tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Mapping from a catalog entry to an MCP tool exposed via HTTP bridge.
+///
+/// The post-SPEC-V1 1.1 shape: tools are dispatched via `POST <bridge_base_url>/tools/<tool_name>`
+/// and the bridge handles all Dora wiring. The legacy `dora_node_id` /
+/// `dora_output_id` fields remain optional for backward-compatible config
+/// files but are ignored by the HTTP transport.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DoraToolMapping {
     /// MCP tool name exposed to the agent.
     pub tool_name: String,
     /// Description for the LLM.
+    #[serde(default)]
     pub description: String,
-    /// Dora node ID that handles this tool.
-    pub dora_node_id: String,
-    /// Dora output ID to send the request to.
-    pub dora_output_id: String,
-    /// Expected input parameters (name -> description).
-    pub parameters: HashMap<String, String>,
+    /// Loopback HTTP base URL of the local bridge process (`http://127.0.0.1:PORT`).
+    /// Required for execution; validated against loopback at bridge build time.
+    #[serde(default)]
+    pub bridge_base_url: String,
     /// Required safety tier for this tool. Strict: unknown tiers fail
-    /// `BridgeConfig::from_json` rather than silently defaulting to
-    /// `Observe`. Serialised as snake_case (matches existing config files
-    /// — `"observe"`, `"safe_motion"`, `"full_actuation"`,
-    /// `"emergency_override"`).
-    #[serde(default = "default_tier")]
+    /// `BridgeConfig::from_json` rather than silently defaulting to `Observe`.
+    #[serde(default)]
     pub safety_tier: SafetyTier,
+    /// Optional JSON Schema for the tool's input. When `None`, a permissive
+    /// `{"type":"object","additionalProperties":true}` is used.
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
     /// Timeout in seconds for the tool call.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-}
-
-fn default_tier() -> SafetyTier {
-    SafetyTier::Observe
+    /// DEPRECATED — kept for older config compatibility but ignored by the
+    /// HTTP-transport implementation. Will be removed in a future release.
+    #[serde(default)]
+    pub dora_node_id: Option<String>,
+    /// DEPRECATED — see `dora_node_id`.
+    #[serde(default)]
+    pub dora_output_id: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -53,18 +59,29 @@ fn default_timeout() -> u64 {
 
 /// A bridge that wraps a [`DoraToolMapping`] as an MCP-compatible [`Tool`].
 ///
-/// In production the `execute` method would forward the request to the dora
-/// dataflow via an IPC channel and await the response.  The current
-/// implementation returns a placeholder describing the would-be forwarded
-/// payload so the bridge can be tested without a running dora runtime.
+/// Transport is delegated to [`HttpTool`]; this layer owns safety_tier
+/// metadata + `RobotToolRegistry` registration so the existing
+/// `group:robot:<tier>` `ToolPolicy` machinery applies.
 pub struct DoraToolBridge {
     mapping: DoraToolMapping,
+    inner: octos_agent::tools::HttpTool,
 }
 
 impl DoraToolBridge {
-    /// Create a new bridge from the given mapping.
-    pub fn new(mapping: DoraToolMapping) -> Self {
-        Self { mapping }
+    /// Construct a bridge. Fails if `mapping.bridge_base_url` is not a
+    /// loopback HTTP URL (delegated to `HttpTool::new`).
+    pub fn new(mapping: DoraToolMapping) -> eyre::Result<Self> {
+        let schema = mapping
+            .input_schema
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "additionalProperties": true}));
+        let inner = octos_agent::tools::HttpTool::new(
+            mapping.tool_name.clone(),
+            mapping.description.clone(),
+            mapping.bridge_base_url.clone(),
+            schema,
+        )?;
+        Ok(Self { mapping, inner })
     }
 
     /// Return a reference to the underlying mapping.
@@ -75,31 +92,6 @@ impl DoraToolBridge {
     /// Required safety tier for this tool, drawn directly from the mapping.
     pub fn required_safety_tier(&self) -> SafetyTier {
         self.mapping.safety_tier
-    }
-
-    /// Build the JSON Schema object describing the tool's input parameters.
-    fn build_input_schema(&self) -> serde_json::Value {
-        let properties: serde_json::Map<String, serde_json::Value> = self
-            .mapping
-            .parameters
-            .iter()
-            .map(|(name, desc)| {
-                (
-                    name.clone(),
-                    serde_json::json!({
-                        "type": "string",
-                        "description": desc
-                    }),
-                )
-            })
-            .collect();
-        let required: Vec<String> = self.mapping.parameters.keys().cloned().collect();
-        serde_json::json!({
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": false,
-        })
     }
 }
 
@@ -114,11 +106,11 @@ impl Tool for DoraToolBridge {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        self.build_input_schema()
+        self.inner.input_schema()
     }
 
     fn tags(&self) -> &[&str] {
-        &["dora", "mcp-bridge", "robot"]
+        &["dora-bridge", "robot"]
     }
 
     /// Codex round-2 P2: anything that can actuate the robot must NOT run in
@@ -137,25 +129,7 @@ impl Tool for DoraToolBridge {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
-        let request = serde_json::json!({
-            "dora_node_id": self.mapping.dora_node_id,
-            "dora_output_id": self.mapping.dora_output_id,
-            "tool_name": self.mapping.tool_name,
-            "args": args,
-            "timeout_secs": self.mapping.timeout_secs,
-            "safety_tier": self.mapping.safety_tier.label(),
-        });
-
-        Ok(ToolResult {
-            output: format!(
-                "[dora-bridge] would forward to {}::{} with payload:\n{}",
-                self.mapping.dora_node_id,
-                self.mapping.dora_output_id,
-                serde_json::to_string_pretty(&request).unwrap_or_default()
-            ),
-            success: true,
-            ..Default::default()
-        })
+        self.inner.execute(args).await
     }
 }
 
@@ -167,18 +141,21 @@ impl Tool for DoraToolBridge {
 ///
 /// Idempotent: re-loading the same config replaces prior tier mappings for
 /// the same tool name (see [`RobotToolRegistry::insert`]).
-pub fn load_bridges(config: &BridgeConfig) -> Vec<DoraToolBridge> {
+///
+/// Returns an error if any mapping has an invalid `bridge_base_url`
+/// (non-loopback / malformed) — the caller decides whether to abort.
+pub fn load_bridges(config: &BridgeConfig) -> eyre::Result<Vec<DoraToolBridge>> {
     let bridges: Vec<DoraToolBridge> = config
         .mappings
         .iter()
         .map(|m| DoraToolBridge::new(m.clone()))
-        .collect();
+        .collect::<eyre::Result<Vec<_>>>()?;
     robot_groups::with_registry_mut(|reg: &mut RobotToolRegistry| {
         for bridge in &bridges {
             reg.insert(bridge.mapping.tool_name.clone(), bridge.mapping.safety_tier);
         }
     });
-    bridges
+    Ok(bridges)
 }
 
 #[cfg(test)]
@@ -186,64 +163,41 @@ mod tests {
     use super::*;
 
     fn sample_mapping() -> DoraToolMapping {
-        let mut params = HashMap::new();
-        params.insert("waypoint".to_string(), "Target waypoint ID".to_string());
-
         DoraToolMapping {
             tool_name: "navigate_to".to_string(),
             description: "Navigate robot to a waypoint".to_string(),
-            dora_node_id: "moveit-skills".to_string(),
-            dora_output_id: "skill_request".to_string(),
-            parameters: params,
+            bridge_base_url: "http://127.0.0.1:8765".to_string(),
             safety_tier: SafetyTier::SafeMotion,
+            input_schema: None,
             timeout_secs: 60,
+            dora_node_id: None,
+            dora_output_id: None,
         }
     }
 
     #[test]
     fn should_expose_correct_tool_name() {
-        let bridge = DoraToolBridge::new(sample_mapping());
+        let bridge = DoraToolBridge::new(sample_mapping()).unwrap();
         assert_eq!(bridge.name(), "navigate_to");
     }
 
     #[test]
     fn should_expose_correct_description() {
-        let bridge = DoraToolBridge::new(sample_mapping());
+        let bridge = DoraToolBridge::new(sample_mapping()).unwrap();
         assert_eq!(bridge.description(), "Navigate robot to a waypoint");
     }
 
     #[test]
-    fn should_build_input_schema_with_parameters() {
-        let bridge = DoraToolBridge::new(sample_mapping());
-        let schema = bridge.input_schema();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["waypoint"].is_object());
-        let required = schema["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "waypoint"));
-    }
-
-    #[test]
-    fn should_build_empty_schema_when_no_parameters() {
-        let mut mapping = sample_mapping();
-        mapping.parameters.clear();
-        let bridge = DoraToolBridge::new(mapping);
-        let schema = bridge.input_schema();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"].as_object().unwrap().is_empty());
-    }
-
-    #[test]
     fn should_include_dora_tags() {
-        let bridge = DoraToolBridge::new(sample_mapping());
+        let bridge = DoraToolBridge::new(sample_mapping()).unwrap();
         let tags = bridge.tags();
-        assert!(tags.contains(&"dora"));
-        assert!(tags.contains(&"mcp-bridge"));
+        assert!(tags.contains(&"dora-bridge"));
         assert!(tags.contains(&"robot"));
     }
 
     #[test]
     fn should_expose_declared_safety_tier() {
-        let bridge = DoraToolBridge::new(sample_mapping());
+        let bridge = DoraToolBridge::new(sample_mapping()).unwrap();
         assert_eq!(bridge.required_safety_tier(), SafetyTier::SafeMotion);
     }
 
@@ -257,9 +211,7 @@ mod tests {
             "mappings": [{
                 "tool_name": "rogue",
                 "description": "should not load",
-                "dora_node_id": "n",
-                "dora_output_id": "o",
-                "parameters": {},
+                "bridge_base_url": "http://127.0.0.1:8765",
                 "safety_tier": "FullActuation",
                 "timeout_secs": 1
             }]
@@ -286,7 +238,7 @@ mod tests {
             description: String::new(),
             mappings: vec![high, low],
         };
-        let bridges = load_bridges(&config);
+        let bridges = load_bridges(&config).unwrap();
         assert_eq!(bridges.len(), 2);
 
         let snap = robot_groups::snapshot();
@@ -301,15 +253,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_execute_bridge_tool_with_args() {
-        let bridge = DoraToolBridge::new(sample_mapping());
-        let result = bridge
-            .execute(&serde_json::json!({"waypoint": "A"}))
-            .await
-            .unwrap();
-        assert!(result.output.contains("dora-bridge"));
-        assert!(result.output.contains("moveit-skills"));
-        assert!(result.output.contains("safe_motion"));
+    async fn execute_forwards_to_bridge_via_http() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/robot.heartbeat"))
+            .and(body_json(serde_json::json!({"args": {}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "code": "0", "msg": "", "data": {"ok": true, "deadline_ms": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let mapping = DoraToolMapping {
+            tool_name: "robot.heartbeat".into(),
+            description: "heartbeat".into(),
+            bridge_base_url: server.uri(),
+            safety_tier: SafetyTier::Observe,
+            timeout_secs: 5,
+            input_schema: None,
+            dora_node_id: None,
+            dora_output_id: None,
+        };
+        let bridge = DoraToolBridge::new(mapping).unwrap();
+        let result = bridge.execute(&serde_json::json!({})).await.unwrap();
         assert!(result.success);
+        assert!(result.output.contains("deadline_ms"));
     }
 }
