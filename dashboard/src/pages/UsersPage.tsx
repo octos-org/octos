@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
+import ConfirmDialog from '../components/ConfirmDialog'
 import { useToast } from '../components/Toast'
 import type { AllowlistEntry, User } from '../types'
 
@@ -31,6 +32,10 @@ function registrationStatus(entry: AllowlistEntry): {
   }
 }
 
+type PendingConfirm =
+  | { kind: 'allowlist'; entry: AllowlistEntry }
+  | { kind: 'user'; user: User }
+
 export default function UsersPage() {
   const { toast } = useToast()
   const [allowedEmails, setAllowedEmails] = useState<AllowlistEntry[]>([])
@@ -42,6 +47,7 @@ export default function UsersPage() {
   const [newNote, setNewNote] = useState('')
   const [removingEmail, setRemovingEmail] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null)
 
   const loadData = useCallback(async () => {
     try {
@@ -99,14 +105,7 @@ export default function UsersPage() {
     }
   }
 
-  const handleRemoveAllowlist = async (entry: AllowlistEntry) => {
-    const confirmed = confirm(
-      entry.registered
-        ? `Remove "${entry.email}" from the allowlist? The already-registered account will remain, but future OTP signup will no longer be pre-authorized.`
-        : `Remove "${entry.email}" from the allowlist?`,
-    )
-    if (!confirmed) return
-
+  const removeAllowlistEntry = async (entry: AllowlistEntry) => {
     try {
       setRemovingEmail(entry.email)
       await api.deleteAllowedEmail(entry.email)
@@ -119,10 +118,7 @@ export default function UsersPage() {
     }
   }
 
-  const handleDeleteUser = async (user: User) => {
-    if (!confirm(`Delete account "${user.email}"? This will also delete the profile and stop its gateway.`)) {
-      return
-    }
+  const deleteUser = async (user: User) => {
     try {
       setDeletingId(user.id)
       await api.deleteUser(user.id)
@@ -134,6 +130,29 @@ export default function UsersPage() {
       setDeletingId(null)
     }
   }
+
+  const handleConfirm = async () => {
+    const pending = pendingConfirm
+    if (!pending) return
+    setPendingConfirm(null)
+    if (pending.kind === 'allowlist') {
+      await removeAllowlistEntry(pending.entry)
+    } else {
+      await deleteUser(pending.user)
+    }
+  }
+
+  const confirmTitle = pendingConfirm?.kind === 'user'
+    ? 'Delete Account'
+    : 'Remove Allowlisted Email'
+  const confirmMessage = pendingConfirm?.kind === 'user'
+    ? `Delete account "${pendingConfirm.user.email}"? This will also delete the profile and stop its gateway.`
+    : pendingConfirm?.entry.registered
+      ? `Remove "${pendingConfirm.entry.email}" from the allowlist? The already-registered account will remain, but future OTP signup will no longer be pre-authorized.`
+      : pendingConfirm
+        ? `Remove "${pendingConfirm.entry.email}" from the allowlist?`
+        : ''
+  const confirmLabel = pendingConfirm?.kind === 'user' ? 'Delete' : 'Remove'
 
   if (loading) {
     return (
@@ -255,7 +274,7 @@ export default function UsersPage() {
                     </td>
                     <td className="px-4 py-3 text-right">
                       <button
-                        onClick={() => handleRemoveAllowlist(entry)}
+                        onClick={() => setPendingConfirm({ kind: 'allowlist', entry })}
                         disabled={removingEmail === entry.email}
                         className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
                       >
@@ -320,7 +339,7 @@ export default function UsersPage() {
                   </td>
                   <td className="px-4 py-3 text-right">
                     <button
-                      onClick={() => handleDeleteUser(user)}
+                      onClick={() => setPendingConfirm({ kind: 'user', user })}
                       disabled={deletingId === user.id}
                       className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
                     >
@@ -340,6 +359,15 @@ export default function UsersPage() {
           </div>
         )}
       </div>
+      <ConfirmDialog
+        open={pendingConfirm !== null}
+        title={confirmTitle}
+        message={confirmMessage}
+        confirmLabel={confirmLabel}
+        danger
+        onConfirm={handleConfirm}
+        onCancel={() => setPendingConfirm(null)}
+      />
     </div>
   )
 }
