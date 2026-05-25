@@ -2170,8 +2170,12 @@ pub async fn activate_skill(
         // are app-level docs only and have no tools or lifecycle.
         return Ok(SkillActivateResult { tool_names: vec![] });
     }
-    let content = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| eyre!("could not read manifest.json in {}: {e}", skill_dir.display()))?;
+    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        eyre!(
+            "could not read manifest.json in {}: {e}",
+            skill_dir.display()
+        )
+    })?;
     let manifest: PluginManifest = serde_json::from_str(&content)
         .map_err(|e| eyre!("invalid manifest.json in {}: {e}", skill_dir.display()))?;
 
@@ -2219,9 +2223,7 @@ pub async fn activate_skill(
         }
         ToolDiscovery::Http { base_url } => {
             let names = register_http_tools(registry, base_url).await.map_err(|e| {
-                eyre!(
-                    "skill {skill_name} HTTP tool discovery from {base_url} failed: {e}"
-                )
+                eyre!("skill {skill_name} HTTP tool discovery from {base_url} failed: {e}")
             })?;
             info!(
                 skill = %skill_name,
