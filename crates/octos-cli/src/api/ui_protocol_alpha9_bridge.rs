@@ -44,6 +44,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use octos_agent::BackgroundResultPayload;
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     FileAttachedEvent, SessionEventBridgedEvent, TurnCompletedEvent, TurnId, TurnSessionResult,
@@ -223,6 +224,52 @@ fn mime_from_path(path: &str) -> Option<String> {
         _ => return None,
     };
     Some(mime.to_owned())
+}
+
+/// Resolve the effective envelope-media list for a spawn_only background
+/// completion payload.
+///
+/// The `BackgroundResultPayload` shape carries TWO media lists by design
+/// (see `BackgroundResultPayload::envelope_media` doc):
+///
+/// - `media` lands on the `message/persisted` row for the completion
+///   (legacy carrier old clients render). Populated by the contract
+///   `Satisfied` path with `output_files`; left empty by the
+///   `NotConfigured` `send_file` fallback because each delivered file
+///   already has its own per-file `message/persisted` companion row.
+/// - `envelope_media` surfaces ONLY on the `turn/spawn_complete`
+///   envelope (the wire signal dual-negotiated clients consume after
+///   they suppress the per-file companions). Populated by the
+///   `NotConfigured` `send_file` fallback with `sent_files`; left
+///   empty by the `Satisfied` path because `media` already carries the
+///   list.
+///
+/// The two carriers were split so the same producer can serve old and
+/// new clients without one shape double-rendering the artefacts the
+/// other already covered. The cost is that EVERY consumer that needs
+/// to render attachments has to coalesce the two: pre-helper, the
+/// `BackgroundResultSender` closure inlined an `if envelope_media
+/// is_empty { media } else { envelope_media }` fallback, and a future
+/// caller that forgot to mirror that fallback would silently drop
+/// half of the live spawn-only completion shapes.
+///
+/// This helper centralises the fallback so the `turn/spawn_complete`
+/// envelope builder, the `emit_files_attached_from_background` caller,
+/// and future consumers all see the same effective list. Returning a
+/// fresh `Vec<String>` (rather than a borrowed slice) keeps callers
+/// free to retain ownership when both sources outlive the call site.
+///
+/// The slides soak round-13 (2026-05-25) confirmed the production
+/// shape: `mofa_slides` enters the `Satisfied` branch with
+/// `media: [deck.pptx]` and `envelope_media: []`. Without the
+/// fallback, `turn/spawn_complete` and `file/attached` consumers both
+/// see an empty list and the SPA never renders a download button.
+pub(super) fn effective_envelope_media(payload: &BackgroundResultPayload) -> Vec<String> {
+    if payload.envelope_media.is_empty() {
+        payload.media.clone()
+    } else {
+        payload.envelope_media.clone()
+    }
 }
 
 /// Bridge a legacy `/api/sessions/:id/events/stream` SSE frame onto the
@@ -672,6 +719,298 @@ mod tests {
         assert!(
             subscriber.try_recv().is_err(),
             "text-only background completions emit zero file/attached envelopes"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Slides soak round-13 (2026-05-25) regression coverage:
+    // `BackgroundResultPayload`-shape → `file/attached` end-to-end. The
+    // existing helper tests above feed `media` / `envelope_media` lists
+    // directly, which exercises `emit_files_attached_from_background`
+    // itself but bypasses the closure-internal `effective_envelope_media`
+    // fallback. Round-13 captured `.pptx` artefacts on disk + persisted
+    // bubbles on the SPA but ZERO `file/attached` frames on 4/4 hosts.
+    // The bridge wire is intact; these tests pin that the live
+    // spawn_only completion shapes — Satisfied (carrier = `media`) and
+    // NotConfigured (carrier = `envelope_media`) — both round-trip a
+    // `file/attached` envelope per artefact through the helper layer.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Helper: build a `BackgroundResultPayload` mirroring the production
+    /// spawn_only completion shape so the regression tests don't repeat
+    /// ten field literals. Callers fill in the two media lists and the
+    /// task_label/tool_call_id; defaults for everything else mirror the
+    /// shape the live closures produce.
+    fn build_payload(
+        task_label: &str,
+        tool_call_id: &str,
+        media: Vec<String>,
+        envelope_media: Vec<String>,
+    ) -> BackgroundResultPayload {
+        BackgroundResultPayload {
+            task_label: task_label.to_string(),
+            content: format!("✓ {task_label} completed"),
+            kind: octos_agent::BackgroundResultKind::Notification,
+            media,
+            envelope_media,
+            originating_thread_id: Some("test-thread".into()),
+            task_id: Some("test-task".into()),
+            originating_client_message_id: Some("test-cmid".into()),
+            tool_call_id: Some(tool_call_id.to_string()),
+        }
+    }
+
+    /// `mofa_slides` Satisfied shape — the workspace contract returned
+    /// `Satisfied { output_files: [deck.pptx] }`, so `execution.rs` builds
+    /// the payload with `media: output_files` and `envelope_media: vec![]`.
+    /// The closure-internal fallback in `BackgroundResultSender` (now
+    /// extracted into [`effective_envelope_media`]) must lift `media` onto
+    /// the envelope side so `emit_files_attached_from_background` sees a
+    /// non-empty list AND fires one `file/attached` per artefact.
+    ///
+    /// Round-13 evidence: the deck reached disk and the persisted bubble
+    /// rendered, but `file/attached` count was 0 on all 4 hosts. Without
+    /// the fallback, this is exactly the failure mode — the helper sees
+    /// `envelope_media: []` and emits nothing for the Satisfied path.
+    #[test]
+    fn should_emit_file_attached_for_satisfied_spawn_only_payload_shape() {
+        let pptx_path =
+            "/Users/cloud/.octos/profiles/dspfac/data/slides/round13/output/deck.pptx".to_string();
+        let payload = build_payload(
+            "mofa_slides",
+            "tc-slides-satisfied",
+            // Satisfied path: media carries the deck, envelope_media empty.
+            vec![pptx_path.clone()],
+            vec![],
+        );
+
+        // Closure mapping: lift media onto envelope side when the carrier
+        // is empty. This is what `BackgroundResultSender` does today and
+        // what was previously inlined.
+        let envelope_media = effective_envelope_media(&payload);
+        assert_eq!(
+            envelope_media,
+            vec![pptx_path.clone()],
+            "Satisfied shape must round-trip media → envelope_media"
+        );
+
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-satisfied-shape");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &payload.media,
+            &envelope_media,
+            payload.tool_call_id.clone(),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(p),
+            ) = &event.event
+            {
+                envelopes.push(p.clone());
+            }
+        }
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "the Satisfied-shape payload must produce exactly one file/attached envelope"
+        );
+        assert_eq!(envelopes[0].path, pptx_path);
+        assert_eq!(
+            envelopes[0].tool_call_id.as_deref(),
+            Some("tc-slides-satisfied"),
+        );
+        assert_eq!(
+            envelopes[0].mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "PPTX MIME hint round-trips so the SPA can render a download button without re-sniffing"
+        );
+    }
+
+    /// NotConfigured-with-files shape — `execution.rs` ran the per-file
+    /// `send_file` retry loop and built the payload with `media: vec![]`
+    /// (no persist-media; per-file companion rows already cover the
+    /// `message/persisted` carrier) and `envelope_media:
+    /// sent_files.clone()`. The fallback is a no-op in this shape
+    /// (envelope_media already non-empty) and the helper must still emit
+    /// one `file/attached` per delivered file. The per-file
+    /// `message/persisted` companion rows the `send_file` consumer
+    /// already committed are out of scope here — the new envelope is the
+    /// dedicated wire signal dual-negotiated clients consume regardless
+    /// of those companions.
+    #[test]
+    fn should_emit_file_attached_for_not_configured_send_file_shape() {
+        let pptx_path =
+            "/Users/cloud/.octos/profiles/dspfac/data/slides/round13/output/deck.pptx".to_string();
+        let payload = build_payload(
+            "mofa_slides",
+            "tc-slides-notconfigured",
+            // NotConfigured `send_file` fallback: media empty, sent_files
+            // surface only on envelope_media so the `message/persisted`
+            // row stays byte-identical to the legacy "spawn-ack with
+            // text only" shape old clients render.
+            vec![],
+            vec![pptx_path.clone()],
+        );
+
+        let envelope_media = effective_envelope_media(&payload);
+        assert_eq!(
+            envelope_media,
+            vec![pptx_path.clone()],
+            "NotConfigured shape preserves envelope_media verbatim (no fallback needed)"
+        );
+
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-notconfigured-shape");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &payload.media,
+            &envelope_media,
+            payload.tool_call_id.clone(),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(p),
+            ) = &event.event
+            {
+                envelopes.push(p.clone());
+            }
+        }
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "the NotConfigured-shape payload must produce exactly one file/attached envelope"
+        );
+        assert_eq!(envelopes[0].path, pptx_path);
+        assert_eq!(
+            envelopes[0].tool_call_id.as_deref(),
+            Some("tc-slides-notconfigured"),
+        );
+    }
+
+    /// Multi-artefact NotConfigured shape — e.g. a future spawn_only
+    /// tool that delivers two PPTX files via the per-file `send_file`
+    /// retry loop. The helper must emit one `file/attached` per distinct
+    /// path in the order they appear in `envelope_media`, with each
+    /// envelope carrying the correct MIME hint.
+    #[test]
+    fn should_emit_file_attached_once_per_distinct_envelope_media_entry() {
+        let primary =
+            "/Users/cloud/.octos/profiles/dspfac/data/slides/round13/output/deck.pptx".to_string();
+        let alt = "/Users/cloud/.octos/profiles/dspfac/data/slides/round13/output/deck-alt.pptx"
+            .to_string();
+        let payload = build_payload(
+            "mofa_slides",
+            "tc-slides-multi",
+            vec![],
+            vec![primary.clone(), alt.clone()],
+        );
+
+        let envelope_media = effective_envelope_media(&payload);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-multi-shape");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &payload.media,
+            &envelope_media,
+            payload.tool_call_id.clone(),
+        );
+
+        let mut paths = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(p),
+            ) = &event.event
+            {
+                paths.push(p.path.clone());
+            }
+        }
+        assert_eq!(
+            paths,
+            vec![primary, alt],
+            "iteration order across envelope_media must be preserved on the wire"
+        );
+    }
+
+    /// Text-only spawn_only completion (e.g. `mofa_publish` returning a
+    /// deploy URL with no on-disk artefact) — both media lists empty.
+    /// [`effective_envelope_media`] returns an empty list and the helper
+    /// must NOT emit any `file/attached` frames so the wire stays clean
+    /// for text-only branches.
+    #[test]
+    fn should_not_emit_file_attached_for_text_only_background_payload() {
+        let payload = build_payload("mofa_publish", "tc-publish-text-only", vec![], vec![]);
+
+        let envelope_media = effective_envelope_media(&payload);
+        assert!(
+            envelope_media.is_empty(),
+            "text-only completions must coalesce to an empty effective envelope_media"
+        );
+
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-text-only-shape");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &payload.media,
+            &envelope_media,
+            payload.tool_call_id.clone(),
+        );
+
+        assert!(
+            subscriber.try_recv().is_err(),
+            "text-only completions emit zero file/attached envelopes"
+        );
+    }
+
+    /// `envelope_media` overrides `media` when both are populated — this
+    /// case does not arise from any current branch in `execution.rs`
+    /// (Satisfied populates only `media`; NotConfigured populates only
+    /// `envelope_media`) but the contract is documented and we pin it so
+    /// a future branch that sets both can't silently drift the helper's
+    /// behaviour. `emit_files_attached_from_background` still chains both
+    /// lists (then dedupes), so the union of paths surfaces; the
+    /// `effective_envelope_media` return value is what
+    /// `turn/spawn_complete` carries.
+    #[test]
+    fn effective_envelope_media_prefers_envelope_field_when_both_populated() {
+        let primary_persist = "/tmp/persisted.md".to_string();
+        let primary_envelope = "/tmp/envelope.pptx".to_string();
+        let payload = build_payload(
+            "future_tool",
+            "tc-future",
+            vec![primary_persist],
+            vec![primary_envelope.clone()],
+        );
+
+        let envelope_media = effective_envelope_media(&payload);
+        assert_eq!(
+            envelope_media,
+            vec![primary_envelope],
+            "non-empty envelope_media wins — must NOT silently inherit `media`"
         );
     }
 

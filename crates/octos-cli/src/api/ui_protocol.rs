@@ -15269,12 +15269,13 @@ async fn run_standalone_turn(
                 // see the per-file `message/persisted` companions). The
                 // contract-`Satisfied` path leaves `envelope_media` as the
                 // empty default; in that case the envelope falls back to
-                // `media`.
-                let envelope_media = if payload.envelope_media.is_empty() {
-                    payload.media.clone()
-                } else {
-                    payload.envelope_media.clone()
-                };
+                // `media`. Centralised in `effective_envelope_media` so the
+                // `file/attached` consumer below (and any future caller)
+                // sees the same coalesced list — see helper doc for the
+                // round-13 slides soak regression that motivated extracting
+                // this from an inline `if`.
+                let envelope_media =
+                    super::ui_protocol_alpha9_bridge::effective_envelope_media(&payload);
                 let kind = payload.kind;
                 let raw_content = payload.content.clone();
                 let task_id = payload.task_id.clone();
