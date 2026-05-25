@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eyre::Result;
+use eyre::{Result, eyre};
+use octos_plugin::{LifecycleExecutor, ToolDiscovery};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -13,6 +14,7 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
+use super::http_discovery::register_http_tools;
 use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
 use super::tool::{PluginTool, SynthesisConfig};
 
@@ -2133,5 +2135,150 @@ edition = "2021"
             "from-corrected",
             "first dir (dir_a / corrected) must win — got the shadow copy"
         );
+    }
+}
+
+// ── Lifecycle-aware install / uninstall ──────────────────────────────
+
+/// Result of a lifecycle-aware skill activation.
+#[derive(Debug)]
+pub struct SkillActivateResult {
+    /// Names of all tools registered (static or HTTP-discovered).
+    pub tool_names: Vec<String>,
+}
+
+/// Run hardware lifecycle phases (preflight → init → ready_check) and then
+/// register the skill's tools (static binary-protocol or HTTP-discovered)
+/// into `registry`.
+///
+/// This is an **async** entry point designed for use by the CLI install
+/// path (bridged via a single-threaded tokio runtime) and by tests. It
+/// does NOT copy files — the skill directory must already exist on disk.
+///
+/// Returns an error (and registers **no** tools) if any critical lifecycle
+/// phase fails or if HTTP tool discovery returns a non-2xx response.
+pub async fn activate_skill(
+    registry: &mut ToolRegistry,
+    skill_dir: &Path,
+    _extra_env: &[(String, String)],
+) -> Result<SkillActivateResult> {
+    use octos_plugin::{LifecyclePhase, NoSandbox};
+
+    let manifest_path = skill_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        // No manifest → nothing to activate. Skills without manifest.json
+        // are app-level docs only and have no tools or lifecycle.
+        return Ok(SkillActivateResult { tool_names: vec![] });
+    }
+    let content = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| eyre!("could not read manifest.json in {}: {e}", skill_dir.display()))?;
+    let manifest: PluginManifest = serde_json::from_str(&content)
+        .map_err(|e| eyre!("invalid manifest.json in {}: {e}", skill_dir.display()))?;
+
+    let skill_name = manifest.name.clone();
+
+    // 1) Run hardware_lifecycle phases if present.
+    if let Some(lifecycle) = manifest.hardware_lifecycle.as_ref() {
+        let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_dir.to_path_buf());
+        for (phase, steps) in [
+            (LifecyclePhase::Preflight, &lifecycle.preflight),
+            (LifecyclePhase::Init, &lifecycle.init),
+            (LifecyclePhase::ReadyCheck, &lifecycle.ready_check),
+        ] {
+            if steps.is_empty() {
+                continue;
+            }
+            let result = executor.run_phase(phase, steps).await;
+            if !result.success {
+                return Err(eyre!(
+                    "skill {skill_name} {} failed: {}",
+                    phase.as_str(),
+                    result.error.unwrap_or_default()
+                ));
+            }
+            info!(
+                skill = %skill_name,
+                phase = phase.as_str(),
+                "lifecycle phase completed"
+            );
+        }
+    }
+
+    // 2) Tool discovery (static binary-protocol is the existing path;
+    //    Http triggers GET <base_url>/tools registration).
+    let mut tool_names = Vec::new();
+    match &manifest.tool_discovery {
+        ToolDiscovery::Static => {
+            // Delegate to the existing binary-protocol scan. `load_into`
+            // expects "skills directories" each containing per-skill
+            // subdirectories, so we pass the skill dir's parent. After
+            // this call, every static tool declared in the manifest is
+            // registered in `registry`.
+            let parent = skill_dir.parent().unwrap_or(skill_dir).to_path_buf();
+            PluginLoader::load_into(registry, &[parent], _extra_env)?;
+        }
+        ToolDiscovery::Http { base_url } => {
+            let names = register_http_tools(registry, base_url).await.map_err(|e| {
+                eyre!(
+                    "skill {skill_name} HTTP tool discovery from {base_url} failed: {e}"
+                )
+            })?;
+            info!(
+                skill = %skill_name,
+                base_url = %base_url,
+                count = names.len(),
+                "HTTP tool discovery completed"
+            );
+            tool_names.extend(names);
+        }
+    }
+
+    Ok(SkillActivateResult { tool_names })
+}
+
+/// Run the `shutdown` lifecycle phase for a skill before uninstall.
+///
+/// Best-effort: failures are logged but do not abort the uninstall (since
+/// the alternative is leaving the skill directory on disk, which is worse).
+/// No-op when the manifest has no `hardware_lifecycle` block.
+pub async fn run_shutdown_phase(skill_dir: &Path) {
+    use octos_plugin::{LifecyclePhase, NoSandbox};
+
+    let manifest_path = skill_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return;
+    }
+    let content = match std::fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(skill_dir = %skill_dir.display(), error = %e, "shutdown: could not read manifest");
+            return;
+        }
+    };
+    let manifest: PluginManifest = match serde_json::from_str(&content) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(skill_dir = %skill_dir.display(), error = %e, "shutdown: invalid manifest");
+            return;
+        }
+    };
+
+    if let Some(lifecycle) = manifest.hardware_lifecycle.as_ref() {
+        if lifecycle.shutdown.is_empty() {
+            return;
+        }
+        let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_dir.to_path_buf());
+        let result = executor
+            .run_phase(LifecyclePhase::Shutdown, &lifecycle.shutdown)
+            .await;
+        if !result.success {
+            warn!(
+                skill = %manifest.name,
+                error = ?result.error,
+                "shutdown phase failed (best-effort, continuing removal)"
+            );
+        } else {
+            info!(skill = %manifest.name, "shutdown phase completed");
+        }
     }
 }
