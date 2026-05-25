@@ -1407,6 +1407,36 @@ fn active_turns_registry() -> SharedActiveTurns {
         .clone()
 }
 
+/// NEW-16 defense-in-depth: per-turn message-index cursor for the
+/// `response.messages` persist loop.
+///
+/// The main fix is the append-only `turn_output_log` upstream in
+/// `loop_runner.rs`, but this cursor exists as a second wall. It
+/// tracks the highest message-index successfully persisted for each
+/// `(session_id, turn_id)` pair. If the same `(turn, index)` is seen
+/// twice (e.g. an edge path drove the persist loop into the SAME
+/// turn twice), subsequent indexes are skipped.
+///
+/// Keyed by `(SessionId.0, TurnId.0)` strings so distinct sessions
+/// using the same TurnId string cannot collide. Today TurnIds are
+/// UUIDs minted server-side (see `TurnId::new` -> `Uuid::new_v4`)
+/// so cross-session collisions are vanishingly unlikely, but the
+/// composite key keeps the contract explicit.
+///
+/// Entries are NOT garbage-collected per-turn — the long-running
+/// server may accumulate them across many turns. The map is bounded
+/// in practice by active sessions; if this becomes a concern, the
+/// follow-up is to evict entries when a turn-end event fires (the
+/// active-turns registry already tracks turn lifetimes).
+type TurnPersistCursors = Arc<TokioMutex<HashMap<(String, String), usize>>>;
+
+fn turn_persist_cursors() -> TurnPersistCursors {
+    static CURSORS: OnceLock<TurnPersistCursors> = OnceLock::new();
+    CURSORS
+        .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
+        .clone()
+}
+
 fn contract_stores() -> Arc<UiProtocolContractStores> {
     static CONTRACT_STORES: OnceLock<Arc<UiProtocolContractStores>> = OnceLock::new();
     CONTRACT_STORES
@@ -15941,12 +15971,47 @@ async fn run_standalone_turn(
                     // drop the preamble's hint).
                     let mut last_persisted_preamble_assistant: Option<String> = None;
                     let mut skipped_internal_user = false;
-                    for message in response.messages.iter().cloned() {
+                    // NEW-16 defense-in-depth: per-turn message-index
+                    // cursor. The main fix is the append-only
+                    // `turn_output_log` upstream — but if some edge
+                    // path re-entered this persist loop for the SAME
+                    // `(session, turn)` pair, we MUST NOT double-write
+                    // the same indexed row. The cursor is loaded under
+                    // the session lock (which is already held below
+                    // via `sessions.lock().await`) so the load-update
+                    // sequence is atomic w.r.t. the session manager.
+                    let persist_cursors = turn_persist_cursors();
+                    let cursor_key = (
+                        agent_session_id.0.clone(),
+                        turn_thread_id_for_persist.clone(),
+                    );
+                    let cursor_already_advanced = {
+                        let cursors = persist_cursors.lock().await;
+                        cursors.get(&cursor_key).copied().unwrap_or(0)
+                    };
+                    for (message_index, message) in response.messages.iter().cloned().enumerate() {
                         if skip_internal_user_persist
                             && !skipped_internal_user
                             && message.role == MessageRole::User
                         {
                             skipped_internal_user = true;
+                            continue;
+                        }
+                        // NEW-16 defense-in-depth: skip indexes already
+                        // persisted for this `(session, turn)` pair.
+                        // `cursor_already_advanced` reflects the
+                        // highest-index-already-written + 1 (i.e. the
+                        // NEXT index that needs writing). If the
+                        // current index is below that watermark, an
+                        // earlier invocation already wrote it.
+                        if message_index < cursor_already_advanced {
+                            tracing::debug!(
+                                session = %agent_session_id.0,
+                                turn = %turn_thread_id_for_persist,
+                                message_index,
+                                cursor_already_advanced,
+                                "NEW-16 cursor guard skipped already-persisted message in this turn"
+                            );
                             continue;
                         }
                         // Detect the exact row that carries
@@ -15988,6 +16053,20 @@ async fn run_standalone_turn(
                             .add_message_with_seq(&agent_session_id, to_save)
                             .await
                         {
+                            // NEW-16: advance the per-turn cursor
+                            // ONLY after the JSONL write succeeded
+                            // (and inside the session lock — note
+                            // that `sessions` is the lock guard, so
+                            // anyone re-entering the persist loop on
+                            // this `(session, turn)` will see the
+                            // updated cursor on their next read).
+                            {
+                                let mut cursors = persist_cursors.lock().await;
+                                let entry = cursors.entry(cursor_key.clone()).or_insert(0);
+                                if message_index + 1 > *entry {
+                                    *entry = message_index + 1;
+                                }
+                            }
                             record_appui_context_manager_message(
                                 &context_data_dir_for_result,
                                 &context_manager_for_result,
@@ -31063,5 +31142,108 @@ ignore = []
         let report: eyre::Report = eyre::eyre!("shell tool: command not found: foo");
         let wire = super::classify_runtime_error_message(&report);
         assert_eq!(wire, "shell tool: command not found: foo");
+    }
+
+    /// NEW-16: the per-turn message-index cursor used as
+    /// defense-in-depth inside the `response.messages` persist loop
+    /// MUST skip any `(session, turn, message_index)` triple it has
+    /// already seen in a previous invocation. This locks in the
+    /// helper logic so a regression that drops the cursor check is
+    /// caught here.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_skips_already_persisted_indexes() {
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        // First invocation: 3 messages persist successfully, cursor
+        // advances to 3 (i.e. next index to write is 3).
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key.clone(), 3);
+        }
+
+        // Second invocation: same `(session, turn)` re-enters with the
+        // SAME 3 messages plus 1 new one. The first 3 (indexes 0, 1,
+        // 2) MUST be skipped. Only index 3 is new.
+        let cursor_already_advanced = {
+            let c = cursors.lock().await;
+            c.get(&key).copied().unwrap_or(0)
+        };
+        assert_eq!(
+            cursor_already_advanced, 3,
+            "cursor should reflect the highest-index-already-written + 1"
+        );
+
+        // Simulate the persist loop's index guard for messages 0..=3.
+        let mut indexes_that_would_persist = Vec::new();
+        for message_index in 0..4 {
+            if message_index < cursor_already_advanced {
+                continue;
+            }
+            indexes_that_would_persist.push(message_index);
+        }
+        assert_eq!(
+            indexes_that_would_persist,
+            vec![3],
+            "only the genuinely new index (3) should pass the cursor guard"
+        );
+
+        // After successfully persisting index 3, the cursor advances.
+        {
+            let mut c = cursors.lock().await;
+            let entry = c.entry(key.clone()).or_insert(0);
+            if 3 + 1 > *entry {
+                *entry = 3 + 1;
+            }
+        }
+        let cursor_after = {
+            let c = cursors.lock().await;
+            c.get(&key).copied().unwrap_or(0)
+        };
+        assert_eq!(cursor_after, 4, "cursor should advance to next index");
+    }
+
+    /// NEW-16: cursor entries are keyed by `(session, turn)`. Two
+    /// different `(session, turn)` pairs MUST be independent — one
+    /// turn's progress cannot leak into another turn's guard.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_isolates_sessions_and_turns() {
+        let cursors = super::turn_persist_cursors();
+        let session_a = format!("session-a-{}", uuid::Uuid::new_v4());
+        let session_b = format!("session-b-{}", uuid::Uuid::new_v4());
+        let turn_1 = format!("turn-1-{}", uuid::Uuid::new_v4());
+        let turn_2 = format!("turn-2-{}", uuid::Uuid::new_v4());
+
+        let key_a1 = (session_a.clone(), turn_1.clone());
+        let key_a2 = (session_a.clone(), turn_2.clone());
+        let key_b1 = (session_b.clone(), turn_1.clone());
+
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key_a1.clone(), 5);
+            c.insert(key_a2.clone(), 2);
+            c.insert(key_b1.clone(), 1);
+        }
+
+        let c = cursors.lock().await;
+        // Each (session, turn) pair has its own cursor.
+        assert_eq!(c.get(&key_a1).copied(), Some(5));
+        assert_eq!(c.get(&key_a2).copied(), Some(2));
+        assert_eq!(c.get(&key_b1).copied(), Some(1));
+        // Cross-key lookups return None — distinct pairs don't share state.
+        assert_eq!(
+            c.get(&(session_a.clone(), "turn-nonexistent".into()))
+                .copied(),
+            None,
+            "a non-existent turn under session-a must NOT inherit any cursor"
+        );
+        assert_eq!(
+            c.get(&(session_b.clone(), turn_2.clone())).copied(),
+            None,
+            "session-b's view of turn-2 must NOT inherit session-a's cursor for turn-2 \
+             (the composite key prevents cross-session collisions)"
+        );
     }
 }

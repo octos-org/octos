@@ -732,7 +732,7 @@ impl Agent {
                     base_content
                 };
 
-                messages.push(Message {
+                let current_user = Message {
                     role: MessageRole::User,
                     content,
                     media,
@@ -742,7 +742,30 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
-                });
+                };
+                messages.push(current_user.clone());
+
+                // NEW-16 (codex design): append-only per-turn output log.
+                //
+                // The persisted `ConversationResponse.messages` MUST NOT be
+                // derived from the LLM prompt buffer (`messages`) by slicing
+                // at `1 + history.len()`. That buffer is mutated during the
+                // loop by `prepare_conversation_messages` (which calls
+                // `repair_message_order`) and by the AppUI context-window
+                // bridge in `ui_protocol.rs`. After mutation, OLD rows from
+                // prior turns can end up past the stale boundary and get
+                // returned as "new", which causes re-persistence and the
+                // 7x duplicate-content drag-forward seen in soak captures
+                // (mini3 Yuan-dynasty content, 2026-05-23).
+                //
+                // Instead, we build an append-only log of just the rows we
+                // genuinely produce in THIS turn (current User, assistant
+                // replies + tool results from `handle_tool_use`, synthetic
+                // loop-detector rows, and any terminal/synthesised assistant
+                // row a return site adds). The log is never read back from
+                // — only pushed to — so no mutation pass can shift OLD rows
+                // into it.
+                let mut turn_output_log: Vec<Message> = vec![current_user];
 
                 let config = self.chat_config();
                 let mut files_modified = Vec::new();
@@ -784,7 +807,7 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed: false,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                             });
@@ -968,7 +991,7 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                             });
@@ -1061,10 +1084,7 @@ impl Agent {
                                             files_modified,
                                             files_to_send,
                                             streamed,
-                                            messages: LoopTurnState::new_messages(
-                                                &messages,
-                                                history.len(),
-                                            ),
+                                            messages: turn_output_log.clone(),
                                             tool_results: tool_structured_metadata.clone(),
                                             synthesized_from_spawn_only: false,
                                         });
@@ -1101,11 +1121,12 @@ impl Agent {
                                     self.emit_cost_update(turn.total_usage(), &response);
                                     match self.dedup_loop_warning(warning) {
                                         Ok(warning_content) => {
-                                            inject_loop_detected_synthetic_results(
+                                            inject_loop_detected_synthetic_results_with_log(
                                                 &mut messages,
                                                 &response,
                                                 &warning_content,
                                                 self,
+                                                Some(&mut turn_output_log),
                                             );
                                             warn!(
                                                 "loop detected — injected synthetic tool results with warning and continuing for ONE more iteration"
@@ -1124,10 +1145,7 @@ impl Agent {
                                                 files_modified,
                                                 files_to_send,
                                                 streamed,
-                                                messages: LoopTurnState::new_messages(
-                                                    &messages,
-                                                    history.len(),
-                                                ),
+                                                messages: turn_output_log.clone(),
                                                 tool_results: tool_structured_metadata.clone(),
                                                 synthesized_from_spawn_only: false,
                                             });
@@ -1164,6 +1182,7 @@ impl Agent {
                                     tracker,
                                     Some(&mut tool_structured_metadata),
                                     Some(&mut iter_tool_success),
+                                    Some(&mut turn_output_log),
                                 )
                                 .await
                             {
@@ -1243,10 +1262,7 @@ impl Agent {
                                     files_modified,
                                     files_to_send,
                                     streamed,
-                                    messages: LoopTurnState::new_messages(
-                                        &messages,
-                                        history.len(),
-                                    ),
+                                    messages: turn_output_log.clone(),
                                     tool_results: tool_structured_metadata.clone(),
                                     synthesized_from_spawn_only: false,
                                 });
@@ -1352,7 +1368,7 @@ impl Agent {
                                         files_modified,
                                         files_to_send,
                                         streamed,
-                                        messages: LoopTurnState::new_messages(&messages, history.len()),
+                                        messages: turn_output_log.clone(),
                                         tool_results: tool_structured_metadata.clone(),
                                         // dspfac "two bubbles per turn" fix: this
                                         // branch synthesises `content` as the
@@ -1383,7 +1399,7 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                             });
@@ -1407,7 +1423,7 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                             });
@@ -1704,6 +1720,7 @@ impl Agent {
                                 None,
                                 None,
                                 None,
+                                None,
                             )
                             .await
                         {
@@ -1844,6 +1861,13 @@ impl Agent {
         // the content shape of each tool message). Background callers
         // pass `None` because the task-loop never emits the synth-ack.
         tool_success_by_id: Option<&mut Vec<(String, bool)>>,
+        // NEW-16: append-only per-turn output log sink for the
+        // conversation loop. When supplied, the SAME assistant message
+        // and merged tool-result rows that go into `messages` are also
+        // appended here. The task loop passes `None` (it returns
+        // `TaskResult`, not `ConversationResponse`, so no log is
+        // needed there).
+        turn_output_log: Option<&mut Vec<Message>>,
     ) -> Result<ChatResponse> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
@@ -1889,7 +1913,8 @@ impl Agent {
                 );
             }
         }
-        messages.push(self.response_to_message(&response));
+        let assistant_msg = self.response_to_message(&response);
+        messages.push(assistant_msg.clone());
         let (limited_response, blocked_messages) =
             self.enforce_session_limits_on_tool_calls(&response);
         let tool_batches = split_tool_calls(
@@ -1961,6 +1986,17 @@ impl Agent {
             }
         }
 
+        // NEW-16: mirror the same assistant + merged rows into the
+        // append-only turn log when the caller (conversation loop)
+        // supplied a sink. The clone is intentional — the prompt
+        // buffer `messages` will be mutated downstream by
+        // `prepare_conversation_messages` /
+        // `repair_message_order`, but the log must stay frozen as the
+        // chronological record of what THIS turn produced.
+        if let Some(log) = turn_output_log {
+            log.push(assistant_msg);
+            log.extend(merged.iter().cloned());
+        }
         messages.extend(merged);
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
@@ -2418,11 +2454,31 @@ fn shell_retry_terminal_user_message(content: &str) -> String {
 ///
 /// See PR `fix/news-fetch-loop-and-detect-recovery`
 /// (session `web-1779494658716-mxrxe8`, ledger seq 214-562).
+///
+/// NEW-16: kept alive for the test suite which exercises the legacy
+/// no-log API. Production callers go through
+/// `inject_loop_detected_synthetic_results_with_log`.
+#[cfg(test)]
 fn inject_loop_detected_synthetic_results(
     messages: &mut Vec<Message>,
     response: &ChatResponse,
     warning: &str,
     agent: &Agent,
+) {
+    inject_loop_detected_synthetic_results_with_log(messages, response, warning, agent, None);
+}
+
+/// NEW-16: same as `inject_loop_detected_synthetic_results`, but also
+/// mirrors the synthetic assistant + tool rows into the conversation
+/// loop's append-only `turn_output_log` when supplied. Keeps the
+/// `messages` mutation behaviour byte-identical for callers that pass
+/// `None` (tests in particular).
+fn inject_loop_detected_synthetic_results_with_log(
+    messages: &mut Vec<Message>,
+    response: &ChatResponse,
+    warning: &str,
+    agent: &Agent,
+    turn_output_log: Option<&mut Vec<Message>>,
 ) {
     let synthesis_hint = "\n\nTry a different approach — synthesise from prior tool results already in this conversation, call a different tool, or finish the turn with the partial information you have.";
     let primary_body = format!("{warning}{synthesis_hint}");
@@ -2446,11 +2502,17 @@ fn inject_loop_detected_synthetic_results(
     // Push the assistant turn (carries the sanitized `tool_calls`) so the
     // synthetic tool-result messages have a corresponding `tool_use` to
     // bind to.
-    messages.push(agent.response_to_message(&sanitized_response));
+    let assistant_msg = agent.response_to_message(&sanitized_response);
+    messages.push(assistant_msg.clone());
+    // Collect the same rows we just pushed so we can mirror them into
+    // the append-only turn log below (when a sink was supplied).
+    let mut rows_for_log: Vec<Message> =
+        Vec::with_capacity(1 + sanitized_response.tool_calls.len());
+    rows_for_log.push(assistant_msg);
 
     for (idx, tc) in sanitized_response.tool_calls.iter().enumerate() {
         let body = if idx == 0 { &primary_body } else { stub_body };
-        messages.push(Message {
+        let tool_msg = Message {
             role: MessageRole::Tool,
             content: body.to_string(),
             media: vec![],
@@ -2460,7 +2522,13 @@ fn inject_loop_detected_synthetic_results(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
-        });
+        };
+        messages.push(tool_msg.clone());
+        rows_for_log.push(tool_msg);
+    }
+
+    if let Some(log) = turn_output_log {
+        log.extend(rows_for_log);
     }
 }
 

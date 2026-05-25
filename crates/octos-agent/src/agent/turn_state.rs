@@ -143,17 +143,22 @@ impl LoopTurnState {
         });
     }
 
-    pub(crate) fn new_output_start(history_len: usize, messages_len: usize) -> usize {
-        (1 + history_len).min(messages_len)
-    }
-
-    pub(crate) fn new_messages(
-        messages: &[octos_core::Message],
-        history_len: usize,
-    ) -> Vec<octos_core::Message> {
-        let new_start = Self::new_output_start(history_len, messages.len());
-        messages[new_start..].to_vec()
-    }
+    // NOTE: `new_messages` / `new_output_start` were removed in NEW-16
+    // (fix/persist-from-append-only-turn-log-not-mutated-buffer).
+    //
+    // They sliced the LLM prompt buffer at `1 + history_len`, which was
+    // unstable because that buffer is mutated during the loop by
+    // `prepare_conversation_messages` (which calls `repair_message_order`)
+    // and by the AppUI bridge in `ui_protocol.rs`. After mutation, OLD
+    // rows from prior turns could end up past the stale boundary and be
+    // returned as "new", which caused the cross-turn drag-forward
+    // re-persistence bug (mini3 Yuan-dynasty content showing up 7x in
+    // a single session, 2026-05-23 soak).
+    //
+    // The replacement is the append-only `turn_output_log` built in
+    // `process_message_inner` (see `loop_runner.rs`). It is never read
+    // back from — only pushed to — so no downstream mutation pass can
+    // shift OLD rows into it.
 }
 
 #[cfg(test)]
