@@ -14,7 +14,7 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
-use super::http_discovery::register_http_tools;
+use super::http_discovery::install_http_tools_from_catalog;
 use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
 use super::tool::{PluginTool, SynthesisConfig};
 
@@ -190,59 +190,29 @@ impl PluginLoader {
 
             if let Some(manifest) = manifest_for_discovery {
                 if let octos_plugin::ToolDiscovery::Http { base_url } = &manifest.tool_discovery {
-                    match super::http_discovery::fetch_http_tool_catalog(base_url).await {
-                        Ok(entries) => {
-                            for entry in entries {
-                                // Hybrid tier resolution: catalog > tool_overrides > manifest default.
-                                let tier = entry
-                                    .safety_tier
-                                    .or_else(|| manifest.tool_overrides.get(&entry.name).copied())
-                                    .unwrap_or(manifest.required_safety_tier);
-
-                                let mapping = crate::tools::dora_bridge::DoraToolMapping {
-                                    tool_name: entry.name.clone(),
-                                    description: entry.description.clone(),
-                                    bridge_base_url: base_url.clone(),
-                                    safety_tier: tier,
-                                    input_schema: Some(entry.input_schema.clone()),
-                                    timeout_secs: crate::tools::dora_bridge::default_timeout(),
-                                    concurrency_class: None,
-                                    dora_node_id: None,
-                                    dora_output_id: None,
-                                };
-                                match crate::tools::dora_bridge::DoraToolBridge::new(mapping) {
-                                    Ok(bridge) => {
-                                        let tool_name = entry.name.clone();
-                                        result.tool_names.push(tool_name.clone());
-                                        crate::tools::robot_groups::with_registry_mut(|reg| {
-                                            reg.insert(tool_name.clone(), tier);
-                                        });
-                                        registry
-                                            .register_arc(std::sync::Arc::new(bridge)
-                                                as std::sync::Arc<dyn Tool>);
-                                        result.tool_count += 1;
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            plugin_dir = %path.display(),
-                                            tool = %entry.name,
-                                            error = %e,
-                                            "failed to construct HTTP bridge, skipping tool",
-                                        );
-                                    }
-                                }
-                            }
+                    match install_http_tools_from_catalog(registry, base_url, Some(&manifest)).await
+                    {
+                        Ok(names) => {
+                            let count = names.len();
+                            result.tool_count += count;
+                            result.tool_names.extend(names);
                             info!(
                                 plugin_dir = %path.display(),
                                 base_url = %base_url,
+                                count = count,
                                 "registered HTTP-discovered tools at startup",
                             );
                         }
                         Err(e) => {
-                            warn!(
+                            // Startup is the only safe window to notice a missing
+                            // bridge; this is safety-critical for robotics. Use
+                            // `error!` so it isn't swallowed by default log
+                            // filters. We still `continue` rather than abort the
+                            // whole load so other skills come up.
+                            tracing::error!(
                                 plugin_dir = %path.display(),
                                 error = %e,
-                                "HTTP tool discovery failed at startup, skipping skill",
+                                "HTTP tool discovery failed; skill registered ZERO tools (was the bridge offline?). Manual restart required after fixing.",
                             );
                         }
                     }
@@ -2329,9 +2299,17 @@ pub async fn activate_skill(
             PluginLoader::load_into(registry, &[parent], _extra_env).await?;
         }
         ToolDiscovery::Http { base_url } => {
-            let names = register_http_tools(registry, base_url).await.map_err(|e| {
-                eyre!("skill {skill_name} HTTP tool discovery from {base_url} failed: {e}")
-            })?;
+            // Important #1 fix from PR #1260 review: use the same helper as
+            // the runtime-startup path (`load_into_with_options`) so a
+            // freshly-installed skill is policy-gated immediately —
+            // registers as `DoraToolBridge` and enrols in `robot_groups`,
+            // rather than as a bare `HttpTool` that flips `concurrency_class`
+            // semantics on next restart.
+            let names = install_http_tools_from_catalog(registry, base_url, Some(&manifest))
+                .await
+                .map_err(|e| {
+                    eyre!("skill {skill_name} HTTP tool discovery from {base_url} failed: {e}")
+                })?;
             info!(
                 skill = %skill_name,
                 base_url = %base_url,

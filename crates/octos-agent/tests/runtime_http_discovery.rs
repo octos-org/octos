@@ -7,7 +7,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use octos_agent::permissions::SafetyTier;
-use octos_agent::plugins::PluginLoader;
+use octos_agent::plugins::{PluginLoader, activate_skill};
 use octos_agent::tools::ToolRegistry;
 use octos_agent::tools::robot_groups;
 
@@ -144,5 +144,57 @@ async fn load_into_uses_tool_overrides_when_present() {
         robot_groups::snapshot().tier_of("robot.estop"),
         Some(SafetyTier::EmergencyOverride),
         "tool_overrides should beat manifest default"
+    );
+}
+
+/// Important #1 fix from PR #1260 review: `activate_skill` (install-time)
+/// must use the same helper as `load_into_with_options` so a freshly
+/// installed skill is policy-gated immediately — registers as
+/// `DoraToolBridge` AND enrols in `robot_groups`, identically to the
+/// runtime-startup path.
+#[tokio::test]
+async fn activate_skill_registers_http_tools_and_robot_groups() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tools"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"name": "install.robot.move", "description": "move arm"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let skill_dir = dir.path().join("install-robot");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let manifest = json!({
+        "name": "install-robot",
+        "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_discovery": { "type": "http", "base_url": server.uri() }
+    });
+    std::fs::write(
+        skill_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = ToolRegistry::new();
+    let result = activate_skill(&mut registry, &skill_dir, &[])
+        .await
+        .expect("activate_skill should succeed");
+
+    assert!(
+        result
+            .tool_names
+            .contains(&"install.robot.move".to_string())
+    );
+    assert!(
+        registry.get_tool("install.robot.move").is_some(),
+        "install-time HTTP-discovered tool missing from registry"
+    );
+    assert_eq!(
+        robot_groups::snapshot().tier_of("install.robot.move"),
+        Some(SafetyTier::SafeMotion),
+        "install path must enrol tools in robot_groups (mirrors runtime path)"
     );
 }

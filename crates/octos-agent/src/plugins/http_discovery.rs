@@ -1,9 +1,12 @@
 //! HTTP-based tool discovery for skills with `tool_discovery = Http { base_url }`.
 //!
 //! Implements `GET <base_url>/tools` to enumerate available tools, then
-//! constructs `HttpTool` instances for each entry. Aborts on any non-2xx
-//! response or network error so that install fails loudly rather than
-//! silently registering a partial tool set.
+//! constructs `DoraToolBridge` instances for each entry and enrols them in
+//! the [`crate::tools::robot_groups`] registry so that the standard
+//! `group:robot:<tier>` ToolPolicy machinery applies.
+//!
+//! Aborts on any non-2xx response or network error so that install fails
+//! loudly rather than silently registering a partial tool set.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +14,8 @@ use std::time::Duration;
 use eyre::{Result, eyre};
 use serde::Deserialize;
 
-use crate::tools::HttpTool;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::dora_bridge::{DoraToolBridge, DoraToolMapping, default_timeout};
+use crate::tools::{Tool, ToolRegistry, robot_groups};
 
 /// Timeout for the discovery HTTP call.
 const DISCOVERY_TIMEOUT_SECS: u64 = 15;
@@ -75,26 +78,63 @@ pub async fn fetch_http_tool_catalog(base_url: &str) -> Result<Vec<HttpToolEntry
     Ok(entries)
 }
 
-/// Register all HTTP-discovered tools into `registry`.
+/// Fetch the HTTP tool catalog and register each entry as a [`DoraToolBridge`]
+/// with the hybrid safety_tier resolved per:
+///   catalog `safety_tier` > `manifest.tool_overrides[name]` > `manifest.required_safety_tier`.
 ///
-/// Constructs an `HttpTool` per entry and registers it. Returns an error
-/// if any entry fails validation (e.g., non-loopback base_url).
-pub async fn register_http_tools(
+/// Each registered bridge is also enrolled in [`robot_groups`] so the
+/// existing `group:robot:<tier>` ToolPolicy machinery applies.
+///
+/// `manifest` is `None` when the caller has no manifest context (e.g. ad-hoc
+/// callers / tests); in that case the per-tool fallback is
+/// [`crate::permissions::SafetyTier::Observe`].
+///
+/// Returns the list of registered tool names. On HTTP/parse error, returns
+/// an `Err` (no partial registration occurs).
+pub async fn install_http_tools_from_catalog(
     registry: &mut ToolRegistry,
     base_url: &str,
+    manifest: Option<&super::manifest::PluginManifest>,
 ) -> Result<Vec<String>> {
     let entries = fetch_http_tool_catalog(base_url).await?;
     let mut names = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        let tool = HttpTool::new(
-            entry.name.clone(),
-            entry.description,
-            base_url.to_string(),
-            entry.input_schema,
-        )?;
-        names.push(entry.name.clone());
-        registry.register_arc(Arc::new(tool) as Arc<dyn Tool>);
+        // Hybrid tier resolution: catalog > tool_overrides > manifest default.
+        let tier = entry
+            .safety_tier
+            .or_else(|| manifest.and_then(|m| m.tool_overrides.get(&entry.name).copied()))
+            .unwrap_or_else(|| {
+                manifest
+                    .map(|m| m.required_safety_tier)
+                    .unwrap_or(crate::permissions::SafetyTier::Observe)
+            });
+
+        let mapping = DoraToolMapping {
+            tool_name: entry.name.clone(),
+            description: entry.description.clone(),
+            bridge_base_url: base_url.to_string(),
+            safety_tier: tier,
+            input_schema: Some(entry.input_schema.clone()),
+            timeout_secs: default_timeout(),
+            concurrency_class: None,
+            dora_node_id: None,
+            dora_output_id: None,
+        };
+        let bridge = DoraToolBridge::new(mapping)
+            .map_err(|e| eyre!("failed to construct HTTP bridge for {}: {e}", entry.name))?;
+
+        // Register the tool first so that any duplicate-name rejection (future
+        // behaviour) doesn't leave a stale tier mapping behind. Today
+        // `register_arc` is infallible / overwrites, but the ordering is the
+        // safer invariant to lock in.
+        let tool_name = entry.name.clone();
+        registry.register_arc(Arc::new(bridge) as Arc<dyn Tool>);
+        robot_groups::with_registry_mut(|reg| {
+            reg.insert(tool_name.clone(), tier);
+        });
+
+        names.push(tool_name);
     }
 
     Ok(names)
