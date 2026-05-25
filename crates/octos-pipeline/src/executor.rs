@@ -1130,8 +1130,7 @@ impl PipelineExecutor {
                 // Drop auto-refunds, preserving the ledger invariant.
                 if r.success {
                     if let Some(handle) = pipeline_reservation.as_ref() {
-                        self.commit_pipeline_reservation(handle, &graph.id, &r.token_usage)
-                            .await;
+                        self.commit_pipeline_reservation(handle, &graph.id, r).await;
                     }
                 }
                 let node_results: Vec<String> = r
@@ -1205,15 +1204,26 @@ impl PipelineExecutor {
         &self,
         handle: &ReservationHandle,
         graph_id: &str,
-        usage: &TokenUsage,
+        result: &PipelineResult,
     ) {
         let contract_id = self.pipeline_contract_id(graph_id);
-        let actual_cost = octos_agent::cost_ledger::project_cost_usd(
-            "pipeline-aggregate",
-            usage.input_tokens,
-            usage.output_tokens,
-        )
-        .unwrap_or(0.0);
+        let usage = &result.token_usage;
+        let node_cost_total: f64 = result
+            .node_costs
+            .iter()
+            .map(|row| row.actual_usd)
+            .filter(|cost| cost.is_finite() && *cost > 0.0)
+            .sum();
+        let actual_cost = if node_cost_total > 0.0 {
+            node_cost_total
+        } else {
+            octos_agent::cost_ledger::project_cost_usd(
+                "pipeline-aggregate",
+                usage.input_tokens,
+                usage.output_tokens,
+            )
+            .unwrap_or(0.0)
+        };
         let event = CostAttributionEvent::new(
             contract_id.clone(),
             contract_id.clone(),
@@ -1234,6 +1244,7 @@ impl PipelineExecutor {
                 contract_id = %contract_id,
                 tokens_in = usage.input_tokens,
                 tokens_out = usage.output_tokens,
+                cost_usd = actual_cost,
                 "pipeline cost reservation committed"
             );
         }
