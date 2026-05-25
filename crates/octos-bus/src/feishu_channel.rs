@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -46,10 +46,8 @@ const FRAME_TYPE_DATA: i32 = 1;
 
 /// Header key constants matching the official SDK.
 const HEADER_TYPE: &str = "type";
-const HEADER_MESSAGE_ID: &str = "message_id";
 const HEADER_SUM: &str = "sum";
 const HEADER_SEQ: &str = "seq";
-const HEADER_BIZ_RT: &str = "biz_rt";
 
 /// Message type constants.
 const MSG_TYPE_EVENT: &str = "event";
@@ -280,7 +278,7 @@ fn encode_varint(buf: &mut Vec<u8>, mut v: u64) {
 }
 
 fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
-    encode_varint(buf, ((field as u64) << 3) | 0); // wire type 0
+    encode_varint(buf, (field as u64) << 3); // wire type 0
     encode_varint(buf, value);
 }
 
@@ -310,29 +308,6 @@ fn new_ping_frame(service_id: i32) -> Frame {
         seq_id: 0,
         log_id: 0,
         log_id_new: String::new(),
-    }
-}
-
-/// Build a response frame echoing the incoming frame's metadata.
-fn new_response_frame(incoming: &Frame, status_code: i32, biz_rt_ms: u64) -> Frame {
-    let mut headers = incoming.headers.clone();
-    headers.push(FrameHeader {
-        key: HEADER_BIZ_RT.to_string(),
-        value: biz_rt_ms.to_string(),
-    });
-    let payload = serde_json::json!({
-        "StatusCode": status_code,
-        "headers": {},
-        "data": null,
-    });
-    Frame {
-        method: incoming.method,
-        service: incoming.service,
-        headers,
-        payload: payload.to_string().into_bytes(),
-        seq_id: incoming.seq_id,
-        log_id: incoming.log_id,
-        log_id_new: incoming.log_id_new.clone(),
     }
 }
 
@@ -655,7 +630,7 @@ impl FeishuChannel {
             http: Client::new(),
             media_dir,
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            dedup: MessageDedup::new(),
+            dedup: MessageDedup::with_config(MAX_SEEN_IDS, Duration::from_secs(60)),
             mode: "ws".to_string(),
             webhook_port: 9321,
             encrypt_key: None,
@@ -1675,6 +1650,69 @@ impl Channel for FeishuChannel {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct MockFeishuRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockFeishuState {
+        requests: Arc<tokio::sync::Mutex<Vec<MockFeishuRequest>>>,
+    }
+
+    async fn mock_feishu_handler(
+        axum::extract::State(state): axum::extract::State<MockFeishuState>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        state.requests.lock().await.push(MockFeishuRequest {
+            method: method.to_string(),
+            path: uri.path().to_string(),
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
+
+        if uri.path() == "/auth/v3/tenant_access_token/internal" {
+            return axum::Json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "mock-tenant-token"
+            }));
+        }
+
+        if uri.path().ends_with("/reply") {
+            return axum::Json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_reply_child" }
+            }));
+        }
+
+        axum::Json(serde_json::json!({
+            "code": 0,
+            "data": { "message_id": "om_unthreaded_child" }
+        }))
+    }
+
+    async fn spawn_mock_feishu_server() -> (String, MockFeishuState) {
+        let state = MockFeishuState::default();
+        let app = axum::Router::new()
+            .fallback(mock_feishu_handler)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Feishu server");
+        let addr = listener.local_addr().expect("mock server local address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Feishu server should run");
+        });
+
+        (format!("http://{addr}"), state)
+    }
+
     fn make_channel(allowed: Vec<&str>) -> FeishuChannel {
         make_channel_with_region(allowed, "cn")
     }
@@ -1834,6 +1872,51 @@ mod tests {
             inbound.message_id,
             Some("om_abc123".to_string()),
             "Feishu must preserve platform message_id for reply threading"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_use_reply_endpoint_when_reply_to_present() {
+        let (base_url, state) = spawn_mock_feishu_server().await;
+        let mut ch = make_channel(vec![]);
+        ch.base_url = base_url;
+
+        let message_id = ch
+            .send_with_id(&OutboundMessage {
+                channel: "feishu".to_string(),
+                chat_id: "oc_chat1".to_string(),
+                content: "threaded assistant reply".to_string(),
+                reply_to: Some("om_parent_message".to_string()),
+                media: Vec::new(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("send threaded Feishu reply");
+
+        assert_eq!(message_id.as_deref(), Some("om_reply_child"));
+
+        let requests = state.requests.lock().await.clone();
+        assert!(
+            requests.iter().any(|req| {
+                req.method == "POST" && req.path == "/auth/v3/tenant_access_token/internal"
+            }),
+            "send_with_id must fetch a tenant token before posting"
+        );
+        let reply_request = requests
+            .iter()
+            .find(|req| {
+                req.method == "POST" && req.path == "/im/v1/messages/om_parent_message/reply"
+            })
+            .expect("reply_to must route through Feishu's reply endpoint");
+        assert!(
+            reply_request.body.contains("threaded assistant reply"),
+            "reply endpoint body should carry the outbound content"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|req| req.method == "POST" && req.path == "/im/v1/messages"),
+            "reply_to must not use the unthreaded Feishu send endpoint"
         );
     }
 
