@@ -29,6 +29,7 @@ use crate::graph::{
     DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode,
 };
+use crate::guard::{GuardContext, GuardDecision, PipelineGuard};
 use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler};
 use crate::parser::parse_dot;
 use crate::validate;
@@ -369,6 +370,11 @@ pub struct ExecutorConfig {
     /// a small value to drive the cap path without waiting on real
     /// LLM-driven planning.
     pub max_pipeline_fanout_total: Option<usize>,
+    /// In-process hooks evaluated in registration order before each
+    /// dispatchable node. A `Skip` decision records a synthetic `Fail`
+    /// outcome for edge routing; an `Abort` decision returns the partial
+    /// pipeline result collected so far.
+    pub guards: Vec<Arc<dyn PipelineGuard>>,
     /// Optional mission checkpoint store. When set, the executor:
     /// * loads the latest `PersistedCheckpoint` at the start of a run and
     ///   skips every node with id `<=` the recorded node in the pipeline's
@@ -1249,6 +1255,16 @@ fn cap_node_output_tokens_for_remaining_budget(
         node.max_output_tokens
             .map_or(per_node_cap, |existing| existing.min(per_node_cap).max(1)),
     );
+}
+
+fn collect_completed_files(completed: &HashMap<String, NodeOutcome>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = completed
+        .values()
+        .flat_map(|outcome| outcome.files_modified.iter().cloned())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// Process results from parallel worker execution, producing merged content and summaries.
@@ -2250,6 +2266,57 @@ impl PipelineExecutor {
             .with_known_tools(tool_names)
     }
 
+    fn evaluate_before_node_guards(
+        &self,
+        graph: &PipelineGraph,
+        node: &PipelineNode,
+        total_tokens: &TokenUsage,
+        pipeline_start: Instant,
+        completed_count: usize,
+        visit_counts: &HashMap<String, usize>,
+    ) -> Result<GuardDecision> {
+        if self.config.guards.is_empty() {
+            return Ok(GuardDecision::Allow);
+        }
+
+        let ctx = GuardContext {
+            graph,
+            node,
+            cumulative_tokens: total_pipeline_tokens(total_tokens),
+            elapsed: pipeline_start.elapsed(),
+            completed_count,
+            visit_counts,
+        };
+
+        for guard in &self.config.guards {
+            match guard.before_node(&ctx)? {
+                GuardDecision::Allow => {}
+                decision => return Ok(decision),
+            }
+        }
+
+        Ok(GuardDecision::Allow)
+    }
+
+    fn guard_aborted_result(
+        &self,
+        node_id: &str,
+        reason: impl std::fmt::Display,
+        total_tokens: TokenUsage,
+        summaries: Vec<NodeSummary>,
+        completed: &HashMap<String, NodeOutcome>,
+        node_costs: Vec<NodeCost>,
+    ) -> PipelineResult {
+        PipelineResult {
+            output: format!("Pipeline aborted by guard before node '{node_id}': {reason}"),
+            success: false,
+            token_usage: total_tokens,
+            node_summaries: summaries,
+            files_modified: collect_completed_files(completed),
+            node_costs,
+        }
+    }
+
     async fn execute_graph(
         &self,
         graph: &PipelineGraph,
@@ -2271,6 +2338,9 @@ impl PipelineExecutor {
         let mut node_task_ids: HashMap<String, String> = HashMap::new();
         // Nodes already executed by a parallel fan-out (skip in normal traversal)
         let mut parallel_executed: HashSet<String> = HashSet::new();
+        // Per-node visit counts surfaced to before-node guards. The current
+        // node is counted immediately before guard evaluation.
+        let mut visit_counts: HashMap<String, usize> = HashMap::new();
         // Guard B: cumulative fan-out worker counter. Incremented exactly
         // once per dispatched worker across both `Parallel` and
         // `DynamicParallel` branches. Once the counter equals
@@ -2388,6 +2458,89 @@ impl PipelineExecutor {
                             node_costs: node_costs.clone(),
                         });
                     }
+                }
+            }
+
+            let visit_count = visit_counts.entry(current_node_id.clone()).or_insert(0);
+            *visit_count = visit_count.saturating_add(1);
+
+            match self.evaluate_before_node_guards(
+                graph,
+                node,
+                &total_tokens,
+                pipeline_start,
+                completed.len(),
+                &visit_counts,
+            ) {
+                Ok(GuardDecision::Allow) => {}
+                Ok(GuardDecision::Skip(reason)) => {
+                    info!(
+                        node = %node.id,
+                        reason = %reason,
+                        "node skipped by pipeline guard"
+                    );
+                    let skipped = NodeOutcome {
+                        node_id: node.id.clone(),
+                        status: OutcomeStatus::Fail,
+                        content: format!("Node '{}' skipped by pipeline guard: {reason}", node.id),
+                        token_usage: TokenUsage::default(),
+                        files_modified: vec![],
+                    };
+                    summaries.push(NodeSummary {
+                        node_id: node.id.clone(),
+                        label: node.label.as_deref().unwrap_or(&node.id).to_string(),
+                        model: node.model.clone(),
+                        token_usage: TokenUsage::default(),
+                        duration_ms: 0,
+                        success: false,
+                    });
+                    completed.insert(current_node_id.clone(), skipped.clone());
+                    match self.select_next_edge(graph, &current_node_id, &skipped)? {
+                        Some(next_id) => {
+                            current_node_id = next_id;
+                            continue;
+                        }
+                        None => {
+                            return Ok(PipelineResult {
+                                output: skipped.content,
+                                success: false,
+                                token_usage: total_tokens,
+                                node_summaries: summaries,
+                                files_modified: collect_completed_files(&completed),
+                                node_costs: node_costs.clone(),
+                            });
+                        }
+                    }
+                }
+                Ok(GuardDecision::Abort(reason)) => {
+                    warn!(
+                        node = %node.id,
+                        reason = %reason,
+                        "pipeline guard aborted execution"
+                    );
+                    return Ok(self.guard_aborted_result(
+                        &node.id,
+                        reason,
+                        total_tokens,
+                        summaries,
+                        &completed,
+                        node_costs.clone(),
+                    ));
+                }
+                Err(error) => {
+                    warn!(
+                        node = %node.id,
+                        error = %error,
+                        "pipeline guard failed before node"
+                    );
+                    return Ok(self.guard_aborted_result(
+                        &node.id,
+                        format!("guard error: {error}"),
+                        total_tokens,
+                        summaries,
+                        &completed,
+                        node_costs.clone(),
+                    ));
                 }
             }
 
@@ -5205,6 +5358,10 @@ fn dag_build_result(
 mod tests {
     use super::*;
     use crate::graph::{NodeOutcome, OutcomeStatus, PipelineNode};
+    use crate::guard::{TimeoutGuard, TokenBudgetGuard};
+    use crate::handler::Handler;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn fanout_worker_deadline_priority_and_clamp() {
@@ -5408,6 +5565,7 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -5648,6 +5806,7 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: Some(cap),
+            guards: Vec::new(),
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -5655,6 +5814,346 @@ mod tests {
             embedder: None,
             catalog_dir: None,
         }
+    }
+
+    struct TokenHandler {
+        calls: Arc<AtomicUsize>,
+        input_tokens: u32,
+        output_tokens: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for TokenHandler {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(NodeOutcome {
+                node_id: node.id.clone(),
+                status: OutcomeStatus::Pass,
+                content: format!("{} complete", node.id),
+                token_usage: TokenUsage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    ..Default::default()
+                },
+                files_modified: vec![],
+            })
+        }
+    }
+
+    struct NodeRecordingGuard {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PipelineGuard for NodeRecordingGuard {
+        fn before_node(&self, ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            self.seen.lock().unwrap().push(ctx.node.id.clone());
+            Ok(GuardDecision::Allow)
+        }
+    }
+
+    struct SelectiveGuard {
+        target: &'static str,
+        decision: GuardDecision,
+    }
+
+    impl PipelineGuard for SelectiveGuard {
+        fn before_node(&self, ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            if ctx.node.id == self.target {
+                Ok(self.decision.clone())
+            } else {
+                Ok(GuardDecision::Allow)
+            }
+        }
+    }
+
+    struct OrderedGuard {
+        name: &'static str,
+        seen: Arc<Mutex<Vec<String>>>,
+        decision: GuardDecision,
+    }
+
+    impl PipelineGuard for OrderedGuard {
+        fn before_node(&self, ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            self.seen.lock().unwrap().push(format!(
+                "{}:{}:{}:{}:{}",
+                self.name,
+                ctx.node.id,
+                ctx.cumulative_tokens,
+                ctx.completed_count,
+                ctx.visit_counts
+                    .get(&ctx.node.id)
+                    .copied()
+                    .unwrap_or_default()
+            ));
+            Ok(self.decision.clone())
+        }
+    }
+
+    struct ErrorGuard;
+
+    impl PipelineGuard for ErrorGuard {
+        fn before_node(&self, _ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            Err(eyre::eyre!("guard storage unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn token_budget_guard_aborts_before_next_node_with_partial_result() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(TokenBudgetGuard::new(7)) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Noop,
+            Arc::new(TokenHandler {
+                calls: calls.clone(),
+                input_tokens: 4,
+                output_tokens: 3,
+            }),
+        );
+
+        let dot = r#"
+            digraph t {
+                a [handler="noop"]
+                b [handler="noop"]
+                a -> b
+            }
+        "#;
+
+        let result = executor
+            .run_with_handlers(dot, "seed", &serde_json::Map::new(), handlers)
+            .await
+            .expect("pipeline should return a partial result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains("token budget exhausted before node 'b'"),
+            "unexpected output: {}",
+            result.output
+        );
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(result.node_summaries.len(), 1);
+        assert_eq!(result.node_summaries[0].node_id, "a");
+        assert_eq!(result.token_usage.input_tokens, 4);
+        assert_eq!(result.token_usage.output_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn timeout_guard_aborts_before_dispatch() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(TimeoutGuard::new(Duration::ZERO)) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let result = executor
+            .run(
+                r#"digraph t { a [handler="noop"] }"#,
+                "seed",
+                &serde_json::Map::new(),
+            )
+            .await
+            .expect("timeout guard should return a partial result");
+
+        assert!(!result.success);
+        assert!(result.node_summaries.is_empty());
+        assert!(
+            result.output.contains("pipeline timeout before node 'a'"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_skip_records_fail_outcome_for_edge_routing() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(SelectiveGuard {
+            target: "gate",
+            decision: GuardDecision::Skip("closed by policy".into()),
+        }) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let dot = r#"
+            digraph t {
+                gate [handler="noop"]
+                fallback [handler="noop"]
+                bad [handler="noop"]
+                gate -> fallback [condition="outcome.status == \"fail\""]
+                gate -> bad [condition="outcome.status == \"pass\""]
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "seed", &serde_json::Map::new())
+            .await
+            .expect("guard skip should route to fallback");
+
+        assert!(result.success, "fallback noop should recover the pipeline");
+        assert_eq!(result.node_summaries[0].node_id, "gate");
+        assert!(!result.node_summaries[0].success);
+        assert!(
+            result
+                .node_summaries
+                .iter()
+                .any(|s| s.node_id == "fallback")
+        );
+        assert!(!result.node_summaries.iter().any(|s| s.node_id == "bad"));
+        assert!(
+            result
+                .output
+                .contains("Node 'gate' skipped by pipeline guard: closed by policy"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn guards_run_in_registration_order_and_short_circuit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![
+            Arc::new(OrderedGuard {
+                name: "first",
+                seen: seen.clone(),
+                decision: GuardDecision::Allow,
+            }) as Arc<dyn PipelineGuard>,
+            Arc::new(OrderedGuard {
+                name: "second",
+                seen: seen.clone(),
+                decision: GuardDecision::Abort("stop here".into()),
+            }) as Arc<dyn PipelineGuard>,
+            Arc::new(OrderedGuard {
+                name: "third",
+                seen: seen.clone(),
+                decision: GuardDecision::Allow,
+            }) as Arc<dyn PipelineGuard>,
+        ];
+        let executor = PipelineExecutor::new(config);
+
+        let result = executor
+            .run(
+                r#"digraph t { a [handler="noop"] }"#,
+                "seed",
+                &serde_json::Map::new(),
+            )
+            .await
+            .expect("guard abort should return partial result");
+
+        assert!(!result.success);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["first:a:0:0:1".to_string(), "second:a:0:0:1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_errors_abort_instead_of_allowing_dispatch() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(ErrorGuard) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Noop,
+            Arc::new(TokenHandler {
+                calls: calls.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+            }),
+        );
+
+        let result = executor
+            .run_with_handlers(
+                r#"digraph t { a [handler="noop"] }"#,
+                "seed",
+                &serde_json::Map::new(),
+                handlers,
+            )
+            .await
+            .expect("guard error should return partial result");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(
+            result
+                .output
+                .contains("guard error: guard storage unavailable"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn guards_run_once_for_static_parallel_before_worker_spawn() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_capped_config(10).await;
+        config.guards =
+            vec![Arc::new(NodeRecordingGuard { seen: seen.clone() }) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="noop"]
+                b [handler="noop"]
+                merge [handler="noop"]
+                fan -> a
+                fan -> b
+                a -> merge
+                b -> merge
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "seed", &serde_json::Map::new())
+            .await
+            .expect("parallel pipeline should complete");
+        assert!(result.success);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|node| node.as_str() == "fan").count(), 1);
+        assert!(!seen.iter().any(|node| node == "a"));
+        assert!(!seen.iter().any(|node| node == "b"));
+        assert!(seen.iter().any(|node| node == "merge"));
+    }
+
+    #[tokio::test]
+    async fn guards_run_once_for_dynamic_parallel_before_worker_spawn() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_capped_config(10).await;
+        config.guards =
+            vec![Arc::new(NodeRecordingGuard { seen: seen.clone() }) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(HandlerKind::Codergen, Arc::new(NoopHandler));
+        handlers.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        handlers.register(HandlerKind::Noop, Arc::new(NoopHandler));
+
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let result = executor
+            .run_with_handlers(dot, "seed", &serde_json::Map::new(), handlers)
+            .await
+            .expect("dynamic parallel pipeline should complete");
+        assert!(result.success);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().filter(|node| node.as_str() == "plan").count(),
+            1
+        );
+        assert!(!seen.iter().any(|node| node.starts_with("plan_task_")));
+        assert!(seen.iter().any(|node| node == "merge"));
     }
 
     /// Guard B regression: a `dynamic_parallel` node whose worker count
@@ -6212,6 +6711,7 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6266,6 +6766,7 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6314,6 +6815,7 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
