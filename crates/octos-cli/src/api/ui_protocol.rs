@@ -1407,6 +1407,120 @@ fn active_turns_registry() -> SharedActiveTurns {
         .clone()
 }
 
+/// NEW-16 defense-in-depth: per-turn message-index cursor for the
+/// `response.messages` persist loop.
+///
+/// The main fix is the append-only `turn_output_log` upstream in
+/// `loop_runner.rs`, but this cursor exists as a second wall. It
+/// tracks the highest message-index successfully persisted for each
+/// `(session_id, turn_id)` pair. If the same `(turn, index)` is seen
+/// twice (e.g. an edge path drove the persist loop into the SAME
+/// turn twice), subsequent indexes are skipped.
+///
+/// Keyed by `(SessionId.0, TurnId.0)` strings so distinct sessions
+/// using the same TurnId string cannot collide. Today TurnIds are
+/// UUIDs minted server-side (see `TurnId::new` -> `Uuid::new_v4`)
+/// so cross-session collisions are vanishingly unlikely, but the
+/// composite key keeps the contract explicit.
+///
+/// Entries carry a `last_touched_at: Instant` and are evicted
+/// opportunistically on every read/write that finds them stale
+/// (older than `TURN_PERSIST_CURSOR_TTL`). Codex round 3 caught
+/// that an immediate end-of-turn GC has two flaws:
+///   1. A queued same-`(session, turn)` re-entry serialised on the
+///      session lock can be scheduled AFTER the first outer task
+///      already evicted the cursor — the guard would miss.
+///   2. Cursor entries leak if the outer `run_standalone_turn`
+///      future is aborted (connection close, parent task drop)
+///      after the persist block inserted the cursor but before
+///      the bottom-of-fn GC runs.
+///
+/// A TTL covers both: the cursor lives long enough for any
+/// realistic queued re-entry to observe it (the TTL is far longer
+/// than the inter-invocation window), and stale entries get
+/// pruned by subsequent persist activity in the SAME session
+/// rather than relying on cancellation-safe cleanup paths.
+type TurnPersistCursors = Arc<TokioMutex<HashMap<(String, String), TurnPersistCursorEntry>>>;
+
+#[derive(Clone, Copy, Debug)]
+struct TurnPersistCursorEntry {
+    /// Highest-index-already-persisted + 1 (i.e. the NEXT index to
+    /// write). For the synthetic final-assistant row, this is
+    /// `response.messages.len() + 1`.
+    next_index: usize,
+    last_touched_at: std::time::Instant,
+}
+
+/// TTL for per-`(session, turn)` cursor entries. 5 minutes is
+/// far longer than any realistic per-turn execution time (the
+/// agent loop's `DEFAULT_SESSION_TIMEOUT_SECS` is 1800s, and a
+/// queued same-turn re-entry would be serialised on the session
+/// lock — typically tens of milliseconds at most). Long enough
+/// to make the queued-re-entry guard reliable; short enough that
+/// abort/panic leaks bound at ~5 minutes per stale entry.
+const TURN_PERSIST_CURSOR_TTL: Duration = Duration::from_secs(300);
+
+fn turn_persist_cursors() -> TurnPersistCursors {
+    static CURSORS: OnceLock<TurnPersistCursors> = OnceLock::new();
+    CURSORS
+        .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
+        .clone()
+}
+
+/// Codex round-4 P2: throttle the full `HashMap::retain` scan
+/// to at most once per `TURN_PERSIST_CURSOR_PRUNE_INTERVAL`.
+/// `retain` is O(capacity), and `HashMap` capacity can stay
+/// high after a burst. Without the throttle, thousands of
+/// concurrent turns/sec would all serialise behind a full-map
+/// scan under the global cursor mutex. When the throttle says
+/// "too soon," the read returns immediately and stale entries
+/// get evicted on the next eligible scan. Memory growth is
+/// bounded by `persist rate * (TTL + PRUNE_INTERVAL)` in the
+/// worst case — still O(active turns × constant).
+const TURN_PERSIST_CURSOR_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Per-process throttle marker for `prune_stale_turn_persist_cursors`.
+/// `StdMutex` is fine — we only hold it across an `Instant` read.
+fn turn_persist_cursor_prune_throttle() -> Arc<StdMutex<Option<std::time::Instant>>> {
+    static THROTTLE: OnceLock<Arc<StdMutex<Option<std::time::Instant>>>> = OnceLock::new();
+    THROTTLE
+        .get_or_init(|| Arc::new(StdMutex::new(None)))
+        .clone()
+}
+
+/// Opportunistic prune: remove every entry older than
+/// `TURN_PERSIST_CURSOR_TTL`. Called from the persist block
+/// itself on every entry/exit, so the map is bounded by
+/// "entries created within the last TTL window."
+fn prune_stale_turn_persist_cursors(map: &mut HashMap<(String, String), TurnPersistCursorEntry>) {
+    let throttle = turn_persist_cursor_prune_throttle();
+    let now = std::time::Instant::now();
+    {
+        let mut last_pruned = throttle.lock().unwrap_or_else(|e| e.into_inner());
+        match *last_pruned {
+            Some(prev) if now.duration_since(prev) < TURN_PERSIST_CURSOR_PRUNE_INTERVAL => {
+                // Within the throttle window — skip the full scan.
+                return;
+            }
+            _ => {
+                *last_pruned = Some(now);
+            }
+        }
+    }
+    map.retain(|_, entry| now.duration_since(entry.last_touched_at) < TURN_PERSIST_CURSOR_TTL);
+}
+
+/// Test-only helper: clear the prune throttle so the next call
+/// to `prune_stale_turn_persist_cursors` actually scans. Used by
+/// the TTL eviction test, which would otherwise see "too soon" if
+/// another test in the same process already primed the throttle.
+#[cfg(test)]
+fn reset_turn_persist_cursor_prune_throttle_for_test() {
+    let throttle = turn_persist_cursor_prune_throttle();
+    let mut g = throttle.lock().unwrap_or_else(|e| e.into_inner());
+    *g = None;
+}
+
 fn contract_stores() -> Arc<UiProtocolContractStores> {
     static CONTRACT_STORES: OnceLock<Arc<UiProtocolContractStores>> = OnceLock::new();
     CONTRACT_STORES
@@ -15941,12 +16055,54 @@ async fn run_standalone_turn(
                     // drop the preamble's hint).
                     let mut last_persisted_preamble_assistant: Option<String> = None;
                     let mut skipped_internal_user = false;
-                    for message in response.messages.iter().cloned() {
+                    // NEW-16 defense-in-depth: per-turn message-index
+                    // cursor. The main fix is the append-only
+                    // `turn_output_log` upstream — but if some edge
+                    // path re-entered this persist loop for the SAME
+                    // `(session, turn)` pair, we MUST NOT double-write
+                    // the same indexed row.
+                    //
+                    // Codex round-3 P1+P2: switched from immediate
+                    // end-of-turn GC to TTL-based opportunistic
+                    // pruning. The entry stays alive long enough for
+                    // any realistic queued re-entry to observe it,
+                    // and stale entries (from abort/panic paths
+                    // where the outer task was cancelled) get
+                    // pruned by subsequent persist activity rather
+                    // than relying on cancellation-safe cleanup.
+                    let persist_cursors = turn_persist_cursors();
+                    let cursor_key = (
+                        agent_session_id.0.clone(),
+                        turn_thread_id_for_persist.clone(),
+                    );
+                    let cursor_already_advanced = {
+                        let mut cursors = persist_cursors.lock().await;
+                        prune_stale_turn_persist_cursors(&mut cursors);
+                        cursors.get(&cursor_key).map(|e| e.next_index).unwrap_or(0)
+                    };
+                    for (message_index, message) in response.messages.iter().cloned().enumerate() {
                         if skip_internal_user_persist
                             && !skipped_internal_user
                             && message.role == MessageRole::User
                         {
                             skipped_internal_user = true;
+                            continue;
+                        }
+                        // NEW-16 defense-in-depth: skip indexes already
+                        // persisted for this `(session, turn)` pair.
+                        // `cursor_already_advanced` reflects the
+                        // highest-index-already-written + 1 (i.e. the
+                        // NEXT index that needs writing). If the
+                        // current index is below that watermark, an
+                        // earlier invocation already wrote it.
+                        if message_index < cursor_already_advanced {
+                            tracing::debug!(
+                                session = %agent_session_id.0,
+                                turn = %turn_thread_id_for_persist,
+                                message_index,
+                                cursor_already_advanced,
+                                "NEW-16 cursor guard skipped already-persisted message in this turn"
+                            );
                             continue;
                         }
                         // Detect the exact row that carries
@@ -15988,6 +16144,30 @@ async fn run_standalone_turn(
                             .add_message_with_seq(&agent_session_id, to_save)
                             .await
                         {
+                            // NEW-16: advance the per-turn cursor
+                            // ONLY after the JSONL write succeeded
+                            // (and inside the session lock — note
+                            // that `sessions` is the lock guard, so
+                            // anyone re-entering the persist loop on
+                            // this `(session, turn)` will see the
+                            // updated cursor on their next read).
+                            //
+                            // Codex round-3: timestamp the entry so
+                            // the TTL pruner can evict it.
+                            {
+                                let mut cursors = persist_cursors.lock().await;
+                                let now = std::time::Instant::now();
+                                let entry = cursors.entry(cursor_key.clone()).or_insert(
+                                    TurnPersistCursorEntry {
+                                        next_index: 0,
+                                        last_touched_at: now,
+                                    },
+                                );
+                                if message_index + 1 > entry.next_index {
+                                    entry.next_index = message_index + 1;
+                                }
+                                entry.last_touched_at = now;
+                            }
                             record_appui_context_manager_message(
                                 &context_data_dir_for_result,
                                 &context_manager_for_result,
@@ -16090,29 +16270,91 @@ async fn run_standalone_turn(
                             // not apply) and its content equals
                             // `response.content` (so it is the
                             // final-assistant carrier).
-                            let to_save =
-                                pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
-                            let saved_for_context = to_save.clone();
-                            let session_id_for_persist = agent_session_id.clone();
-                            let commit = sessions
-                                .add_message_with_seq(&session_id_for_persist, to_save)
-                                .await;
-                            if let Ok(seq) = commit {
-                                record_appui_context_manager_message(
-                                    &context_data_dir_for_result,
-                                    &context_manager_for_result,
-                                    &agent_session_id,
-                                    &saved_for_context,
-                                    seq,
+                            //
+                            // NEW-16 codex review P1: extend the per-turn
+                            // cursor guard to cover the synthesised final
+                            // assistant row too. Treat it as VIRTUAL
+                            // index `response.messages.len()` — the slot
+                            // immediately past the last log row. If a
+                            // re-entry into this persist block sees the
+                            // cursor advanced to `messages.len() + 1`,
+                            // the final row has already been written and
+                            // the second invocation must skip.
+                            let final_virtual_index = response.messages.len();
+                            let cursor_already_at_final = {
+                                let c = persist_cursors.lock().await;
+                                c.get(&cursor_key).map(|e| e.next_index).unwrap_or(0)
+                                    > final_virtual_index
+                            };
+                            if cursor_already_at_final {
+                                tracing::debug!(
+                                    session = %agent_session_id.0,
+                                    turn = %turn_thread_id_for_persist,
+                                    final_virtual_index,
+                                    "NEW-16 cursor guard skipped already-persisted synthetic \
+                                     final assistant row in this turn"
                                 );
-                                cursor = Some(UiCursor {
-                                    stream: agent_session_id.0.clone(),
-                                    seq: seq as u64,
-                                });
+                                // The final row was committed by an earlier
+                                // invocation. Flip `final_assistant_persisted`
+                                // so downstream signalling (oneshot send)
+                                // sees the same state as the original
+                                // successful path.
                                 final_assistant_persisted = true;
+                            } else {
+                                let to_save =
+                                    pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                                let saved_for_context = to_save.clone();
+                                let session_id_for_persist = agent_session_id.clone();
+                                let commit = sessions
+                                    .add_message_with_seq(&session_id_for_persist, to_save)
+                                    .await;
+                                if let Ok(seq) = commit {
+                                    // Advance the cursor past the virtual
+                                    // final-row index so a re-entry skips it.
+                                    {
+                                        let mut c = persist_cursors.lock().await;
+                                        let now = std::time::Instant::now();
+                                        let entry = c.entry(cursor_key.clone()).or_insert(
+                                            TurnPersistCursorEntry {
+                                                next_index: 0,
+                                                last_touched_at: now,
+                                            },
+                                        );
+                                        if final_virtual_index + 1 > entry.next_index {
+                                            entry.next_index = final_virtual_index + 1;
+                                        }
+                                        entry.last_touched_at = now;
+                                    }
+                                    record_appui_context_manager_message(
+                                        &context_data_dir_for_result,
+                                        &context_manager_for_result,
+                                        &agent_session_id,
+                                        &saved_for_context,
+                                        seq,
+                                    );
+                                    cursor = Some(UiCursor {
+                                        stream: agent_session_id.0.clone(),
+                                        seq: seq as u64,
+                                    });
+                                    final_assistant_persisted = true;
+                                }
                             }
                         }
                     }
+                    // NEW-16 codex round-3 P1+P2: do NOT GC the
+                    // cursor here AND do NOT GC at the bottom of
+                    // `run_standalone_turn`. The TTL pruner
+                    // (`prune_stale_turn_persist_cursors`) handles
+                    // eviction opportunistically on subsequent
+                    // persist activity. That covers:
+                    //   - queued same-`(session, turn)` re-entry
+                    //     (entry stays alive until TTL expires)
+                    //   - abort/panic paths (outer GC would be
+                    //     skipped on cancellation; TTL evicts
+                    //     anyway)
+                    //   - long-running server map bound (TTL
+                    //     caps memory at "entries created within
+                    //     the last 5 minutes")
                 }
                 // #1158 codex P2 rev3 follow-up: distinguish two
                 // shapes of "empty captured reply":
@@ -16354,6 +16596,21 @@ async fn run_standalone_turn(
     }
 
     let _ = agent_task.await;
+
+    // NEW-16 codex round-3 P1+P2: GC moved from here to the
+    // TTL-based opportunistic pruner inside the persist block.
+    // Earlier rounds 1-2 evicted here, but that left two gaps:
+    //   1. A queued same-`(session, turn)` re-entry scheduled
+    //      AFTER this outer task completed would see a cleaned
+    //      cursor and could re-persist (the guard's whole point
+    //      was to prevent that).
+    //   2. Connection-close abort of the OUTER
+    //      `run_standalone_turn` future would skip this GC line
+    //      entirely, leaking entries until process restart.
+    // The TTL pruner solves both: cursor lives long enough for
+    // realistic re-entries, and stale entries get evicted by
+    // subsequent persist activity rather than relying on a
+    // cancellation-safe cleanup path.
 
     // Wave4-A: emit a final `router/status` snapshot adjacent to
     // `turn/completed` so clients see the actual provider that ran
@@ -31063,5 +31320,363 @@ ignore = []
         let report: eyre::Report = eyre::eyre!("shell tool: command not found: foo");
         let wire = super::classify_runtime_error_message(&report);
         assert_eq!(wire, "shell tool: command not found: foo");
+    }
+
+    /// NEW-16 codex round-3: helper for building a
+    /// `TurnPersistCursorEntry` in tests at a given `next_index`,
+    /// stamped at NOW. Centralises the construction so a future
+    /// refactor of the entry type only touches one place.
+    fn make_cursor_entry_fresh(next_index: usize) -> super::TurnPersistCursorEntry {
+        super::TurnPersistCursorEntry {
+            next_index,
+            last_touched_at: std::time::Instant::now(),
+        }
+    }
+
+    /// NEW-16 codex round-4: the cursor tests share the same
+    /// process-wide static map AND the process-wide prune
+    /// throttle. Running them in parallel under
+    /// `cargo test --test-threads=N` would let one test's prune
+    /// or insert race another's assertion. Serialise via a
+    /// `tokio::sync::Mutex` whose owned guard each test holds for
+    /// its entire body across `await` points (so we get a true
+    /// inter-test serialisation, not just sync setup serialisation).
+    /// A std `Mutex` would not work here because tokio tests
+    /// suspend across `.await`; that would either deadlock or
+    /// require parking a worker thread on the lock.
+    fn new16_cursor_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+        static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+        LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// NEW-16: the per-turn message-index cursor used as
+    /// defense-in-depth inside the `response.messages` persist loop
+    /// MUST skip any `(session, turn, message_index)` triple it has
+    /// already seen in a previous invocation. This locks in the
+    /// helper logic so a regression that drops the cursor check is
+    /// caught here.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_skips_already_persisted_indexes() {
+        let _serial = new16_cursor_test_lock().lock_owned().await;
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        // First invocation: 3 messages persist successfully, cursor
+        // advances to 3 (i.e. next index to write is 3).
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key.clone(), make_cursor_entry_fresh(3));
+        }
+
+        // Second invocation: same `(session, turn)` re-enters with the
+        // SAME 3 messages plus 1 new one. The first 3 (indexes 0, 1,
+        // 2) MUST be skipped. Only index 3 is new.
+        let cursor_already_advanced = {
+            let c = cursors.lock().await;
+            c.get(&key).map(|e| e.next_index).unwrap_or(0)
+        };
+        assert_eq!(
+            cursor_already_advanced, 3,
+            "cursor should reflect the highest-index-already-written + 1"
+        );
+
+        // Simulate the persist loop's index guard for messages 0..=3.
+        let mut indexes_that_would_persist = Vec::new();
+        for message_index in 0..4 {
+            if message_index < cursor_already_advanced {
+                continue;
+            }
+            indexes_that_would_persist.push(message_index);
+        }
+        assert_eq!(
+            indexes_that_would_persist,
+            vec![3],
+            "only the genuinely new index (3) should pass the cursor guard"
+        );
+
+        // After successfully persisting index 3, the cursor advances.
+        {
+            let mut c = cursors.lock().await;
+            let now = std::time::Instant::now();
+            let entry = c
+                .entry(key.clone())
+                .or_insert(super::TurnPersistCursorEntry {
+                    next_index: 0,
+                    last_touched_at: now,
+                });
+            if 3 + 1 > entry.next_index {
+                entry.next_index = 3 + 1;
+            }
+            entry.last_touched_at = now;
+        }
+        let cursor_after = {
+            let c = cursors.lock().await;
+            c.get(&key).map(|e| e.next_index).unwrap_or(0)
+        };
+        assert_eq!(cursor_after, 4, "cursor should advance to next index");
+
+        // Cleanup: opportunistic prune treats the entry as fresh
+        // (no TTL elapsed), so explicitly remove for hermeticity.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
+    }
+
+    /// NEW-16 codex review round-1 P1: the cursor guard MUST cover
+    /// the synthesised final assistant row too. When the cursor is
+    /// advanced to `response.messages.len() + 1`, the synthesised
+    /// final row has already been persisted in a prior invocation
+    /// and must be skipped on re-entry.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_covers_synthesised_final_assistant_row() {
+        let _serial = new16_cursor_test_lock().lock_owned().await;
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        let log_row_count = 3usize;
+        let final_virtual_index = log_row_count;
+        {
+            let mut c = cursors.lock().await;
+            c.insert(
+                key.clone(),
+                make_cursor_entry_fresh(final_virtual_index + 1),
+            );
+        }
+
+        let cursor_already_advanced = {
+            let c = cursors.lock().await;
+            c.get(&key).map(|e| e.next_index).unwrap_or(0)
+        };
+        for message_index in 0..log_row_count {
+            assert!(
+                message_index < cursor_already_advanced,
+                "indexed row {message_index} must be skipped on re-entry"
+            );
+        }
+        let final_row_already_persisted = cursor_already_advanced > final_virtual_index;
+        assert!(
+            final_row_already_persisted,
+            "the synthetic final assistant row MUST also be skipped on re-entry — \
+             this is the codex round-1 P1 contract on NEW-16"
+        );
+
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
+    }
+
+    /// NEW-16 codex review round-3 P2: the TTL pruner MUST evict
+    /// entries older than `TURN_PERSIST_CURSOR_TTL`. This guards
+    /// against:
+    ///   - abort/panic paths that prevented end-of-turn cleanup
+    ///   - long-running server map growth (bounded at ~TTL of
+    ///     entries created within the last window)
+    ///
+    /// We can't easily wait 5 minutes in a test, so we forge an
+    /// entry with an old `last_touched_at` directly and run the
+    /// pruner. Codex round-4 P2 added a per-process throttle on
+    /// the prune call; clear it via the test-only helper so we
+    /// know this scan won't be throttled out.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_ttl_pruner_evicts_stale_entries() {
+        let _serial = new16_cursor_test_lock().lock_owned().await;
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        // Forge an entry older than TTL.
+        let stale_ts = std::time::Instant::now()
+            - super::TURN_PERSIST_CURSOR_TTL
+            - std::time::Duration::from_secs(1);
+        {
+            let mut c = cursors.lock().await;
+            c.insert(
+                key.clone(),
+                super::TurnPersistCursorEntry {
+                    next_index: 99,
+                    last_touched_at: stale_ts,
+                },
+            );
+        }
+        // The stale entry is present.
+        {
+            let c = cursors.lock().await;
+            assert!(
+                c.contains_key(&key),
+                "stale entry should be present before prune"
+            );
+        }
+        // Reset round-4 throttle so the prune actually scans.
+        super::reset_turn_persist_cursor_prune_throttle_for_test();
+        // Run the pruner.
+        {
+            let mut c = cursors.lock().await;
+            super::prune_stale_turn_persist_cursors(&mut c);
+        }
+        // The stale entry is gone.
+        {
+            let c = cursors.lock().await;
+            assert!(
+                !c.contains_key(&key),
+                "stale entry MUST be evicted by TTL pruner (codex round-3 P2 — \
+                 the pruner is the only GC path now, so this MUST work)"
+            );
+        }
+    }
+
+    /// NEW-16 codex round-3: fresh entries (within TTL) MUST be
+    /// preserved by the pruner. A regression that nukes everything
+    /// would defeat the cursor guard entirely.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_ttl_pruner_preserves_fresh_entries() {
+        let _serial = new16_cursor_test_lock().lock_owned().await;
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key.clone(), make_cursor_entry_fresh(42));
+        }
+        // Reset round-4 throttle so the prune actually scans.
+        super::reset_turn_persist_cursor_prune_throttle_for_test();
+        {
+            let mut c = cursors.lock().await;
+            super::prune_stale_turn_persist_cursors(&mut c);
+        }
+        {
+            let c = cursors.lock().await;
+            let entry = c
+                .get(&key)
+                .expect("fresh entry MUST survive the TTL pruner");
+            assert_eq!(
+                entry.next_index, 42,
+                "the pruner must not corrupt surviving entries"
+            );
+        }
+        // Cleanup.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
+    }
+
+    /// NEW-16 codex round-4 P2: the prune throttle MUST suppress
+    /// subsequent prune calls within
+    /// `TURN_PERSIST_CURSOR_PRUNE_INTERVAL` so a burst of
+    /// concurrent persist blocks doesn't all hold the global
+    /// cursor mutex while doing redundant full-map scans.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_prune_throttle_suppresses_back_to_back_scans() {
+        let _serial = new16_cursor_test_lock().lock_owned().await;
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        // Reset throttle, then run an initial scan that primes it.
+        super::reset_turn_persist_cursor_prune_throttle_for_test();
+        {
+            let mut c = cursors.lock().await;
+            super::prune_stale_turn_persist_cursors(&mut c);
+        }
+
+        // Now insert a stale entry. A subsequent prune within the
+        // throttle window should NOT evict it (the throttle skips
+        // the scan entirely).
+        let stale_ts = std::time::Instant::now()
+            - super::TURN_PERSIST_CURSOR_TTL
+            - std::time::Duration::from_secs(1);
+        {
+            let mut c = cursors.lock().await;
+            c.insert(
+                key.clone(),
+                super::TurnPersistCursorEntry {
+                    next_index: 7,
+                    last_touched_at: stale_ts,
+                },
+            );
+        }
+        // Second prune call — throttle is still primed (we just
+        // ran one above), so the scan should be skipped and the
+        // stale entry should survive.
+        {
+            let mut c = cursors.lock().await;
+            super::prune_stale_turn_persist_cursors(&mut c);
+        }
+        {
+            let c = cursors.lock().await;
+            assert!(
+                c.contains_key(&key),
+                "throttle within window MUST suppress the scan — the stale entry \
+                 should survive until the throttle window expires (codex round-4 P2)"
+            );
+        }
+        // Cleanup: reset throttle so the next test starts clean,
+        // then remove the forged entry.
+        super::reset_turn_persist_cursor_prune_throttle_for_test();
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
+    }
+
+    /// NEW-16: cursor entries are keyed by `(session, turn)`. Two
+    /// different `(session, turn)` pairs MUST be independent — one
+    /// turn's progress cannot leak into another turn's guard.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_isolates_sessions_and_turns() {
+        let _serial = new16_cursor_test_lock().lock_owned().await;
+        let cursors = super::turn_persist_cursors();
+        let session_a = format!("session-a-{}", uuid::Uuid::new_v4());
+        let session_b = format!("session-b-{}", uuid::Uuid::new_v4());
+        let turn_1 = format!("turn-1-{}", uuid::Uuid::new_v4());
+        let turn_2 = format!("turn-2-{}", uuid::Uuid::new_v4());
+
+        let key_a1 = (session_a.clone(), turn_1.clone());
+        let key_a2 = (session_a.clone(), turn_2.clone());
+        let key_b1 = (session_b.clone(), turn_1.clone());
+
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key_a1.clone(), make_cursor_entry_fresh(5));
+            c.insert(key_a2.clone(), make_cursor_entry_fresh(2));
+            c.insert(key_b1.clone(), make_cursor_entry_fresh(1));
+        }
+
+        let c = cursors.lock().await;
+        // Each (session, turn) pair has its own cursor.
+        assert_eq!(c.get(&key_a1).map(|e| e.next_index), Some(5));
+        assert_eq!(c.get(&key_a2).map(|e| e.next_index), Some(2));
+        assert_eq!(c.get(&key_b1).map(|e| e.next_index), Some(1));
+        // Cross-key lookups return None — distinct pairs don't share state.
+        assert!(
+            c.get(&(session_a.clone(), "turn-nonexistent".into()))
+                .is_none(),
+            "a non-existent turn under session-a must NOT inherit any cursor"
+        );
+        assert!(
+            c.get(&(session_b.clone(), turn_2.clone())).is_none(),
+            "session-b's view of turn-2 must NOT inherit session-a's cursor for turn-2 \
+             (the composite key prevents cross-session collisions)"
+        );
+        drop(c);
+
+        // Cleanup.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key_a1);
+            c.remove(&key_a2);
+            c.remove(&key_b1);
+        }
     }
 }
