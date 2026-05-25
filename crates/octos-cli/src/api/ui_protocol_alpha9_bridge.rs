@@ -572,7 +572,8 @@ mod tests {
         // path inherits the same list (see api/ui_protocol.rs
         // envelope_media fallback). Soak captured this exact shape.
         let media = vec![
-            "/Users/cloud/.octos/profiles/dspfac/data/slides/deck-soak/output/deck.pptx".to_string(),
+            "/Users/cloud/.octos/profiles/dspfac/data/slides/deck-soak/output/deck.pptx"
+                .to_string(),
         ];
         let envelope_media = media.clone();
 
@@ -647,7 +648,10 @@ mod tests {
         }
         assert_eq!(
             paths,
-            vec!["/tmp/report.md".to_string(), "/tmp/outline.json".to_string()],
+            vec![
+                "/tmp/report.md".to_string(),
+                "/tmp/outline.json".to_string()
+            ],
             "blank entries filtered; ordering preserved"
         );
     }
