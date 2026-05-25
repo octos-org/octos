@@ -214,6 +214,7 @@ impl PluginLoader {
                 Ok((tools, extras)) => {
                     let n = tools.len();
                     let spawn_only = extras.spawn_only_tools.clone();
+                    let auto_summarize = extras.spawn_only_auto_summarize.clone();
                     for loaded in tools {
                         let tool = loaded.tool;
                         let name = tool.name().to_string();
@@ -230,6 +231,9 @@ impl PluginLoader {
                         for name in &spawn_only {
                             let msg = extras.spawn_only_messages.get(name).cloned();
                             registry.mark_spawn_only(name, msg);
+                            if auto_summarize.iter().any(|tool| tool == name) {
+                                registry.mark_spawn_only_auto_summarize(name);
+                            }
                         }
                         // Don't defer — tool stays visible to LLM.
                         // The execution loop auto-redirects calls to background spawn.
@@ -565,6 +569,12 @@ impl PluginLoader {
                 )
             })
             .collect();
+        let spawn_only_auto_summarize: Vec<String> = manifest
+            .tools
+            .iter()
+            .filter(|t| t.spawn_only && t.auto_summarize && t.validate_for_registration().is_ok())
+            .map(|t| t.name.clone())
+            .collect();
 
         let plugin_name = manifest.name.clone();
         let tools: Vec<LoadedPluginTool> = manifest
@@ -664,6 +674,7 @@ impl PluginLoader {
         // Return extras with spawn_only info
         extras.spawn_only_tools = spawn_only_names;
         extras.spawn_only_messages = spawn_only_msgs;
+        extras.spawn_only_auto_summarize = spawn_only_auto_summarize;
 
         Ok((tools, extras))
     }
@@ -1919,6 +1930,41 @@ mod tests {
         assert!(plugin_dir.join("main").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_loader_marks_spawn_only_auto_summarize_from_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-publish");
+        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-publish",
+  "version": "0.1.0",
+  "tools": [{
+    "name": "mofa_publish",
+    "description": "deploy",
+    "spawn_only": true,
+    "auto_summarize": true
+  }]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("scripts/publish_site.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 1);
+        assert!(registry.is_spawn_only("mofa_publish"));
+        assert!(registry.spawn_only_auto_summarize("mofa_publish"));
+    }
+
     #[test]
     fn test_builtin_env_allowlist_augments_first_party_mofa_tools_only() {
         let def = PluginToolDef {
@@ -1929,6 +1975,7 @@ mod tests {
             env: vec!["EXISTING_ENV".to_string(), "GEMINI_API_KEY".to_string()],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
 
@@ -1953,6 +2000,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let untrusted = apply_builtin_env_allowlist("custom-plugin", untrusted);

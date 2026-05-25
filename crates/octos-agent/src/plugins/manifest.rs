@@ -193,6 +193,10 @@ pub struct PluginToolDef {
     /// Default: "SUCCESS: Task is now running in background..."
     #[serde(default)]
     pub spawn_only_message: Option<String>,
+    /// If true, successful spawn_only completions with large text file outputs
+    /// append a bounded LLM-generated summary to chat history.
+    #[serde(default)]
+    pub auto_summarize: bool,
     /// Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
     /// optional concurrency class. When `"exclusive"` the M8.8
     /// scheduler serialises this tool against any sibling in the same
@@ -715,8 +719,37 @@ mod tests {
             env: env.into_iter().map(str::to_string).collect(),
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         }
+    }
+
+    #[test]
+    fn tool_auto_summarize_defaults_false_and_parses_true() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{
+                "name": "summary-default",
+                "version": "0.1.0",
+                "tools": [{"name": "default_tool", "description": "d"}]
+            }"#,
+        )
+        .unwrap();
+        assert!(!manifest.tools[0].auto_summarize);
+
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{
+                "name": "summary-opt-in",
+                "version": "0.1.0",
+                "tools": [{
+                    "name": "summary_tool",
+                    "description": "d",
+                    "spawn_only": true,
+                    "auto_summarize": true
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(manifest.tools[0].auto_summarize);
     }
 
     #[test]
@@ -843,6 +876,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: class.map(str::to_string),
         }
     }

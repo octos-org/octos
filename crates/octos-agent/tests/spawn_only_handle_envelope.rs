@@ -4,11 +4,14 @@
 //! message returned to the LLM must be the JSON `task_handle` envelope, not
 //! the full tool output. This pins the contract.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt;
+use octos_agent::tools::spawn::{BackgroundResultPayload, BackgroundResultSender};
 use octos_agent::{Agent, AgentConfig, ReadTaskOutputTool, Tool, ToolRegistry, ToolResult};
 use octos_core::{AgentId, Message, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
@@ -16,14 +19,20 @@ use octos_memory::EpisodeStore;
 use tempfile::TempDir;
 
 struct ScriptedLlm {
-    responses: std::sync::Mutex<Vec<ChatResponse>>,
+    responses: Mutex<Vec<ChatResponse>>,
+    calls: Mutex<Vec<(Vec<Message>, ChatConfig)>>,
 }
 
 impl ScriptedLlm {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
-            responses: std::sync::Mutex::new(responses),
+            responses: Mutex::new(responses),
+            calls: Mutex::new(Vec::new()),
         }
+    }
+
+    fn calls(&self) -> Vec<(Vec<Message>, ChatConfig)> {
+        self.calls.lock().unwrap().clone()
     }
 }
 
@@ -31,10 +40,14 @@ impl ScriptedLlm {
 impl LlmProvider for ScriptedLlm {
     async fn chat(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSpec],
-        _config: &ChatConfig,
+        config: &ChatConfig,
     ) -> eyre::Result<ChatResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((messages.to_vec(), config.clone()));
         let mut r = self.responses.lock().unwrap();
         if r.is_empty() {
             eyre::bail!("ScriptedLlm: no more responses");
@@ -77,6 +90,72 @@ impl Tool for HugeOutputTool {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         Ok(ToolResult {
             output: self.payload.clone(),
+            success: true,
+            ..Default::default()
+        })
+    }
+}
+
+struct FileOutputTool {
+    name: &'static str,
+    invocations: Arc<AtomicU32>,
+    output_path: PathBuf,
+}
+
+#[async_trait]
+impl Tool for FileOutputTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "spawn_only probe that writes a large text artifact"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        if let Some(parent) = self.output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &self.output_path,
+            format!(
+                "# Summary Probe\n\nALPHA_SENTINEL {}\n",
+                "body ".repeat(1_200)
+            ),
+        )?;
+        Ok(ToolResult {
+            output: String::new(),
+            success: true,
+            files_to_send: vec![self.output_path.clone()],
+            ..Default::default()
+        })
+    }
+}
+
+struct SendFileOkTool;
+
+#[async_trait]
+impl Tool for SendFileOkTool {
+    fn name(&self) -> &str {
+        "send_file"
+    }
+
+    fn description(&self) -> &str {
+        "test send_file stub"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+        Ok(ToolResult {
+            output: "sent".to_string(),
             success: true,
             ..Default::default()
         })
@@ -223,6 +302,131 @@ async fn spawn_only_intercept_returns_task_handle_envelope_not_full_output() {
 
     // Settle any spurious background tasks before we tear down.
     tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test]
+async fn spawn_only_auto_summarize_appends_followup_for_large_file_output() {
+    let memory_dir = TempDir::new().unwrap();
+    let workspace = memory_dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output_path = workspace.join("reports/summary_probe.md");
+
+    let invocations = Arc::new(AtomicU32::new(0));
+    let probe = FileOutputTool {
+        name: "summary_probe",
+        invocations: invocations.clone(),
+        output_path: output_path.clone(),
+    };
+
+    let captured: Arc<Mutex<Vec<BackgroundResultPayload>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_sender = captured.clone();
+    let sender: BackgroundResultSender = Arc::new(move |payload| {
+        let captured = captured_for_sender.clone();
+        async move {
+            captured.lock().unwrap().push(payload);
+            true
+        }
+        .boxed()
+    });
+
+    let mut tools = ToolRegistry::new();
+    tools.set_workspace_root(workspace.clone());
+    tools.register(probe);
+    tools.register(SendFileOkTool);
+    tools.mark_spawn_only("summary_probe", None);
+    tools.mark_spawn_only_auto_summarize("summary_probe");
+    tools.set_background_result_sender(sender);
+
+    let supervisor = tools.supervisor();
+    tools.register(ReadTaskOutputTool::new(
+        supervisor,
+        "test-session",
+        None,
+        workspace.clone(),
+    ));
+
+    let memory = Arc::new(
+        EpisodeStore::open(memory_dir.path().join(".octos"))
+            .await
+            .unwrap(),
+    );
+
+    let scripted = Arc::new(ScriptedLlm::new(vec![
+        tool_use(vec![tc("call-summary-1", "summary_probe")]),
+        end_turn("Alpha summary remembers the generated report."),
+    ]));
+    let llm: Arc<dyn LlmProvider> = scripted.clone();
+
+    let agent =
+        Agent::new(AgentId::new("auto-summary"), llm, tools, memory).with_config(AgentConfig {
+            save_episodes: false,
+            suppress_auto_send_files: true,
+            ..Default::default()
+        });
+
+    let response = agent
+        .process_message("kick summary probe", &[], vec![])
+        .await
+        .expect("agent loop must not error");
+    assert!(
+        response.messages.iter().any(|m| {
+            matches!(m.role, octos_core::MessageRole::Tool)
+                && m.tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id.contains("call-summary-1"))
+        }),
+        "foreground turn should return the spawn_only handle"
+    );
+
+    let mut summary_payload = None;
+    for _ in 0..100 {
+        summary_payload = captured.lock().unwrap().iter().find_map(|payload| {
+            payload
+                .content
+                .starts_with("`summary_probe` summary:")
+                .then(|| payload.clone())
+        });
+        if summary_payload.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let summary_payload = summary_payload.unwrap_or_else(|| {
+        panic!(
+            "expected auto-summary background payload, got: {:#?}",
+            captured.lock().unwrap()
+        )
+    });
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert!(
+        summary_payload
+            .content
+            .contains("Alpha summary remembers the generated report."),
+        "got: {}",
+        summary_payload.content
+    );
+    assert!(
+        summary_payload
+            .content
+            .contains("Full output at reports/summary_probe.md; call `read_file` to inspect."),
+        "got: {}",
+        summary_payload.content
+    );
+    assert!(summary_payload.media.is_empty());
+    assert!(summary_payload.envelope_media.is_empty());
+
+    let calls = scripted.calls();
+    assert!(
+        calls.iter().any(|(messages, config)| {
+            config.max_tokens == Some(300)
+                && config.temperature == Some(0.0)
+                && messages
+                    .iter()
+                    .any(|m| m.content.contains("ALPHA_SENTINEL"))
+        }),
+        "summary LLM call must be bounded and include file content; calls: {calls:#?}"
+    );
 }
 
 // Codex P2 (round 1) regression guard: when `read_task_output` is NOT

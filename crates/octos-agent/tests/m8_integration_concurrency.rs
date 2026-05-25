@@ -82,6 +82,7 @@ fn plugin_with_exclusive_manifest_serializes_with_other_exclusive_tools_in_batch
         env: vec![],
         risk: None,
         spawn_only_message: None,
+        auto_summarize: false,
         concurrency_class: Some("exclusive".into()),
     };
     let exclusive_tool = PluginTool::new(
@@ -109,6 +110,7 @@ fn plugin_with_no_concurrency_declaration_defaults_to_safe() {
         env: vec![],
         risk: None,
         spawn_only_message: None,
+        auto_summarize: false,
         concurrency_class: None,
     };
     let safe_tool = PluginTool::new(

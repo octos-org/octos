@@ -23,11 +23,14 @@
 //! tools still serializes the whole batch. An optimised "run Safe in parallel,
 //! then Exclusive in order" pipeline is explicitly deferred (see the M8.8 spec).
 
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, TokenUsage};
-use octos_llm::ChatResponse;
+use octos_llm::{ChatConfig, ChatResponse, LlmProvider};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -105,6 +108,263 @@ fn build_spawn_only_produced_files_message(
     Some(out)
 }
 
+const SPAWN_ONLY_SUMMARY_MIN_BYTES: u64 = 4 * 1024;
+const SPAWN_ONLY_SUMMARY_MAX_INPUT_BYTES: u64 = 24 * 1024;
+const SPAWN_ONLY_SUMMARY_MAX_OUTPUT_TOKENS: u32 = 300;
+
+struct SpawnOnlySummarySource {
+    prompt_body: String,
+    display_paths: Vec<String>,
+}
+
+fn is_text_summary_candidate(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase()),
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "md" | "markdown"
+                    | "txt"
+                    | "json"
+                    | "jsonl"
+                    | "csv"
+                    | "tsv"
+                    | "html"
+                    | "xml"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "log"
+            )
+    )
+}
+
+fn resolve_spawn_only_summary_path(file: &str, workspace_root: &Path) -> Option<PathBuf> {
+    use octos_bus::file_handle::{ToolPathScope, resolve_tool_path};
+
+    match resolve_tool_path(workspace_root, None, file) {
+        Ok(resolved) if resolved.scope == ToolPathScope::Workspace => Some(resolved.absolute),
+        Ok(resolved) => {
+            warn!(
+                file = %file,
+                scope = ?resolved.scope,
+                "skipping spawn_only auto-summary file outside workspace"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                file = %file,
+                error = ?error,
+                "skipping spawn_only auto-summary file that failed workspace resolution"
+            );
+            None
+        }
+    }
+}
+
+fn reject_spawn_only_summary_symlinked_ancestors(
+    workspace_root: &Path,
+    resolved: &Path,
+) -> std::io::Result<()> {
+    let canonical_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let lexical_root = workspace_root.to_path_buf();
+    let (mut current, suffix) = if let Ok(suffix) = resolved.strip_prefix(&lexical_root) {
+        (lexical_root, suffix.to_path_buf())
+    } else if let Ok(suffix) = resolved.strip_prefix(&canonical_root) {
+        (canonical_root, suffix.to_path_buf())
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "path {} is not under workspace {}",
+                resolved.display(),
+                workspace_root.display()
+            ),
+        ));
+    };
+
+    let components: Vec<_> = suffix.components().collect();
+    for component in &components[..components.len().saturating_sub(1)] {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("symlink ancestor rejected: {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn open_spawn_only_summary_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "symlink leaf rejected",
+            ));
+        }
+    }
+    options.open(path)
+}
+
+fn collect_spawn_only_summary_source(
+    files: &[String],
+    workspace_root: Option<&Path>,
+) -> Option<SpawnOnlySummarySource> {
+    let workspace_root = workspace_root?;
+    let mut total_text_bytes = 0_u64;
+    let mut remaining = SPAWN_ONLY_SUMMARY_MAX_INPUT_BYTES;
+    let mut prompt_body = String::new();
+    let mut display_paths = Vec::new();
+
+    for file in files {
+        if remaining == 0 {
+            break;
+        }
+        let Some(resolved) = resolve_spawn_only_summary_path(file, workspace_root) else {
+            continue;
+        };
+        if !is_text_summary_candidate(&resolved) {
+            continue;
+        }
+        if let Err(error) = reject_spawn_only_summary_symlinked_ancestors(workspace_root, &resolved)
+        {
+            warn!(
+                file = %file,
+                resolved = %resolved.display(),
+                error = %error,
+                "skipping spawn_only auto-summary file with unsafe path"
+            );
+            continue;
+        }
+        let mut file_handle = match open_spawn_only_summary_file(&resolved) {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!(
+                    file = %file,
+                    resolved = %resolved.display(),
+                    error = %error,
+                    "skipping spawn_only auto-summary file that could not be opened safely"
+                );
+                continue;
+            }
+        };
+        let Ok(metadata) = file_handle.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        total_text_bytes = total_text_bytes.saturating_add(metadata.len());
+        let display_path =
+            relativize_workspace_path(&resolved.to_string_lossy(), Some(workspace_root));
+        let mut bytes = Vec::new();
+        let read_limit = remaining.min(metadata.len());
+        if file_handle
+            .by_ref()
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        remaining = remaining.saturating_sub(bytes.len() as u64);
+        display_paths.push(display_path.clone());
+        let text = String::from_utf8_lossy(&bytes);
+        prompt_body.push_str("\n\n--- ");
+        prompt_body.push_str(&display_path);
+        prompt_body.push_str(" ---\n");
+        prompt_body.push_str(&text);
+    }
+
+    if total_text_bytes <= SPAWN_ONLY_SUMMARY_MIN_BYTES || prompt_body.trim().is_empty() {
+        return None;
+    }
+
+    Some(SpawnOnlySummarySource {
+        prompt_body,
+        display_paths,
+    })
+}
+
+async fn build_spawn_only_auto_summary_message(
+    llm: Arc<dyn LlmProvider>,
+    tool_name: &str,
+    files: &[String],
+    workspace_root: Option<&Path>,
+) -> Option<String> {
+    let source = collect_spawn_only_summary_source(files, workspace_root)?;
+    let messages = vec![
+        Message::system(
+            "Summarize generated tool output for future assistant context. \
+             Write 200-300 words when the content supports it, stay under \
+             300 words, be factual, and do not include a preamble.",
+        ),
+        Message::user(format!(
+            "Tool `{tool_name}` produced these output files. Summarize the useful \
+             findings, decisions, and artifact contents so a later turn can refer \
+             to them without rereading the full file.\n{}",
+            source.prompt_body
+        )),
+    ];
+    let response = match llm
+        .chat(
+            &messages,
+            &[],
+            &ChatConfig {
+                max_tokens: Some(SPAWN_ONLY_SUMMARY_MAX_OUTPUT_TOKENS),
+                temperature: Some(0.0),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(
+                tool = %tool_name,
+                error = %error,
+                "spawn_only auto-summary generation failed"
+            );
+            return None;
+        }
+    };
+    let summary = response.content.unwrap_or_default();
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return None;
+    }
+
+    let path_hint = match source.display_paths.as_slice() {
+        [path] => format!("Full output at {path}; call `read_file` to inspect."),
+        paths => format!(
+            "Full outputs at {}; call `read_file` to inspect.",
+            paths.join(", ")
+        ),
+    };
+    Some(format!(
+        "`{tool_name}` summary:\n{summary}\n\n({path_hint})"
+    ))
+}
+
 /// Strip the workspace prefix from an absolute path, returning a
 /// workspace-relative path string. Falls back to the original path if it
 /// cannot be relativised (already-relative input, different root, or no
@@ -119,7 +379,14 @@ fn relativize_workspace_path(path: &str, workspace_root: Option<&std::path::Path
     let abs = std::path::Path::new(path);
     match abs.strip_prefix(root) {
         Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => path.to_string(),
+        Err(_) => {
+            if let (Ok(abs), Ok(root)) = (abs.canonicalize(), root.canonicalize()) {
+                if let Ok(rel) = abs.strip_prefix(root) {
+                    return rel.to_string_lossy().into_owned();
+                }
+            }
+            path.to_string()
+        }
     }
 }
 
@@ -196,6 +463,7 @@ impl Agent {
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
     ) -> JoinHandle<ToolCallResult> {
         // Clone Arc-wrapped fields so the spawned task is 'static
+        let llm = self.llm.clone();
         let tools = self.tools.clone();
         let reporter = self.reporter();
         let hooks = self.hooks.clone();
@@ -401,6 +669,7 @@ impl Agent {
                     "running spawn_only tool in background"
                 );
                 let bg_tools = tools.clone();
+                let bg_llm = llm.clone();
                 let bg_name = tc_name.clone();
                 let bg_args = effective_args.clone();
                 let bg_sender = tools.background_result_sender();
@@ -751,34 +1020,46 @@ impl Agent {
                                         // otherwise we'd suppress the file-list
                                         // bubble and the user would see no
                                         // signal that the task completed.
-                                        let already_sent_summary = !r.output.trim().is_empty();
-                                        if !already_sent_summary {
-                                            if let Some(ref sender) = bg_sender {
-                                                if let Some(produced_msg) =
+                                        if let Some(ref sender) = bg_sender {
+                                            let auto_summary =
+                                                if bg_tools.spawn_only_auto_summarize(&bg_name) {
+                                                    build_spawn_only_auto_summary_message(
+                                                        bg_llm.clone(),
+                                                        &bg_name,
+                                                        &output_files,
+                                                        bg_tools.workspace_root(),
+                                                    )
+                                                    .await
+                                                } else {
+                                                    None
+                                                };
+                                            let already_sent_summary = !r.output.trim().is_empty();
+                                            let followup_msg = auto_summary.or_else(|| {
+                                                if already_sent_summary {
+                                                    None
+                                                } else {
                                                     build_spawn_only_produced_files_message(
                                                         &bg_name,
                                                         &output_files,
                                                         bg_tools.workspace_root(),
                                                     )
-                                                {
-                                                    let _ =
-                                                        sender(BackgroundResultPayload {
-                                                            task_label: bg_name.clone(),
-                                                            content: produced_msg,
-                                                            kind:
-                                                                BackgroundResultKind::Notification,
-                                                            media: vec![],
-                                                            envelope_media: vec![],
-                                                            originating_thread_id:
-                                                                bg_originating_thread_id.clone(),
-                                                            task_id: Some(task_id.clone()),
-                                                            originating_client_message_id:
-                                                                bg_originating_client_message_id
-                                                                    .clone(),
-                                                            tool_call_id: Some(bg_tc_id.clone()),
-                                                        })
-                                                        .await;
                                                 }
+                                            });
+                                            if let Some(produced_msg) = followup_msg {
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: produced_msg,
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: vec![],
+                                                    envelope_media: vec![],
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
+                                                    task_id: Some(task_id.clone()),
+                                                    originating_client_message_id:
+                                                        bg_originating_client_message_id.clone(),
+                                                    tool_call_id: Some(bg_tc_id.clone()),
+                                                })
+                                                .await;
                                             }
                                         }
                                     } else {
@@ -1240,17 +1521,35 @@ impl Agent {
                                                 // LLM loses its stable
                                                 // filename reference for the
                                                 // next turn.
+                                                let auto_summary = if bg_tools
+                                                    .spawn_only_auto_summarize(&bg_name)
+                                                {
+                                                    build_spawn_only_auto_summary_message(
+                                                        bg_llm.clone(),
+                                                        &bg_name,
+                                                        &sent_files,
+                                                        bg_tools.workspace_root(),
+                                                    )
+                                                    .await
+                                                } else {
+                                                    None
+                                                };
                                                 let already_sent_summary =
                                                     !r.output.trim().is_empty();
-                                                if !already_sent_summary {
-                                                    if let Some(produced_msg) =
+                                                let followup_msg = auto_summary.or_else(|| {
+                                                    if already_sent_summary {
+                                                        None
+                                                    } else {
                                                         build_spawn_only_produced_files_message(
                                                             &bg_name,
                                                             &sent_files,
                                                             bg_tools.workspace_root(),
                                                         )
-                                                    {
-                                                        let _ = sender(BackgroundResultPayload {
+                                                    }
+                                                });
+                                                if let Some(produced_msg) = followup_msg {
+                                                    let _ =
+                                                        sender(BackgroundResultPayload {
                                                             task_label: bg_name.clone(),
                                                             content: produced_msg,
                                                             kind:
@@ -1266,7 +1565,6 @@ impl Agent {
                                                             tool_call_id: Some(bg_tc_id.clone()),
                                                         })
                                                         .await;
-                                                    }
                                                 }
                                             }
                                         }
@@ -1973,9 +2271,63 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 #[cfg(test)]
 mod tests {
     use super::{
-        build_spawn_only_produced_files_message, relativize_workspace_path,
-        satisfied_completion_content, should_auto_send_tool_files,
+        SPAWN_ONLY_SUMMARY_MAX_OUTPUT_TOKENS, build_spawn_only_auto_summary_message,
+        build_spawn_only_produced_files_message, collect_spawn_only_summary_source,
+        relativize_workspace_path, satisfied_completion_content, should_auto_send_tool_files,
     };
+    use async_trait::async_trait;
+    use octos_core::Message;
+    use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
+    use std::sync::{Arc, Mutex};
+
+    struct SummaryProvider {
+        reply: String,
+        calls: Mutex<Vec<(Vec<Message>, ChatConfig)>>,
+    }
+
+    impl SummaryProvider {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SummaryProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((messages.to_vec(), config.clone()));
+            Ok(ChatResponse {
+                content: Some(self.reply.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            "summary-provider-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
 
     #[test]
     fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
@@ -2063,6 +2415,110 @@ mod tests {
         // No file content sentinels.
         assert!(!msg.contains("LLM synthesis"));
         assert!(!msg.contains("# Deep Research:"));
+    }
+
+    #[tokio::test]
+    async fn auto_summary_message_reads_large_workspace_text_with_bounded_llm_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let report_dir = workspace.join("reports");
+        std::fs::create_dir_all(&report_dir).unwrap();
+        let report = report_dir.join("deep_search.md");
+        std::fs::write(
+            &report,
+            format!(
+                "# Deep Search\n\nALPHA_SENTINEL {}\n",
+                "body ".repeat(1_200)
+            ),
+        )
+        .unwrap();
+
+        let provider = Arc::new(SummaryProvider::new(
+            "Alpha finding, beta decision, and gamma artifact are ready.",
+        ));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let msg = build_spawn_only_auto_summary_message(
+            llm,
+            "deep_search",
+            &[report.to_string_lossy().into_owned()],
+            Some(&workspace),
+        )
+        .await
+        .expect("large text output should produce a summary follow-up");
+
+        assert!(msg.starts_with("`deep_search` summary:\n"), "got: {msg}");
+        assert!(msg.contains("Alpha finding, beta decision"), "got: {msg}");
+        assert!(
+            msg.contains("(Full output at reports/deep_search.md; call `read_file` to inspect.)"),
+            "got: {msg}"
+        );
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1.max_tokens,
+            Some(SPAWN_ONLY_SUMMARY_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(calls[0].1.temperature, Some(0.0));
+        assert!(
+            calls[0]
+                .0
+                .iter()
+                .any(|m| m.content.contains("ALPHA_SENTINEL")),
+            "summary prompt must include bounded file content"
+        );
+    }
+
+    #[test]
+    fn auto_summary_source_requires_more_than_four_kb_of_text_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let small = workspace.join("small.md");
+        std::fs::write(&small, "too small").unwrap();
+        let binary = workspace.join("voice.mp3");
+        std::fs::write(&binary, "X".repeat(8_000)).unwrap();
+
+        assert!(
+            collect_spawn_only_summary_source(
+                &[small.to_string_lossy().into_owned()],
+                Some(&workspace)
+            )
+            .is_none(),
+            "small text output must not spend a summary LLM call"
+        );
+        assert!(
+            collect_spawn_only_summary_source(
+                &[binary.to_string_lossy().into_owned()],
+                Some(&workspace)
+            )
+            .is_none(),
+            "binary/non-text extensions must be skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_summary_source_rejects_symlinked_parent_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("report.md"), "outside ".repeat(1_000)).unwrap();
+        symlink(&outside, workspace.join("linked")).unwrap();
+        let linked_report = workspace.join("linked/report.md");
+
+        assert!(
+            collect_spawn_only_summary_source(
+                &[linked_report.to_string_lossy().into_owned()],
+                Some(&workspace)
+            )
+            .is_none(),
+            "auto-summary must not read through a symlinked workspace ancestor"
+        );
     }
 
     #[test]

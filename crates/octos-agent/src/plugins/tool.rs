@@ -2611,6 +2611,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         }
     }
@@ -2695,6 +2696,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -2742,6 +2744,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -2802,6 +2805,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -2850,6 +2854,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         // Plugin's work_dir mirrors the modern `runtime/session.rs`
@@ -2896,6 +2901,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
@@ -3028,6 +3034,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
@@ -3087,6 +3094,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-slides".into(), def, PathBuf::from("/bin/true"))
@@ -3214,6 +3222,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
@@ -3425,6 +3434,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-frame".into(), def, PathBuf::from("/bin/true"))
@@ -3470,6 +3480,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -3505,6 +3516,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -3536,6 +3548,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -3566,6 +3579,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -3604,6 +3618,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         }
     }
@@ -3941,6 +3956,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -3983,6 +3999,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -4028,6 +4045,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -4869,6 +4887,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         }
     }
@@ -5287,6 +5306,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -5375,6 +5395,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -5501,6 +5522,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool_out = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -5680,6 +5702,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))

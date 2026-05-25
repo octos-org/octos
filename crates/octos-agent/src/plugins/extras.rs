@@ -39,6 +39,8 @@ pub struct SkillExtras {
     pub spawn_only_tools: Vec<String>,
     /// Custom messages per spawn_only tool.
     pub spawn_only_messages: std::collections::HashMap<String, String>,
+    /// spawn_only tools opted into bounded file summary follow-ups.
+    pub spawn_only_auto_summarize: Vec<String>,
 }
 
 /// Resolve manifest extras against the skill directory.

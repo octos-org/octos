@@ -153,6 +153,8 @@ pub struct ToolRegistry {
     spawn_only: HashSet<String>,
     /// Custom messages for spawn_only tools returned to the LLM after auto-backgrounding.
     spawn_only_messages: HashMap<String, String>,
+    /// spawn_only tools whose file outputs should be summarized into chat history.
+    spawn_only_auto_summarize: HashSet<String>,
     /// Callback to notify session actor when background (spawn_only) tasks complete or fail.
     background_result_sender: Option<super::spawn::BackgroundResultSender>,
     /// Supervisor for tracking background task lifecycle.
@@ -192,6 +194,7 @@ impl ToolRegistry {
             plugin_tools: HashSet::new(),
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
+            spawn_only_auto_summarize: HashSet::new(),
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -219,9 +222,21 @@ impl ToolRegistry {
         }
     }
 
+    /// Mark a spawn_only tool as opted in to file-summary follow-ups.
+    pub fn mark_spawn_only_auto_summarize(&mut self, name: &str) {
+        if self.spawn_only.contains(name) {
+            self.spawn_only_auto_summarize.insert(name.to_string());
+        }
+    }
+
     /// Check if a tool is marked spawn_only.
     pub fn is_spawn_only(&self, name: &str) -> bool {
         self.spawn_only.contains(name)
+    }
+
+    /// Check if a spawn_only tool requested file-summary follow-ups.
+    pub fn spawn_only_auto_summarize(&self, name: &str) -> bool {
+        self.spawn_only_auto_summarize.contains(name)
     }
 
     /// Clear all spawn_only markers so tools appear as regular tools.
@@ -230,6 +245,7 @@ impl ToolRegistry {
     pub fn clear_spawn_only(&mut self) {
         self.spawn_only.clear();
         self.spawn_only_messages.clear();
+        self.spawn_only_auto_summarize.clear();
         self.invalidate_cache();
     }
 
@@ -673,6 +689,8 @@ impl ToolRegistry {
         self.spawn_only.retain(|name| self.tools.contains_key(name));
         self.spawn_only_messages
             .retain(|name, _| self.tools.contains_key(name));
+        self.spawn_only_auto_summarize
+            .retain(|name| self.tools.contains_key(name));
         // Stale `deferred` entries are interior-mutable; lock and prune
         // here so a subsequent `activate(...)` cannot resurrect a tool
         // that policy has already removed.
@@ -825,6 +843,7 @@ impl ToolRegistry {
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
+            spawn_only_auto_summarize: self.spawn_only_auto_summarize.clone(),
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
