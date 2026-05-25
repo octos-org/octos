@@ -9,6 +9,7 @@ use chrono::Utc;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use octos_core::{InboundMessage, OutboundMessage};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -142,7 +143,7 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
         .join(",");
 
     // Collect parsed emails first, then drop the stream to release session borrow.
-    let mut parsed_emails: Vec<(String, String, String)> = Vec::new();
+    let mut parsed_emails: Vec<ParsedEmailMessage> = Vec::new();
     {
         let mut messages = session
             .fetch(&seq_set, "RFC822")
@@ -173,11 +174,21 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
 
             let from = extract_header(&parsed, "From").unwrap_or_default();
             let subject = extract_header(&parsed, "Subject").unwrap_or_default();
+            let message_id = extract_header(&parsed, "Message-ID");
+            let in_reply_to = extract_header(&parsed, "In-Reply-To");
+            let references = extract_header(&parsed, "References");
             let mut text_body = extract_text_body(&parsed).unwrap_or_default();
             octos_core::truncate_utf8(&mut text_body, config.max_body_chars, "...");
 
             if !text_body.is_empty() {
-                parsed_emails.push((from, subject, text_body));
+                parsed_emails.push(ParsedEmailMessage {
+                    from,
+                    subject,
+                    message_id,
+                    in_reply_to,
+                    references,
+                    text_body,
+                });
             }
         }
     }
@@ -189,26 +200,8 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
 
     // Send parsed emails as inbound messages
     let mut count = 0;
-    for (from, subject, text_body) in parsed_emails {
-        let sender_email = extract_email_address(&from);
-
-        let content = if subject.is_empty() {
-            text_body
-        } else {
-            format!("[Subject: {subject}]\n{text_body}")
-        };
-
-        let inbound = InboundMessage {
-            channel: "email".into(),
-            sender_id: sender_email.clone(),
-            chat_id: sender_email,
-            content,
-            timestamp: Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({ "subject": subject }),
-            message_id: None,
-        };
-
+    for parsed_email in parsed_emails {
+        let inbound = build_inbound_message(parsed_email);
         if tx.send(inbound).await.is_err() {
             break;
         }
@@ -216,6 +209,125 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
     }
 
     Ok(count)
+}
+
+struct ParsedEmailMessage {
+    from: String,
+    subject: String,
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    text_body: String,
+}
+
+fn build_inbound_message(parsed: ParsedEmailMessage) -> InboundMessage {
+    let ParsedEmailMessage {
+        from,
+        subject,
+        message_id,
+        in_reply_to,
+        references,
+        text_body,
+    } = parsed;
+
+    let sender_email = extract_email_address(&from);
+    let topic = email_thread_topic(
+        &subject,
+        message_id.as_deref(),
+        in_reply_to.as_deref(),
+        references.as_deref(),
+    );
+
+    let content = if subject.is_empty() {
+        text_body
+    } else {
+        format!("[Subject: {subject}]\n{text_body}")
+    };
+
+    InboundMessage {
+        channel: "email".into(),
+        sender_id: sender_email.clone(),
+        chat_id: sender_email,
+        content,
+        timestamp: Utc::now(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "subject": subject,
+            "topic": topic.clone(),
+            "email_thread_key": topic,
+            "email_message_id": message_id.clone(),
+            "in_reply_to": in_reply_to.clone(),
+            "references": references.clone(),
+        }),
+        message_id,
+    }
+}
+
+fn email_thread_topic(
+    subject: &str,
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> String {
+    let normalized_subject = normalize_subject(subject);
+    let basis = if normalized_subject.is_empty() {
+        references
+            .and_then(first_message_id)
+            .or_else(|| in_reply_to.and_then(first_message_id))
+            .or_else(|| message_id.and_then(first_message_id))
+            .map(|id| format!("message-id:{id}"))
+            .unwrap_or_else(|| "untitled".to_string())
+    } else {
+        format!("subject:{normalized_subject}")
+    };
+    let digest = Sha256::digest(basis.as_bytes());
+    let hex = format!("{digest:x}");
+    format!("email-thread-{}", &hex[..12])
+}
+
+fn normalize_subject(subject: &str) -> String {
+    let mut value = subject.trim();
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let Some(rest) = lower
+            .strip_prefix("re:")
+            .or_else(|| lower.strip_prefix("fw:"))
+            .or_else(|| lower.strip_prefix("fwd:"))
+        else {
+            break;
+        };
+        let prefix_len = value.len() - rest.len();
+        value = value[prefix_len..].trim_start();
+    }
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_message_id(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .find_map(clean_message_id)
+        .or_else(|| clean_message_id(value))
+}
+
+fn clean_message_id(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_matches(',');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(start) = trimmed.find('<') {
+        if let Some(end) = trimmed[start + 1..].find('>') {
+            let id = trimmed[start + 1..start + 1 + end].trim();
+            if !id.is_empty() {
+                return Some(id.to_ascii_lowercase());
+            }
+        }
+    }
+    Some(
+        trimmed
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_ascii_lowercase(),
+    )
 }
 
 /// Send an email via SMTP with lettre.
@@ -309,5 +421,95 @@ mod tests {
             extract_email_address("<bob@example.com>"),
             "bob@example.com"
         );
+    }
+
+    #[test]
+    fn test_email_thread_topic_separates_subjects() {
+        let invoice = build_test_inbound("Quarterly invoice", Some("<a@example.test>"));
+        let support = build_test_inbound("Support follow-up", Some("<b@example.test>"));
+
+        assert_eq!(invoice.chat_id, "sender@example.com");
+        assert_eq!(support.chat_id, "sender@example.com");
+        assert_ne!(
+            invoice.metadata["topic"], support.metadata["topic"],
+            "different email subjects from the same sender must not share one session"
+        );
+        assert_ne!(
+            routed_email_session_key(&invoice),
+            routed_email_session_key(&support)
+        );
+    }
+
+    #[test]
+    fn test_email_thread_topic_normalizes_reply_subjects() {
+        let original = build_test_inbound("Incident 42", Some("<orig@example.test>"));
+        let reply = build_test_inbound("Re: Incident   42", Some("<reply@example.test>"));
+
+        assert_eq!(original.metadata["topic"], reply.metadata["topic"]);
+        assert_eq!(
+            routed_email_session_key(&original),
+            routed_email_session_key(&reply)
+        );
+    }
+
+    #[test]
+    fn test_email_thread_topic_uses_message_id_without_subject() {
+        let first = build_test_inbound("", Some("<first@example.test>"));
+        let second = build_test_inbound("", Some("<second@example.test>"));
+
+        assert_ne!(first.metadata["topic"], second.metadata["topic"]);
+        assert_ne!(
+            routed_email_session_key(&first),
+            routed_email_session_key(&second)
+        );
+    }
+
+    #[test]
+    fn test_email_thread_topic_uses_references_for_subjectless_replies() {
+        let original = build_test_inbound("", Some("<root@example.test>"));
+        let reply = build_inbound_message(ParsedEmailMessage {
+            from: "Sender <sender@example.com>".into(),
+            subject: String::new(),
+            message_id: Some("<reply@example.test>".into()),
+            in_reply_to: Some("<root@example.test>".into()),
+            references: Some("<root@example.test> <middle@example.test>".into()),
+            text_body: "reply body".into(),
+        });
+
+        assert_eq!(original.metadata["topic"], reply.metadata["topic"]);
+        assert_eq!(
+            routed_email_session_key(&original),
+            routed_email_session_key(&reply)
+        );
+    }
+
+    #[test]
+    fn test_email_thread_topic_is_gateway_safe() {
+        let msg = build_test_inbound(
+            "default: / # control\n subject with enough words to overflow any readable topic label",
+            Some("<safe@example.test>"),
+        );
+        let topic = msg.metadata["topic"].as_str().unwrap();
+
+        assert!(topic.starts_with("email-thread-"));
+        assert!(topic.len() <= 50);
+        assert!(!topic.chars().any(|c| matches!(c, '#' | ':' | '/')));
+        assert!(!topic.chars().any(char::is_control));
+    }
+
+    fn build_test_inbound(subject: &str, message_id: Option<&str>) -> InboundMessage {
+        build_inbound_message(ParsedEmailMessage {
+            from: "Sender <sender@example.com>".into(),
+            subject: subject.into(),
+            message_id: message_id.map(String::from),
+            in_reply_to: None,
+            references: None,
+            text_body: "body".into(),
+        })
+    }
+
+    fn routed_email_session_key(msg: &InboundMessage) -> octos_core::SessionKey {
+        let topic = msg.metadata["topic"].as_str().unwrap();
+        octos_core::SessionKey::with_topic(&msg.channel, &msg.chat_id, topic)
     }
 }
