@@ -5,6 +5,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::HardwareLifecycle;
 
+/// How the skill exposes its tools to the agent.
+///
+/// `Static` (default) means tools are enumerated in `PluginManifest.tools`
+/// and dispatched via the plugin binary protocol. `Http` means the agent
+/// should call `GET <base_url>/tools` at install time to discover tools,
+/// then dispatch each call as `POST <base_url>/tools/<tool_name>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDiscovery {
+    /// Existing behaviour — tools enumerated in `manifest.tools`.
+    #[default]
+    Static,
+    /// Pull the tool list from `<base_url>/tools` at install time.
+    /// SSRF: the loader will reject any `base_url` that does not resolve
+    /// to a loopback address (127.0.0.0/8 or ::1).
+    Http {
+        /// Bridge HTTP root, e.g. `http://localhost:8765`.
+        base_url: String,
+    },
+}
+
 /// The type of plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use octos_plugin::{HardwareLifecycle, ToolDiscovery};
 use serde::{Deserialize, Deserializer};
 
 /// A plugin manifest (manifest.json).
@@ -43,6 +44,16 @@ pub struct PluginManifest {
     /// Prompt fragments to inject into the system prompt.
     #[serde(default)]
     pub prompts: Option<SkillPrompts>,
+    /// Optional hardware lifecycle (preflight / init / ready_check /
+    /// shutdown / emergency_shutdown). Executed by the skill installer
+    /// when present. Skills without hardware (most app skills) omit this.
+    #[serde(default)]
+    pub hardware_lifecycle: Option<HardwareLifecycle>,
+    /// How this skill's tools are discovered. Defaults to `Static`
+    /// (enumerated in `tools`); `Http` triggers dynamic discovery from
+    /// a localhost bridge.
+    #[serde(default)]
+    pub tool_discovery: ToolDiscovery,
 }
 
 impl PluginManifest {
@@ -841,5 +852,64 @@ mod tests {
             def_with_concurrency(Some("   ")).classify_concurrency_class(),
             ConcurrencyClassClassification::Unset
         );
+    }
+
+    #[test]
+    fn hardware_lifecycle_optional_absent_means_none() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0"
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.hardware_lifecycle.is_none());
+    }
+
+    #[test]
+    fn hardware_lifecycle_parses_when_present() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0",
+            "hardware_lifecycle": {
+                "init": [
+                    {"label": "start dataflow", "command": "echo start", "timeout_secs": 10}
+                ],
+                "shutdown": [
+                    {"label": "stop dataflow", "command": "echo stop", "timeout_secs": 5}
+                ]
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        let lc = manifest
+            .hardware_lifecycle
+            .expect("lifecycle should be present");
+        assert_eq!(lc.init.len(), 1);
+        assert_eq!(lc.init[0].label, "start dataflow");
+        assert_eq!(lc.shutdown.len(), 1);
+    }
+
+    #[test]
+    fn tool_discovery_defaults_to_static() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0"
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(matches!(manifest.tool_discovery, ToolDiscovery::Static));
+    }
+
+    #[test]
+    fn tool_discovery_http_parses() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0",
+            "tool_discovery": {"type": "http", "base_url": "http://localhost:8765"}
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        match manifest.tool_discovery {
+            ToolDiscovery::Http { base_url } => {
+                assert_eq!(base_url, "http://localhost:8765");
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
     }
 }

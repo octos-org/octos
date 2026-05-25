@@ -309,6 +309,8 @@ mod tests {
             mcp_servers: vec![],
             hooks: vec![],
             prompts: None,
+            hardware_lifecycle: None,
+            tool_discovery: octos_plugin::ToolDiscovery::Static,
         };
         let extras = resolve_extras(&manifest, Path::new("/skills/test"));
         assert!(extras.mcp_servers.is_empty());
@@ -337,6 +339,8 @@ mod tests {
             prompts: Some(SkillPrompts {
                 include: vec!["prompts/*.md".into()],
             }),
+            hardware_lifecycle: None,
+            tool_discovery: octos_plugin::ToolDiscovery::Static,
         };
         let extras = resolve_extras(&manifest, dir.path());
         assert_eq!(extras.prompt_fragments.len(), 2);
