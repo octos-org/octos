@@ -136,6 +136,37 @@ pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persis
 /// the message — only the wire event the connected client observes flips.
 pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1";
 
+/// Feature flag for the explicit `file/attached` envelope (UPCR-2026-014
+/// M9-α-9).
+///
+/// Surfaces a dedicated, dedicated-shape notification per artefact path
+/// when a `spawn_only` background tool (`mofa_slides`, `podcast_generate`,
+/// `fm_tts`, `deep_search`) — or any code path that drains a
+/// `BackgroundResultPayload` with non-empty `media` / `envelope_media` —
+/// commits to the canonical session ledger. Mirrors the per-file media
+/// already carried on `message/persisted` and `turn/spawn_complete`, but
+/// as an isolated wire signal so SPA reducers (and admin / debug
+/// clients) can subscribe to file deliveries without parsing the
+/// content-bearing envelopes.
+///
+/// The fan-out is best-effort and additive: when no client has
+/// negotiated this capability the helper still appends the envelope to
+/// the ledger (subscribers + replay buffers continue to observe), but
+/// the dedicated per-connection wire filter drops the frame so legacy
+/// clients see no behaviour change. Clients that advertise this
+/// capability receive a `file/attached` per artefact in addition to the
+/// existing `message/persisted` / `turn/spawn_complete` envelopes.
+///
+/// Wired by the AppUI WS path's `BackgroundResultSender` closure (see
+/// `ui_protocol.rs::install_message_commit_observer` adjacent helpers)
+/// after each background result row commits. The notification's
+/// `(turn_id, path)` pair gives the SPA an authoritative placement
+/// signal even when `turn/spawn_complete`'s richer envelope is delayed
+/// or lost to a wire-level filter mismatch — the exact failure mode
+/// captured by the slides soak (2026-05-24, 5/8 successful generations
+/// produced PPTX bytes but 0/8 surfaced a clickable button on the SPA).
+pub const UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1: &str = "event.file_attached.v1";
+
 /// Feature flag for UPCR-2026-014 M9-γ canonical projection envelope.
 ///
 /// Capability-gated — servers advertise it only when they emit the
@@ -211,6 +242,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -5930,6 +5962,7 @@ mod tests {
                     "state.turn_state_get.v1",
                     "event.message_persisted.v1",
                     "event.spawn_complete.v1",
+                    "event.file_attached.v1",
                     "projection.envelope.v1",
                     "auxiliary.rest_to_ws.v1",
                     "coding.autonomy.v1",

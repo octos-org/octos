@@ -47,15 +47,16 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
+    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
+    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
+    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
     approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
@@ -913,6 +914,15 @@ struct ConnectionUiFeatures {
     /// `message/persisted` shape is preserved and `turn/spawn_complete`
     /// is suppressed.
     spawn_complete: bool,
+    /// UPCR-2026-014 M9-α-9 `event.file_attached.v1` negotiated. When
+    /// set, the connection receives one `file/attached` envelope per
+    /// artefact delivered by a `spawn_only` background tool — a
+    /// dedicated wire signal that runs alongside (not replacing) the
+    /// `message/persisted` / `turn/spawn_complete` media carriers.
+    /// Defensive against the slides soak (2026-05-24) failure mode
+    /// where the richer envelopes' placement logic dropped PPTX
+    /// deliveries on the SPA's chat thread.
+    file_attached: bool,
     /// M12 Phase D-1 `auxiliary.rest_to_ws.v1` negotiated. Unlocks the
     /// thirteen auxiliary JSON-RPC methods (`session/list`,
     /// `session/snapshot`, `session/messages_page`, `session/status.get`,
@@ -986,6 +996,7 @@ impl ConnectionUiFeatures {
                 UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             ),
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
+            file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             auxiliary_rest_to_ws_v1: has_ui_feature(
                 headers,
                 query,
@@ -1034,6 +1045,7 @@ impl ConnectionUiFeatures {
             turn_state_get: true,
             message_persisted: true,
             spawn_complete: true,
+            file_attached: true,
             auxiliary_rest_to_ws_v1: true,
             coding_autonomy_v1: true,
             coding_agent_control_v1: true,
@@ -1068,6 +1080,7 @@ impl ConnectionUiFeatures {
             turn_state_get: has(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
             message_persisted: has(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
+            file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
             coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
@@ -1123,6 +1136,9 @@ impl ConnectionUiFeatures {
         }
         if self.spawn_complete {
             requested.push(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1);
+        }
+        if self.file_attached {
+            requested.push(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1);
         }
         if self.auxiliary_rest_to_ws_v1 {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
@@ -7744,6 +7760,15 @@ fn live_event_passes_capability_filter(
             if matches!(event.source, MessagePersistedSource::Background) {
                 return false;
             }
+        }
+    }
+    // UPCR-2026-014 M9-α-9: `event.file_attached.v1` gate. Old clients
+    // never see the new `file/attached` envelope — they keep relying on
+    // `media` on `message/persisted` / `turn/spawn_complete`. New
+    // clients see `file/attached` as an additional dedicated signal.
+    if !features.file_attached {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_)) = event {
+            return false;
         }
     }
     true
@@ -15372,9 +15397,34 @@ async fn run_standalone_turn(
                             },
                             persisted_at: Utc::now(),
                             content: content_text,
-                            media: envelope_media,
+                            media: envelope_media.clone(),
                         };
                         ledger.append_notification(UiNotification::TurnSpawnComplete(event));
+
+                        // UPCR-2026-014 M9-α-9: emit one `file/attached`
+                        // envelope per delivered artefact in addition to
+                        // the content-bearing envelopes above. Clients
+                        // that negotiated `event.file_attached.v1`
+                        // receive a dedicated wire signal per file —
+                        // independent of the `turn/spawn_complete` /
+                        // `message/persisted` placement heuristics —
+                        // and can render a download button without
+                        // having to parse the rich envelope. The slides
+                        // soak (2026-05-24) captured PPTX artefacts on
+                        // disk that never surfaced a clickable button
+                        // on the SPA; the redundant signal closes that
+                        // gap. Helper retains the legacy guard against
+                        // empty media (no-op when both lists are
+                        // empty), so this stays cheap on text-only
+                        // background completions.
+                        super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                            &ledger,
+                            &session_id,
+                            &turn_id,
+                            &media,
+                            &envelope_media,
+                            originating_tool_call_id.clone(),
+                        );
                     } else if task_id_clean.is_none() {
                         // Best-effort: a payload without `task_id` (or
                         // with the empty-string sentinel returned by
@@ -15389,6 +15439,23 @@ async fn run_standalone_turn(
                             task_label,
                             had_empty_task_id = task_id.as_deref() == Some(""),
                             "background result missing task_id; turn/spawn_complete suppressed"
+                        );
+                        // UPCR-2026-014 M9-α-9: the `turn/spawn_complete`
+                        // envelope was suppressed (no task_id) but a
+                        // file delivery still happened. Surface
+                        // `file/attached` so dual-negotiated clients
+                        // can still render a download button — old
+                        // clients fall back to the legacy
+                        // `message/persisted` row with `media`. Without
+                        // this, an envelope-only-negotiating client
+                        // sees nothing for the file.
+                        super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                            &ledger,
+                            &session_id,
+                            &turn_id,
+                            &media,
+                            &envelope_media,
+                            originating_tool_call_id.clone(),
                         );
                     } else {
                         // Persist of the spawn-ack/completion row failed.
@@ -21297,6 +21364,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -21356,6 +21424,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -21460,6 +21529,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -21519,6 +21589,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -21571,6 +21642,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -21666,6 +21738,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -23451,6 +23524,7 @@ ignore = []
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                file_attached: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -28424,6 +28498,34 @@ ignore = []
         }
     }
 
+    /// Build a `ConnectionUiFeatures` for the UPCR-2026-014 M9-α-9
+    /// `event.file_attached.v1` capability gate. Independent of the
+    /// message_persisted / spawn_complete flags so old clients and
+    /// new-shape-only clients can both be modelled.
+    fn features_for_file_attached_test(file_attached: bool) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            file_attached,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Slides soak regression: build a representative `file/attached`
+    /// notification carrying a PPTX artefact and the expected MIME hint.
+    /// Used by the capability-gate tests to assert legacy clients never
+    /// see the new envelope and new clients always do.
+    fn file_attached_for(session: &SessionKey) -> UiNotification {
+        UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+            session_id: session.clone(),
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: Some("tc-slides".into()),
+            mime: Some(
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation".into(),
+            ),
+        })
+    }
+
     fn context_state_for_test(session: &SessionKey) -> UiContextState {
         UiContextState {
             session_id: session.clone(),
@@ -28837,6 +28939,49 @@ ignore = []
         assert!(
             live_event_passes_capability_filter(&regular, new),
             "non-background message/persisted must still flow to new clients",
+        );
+    }
+
+    /// UPCR-2026-014 M9-α-9 `event.file_attached.v1` capability gate.
+    /// Old clients that never advertised the feature MUST NOT receive
+    /// `file/attached` envelopes — they keep relying on `media` on
+    /// `message/persisted` / `turn/spawn_complete`. New clients that
+    /// negotiated the feature MUST receive the dedicated envelope so
+    /// the slides soak's "PPTX on disk but no button on SPA" regression
+    /// can be closed by a redundant wire signal.
+    #[test]
+    fn capability_filter_routes_file_attached_gating() {
+        let session = SessionKey("local:file-attached-gate".into());
+        let file_attached = UiProtocolLedgerEvent::Notification(file_attached_for(&session));
+
+        // Old client: never observe the new envelope.
+        let old = features_for_file_attached_test(false);
+        assert!(
+            !live_event_passes_capability_filter(&file_attached, old),
+            "clients without event.file_attached.v1 must not receive file/attached envelopes",
+        );
+
+        // New client: receive the envelope.
+        let new = features_for_file_attached_test(true);
+        assert!(
+            live_event_passes_capability_filter(&file_attached, new),
+            "clients with event.file_attached.v1 receive the per-artefact envelope",
+        );
+
+        // Independence from spawn_complete: a new client that
+        // negotiated ONLY file_attached (no message_persisted, no
+        // spawn_complete) still sees the file delivery. This matches
+        // the redundancy goal — file_attached is the safety net for
+        // clients whose richer-envelope reducers might drop the
+        // delivery.
+        let only_file_attached = ConnectionUiFeatures {
+            file_attached: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        assert!(
+            live_event_passes_capability_filter(&file_attached, only_file_attached),
+            "file_attached gate is independent of spawn_complete / message_persisted",
         );
     }
 

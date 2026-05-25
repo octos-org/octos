@@ -138,6 +138,93 @@ pub(super) fn emit_file_attached(
     let _ = ledger.append_notification(notification);
 }
 
+/// Emit one `file/attached` envelope per delivered artefact when a
+/// `spawn_only` background tool's `BackgroundResultPayload` lands on
+/// the AppUI WS path.
+///
+/// Coalesces the payload's persist-media (`media`, lives on the
+/// `message/persisted` row) and envelope-only-media (`envelope_media`,
+/// surfaced on the `turn/spawn_complete` envelope) into a single
+/// deduplicated stream of paths — clients receive ONE `file/attached`
+/// per unique artefact regardless of which path source carried it. A
+/// path that appears in both sources still emits exactly one envelope.
+///
+/// Defensive against the production failure mode the slides soak
+/// captured (2026-05-24): PPTX artefacts that landed on disk and were
+/// verified by the workspace contract never surfaced a clickable
+/// button on the SPA because `turn/spawn_complete` and the
+/// `message/persisted` row's `media` field both required the SPA's
+/// content-bearing-envelope reducers to fire correctly. A dedicated
+/// per-file envelope is the redundant signal that keeps the user-
+/// visible delivery resilient against placement / sticky-thread bugs
+/// in those richer reducers.
+///
+/// Best-effort: ledger append failures are logged inside the ledger
+/// and do not propagate. Callers MUST run this after the persist /
+/// `turn/spawn_complete` block so the placement context (turn_id,
+/// session_id) is stable. No-op when both source lists are empty.
+pub(super) fn emit_files_attached_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    media: &[String],
+    envelope_media: &[String],
+    tool_call_id: Option<String>,
+) {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for path in media.iter().chain(envelope_media.iter()) {
+        if path.is_empty() {
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let mime = mime_from_path(path);
+        emit_file_attached(
+            ledger,
+            session_id,
+            turn_id,
+            path.clone(),
+            tool_call_id.clone(),
+            mime,
+        );
+    }
+}
+
+/// Lightweight extension-based MIME sniffer used by
+/// [`emit_files_attached_from_background`].
+///
+/// `file/attached` clients render attachments from the `mime` hint
+/// when present and fall back to extension parsing otherwise. We
+/// populate it with the artefact families the spawn_only producers
+/// actually emit — `.pptx`, `.html`, `.md`, `.mp3`, `.mp4`, `.png`,
+/// `.jpg`. Anything else returns `None` and clients fall back to
+/// extension-based rendering. We deliberately do NOT crack open the
+/// file (no I/O on the dispatch hot path); the wire shape is best-
+/// effort so extension drift is recovered by the client.
+fn mime_from_path(path: &str) -> Option<String> {
+    let lower = path.to_lowercase();
+    let suffix = lower.rsplit('.').next()?;
+    let mime = match suffix {
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "html" | "htm" => "text/html",
+        "md" | "markdown" => "text/markdown",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => return None,
+    };
+    Some(mime.to_owned())
+}
+
 /// Bridge a legacy `/api/sessions/:id/events/stream` SSE frame onto the
 /// WS surface as a `session/event.v1` envelope.
 ///
@@ -466,6 +553,165 @@ mod tests {
         assert!(
             sub_b.try_recv().is_err(),
             "α-9 envelopes must NOT cross-deliver to other session subscribers"
+        );
+    }
+
+    /// Slides soak regression — `emit_files_attached_from_background`
+    /// emits one envelope per unique path across the persist-media and
+    /// envelope-only-media lists. Deduplicates paths that appear in
+    /// both lists so dual-negotiated clients receive ONE button per
+    /// artefact regardless of which carrier brought it.
+    #[test]
+    fn should_emit_one_file_attached_per_unique_artefact_path() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-slides-soak");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        // Slides Satisfied path: persist-media carries the deck, envelope
+        // path inherits the same list (see api/ui_protocol.rs
+        // envelope_media fallback). Soak captured this exact shape.
+        let media = vec![
+            "/Users/cloud/.octos/profiles/dspfac/data/slides/deck-soak/output/deck.pptx"
+                .to_string(),
+        ];
+        let envelope_media = media.clone();
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &media,
+            &envelope_media,
+            Some("tc-slides-soak".into()),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(payload),
+            ) = &event.event
+            {
+                envelopes.push(payload.clone());
+            }
+        }
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "duplicate paths across media + envelope_media collapse to one envelope"
+        );
+        assert_eq!(envelopes[0].path, media[0]);
+        assert_eq!(envelopes[0].tool_call_id.as_deref(), Some("tc-slides-soak"));
+        assert_eq!(
+            envelopes[0].mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "PPTX extension lifts to the canonical OOXML MIME"
+        );
+    }
+
+    /// Multi-artefact delivery (e.g. deep_research `_report.md` +
+    /// `outline.json`) emits one envelope per file, with stable order
+    /// matching the iteration order of the input slices. Empty entries
+    /// are filtered (defensive against producers that emit a sentinel
+    /// blank path).
+    #[test]
+    fn should_emit_envelope_per_distinct_path_filtering_blanks() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-multi-artefact");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        let media = vec![
+            "/tmp/report.md".to_string(),
+            "".to_string(), // blank sentinel — must be filtered
+            "/tmp/outline.json".to_string(),
+        ];
+        let envelope_media: Vec<String> = vec![];
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &media,
+            &envelope_media,
+            None,
+        );
+
+        let mut paths = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(payload),
+            ) = &event.event
+            {
+                paths.push(payload.path.clone());
+            }
+        }
+        assert_eq!(
+            paths,
+            vec![
+                "/tmp/report.md".to_string(),
+                "/tmp/outline.json".to_string()
+            ],
+            "blank entries filtered; ordering preserved"
+        );
+    }
+
+    /// No-op fast path — both source lists empty produces zero
+    /// envelopes. Text-only background completions (mofa_publish URL
+    /// emission, etc.) must NOT clutter the wire with empty
+    /// `file/attached` frames.
+    #[test]
+    fn should_not_emit_when_both_media_lists_empty() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-empty");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        emit_files_attached_from_background(&ledger, &session_id, &turn_id, &[], &[], None);
+
+        assert!(
+            subscriber.try_recv().is_err(),
+            "text-only background completions emit zero file/attached envelopes"
+        );
+    }
+
+    /// MIME sniffer table — covers the spawn_only artefact families
+    /// (`.pptx`, `.md`, `.mp3`, `.html`, image / video) and falls back
+    /// to None for unknown extensions so the client can do its own
+    /// detection.
+    #[test]
+    fn should_lift_known_extensions_to_canonical_mime_types() {
+        assert_eq!(
+            mime_from_path("/abs/path/deck.pptx").as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/REPORT.MD").as_deref(),
+            Some("text/markdown"),
+            "case-insensitive on extension"
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/podcast.mp3").as_deref(),
+            Some("audio/mpeg"),
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/page.html").as_deref(),
+            Some("text/html"),
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/page.htm").as_deref(),
+            Some("text/html"),
+            "htm alias maps to text/html"
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/something.xyz"),
+            None,
+            "unknown extensions fall back to None"
+        );
+        assert_eq!(
+            mime_from_path("noextension"),
+            None,
+            "files without extension fall back to None"
         );
     }
 }
