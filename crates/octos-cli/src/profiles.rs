@@ -479,6 +479,10 @@ pub struct GatewaySettingsPatch {
     pub browser_timeout_secs: PatchField<u64>,
     #[serde(default)]
     pub max_output_tokens: PatchField<u32>,
+    #[serde(default)]
+    pub watchdog_enabled: PatchField<bool>,
+    #[serde(default)]
+    pub alerts_enabled: PatchField<bool>,
 }
 
 /// Structured LLM contract for a profile.
@@ -786,6 +790,20 @@ impl GatewaySettingsPatch {
                 gateway.max_output_tokens = Some(max_output_tokens);
             }
         }
+        match self.watchdog_enabled {
+            PatchField::Absent => {}
+            PatchField::Clear => gateway.watchdog_enabled = None,
+            PatchField::Value(watchdog_enabled) => {
+                gateway.watchdog_enabled = Some(watchdog_enabled);
+            }
+        }
+        match self.alerts_enabled {
+            PatchField::Absent => {}
+            PatchField::Clear => gateway.alerts_enabled = None,
+            PatchField::Value(alerts_enabled) => {
+                gateway.alerts_enabled = Some(alerts_enabled);
+            }
+        }
     }
 }
 
@@ -1020,6 +1038,12 @@ pub struct GatewaySettings {
     /// Overrides the built-in default from model_limits.json.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Per-profile watchdog override. `None` inherits the system monitor default.
+    #[serde(default)]
+    pub watchdog_enabled: Option<bool>,
+    /// Per-profile alert override. `None` inherits the system monitor default.
+    #[serde(default)]
+    pub alerts_enabled: Option<bool>,
 }
 
 /// Manages profile storage as individual JSON files.

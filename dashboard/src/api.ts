@@ -15,6 +15,7 @@ import type {
   AllowlistEntry,
   SharedMetrics,
   MonitorStatus,
+  MonitorProfileStatus,
   SystemMetrics,
   PurgeReport,
 } from './types'
@@ -214,6 +215,15 @@ export const api = {
     request<{ ok: boolean; alerts_enabled: boolean }>('/monitor/alerts', {
       method: 'POST',
       body: JSON.stringify({ enabled }),
+    }),
+
+  updateProfileMonitor: (
+    id: string,
+    data: { watchdog?: 'inherit' | 'enabled' | 'disabled'; alerts?: 'inherit' | 'enabled' | 'disabled' },
+  ) =>
+    request<MonitorProfileStatus>(`/monitor/profiles/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     }),
 
   gatewayStatus: (id: string) =>

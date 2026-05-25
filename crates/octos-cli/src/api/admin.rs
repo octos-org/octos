@@ -1795,7 +1795,25 @@ fn task_row_to_input(
 
 // ── Monitor control endpoints ────────────────────────────────────────
 
-/// GET /api/admin/monitor/status — returns watchdog/alerts status.
+fn profile_monitor_status_json(
+    profile: UserProfile,
+    system_watchdog: bool,
+    system_alerts: bool,
+) -> serde_json::Value {
+    let watchdog_override = profile.config.gateway.watchdog_enabled;
+    let alerts_override = profile.config.gateway.alerts_enabled;
+    serde_json::json!({
+        "id": profile.id,
+        "name": profile.name,
+        "enabled": profile.enabled,
+        "watchdog_enabled": watchdog_override.unwrap_or(system_watchdog),
+        "watchdog_override": watchdog_override,
+        "alerts_enabled": alerts_override.unwrap_or(system_alerts),
+        "alerts_override": alerts_override,
+    })
+}
+
+/// GET /api/admin/monitor/status — returns system defaults plus profile overrides.
 pub async fn monitor_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1809,16 +1827,53 @@ pub async fn monitor_status(
         .as_ref()
         .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(false);
+    let profiles = if let Some(store) = state.profile_store.as_ref() {
+        store
+            .list()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .map(|profile| profile_monitor_status_json(profile, watchdog, alerts))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(serde_json::json!({
         "watchdog_enabled": watchdog,
         "alerts_enabled": alerts,
+        "profiles": profiles,
     })))
 }
 
 #[derive(Deserialize)]
 pub struct MonitorToggleRequest {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileMonitorOverrideRequest {
+    Inherit,
+    Enabled,
+    Disabled,
+}
+
+impl ProfileMonitorOverrideRequest {
+    fn as_option_bool(self) -> Option<bool> {
+        match self {
+            Self::Inherit => None,
+            Self::Enabled => Some(true),
+            Self::Disabled => Some(false),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ProfileMonitorUpdateRequest {
+    #[serde(default)]
+    pub watchdog: Option<ProfileMonitorOverrideRequest>,
+    #[serde(default)]
+    pub alerts: Option<ProfileMonitorOverrideRequest>,
 }
 
 /// POST /api/admin/monitor/watchdog — toggle watchdog.
@@ -1845,6 +1900,47 @@ pub async fn toggle_alerts(
     Ok(Json(
         serde_json::json!({ "ok": true, "alerts_enabled": req.enabled }),
     ))
+}
+
+/// POST /api/admin/monitor/profiles/:id — set per-profile monitor overrides.
+pub async fn update_profile_monitor(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ProfileMonitorUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let mut profile = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+
+    if let Some(watchdog) = req.watchdog {
+        profile.config.gateway.watchdog_enabled = watchdog.as_option_bool();
+    }
+    if let Some(alerts) = req.alerts {
+        profile.config.gateway.alerts_enabled = alerts.as_option_bool();
+    }
+    profile.updated_at = Utc::now();
+    store
+        .save(&profile)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let watchdog = state
+        .watchdog_enabled
+        .as_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+    let alerts = state
+        .alerts_enabled
+        .as_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+
+    Ok(Json(profile_monitor_status_json(profile, watchdog, alerts)))
 }
 
 // ── Skill management ─────────────────────────────────────────────────

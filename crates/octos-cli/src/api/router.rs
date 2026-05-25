@@ -446,6 +446,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/monitor/status", get(admin::monitor_status))
         .route("/api/admin/monitor/watchdog", post(admin::toggle_watchdog))
         .route("/api/admin/monitor/alerts", post(admin::toggle_alerts))
+        .route(
+            "/api/admin/monitor/profiles/{id}",
+            post(admin::update_profile_monitor),
+        )
         // Platform skills management
         .route(
             "/api/admin/platform-skills",

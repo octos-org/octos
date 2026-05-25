@@ -38,6 +38,15 @@ pub enum AdminAlert {
 }
 
 impl AdminAlert {
+    pub fn profile_id(&self) -> &str {
+        match self {
+            Self::GatewayExited { profile_id, .. }
+            | Self::ProfileDown { profile_id, .. }
+            | Self::WatchdogRestarted { profile_id, .. }
+            | Self::WatchdogGaveUp { profile_id, .. } => profile_id,
+        }
+    }
+
     /// Human-readable alert message.
     pub fn message(&self) -> String {
         match self {
@@ -68,6 +77,32 @@ impl AdminAlert {
             }
         }
     }
+}
+
+fn profile_watchdog_enabled(
+    profile_store: &ProfileStore,
+    profile_id: &str,
+    system_default: bool,
+) -> bool {
+    profile_store
+        .get(profile_id)
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.config.gateway.watchdog_enabled)
+        .unwrap_or(system_default)
+}
+
+fn profile_alerts_enabled(
+    profile_store: &ProfileStore,
+    profile_id: &str,
+    system_default: bool,
+) -> bool {
+    profile_store
+        .get(profile_id)
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.config.gateway.alerts_enabled)
+        .unwrap_or(system_default)
 }
 
 /// Trait for sending alerts to messaging channels.
@@ -150,8 +185,11 @@ impl Monitor {
                     break;
                 }
 
+                let profile_alerts_enabled =
+                    profile_alerts_enabled(&ps1, alert.profile_id(), al1.load(Ordering::Relaxed));
+
                 // Send alert to all channels
-                if al1.load(Ordering::Relaxed) {
+                if profile_alerts_enabled {
                     let msg = alert.message();
                     for sender in senders1.iter() {
                         sender.send_alert(&msg).await;
@@ -160,7 +198,7 @@ impl Monitor {
 
                 // Watchdog: auto-restart on GatewayExited
                 if let AdminAlert::GatewayExited { ref profile_id, .. } = alert {
-                    if wd1.load(Ordering::Relaxed) {
+                    if profile_watchdog_enabled(&ps1, profile_id, wd1.load(Ordering::Relaxed)) {
                         let mut counts = rc1.lock().await;
                         let (count, _) =
                             counts.entry(profile_id.clone()).or_insert((0, Utc::now()));
@@ -175,7 +213,7 @@ impl Monitor {
                             );
 
                             // Send restart notification
-                            if al1.load(Ordering::Relaxed) {
+                            if profile_alerts_enabled {
                                 let restart_msg = AdminAlert::WatchdogRestarted {
                                     profile_id: profile_id.clone(),
                                     attempt,
@@ -210,7 +248,7 @@ impl Monitor {
                                 attempts = attempt,
                                 "watchdog giving up"
                             );
-                            if al1.load(Ordering::Relaxed) {
+                            if profile_alerts_enabled {
                                 let giveup_msg = AdminAlert::WatchdogGaveUp {
                                     profile_id: profile_id.clone(),
                                     attempts: attempt,
@@ -251,7 +289,12 @@ impl Monitor {
                         let already_tracked = counts.get(&p.id).is_some_and(|(c, _)| *c > 0);
                         drop(counts);
 
-                        if !already_tracked && al.load(Ordering::Relaxed) {
+                        if !already_tracked
+                            && p.config
+                                .gateway
+                                .alerts_enabled
+                                .unwrap_or_else(|| al.load(Ordering::Relaxed))
+                        {
                             let msg = AdminAlert::ProfileDown {
                                 profile_id: p.id.clone(),
                                 profile_name: p.name.clone(),
@@ -403,5 +446,53 @@ impl AlertSender for FeishuAlertSender {
                 tracing::warn!(user_id = %user_id, error = %e, "failed to send Feishu alert");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::{GatewaySettings, ProfileConfig, UserProfile};
+
+    fn profile(
+        id: &str,
+        watchdog_enabled: Option<bool>,
+        alerts_enabled: Option<bool>,
+    ) -> UserProfile {
+        let now = Utc::now();
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings {
+                    watchdog_enabled,
+                    alerts_enabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn profile_monitor_overrides_fall_back_to_system_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&profile("alpha", Some(false), Some(true)))
+            .unwrap();
+        store.save(&profile("beta", None, None)).unwrap();
+
+        assert!(!profile_watchdog_enabled(&store, "alpha", true));
+        assert!(profile_alerts_enabled(&store, "alpha", false));
+        assert!(profile_watchdog_enabled(&store, "beta", true));
+        assert!(!profile_alerts_enabled(&store, "beta", false));
+        assert!(profile_watchdog_enabled(&store, "missing", true));
     }
 }
