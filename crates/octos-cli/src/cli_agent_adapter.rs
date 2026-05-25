@@ -329,15 +329,15 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    fn write_executable(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn write_script(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::write(&path, body).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    fn script_command(script: PathBuf) -> CliAgentCommandConfig {
+        CliAgentCommandConfig::new("/bin/sh").arg(script.to_string_lossy())
     }
 
     #[cfg(unix)]
@@ -345,7 +345,7 @@ mod tests {
     async fn captures_stdout_stderr_and_declared_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("report.md");
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "agent-fixture",
             r#"#!/bin/sh
@@ -356,7 +356,7 @@ printf '# report\n' > "$1"
         );
 
         let result = run_cli_agent_command(
-            CliAgentCommandConfig::new(script)
+            script_command(script)
                 .arg(artifact.to_string_lossy())
                 .declared_artifact(&artifact),
         )
@@ -382,7 +382,7 @@ printf '# report\n' > "$1"
     #[tokio::test]
     async fn relative_declared_artifacts_resolve_against_child_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "relative-artifact-agent",
             r#"#!/bin/sh
@@ -391,7 +391,7 @@ printf '# report\n' > report.md
         );
 
         let result = run_cli_agent_command(
-            CliAgentCommandConfig::new(script)
+            script_command(script)
                 .cwd(dir.path())
                 .declared_artifact("report.md"),
         )
@@ -411,7 +411,7 @@ printf '# report\n' > report.md
     #[tokio::test]
     async fn transcript_capture_is_bounded_and_marks_truncation() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "large-output-agent",
             r#"#!/bin/sh
@@ -419,9 +419,7 @@ perl -e 'print "x" x (1024 * 1024 + 64)'
 "#,
         );
 
-        let result = run_cli_agent_command(CliAgentCommandConfig::new(script))
-            .await
-            .unwrap();
+        let result = run_cli_agent_command(script_command(script)).await.unwrap();
 
         assert_eq!(
             result.transcript.stdout.len(),
@@ -436,7 +434,7 @@ perl -e 'print "x" x (1024 * 1024 + 64)'
     async fn times_out_and_kills_child() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("finished");
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "slow-agent",
             r#"#!/bin/sh
@@ -446,7 +444,7 @@ printf done > "$1"
         );
 
         let result = run_cli_agent_command(
-            CliAgentCommandConfig::new(script)
+            script_command(script)
                 .arg(marker.to_string_lossy())
                 .timeout(Duration::from_millis(100)),
         )
@@ -463,7 +461,7 @@ printf done > "$1"
     async fn cancel_reports_cancelled_and_stops_process() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("finished");
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "cancel-agent",
             r#"#!/bin/sh
@@ -473,7 +471,7 @@ printf done > "$1"
         );
 
         let mut process = CliAgentProcess::spawn(
-            CliAgentCommandConfig::new(script)
+            script_command(script)
                 .arg(marker.to_string_lossy())
                 .timeout(Duration::from_secs(5)),
         )
@@ -490,7 +488,7 @@ printf done > "$1"
     async fn close_reports_closed_and_stops_process() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("finished");
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "close-agent",
             r#"#!/bin/sh
@@ -500,7 +498,7 @@ printf done > "$1"
         );
 
         let mut process = CliAgentProcess::spawn(
-            CliAgentCommandConfig::new(script)
+            script_command(script)
                 .arg(marker.to_string_lossy())
                 .timeout(Duration::from_secs(5)),
         )
@@ -517,7 +515,7 @@ printf done > "$1"
     async fn argv_config_does_not_invoke_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let injected = dir.path().join("pwned");
-        let script = write_executable(
+        let script = write_script(
             &dir,
             "echo-argv",
             r#"#!/bin/sh
@@ -526,7 +524,7 @@ printf '%s\n' "$1"
         );
 
         let payload = format!("literal; touch {}", injected.display());
-        let result = run_cli_agent_command(CliAgentCommandConfig::new(script).arg(payload.clone()))
+        let result = run_cli_agent_command(script_command(script).arg(payload.clone()))
             .await
             .unwrap();
 
