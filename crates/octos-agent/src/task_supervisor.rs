@@ -1388,13 +1388,46 @@ impl TaskSupervisor {
                 return Err(error);
             }
 
-            let current_count = self
-                .tasks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values()
-                .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
-                .count();
+            // Codex P2 follow-up #2: combine the per-session cap query
+            // AND the parent-terminal recheck under the SAME `tasks`
+            // lock acquisition. If the parent has flipped to terminal
+            // since the pre-cap check, return `ParentTerminal` instead
+            // of triggering the cap path's side effects (poisoning the
+            // session, force-failing every active sibling). The
+            // recheck is gated on `parent_terminal_check_tool_call_id`
+            // so non-pipeline callers (e.g. spawn_only register paths)
+            // continue to hit the cap path as before.
+            let (current_count, parent_terminal_status) = {
+                let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                let count = tasks
+                    .values()
+                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .count();
+                let terminal = parent_terminal_check_tool_call_id
+                    .filter(|tcid| !tcid.is_empty())
+                    .and_then(|tcid| Self::pick_parent_status(&tasks, tcid))
+                    .filter(|status| status.is_terminal());
+                (count, terminal)
+            };
+            if let Some(status) = parent_terminal_status {
+                let parent_tcid = parent_terminal_check_tool_call_id.unwrap_or_default();
+                tracing::warn!(
+                    tool_name,
+                    parent_tool_call_id = parent_tcid,
+                    parent_status = status.as_str(),
+                    "refusing pipeline node child registration: parent task terminal at cap-recheck (atomic)"
+                );
+                counter!(
+                    "octos_task_supervisor_register_node_rejected_total",
+                    "reason" => "parent_terminal".to_string(),
+                    "parent_status" => status.as_str().to_string(),
+                )
+                .increment(1);
+                return Err(RegisterTaskError::ParentTerminal {
+                    parent_tool_call_id: parent_tcid.to_string(),
+                    parent_status: status,
+                });
+            }
             if current_count >= cap {
                 // Mark the parent session as poisoned so subsequent
                 // attempts fail fast without re-counting.
@@ -4378,67 +4411,96 @@ mod tests {
     /// Codex P2 follow-up — terminal-parent rejection must NOT trigger
     /// the fan-out cap path's side effects (poisoning the session,
     /// `mark_failed`-ing every active sibling under the same
-    /// `parent_session_key`). The early terminal check in
-    /// `register_full` short-circuits before the cap block so unrelated
-    /// active children of other parents (sharing only the session key)
-    /// are not collaterally cascaded.
+    /// `parent_session_key`). The terminal-parent check in
+    /// `register_full` short-circuits the cap block in two places:
+    /// (1) at the pre-cap fast path, and (2) under the same lock as
+    /// the cap-check itself (atomic with the cap decision).
+    ///
+    /// This test exercises path (2) — it drives the session to
+    /// `MAX_CHILDREN_PER_PARENT`, then a registration attempt against
+    /// a TERMINAL parent in that same session must return
+    /// `ParentTerminal` without poisoning the session or
+    /// cascade-failing the existing 200 active siblings.
     #[test]
     fn try_register_node_task_terminal_parent_does_not_trigger_fanout_side_effects() {
-        // Use a tiny synthetic supervisor with no special env tweaks —
-        // we don't need to actually hit the cap. We just need to
-        // assert that under a terminal parent the cap-cascade does NOT
-        // touch any other active children in the same session_key.
         let supervisor = TaskSupervisor::new();
-        let parent_tcid = "call-terminal-parent-sideeffect";
-        let session = "sess-cap-collateral";
+        let session = "api:sess-cap-collateral";
 
-        // Parent is terminal (Failed).
-        let parent = supervisor.register("run_pipeline", parent_tcid, Some(session));
-        supervisor.mark_running(&parent);
-        supervisor.mark_failed(&parent, "orphaned across restart".to_string());
-
-        // An unrelated sibling task under the SAME session_key but a
-        // DIFFERENT tool_call_id is running. The bug would force-fail
-        // it via the cap poisoning path if the terminal check ran
-        // AFTER the cap path. (We can't easily hit the 200-child cap
-        // in a test; we verify the early-check by asserting no
-        // mark_failed callbacks fire on the unrelated task during
-        // the rejected child registration.)
-        let unrelated = supervisor.register("tts", "call-unrelated-tcid", Some(session));
-        supervisor.mark_running(&unrelated);
+        // Pre-fill the session to MAX_CHILDREN_PER_PARENT - 1 active
+        // unrelated tasks, then register the terminal parent as the
+        // exact cap-th task. This puts count == cap when the test's
+        // straggler attempt fires, so the cap branch is exercised.
+        let terminal_parent_tcid = "call-terminal-parent-at-cap";
+        let n_fill = MAX_CHILDREN_PER_PARENT - 1;
+        let mut active_siblings = Vec::with_capacity(n_fill);
+        for i in 0..n_fill {
+            let id = supervisor
+                .try_register_with_input("tts", &format!("call-{i}"), Some(session), None)
+                .unwrap_or_else(|err| {
+                    panic!("filling cap: register #{i} should succeed; got {err}")
+                });
+            supervisor.mark_running(&id);
+            active_siblings.push(id);
+        }
+        let terminal_parent = supervisor
+            .try_register_with_input("run_pipeline", terminal_parent_tcid, Some(session), None)
+            .expect("terminal parent register at cap-1 must succeed (just barely fits)");
+        supervisor.mark_running(&terminal_parent);
+        supervisor.mark_failed(&terminal_parent, "orphaned across restart".to_string());
         assert_eq!(
-            supervisor.get_task(&unrelated).unwrap().status,
-            TaskStatus::Running
+            supervisor.get_tasks_for_session(session).len(),
+            MAX_CHILDREN_PER_PARENT,
+            "session must be exactly at cap before the test attempt"
         );
 
-        // Attempt: straggler tries to register a child under the
-        // terminal parent. Must be refused with ParentTerminal.
+        // Snapshot how many active siblings exist BEFORE the attempt.
+        // Should be n_fill (the parent itself is Failed, not active).
+        let pre_active: usize = supervisor
+            .get_tasks_for_session(session)
+            .into_iter()
+            .filter(|t| t.status.is_active())
+            .count();
+        assert_eq!(
+            pre_active, n_fill,
+            "expected {n_fill} active siblings (parent itself is terminal) before attempt"
+        );
+
+        // Straggler attempt: register a pipeline child under the
+        // terminal parent IN THE CAPPED SESSION. The fix's atomic
+        // recheck must catch this and return ParentTerminal — NOT
+        // ChildFanoutExceeded. Without the inside-cap-lock recheck
+        // the cap path would poison the session and `mark_failed`
+        // every active sibling first.
         let err = supervisor
-            .try_register_node_task("pipeline:analyze", parent_tcid, Some(session))
-            .expect_err("registration must be rejected for terminal parent");
-        assert!(matches!(err, RegisterTaskError::ParentTerminal { .. }));
-
-        // The unrelated active sibling under the same session must be
-        // UNTOUCHED. If the cap path had run, it would have been
-        // mark_failed-ed (or the session poisoned).
-        let unrelated_after = supervisor.get_task(&unrelated).unwrap();
-        assert_eq!(
-            unrelated_after.status,
-            TaskStatus::Running,
-            "unrelated active sibling must not be cascaded by terminal-parent rejection"
+            .try_register_node_task("pipeline:analyze", terminal_parent_tcid, Some(session))
+            .expect_err("registration must be rejected for terminal parent (even at cap)");
+        assert!(
+            matches!(err, RegisterTaskError::ParentTerminal { .. }),
+            "must return ParentTerminal not ChildFanoutExceeded; got {err:?}",
         );
 
-        // And the parent session must NOT be poisoned — a fresh
-        // registration under a DIFFERENT parent in the same session
-        // (e.g. a healthy run_pipeline) must succeed.
-        let healthy_parent_tcid = "call-healthy-parent";
-        let healthy_parent =
-            supervisor.register("run_pipeline", healthy_parent_tcid, Some(session));
-        supervisor.mark_running(&healthy_parent);
-        let healthy_child = supervisor
-            .try_register_node_task("pipeline:analyze", healthy_parent_tcid, Some(session))
-            .expect("healthy parent under the same session must accept a fresh node registration");
-        assert!(!healthy_child.is_empty());
+        // The session must NOT be poisoned: subsequent legitimate
+        // failure attempts (cap-only path, no terminal parent) must
+        // still hit ChildFanoutExceeded with their own count, not the
+        // ParentTerminal already-poisoned fast path. We can't probe
+        // the poisoned set directly, but we can probe its effect:
+        // attempting a NON-strict registration would also be refused
+        // if poisoned. (Skip this verification since the
+        // ChildFanoutExceeded sibling count would itself trigger if
+        // we tried — the cleaner assertion is on active sibling
+        // counts.)
+
+        // The 200 active siblings must remain UNTOUCHED — the cap
+        // path's force-fail cascade did NOT run.
+        let post_active: usize = supervisor
+            .get_tasks_for_session(session)
+            .into_iter()
+            .filter(|t| t.status.is_active())
+            .count();
+        assert_eq!(
+            post_active, pre_active,
+            "no active sibling may be cascaded by a terminal-parent rejection at cap"
+        );
     }
 
     /// NEW-09 contract: cascade-failing a child via
