@@ -1529,6 +1529,12 @@ impl UiProtocolLedger {
         inner.subscribers.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_session_in_memory_for_test(&self, session_id: &SessionKey) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.sessions.contains_key(session_id)
+    }
+
     /// Snapshot of the observability counters. Useful for tests and the
     /// `/metrics` endpoint integration.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2179,6 +2185,23 @@ mod tests {
             .collect()
     }
 
+    fn session_log_payload(data_dir: &Path, session_id: &SessionKey) -> String {
+        let session_dir = data_dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id));
+        let mut log_files = list_log_files(&session_dir).expect("list session log files");
+        log_files.sort();
+        assert!(
+            !log_files.is_empty(),
+            "expected persisted JSONL log files for {}",
+            session_id.0
+        );
+        log_files
+            .iter()
+            .map(|path| std::fs::read_to_string(path).expect("read session log file"))
+            .collect::<String>()
+    }
+
     #[test]
     fn ledger_replays_notifications_after_cursor_in_order() {
         let ledger = UiProtocolLedger::new(8);
@@ -2378,6 +2401,45 @@ mod tests {
             .expect("replay evicted session from disk");
 
         assert_eq!(replay_texts(&replay), vec!["two", "three"]);
+    }
+
+    #[test]
+    fn ledger_post_eviction_validation_path_replays_from_persisted_jsonl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.retained_per_session = 4;
+        config.active_session_cap = 1;
+        let ledger = UiProtocolLedger::with_config(config);
+        let target = SessionKey("local:post-eviction-target".into());
+        let filler = SessionKey("local:post-eviction-filler".into());
+
+        ledger.append_notification(delta(&target, "target-one"));
+        ledger.append_notification(delta(&target, "target-two"));
+        assert!(ledger.has_session_in_memory_for_test(&target));
+        assert!(session_log_payload(temp.path(), &target).contains("target-two"));
+
+        ledger.append_notification(delta(&filler, "filler-evicts-target"));
+        let post_eviction_metrics = ledger.metrics();
+        assert_eq!(post_eviction_metrics.sessions_evicted, 1);
+        assert_eq!(post_eviction_metrics.sessions_active, 1);
+        assert!(!ledger.has_session_in_memory_for_test(&target));
+        assert!(ledger.has_session_in_memory_for_test(&filler));
+
+        let (replayed, cursor) = ledger
+            .snapshot_with_cursor(
+                &target,
+                Some(&UiCursor {
+                    stream: target.0.clone(),
+                    seq: 1,
+                }),
+            )
+            .expect("hydrate evicted target session from JSONL");
+
+        assert_eq!(replay_texts(&replayed), vec!["target-two"]);
+        assert_eq!(cursor.seq, 2);
+        assert!(ledger.has_session_in_memory_for_test(&target));
+        assert!(!ledger.has_session_in_memory_for_test(&filler));
+        assert_eq!(ledger.metrics().sessions_evicted, 2);
     }
 
     #[test]
