@@ -555,4 +555,159 @@ mod tests {
             "α-9 envelopes must NOT cross-deliver to other session subscribers"
         );
     }
+
+    /// Slides soak regression — `emit_files_attached_from_background`
+    /// emits one envelope per unique path across the persist-media and
+    /// envelope-only-media lists. Deduplicates paths that appear in
+    /// both lists so dual-negotiated clients receive ONE button per
+    /// artefact regardless of which carrier brought it.
+    #[test]
+    fn should_emit_one_file_attached_per_unique_artefact_path() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-slides-soak");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        // Slides Satisfied path: persist-media carries the deck, envelope
+        // path inherits the same list (see api/ui_protocol.rs
+        // envelope_media fallback). Soak captured this exact shape.
+        let media = vec![
+            "/Users/cloud/.octos/profiles/dspfac/data/slides/deck-soak/output/deck.pptx".to_string(),
+        ];
+        let envelope_media = media.clone();
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &media,
+            &envelope_media,
+            Some("tc-slides-soak".into()),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(payload),
+            ) = &event.event
+            {
+                envelopes.push(payload.clone());
+            }
+        }
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "duplicate paths across media + envelope_media collapse to one envelope"
+        );
+        assert_eq!(envelopes[0].path, media[0]);
+        assert_eq!(envelopes[0].tool_call_id.as_deref(), Some("tc-slides-soak"));
+        assert_eq!(
+            envelopes[0].mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "PPTX extension lifts to the canonical OOXML MIME"
+        );
+    }
+
+    /// Multi-artefact delivery (e.g. deep_research `_report.md` +
+    /// `outline.json`) emits one envelope per file, with stable order
+    /// matching the iteration order of the input slices. Empty entries
+    /// are filtered (defensive against producers that emit a sentinel
+    /// blank path).
+    #[test]
+    fn should_emit_envelope_per_distinct_path_filtering_blanks() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-multi-artefact");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        let media = vec![
+            "/tmp/report.md".to_string(),
+            "".to_string(), // blank sentinel — must be filtered
+            "/tmp/outline.json".to_string(),
+        ];
+        let envelope_media: Vec<String> = vec![];
+
+        emit_files_attached_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+            &media,
+            &envelope_media,
+            None,
+        );
+
+        let mut paths = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(payload),
+            ) = &event.event
+            {
+                paths.push(payload.path.clone());
+            }
+        }
+        assert_eq!(
+            paths,
+            vec!["/tmp/report.md".to_string(), "/tmp/outline.json".to_string()],
+            "blank entries filtered; ordering preserved"
+        );
+    }
+
+    /// No-op fast path — both source lists empty produces zero
+    /// envelopes. Text-only background completions (mofa_publish URL
+    /// emission, etc.) must NOT clutter the wire with empty
+    /// `file/attached` frames.
+    #[test]
+    fn should_not_emit_when_both_media_lists_empty() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey::new("api", "alpha9-empty");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        emit_files_attached_from_background(&ledger, &session_id, &turn_id, &[], &[], None);
+
+        assert!(
+            subscriber.try_recv().is_err(),
+            "text-only background completions emit zero file/attached envelopes"
+        );
+    }
+
+    /// MIME sniffer table — covers the spawn_only artefact families
+    /// (`.pptx`, `.md`, `.mp3`, `.html`, image / video) and falls back
+    /// to None for unknown extensions so the client can do its own
+    /// detection.
+    #[test]
+    fn should_lift_known_extensions_to_canonical_mime_types() {
+        assert_eq!(
+            mime_from_path("/abs/path/deck.pptx").as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/REPORT.MD").as_deref(),
+            Some("text/markdown"),
+            "case-insensitive on extension"
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/podcast.mp3").as_deref(),
+            Some("audio/mpeg"),
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/page.html").as_deref(),
+            Some("text/html"),
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/page.htm").as_deref(),
+            Some("text/html"),
+            "htm alias maps to text/html"
+        );
+        assert_eq!(
+            mime_from_path("/abs/path/something.xyz"),
+            None,
+            "unknown extensions fall back to None"
+        );
+        assert_eq!(
+            mime_from_path("noextension"),
+            None,
+            "files without extension fall back to None"
+        );
+    }
 }

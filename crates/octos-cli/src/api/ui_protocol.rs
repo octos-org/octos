@@ -28498,6 +28498,34 @@ ignore = []
         }
     }
 
+    /// Build a `ConnectionUiFeatures` for the UPCR-2026-014 M9-α-9
+    /// `event.file_attached.v1` capability gate. Independent of the
+    /// message_persisted / spawn_complete flags so old clients and
+    /// new-shape-only clients can both be modelled.
+    fn features_for_file_attached_test(file_attached: bool) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            file_attached,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Slides soak regression: build a representative `file/attached`
+    /// notification carrying a PPTX artefact and the expected MIME hint.
+    /// Used by the capability-gate tests to assert legacy clients never
+    /// see the new envelope and new clients always do.
+    fn file_attached_for(session: &SessionKey) -> UiNotification {
+        UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+            session_id: session.clone(),
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: Some("tc-slides".into()),
+            mime: Some(
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation".into(),
+            ),
+        })
+    }
+
     fn context_state_for_test(session: &SessionKey) -> UiContextState {
         UiContextState {
             session_id: session.clone(),
@@ -28911,6 +28939,49 @@ ignore = []
         assert!(
             live_event_passes_capability_filter(&regular, new),
             "non-background message/persisted must still flow to new clients",
+        );
+    }
+
+    /// UPCR-2026-014 M9-α-9 `event.file_attached.v1` capability gate.
+    /// Old clients that never advertised the feature MUST NOT receive
+    /// `file/attached` envelopes — they keep relying on `media` on
+    /// `message/persisted` / `turn/spawn_complete`. New clients that
+    /// negotiated the feature MUST receive the dedicated envelope so
+    /// the slides soak's "PPTX on disk but no button on SPA" regression
+    /// can be closed by a redundant wire signal.
+    #[test]
+    fn capability_filter_routes_file_attached_gating() {
+        let session = SessionKey("local:file-attached-gate".into());
+        let file_attached = UiProtocolLedgerEvent::Notification(file_attached_for(&session));
+
+        // Old client: never observe the new envelope.
+        let old = features_for_file_attached_test(false);
+        assert!(
+            !live_event_passes_capability_filter(&file_attached, old),
+            "clients without event.file_attached.v1 must not receive file/attached envelopes",
+        );
+
+        // New client: receive the envelope.
+        let new = features_for_file_attached_test(true);
+        assert!(
+            live_event_passes_capability_filter(&file_attached, new),
+            "clients with event.file_attached.v1 receive the per-artefact envelope",
+        );
+
+        // Independence from spawn_complete: a new client that
+        // negotiated ONLY file_attached (no message_persisted, no
+        // spawn_complete) still sees the file delivery. This matches
+        // the redundancy goal — file_attached is the safety net for
+        // clients whose richer-envelope reducers might drop the
+        // delivery.
+        let only_file_attached = ConnectionUiFeatures {
+            file_attached: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        assert!(
+            live_event_passes_capability_filter(&file_attached, only_file_attached),
+            "file_attached gate is independent of spawn_complete / message_persisted",
         );
     }
 
