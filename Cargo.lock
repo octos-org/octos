@@ -3809,6 +3809,7 @@ dependencies = [
  "octos-llm",
  "octos-memory",
  "octos-pipeline",
+ "octos-plugin",
  "octos-swarm",
  "open",
  "percent-encoding",

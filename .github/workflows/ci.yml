@@ -160,6 +160,14 @@ jobs:
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 
+      # RFC-2 (issue #1291): validate every bundled `crates/app-skills/*/manifest.json`
+      # against the strict octos JSON schema validator. A failure here means a
+      # bundled skill ships a manifest shape that strict LLM-provider validators
+      # (Moonshot Kimi K2.6 etc.) will reject at request time — see the
+      # 2026-05-25 mofa-slides v0.5.0 incident write-up.
+      - name: RFC-2 bundled manifest schema validation
+        run: ./scripts/validate-skill-manifests.sh
+
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
 

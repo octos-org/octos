@@ -9,6 +9,38 @@ use serde::{Deserialize, Serialize};
 
 use super::Executable;
 
+/// RFC-2 (issue #1291): validate a skill directory's `manifest.json`
+/// against the strict octos JSON schema validator before we commit
+/// the install to disk.
+///
+/// Behaviour
+/// ---------
+/// - If the skill has no `manifest.json`, this is a no-op (pure SKILL.md
+///   skills are not affected — they don't ship tool schemas).
+/// - If the manifest fails to parse OR fails strict schema validation,
+///   we bail with the structured violation list so the operator sees
+///   every problem at once.
+/// - Operators who need to install a known-bad manifest can set
+///   `OCTOS_MANIFEST_VALIDATION=lenient` (Draft 07 sanity only) or
+///   `=off` (skip entirely). Default is `strict`.
+fn validate_skill_manifest(skill_dir: &Path) -> Result<()> {
+    let manifest_path = skill_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    // `PluginManifest::from_file` runs both structural and schema
+    // validation, threading through `OCTOS_MANIFEST_VALIDATION` for
+    // the strict-rule layer.
+    octos_plugin::PluginManifest::from_file(&manifest_path)
+        .map(|_| ())
+        .wrap_err_with(|| {
+            format!(
+                "manifest at {} failed RFC-2 schema validation\n\nSet OCTOS_MANIFEST_VALIDATION=lenient to skip the strict octos rules, or =off to skip validation entirely.",
+                manifest_path.display()
+            )
+        })
+}
+
 // ── Public types for programmatic access ─────────────────────────────
 
 /// Information about an installed skill (for programmatic use).
@@ -339,6 +371,12 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
             src.display()
         );
     }
+
+    // RFC-2: reject malformed manifests BEFORE we copy anything to
+    // disk. This is the install-time hook called out in #1291: the
+    // operator gets the structured violation list with no half-broken
+    // skill directory left behind.
+    validate_skill_manifest(src)?;
 
     let name = src
         .file_name()
@@ -894,6 +932,12 @@ fn install_via_git_result(
             );
         }
 
+        // RFC-2: validate the manifest BEFORE we copy anything to the
+        // user-visible skills dir. A malformed manifest aborts the
+        // install with the structured violation list — no half-broken
+        // skill directory left behind.
+        validate_skill_manifest(&src)?;
+
         let name = Path::new(subdir)
             .file_name()
             .unwrap()
@@ -947,6 +991,9 @@ fn install_via_git_result(
     } else {
         // Whole-repo install: check if root is a single skill or multi-skill
         if clone_dir.join("SKILL.md").exists() {
+            // RFC-2: validate the single-skill root manifest before copy.
+            validate_skill_manifest(&clone_dir)?;
+
             // Single-skill repo: install as repo_name/
             let dest = skills_dir.join(&spec.repo_name);
             if dest.exists() && !force {
@@ -964,6 +1011,21 @@ fn install_via_git_result(
                 installed.push(spec.repo_name.clone());
             }
         } else {
+            // RFC-2: validate every multi-skill subdirectory's manifest
+            // before any copy. Aborts the whole install on the first
+            // failure rather than ending up with a mixed-validity
+            // skills dir.
+            for entry in std::fs::read_dir(&clone_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                validate_skill_manifest(&entry.path())?;
+            }
             // Multi-skill repo: copy all top-level directories
             for entry in std::fs::read_dir(&clone_dir)? {
                 let entry = entry?;
@@ -1887,5 +1949,96 @@ fi
         std::fs::write(skill_dir.join("main"), "#!/usr/bin/env bash\necho ok\n").unwrap();
 
         assert!(has_installed_skill_executable(&skill_dir, "mofa-fm"));
+    }
+
+    /// RFC-2 (issue #1291): a skill that ships the mofa-slides v0.5.0
+    /// `anyOf`-without-`type` shape must be rejected at install time
+    /// with a descriptive error, BEFORE we copy the skill onto disk.
+    /// The skills dir must remain unchanged after the failure.
+    #[test]
+    fn install_from_local_rejects_invalid_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bad-skill");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "# bad\n").unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{
+              "id": "bad-skill",
+              "version": "0.1.0",
+              "tools": [{
+                "name": "do_thing",
+                "description": "...",
+                "input_schema": {
+                  "type": "object",
+                  "anyOf": [
+                    { "required": ["a"] },
+                    { "required": ["b"] }
+                  ]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let skills_dir = tmp.path().join("skills");
+        let err = install_skill(
+            &skills_dir,
+            &src.to_string_lossy(),
+            /* force */ false,
+            "main",
+        )
+        .expect_err("install must reject malformed manifest");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RFC-2") || msg.contains("schema violation"),
+            "expected RFC-2 violation message, got: {msg}"
+        );
+        // Critically — skills_dir must NOT contain the bad skill.
+        assert!(
+            !skills_dir.join("bad-skill").exists(),
+            "validator must run before copy; bad-skill dir leaked"
+        );
+    }
+
+    /// RFC-2: a clean, valid local skill manifest is still accepted by
+    /// the install path. Sanity test that the validator hook didn't
+    /// regress the happy path.
+    #[test]
+    fn install_from_local_accepts_valid_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("good-skill");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "# good\n").unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{
+              "id": "good-skill",
+              "version": "0.1.0",
+              "tools": [{
+                "name": "do_thing",
+                "description": "Does a thing.",
+                "input_schema": {
+                  "type": "object",
+                  "properties": {
+                    "x": { "type": "string" }
+                  },
+                  "required": ["x"]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let skills_dir = tmp.path().join("skills");
+        let result = install_skill(
+            &skills_dir,
+            &src.to_string_lossy(),
+            /* force */ false,
+            "main",
+        )
+        .expect("clean manifest must install");
+        assert_eq!(result.installed, vec!["good-skill".to_string()]);
+        assert!(skills_dir.join("good-skill").join("manifest.json").exists());
     }
 }

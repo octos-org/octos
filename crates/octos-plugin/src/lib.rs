@@ -31,6 +31,7 @@ pub mod discovery;
 pub mod gating;
 pub mod lifecycle;
 pub mod manifest;
+pub mod manifest_validator;
 pub mod protocol_v2;
 pub mod types;
 
@@ -43,6 +44,10 @@ pub use lifecycle::{
     is_safe_shell_command,
 };
 pub use manifest::{InstallSpec, PluginManifest, PluginType, Requirements, ToolDefinition};
+pub use manifest_validator::{
+    ManifestSchemaError, SchemaKind, ValidationProfile, validate_manifest_schemas,
+    validate_manifest_schemas_with, validate_schema,
+};
 pub use protocol_v2::{
     ArtifactEvent, CostEvent, LineParse, LogEvent, PhaseEvent, ProgressEvent, ProtocolV2Event,
     ResultCost, ResultSource, ResultSummary, emit_cost, emit_event, emit_progress,

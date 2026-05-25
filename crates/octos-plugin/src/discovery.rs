@@ -154,12 +154,16 @@ mod tests {
 
     #[test]
     fn discover_single_plugin() {
+        // RFC-2: tool manifests must carry an `input_schema` rooted at
+        // `type: "object"`. Omitting it (as the original test did)
+        // surfaces as a discovery rejection in the strict profile.
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
             "weather",
             r#"{ "id": "weather", "version": "1.0.0", "type": "tool",
-                 "tools": [{"name": "get_weather", "description": "weather"}] }"#,
+                 "tools": [{"name": "get_weather", "description": "weather",
+                            "input_schema": {"type": "object", "properties": {}}}] }"#,
         );
 
         let sources = vec![PluginSource {
@@ -182,13 +186,15 @@ mod tests {
             profile_dir.path(),
             "weather",
             r#"{ "id": "weather", "version": "2.0.0", "type": "tool",
-                 "tools": [{"name": "get_weather", "description": "v2"}] }"#,
+                 "tools": [{"name": "get_weather", "description": "v2",
+                            "input_schema": {"type": "object", "properties": {}}}] }"#,
         );
         write_manifest(
             user_dir.path(),
             "weather",
             r#"{ "id": "weather", "version": "1.0.0", "type": "tool",
-                 "tools": [{"name": "get_weather", "description": "v1"}] }"#,
+                 "tools": [{"name": "get_weather", "description": "v1",
+                            "input_schema": {"type": "object", "properties": {}}}] }"#,
         );
 
         let sources = vec![
@@ -311,6 +317,8 @@ mod tests {
 
     #[test]
     fn legacy_manifest_with_name_field() {
+        // RFC-2: legacy `name`-using manifests still parse, but the
+        // tool's `input_schema` must now declare `type: "object"`.
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
@@ -324,7 +332,10 @@ mod tests {
                         "name": "news_fetch",
                         "description": "Fetch news",
                         "entrypoint": "target/release/news_fetch",
-                        "input_schema": {}
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {}
+                        }
                     }
                 ]
             }"#,
@@ -338,5 +349,43 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].manifest.id, "news");
         assert_eq!(plugins[0].origin, PluginOrigin::Legacy);
+    }
+
+    /// RFC-2: discovery must not load a manifest that violates the
+    /// strict profile — it should `warn!` and continue. This is the
+    /// daemon-startup hook from RFC-2 (item 2: "Plugin discovery on
+    /// daemon startup").
+    #[test]
+    fn rfc2_discovery_skips_manifest_with_invalid_schema() {
+        let tmp = TempDir::new().unwrap();
+        write_manifest(
+            tmp.path(),
+            "bad-skill",
+            // Reproduces the mofa-slides v0.5.0 anyOf branch missing type.
+            r#"{
+                "id": "bad-skill",
+                "version": "0.1.0",
+                "tools": [{
+                    "name": "do_thing",
+                    "description": "...",
+                    "input_schema": {
+                        "type": "object",
+                        "anyOf": [
+                            { "required": ["a"] },
+                            { "required": ["b"] }
+                        ]
+                    }
+                }]
+            }"#,
+        );
+        let sources = vec![PluginSource {
+            path: tmp.path().to_path_buf(),
+            origin: PluginOrigin::User,
+        }];
+        let plugins = discover_plugins(&sources, &HashMap::new());
+        assert!(
+            plugins.is_empty(),
+            "expected discovery to skip manifest with invalid schema, got {plugins:?}"
+        );
     }
 }

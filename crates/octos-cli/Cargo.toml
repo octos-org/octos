@@ -18,6 +18,12 @@ octos-llm = { workspace = true }
 octos-bus = { workspace = true }
 octos-pipeline = { workspace = true }
 octos-swarm = { workspace = true }
+# RFC-2 (issue #1291): `octos skills install` runs the manifest schema
+# validator at install time so the operator sees the error before the
+# agent loop ever loads the broken manifest. The validator lives in
+# `octos-plugin::manifest_validator` and is reached through the
+# top-level re-exports.
+octos-plugin = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
