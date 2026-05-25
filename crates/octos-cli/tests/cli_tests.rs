@@ -174,6 +174,33 @@ fn test_init_defaults_in_temp_dir() {
 }
 
 #[test]
+fn test_init_defaults_refuses_to_overwrite_existing_config() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.json");
+    let original = r#"{"provider":"custom","model":"keep-me"}"#;
+    std::fs::write(&config_path, original).unwrap();
+
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "init --defaults should fail instead of overwriting config"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("config already exists"));
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+}
+
+#[test]
 fn test_init_defaults_uses_octos_home_when_cwd_not_provided() {
     let temp_dir = tempfile::tempdir().unwrap();
     let octos_home = temp_dir.path().join("custom-home");

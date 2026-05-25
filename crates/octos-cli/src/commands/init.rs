@@ -167,16 +167,20 @@ impl Executable for InitCommand {
                 "Config already exists:".yellow(),
                 config_path.display()
             );
-            if !self.defaults {
-                print!("Overwrite? [y/N] ");
-                io::stdout().flush()?;
+            if self.defaults {
+                return Err(eyre::eyre!(
+                    "config already exists at {}. Run `octos init` interactively to confirm overwrite.",
+                    config_path.display()
+                ));
+            }
+            print!("Overwrite? [y/N] ");
+            io::stdout().flush()?;
 
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Aborted.");
-                    return Ok(());
-                }
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Aborted.");
+                return Ok(());
             }
         }
 
