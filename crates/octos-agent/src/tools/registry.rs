@@ -2539,4 +2539,98 @@ mod profile_filter_tests {
             "coding profile must preserve behaviour parity with the default path",
         );
     }
+
+    #[test]
+    fn should_retain_only_mofa_slides_when_slides_session_filter_runs() {
+        // Pins the wiring in session_actor.rs::spawn slides branch:
+        // `tools.retain(octos_agent::keep_tool_in_slides_session)` must
+        // evict every fake mofa skill except `mofa_slides`, and must NOT
+        // evict the unrelated tools (read_file, shell, etc.).
+        //
+        // Without this guardrail the kimi-k2.6 fallback on mini1 dspfac
+        // misrouted "Make a 3-slide intro deck" → mofa_site (2026-05-24
+        // soak). The structural filter makes that misroute literally
+        // impossible regardless of LLM judgement.
+        use super::policy::keep_tool_in_slides_session;
+        use async_trait::async_trait;
+        use eyre::Result;
+        use serde_json::Value;
+
+        struct FakeMofa(&'static str);
+        #[async_trait]
+        impl Tool for FakeMofa {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake mofa skill (test fixture)"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        // Simulate the fleet skill surface: every dspfac-installed mofa
+        // skill is registered as a plugin tool. (Real plugins go via
+        // PluginLoader; here we use a stub for an isolated unit test.)
+        for name in [
+            "mofa_slides",
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            reg.register(FakeMofa(name));
+        }
+
+        reg.retain(keep_tool_in_slides_session);
+
+        let names = builtin_names(&reg);
+        assert!(
+            names.contains(&"mofa_slides".to_string()),
+            "mofa_slides MUST survive the slides-session filter",
+        );
+        for unwanted in [
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            assert!(
+                !names.contains(&unwanted.to_string()),
+                "{unwanted} MUST be evicted from a slides session",
+            );
+        }
+        // Built-in non-mofa tools must remain — these are the tools the
+        // slides system prompt's "TOOL DISCIPLINE" block depends on.
+        for kept in ["read_file", "write_file", "glob", "shell"] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "{kept} must NOT be evicted by the slides filter",
+            );
+        }
+    }
 }

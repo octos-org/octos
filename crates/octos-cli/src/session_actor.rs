@@ -2951,6 +2951,19 @@ impl ActorFactory {
         if is_slides {
             tools.activate("group:media");
 
+            // Structural guardrail (fix/slides-session-tool-allowlist):
+            // hide every `mofa_*` plugin tool except `mofa_slides` so a
+            // weaker fallback model (e.g. kimi-k2.6 on mini1 dspfac,
+            // 2026-05-24) cannot misroute the slides workflow to
+            // `mofa_site` / `mofa_youtube` / etc. when the
+            // "ALWAYS use mofa_slides" rule buried in
+            // `prompts/slides_default.txt` is not strong enough on its
+            // own. The non-`mofa_*` tool surface (web_search, file
+            // tools, shell, send_file, contract / task checks)
+            // is unaffected — see
+            // `tools::policy::keep_tool_in_slides_session`.
+            tools.retain(octos_agent::keep_tool_in_slides_session);
+
             // Scaffold slides project INTO the workspace so file tools
             // (read_file, write_file, mofa_slides) all resolve the same paths.
             // The earlier scaffold in gateway_dispatcher writes to data_dir

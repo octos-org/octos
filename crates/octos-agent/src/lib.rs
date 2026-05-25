@@ -165,7 +165,7 @@ pub use tools::{
     ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     build_backend_from_config, build_delegated_child_policy, build_dispatch_event_payload,
-    dispatch_with_metrics, install_robot_registry, record_dispatch,
+    dispatch_with_metrics, install_robot_registry, keep_tool_in_slides_session, record_dispatch,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{
