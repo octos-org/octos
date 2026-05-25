@@ -411,12 +411,19 @@ pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
     {
         use octos_agent::plugins::run_shutdown_phase;
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .ok();
-        if let Some(rt) = runtime {
-            rt.block_on(run_shutdown_phase(&dest));
+        {
+            Ok(rt) => {
+                rt.block_on(run_shutdown_phase(&dest));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to build runtime for shutdown phase; skipping (skill removal continues)"
+                );
+            }
         }
     }
 
