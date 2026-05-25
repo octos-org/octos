@@ -66,6 +66,7 @@ fn test_init_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Initialize"));
     assert!(stdout.contains("--defaults"));
+    assert!(stdout.contains("--force"));
 }
 
 #[test]
@@ -205,6 +206,70 @@ fn test_init_defaults_uses_octos_home_when_cwd_not_provided() {
     let content = std::fs::read_to_string(&home_config).unwrap();
     assert!(content.contains("openai"));
     assert!(content.contains("gpt-4.1-mini"));
+}
+
+#[test]
+fn test_init_defaults_refuses_existing_config_without_force() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.json");
+    let original = r#"{
+  "provider": "sentinel",
+  "model": "do-not-overwrite",
+  "api_key_env": "SENTINEL_API_KEY"
+}
+"#;
+    std::fs::write(&config_path, original).unwrap();
+
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "init --defaults must refuse to overwrite an existing config"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Use --force to overwrite"),
+        "stderr did not explain the force path: {stderr}"
+    );
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert_eq!(content, original);
+}
+
+#[test]
+fn test_init_defaults_force_overwrites_existing_config() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"provider":"sentinel","model":"do-not-overwrite"}"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--force", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("openai"));
+    assert!(content.contains("gpt-4.1-mini"));
+    assert!(!content.contains("do-not-overwrite"));
 }
 
 #[test]

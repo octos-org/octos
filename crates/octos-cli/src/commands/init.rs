@@ -147,6 +147,10 @@ pub struct InitCommand {
     /// Skip interactive prompts and use defaults.
     #[arg(long)]
     pub defaults: bool,
+
+    /// Overwrite an existing config without prompting.
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl Executable for InitCommand {
@@ -167,7 +171,14 @@ impl Executable for InitCommand {
                 "Config already exists:".yellow(),
                 config_path.display()
             );
-            if !self.defaults {
+            if self.force {
+                println!("{}", "Overwriting because --force was provided.".yellow());
+            } else if self.defaults {
+                eyre::bail!(
+                    "Config already exists at {}. Use --force to overwrite or run `octos init` interactively.",
+                    config_path.display()
+                );
+            } else {
                 print!("Overwrite? [y/N] ");
                 io::stdout().flush()?;
 
