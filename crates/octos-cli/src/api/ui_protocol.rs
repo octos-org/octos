@@ -32047,6 +32047,59 @@ ignore = []
         assert_eq!(after, MessagePersistedSource::Assistant);
     }
 
+    /// Issue #889: a contract-verified `fm_tts` spawn result must persist
+    /// its completion row after the MP3 reaches disk. A false return from
+    /// this helper is a real session-ledger inconsistency, so pin the
+    /// success path with media and the background source override that the
+    /// production `BackgroundResultSender` uses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_result_sender_persists_contract_verified_media_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media_dir = tmp
+            .path()
+            .join("users")
+            .join("dspfac%3Aapi%3Am11h-yangmi")
+            .join("workspace")
+            .join("skill-output");
+        std::fs::create_dir_all(&media_dir).expect("media dir");
+        let mp3_path = media_dir.join("yangmi_hello_1778515952.mp3");
+        std::fs::write(&mp3_path, b"ID3 issue-889 regression").expect("mp3 fixture");
+
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(tmp.path()).expect("session manager"),
+        ));
+        let session_id = SessionKey("dspfac:api:m11h-yangmi-issue-889".into());
+        let thread_id = "turn-issue-889";
+        let media = vec![mp3_path.to_string_lossy().into_owned()];
+
+        let persisted = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+            .scope(
+                Some(MessagePersistedSource::Background),
+                persist_assistant_with_media(
+                    &sessions,
+                    tmp.path(),
+                    &session_id,
+                    "✅ fm_tts delivered.".to_owned(),
+                    media.clone(),
+                    thread_id.to_owned(),
+                    "fm_tts",
+                ),
+            )
+            .await;
+
+        let persisted = persisted.expect("background result row should persist");
+        assert_eq!(persisted.committed_seq, 0);
+
+        let handle = octos_bus::SessionHandle::open(tmp.path(), &session_id);
+        let history = handle.session().messages.clone();
+        assert_eq!(history.len(), 1, "one background completion row");
+        let row = &history[0];
+        assert_eq!(row.role, MessageRole::Assistant);
+        assert_eq!(row.content, "✅ fm_tts delivered.");
+        assert_eq!(row.media, media);
+        assert_eq!(row.thread_id.as_deref(), Some(thread_id));
+    }
+
     /// Fleet-UX soak NEW-03 (mini3 / mini5, 2026-05-23): the #1183 fix
     /// suppressed the synthesised "Background work started for `<tool>`."
     /// ack on the LIVE `message/persisted` broadcast for dual-negotiated
