@@ -6,6 +6,28 @@ type ProcSortKey = 'pid' | 'name' | 'cpu_percent' | 'memory_bytes'
 type SortDir = 'asc' | 'desc'
 
 const POLL_INTERVAL = 5000
+const FRESHNESS_TICK = 1000
+
+function formatAge(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+export function formatFreshnessLabel(updatedAt: number | null, now: number): string {
+  if (updatedAt === null) return 'Not updated yet'
+  return `Updated ${formatAge(now - updatedAt)}`
+}
+
+export function formatLastSuccessfulUpdate(updatedAt: number | null, now: number): string {
+  if (updatedAt === null) return 'never'
+  return formatAge(now - updatedAt)
+}
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -84,6 +106,8 @@ export default function ServerMetricsPage() {
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [live, setLive] = useState(true)
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
   const [procSort, setProcSort] = useState<ProcSortKey>('memory_bytes')
   const [procDir, setProcDir] = useState<SortDir>('desc')
   const [procOpen, setProcOpen] = useState(false)
@@ -93,7 +117,10 @@ export default function ServerMetricsPage() {
   const fetchMetrics = async () => {
     try {
       const data = await api.systemMetrics({ procs: procOpenRef.current })
+      const fetchedAt = Date.now()
       setMetrics(data)
+      setLastUpdatedAt(fetchedAt)
+      setNow(fetchedAt)
       setError(null)
     } catch (e: any) {
       setError(e.message)
@@ -103,8 +130,10 @@ export default function ServerMetricsPage() {
   useEffect(() => {
     fetchMetrics()
     timerRef.current = setInterval(fetchMetrics, POLL_INTERVAL)
+    const freshnessTimer = setInterval(() => setNow(Date.now()), FRESHNESS_TICK)
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
+      clearInterval(freshnessTimer)
     }
   }, [])
 
@@ -175,18 +204,23 @@ export default function ServerMetricsPage() {
             {m.platform.os} {m.platform.os_version} &middot; up {formatUptime(m.platform.uptime_secs)}
           </p>
         </div>
-        <button
-          onClick={toggleLive}
-          className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-700 hover:bg-white/5 transition"
-        >
-          <span className={`inline-block w-2 h-2 rounded-full ${live ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
-          {live ? 'Live' : 'Paused'}
-        </button>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-500">
+            {formatFreshnessLabel(lastUpdatedAt, now)}
+          </span>
+          <button
+            onClick={toggleLive}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-700 hover:bg-white/5 transition"
+          >
+            <span className={`inline-block w-2 h-2 rounded-full ${live ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
+            {live ? 'Live' : 'Paused'}
+          </button>
+        </div>
       </div>
 
       {error && (
         <div className="text-xs text-yellow-500 bg-yellow-500/10 rounded-lg px-3 py-2">
-          Update failed: {error} (showing last known data)
+          Update failed: {error}. Last successful update: {formatLastSuccessfulUpdate(lastUpdatedAt, now)}.
         </div>
       )}
 
