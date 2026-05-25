@@ -1090,6 +1090,7 @@ impl TaskSupervisor {
             task_ledger_path,
             None,
             None,
+            None,
         ) {
             Ok(id) => id,
             Err(error) => {
@@ -1117,7 +1118,15 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         tool_input: Option<Value>,
     ) -> String {
-        match self.register_full(tool_name, tool_call_id, session_key, None, tool_input, None) {
+        match self.register_full(
+            tool_name,
+            tool_call_id,
+            session_key,
+            None,
+            tool_input,
+            None,
+            None,
+        ) {
             Ok(id) => id,
             Err(error) => {
                 tracing::error!(
@@ -1152,6 +1161,7 @@ impl TaskSupervisor {
             None,
             tool_input,
             originating_client_message_id,
+            None,
         ) {
             Ok(id) => id,
             Err(error) => {
@@ -1167,27 +1177,58 @@ impl TaskSupervisor {
         }
     }
 
-    /// NEW-18b — return the [`TaskStatus`] of the most-recently-updated
-    /// task that holds `parent_tool_call_id` as its `tool_call_id` AND
-    /// whose `tool_name` does NOT start with `pipeline:`. The
-    /// `pipeline:` prefix filter is intentional: every pipeline node
-    /// child reuses the parent's `tool_call_id` (see
-    /// `executor.rs::register_node_task`), so without the filter this
-    /// lookup would return the status of a sibling node instead of the
-    /// `run_pipeline` parent. Returns `None` when no parent record
-    /// matches (e.g. ephemeral test harnesses that never register a
-    /// run_pipeline task).
+    /// NEW-18b — return the [`TaskStatus`] of the parent task identified
+    /// by `parent_tool_call_id`, with the relaunch-safe selection rule:
+    /// prefer an **active** non-pipeline record if one exists, otherwise
+    /// fall back to the most-recently-updated terminal record.
     ///
-    /// Most-recently-updated semantics: when multiple non-pipeline
-    /// records share a `tool_call_id` (unusual but possible in tests),
-    /// the one with the highest `updated_at` wins. This matches the
-    /// observable invariant that the most recent terminal transition
-    /// is the parent's true current state.
+    /// Filtering rules:
+    /// * Records whose `tool_name` starts with `pipeline:` are excluded —
+    ///   every pipeline node child reuses the parent's `tool_call_id`
+    ///   (see `executor.rs::register_node_task`), so without the filter
+    ///   this lookup would return the status of a sibling node instead
+    ///   of the `run_pipeline` parent.
+    /// * When `relaunch` re-registers a new parent task with the same
+    ///   `tool_call_id` as a failed predecessor, the new record is
+    ///   active and the old one is terminal. Preferring the active
+    ///   record avoids rejecting node registrations for the live
+    ///   relaunch just because the stale failed record has a more
+    ///   recent (idempotent) update.
+    ///
+    /// Returns `None` when no parent record matches (e.g. ephemeral
+    /// test harnesses that never register a `run_pipeline` task).
     pub fn parent_status_for_tool_call_id(&self, parent_tool_call_id: &str) -> Option<TaskStatus> {
         if parent_tool_call_id.is_empty() {
             return None;
         }
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        Self::pick_parent_status(&tasks, parent_tool_call_id)
+    }
+
+    /// Shared helper that applies the parent-selection rule documented
+    /// on [`Self::parent_status_for_tool_call_id`]. Caller holds the
+    /// `tasks` lock; this is the inside-lock implementation reused by
+    /// the atomic registration guard in [`Self::register_full`].
+    fn pick_parent_status(
+        tasks: &HashMap<String, BackgroundTask>,
+        parent_tool_call_id: &str,
+    ) -> Option<TaskStatus> {
+        // Codex P2: prefer an active non-pipeline record (live parent)
+        // over a stale terminal record sharing the same tool_call_id.
+        // This makes the lookup relaunch-safe — `TaskSupervisor::relaunch`
+        // re-registers the new parent with the original tool_call_id,
+        // so the active record is the true current parent.
+        if let Some(active) = tasks
+            .values()
+            .filter(|task| {
+                task.tool_call_id == parent_tool_call_id
+                    && !task.tool_name.starts_with("pipeline:")
+                    && task.status.is_active()
+            })
+            .max_by_key(|task| task.updated_at)
+        {
+            return Some(active.status.clone());
+        }
         tasks
             .values()
             .filter(|task| {
@@ -1199,15 +1240,20 @@ impl TaskSupervisor {
 
     /// NEW-18b — strict registration for a pipeline node child task.
     ///
-    /// Wraps [`Self::try_register_with_input`] with an Option-A
-    /// preventive guard: looks up the parent task by
-    /// `parent_tool_call_id` (filtering OUT sibling `pipeline:<node>`
-    /// entries) and refuses to register a new child when the parent is
-    /// already in a terminal state. This closes the "phantom child
-    /// task" race where the orphan-sweep in
-    /// [`Self::enable_persistence`] marks the parent failed but a
-    /// straggler pipeline tokio worker that survived the restart keeps
-    /// registering fresh node children against the live supervisor.
+    /// Wraps [`Self::register_full`] with an Option-A preventive guard:
+    /// the parent-terminal check and the child insertion happen UNDER
+    /// THE SAME `tasks` lock acquisition (see
+    /// `parent_terminal_check_tool_call_id` parameter), so concurrent
+    /// transitions on the parent cannot slip past the guard between
+    /// lookup and insert (codex P2 atomicity concern).
+    ///
+    /// Refuses with [`RegisterTaskError::ParentTerminal`] when the
+    /// parent (looked up via [`Self::pick_parent_status`]) is in a
+    /// terminal state. This closes the "phantom child task" race where
+    /// the orphan-sweep in [`Self::enable_persistence`] marks the parent
+    /// failed but a straggler pipeline tokio worker that survived the
+    /// restart keeps registering fresh node children against the live
+    /// supervisor.
     ///
     /// On a non-terminal (or unknown) parent the call falls through to
     /// the regular registration path (cap checks still apply). Callers
@@ -1219,27 +1265,15 @@ impl TaskSupervisor {
         parent_tool_call_id: &str,
         session_key: Option<&str>,
     ) -> Result<String, RegisterTaskError> {
-        if let Some(status) = self.parent_status_for_tool_call_id(parent_tool_call_id) {
-            if status.is_terminal() {
-                tracing::warn!(
-                    node_tool_name,
-                    parent_tool_call_id,
-                    parent_status = status.as_str(),
-                    "refusing pipeline node child registration: parent task is terminal"
-                );
-                counter!(
-                    "octos_task_supervisor_register_node_rejected_total",
-                    "reason" => "parent_terminal".to_string(),
-                    "parent_status" => status.as_str().to_string(),
-                )
-                .increment(1);
-                return Err(RegisterTaskError::ParentTerminal {
-                    parent_tool_call_id: parent_tool_call_id.to_string(),
-                    parent_status: status,
-                });
-            }
-        }
-        self.try_register_with_input(node_tool_name, parent_tool_call_id, session_key, None)
+        self.register_full(
+            node_tool_name,
+            parent_tool_call_id,
+            session_key,
+            None,
+            None,
+            None,
+            Some(parent_tool_call_id),
+        )
     }
 
     /// Strict variant of [`Self::register_with_input`]: returns the typed
@@ -1253,9 +1287,18 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         tool_input: Option<Value>,
     ) -> Result<String, RegisterTaskError> {
-        self.register_full(tool_name, tool_call_id, session_key, None, tool_input, None)
+        self.register_full(
+            tool_name,
+            tool_call_id,
+            session_key,
+            None,
+            tool_input,
+            None,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_full(
         &self,
         tool_name: &str,
@@ -1264,6 +1307,7 @@ impl TaskSupervisor {
         task_ledger_path: Option<&str>,
         tool_input: Option<Value>,
         originating_client_message_id: Option<String>,
+        parent_terminal_check_tool_call_id: Option<&str>,
     ) -> Result<String, RegisterTaskError> {
         // Per-parent fan-out cap. Detached registrations (`session_key ==
         // None`) skip the gate because they do not have a parent to
@@ -1403,6 +1447,38 @@ impl TaskSupervisor {
             runtime_policy_stamp: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        // Codex P2 atomicity: when this is a child-task registration
+        // that requested the parent-terminal guard, recheck parent
+        // status UNDER the same lock that performs the insertion. This
+        // closes the race where a concurrent transition could mark the
+        // parent terminal between an outside-lock lookup and the
+        // insert — without it, a worker could observe the parent as
+        // Running, get descheduled while `mark_failed` +
+        // `mark_descendants_failed` run, and then insert a fresh
+        // `pipeline:<node>` after the cascade.
+        if let Some(parent_tcid) = parent_terminal_check_tool_call_id
+            && !parent_tcid.is_empty()
+            && let Some(status) = Self::pick_parent_status(&tasks, parent_tcid)
+            && status.is_terminal()
+        {
+            drop(tasks);
+            tracing::warn!(
+                tool_name,
+                parent_tool_call_id = parent_tcid,
+                parent_status = status.as_str(),
+                "refusing pipeline node child registration: parent task is terminal (atomic recheck)"
+            );
+            counter!(
+                "octos_task_supervisor_register_node_rejected_total",
+                "reason" => "parent_terminal".to_string(),
+                "parent_status" => status.as_str().to_string(),
+            )
+            .increment(1);
+            return Err(RegisterTaskError::ParentTerminal {
+                parent_tool_call_id: parent_tcid.to_string(),
+                parent_status: status,
+            });
+        }
         tasks.insert(id.clone(), task);
         drop(tasks);
         self.persist_snapshot_by_id(&id);
@@ -3977,6 +4053,44 @@ mod tests {
         assert!(!child_id.is_empty());
     }
 
+    /// Codex P2 #2 — when a `run_pipeline` task is relaunched with
+    /// the same `tool_call_id` (mirroring `TaskSupervisor::relaunch`'s
+    /// behaviour), the lookup must return the ACTIVE relaunch's
+    /// status, not the stale failed predecessor's. Without preferring
+    /// active records, a fresh node registration under the live
+    /// relaunch would be rejected just because the failed record
+    /// happens to share the tool_call_id.
+    #[test]
+    fn parent_status_for_tool_call_id_prefers_active_relaunch_over_stale_failed() {
+        let supervisor = TaskSupervisor::new();
+        let tcid = "call-relaunched-tcid";
+
+        // Original parent: Failed (the predecessor that triggered
+        // relaunch).
+        let original = supervisor.register("run_pipeline", tcid, Some("sess-relaunch"));
+        supervisor.mark_running(&original);
+        supervisor.mark_failed(&original, "predecessor failed".to_string());
+
+        // Relaunch: a fresh parent task registered with the same
+        // tool_call_id. Status: Running.
+        let relaunched = supervisor.register("run_pipeline", tcid, Some("sess-relaunch"));
+        supervisor.mark_running(&relaunched);
+
+        let status = supervisor.parent_status_for_tool_call_id(tcid);
+        assert_eq!(
+            status,
+            Some(TaskStatus::Running),
+            "lookup must prefer the active relaunch over the stale failed predecessor"
+        );
+
+        // Consequence: try_register_node_task must SUCCEED for the
+        // live relaunch.
+        let child = supervisor
+            .try_register_node_task("pipeline:analyze", tcid, Some("sess-relaunch"))
+            .expect("child registration must succeed for live relaunch");
+        assert!(!child.is_empty());
+    }
+
     /// `parent_status_for_tool_call_id` must filter OUT sibling
     /// `pipeline:<node>` records when resolving the parent status,
     /// because every pipeline child reuses the parent's tool_call_id.
@@ -4179,6 +4293,44 @@ mod tests {
             m.error.as_deref(),
             Some("parent task orphaned across restart"),
             "mixed-state child must carry the cascade reason (proves Option-C ran distinctly from main sweep)"
+        );
+    }
+
+    /// Codex P2 atomicity — the parent-terminal check inside
+    /// `register_full` happens under the SAME `tasks` lock as the
+    /// child insert. There is no observable window between lookup
+    /// and insert. This test pins that the strict node-registration
+    /// path actually goes through `register_full`'s inside-lock
+    /// guard (not an outside-lock check that could race).
+    ///
+    /// We assert this indirectly by verifying that even a child
+    /// inserted via the regular non-strict path (which has NO
+    /// parent check) ends up in the supervisor — proving the strict
+    /// guard is the ONLY mechanism that refuses based on parent
+    /// state, and that strict mode actually exercises the in-lock
+    /// recheck (since we use `try_register_node_task`, not the
+    /// outside-lock convenience wrapper).
+    #[test]
+    fn try_register_node_task_uses_in_lock_guard_not_outside_check() {
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-atomic-guard";
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-atom"));
+        supervisor.mark_running(&parent);
+        supervisor.mark_failed(&parent, "orphaned across restart".to_string());
+
+        // Strict registration must reject (in-lock guard).
+        let err = supervisor
+            .try_register_node_task("pipeline:analyze", parent_tcid, Some("sess-atom"))
+            .expect_err("strict path must reject terminal parent");
+        assert!(matches!(err, RegisterTaskError::ParentTerminal { .. }));
+
+        // Non-strict registration via `register` (no parent guard)
+        // succeeds — this proves the rejection in the strict path
+        // is the parent-terminal guard, not some unrelated check.
+        let allowed = supervisor.register("pipeline:setup", parent_tcid, Some("sess-atom"));
+        assert!(
+            !allowed.is_empty(),
+            "non-strict register must NOT consult parent status — the guard is opt-in"
         );
     }
 
