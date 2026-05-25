@@ -1423,24 +1423,57 @@ fn active_turns_registry() -> SharedActiveTurns {
 /// so cross-session collisions are vanishingly unlikely, but the
 /// composite key keeps the contract explicit.
 ///
-/// Entries are garbage-collected at the end of each turn, after
-/// the per-turn `agent_task.await` has joined (or been aborted) in
-/// `run_standalone_turn`. This is OUTSIDE the session-manager
-/// critical section that holds the cursor read/write sites, so a
-/// queued same-`(session, turn)` re-entry serialised on the
-/// session lock can still observe the advanced cursor before the
-/// outer GC runs. The codex round-2 review on NEW-16 mandated this
-/// placement; doing the GC inside the persist block evicts the
-/// state before the second invocation can read it, defeating the
-/// guard for the queued case AND leaking on abort/panic paths
-/// inside the persist block.
-type TurnPersistCursors = Arc<TokioMutex<HashMap<(String, String), usize>>>;
+/// Entries carry a `last_touched_at: Instant` and are evicted
+/// opportunistically on every read/write that finds them stale
+/// (older than `TURN_PERSIST_CURSOR_TTL`). Codex round 3 caught
+/// that an immediate end-of-turn GC has two flaws:
+///   1. A queued same-`(session, turn)` re-entry serialised on the
+///      session lock can be scheduled AFTER the first outer task
+///      already evicted the cursor — the guard would miss.
+///   2. Cursor entries leak if the outer `run_standalone_turn`
+///      future is aborted (connection close, parent task drop)
+///      after the persist block inserted the cursor but before
+///      the bottom-of-fn GC runs.
+///
+/// A TTL covers both: the cursor lives long enough for any
+/// realistic queued re-entry to observe it (the TTL is far longer
+/// than the inter-invocation window), and stale entries get
+/// pruned by subsequent persist activity in the SAME session
+/// rather than relying on cancellation-safe cleanup paths.
+type TurnPersistCursors = Arc<TokioMutex<HashMap<(String, String), TurnPersistCursorEntry>>>;
+
+#[derive(Clone, Copy, Debug)]
+struct TurnPersistCursorEntry {
+    /// Highest-index-already-persisted + 1 (i.e. the NEXT index to
+    /// write). For the synthetic final-assistant row, this is
+    /// `response.messages.len() + 1`.
+    next_index: usize,
+    last_touched_at: std::time::Instant,
+}
+
+/// TTL for per-`(session, turn)` cursor entries. 5 minutes is
+/// far longer than any realistic per-turn execution time (the
+/// agent loop's `DEFAULT_SESSION_TIMEOUT_SECS` is 1800s, and a
+/// queued same-turn re-entry would be serialised on the session
+/// lock — typically tens of milliseconds at most). Long enough
+/// to make the queued-re-entry guard reliable; short enough that
+/// abort/panic leaks bound at ~5 minutes per stale entry.
+const TURN_PERSIST_CURSOR_TTL: Duration = Duration::from_secs(300);
 
 fn turn_persist_cursors() -> TurnPersistCursors {
     static CURSORS: OnceLock<TurnPersistCursors> = OnceLock::new();
     CURSORS
         .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
         .clone()
+}
+
+/// Opportunistic prune: remove every entry older than
+/// `TURN_PERSIST_CURSOR_TTL`. Called from the persist block
+/// itself on every entry/exit, so the map is bounded by
+/// "entries created within the last TTL window."
+fn prune_stale_turn_persist_cursors(map: &mut HashMap<(String, String), TurnPersistCursorEntry>) {
+    let now = std::time::Instant::now();
+    map.retain(|_, entry| now.duration_since(entry.last_touched_at) < TURN_PERSIST_CURSOR_TTL);
 }
 
 fn contract_stores() -> Arc<UiProtocolContractStores> {
@@ -15982,18 +16015,25 @@ async fn run_standalone_turn(
                     // `turn_output_log` upstream — but if some edge
                     // path re-entered this persist loop for the SAME
                     // `(session, turn)` pair, we MUST NOT double-write
-                    // the same indexed row. The cursor is loaded under
-                    // the session lock (which is already held below
-                    // via `sessions.lock().await`) so the load-update
-                    // sequence is atomic w.r.t. the session manager.
+                    // the same indexed row.
+                    //
+                    // Codex round-3 P1+P2: switched from immediate
+                    // end-of-turn GC to TTL-based opportunistic
+                    // pruning. The entry stays alive long enough for
+                    // any realistic queued re-entry to observe it,
+                    // and stale entries (from abort/panic paths
+                    // where the outer task was cancelled) get
+                    // pruned by subsequent persist activity rather
+                    // than relying on cancellation-safe cleanup.
                     let persist_cursors = turn_persist_cursors();
                     let cursor_key = (
                         agent_session_id.0.clone(),
                         turn_thread_id_for_persist.clone(),
                     );
                     let cursor_already_advanced = {
-                        let cursors = persist_cursors.lock().await;
-                        cursors.get(&cursor_key).copied().unwrap_or(0)
+                        let mut cursors = persist_cursors.lock().await;
+                        prune_stale_turn_persist_cursors(&mut cursors);
+                        cursors.get(&cursor_key).map(|e| e.next_index).unwrap_or(0)
                     };
                     for (message_index, message) in response.messages.iter().cloned().enumerate() {
                         if skip_internal_user_persist
@@ -16066,12 +16106,22 @@ async fn run_standalone_turn(
                             // anyone re-entering the persist loop on
                             // this `(session, turn)` will see the
                             // updated cursor on their next read).
+                            //
+                            // Codex round-3: timestamp the entry so
+                            // the TTL pruner can evict it.
                             {
                                 let mut cursors = persist_cursors.lock().await;
-                                let entry = cursors.entry(cursor_key.clone()).or_insert(0);
-                                if message_index + 1 > *entry {
-                                    *entry = message_index + 1;
+                                let now = std::time::Instant::now();
+                                let entry = cursors.entry(cursor_key.clone()).or_insert(
+                                    TurnPersistCursorEntry {
+                                        next_index: 0,
+                                        last_touched_at: now,
+                                    },
+                                );
+                                if message_index + 1 > entry.next_index {
+                                    entry.next_index = message_index + 1;
                                 }
+                                entry.last_touched_at = now;
                             }
                             record_appui_context_manager_message(
                                 &context_data_dir_for_result,
@@ -16188,7 +16238,8 @@ async fn run_standalone_turn(
                             let final_virtual_index = response.messages.len();
                             let cursor_already_at_final = {
                                 let c = persist_cursors.lock().await;
-                                c.get(&cursor_key).copied().unwrap_or(0) > final_virtual_index
+                                c.get(&cursor_key).map(|e| e.next_index).unwrap_or(0)
+                                    > final_virtual_index
                             };
                             if cursor_already_at_final {
                                 tracing::debug!(
@@ -16217,10 +16268,17 @@ async fn run_standalone_turn(
                                     // final-row index so a re-entry skips it.
                                     {
                                         let mut c = persist_cursors.lock().await;
-                                        let entry = c.entry(cursor_key.clone()).or_insert(0);
-                                        if final_virtual_index + 1 > *entry {
-                                            *entry = final_virtual_index + 1;
+                                        let now = std::time::Instant::now();
+                                        let entry = c.entry(cursor_key.clone()).or_insert(
+                                            TurnPersistCursorEntry {
+                                                next_index: 0,
+                                                last_touched_at: now,
+                                            },
+                                        );
+                                        if final_virtual_index + 1 > entry.next_index {
+                                            entry.next_index = final_virtual_index + 1;
                                         }
+                                        entry.last_touched_at = now;
                                     }
                                     record_appui_context_manager_message(
                                         &context_data_dir_for_result,
@@ -16238,16 +16296,20 @@ async fn run_standalone_turn(
                             }
                         }
                     }
-                    // NEW-16 codex round-2 P1: do NOT GC the cursor
-                    // here. Eviction has moved to the OUTER scope
-                    // (after `agent_task.await` joins / abort path)
-                    // so that a queued same-`(session, turn)` re-entry
-                    // serialised on the session lock can still observe
-                    // the advanced cursor. GC'ing inside the session
-                    // critical section that holds the lock would
-                    // delete the state before the re-entry could
-                    // acquire the lock and read it, defeating the
-                    // guard for the queued case.
+                    // NEW-16 codex round-3 P1+P2: do NOT GC the
+                    // cursor here AND do NOT GC at the bottom of
+                    // `run_standalone_turn`. The TTL pruner
+                    // (`prune_stale_turn_persist_cursors`) handles
+                    // eviction opportunistically on subsequent
+                    // persist activity. That covers:
+                    //   - queued same-`(session, turn)` re-entry
+                    //     (entry stays alive until TTL expires)
+                    //   - abort/panic paths (outer GC would be
+                    //     skipped on cancellation; TTL evicts
+                    //     anyway)
+                    //   - long-running server map bound (TTL
+                    //     caps memory at "entries created within
+                    //     the last 5 minutes")
                 }
                 // #1158 codex P2 rev3 follow-up: distinguish two
                 // shapes of "empty captured reply":
@@ -16490,22 +16552,20 @@ async fn run_standalone_turn(
 
     let _ = agent_task.await;
 
-    // NEW-16 codex round-2 P1+P2: garbage-collect the per-turn
-    // persist cursor here, AFTER the agent task has joined (or been
-    // aborted above). This is OUTSIDE the session-manager lock the
-    // persist block held, so any queued same-`(session, turn)`
-    // re-entry serialised on that lock got to observe the advanced
-    // cursor before we removed it. This also closes the
-    // abort-leak path the round-2 P2 review flagged: even on
-    // `agent_task.abort()`, the join completes and we still run
-    // through here. Eviction is keyed by `(session_id.0,
-    // turn_id.0)` so it cannot mistakenly evict a sibling turn's
-    // entry.
-    {
-        let cursors = turn_persist_cursors();
-        let mut c = cursors.lock().await;
-        c.remove(&(session_id.0.clone(), turn_id.0.to_string()));
-    }
+    // NEW-16 codex round-3 P1+P2: GC moved from here to the
+    // TTL-based opportunistic pruner inside the persist block.
+    // Earlier rounds 1-2 evicted here, but that left two gaps:
+    //   1. A queued same-`(session, turn)` re-entry scheduled
+    //      AFTER this outer task completed would see a cleaned
+    //      cursor and could re-persist (the guard's whole point
+    //      was to prevent that).
+    //   2. Connection-close abort of the OUTER
+    //      `run_standalone_turn` future would skip this GC line
+    //      entirely, leaking entries until process restart.
+    // The TTL pruner solves both: cursor lives long enough for
+    // realistic re-entries, and stale entries get evicted by
+    // subsequent persist activity rather than relying on a
+    // cancellation-safe cleanup path.
 
     // Wave4-A: emit a final `router/status` snapshot adjacent to
     // `turn/completed` so clients see the actual provider that ran
@@ -31217,6 +31277,17 @@ ignore = []
         assert_eq!(wire, "shell tool: command not found: foo");
     }
 
+    /// NEW-16 codex round-3: helper for building a
+    /// `TurnPersistCursorEntry` in tests at a given `next_index`,
+    /// stamped at NOW. Centralises the construction so a future
+    /// refactor of the entry type only touches one place.
+    fn make_cursor_entry_fresh(next_index: usize) -> super::TurnPersistCursorEntry {
+        super::TurnPersistCursorEntry {
+            next_index,
+            last_touched_at: std::time::Instant::now(),
+        }
+    }
+
     /// NEW-16: the per-turn message-index cursor used as
     /// defense-in-depth inside the `response.messages` persist loop
     /// MUST skip any `(session, turn, message_index)` triple it has
@@ -31234,7 +31305,7 @@ ignore = []
         // advances to 3 (i.e. next index to write is 3).
         {
             let mut c = cursors.lock().await;
-            c.insert(key.clone(), 3);
+            c.insert(key.clone(), make_cursor_entry_fresh(3));
         }
 
         // Second invocation: same `(session, turn)` re-enters with the
@@ -31242,7 +31313,7 @@ ignore = []
         // 2) MUST be skipped. Only index 3 is new.
         let cursor_already_advanced = {
             let c = cursors.lock().await;
-            c.get(&key).copied().unwrap_or(0)
+            c.get(&key).map(|e| e.next_index).unwrap_or(0)
         };
         assert_eq!(
             cursor_already_advanced, 3,
@@ -31266,20 +31337,34 @@ ignore = []
         // After successfully persisting index 3, the cursor advances.
         {
             let mut c = cursors.lock().await;
-            let entry = c.entry(key.clone()).or_insert(0);
-            if 3 + 1 > *entry {
-                *entry = 3 + 1;
+            let now = std::time::Instant::now();
+            let entry = c
+                .entry(key.clone())
+                .or_insert(super::TurnPersistCursorEntry {
+                    next_index: 0,
+                    last_touched_at: now,
+                });
+            if 3 + 1 > entry.next_index {
+                entry.next_index = 3 + 1;
             }
+            entry.last_touched_at = now;
         }
         let cursor_after = {
             let c = cursors.lock().await;
-            c.get(&key).copied().unwrap_or(0)
+            c.get(&key).map(|e| e.next_index).unwrap_or(0)
         };
         assert_eq!(cursor_after, 4, "cursor should advance to next index");
+
+        // Cleanup: opportunistic prune treats the entry as fresh
+        // (no TTL elapsed), so explicitly remove for hermeticity.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
+        }
     }
 
-    /// NEW-16 codex review P1: the cursor guard MUST cover the
-    /// synthesised final assistant row too. When the cursor is
+    /// NEW-16 codex review round-1 P1: the cursor guard MUST cover
+    /// the synthesised final assistant row too. When the cursor is
     /// advanced to `response.messages.len() + 1`, the synthesised
     /// final row has already been persisted in a prior invocation
     /// and must be skipped on re-entry.
@@ -31290,23 +31375,19 @@ ignore = []
         let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
         let key = (session_id.clone(), turn_id.clone());
 
-        // Simulate first invocation: 3 indexed log rows + 1 synthetic
-        // final row all persisted. Cursor advances to
-        // `messages.len() + 1` = 3 + 1 = 4.
         let log_row_count = 3usize;
-        let final_virtual_index = log_row_count; // == messages.len()
+        let final_virtual_index = log_row_count;
         {
             let mut c = cursors.lock().await;
-            c.insert(key.clone(), final_virtual_index + 1);
+            c.insert(
+                key.clone(),
+                make_cursor_entry_fresh(final_virtual_index + 1),
+            );
         }
 
-        // Second invocation (re-entry on SAME (session, turn)):
-        // - All indexed rows < final_virtual_index must skip.
-        // - The synthetic final row check: cursor > final_virtual_index?
-        //   Yes (4 > 3), so the synthetic final row is also skipped.
         let cursor_already_advanced = {
             let c = cursors.lock().await;
-            c.get(&key).copied().unwrap_or(0)
+            c.get(&key).map(|e| e.next_index).unwrap_or(0)
         };
         for message_index in 0..log_row_count {
             assert!(
@@ -31321,59 +31402,99 @@ ignore = []
              this is the codex round-1 P1 contract on NEW-16"
         );
 
-        // Cleanup so this test is hermetic.
         {
             let mut c = cursors.lock().await;
             c.remove(&key);
         }
     }
 
-    /// NEW-16 codex review round-1 P2 + round-2 P1+P2: cursor
-    /// entries are evicted in the OUTER scope of `run_standalone_turn`,
-    /// after `agent_task.await` joins (or is aborted). Eviction
-    /// happens OUTSIDE the session-manager critical section the
-    /// persist block held — so a queued same-`(session, turn)`
-    /// re-entry serialised on that lock can still observe the
-    /// advanced cursor before the outer GC runs. The eviction also
-    /// covers the abort/panic path (because `agent_task.await`
-    /// returns after `agent_task.abort()` too).
+    /// NEW-16 codex review round-3 P2: the TTL pruner MUST evict
+    /// entries older than `TURN_PERSIST_CURSOR_TTL`. This guards
+    /// against:
+    ///   - abort/panic paths that prevented end-of-turn cleanup
+    ///   - long-running server map growth (bounded at ~TTL of
+    ///     entries created within the last window)
+    ///
+    /// We can't easily wait 5 minutes in a test, so we forge an
+    /// entry with an old `last_touched_at` directly and run the
+    /// pruner.
     #[tokio::test]
-    async fn new16_turn_persist_cursor_is_evicted_after_turn_completes() {
+    async fn new16_turn_persist_cursor_ttl_pruner_evicts_stale_entries() {
         let cursors = super::turn_persist_cursors();
         let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
         let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
         let key = (session_id.clone(), turn_id.clone());
 
-        // Simulate the persist block populating the cursor while
-        // holding the sessions lock.
+        // Forge an entry that is 2× TTL old.
+        let stale_ts = std::time::Instant::now()
+            - super::TURN_PERSIST_CURSOR_TTL
+            - std::time::Duration::from_secs(1);
         {
             let mut c = cursors.lock().await;
-            c.insert(key.clone(), 5);
+            c.insert(
+                key.clone(),
+                super::TurnPersistCursorEntry {
+                    next_index: 99,
+                    last_touched_at: stale_ts,
+                },
+            );
         }
-        // While the persist block holds the sessions lock, the
-        // cursor is observable — a queued same-`(session, turn)`
-        // invocation waiting on the sessions lock would see this on
-        // its next read. Confirm it's there.
-        {
-            let c = cursors.lock().await;
-            assert_eq!(c.get(&key).copied(), Some(5));
-        }
-        // Simulate the OUTER-scope GC at end of `run_standalone_turn`,
-        // AFTER `agent_task.await` joins. By this point any queued
-        // same-turn re-entry's persist block has already completed.
-        {
-            let mut c = cursors.lock().await;
-            c.remove(&key);
-        }
-        // The entry is gone.
+        // The stale entry is present.
         {
             let c = cursors.lock().await;
             assert!(
-                c.get(&key).is_none(),
-                "cursor entry MUST be evicted after the per-turn agent_task \
-                 joins (codex round-2 P2 — covers normal + abort/panic paths \
-                 and keeps the map bounded on a long-running server)"
+                c.contains_key(&key),
+                "stale entry should be present before prune"
             );
+        }
+        // Run the pruner.
+        {
+            let mut c = cursors.lock().await;
+            super::prune_stale_turn_persist_cursors(&mut c);
+        }
+        // The stale entry is gone.
+        {
+            let c = cursors.lock().await;
+            assert!(
+                !c.contains_key(&key),
+                "stale entry MUST be evicted by TTL pruner (codex round-3 P2 — \
+                 the pruner is the only GC path now, so this MUST work)"
+            );
+        }
+    }
+
+    /// NEW-16 codex round-3: fresh entries (within TTL) MUST be
+    /// preserved by the pruner. A regression that nukes everything
+    /// would defeat the cursor guard entirely.
+    #[tokio::test]
+    async fn new16_turn_persist_cursor_ttl_pruner_preserves_fresh_entries() {
+        let cursors = super::turn_persist_cursors();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
+        let key = (session_id.clone(), turn_id.clone());
+
+        {
+            let mut c = cursors.lock().await;
+            c.insert(key.clone(), make_cursor_entry_fresh(42));
+        }
+        {
+            let mut c = cursors.lock().await;
+            super::prune_stale_turn_persist_cursors(&mut c);
+        }
+        {
+            let c = cursors.lock().await;
+            let entry = c
+                .get(&key)
+                .expect("fresh entry MUST survive the TTL pruner");
+            assert_eq!(
+                entry.next_index, 42,
+                "the pruner must not corrupt surviving entries"
+            );
+        }
+        // Cleanup.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key);
         }
     }
 
@@ -31394,28 +31515,35 @@ ignore = []
 
         {
             let mut c = cursors.lock().await;
-            c.insert(key_a1.clone(), 5);
-            c.insert(key_a2.clone(), 2);
-            c.insert(key_b1.clone(), 1);
+            c.insert(key_a1.clone(), make_cursor_entry_fresh(5));
+            c.insert(key_a2.clone(), make_cursor_entry_fresh(2));
+            c.insert(key_b1.clone(), make_cursor_entry_fresh(1));
         }
 
         let c = cursors.lock().await;
         // Each (session, turn) pair has its own cursor.
-        assert_eq!(c.get(&key_a1).copied(), Some(5));
-        assert_eq!(c.get(&key_a2).copied(), Some(2));
-        assert_eq!(c.get(&key_b1).copied(), Some(1));
+        assert_eq!(c.get(&key_a1).map(|e| e.next_index), Some(5));
+        assert_eq!(c.get(&key_a2).map(|e| e.next_index), Some(2));
+        assert_eq!(c.get(&key_b1).map(|e| e.next_index), Some(1));
         // Cross-key lookups return None — distinct pairs don't share state.
-        assert_eq!(
+        assert!(
             c.get(&(session_a.clone(), "turn-nonexistent".into()))
-                .copied(),
-            None,
+                .is_none(),
             "a non-existent turn under session-a must NOT inherit any cursor"
         );
-        assert_eq!(
-            c.get(&(session_b.clone(), turn_2.clone())).copied(),
-            None,
+        assert!(
+            c.get(&(session_b.clone(), turn_2.clone())).is_none(),
             "session-b's view of turn-2 must NOT inherit session-a's cursor for turn-2 \
              (the composite key prevents cross-session collisions)"
         );
+        drop(c);
+
+        // Cleanup.
+        {
+            let mut c = cursors.lock().await;
+            c.remove(&key_a1);
+            c.remove(&key_a2);
+            c.remove(&key_b1);
+        }
     }
 }
