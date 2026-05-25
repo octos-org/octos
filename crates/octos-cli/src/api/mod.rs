@@ -8,6 +8,7 @@
 //! process-wide [`EventBroadcaster`] over SSE (admin-only).
 
 pub mod admin;
+pub mod admin_audit;
 pub mod admin_setup;
 pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
@@ -108,6 +109,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::admin_audit_store::AdminAuditStore;
 use crate::admin_token_store::AdminTokenStore;
 use crate::content_catalog::ContentCatalogManager;
 use crate::login_allowlist::LoginAllowlistStore;
@@ -220,6 +222,8 @@ pub struct AppState {
     pub user_store: Option<Arc<UserStore>>,
     /// Allowlist for pre-authorized email-based signup.
     pub allowlist_store: Option<Arc<LoginAllowlistStore>>,
+    /// Persistent audit log for state-changing admin actions.
+    pub admin_audit_store: Option<Arc<AdminAuditStore>>,
     /// Auth manager for email OTP and sessions.
     pub auth_manager: Option<Arc<AuthManager>>,
     /// Shared HTTP client for webhook proxying.
@@ -357,6 +361,7 @@ impl AppState {
             process_manager: None,
             user_store: None,
             allowlist_store: None,
+            admin_audit_store: None,
             auth_manager: None,
             http_client: reqwest::Client::new(),
             config_path: None,

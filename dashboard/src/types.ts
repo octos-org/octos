@@ -252,6 +252,24 @@ export interface AllowlistEntry {
   last_login_at?: string | null
 }
 
+export interface AdminAuditEntry {
+  schema_version: number
+  id: string
+  timestamp: string
+  actor: string
+  action: string
+  target_id: string
+  before_summary?: unknown
+  after_summary?: unknown
+}
+
+export interface AdminAuditResponse {
+  entries: AdminAuditEntry[]
+  total: number
+  limit: number
+  offset: number
+}
+
 /// The active tenant scope derived from the request `Host` /
 /// `X-Forwarded-Host` header. Populated by the server's
 /// `host_scoped_profile_id` resolver. `null` when no tenant subdomain

@@ -12,6 +12,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+use super::router::AuthIdentity;
 use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
 
 /// Basic email format validation.
@@ -260,6 +261,7 @@ pub(crate) fn relocate_keychain_backed_secrets(
 
 /// POST /api/admin/profiles
 pub async fn create_profile(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateProfileRequest>,
 ) -> Result<(StatusCode, Json<ProfileResponse>), (StatusCode, String)> {
@@ -313,18 +315,26 @@ pub async fn create_profile(
 
     tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(ProfileResponse {
-            email: None,
-            profile: mask_secrets(&profile),
-            status,
-        }),
-    ))
+    let response = ProfileResponse {
+        email: None,
+        profile: mask_secrets(&profile),
+        status,
+    };
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "profile.create",
+        profile.id.clone(),
+        None,
+        super::admin_audit::summary_value(&response.profile),
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// PUT /api/admin/profiles/:id
 pub async fn update_profile(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: String,
@@ -346,6 +356,7 @@ pub async fn update_profile(
         .get(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    let before_profile = profile.clone();
 
     if let Some(name) = req.name {
         profile.name = name;
@@ -425,15 +436,28 @@ pub async fn update_profile(
 
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
-    Ok(Json(ProfileResponse {
+    let response = ProfileResponse {
         email: None,
         profile: mask_secrets(&profile),
         status,
-    }))
+    };
+    let before_summary = super::admin_audit::summary_value(&mask_secrets(&before_profile));
+    let after_summary = super::admin_audit::summary_value(&response.profile);
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "profile.update",
+        id,
+        before_summary,
+        after_summary,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(response))
 }
 
 /// DELETE /api/admin/profiles/:id
 pub async fn delete_profile(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
@@ -477,6 +501,10 @@ pub async fn delete_profile(
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
     }
 
+    let before_summary = profile
+        .as_ref()
+        .and_then(|profile| super::admin_audit::summary_value(&mask_secrets(profile)));
+
     // Clean up data directory
     if let Some(profile) = profile {
         let data_dir = store.resolve_data_dir(&profile);
@@ -488,6 +516,15 @@ pub async fn delete_profile(
     }
 
     tracing::info!(profile = %id, "profile deleted");
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "profile.delete",
+        id.clone(),
+        before_summary,
+        None,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(ActionResponse {
         ok: true,
         message: Some(format!("profile '{id}' deleted")),
@@ -1958,12 +1995,27 @@ pub struct ProfileMonitorUpdateRequest {
 
 /// POST /api/admin/monitor/watchdog — toggle watchdog.
 pub async fn toggle_watchdog(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MonitorToggleRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let before = state
+        .watchdog_enabled
+        .as_ref()
+        .map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
     if let Some(ref flag) = state.watchdog_enabled {
         flag.store(req.enabled, std::sync::atomic::Ordering::Relaxed);
     }
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "monitor.watchdog.toggle",
+        "monitor.watchdog",
+        Some(serde_json::json!({ "enabled": before })),
+        Some(serde_json::json!({ "enabled": req.enabled })),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "watchdog_enabled": req.enabled }),
     ))
@@ -1971,12 +2023,27 @@ pub async fn toggle_watchdog(
 
 /// POST /api/admin/monitor/alerts — toggle alerts.
 pub async fn toggle_alerts(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MonitorToggleRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let before = state
+        .alerts_enabled
+        .as_ref()
+        .map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
     if let Some(ref flag) = state.alerts_enabled {
         flag.store(req.enabled, std::sync::atomic::Ordering::Relaxed);
     }
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "monitor.alerts.toggle",
+        "monitor.alerts",
+        Some(serde_json::json!({ "enabled": before })),
+        Some(serde_json::json!({ "enabled": req.enabled })),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "alerts_enabled": req.enabled }),
     ))

@@ -5,6 +5,8 @@
 //! the MCP server dispatch in [`commands::mcp_serve`]). Keep the public API
 //! narrow — only items that integration tests or sibling crates consume.
 
+#[cfg(feature = "api")]
+pub mod admin_audit_store;
 pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
