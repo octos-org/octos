@@ -3,12 +3,17 @@
 //! Extracted from the gateway main loop to keep `mod.rs` focused on
 //! orchestration and dispatch.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eyre::WrapErr;
 use octos_bus::ChannelManager;
 use octos_core::{InboundMessage, OutboundMessage};
 use tracing::warn;
+
+const MAX_SCANNED_PDF_FALLBACK_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_SCANNED_PDF_FALLBACK_PAGES: u32 = 3;
+const SCANNED_PDF_FALLBACK_DPI: u32 = 120;
+const MIN_MEANINGFUL_PDF_ALNUM_CHARS: usize = 24;
 
 /// Result of media preprocessing on an inbound message.
 pub struct MediaResult {
@@ -38,6 +43,7 @@ pub async fn process_media(
     let mut is_voice_message = false;
     let mut audio_filenames = Vec::new();
     let mut attachment_filenames = Vec::new();
+    let mut attachment_notes = Vec::new();
 
     if let Some(asr_bin) = asr_binary {
         for path in &inbound.media {
@@ -73,7 +79,9 @@ pub async fn process_media(
                     &mut image_media,
                     &mut attachment_media,
                     &mut attachment_filenames,
-                );
+                    &mut attachment_notes,
+                )
+                .await;
             }
         }
     } else {
@@ -91,7 +99,9 @@ pub async fn process_media(
                     &mut image_media,
                     &mut attachment_media,
                     &mut attachment_filenames,
-                );
+                    &mut attachment_notes,
+                )
+                .await;
             }
         }
     }
@@ -101,6 +111,10 @@ pub async fn process_media(
         .chain(build_attachment_summary(
             "Attached files",
             &attachment_filenames,
+        ))
+        .chain(build_attachment_summary(
+            "PDF processing",
+            &attachment_notes,
         ))
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -124,19 +138,229 @@ pub async fn process_media(
     }
 }
 
-fn route_non_audio_attachment(
+async fn route_non_audio_attachment(
     resolved_path: &str,
     display_source: &str,
     image_media: &mut Vec<String>,
     attachment_media: &mut Vec<String>,
     attachment_filenames: &mut Vec<String>,
+    attachment_notes: &mut Vec<String>,
 ) {
     if octos_bus::media::is_image(display_source) {
         image_media.push(resolved_path.to_string());
     } else {
         attachment_media.push(resolved_path.to_string());
-        attachment_filenames.push(attachment_display_name(display_source));
+        let display_name = attachment_display_name(display_source);
+        attachment_filenames.push(display_name.clone());
+        maybe_add_scanned_pdf_fallback(resolved_path, &display_name, image_media, attachment_notes)
+            .await;
     }
+}
+
+async fn maybe_add_scanned_pdf_fallback(
+    resolved_path: &str,
+    display_name: &str,
+    image_media: &mut Vec<String>,
+    attachment_notes: &mut Vec<String>,
+) {
+    let path = Path::new(resolved_path);
+    if !path.exists() || !has_pdf_magic(path) {
+        return;
+    }
+
+    match path.metadata().map(|meta| meta.len()) {
+        Ok(size) if size > MAX_SCANNED_PDF_FALLBACK_BYTES => {
+            attachment_notes.push(pdf_fallback_size_limit_note(display_name, size));
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            attachment_notes.push(format!(
+                "{display_name}: PDF page-image fallback skipped: failed to read file metadata: {error}"
+            ));
+            return;
+        }
+    }
+
+    let text_status = classify_pdf_text(path).await;
+    if text_status == PdfTextStatus::Meaningful {
+        return;
+    }
+
+    let render_result = render_pdf_pages_as_images(path).await;
+    record_pdf_fallback_result(
+        display_name,
+        text_status,
+        render_result,
+        image_media,
+        attachment_notes,
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PdfTextStatus {
+    Meaningful,
+    EmptyOrSparse,
+    ExtractionFailed(String),
+}
+
+async fn classify_pdf_text(path: &Path) -> PdfTextStatus {
+    match octos_agent::tools::read_no_follow(path).await {
+        Ok(text) if has_meaningful_pdf_text(&text) => PdfTextStatus::Meaningful,
+        Ok(_) => PdfTextStatus::EmptyOrSparse,
+        Err(error) => PdfTextStatus::ExtractionFailed(error.to_string()),
+    }
+}
+
+fn has_meaningful_pdf_text(text: &str) -> bool {
+    text.chars().filter(|ch| ch.is_alphanumeric()).count() >= MIN_MEANINGFUL_PDF_ALNUM_CHARS
+}
+
+fn has_pdf_magic(path: &Path) -> bool {
+    use std::io::Read;
+
+    if path.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
+        return false;
+    }
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 5];
+    matches!(file.read(&mut magic), Ok(n) if n >= 5 && &magic == b"%PDF-")
+}
+
+fn record_pdf_fallback_result(
+    display_name: &str,
+    text_status: PdfTextStatus,
+    render_result: Result<Vec<String>, String>,
+    image_media: &mut Vec<String>,
+    attachment_notes: &mut Vec<String>,
+) {
+    let reason = match text_status {
+        PdfTextStatus::Meaningful => return,
+        PdfTextStatus::EmptyOrSparse => {
+            "PDF text extraction produced no meaningful text".to_string()
+        }
+        PdfTextStatus::ExtractionFailed(error) => {
+            format!("PDF text extraction failed: {error}")
+        }
+    };
+
+    match render_result {
+        Ok(pages) if !pages.is_empty() => {
+            let count = pages.len();
+            let page_labels = (1..=count)
+                .map(|page| format!("{display_name} page {page}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            image_media.extend(pages);
+            attachment_notes.push(format!(
+                "{display_name}: {reason}; rendered first {count} page(s) as images for vision-capable models ({page_labels}; bounded to {MAX_SCANNED_PDF_FALLBACK_PAGES} page(s))"
+            ));
+        }
+        Ok(_) => attachment_notes.push(format!(
+            "{display_name}: {reason}; page-image fallback failed: renderer produced no pages"
+        )),
+        Err(error) => attachment_notes.push(format!(
+            "{display_name}: {reason}; page-image fallback failed: {error}"
+        )),
+    }
+}
+
+fn pdf_fallback_size_limit_note(display_name: &str, size: u64) -> String {
+    format!(
+        "{display_name}: PDF page-image fallback skipped: file size {size} bytes exceeds {MAX_SCANNED_PDF_FALLBACK_BYTES} byte limit"
+    )
+}
+
+async fn render_pdf_pages_as_images(pdf_path: &Path) -> Result<Vec<String>, String> {
+    let pdf_path = pdf_path.to_owned();
+    tokio::task::spawn_blocking(move || render_pdf_pages_as_images_blocking(&pdf_path))
+        .await
+        .unwrap_or_else(|error| Err(format!("renderer task failed: {error}")))
+}
+
+fn render_pdf_pages_as_images_blocking(pdf_path: &Path) -> Result<Vec<String>, String> {
+    let output_dir = octos_bus::file_handle::temp_upload_root().join("pdf-page-images");
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("failed to create rendered-page directory: {error}"))?;
+
+    let prefix_name = format!("{}-{}-page", uuid::Uuid::now_v7(), safe_file_stem(pdf_path));
+    let output_prefix = output_dir.join(&prefix_name);
+    let output = std::process::Command::new("pdftoppm")
+        .arg("-png")
+        .arg("-r")
+        .arg(SCANNED_PDF_FALLBACK_DPI.to_string())
+        .arg("-f")
+        .arg("1")
+        .arg("-l")
+        .arg(MAX_SCANNED_PDF_FALLBACK_PAGES.to_string())
+        .arg(pdf_path)
+        .arg(&output_prefix)
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "pdftoppm not found (install poppler)".to_string()
+            } else {
+                format!("failed to run pdftoppm: {error}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pdftoppm failed: {}", stderr.trim()));
+    }
+
+    collect_rendered_pdf_pages(&output_dir, &prefix_name)
+}
+
+fn collect_rendered_pdf_pages(output_dir: &Path, prefix_name: &str) -> Result<Vec<String>, String> {
+    let mut pages: Vec<PathBuf> = std::fs::read_dir(output_dir)
+        .map_err(|error| format!("failed to list rendered pages: {error}"))?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            if name.starts_with(prefix_name) && name.ends_with(".png") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    pages.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+
+    Ok(pages
+        .into_iter()
+        .map(|path| {
+            path.canonicalize()
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect())
+}
+
+fn safe_file_stem(path: &Path) -> String {
+    let raw = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("pdf");
+    let mut safe = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect::<String>();
+    if safe.trim_matches('-').is_empty() {
+        safe = "pdf".to_string();
+    }
+    safe
 }
 
 fn resolve_media_reference(path: &str) -> String {
@@ -368,6 +592,72 @@ mod tests {
 
         assert_eq!(result.attachment_media, vec![expected]);
         let _ = std::fs::remove_file(saved);
+    }
+
+    #[test]
+    fn pdf_fallback_routes_sparse_pdf_pages_to_image_media() {
+        let mut image_media = Vec::new();
+        let mut notes = Vec::new();
+
+        record_pdf_fallback_result(
+            "scan.pdf",
+            PdfTextStatus::EmptyOrSparse,
+            Ok(vec![
+                "/tmp/octos/scan-page-1.png".to_string(),
+                "/tmp/octos/scan-page-2.png".to_string(),
+            ]),
+            &mut image_media,
+            &mut notes,
+        );
+
+        assert_eq!(
+            image_media,
+            vec![
+                "/tmp/octos/scan-page-1.png".to_string(),
+                "/tmp/octos/scan-page-2.png".to_string()
+            ]
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("PDF text extraction produced no meaningful text"));
+        assert!(notes[0].contains("rendered first 2 page(s) as images"));
+        assert!(notes[0].contains("bounded to 3 page(s)"));
+    }
+
+    #[test]
+    fn pdf_fallback_distinguishes_text_extraction_and_render_failures() {
+        let mut image_media = Vec::new();
+        let mut notes = Vec::new();
+
+        record_pdf_fallback_result(
+            "broken.pdf",
+            PdfTextStatus::ExtractionFailed("pdf extraction failed: invalid xref".to_string()),
+            Err("pdftoppm not found (install poppler)".to_string()),
+            &mut image_media,
+            &mut notes,
+        );
+
+        assert!(image_media.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("PDF text extraction failed: pdf extraction failed"));
+        assert!(notes[0].contains("page-image fallback failed: pdftoppm not found"));
+    }
+
+    #[test]
+    fn pdf_fallback_records_size_bound() {
+        let note =
+            pdf_fallback_size_limit_note("huge-scan.pdf", MAX_SCANNED_PDF_FALLBACK_BYTES + 1);
+
+        assert!(note.contains("PDF page-image fallback skipped"));
+        assert!(note.contains("exceeds 26214400 byte limit"));
+    }
+
+    #[test]
+    fn meaningful_pdf_text_requires_real_content() {
+        assert!(!has_meaningful_pdf_text("\n \u{0c}\t"));
+        assert!(!has_meaningful_pdf_text("Invoice #"));
+        assert!(has_meaningful_pdf_text(
+            "Invoice number 12345. Total due is 678.90 USD."
+        ));
     }
 
     #[test]
