@@ -1,13 +1,14 @@
 //! Spawn tool for background subagent execution.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use metrics::counter;
-use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind, TaskResult};
+use octos_core::{AgentId, InboundMessage, SessionScope, Task, TaskContext, TaskKind, TaskResult};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use regex::Regex;
@@ -78,6 +79,180 @@ pub type ChildSessionLifecycleSender = Arc<
 >;
 
 pub type ChildToolFactory = Arc<dyn Fn() -> Arc<dyn Tool> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkerIsolation {
+    #[default]
+    Shared,
+    Worktree,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerWorktree {
+    slug: String,
+    branch: String,
+    path: PathBuf,
+}
+
+impl WorkerWorktree {
+    fn mark_status(&self, status: &str) {
+        if let Err(error) = write_worker_worktree_status(self, status) {
+            warn!(
+                slug = %self.slug,
+                branch = %self.branch,
+                path = %self.path.display(),
+                error = %error,
+                "spawn: failed to update worker worktree status"
+            );
+        }
+    }
+}
+
+fn validate_worker_worktree_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty() {
+        return Err("worker worktree slug must not be empty".to_string());
+    }
+    if slug.len() > 64 {
+        return Err("worker worktree slug must be at most 64 characters".to_string());
+    }
+    if slug.starts_with('/') || slug.starts_with('\\') || slug.contains('\\') {
+        return Err("worker worktree slug must be relative and use '/' separators".to_string());
+    }
+    for segment in slug.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err("worker worktree slug contains an unsafe path segment".to_string());
+        }
+        if !segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        {
+            return Err(format!(
+                "worker worktree slug segment {segment:?} contains unsupported characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(eyre::eyre!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", refname])
+        .status()
+        .wrap_err("failed to run git show-ref")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(eyre::eyre!("git show-ref exited with {status}")),
+    }
+}
+
+fn allocate_worker_worktree(
+    parent_working_dir: &Path,
+    worker_id: &AgentId,
+) -> Result<WorkerWorktree> {
+    let repo_root = PathBuf::from(git_stdout(
+        parent_working_dir,
+        &["rev-parse", "--show-toplevel"],
+    )?);
+    let base_slug = worker_id.to_string();
+    let work_root = repo_root.join(".octos").join("work");
+    std::fs::create_dir_all(&work_root).wrap_err_with(|| {
+        format!(
+            "failed to create worker worktree root {}",
+            work_root.display()
+        )
+    })?;
+
+    for attempt in 0..=32 {
+        let slug = if attempt == 0 {
+            base_slug.clone()
+        } else {
+            format!("{base_slug}-{attempt}")
+        };
+        validate_worker_worktree_slug(&slug).map_err(eyre::Report::msg)?;
+        let branch = format!("octos/worker/{slug}");
+        let refname = format!("refs/heads/{branch}");
+        let path = work_root.join(&slug);
+        if path.exists() || git_ref_exists(&repo_root, &refname)? {
+            continue;
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "add", "-b"])
+            .arg(&branch)
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .wrap_err("failed to run git worktree add")?;
+        if !output.status.success() {
+            return Err(eyre::eyre!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let allocation = WorkerWorktree { slug, branch, path };
+        allocation.mark_status("spawned");
+        return Ok(allocation);
+    }
+
+    Err(eyre::eyre!(
+        "could not allocate a unique worker worktree slug for {base_slug:?}"
+    ))
+}
+
+fn write_worker_worktree_status(worktree: &WorkerWorktree, status: &str) -> Result<()> {
+    let state_dir = worktree.path.join(".octos");
+    std::fs::create_dir_all(&state_dir)?;
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "agent_id": worktree.slug,
+        "branch": worktree.branch,
+        "path": worktree.path,
+        "status": status,
+    });
+    std::fs::write(
+        state_dir.join("worker-worktree.json"),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    Ok(())
+}
+
+fn scoped_child_session_scope(
+    parent_scope: Option<&Arc<SessionScope>>,
+    working_dir: &Path,
+) -> Result<Option<Arc<SessionScope>>> {
+    parent_scope
+        .map(|scope| {
+            scope
+                .as_ref()
+                .clone()
+                .with_workspace(working_dir.to_path_buf())
+                .map(Arc::new)
+                .map_err(|error| eyre::eyre!(error))
+        })
+        .transpose()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundResultKind {
@@ -950,6 +1125,10 @@ struct Input {
     /// "background" (default) or "sync".
     #[serde(default = "default_mode")]
     mode: String,
+    /// Worker filesystem isolation strategy. Shared preserves legacy behavior;
+    /// worktree gives the child a dedicated git worktree under `.octos/work`.
+    #[serde(default)]
+    isolation: WorkerIsolation,
     /// Tool names the subagent is allowed to use. Empty = all builtins.
     #[serde(default)]
     allowed_tools: Vec<String>,
@@ -1869,6 +2048,12 @@ impl Tool for SpawnTool {
                     "description": "background: returns immediately, result announced later. sync: waits and returns the result.",
                     "default": "background"
                 },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["shared", "worktree"],
+                    "description": "Filesystem isolation for builtin subagents. shared uses the parent workspace; worktree creates a dedicated git worktree under .octos/work.",
+                    "default": "shared"
+                },
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -2006,6 +2191,13 @@ impl Tool for SpawnTool {
         let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
         let is_agent_mcp = input.backend == "agent_mcp";
+        if is_agent_mcp && input.isolation == WorkerIsolation::Worktree {
+            return Ok(ToolResult {
+                output: "Status: FAILED\nworktree isolation is currently supported only for builtin subagents".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
 
         info!(
             worker_id = %worker_id,
@@ -2434,6 +2626,43 @@ impl Tool for SpawnTool {
             });
         }
 
+        let worker_worktree = match input.isolation {
+            WorkerIsolation::Shared => None,
+            WorkerIsolation::Worktree => {
+                match allocate_worker_worktree(&self.working_dir, &worker_id) {
+                    Ok(worktree) => Some(worktree),
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            output: format!(
+                                "Status: FAILED\nfailed to allocate worker git worktree: {error}"
+                            ),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        };
+        let child_working_dir = worker_worktree
+            .as_ref()
+            .map(|worktree| worktree.path.clone())
+            .unwrap_or_else(|| self.working_dir.clone());
+        let child_session_scope = match scoped_child_session_scope(
+            ctx.session_scope.as_ref(),
+            &child_working_dir,
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                return Ok(ToolResult {
+                    output: format!(
+                        "Status: FAILED\nfailed to inherit session scope for worker worktree: {error}"
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
 
         // Review A F-004: snapshot the parent workspace policy once so both the
@@ -2457,7 +2686,7 @@ impl Tool for SpawnTool {
 
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
-            let mut tools = ToolRegistry::with_builtins(&self.working_dir);
+            let mut tools = ToolRegistry::with_builtins(&child_working_dir);
             // Load plugin tools so subagents can use fm_tts, etc.
             // Section B (codex review P1.1): honour the parent's
             // require_signed policy so unsigned plugins are rejected here
@@ -2468,7 +2697,7 @@ impl Tool for SpawnTool {
                     &self.plugin_dirs,
                     &self.plugin_extra_env,
                     crate::plugins::PluginLoadOptions {
-                        work_dir: Some(&self.working_dir),
+                        work_dir: Some(&child_working_dir),
                         synthesis_config: None,
                         require_signed: self.plugin_require_signed,
                         verified_cache_dir: None,
@@ -2505,10 +2734,9 @@ impl Tool for SpawnTool {
             // parent's scope into the child Agent so the child's tools
             // (shell, read_file, write_file, edit_file, plugin tool,
             // pipeline workers) all see the same filesystem contract.
-            // The child runs in a sub-session of the same parent — for
-            // now it shares the parent's workspace; a future enhancement
-            // can carve out per-child subdirs if isolation is required.
-            if let Some(scope) = ctx.session_scope.as_ref() {
+            // Worktree-isolated children inherit the same root/mode policy
+            // with their workspace rebound to the worker worktree.
+            if let Some(scope) = child_session_scope.as_ref() {
                 worker = worker.with_session_scope(scope.clone());
             }
             // Keep an Arc handle to the child's tool registry so we can run
@@ -2585,7 +2813,7 @@ impl Tool for SpawnTool {
                     files: vec![],
                 },
                 TaskContext {
-                    working_dir: self.working_dir.clone(),
+                    working_dir: child_working_dir.clone(),
                     ..Default::default()
                 },
             );
@@ -2594,7 +2822,7 @@ impl Tool for SpawnTool {
             // M8.9 recovery so the synchronous spawn path mirrors the
             // session-actor recovery contract.
             let result = run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await;
-            match result {
+            let tool_result = match result {
                 Ok(r) => {
                     // Review A F-004: run declared completion-phase validators
                     // against the child's artifacts before surfacing success.
@@ -2608,7 +2836,7 @@ impl Tool for SpawnTool {
                             if !policy.validation.validators.is_empty() {
                                 match crate::workspace_contract::run_declared_validators(
                                     child_tools_handle.as_ref(),
-                                    &self.working_dir,
+                                    &child_working_dir,
                                     &policy.validation.validators,
                                     "spawn",
                                     crate::validators::ValidatorPhase::Completion,
@@ -2645,7 +2873,7 @@ impl Tool for SpawnTool {
                             workflow.as_ref().and_then(workflow_contract_project_kind);
                         let report = crate::workspace_contract::run_project_root_validators(
                             child_tools_handle.as_ref(),
-                            &self.working_dir,
+                            &child_working_dir,
                             expected_kind,
                             &r.files_to_send,
                         )
@@ -2658,19 +2886,27 @@ impl Tool for SpawnTool {
                         }
                     }
 
-                    Ok(ToolResult {
+                    ToolResult {
                         output,
                         success,
                         tokens_used: Some(r.token_usage),
                         ..Default::default()
-                    })
+                    }
                 }
-                Err(e) => Ok(ToolResult {
+                Err(e) => ToolResult {
                     output: format!("Subagent failed: {e}"),
                     success: false,
                     ..Default::default()
-                }),
+                },
+            };
+            if let Some(worktree) = worker_worktree.as_ref() {
+                worktree.mark_status(if tool_result.success {
+                    "completed"
+                } else {
+                    "failed"
+                });
             }
+            Ok(tool_result)
         } else {
             // Background mode: fire-and-forget
             let (origin_channel, origin_chat_id) = self
@@ -2735,9 +2971,10 @@ impl Tool for SpawnTool {
                 };
             let llm = sub_llm;
             let memory = self.memory.clone();
-            let working_dir = self.working_dir.clone();
+            let working_dir = child_working_dir.clone();
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
+            let detached_worker_worktree = worker_worktree.clone();
             let provider_policy = self.provider_policy.clone();
             let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
@@ -2824,11 +3061,9 @@ impl Tool for SpawnTool {
             let child_spawn_depth = ctx.spawn_depth.saturating_add(1);
             // Phase 2-D of the SessionScope migration: snapshot the
             // parent's scope before crossing into the detached
-            // `tokio::spawn` task. The background child shares the
-            // parent workspace — same contract as the sync branch above
-            // — so subprocesses spawned by the child's shell tool see
-            // the same CWD the foreground would.
-            let child_session_scope = ctx.session_scope.clone();
+            // `tokio::spawn` task. Worktree-isolated children get a
+            // precomputed scope with the same policy and a worker CWD.
+            let child_session_scope = child_session_scope.clone();
 
             tokio::spawn(async move {
                 // codex round-5: the terminal guard was armed in the
@@ -3282,6 +3517,14 @@ impl Tool for SpawnTool {
                 } else {
                     classify_child_session_lifecycle_kind(&result)
                 };
+                if let Some(worktree) = detached_worker_worktree.as_ref() {
+                    worktree.mark_status(match terminal_kind {
+                        ChildSessionLifecycleKind::Completed => "completed",
+                        ChildSessionLifecycleKind::RetryableFailed
+                        | ChildSessionLifecycleKind::TerminalFailed => "failed",
+                        ChildSessionLifecycleKind::Spawned => "spawned",
+                    });
+                }
 
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
@@ -5522,6 +5765,155 @@ PY
 
         fn provider_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct EditSameFileProvider;
+
+    #[async_trait]
+    impl LlmProvider for EditSameFileProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let edit_already_run = messages
+                .iter()
+                .any(|msg| matches!(msg.role, octos_core::MessageRole::Tool));
+            if edit_already_run {
+                return Ok(octos_llm::ChatResponse {
+                    content: Some("done".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                });
+            }
+
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![octos_core::ToolCall {
+                    id: "call_edit_file".into(),
+                    name: "edit_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "shared.txt",
+                        "old_string": "base\n",
+                        "new_string": "worker content\n"
+                    }),
+                    metadata: None,
+                }],
+                stop_reason: octos_llm::StopReason::ToolUse,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("git command starts");
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    #[test]
+    fn worker_worktree_slug_validation_rejects_traversal() {
+        for valid in ["subagent-0", "abc.DEF_123", "parent/child-1"] {
+            validate_worker_worktree_slug(valid).expect("valid slug accepted");
+        }
+
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "escape/..",
+            "/absolute",
+            "\\absolute",
+            "bad\\slash",
+            "bad space",
+        ] {
+            assert!(
+                validate_worker_worktree_slug(invalid).is_err(),
+                "invalid slug {invalid:?} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_isolation_runs_concurrent_writers_on_separate_branches() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]);
+        std::fs::write(repo.path().join("shared.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "shared.txt"]);
+        run_git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=Octos Test",
+                "-c",
+                "user.email=octos@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        let scope = octos_core::SessionScope::solo(repo.path().to_path_buf(), vec![])
+            .expect("scope construction");
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(EditSameFileProvider),
+            Arc::new(create_test_store().await),
+            repo.path().to_path_buf(),
+            in_tx,
+        );
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let args = serde_json::json!({
+            "task": "edit shared.txt",
+            "mode": "sync",
+            "isolation": "worktree",
+            "allowed_tools": ["edit_file"]
+        });
+        let (first, second) = tokio::join!(
+            tool.execute_with_context(&ctx, &args),
+            tool.execute_with_context(&ctx, &args)
+        );
+        let first = first.expect("first spawn returns");
+        let second = second.expect("second spawn returns");
+        assert!(first.success, "first spawn failed: {}", first.output);
+        assert!(second.success, "second spawn failed: {}", second.output);
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("shared.txt")).unwrap(),
+            "base\n",
+            "parent workspace must not be mutated by isolated workers"
+        );
+        for slug in ["subagent-0", "subagent-1"] {
+            let worker_root = repo.path().join(".octos/work").join(slug);
+            assert_eq!(
+                std::fs::read_to_string(worker_root.join("shared.txt")).unwrap(),
+                "worker content\n"
+            );
+            let status =
+                std::fs::read_to_string(worker_root.join(".octos/worker-worktree.json")).unwrap();
+            assert!(status.contains("\"status\": \"completed\""));
         }
     }
 
