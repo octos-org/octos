@@ -66,6 +66,17 @@ pub enum RegisterTaskError {
         count: usize,
         cap: usize,
     },
+    /// NEW-18b: the parent task identified by `parent_tool_call_id` is
+    /// already in a terminal state (`Failed`, `Completed`, or
+    /// `Cancelled`). Refusing the child registration prevents the
+    /// "phantom child task" pattern where a pipeline's tokio workers
+    /// survive a serve restart, observe the orphan-swept parent as
+    /// `failed`, and keep registering NEW node tasks against the live
+    /// supervisor — wasting CPU/tokens and confusing the UI.
+    ParentTerminal {
+        parent_tool_call_id: String,
+        parent_status: TaskStatus,
+    },
 }
 
 impl std::fmt::Display for RegisterTaskError {
@@ -78,6 +89,14 @@ impl std::fmt::Display for RegisterTaskError {
             } => write!(
                 f,
                 "child fanout exceeded ({count} of {cap}) for parent session '{parent_session_key}'"
+            ),
+            Self::ParentTerminal {
+                parent_tool_call_id,
+                parent_status,
+            } => write!(
+                f,
+                "parent task (tool_call_id='{parent_tool_call_id}') is already {} — refusing child registration",
+                parent_status.as_str(),
             ),
         }
     }
@@ -789,19 +808,63 @@ impl TaskSupervisor {
         // no new work has been scheduled yet). Mark them Failed via the
         // standard mark_failed path so the JSONL ledger gets a proper
         // terminal entry and re-loading is idempotent.
-        let orphans: Vec<String> = {
+        //
+        // NEW-18b — capture the `(id, tool_call_id, tool_name)` triple
+        // for every orphan so that after the parent transition fires we
+        // can cascade-fail any LIVE descendants (children that already
+        // registered against this supervisor under the same
+        // tool_call_id but haven't transitioned to a terminal state
+        // themselves). This is Option-C in the bug brief: a backstop
+        // for the race where a pipeline child registers before the
+        // sweep runs, or where a straggler pipeline tokio worker
+        // survives the restart and re-registers a node task between
+        // load and sweep.
+        let orphans: Vec<(String, String, String)> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks
                 .values()
                 .filter(|task| !is_terminal_runtime_state(&task.runtime_state))
-                .map(|task| task.id.clone())
+                .map(|task| {
+                    (
+                        task.id.clone(),
+                        task.tool_call_id.clone(),
+                        task.tool_name.clone(),
+                    )
+                })
                 .collect()
         };
-        for task_id in &orphans {
+        for (task_id, _, _) in &orphans {
             self.mark_failed(task_id, "orphaned across restart".to_string());
         }
         if !orphans.is_empty() {
             counter!("octos_orphaned_tasks_reaped_total").increment(orphans.len() as u64);
+        }
+
+        // Option C — cascade orphaned-parent transitions onto any
+        // active `pipeline:<node>` children sharing the parent's
+        // tool_call_id. `mark_descendants_failed` is the same helper
+        // the `RunPipelineTool` timeout arm uses, and is a no-op on
+        // already-terminal children and on parents whose tool_name
+        // starts with `pipeline:` (so cascade siblings don't recurse).
+        // The reason string is intentionally distinct from the parent
+        // sweep ("parent task orphaned across restart") so operators
+        // can tell which transition wrote the failure record.
+        let mut cascade_seen: HashSet<String> = HashSet::new();
+        for (_, parent_tcid, parent_tool_name) in &orphans {
+            if parent_tcid.is_empty() {
+                continue;
+            }
+            // Skip pipeline node siblings — they are children, not
+            // parents. Only `run_pipeline` (and any future non-pipeline
+            // parents that supervise pipeline children) should trigger
+            // the cascade.
+            if parent_tool_name.starts_with("pipeline:") {
+                continue;
+            }
+            if !cascade_seen.insert(parent_tcid.clone()) {
+                continue;
+            }
+            self.mark_descendants_failed(parent_tcid, "parent task orphaned across restart");
         }
 
         Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
@@ -1102,6 +1165,81 @@ impl TaskSupervisor {
                 String::new()
             }
         }
+    }
+
+    /// NEW-18b — return the [`TaskStatus`] of the most-recently-updated
+    /// task that holds `parent_tool_call_id` as its `tool_call_id` AND
+    /// whose `tool_name` does NOT start with `pipeline:`. The
+    /// `pipeline:` prefix filter is intentional: every pipeline node
+    /// child reuses the parent's `tool_call_id` (see
+    /// `executor.rs::register_node_task`), so without the filter this
+    /// lookup would return the status of a sibling node instead of the
+    /// `run_pipeline` parent. Returns `None` when no parent record
+    /// matches (e.g. ephemeral test harnesses that never register a
+    /// run_pipeline task).
+    ///
+    /// Most-recently-updated semantics: when multiple non-pipeline
+    /// records share a `tool_call_id` (unusual but possible in tests),
+    /// the one with the highest `updated_at` wins. This matches the
+    /// observable invariant that the most recent terminal transition
+    /// is the parent's true current state.
+    pub fn parent_status_for_tool_call_id(&self, parent_tool_call_id: &str) -> Option<TaskStatus> {
+        if parent_tool_call_id.is_empty() {
+            return None;
+        }
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks
+            .values()
+            .filter(|task| {
+                task.tool_call_id == parent_tool_call_id && !task.tool_name.starts_with("pipeline:")
+            })
+            .max_by_key(|task| task.updated_at)
+            .map(|task| task.status.clone())
+    }
+
+    /// NEW-18b — strict registration for a pipeline node child task.
+    ///
+    /// Wraps [`Self::try_register_with_input`] with an Option-A
+    /// preventive guard: looks up the parent task by
+    /// `parent_tool_call_id` (filtering OUT sibling `pipeline:<node>`
+    /// entries) and refuses to register a new child when the parent is
+    /// already in a terminal state. This closes the "phantom child
+    /// task" race where the orphan-sweep in
+    /// [`Self::enable_persistence`] marks the parent failed but a
+    /// straggler pipeline tokio worker that survived the restart keeps
+    /// registering fresh node children against the live supervisor.
+    ///
+    /// On a non-terminal (or unknown) parent the call falls through to
+    /// the regular registration path (cap checks still apply). Callers
+    /// should treat the returned error as a signal to abort the local
+    /// node future — there's no successor task to drive forward.
+    pub fn try_register_node_task(
+        &self,
+        node_tool_name: &str,
+        parent_tool_call_id: &str,
+        session_key: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        if let Some(status) = self.parent_status_for_tool_call_id(parent_tool_call_id) {
+            if status.is_terminal() {
+                tracing::warn!(
+                    node_tool_name,
+                    parent_tool_call_id,
+                    parent_status = status.as_str(),
+                    "refusing pipeline node child registration: parent task is terminal"
+                );
+                counter!(
+                    "octos_task_supervisor_register_node_rejected_total",
+                    "reason" => "parent_terminal".to_string(),
+                    "parent_status" => status.as_str().to_string(),
+                )
+                .increment(1);
+                return Err(RegisterTaskError::ParentTerminal {
+                    parent_tool_call_id: parent_tool_call_id.to_string(),
+                    parent_status: status,
+                });
+            }
+        }
+        self.try_register_with_input(node_tool_name, parent_tool_call_id, session_key, None)
     }
 
     /// Strict variant of [`Self::register_with_input`]: returns the typed
@@ -3534,6 +3672,7 @@ mod tests {
                 assert_eq!(count, MAX_CHILDREN_PER_PARENT);
                 assert_eq!(cap, MAX_CHILDREN_PER_PARENT);
             }
+            other => panic!("expected ChildFanoutExceeded, got {other:?}"),
         }
 
         // The cap rejection must not leak a new task into the
@@ -3707,5 +3846,419 @@ mod tests {
             "cancelled tasks must not be reaped"
         );
         assert_eq!(cancelled.runtime_state, TaskRuntimeState::Cancelled);
+    }
+
+    /// NEW-18b Option A — `try_register_node_task` must refuse a child
+    /// registration when the parent task (looked up by
+    /// `tool_call_id`) is already in a terminal state. This closes
+    /// the race where pipeline tokio workers survive a serve restart,
+    /// observe the orphan-swept parent as `failed`, and continue
+    /// registering fresh node children that waste CPU/tokens.
+    #[test]
+    fn register_node_task_refuses_when_parent_already_failed() {
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-pipeline-parent-x";
+
+        // Pre-populate the parent in the failed state (mirrors the
+        // post-orphan-sweep shape that triggers the race).
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-A"));
+        supervisor.mark_running(&parent);
+        supervisor.mark_failed(&parent, "orphaned across restart".to_string());
+        assert_eq!(
+            supervisor.get_task(&parent).unwrap().status,
+            TaskStatus::Failed,
+            "parent must be Failed before child registration races in"
+        );
+
+        // Straggler pipeline worker attempts to register a child node
+        // task against the same parent_tool_call_id. Must be refused.
+        let err = supervisor
+            .try_register_node_task("pipeline:analyze", parent_tcid, Some("sess-A"))
+            .expect_err("registration must be rejected for terminal parent");
+        match err {
+            RegisterTaskError::ParentTerminal {
+                parent_tool_call_id,
+                parent_status,
+            } => {
+                assert_eq!(parent_tool_call_id, parent_tcid);
+                assert_eq!(parent_status, TaskStatus::Failed);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // The supervisor must NOT have any child task under that
+        // parent — the straggler attempt was rejected before insert.
+        let children: Vec<_> = supervisor
+            .get_all_tasks()
+            .into_iter()
+            .filter(|task| {
+                task.tool_call_id == parent_tcid && task.tool_name.starts_with("pipeline:")
+            })
+            .collect();
+        assert!(
+            children.is_empty(),
+            "no pipeline child task should be registered; got {:?}",
+            children.iter().map(|t| &t.tool_name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Same guard, but for `Cancelled` and `Completed` parents.
+    #[test]
+    fn register_node_task_refuses_when_parent_cancelled_or_completed() {
+        let supervisor = TaskSupervisor::new();
+
+        let cancel_tcid = "call-pipeline-parent-cancelled";
+        let cancel_parent = supervisor.register("run_pipeline", cancel_tcid, Some("sess-cancel"));
+        supervisor.mark_running(&cancel_parent);
+        supervisor
+            .cancel(&cancel_parent)
+            .expect("cancel must succeed");
+        let err = supervisor
+            .try_register_node_task("pipeline:setup", cancel_tcid, Some("sess-cancel"))
+            .expect_err("registration must be rejected for cancelled parent");
+        assert!(
+            matches!(
+                err,
+                RegisterTaskError::ParentTerminal {
+                    parent_status: TaskStatus::Cancelled,
+                    ..
+                }
+            ),
+            "expected ParentTerminal/Cancelled, got {err:?}"
+        );
+
+        let done_tcid = "call-pipeline-parent-completed";
+        let done_parent = supervisor.register("run_pipeline", done_tcid, Some("sess-done"));
+        supervisor.mark_running(&done_parent);
+        supervisor.mark_completed(&done_parent, vec![]);
+        let err = supervisor
+            .try_register_node_task("pipeline:setup", done_tcid, Some("sess-done"))
+            .expect_err("registration must be rejected for completed parent");
+        assert!(
+            matches!(
+                err,
+                RegisterTaskError::ParentTerminal {
+                    parent_status: TaskStatus::Completed,
+                    ..
+                }
+            ),
+            "expected ParentTerminal/Completed, got {err:?}"
+        );
+    }
+
+    /// Healthy parent: registration must succeed.
+    #[test]
+    fn register_node_task_succeeds_when_parent_running() {
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-pipeline-parent-running";
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-ok"));
+        supervisor.mark_running(&parent);
+
+        let child_id = supervisor
+            .try_register_node_task("pipeline:analyze", parent_tcid, Some("sess-ok"))
+            .expect("registration must succeed when parent is Running");
+        assert!(!child_id.is_empty());
+
+        let child = supervisor.get_task(&child_id).expect("child registered");
+        assert_eq!(child.tool_name, "pipeline:analyze");
+        assert_eq!(child.tool_call_id, parent_tcid);
+    }
+
+    /// Unknown parent (no matching tool_call_id in the supervisor):
+    /// `try_register_node_task` falls through to normal registration
+    /// instead of rejecting. This keeps legacy/test callers that
+    /// never register a `run_pipeline` parent on the no-op path.
+    #[test]
+    fn register_node_task_allows_when_no_parent_registered() {
+        let supervisor = TaskSupervisor::new();
+        let child_id = supervisor
+            .try_register_node_task("pipeline:analyze", "call-no-parent", Some("sess-test"))
+            .expect("unknown parent must fall through to normal registration");
+        assert!(!child_id.is_empty());
+    }
+
+    /// `parent_status_for_tool_call_id` must filter OUT sibling
+    /// `pipeline:<node>` records when resolving the parent status,
+    /// because every pipeline child reuses the parent's tool_call_id.
+    /// Without the filter the lookup could return a sibling's status
+    /// and incorrectly reject a fresh child even though the actual
+    /// parent is still Running.
+    #[test]
+    fn parent_status_for_tool_call_id_ignores_pipeline_siblings() {
+        let supervisor = TaskSupervisor::new();
+        let tcid = "call-shared";
+        // Sibling pipeline child that just transitioned to Failed.
+        let sib = supervisor.register("pipeline:setup", tcid, Some("sess-shared"));
+        supervisor.mark_running(&sib);
+        supervisor.mark_failed(&sib, "node failed".to_string());
+
+        // Parent run_pipeline task is still Running.
+        let parent = supervisor.register("run_pipeline", tcid, Some("sess-shared"));
+        supervisor.mark_running(&parent);
+
+        let status = supervisor.parent_status_for_tool_call_id(tcid);
+        assert_eq!(
+            status,
+            Some(TaskStatus::Running),
+            "lookup must skip pipeline:<node> siblings and return the parent's status"
+        );
+
+        // And as the consequence, registration of another node child
+        // must succeed.
+        let new_child = supervisor
+            .try_register_node_task("pipeline:analyze", tcid, Some("sess-shared"))
+            .expect("registration must succeed while parent is Running");
+        assert!(!new_child.is_empty());
+    }
+
+    /// NEW-18b Option C — `enable_persistence`'s orphan sweep must
+    /// also cascade-fail any LIVE pipeline children that share the
+    /// parent's `tool_call_id`. Catches the case where children
+    /// already registered before the sweep fires (e.g. they were
+    /// persisted to JSONL while their workers were running, then the
+    /// process crashed mid-run).
+    #[test]
+    fn enable_persistence_cascades_to_children_with_same_tool_call_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Pre-populate the ledger with one orphan parent + two orphan
+        // children sharing its tool_call_id, plus one unrelated
+        // sibling under a different tool_call_id (must NOT be
+        // cascaded). All three "running" tasks have non-terminal
+        // runtime_state so the orphan reaper will mark them Failed.
+        let parent_tcid = "call-pipeline-mini3-phantom";
+        let writer = TaskSupervisor::new();
+        writer.enable_persistence(&ledger_path).unwrap();
+        let parent = writer.register("run_pipeline", parent_tcid, Some("sess-phantom"));
+        let child1 = writer.register("pipeline:analyze", parent_tcid, Some("sess-phantom"));
+        let child2 = writer.register("pipeline:synthesize", parent_tcid, Some("sess-phantom"));
+        let unrelated =
+            writer.register("pipeline:other", "call-other-parent", Some("sess-phantom"));
+        writer.mark_running(&parent);
+        writer.mark_running(&child1);
+        writer.mark_running(&child2);
+        writer.mark_running(&unrelated);
+        drop(writer);
+
+        // Fresh supervisor replays the ledger and runs the orphan
+        // sweep. After enable_persistence returns, every orphan
+        // parent's children should ALSO be terminal.
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        // Parent: orphan-swept to Failed with the standard reason.
+        let parent_task = restored.get_task(&parent).expect("parent persisted");
+        assert_eq!(parent_task.status, TaskStatus::Failed);
+        assert_eq!(
+            parent_task.error.as_deref(),
+            Some("orphaned across restart"),
+            "parent retains the standard orphan-sweep reason"
+        );
+
+        // Both children under the orphaned parent must now be Failed.
+        // They could be Failed via EITHER (a) the orphan sweep itself
+        // (because they are also non-terminal-runtime-state) OR (b)
+        // the Option-C cascade. Both paths satisfy the contract: the
+        // child task is terminal and no longer wastes CPU/tokens.
+        for cid in [&child1, &child2] {
+            let task = restored.get_task(cid).expect("child persisted");
+            assert_eq!(
+                task.status,
+                TaskStatus::Failed,
+                "child {cid} must be Failed after restart sweep + cascade"
+            );
+            assert_eq!(task.runtime_state, TaskRuntimeState::Failed);
+            assert!(task.completed_at.is_some());
+            let reason = task.error.clone().unwrap_or_default();
+            assert!(
+                reason == "orphaned across restart"
+                    || reason == "parent task orphaned across restart",
+                "child {cid} must carry orphan-sweep OR cascade reason, got '{reason}'"
+            );
+        }
+
+        // The unrelated sibling under a different parent tool_call_id
+        // should still be Failed (orphan sweep applies to it too —
+        // its own runtime_state is non-terminal) BUT it must NOT
+        // carry the "parent task orphaned" reason: that's the cascade
+        // marker for descendants of an orphaned parent.
+        let other = restored.get_task(&unrelated).expect("unrelated persisted");
+        assert_eq!(
+            other.status,
+            TaskStatus::Failed,
+            "unrelated orphan is also swept, just via the main sweep loop"
+        );
+        // Note: when the unrelated task is itself an orphan, the main
+        // sweep marks it Failed first. Then the cascade with its
+        // tool_call_id ("call-other-parent") runs but finds no other
+        // children under that key. So its reason should be the main
+        // sweep's "orphaned across restart", not the cascade's variant.
+        assert_eq!(
+            other.error.as_deref(),
+            Some("orphaned across restart"),
+            "unrelated orphan must carry the standard reason"
+        );
+    }
+
+    /// Option-C cascade must run as a DISTINCT post-sweep pass.
+    ///
+    /// Scenario: a pipeline child has `status = Running` (so it's
+    /// still active from the cascade's perspective) BUT its
+    /// `runtime_state` was concurrently driven into a terminal state
+    /// (`ResolvingOutputs` finished and the worker wrote
+    /// `runtime_state = Completed` but crashed before it could call
+    /// `mark_completed` to also flip `status = Completed`). The main
+    /// orphan sweep's `!is_terminal_runtime_state` filter SKIPS this
+    /// child — runtime_state is already terminal. Without Option-C,
+    /// the child stays `status = Running` forever after the parent
+    /// is orphan-swept. With Option-C, `mark_descendants_failed`
+    /// (which filters by `status.is_active()`) catches it.
+    ///
+    /// This test pins that Option-C cascade actually transitions
+    /// such children to `Failed` after `enable_persistence` returns.
+    #[test]
+    fn enable_persistence_cascade_catches_active_status_with_terminal_runtime_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let parent_tcid = "call-mixed-state-parent";
+        let writer = TaskSupervisor::new();
+        writer.enable_persistence(&ledger_path).unwrap();
+        let parent = writer.register("run_pipeline", parent_tcid, Some("sess-mix"));
+        // Healthy orphan child that the main sweep catches.
+        let healthy_orphan = writer.register("pipeline:setup", parent_tcid, Some("sess-mix"));
+        // "Mixed-state" child: status=Running, runtime_state=Completed
+        // (set explicitly via mark_runtime_state).
+        let mixed_child = writer.register("pipeline:analyze", parent_tcid, Some("sess-mix"));
+        writer.mark_running(&parent);
+        writer.mark_running(&healthy_orphan);
+        writer.mark_running(&mixed_child);
+        // Drive runtime_state to a terminal value WITHOUT touching
+        // status. This simulates the worker crashing after it set
+        // `runtime_state = Completed` but before `mark_completed`
+        // flipped `status` to Completed.
+        writer.mark_runtime_state(
+            &mixed_child,
+            TaskRuntimeState::Completed,
+            Some("worker finished but crashed pre-mark_completed".to_string()),
+        );
+        // Sanity: status is still Running, runtime_state is terminal.
+        let pre = writer.get_task(&mixed_child).unwrap();
+        assert_eq!(pre.status, TaskStatus::Running);
+        assert_eq!(pre.runtime_state, TaskRuntimeState::Completed);
+        drop(writer);
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        // Parent: main sweep catches it (status=Running, runtime_state
+        // is non-terminal — `Spawned`).
+        let parent_task = restored.get_task(&parent).expect("parent loaded");
+        assert_eq!(parent_task.status, TaskStatus::Failed);
+        assert_eq!(
+            parent_task.error.as_deref(),
+            Some("orphaned across restart")
+        );
+
+        // Healthy orphan child: main sweep catches it.
+        let h = restored.get_task(&healthy_orphan).expect("healthy loaded");
+        assert_eq!(h.status, TaskStatus::Failed);
+
+        // Mixed-state child: main sweep SKIPS it because its
+        // runtime_state is already terminal (Completed). The Option-C
+        // cascade fires immediately after and DOES catch it — its
+        // status was still `is_active()` when the cascade ran.
+        let m = restored.get_task(&mixed_child).expect("mixed loaded");
+        assert_eq!(
+            m.status,
+            TaskStatus::Failed,
+            "mixed-state child must be Failed after Option-C cascade"
+        );
+        assert_eq!(
+            m.error.as_deref(),
+            Some("parent task orphaned across restart"),
+            "mixed-state child must carry the cascade reason (proves Option-C ran distinctly from main sweep)"
+        );
+    }
+
+    /// NEW-09 contract: cascade-failing a child via
+    /// `mark_descendants_failed` must still emit the per-task
+    /// completion bubble (spawn_only on_failure_signal +
+    /// emit_progress_for_state). This pin guarantees that the
+    /// Option-C cascade does not regress NEW-09 — every cascade-
+    /// failed child fires the same notification callbacks as a
+    /// direct `mark_failed` call.
+    #[test]
+    fn mark_descendants_failed_emits_progress_and_failure_signal_per_child() {
+        use std::sync::Mutex;
+
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-cascade-signals";
+
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-sig"));
+        let c1 = supervisor.register("pipeline:setup", parent_tcid, Some("sess-sig"));
+        let c2 = supervisor.register("pipeline:analyze", parent_tcid, Some("sess-sig"));
+        supervisor.mark_running(&parent);
+        supervisor.mark_running(&c1);
+        supervisor.mark_running(&c2);
+
+        // Capture every on_failure_signal payload that fires.
+        let failure_signals: Arc<Mutex<Vec<SpawnOnlyFailureSignal>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        {
+            let captured = failure_signals.clone();
+            supervisor.set_on_failure_signal(move |signal| {
+                captured.lock().unwrap().push(signal.clone());
+            });
+        }
+
+        // Capture every on_change snapshot. mark_failed fires
+        // notify_change unconditionally for every transition.
+        let change_log: Arc<Mutex<Vec<BackgroundTask>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let captured = change_log.clone();
+            supervisor.set_on_change(move |task| {
+                captured.lock().unwrap().push(task.clone());
+            });
+        }
+
+        let cascaded =
+            supervisor.mark_descendants_failed(parent_tcid, "parent task orphaned across restart");
+        assert_eq!(cascaded, 2, "both running children should cascade-fail");
+
+        // Failure signals: one per child, neither for the parent.
+        let signals = failure_signals.lock().unwrap();
+        assert_eq!(
+            signals.len(),
+            2,
+            "every cascade-failed child must fire on_failure_signal (NEW-09)"
+        );
+        let signal_task_ids: HashSet<&str> = signals.iter().map(|s| s.task_id.as_str()).collect();
+        assert!(signal_task_ids.contains(c1.as_str()));
+        assert!(signal_task_ids.contains(c2.as_str()));
+        for sig in signals.iter() {
+            assert_eq!(
+                sig.error_message, "parent task orphaned across restart",
+                "cascade reason must propagate into the failure signal payload"
+            );
+            assert_eq!(sig.parent_session_key.as_deref(), Some("sess-sig"));
+        }
+
+        // on_change must have fired for both children's terminal
+        // transitions. (We don't assert exact count because the
+        // parent's earlier mark_running fires it too, but the failed
+        // snapshots must be present.)
+        let changes = change_log.lock().unwrap();
+        let failed_snapshots: Vec<_> = changes
+            .iter()
+            .filter(|t| t.status == TaskStatus::Failed && t.tool_name.starts_with("pipeline:"))
+            .collect();
+        assert!(
+            failed_snapshots.len() >= 2,
+            "on_change must fire for each cascade-failed child terminal transition; \
+             got {} failed pipeline snapshots",
+            failed_snapshots.len()
+        );
     }
 }
