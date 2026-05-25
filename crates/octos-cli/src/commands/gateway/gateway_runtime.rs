@@ -724,7 +724,9 @@ impl GatewayRuntime {
                             // still load with a warning).
                             require_signed: config.plugins.require_signed,
                         },
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),
                     }

@@ -3885,13 +3885,7 @@ dependencies = [
 name = "octos-dora-mcp"
 version = "0.1.1"
 dependencies = [
- "async-trait",
- "eyre",
  "octos-agent",
- "serde",
- "serde_json",
- "tokio",
- "wiremock",
 ]
 
 [[package]]

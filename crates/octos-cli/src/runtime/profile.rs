@@ -594,7 +594,9 @@ impl ProfileRuntime {
                     // strict signature enforcement per deployment.
                     require_signed: config.plugins.require_signed,
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(result) => plugin_result = result,
                 Err(e) => warn!(profile_id = %profile.id, error = %e, "plugin loading failed"),
             }

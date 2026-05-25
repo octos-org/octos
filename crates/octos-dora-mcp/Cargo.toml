@@ -5,16 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Dora-RS to MCP tool bridge for octos"
+description = "Compatibility re-export crate for the dora bridge (canonical home: octos-agent::tools::dora_bridge)"
 
 [dependencies]
 octos-agent = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-eyre = { workspace = true }
-async-trait = { workspace = true }
-tokio = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-wiremock = { workspace = true }

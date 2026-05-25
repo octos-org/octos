@@ -646,6 +646,7 @@ pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
+pub mod dora_bridge;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;

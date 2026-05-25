@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -69,7 +70,10 @@ impl CachedPluginRegistration {
 /// throw-away registry. Errors are downgraded to a warn (matching the
 /// legacy pipeline behaviour) and an empty registration is cached so
 /// the warning fires at most once per handler lifetime.
-fn build_cached_plugin_registration(
+///
+/// Async because `PluginLoader::load_into_with_options` is now async
+/// (HTTP tool discovery fires a `GET <base_url>/tools` per skill).
+async fn build_cached_plugin_registration(
     plugin_dirs: &[PathBuf],
     require_signed: bool,
 ) -> CachedPluginRegistration {
@@ -93,7 +97,8 @@ fn build_cached_plugin_registration(
             synthesis_config: None,
             require_signed,
         },
-    );
+    )
+    .await;
     let elapsed = started.elapsed();
 
     let load_result = match load_result {
@@ -303,7 +308,7 @@ pub struct CodergenHandler {
     /// `execute()` (or test warm-up call) so all subsequent nodes skip
     /// the SHA-256 verification + 100 MB executable read that would
     /// otherwise re-run on every node and starve the SSE window.
-    plugin_cache: Arc<OnceLock<Arc<CachedPluginRegistration>>>,
+    plugin_cache: Arc<OnceCell<Arc<CachedPluginRegistration>>>,
     /// NEW-06 fix: optional embedder propagated onto every worker
     /// `Agent` built by this handler so episodic memory recall stays
     /// on the contamination-safe hybrid scored + filtered path
@@ -335,7 +340,7 @@ impl CodergenHandler {
             compaction_workspace: None,
             compaction_llm_provider: None,
             host_context: crate::host_context::PipelineHostContext::default(),
-            plugin_cache: Arc::new(OnceLock::new()),
+            plugin_cache: Arc::new(OnceCell::new()),
             embedder: None,
         }
     }
@@ -374,7 +379,7 @@ impl CodergenHandler {
         // Mirror `with_plugin_dirs`: a policy change must invalidate the
         // cache so a builder reordering doesn't surface a stale permissive
         // registration.
-        self.plugin_cache = Arc::new(OnceLock::new());
+        self.plugin_cache = Arc::new(OnceCell::new());
         self
     }
 
@@ -413,7 +418,7 @@ impl CodergenHandler {
         self.plugin_dirs = dirs;
         // Backend bug #1: reset the plugin-load cache when dirs change
         // so a builder reordering can't end up with a stale cached set.
-        self.plugin_cache = Arc::new(OnceLock::new());
+        self.plugin_cache = Arc::new(OnceCell::new());
         self
     }
 
@@ -479,36 +484,37 @@ impl CodergenHandler {
     /// 100 MB-bounded executable read into a single up-front scan.
     ///
     /// The returned `Arc<CachedPluginRegistration>` is shared across every
-    /// node in the same pipeline run, and via `Arc<OnceLock>` across every
+    /// node in the same pipeline run, and via `Arc<OnceCell>` across every
     /// `Arc<dyn Handler>` clone of the same handler instance.
     ///
     /// First-call latency equals the legacy load cost (SHA-256 plus
     /// `.<name>_verified` write). Subsequent calls reduce to a single atomic
     /// load and an `Arc::clone`.
-    fn cached_plugin_registration(&self) -> Arc<CachedPluginRegistration> {
+    async fn cached_plugin_registration(&self) -> Arc<CachedPluginRegistration> {
         self.plugin_cache
-            .get_or_init(|| {
-                Arc::new(build_cached_plugin_registration(
-                    &self.plugin_dirs,
-                    self.plugin_require_signed,
-                ))
+            .get_or_init(|| async {
+                Arc::new(
+                    build_cached_plugin_registration(&self.plugin_dirs, self.plugin_require_signed)
+                        .await,
+                )
             })
+            .await
             .clone()
     }
 
     /// Doc-hidden test accessor — populates the plugin cache so tests
     /// can assert that subsequent loads do NOT re-touch disk.
     #[doc(hidden)]
-    pub fn warm_plugin_cache_for_test(&self) {
-        let _ = self.cached_plugin_registration();
+    pub async fn warm_plugin_cache_for_test(&self) {
+        let _ = self.cached_plugin_registration().await;
     }
 
     /// Doc-hidden test accessor — exposes the cached plugin tool names.
     /// Used by the regression test for backend bug #1 to confirm the
     /// cached registration is stable across calls.
     #[doc(hidden)]
-    pub fn cached_plugin_tool_names_for_test(&self) -> Vec<String> {
-        self.cached_plugin_registration().tool_names.clone()
+    pub async fn cached_plugin_tool_names_for_test(&self) -> Vec<String> {
+        self.cached_plugin_registration().await.tool_names.clone()
     }
 
     /// Resolve LLM provider for a node, following SpawnTool pattern.
@@ -572,7 +578,7 @@ impl Handler for CodergenHandler {
         // 100 ms–seconds of per-node latency, starving the SSE window
         // the chat UI / e2e tests inspect.
         if !self.plugin_dirs.is_empty() {
-            let cached = self.cached_plugin_registration();
+            let cached = self.cached_plugin_registration().await;
             cached.apply_to(&mut tools);
         }
 

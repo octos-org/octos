@@ -112,7 +112,7 @@ async fn pipeline_plugin_load_is_cached_across_nodes() {
     .with_plugin_dirs(vec![plugins_root.path().to_path_buf()]);
 
     // First load — verified files get written.
-    handler.warm_plugin_cache_for_test();
+    handler.warm_plugin_cache_for_test().await;
 
     let alpha_verified = plugins_root.path().join("stub-alpha/.stub-alpha_verified");
     let beta_verified = plugins_root.path().join("stub-beta/.stub-beta_verified");
@@ -144,8 +144,8 @@ async fn pipeline_plugin_load_is_cached_across_nodes() {
 
     // Second + third loads — these would re-write the verified files
     // under the old (uncached) code path. With caching they must NOT.
-    handler.warm_plugin_cache_for_test();
-    handler.warm_plugin_cache_for_test();
+    handler.warm_plugin_cache_for_test().await;
+    handler.warm_plugin_cache_for_test().await;
 
     let alpha_mtime_2 = std::fs::metadata(&alpha_verified)
         .unwrap()
@@ -185,8 +185,8 @@ async fn cached_plugin_registration_exposes_loaded_tools() {
     )
     .with_plugin_dirs(vec![plugins_root.path().to_path_buf()]);
 
-    let names_first = handler.cached_plugin_tool_names_for_test();
-    let names_second = handler.cached_plugin_tool_names_for_test();
+    let names_first = handler.cached_plugin_tool_names_for_test().await;
+    let names_second = handler.cached_plugin_tool_names_for_test().await;
 
     assert_eq!(
         names_first, names_second,
@@ -207,7 +207,7 @@ async fn empty_plugin_dirs_is_a_no_op_fast_path() {
         working_dir.path().to_path_buf(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
-    assert!(handler.cached_plugin_tool_names_for_test().is_empty());
+    assert!(handler.cached_plugin_tool_names_for_test().await.is_empty());
 }
 
 /// Measurement guard — the second cached load must complete in under
@@ -235,12 +235,12 @@ async fn cached_load_is_at_least_an_order_of_magnitude_faster() {
 
     // First load — full cost.
     let cold_start = std::time::Instant::now();
-    handler.warm_plugin_cache_for_test();
+    handler.warm_plugin_cache_for_test().await;
     let cold_elapsed = cold_start.elapsed();
 
     // Second load — must be effectively free.
     let warm_start = std::time::Instant::now();
-    handler.warm_plugin_cache_for_test();
+    handler.warm_plugin_cache_for_test().await;
     let warm_elapsed = warm_start.elapsed();
 
     eprintln!(

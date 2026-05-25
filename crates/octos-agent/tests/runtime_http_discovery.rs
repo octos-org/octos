@@ -1,0 +1,148 @@
+//! Verifies that PluginLoader::load_into_with_options re-registers HTTP-discovered
+//! tools on every startup — fixes Critical #1 from the PR #1260 code review.
+
+use serde_json::json;
+use tempfile::tempdir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use octos_agent::permissions::SafetyTier;
+use octos_agent::plugins::PluginLoader;
+use octos_agent::tools::ToolRegistry;
+use octos_agent::tools::robot_groups;
+
+#[tokio::test]
+async fn load_into_registers_http_tools_from_catalog() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tools"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"name": "robot.heartbeat", "description": "ping the robot", "safety_tier": "observe"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let skill_dir = dir.path().join("test-robot");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let manifest = json!({
+        "name": "test-robot",
+        "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_discovery": { "type": "http", "base_url": server.uri() }
+    });
+    std::fs::write(
+        skill_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = ToolRegistry::new();
+    PluginLoader::load_into_with_options(
+        &mut registry,
+        &[dir.path().to_path_buf()],
+        &[],
+        Default::default(),
+    )
+    .await
+    .expect("load_into should succeed");
+
+    assert!(
+        registry.get_tool("robot.heartbeat").is_some(),
+        "HTTP-discovered tool missing from registry"
+    );
+    assert_eq!(
+        robot_groups::snapshot().tier_of("robot.heartbeat"),
+        Some(SafetyTier::Observe),
+        "catalog safety_tier should win"
+    );
+}
+
+#[tokio::test]
+async fn load_into_falls_back_to_manifest_required_safety_tier_when_catalog_omits() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tools"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"name": "vendor.x.y.motion.go", "description": "go"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let skill_dir = dir.path().join("legacy-robot");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let manifest = json!({
+        "name": "legacy-robot",
+        "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_discovery": { "type": "http", "base_url": server.uri() }
+    });
+    std::fs::write(
+        skill_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = ToolRegistry::new();
+    PluginLoader::load_into_with_options(
+        &mut registry,
+        &[dir.path().to_path_buf()],
+        &[],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(registry.get_tool("vendor.x.y.motion.go").is_some());
+    assert_eq!(
+        robot_groups::snapshot().tier_of("vendor.x.y.motion.go"),
+        Some(SafetyTier::SafeMotion),
+        "manifest required_safety_tier should be the fallback"
+    );
+}
+
+#[tokio::test]
+async fn load_into_uses_tool_overrides_when_present() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tools"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"name": "robot.estop", "description": "stop"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let skill_dir = dir.path().join("override-robot");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let manifest = json!({
+        "name": "override-robot",
+        "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_overrides": { "robot.estop": "emergency_override" },
+        "tool_discovery": { "type": "http", "base_url": server.uri() }
+    });
+    std::fs::write(
+        skill_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = ToolRegistry::new();
+    PluginLoader::load_into_with_options(
+        &mut registry,
+        &[dir.path().to_path_buf()],
+        &[],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(registry.get_tool("robot.estop").is_some());
+    assert_eq!(
+        robot_groups::snapshot().tier_of("robot.estop"),
+        Some(SafetyTier::EmergencyOverride),
+        "tool_overrides should beat manifest default"
+    );
+}

@@ -630,7 +630,9 @@ impl ProfileActorFactoryBuilder {
                         // load with a warning).
                         require_signed: profile_config.plugins.require_signed,
                     },
-                ) {
+                )
+                .await
+                {
                     Ok(result) => {
                         child_plugin_prompt_fragments = result.prompt_fragments;
                         child_plugin_hooks = result.hooks;

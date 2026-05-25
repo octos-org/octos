@@ -2463,7 +2463,8 @@ impl Tool for SpawnTool {
                         synthesis_config: None,
                         require_signed: self.plugin_require_signed,
                     },
-                );
+                )
+                .await;
             }
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
@@ -2892,7 +2893,8 @@ impl Tool for SpawnTool {
                             synthesis_config: None,
                             require_signed: plugin_require_signed,
                         },
-                    );
+                    )
+                    .await;
                 }
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());

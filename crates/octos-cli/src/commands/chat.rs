@@ -274,7 +274,9 @@ impl ChatCommand {
                     synthesis_config: None,
                     require_signed: config.plugins.require_signed,
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(result) => plugin_result = result,
                 Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
             }

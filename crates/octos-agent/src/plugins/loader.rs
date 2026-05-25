@@ -96,16 +96,16 @@ impl PluginLoader {
     ///
     /// Returns a `PluginLoadResult` with tool count and any resolved extras
     /// (MCP servers, hooks, prompt fragments).
-    pub fn load_into(
+    pub async fn load_into(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
     ) -> Result<PluginLoadResult> {
-        Self::load_into_with_work_dir(registry, dirs, extra_env, None)
+        Self::load_into_with_work_dir(registry, dirs, extra_env, None).await
     }
 
     /// Like `load_into`, but sets a working directory for plugin processes.
-    pub fn load_into_with_work_dir(
+    pub async fn load_into_with_work_dir(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
@@ -121,6 +121,7 @@ impl PluginLoader {
                 require_signed: false,
             },
         )
+        .await
     }
 
     /// Full-featured loader that accepts arbitrary [`PluginLoadOptions`].
@@ -128,7 +129,12 @@ impl PluginLoader {
     /// New host-controlled config (e.g. `synthesis_config`) is plumbed
     /// through here so older `load_into` callers keep working without
     /// signature churn.
-    pub fn load_into_with_options(
+    ///
+    /// Async because skills with `tool_discovery = Http { base_url }` issue
+    /// a `GET <base_url>/tools` request at every startup so HTTP-discovered
+    /// tools re-register on each `octos chat` / `octos gateway` / `octos serve`
+    /// boot (fixes Critical #1 from the PR #1260 review).
+    pub async fn load_into_with_options(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
@@ -170,6 +176,82 @@ impl PluginLoader {
 
         for plugin in discovered {
             let path = plugin.path;
+            // Critical #1 fix from PR #1260 review: HTTP-discovered tools
+            // previously only registered during `activate_skill` at install
+            // time, so they vanished on every agent restart. Pre-parse the
+            // manifest here to detect `tool_discovery = Http { base_url }`
+            // and re-register the catalog on every startup. Re-parse is
+            // cheap (single JSON read per skill dir) and only happens once
+            // per process boot.
+            let manifest_path = path.join("manifest.json");
+            let manifest_for_discovery = std::fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<PluginManifest>(&s).ok());
+
+            if let Some(manifest) = manifest_for_discovery {
+                if let octos_plugin::ToolDiscovery::Http { base_url } = &manifest.tool_discovery {
+                    match super::http_discovery::fetch_http_tool_catalog(base_url).await {
+                        Ok(entries) => {
+                            for entry in entries {
+                                // Hybrid tier resolution: catalog > tool_overrides > manifest default.
+                                let tier = entry
+                                    .safety_tier
+                                    .or_else(|| manifest.tool_overrides.get(&entry.name).copied())
+                                    .unwrap_or(manifest.required_safety_tier);
+
+                                let mapping = crate::tools::dora_bridge::DoraToolMapping {
+                                    tool_name: entry.name.clone(),
+                                    description: entry.description.clone(),
+                                    bridge_base_url: base_url.clone(),
+                                    safety_tier: tier,
+                                    input_schema: Some(entry.input_schema.clone()),
+                                    timeout_secs: crate::tools::dora_bridge::default_timeout(),
+                                    concurrency_class: None,
+                                    dora_node_id: None,
+                                    dora_output_id: None,
+                                };
+                                match crate::tools::dora_bridge::DoraToolBridge::new(mapping) {
+                                    Ok(bridge) => {
+                                        let tool_name = entry.name.clone();
+                                        result.tool_names.push(tool_name.clone());
+                                        crate::tools::robot_groups::with_registry_mut(|reg| {
+                                            reg.insert(tool_name.clone(), tier);
+                                        });
+                                        registry
+                                            .register_arc(std::sync::Arc::new(bridge)
+                                                as std::sync::Arc<dyn Tool>);
+                                        result.tool_count += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            plugin_dir = %path.display(),
+                                            tool = %entry.name,
+                                            error = %e,
+                                            "failed to construct HTTP bridge, skipping tool",
+                                        );
+                                    }
+                                }
+                            }
+                            info!(
+                                plugin_dir = %path.display(),
+                                base_url = %base_url,
+                                "registered HTTP-discovered tools at startup",
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                plugin_dir = %path.display(),
+                                error = %e,
+                                "HTTP tool discovery failed at startup, skipping skill",
+                            );
+                        }
+                    }
+                    // HTTP-discovery skills do NOT fall through to the
+                    // binary-protocol loader — they ship no native binary.
+                    continue;
+                }
+            }
+
             // Re-parse via the agent-side manifest type below: octos_plugin's
             // PluginManifest is a structural subset and doesn't model
             // mcp_servers / hooks / prompts / spawn_only. Discovery has
@@ -954,27 +1036,29 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    #[test]
-    fn test_load_nonexistent_dir() {
+    #[tokio::test]
+    async fn test_load_nonexistent_dir() {
         let mut registry = ToolRegistry::new();
         let result =
-            PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")], &[]);
+            PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")], &[])
+                .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().tool_count, 0);
     }
 
-    #[test]
-    fn test_load_empty_dir() {
+    #[tokio::test]
+    async fn test_load_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 0);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_load_plugin_with_manifest() {
+    #[tokio::test]
+    async fn test_load_plugin_with_manifest() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -997,15 +1081,16 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_hash_verification_pass() {
+    #[tokio::test]
+    async fn test_hash_verification_pass() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1026,14 +1111,15 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 1);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_hash_verification_fail() {
+    #[tokio::test]
+    async fn test_hash_verification_fail() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1049,8 +1135,9 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         // Should succeed overall (skips failed plugin) but register 0 tools
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 0);
     }
 
@@ -1070,8 +1157,8 @@ mod tests {
     /// time when `require_signed = true` — instead of the legacy "warn and
     /// proceed" path.
     #[cfg(unix)]
-    #[test]
-    fn require_signed_rejects_unsigned_plugin() {
+    #[tokio::test]
+    async fn require_signed_rejects_unsigned_plugin() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1101,6 +1188,7 @@ mod tests {
                 require_signed: true,
             },
         )
+        .await
         .unwrap();
         assert_eq!(
             result.tool_count, 0,
@@ -1111,8 +1199,8 @@ mod tests {
     /// Section B: with `require_signed = true`, signed plugins (those that
     /// declare a matching `manifest.sha256`) still load normally.
     #[cfg(unix)]
-    #[test]
-    fn require_signed_accepts_signed_plugin() {
+    #[tokio::test]
+    async fn require_signed_accepts_signed_plugin() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1141,6 +1229,7 @@ mod tests {
                 require_signed: true,
             },
         )
+        .await
         .unwrap();
         assert_eq!(
             result.tool_count, 1,
@@ -1153,8 +1242,8 @@ mod tests {
     /// is rejected because the `manifest.sha256` field can never anchor a
     /// hash check for its executable extras — the load path otherwise
     /// returns extras unconditionally on `tools.is_empty()`.
-    #[test]
-    fn require_signed_rejects_extras_only_skill() {
+    #[tokio::test]
+    async fn require_signed_rejects_extras_only_skill() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("extras-only");
         std::fs::create_dir(&plugin_dir).unwrap();
@@ -1186,6 +1275,7 @@ mod tests {
                 require_signed: true,
             },
         )
+        .await
         .unwrap();
         assert_eq!(
             result.tool_count, 0,
@@ -1206,8 +1296,8 @@ mod tests {
     /// installing executable extras while keeping the executable hash
     /// matching.
     #[cfg(unix)]
-    #[test]
-    fn require_signed_drops_extras_on_mixed_signed_manifest() {
+    #[tokio::test]
+    async fn require_signed_drops_extras_on_mixed_signed_manifest() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1245,6 +1335,7 @@ mod tests {
                 require_signed: true,
             },
         )
+        .await
         .unwrap();
         assert_eq!(result.tool_count, 1, "signed tool still registers");
         assert!(
@@ -1265,8 +1356,8 @@ mod tests {
     /// so it's not covered by `manifest.sha256` — and an unsigned edit to
     /// SKILL.md would otherwise still slip into the agent system prompt.
     #[cfg(unix)]
-    #[test]
-    fn require_signed_drops_auto_skill_md_for_spawn_only() {
+    #[tokio::test]
+    async fn require_signed_drops_auto_skill_md_for_spawn_only() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1305,6 +1396,7 @@ mod tests {
                 require_signed: true,
             },
         )
+        .await
         .unwrap();
         assert_eq!(result.tool_count, 1);
         assert!(
@@ -1318,8 +1410,8 @@ mod tests {
     /// mixed manifest installs both the tool AND the extras (legacy
     /// behaviour — no regression).
     #[cfg(unix)]
-    #[test]
-    fn require_signed_off_keeps_mixed_extras_on_signed_manifest() {
+    #[tokio::test]
+    async fn require_signed_off_keeps_mixed_extras_on_signed_manifest() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1347,8 +1439,9 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(
             result.mcp_servers.len(),
@@ -1360,8 +1453,8 @@ mod tests {
     /// Section B (codex review follow-up): under permissive mode, an
     /// extras-only skill still loads its extras as it always did — this
     /// is a backward-compatibility check.
-    #[test]
-    fn require_signed_off_keeps_extras_only_skill_loading() {
+    #[tokio::test]
+    async fn require_signed_off_keeps_extras_only_skill_loading() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("extras-only-legacy");
         std::fs::create_dir(&plugin_dir).unwrap();
@@ -1378,8 +1471,9 @@ mod tests {
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 0, "extras-only skill registers no tools");
         assert_eq!(
             result.mcp_servers.len(),
@@ -1392,8 +1486,8 @@ mod tests {
     /// unsigned plugins still load with a warning — backward compatibility
     /// is preserved.
     #[cfg(unix)]
-    #[test]
-    fn require_signed_off_keeps_legacy_unsigned_path() {
+    #[tokio::test]
+    async fn require_signed_off_keeps_legacy_unsigned_path() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1411,8 +1505,9 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(
             result.tool_count, 1,
             "unsigned plugin must still load under the legacy default"
@@ -1444,8 +1539,9 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 1);
 
         // Swap the verified-exe bytes on disk so the re-hash gate fires.
@@ -1502,6 +1598,7 @@ mod tests {
                 require_signed: true,
             },
         )
+        .await
         .unwrap();
 
         // Swap manifest.json on disk to a different value. Note: we keep
@@ -1544,7 +1641,9 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
 
         let tool = registry.get("intact_tool").expect("tool registered");
         let result = tool.execute(&serde_json::json!({})).await.unwrap();
@@ -1578,8 +1677,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_plugin_loader_rejects_symlink_executable() {
+    #[tokio::test]
+    async fn test_plugin_loader_rejects_symlink_executable() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1602,8 +1701,9 @@ mod tests {
         std::os::unix::fs::symlink(&real_exec, plugin_dir.join("evil-plugin")).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         // Should not load any tools because the executable is a symlink
         assert_eq!(
             result.tool_count, 0,
@@ -1612,8 +1712,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_loader_registers_manifest_approval_risk_and_overwrites_unspecified() {
+    #[tokio::test]
+    async fn test_loader_registers_manifest_approval_risk_and_overwrites_unspecified() {
         use std::os::unix::fs::PermissionsExt;
 
         fn write_plugin(root: &Path, plugin_name: &str, manifest: String) {
@@ -1653,6 +1753,7 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         let first = PluginLoader::load_into(&mut registry, &[first_root.path().to_path_buf()], &[])
+            .await
             .unwrap();
         assert_eq!(first.tool_count, 3);
         assert_eq!(
@@ -1686,6 +1787,7 @@ mod tests {
 
         let second =
             PluginLoader::load_into(&mut registry, &[second_root.path().to_path_buf()], &[])
+                .await
                 .unwrap();
         assert_eq!(second.tool_count, 2);
         assert_eq!(
@@ -1699,8 +1801,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_loader_bootstraps_script_skill_wrapper() {
+    #[tokio::test]
+    async fn test_loader_bootstraps_script_skill_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
         std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
@@ -1721,8 +1823,9 @@ mod tests {
         .unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 1);
         assert!(plugin_dir.join("main").exists());
     }
@@ -1846,8 +1949,8 @@ edition = "2021"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_verified_executable_is_world_executable() {
+    #[tokio::test]
+    async fn test_verified_executable_is_world_executable() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1875,8 +1978,9 @@ edition = "2021"
         .unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 1);
 
         let verified = plugin_dir.join(".perm-plugin_verified");
@@ -2009,8 +2113,8 @@ edition = "2021"
     /// at registration time so the malicious entry never reaches the
     /// runtime gate.
     #[cfg(unix)]
-    #[test]
-    fn loader_skips_tool_with_invalid_env_allowlist_entry() {
+    #[tokio::test]
+    async fn loader_skips_tool_with_invalid_env_allowlist_entry() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2039,8 +2143,9 @@ edition = "2021"
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
 
         // good_tool registered, bad_tool skipped.
         assert_eq!(result.tool_count, 1);
@@ -2051,8 +2156,8 @@ edition = "2021"
     /// Pin that registration-time validation rejects manifests with
     /// `env` entries containing `=` (a shell-injection vector).
     #[cfg(unix)]
-    #[test]
-    fn loader_skips_tool_with_equals_in_env_name() {
+    #[tokio::test]
+    async fn loader_skips_tool_with_equals_in_env_name() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2077,14 +2182,15 @@ edition = "2021"
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .await
+            .unwrap();
         assert_eq!(result.tool_count, 0);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn duplicate_plugin_id_first_dir_wins() {
+    #[tokio::test]
+    async fn duplicate_plugin_id_first_dir_wins() {
         use std::os::unix::fs::PermissionsExt;
 
         let write_skill = |dir: &std::path::Path, marker: &str| {
@@ -2122,6 +2228,7 @@ edition = "2021"
             &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
             &[],
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -2219,7 +2326,7 @@ pub async fn activate_skill(
             // this call, every static tool declared in the manifest is
             // registered in `registry`.
             let parent = skill_dir.parent().unwrap_or(skill_dir).to_path_buf();
-            PluginLoader::load_into(registry, &[parent], _extra_env)?;
+            PluginLoader::load_into(registry, &[parent], _extra_env).await?;
         }
         ToolDiscovery::Http { base_url } => {
             let names = register_http_tools(registry, base_url).await.map_err(|e| {
