@@ -606,6 +606,7 @@ impl ProfileRuntime {
                     // `config_from_profile` so operators can opt into
                     // strict signature enforcement per deployment.
                     require_signed: config.plugins.require_signed,
+                    verified_cache_dir: None,
                 },
             ) {
                 Ok(result) => plugin_result = result,

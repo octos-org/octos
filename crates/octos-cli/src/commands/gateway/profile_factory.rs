@@ -629,6 +629,7 @@ impl ProfileActorFactoryBuilder {
                         // (backward compatible — unsigned plugins still
                         // load with a warning).
                         require_signed: profile_config.plugins.require_signed,
+                        verified_cache_dir: None,
                     },
                 ) {
                     Ok(result) => {

@@ -68,6 +68,13 @@ pub struct PluginLoadOptions<'a> {
     /// spawning. When `false` (the default), the legacy permissive flow is
     /// preserved for backward compatibility.
     pub require_signed: bool,
+    /// Override the directory used to store the verified-exe copy. When
+    /// `None`, the loader resolves to `~/.octos/cache/verified/` so the
+    /// copy lives outside the skill source tree (writing inside the source
+    /// dir taints ownership when the daemon runs as a different uid — see
+    /// 2026-05 fleet skill-dir-root-ownership bug). Tests pass a tempdir
+    /// here for isolation; production callers leave this `None`.
+    pub verified_cache_dir: Option<PathBuf>,
 }
 
 impl PluginLoadResult {
@@ -117,6 +124,7 @@ impl PluginLoader {
                 work_dir,
                 synthesis_config: None,
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
     }
@@ -254,6 +262,7 @@ impl PluginLoader {
                 work_dir,
                 synthesis_config: None,
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
     }
@@ -281,6 +290,7 @@ impl PluginLoader {
         let work_dir = options.work_dir;
         let synthesis_config = options.synthesis_config;
         let require_signed = options.require_signed;
+        let verified_cache_dir = options.verified_cache_dir.clone();
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
@@ -447,12 +457,21 @@ impl PluginLoader {
             }
         }
 
-        // Write verified bytes to a sibling file so PluginTool executes
-        // exactly what we hashed (prevents TOCTOU file swap attacks).
-        let verified_exe = plugin_dir.join(format!(
-            ".{}_verified",
-            executable.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        // Write verified bytes to a path OUTSIDE the skill source dir so
+        // PluginTool executes exactly what we hashed (TOCTOU defence) without
+        // tainting the skill tree's ownership. Writing into the skill dir is
+        // the original 2026-05 fleet bug: when the daemon runs as root (e.g.
+        // from a `sudo`-installed launchd plist), the verified copy lands as
+        // root:wheel and any subsequent chmod/chown by the operator user
+        // fails. The cache lives at `<verified_cache_dir>/<plugin>/main` —
+        // resolved from `PluginLoadOptions::verified_cache_dir` (tests) or
+        // `~/.octos/cache/verified/` (production).
+        let verified_exe = resolve_verified_path(verified_cache_dir.as_deref(), &manifest.name)?;
+        if let Some(parent) = verified_exe.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                eyre::eyre!("cannot create verified cache dir {}: {e}", parent.display())
+            })?;
+        }
         // Remove existing verified file first so we can refresh the copy on restart.
         let _ = std::fs::remove_file(&verified_exe);
         std::fs::write(&verified_exe, &exe_bytes)
@@ -929,6 +948,77 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{hash:x}"))
 }
 
+/// Resolve where to store the verified-exe copy for a plugin.
+///
+/// Resolution order:
+/// 1. Explicit `override_dir` from [`PluginLoadOptions::verified_cache_dir`]
+///    (used by tests to isolate from the real cache).
+/// 2. Under `cargo test`, a process-scoped tempdir auto-cleaned at exit —
+///    keeps the test suite from polluting `~/.octos/cache/verified/` and
+///    avoids cross-test races on shared plugin names.
+/// 3. `~/.octos/cache/verified/` derived from `dirs::home_dir()`.
+/// 4. `std::env::temp_dir().join("octos-verified")` as a last resort when
+///    HOME is unavailable (e.g. sandbox).
+///
+/// Returns `<base>/<plugin_name>/main`. The caller is responsible for
+/// `create_dir_all` on the parent before writing.
+fn resolve_verified_path(override_dir: Option<&Path>, plugin_name: &str) -> Result<PathBuf> {
+    // Guard against a plugin name with path separators that would let a
+    // malicious manifest escape the cache root. The manifest loader already
+    // validates this for tool registration, but we belt-and-brace here so
+    // future call sites that bypass tool validation still land in a safe
+    // subdir.
+    if plugin_name.contains('/')
+        || plugin_name.contains('\\')
+        || plugin_name == "."
+        || plugin_name == ".."
+        || plugin_name.is_empty()
+    {
+        eyre::bail!("plugin name {plugin_name:?} not safe for cache path");
+    }
+    let base = if let Some(dir) = override_dir {
+        dir.to_path_buf()
+    } else if cfg!(test) {
+        // Tests that don't care about the verified-exe location still go
+        // through this default path; keep them out of the user's real
+        // cache (and let TempDir auto-cleanup at process exit).
+        test_default_cache_dir()
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".octos").join("cache").join("verified")
+    } else {
+        std::env::temp_dir().join("octos-verified")
+    };
+    Ok(base.join(plugin_name).join("main"))
+}
+
+/// Process-scoped tempdir for tests that don't explicitly pass a
+/// `verified_cache_dir`. Created once on first access; auto-cleaned when
+/// the test process exits. Without this, every test would write into the
+/// dev machine's real `~/.octos/cache/verified/` and tests reusing the
+/// same plugin name in parallel would race.
+#[cfg(test)]
+fn test_default_cache_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static TEST_CACHE: OnceLock<tempfile::TempDir> = OnceLock::new();
+    TEST_CACHE
+        .get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("octos-verified-test-")
+                .tempdir()
+                .expect("create test verified cache tempdir")
+        })
+        .path()
+        .to_path_buf()
+}
+
+/// Non-test stub so the default branch in `resolve_verified_path` compiles
+/// outside `cfg(test)` without a `cfg!(test)` flicker.
+#[cfg(not(test))]
+#[allow(dead_code)]
+fn test_default_cache_dir() -> PathBuf {
+    PathBuf::new()
+}
+
 /// Check if a path is a regular executable file (Unix).
 /// Rejects symlinks as defense-in-depth against link-swap attacks.
 #[cfg(unix)]
@@ -1097,6 +1187,7 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1137,6 +1228,7 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1182,6 +1274,7 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1241,6 +1334,7 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1302,6 +1396,7 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1420,8 +1515,9 @@ mod tests {
 
     /// Section C: when the verified-exe bytes on disk are swapped between
     /// load and invocation, the pre-spawn re-hash gate refuses to spawn the
-    /// process. We simulate the swap by overwriting `.<name>_verified`
-    /// after `load_into` returns.
+    /// process. We simulate the swap by overwriting the verified-cache copy
+    /// (now stored under `verified_cache_dir`, not the skill source tree)
+    /// after `load_into_with_options` returns.
     #[cfg(unix)]
     #[tokio::test]
     async fn pre_spawn_rehash_detects_swap() {
@@ -1442,16 +1538,28 @@ mod tests {
         std::fs::write(&exec_path, exec_content).unwrap();
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        let cache_dir = dir.path().join("cache");
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: Some(cache_dir.clone()),
+            },
+        )
+        .unwrap();
         assert_eq!(result.tool_count, 1);
 
-        // Swap the verified-exe bytes on disk so the re-hash gate fires.
-        let verified_exe = plugin_dir.join(".swap-plugin_verified");
+        // Swap the verified-cache bytes on disk so the re-hash gate fires.
+        let verified_exe = cache_dir.join("swap-plugin").join("main");
         assert!(
             verified_exe.exists(),
-            "loader must write a verified-exe sibling"
+            "loader must write a verified-exe copy at {}",
+            verified_exe.display()
         );
         std::fs::write(&verified_exe, b"#!/bin/sh\necho TAMPERED").unwrap();
 
@@ -1499,6 +1607,7 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1873,12 +1982,24 @@ edition = "2021"
         )
         .unwrap();
 
+        let cache_dir = dir.path().join("cache");
         let mut registry = ToolRegistry::new();
-        let result =
-            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: Some(cache_dir.clone()),
+            },
+        )
+        .unwrap();
         assert_eq!(result.tool_count, 1);
 
-        let verified = plugin_dir.join(".perm-plugin_verified");
+        // Verified copy lives under cache_dir, not the skill source dir.
+        let verified = cache_dir.join("perm-plugin").join("main");
         let mode = std::fs::metadata(&verified).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
     }
@@ -1932,6 +2053,7 @@ edition = "2021"
                 work_dir: None,
                 synthesis_config: Some(cfg),
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -1990,6 +2112,7 @@ edition = "2021"
                 work_dir: None,
                 synthesis_config: Some(cfg),
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -2135,5 +2258,71 @@ edition = "2021"
             "from-corrected",
             "first dir (dir_a / corrected) must win — got the shadow copy"
         );
+    }
+
+    /// Regression: the verified-exe copy must live OUTSIDE the skill source
+    /// directory so that running `octos serve` as root (or any non-operator
+    /// uid) does not taint the skill tree with foreign ownership and lock
+    /// out the operator's interactive CLI. The cache is keyed by plugin
+    /// name and lives under `verified_cache_dir`.
+    #[cfg(unix)]
+    #[test]
+    fn verified_path_lives_under_cache_dir_not_skill_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("isolated-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{"name": "isolated-plugin", "version": "1.0", "tools": [{"name": "iso_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}]}"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("isolated-plugin");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho hi").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cache_dir = dir.path().join("cache-root");
+        let mut registry = ToolRegistry::new();
+        PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: Some(cache_dir.clone()),
+            },
+        )
+        .unwrap();
+
+        // The verified copy must live under cache_dir/<plugin>/main.
+        let expected = cache_dir.join("isolated-plugin").join("main");
+        assert!(
+            expected.is_file(),
+            "verified copy must live at {} (got nothing); cache_dir contents: {:?}",
+            expected.display(),
+            std::fs::read_dir(&cache_dir).ok().map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .collect::<Vec<_>>()
+            }),
+        );
+
+        // The skill source dir must NOT contain a `.isolated-plugin_verified`
+        // or `.main_verified` sibling — that was the old taint vector.
+        let skill_entries: Vec<_> = std::fs::read_dir(&plugin_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &skill_entries {
+            assert!(
+                !name.ends_with("_verified") && name != ".main_verified",
+                "skill source dir should not contain verified-copy file '{}' (full list: {:?})",
+                name,
+                skill_entries,
+            );
+        }
     }
 }

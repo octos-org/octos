@@ -92,16 +92,22 @@ fn create_stub_plugin(plugins_root: &Path, name: &str) -> PathBuf {
     plugin_dir
 }
 
-/// Acceptance — the cached-plugin path writes the verified-bytes sibling
+/// Acceptance — the cached-plugin path writes the verified-bytes copy
 /// exactly once across many invocations, even when several plugin dirs
 /// are configured. This is the per-node-spawn cost the bug report
 /// flagged: prior to caching every node re-read + re-hashed every
-/// plugin and re-wrote `.<name>_verified` files, so the mtime advanced
-/// on every node execution.
+/// plugin and re-wrote the verified copy, so the mtime advanced on
+/// every node execution.
+///
+/// Post 2026-05 fix (`fix/skill-dir-root-ownership-bug`) the verified
+/// copy lives under `verified_cache_dir`, NOT inside the skill source
+/// tree. The test passes its own tempdir for isolation from the user's
+/// real `~/.octos/cache/verified/`.
 #[tokio::test]
 async fn pipeline_plugin_load_is_cached_across_nodes() {
     let plugins_root = tempfile::tempdir().unwrap();
     let working_dir = tempfile::tempdir().unwrap();
+    let verified_cache = tempfile::tempdir().unwrap();
 
     // Two stub plugins so the test exercises a multi-dir scan.
     create_stub_plugin(plugins_root.path(), "stub-alpha");
@@ -113,13 +119,14 @@ async fn pipeline_plugin_load_is_cached_across_nodes() {
         working_dir.path().to_path_buf(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
-    .with_plugin_dirs(vec![plugins_root.path().to_path_buf()]);
+    .with_plugin_dirs(vec![plugins_root.path().to_path_buf()])
+    .with_plugin_verified_cache_dir(Some(verified_cache.path().to_path_buf()));
 
-    // First load — verified files get written.
+    // First load — verified files get written under the cache dir.
     handler.warm_plugin_cache_for_test();
 
-    let alpha_verified = plugins_root.path().join("stub-alpha/.stub-alpha_verified");
-    let beta_verified = plugins_root.path().join("stub-beta/.stub-beta_verified");
+    let alpha_verified = verified_cache.path().join("stub-alpha").join("main");
+    let beta_verified = verified_cache.path().join("stub-beta").join("main");
     assert!(
         alpha_verified.exists(),
         "first load should have written {}",
@@ -129,6 +136,16 @@ async fn pipeline_plugin_load_is_cached_across_nodes() {
         beta_verified.exists(),
         "first load should have written {}",
         beta_verified.display()
+    );
+
+    // Regression: the verified copy must NOT taint the skill source dir.
+    let alpha_skill_sibling = plugins_root.path().join("stub-alpha/.stub-alpha_verified");
+    let alpha_skill_sibling_main = plugins_root.path().join("stub-alpha/.main_verified");
+    assert!(
+        !alpha_skill_sibling.exists() && !alpha_skill_sibling_main.exists(),
+        "skill source dir must not host a verified-copy file (saw {} or {})",
+        alpha_skill_sibling.display(),
+        alpha_skill_sibling_main.display(),
     );
 
     let alpha_mtime_1 = std::fs::metadata(&alpha_verified)
