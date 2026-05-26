@@ -200,21 +200,15 @@ fn validate_one_schema(
     profile: ValidationProfile,
     errors: &mut Vec<ManifestSchemaError>,
 ) {
-    // Special-case the empty object — every legacy manifest in the
-    // wild that omitted `input_schema` parses as `{}`. We require a
-    // real schema so providers don't see "no parameters" when the
-    // tool actually expects fields.
-    if let Some(obj) = schema.as_object() {
-        if obj.is_empty() {
-            errors.push(ManifestSchemaError {
-                tool_name: tool_name.to_string(),
-                schema_kind,
-                path: String::new(),
-                message: "schema is empty — tools must declare `\"type\": \"object\"` and at least an empty `properties` map".to_string(),
-            });
-            return;
-        }
-    } else {
+    // The schema must at least be a JSON object — Draft 07 says a
+    // schema can also be `true`/`false`, but tool input schemas are
+    // never one of those in practice; rejecting now gives a useful
+    // pointer rather than letting the walker silently no-op.
+    //
+    // This check fires in every profile (including lenient) because a
+    // non-object root is not a valid Draft 07 schema for the tool-input
+    // role; the `Off` short-circuit higher up still bypasses it.
+    if !schema.is_object() {
         errors.push(ManifestSchemaError {
             tool_name: tool_name.to_string(),
             schema_kind,
@@ -237,6 +231,20 @@ fn validate_one_schema(
 
     // Layer 2: octos strict rules — run unless explicitly relaxed.
     if matches!(profile, ValidationProfile::Strict) {
+        // The empty-schema rule belongs to the strict octos profile —
+        // `{}` is a valid Draft 07 schema, so accepting it in lenient
+        // mode matches the documented "Draft 07 sanity only" contract
+        // (codex P2 review, 2026-05-25). Operators who genuinely want
+        // an "accept anything" tool can opt out with =lenient or =off.
+        if schema.as_object().is_some_and(|o| o.is_empty()) {
+            errors.push(ManifestSchemaError {
+                tool_name: tool_name.to_string(),
+                schema_kind,
+                path: String::new(),
+                message: "schema is empty — tools must declare `\"type\": \"object\"` and at least an empty `properties` map".to_string(),
+            });
+            return;
+        }
         // Root-schema-only rules.
         check_root(tool_name, schema_kind, schema, errors);
         walk_strict(tool_name, schema_kind, schema, "", explicit_draft07, errors);
@@ -288,16 +296,40 @@ fn walk_draft07(
 
     if let Some(v) = obj.get("type") {
         match v {
-            Value::String(_) => {}
+            // String form — must be one of the Draft 07 type names.
+            // Catches typos like `"strng"` that satisfy the strict
+            // "has type" check but are rejected by JSON Schema and
+            // provider validators (codex P2 review, 2026-05-25).
+            Value::String(s) => {
+                if !is_valid_draft07_type(s) {
+                    errors.push(err(
+                        tool_name,
+                        schema_kind,
+                        path,
+                        &format!(
+                            "`type: \"{s}\"` is not a valid JSON Schema Draft 07 type (must be one of: null, boolean, object, array, number, string, integer)"
+                        ),
+                    ));
+                }
+            }
             Value::Array(arr) => {
                 for (i, item) in arr.iter().enumerate() {
-                    if !item.is_string() {
-                        errors.push(err(
+                    match item.as_str() {
+                        Some(s) if is_valid_draft07_type(s) => {}
+                        Some(s) => errors.push(err(
+                            tool_name,
+                            schema_kind,
+                            &join(path, &format!("type/{i}")),
+                            &format!(
+                                "`type[{i}]: \"{s}\"` is not a valid JSON Schema Draft 07 type"
+                            ),
+                        )),
+                        None => errors.push(err(
                             tool_name,
                             schema_kind,
                             &join(path, &format!("type/{i}")),
                             "`type` array items must be strings",
-                        ));
+                        )),
                     }
                 }
             }
@@ -345,53 +377,14 @@ fn walk_draft07(
         }
     }
 
-    // Recurse.
-    if let Some(Value::Object(props)) = obj.get("properties") {
-        for (k, sub) in props {
-            walk_draft07(
-                tool_name,
-                schema_kind,
-                sub,
-                &join(path, &format!("properties/{k}")),
-                errors,
-            );
-        }
-    }
-    for combinator in ["anyOf", "oneOf", "allOf"] {
-        if let Some(Value::Array(arr)) = obj.get(combinator) {
-            for (i, sub) in arr.iter().enumerate() {
-                walk_draft07(
-                    tool_name,
-                    schema_kind,
-                    sub,
-                    &join(path, &format!("{combinator}/{i}")),
-                    errors,
-                );
-            }
-        }
-    }
-    if let Some(items) = obj.get("items") {
-        match items {
-            Value::Object(_) => {
-                walk_draft07(tool_name, schema_kind, items, &join(path, "items"), errors)
-            }
-            Value::Array(arr) => {
-                for (i, sub) in arr.iter().enumerate() {
-                    walk_draft07(
-                        tool_name,
-                        schema_kind,
-                        sub,
-                        &join(path, &format!("items/{i}")),
-                        errors,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(sub) = obj.get("not") {
-        walk_draft07(tool_name, schema_kind, sub, &join(path, "not"), errors);
-    }
+    // Recurse into every schema-bearing keyword. We use the shared
+    // `for_each_subschema` helper so the Draft 07 walker, the strict
+    // walker, and any future layer see the same recursion shape; if
+    // somebody adds a new sub-schema-bearing keyword they only need
+    // to update one place.
+    for_each_subschema(obj, path, |sub, sub_path| {
+        walk_draft07(tool_name, schema_kind, sub, &sub_path, errors);
+    });
 }
 
 // ── Layer 2: strict octos rules ──────────────────────────────────────
@@ -485,7 +478,7 @@ fn walk_strict(
         }
     }
 
-    // Every `properties.X` must declare a `type`.
+    // Node-local checks: every `properties.X` must declare a `type`.
     if let Some(Value::Object(props)) = obj.get("properties") {
         for (k, sub) in props {
             let sub_path = join(path, &format!("properties/{k}"));
@@ -515,18 +508,10 @@ fn walk_strict(
                     &format!("property `{k}` must be a schema object"),
                 ));
             }
-            walk_strict(
-                tool_name,
-                schema_kind,
-                sub,
-                &sub_path,
-                draft07_opt_in,
-                errors,
-            );
         }
     }
 
-    // Every `anyOf`/`oneOf`/`allOf` branch must declare a `type`.
+    // Node-local: every `anyOf`/`oneOf`/`allOf` branch must declare a `type`.
     for combinator in ["anyOf", "oneOf", "allOf"] {
         if let Some(Value::Array(branches)) = obj.get(combinator) {
             for (i, branch) in branches.iter().enumerate() {
@@ -547,57 +532,120 @@ fn walk_strict(
                         ));
                     }
                 }
-                walk_strict(
-                    tool_name,
-                    schema_kind,
-                    branch,
-                    &branch_path,
-                    draft07_opt_in,
-                    errors,
-                );
             }
         }
     }
 
-    // Recurse into `items`, `not`.
+    // Recurse into every schema-bearing keyword. Shared between
+    // `walk_draft07` and `walk_strict` so adding a new sub-schema
+    // keyword (e.g. a future Draft 07 extension) updates both layers
+    // automatically.
+    for_each_subschema(obj, path, |sub, sub_path| {
+        walk_strict(
+            tool_name,
+            schema_kind,
+            sub,
+            &sub_path,
+            draft07_opt_in,
+            errors,
+        );
+    });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/// The seven type names recognised by JSON Schema Draft 07.
+const DRAFT07_TYPES: &[&str] = &[
+    "null", "boolean", "object", "array", "number", "string", "integer",
+];
+
+/// Whether `name` is a Draft 07 primitive type. Used to catch typos
+/// (e.g. `"strng"`) that would slip past the strict "has type" rule
+/// but fail at provider validation time.
+fn is_valid_draft07_type(name: &str) -> bool {
+    DRAFT07_TYPES.contains(&name)
+}
+
+/// Invoke `visit(sub, sub_path)` for every schema-bearing sub-schema
+/// of `obj`. Centralising the recursion shape means both validation
+/// layers descend into the same set of keywords, and a future
+/// schema-bearing keyword (e.g. an extension we adopt) only needs to
+/// be added once.
+///
+/// Keyword coverage matches Draft 07's "applicator" vocabulary:
+/// `properties`, `patternProperties`, `additionalProperties`,
+/// `definitions` / `$defs`, `propertyNames`, `items`,
+/// `additionalItems`, `contains`, `anyOf`/`oneOf`/`allOf`, `not`,
+/// `if`/`then`/`else`, `dependencies` (schema form). The walker is
+/// conservative: keywords whose value is not a schema in Draft 07
+/// (e.g. `dependencies` with an array form, `enum` values) are
+/// ignored. That matches what JSON Schema validators do.
+fn for_each_subschema<F>(obj: &serde_json::Map<String, Value>, path: &str, mut visit: F)
+where
+    F: FnMut(&Value, String),
+{
+    // Object-valued shorthand: `properties` and `patternProperties`
+    // both map to a `name -> sub-schema` table.
+    for keyword in ["properties", "patternProperties", "definitions", "$defs"] {
+        if let Some(Value::Object(map)) = obj.get(keyword) {
+            for (k, sub) in map {
+                visit(sub, join(path, &format!("{keyword}/{k}")));
+            }
+        }
+    }
+
+    // Array-valued: every combinator's items are sub-schemas.
+    for combinator in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(arr)) = obj.get(combinator) {
+            for (i, sub) in arr.iter().enumerate() {
+                visit(sub, join(path, &format!("{combinator}/{i}")));
+            }
+        }
+    }
+
+    // `items` is either a single schema or an array of schemas.
     if let Some(items) = obj.get("items") {
         match items {
-            Value::Object(_) => walk_strict(
-                tool_name,
-                schema_kind,
-                items,
-                &join(path, "items"),
-                draft07_opt_in,
-                errors,
-            ),
+            Value::Object(_) => visit(items, join(path, "items")),
             Value::Array(arr) => {
                 for (i, sub) in arr.iter().enumerate() {
-                    walk_strict(
-                        tool_name,
-                        schema_kind,
-                        sub,
-                        &join(path, &format!("items/{i}")),
-                        draft07_opt_in,
-                        errors,
-                    );
+                    visit(sub, join(path, &format!("items/{i}")));
                 }
             }
             _ => {}
         }
     }
-    if let Some(sub) = obj.get("not") {
-        walk_strict(
-            tool_name,
-            schema_kind,
-            sub,
-            &join(path, "not"),
-            draft07_opt_in,
-            errors,
-        );
+
+    // Single-schema applicators. `additionalProperties` and
+    // `additionalItems` can also be booleans — those aren't schemas
+    // and we skip them.
+    for keyword in [
+        "additionalProperties",
+        "additionalItems",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(sub) = obj.get(keyword) {
+            if sub.is_object() {
+                visit(sub, join(path, keyword));
+            }
+        }
+    }
+
+    // `dependencies` in Draft 07 is either `{name: [required-list]}`
+    // (skip — not a sub-schema) or `{name: sub-schema}` (recurse).
+    if let Some(Value::Object(deps)) = obj.get("dependencies") {
+        for (k, v) in deps {
+            if v.is_object() {
+                visit(v, join(path, &format!("dependencies/{k}")));
+            }
+        }
     }
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────
 
 fn err(tool_name: &str, schema_kind: SchemaKind, path: &str, message: &str) -> ManifestSchemaError {
     ManifestSchemaError {
@@ -969,6 +1017,176 @@ mod tests {
                 .iter()
                 .any(|e| e.path == "/properties/nested/anyOf/0"),
             "expected /properties/nested/anyOf/0 path, got {errors:?}"
+        );
+    }
+
+    // ── Codex P2 review follow-ups (2026-05-25) ─────────────────────
+
+    /// Codex P2 #2: `{}` is a valid Draft 07 schema, so lenient mode
+    /// must accept it. The empty-schema rule is part of the strict
+    /// octos profile only.
+    #[test]
+    fn lenient_profile_accepts_empty_schema() {
+        let schema = schema_of(json!({}));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Lenient,
+        );
+        assert!(
+            errors.is_empty(),
+            "lenient must accept empty `{{}}` (valid Draft 07), got {errors:?}"
+        );
+    }
+
+    /// Codex P2 #2 (continued): strict still rejects empty `{}`.
+    #[test]
+    fn strict_profile_still_rejects_empty_schema() {
+        let schema = schema_of(json!({}));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Strict,
+        );
+        assert!(
+            errors.iter().any(|e| e.message.contains("empty")),
+            "strict must reject empty `{{}}`, got {errors:?}"
+        );
+    }
+
+    /// Codex P2 #3: `{"type": "strng"}` satisfied the strict "has
+    /// type" check but is rejected by Draft 07 + provider validators.
+    /// The Draft 07 sanity pass now catches this typo.
+    #[test]
+    fn invalid_draft07_type_name_rejected() {
+        let schema = schema_of(json!({
+            "type": "object",
+            "properties": {
+                "field": { "type": "strng" }  // typo for "string"
+            }
+        }));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Lenient,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path == "/properties/field" && e.message.contains("\"strng\"")),
+            "expected invalid-type rejection, got {errors:?}"
+        );
+    }
+
+    /// Codex P2 #3 (continued): array-form `type` with a bogus entry
+    /// is also caught.
+    #[test]
+    fn invalid_draft07_type_name_in_array_rejected() {
+        let schema = schema_of(json!({
+            "type": "object",
+            "properties": {
+                "field": { "type": ["string", "bogus"] }
+            }
+        }));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Lenient,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path == "/properties/field/type/1" && e.message.contains("\"bogus\"")),
+            "expected invalid-type-in-array rejection, got {errors:?}"
+        );
+    }
+
+    /// Codex P2 #4: a bare-`anyOf`-branch shape hidden under
+    /// `additionalProperties` must be caught. Without the recursion
+    /// fix this would silently pass.
+    #[test]
+    fn additional_properties_recursion_catches_invalid_anyof() {
+        let schema = schema_of(json!({
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "anyOf": [
+                    { "required": ["a"] },
+                    { "required": ["b"] }
+                ]
+            }
+        }));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Strict,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.starts_with("/additionalProperties/anyOf/")),
+            "expected anyOf-under-additionalProperties rejection, got {errors:?}"
+        );
+    }
+
+    /// Codex P2 #4 (continued): `$defs` / `definitions` schemas also
+    /// recurse so a malformed shared definition can't sneak past.
+    #[test]
+    fn defs_recursion_catches_invalid_anyof() {
+        let schema = schema_of(json!({
+            "type": "object",
+            "$defs": {
+                "Inner": {
+                    "type": "object",
+                    "anyOf": [
+                        { "required": ["x"] }
+                    ]
+                }
+            }
+        }));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Strict,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.starts_with("/$defs/Inner/anyOf/")),
+            "expected anyOf-under-$defs rejection, got {errors:?}"
+        );
+    }
+
+    /// Codex P2 #4 (continued): `if`/`then`/`else` are sub-schemas in
+    /// Draft 07 and must recurse so the same bug class doesn't hide
+    /// inside conditional branches.
+    #[test]
+    fn if_then_else_recursion_catches_invalid_anyof() {
+        let schema = schema_of(json!({
+            "type": "object",
+            "if": {
+                "type": "object",
+                "anyOf": [
+                    { "required": ["mode"] }
+                ]
+            },
+            "then": { "type": "object" }
+        }));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Strict,
+        );
+        assert!(
+            errors.iter().any(|e| e.path.starts_with("/if/anyOf/")),
+            "expected anyOf-under-if rejection, got {errors:?}"
         );
     }
 }

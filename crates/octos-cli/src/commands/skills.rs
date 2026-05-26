@@ -965,7 +965,11 @@ fn install_via_git_result(
             }
         }
 
-        // Auto-detect shared dependencies referenced in SKILL.md
+        // Auto-detect shared dependencies referenced in SKILL.md.
+        // RFC-2 follow-up (codex P2, 2026-05-25): every shared dep
+        // must pass `validate_skill_manifest` BEFORE we copy it,
+        // otherwise a malformed sibling skill bypasses the install
+        // guarantee even though the targeted subdir was clean.
         let skill_md_path = src.join("SKILL.md");
         if skill_md_path.exists() {
             let content = std::fs::read_to_string(&skill_md_path)?;
@@ -980,6 +984,10 @@ fn install_via_git_result(
                         dep
                     );
                 } else {
+                    // Pre-flight validation — bails the install if a
+                    // dep manifest is malformed, leaving nothing
+                    // half-written on disk.
+                    validate_skill_manifest(&dep_src)?;
                     if dep_dest.exists() {
                         std::fs::remove_dir_all(&dep_dest)?;
                     }
