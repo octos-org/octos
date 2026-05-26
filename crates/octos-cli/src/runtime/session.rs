@@ -616,6 +616,7 @@ mod tests {
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
+            lane_routing: None,
         })
     }
 
@@ -1095,6 +1096,7 @@ mod tests {
             cron_service: None,
             pipeline_factory: None,
             hook_executor: Some(executor),
+            lane_routing: None,
         })
     }
 
@@ -1146,6 +1148,7 @@ mod tests {
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
+            lane_routing: None,
         });
         let key = SessionKey::new("api", "activate-tools-probe");
         let rt = SessionRuntime::bootstrap(&profile, key, None)
@@ -1225,6 +1228,7 @@ mod tests {
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
+            lane_routing: None,
         });
 
         let rt_a = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-a"), None)

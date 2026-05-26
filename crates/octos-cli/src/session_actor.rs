@@ -2342,6 +2342,10 @@ pub struct ActorFactory {
     /// Side-channel to the AdaptiveRouter for responsiveness feedback.
     /// None when adaptive routing is disabled or using a static provider chain.
     pub adaptive_router: Option<Arc<AdaptiveRouter>>,
+    /// RFC-3 (#1292): per-profile topic→lane override block, mirrored
+    /// onto every actor at spawn time. `None` keeps the built-in
+    /// defaults from [`octos_llm::lane`] active without further wiring.
+    pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
@@ -3178,6 +3182,7 @@ impl ActorFactory {
             queue_mode: self.queue_mode,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: self.adaptive_router.clone(),
+            lane_routing: self.lane_routing.clone(),
             memory_store: self.memory_store.clone(),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -3651,6 +3656,14 @@ struct SessionActor {
     responsiveness: ResponsivenessObserver,
     /// Side-channel to AdaptiveRouter for toggling auto-protection.
     adaptive_router: Option<Arc<AdaptiveRouter>>,
+    /// RFC-3 (#1292) — per-profile topic→lane overrides. `None`
+    /// means "use built-in defaults"; built-ins still apply on
+    /// every turn via `LaneContext::for_topic(topic, None)`.
+    /// Stashed on the actor (not re-resolved off ProfileRuntime
+    /// every turn) so a hot-reload that swaps the profile's
+    /// `lane_routing` field doesn't race the lane-context build
+    /// inside the agent_task spawn.
+    lane_routing: Option<octos_llm::LaneRoutingConfig>,
     /// Memory store for saving long research reports out-of-band.
     memory_store: Option<Arc<MemoryStore>>,
     /// Active overflow task counter for concurrency limiting.
@@ -5924,6 +5937,17 @@ impl SessionActor {
         // this stamp the gateway's failover surfacing would never fire.
         let router_session_id = self.session_key.to_string();
         let router_turn_id = client_message_id.clone();
+        // RFC-3 (#1292): resolve the session's topic to a capability
+        // lane (slides/code/research/etc. → InstructionStrong /
+        // CodeCapable / etc.) and pass it to the AdaptiveRouter via
+        // `with_lane_context`. The WS turn path in `ui_protocol.rs`
+        // does the same — both paths must stay in lockstep so
+        // model selection is identical whether a session is opened
+        // through gateway or web. Pre-RFC-3 behavior persists for
+        // profiles without `lane_routing` config (built-in defaults
+        // resolve unknown prefixes to General, which is a no-op).
+        let lane_ctx =
+            octos_llm::LaneContext::for_topic(self.session_key.topic(), self.lane_routing.as_ref());
 
         // Snapshot for overflow tasks: conversation context BEFORE the
         // primary task, EXCLUDING the primary user message.  Overflow needs
@@ -5935,19 +5959,25 @@ impl SessionActor {
 
         let mut agent_task = tokio::spawn(async move {
             let start = Instant::now();
+            // RFC-3 (#1292): innermost task-local is the lane scope so
+            // each agent-loop iteration's chat() call sees both the
+            // lane filter and the failover-routing context.
             let result = octos_llm::with_router_context(
                 octos_llm::RouterContext {
                     session_id: Some(router_session_id),
                     turn_id: router_turn_id,
                 },
-                tokio::time::timeout(
-                    session_timeout,
-                    agent.process_message_tracked_with_attachments(
-                        &content,
-                        &history_for_agent,
-                        media,
-                        attachments,
-                        &tracker,
+                octos_llm::with_lane_context(
+                    lane_ctx,
+                    tokio::time::timeout(
+                        session_timeout,
+                        agent.process_message_tracked_with_attachments(
+                            &content,
+                            &history_for_agent,
+                            media,
+                            attachments,
+                            &tracker,
+                        ),
                     ),
                 ),
             )
@@ -9632,6 +9662,7 @@ mod tests {
             queue_mode,
             responsiveness,
             adaptive_router,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9701,6 +9732,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9851,6 +9883,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9973,6 +10006,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -10091,6 +10125,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -10181,6 +10216,7 @@ mod tests {
             queue_mode: QueueMode::Speculative,
             responsiveness,
             adaptive_router: Some(router),
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -10270,6 +10306,7 @@ mod tests {
             queue_mode: QueueMode::Speculative,
             responsiveness,
             adaptive_router: Some(router),
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -12660,6 +12697,7 @@ mod tests {
             pending_messages: Arc::new(Mutex::new(HashMap::new())),
             queue_mode: QueueMode::Followup,
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),

@@ -1747,17 +1747,111 @@ impl AdaptiveRouter {
         we * blended_err + wl * ranking_component + wp * norm_priority + wc * norm_cost
     }
 
+    /// RFC-3 (#1292) — when a per-turn [`crate::LaneContext`] is in
+    /// scope and resolves to a non-`General` lane with at least one
+    /// `(provider, model)` candidate that matches a router slot,
+    /// return the matching slot indices in candidate order.
+    ///
+    /// Returns `None` for:
+    /// - no `LANE_CONTEXT` active (outside a `with_lane_context`
+    ///   scope — test paths, gateway pre-RFC-3 sessions)
+    /// - lane is `General` or `None` (semantics: "no filter")
+    /// - candidate list is empty
+    /// - candidate list matches no provider in the chain
+    ///
+    /// All three "None" cases preserve the pre-RFC-3 behavior: every
+    /// slot remains eligible for selection. This is the backward
+    /// compat anchor — profiles that don't carry a topic resolve to
+    /// `General`, get `None` back, and never observe a behavior
+    /// change.
+    fn lane_filtered_slot_indices(&self) -> Option<Vec<usize>> {
+        let ctx = crate::lane::current_lane_context();
+        let lane = ctx.lane?;
+        if lane == crate::Lane::General {
+            return None;
+        }
+        let candidates = ctx.candidates();
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut matched: Vec<usize> = Vec::new();
+        for (want_provider, want_model) in &candidates {
+            for (i, slot) in self.slots.iter().enumerate() {
+                if slot.provider.provider_name() == want_provider
+                    && slot.provider.model_id() == want_model
+                    && !matched.contains(&i)
+                {
+                    matched.push(i);
+                }
+            }
+        }
+        if matched.is_empty() {
+            // Candidates exist but none of them are in this chain.
+            // Fall through to default selection rather than starving
+            // the router. This matches the RFC-3 "lane defaults must
+            // not break existing profiles" requirement.
+            debug!(
+                lane = lane.as_str(),
+                "lane filter resolved zero matching slots; falling through to default selection"
+            );
+            return None;
+        }
+        debug!(
+            lane = lane.as_str(),
+            matched = matched.len(),
+            total = self.slots.len(),
+            "lane filter narrowed candidate slots"
+        );
+        Some(matched)
+    }
+
     /// Select provider index and whether this is a probe request.
     ///
     /// - Off / Hedge: priority order, skip circuit-broken only.
     ///   (Hedge mode uses this to pick the primary for racing.)
     /// - Lane: score-based selection across all providers.
+    ///
+    /// RFC-3 (#1292): when a per-turn lane is in scope, the eligible
+    /// set is narrowed to slots whose `(provider_name, model_id)` is
+    /// in the lane's candidate list. When the lane filter yields
+    /// zero matches we fall through to the full slot list so the
+    /// router never starves (see [`Self::lane_filtered_slot_indices`]).
     fn select_provider(&self) -> (usize, bool) {
         let mode = self.mode();
+        // RFC-3: lane-filtered eligible set, if any. None ⇒ no
+        // filter; behave identically to pre-RFC-3.
+        let lane_eligible = self.lane_filtered_slot_indices();
 
         // Off and Hedge both use priority order for the primary selection.
         // (Hedge picks the alternate separately in hedged_chat.)
         if mode != AdaptiveMode::Lane {
+            // RFC-3: when a lane filter is active, walk the lane's
+            // candidate list in declared order rather than the full
+            // priority order. The first non-circuit-broken match
+            // wins. Falls through to the full slot list if every
+            // lane candidate has a circuit-open breaker.
+            if let Some(ref eligible) = lane_eligible {
+                for &i in eligible {
+                    let slot = &self.slots[i];
+                    if !slot.metrics.is_circuit_open(self.config.failure_threshold) {
+                        let prev = self.last_selected.swap(i as u32, Ordering::Relaxed);
+                        if prev != i as u32 {
+                            info!(
+                                from = self
+                                    .slots
+                                    .get(prev as usize)
+                                    .map(|s| s.provider.provider_name())
+                                    .unwrap_or("?"),
+                                to = slot.provider.provider_name(),
+                                "provider failover (lane filter, lane changing disabled)"
+                            );
+                        }
+                        return (i, false);
+                    }
+                }
+                // All lane candidates circuit-broken → fall through
+                // to the wider priority walk below.
+            }
             for (i, slot) in self.slots.iter().enumerate() {
                 if !slot.metrics.is_circuit_open(self.config.failure_threshold) {
                     let prev = self.last_selected.swap(i as u32, Ordering::Relaxed);
@@ -1778,14 +1872,38 @@ impl AdaptiveRouter {
             // All circuit-broken — fall through to least-failed logic below
         }
 
-        // Score all non-circuit-broken providers
+        // Score all non-circuit-broken providers. RFC-3: if a lane
+        // filter is active and at least one matching slot is up, the
+        // scoring set is restricted to those slots. When the filter
+        // produces zero usable slots we fall back to the full chain.
         let mut scored: Vec<(usize, f64)> = self
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| !s.metrics.is_circuit_open(self.config.failure_threshold))
+            .filter(|(i, s)| {
+                if !s.metrics.is_circuit_open(self.config.failure_threshold) {
+                    match lane_eligible {
+                        Some(ref eligible) => eligible.contains(i),
+                        None => true,
+                    }
+                } else {
+                    false
+                }
+            })
             .map(|(i, s)| (i, self.score(s)))
             .collect();
+        // RFC-3 fall-through: if the lane filter excluded every
+        // remaining slot, redo without the lane filter so the router
+        // doesn't starve under transient lane outages.
+        if scored.is_empty() && lane_eligible.is_some() {
+            scored = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.metrics.is_circuit_open(self.config.failure_threshold))
+                .map(|(i, s)| (i, self.score(s)))
+                .collect();
+        }
 
         // If all circuit-broken, pick least-failed
         if scored.is_empty() {
@@ -2125,16 +2243,12 @@ impl LlmProvider for AdaptiveRouter {
                 );
 
                 // Failover: try remaining providers in score order.
-                let mut scored: Vec<(usize, f64)> = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, s)| {
-                        *i != start_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
-                    })
-                    .map(|(i, s)| (i, self.score(s)))
-                    .collect();
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                // RFC-3 (#1292): when a lane filter is active, prefer
+                // the lane's remaining candidates. If every lane
+                // candidate is exhausted or excluded, fall back to the
+                // full unfiltered set so the router never starves.
+                let lane_eligible = self.lane_filtered_slot_indices();
+                let scored = build_failover_candidates(self, start_idx, lane_eligible.as_ref());
 
                 let mut last_error = e;
                 for (idx, _) in scored {
@@ -2210,16 +2324,9 @@ impl LlmProvider for AdaptiveRouter {
                     "adaptive router failing over stream"
                 );
 
-                let mut scored: Vec<(usize, f64)> = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, s)| {
-                        *i != start_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
-                    })
-                    .map(|(i, s)| (i, self.score(s)))
-                    .collect();
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                // RFC-3 (#1292): same lane-aware failover as chat() above.
+                let lane_eligible = self.lane_filtered_slot_indices();
+                let scored = build_failover_candidates(self, start_idx, lane_eligible.as_ref());
 
                 let mut last_error = e;
                 for (idx, _) in scored {
@@ -2310,6 +2417,54 @@ impl LlmProvider for AdaptiveRouter {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the score-ordered failover candidate list for a router after
+/// the primary slot has errored. RFC-3 (#1292) preference: when
+/// `lane_eligible` is `Some(_)`, only slots in that set are
+/// considered. If that lane-filtered set is empty (every candidate
+/// was either the primary or circuit-broken), the function silently
+/// falls back to the full slot list so the router doesn't starve on
+/// transient lane outages.
+///
+/// Shared between `chat()` and `chat_stream()` so both code paths
+/// retain consistent failover behavior under lane filtering.
+fn build_failover_candidates(
+    router: &AdaptiveRouter,
+    start_idx: usize,
+    lane_eligible: Option<&Vec<usize>>,
+) -> Vec<(usize, f64)> {
+    let circuit_threshold = router.config.failure_threshold;
+    let mut scored: Vec<(usize, f64)> = router
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            if *i == start_idx || s.metrics.is_circuit_open(circuit_threshold) {
+                return false;
+            }
+            match lane_eligible {
+                Some(eligible) => eligible.contains(i),
+                None => true,
+            }
+        })
+        .map(|(i, s)| (i, router.score(s)))
+        .collect();
+    if scored.is_empty() && lane_eligible.is_some() {
+        // RFC-3 fall-through: lane filter excluded every remaining
+        // slot; widen to the full set so failover still has somewhere
+        // to go. The starting slot has already errored, so the
+        // surviving candidates come from outside the lane.
+        scored = router
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != start_idx && !s.metrics.is_circuit_open(circuit_threshold))
+            .map(|(i, s)| (i, router.score(s)))
+            .collect();
+    }
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
 
 fn now_epoch_us() -> u64 {
     std::time::SystemTime::now()
@@ -4187,5 +4342,229 @@ mod tests {
             AdaptiveMode::Hedge,
             "router should have escalated on the latency_ceiling_ms path"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // RFC-3 (#1292) — lane-aware provider selection
+    // ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_steers_chat_to_first_matching_candidate() {
+        // Build a 3-slot router so the lane filter has meaningful
+        // narrowing to do (priority order [primary, code, strong]).
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "openrouter",
+                    model: "gpt-4o-mini",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "deepseek",
+                    model: "deepseek-coder",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        // Default mode is Off → priority order; pre-lane this would
+        // pick `openrouter` (index 0).
+        let baseline = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(baseline.content.as_deref(), Some("from-openrouter"));
+
+        // Now scope a CodeCapable lane — the first lane candidate is
+        // `(anthropic, claude-sonnet-4-6)`, so the router should
+        // route to anthropic even though its priority is lowest.
+        let ctx = crate::LaneContext::for_topic(Some("code:refactor"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-anthropic"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_unknown_topic_preserves_default_behavior() {
+        // Built-in default for `chat:*` is `General` → no filter.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "wisemodel",
+                    model: "kimi-k2.6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::LaneContext::for_topic(Some("chat:hello"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // General lane = no filter, so priority-0 (wisemodel) wins.
+        assert_eq!(resp.content.as_deref(), Some("from-wisemodel"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_zero_matches_falls_through_to_full_chain() {
+        // None of the registered providers match the InstructionStrong
+        // defaults — the filter must not starve the router.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "custom-provider",
+                    model: "custom-model",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "other-provider",
+                    model: "other-model",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::LaneContext::for_topic(Some("slides:demo"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Zero lane matches → priority-0 wins (no starvation).
+        assert_eq!(resp.content.as_deref(), Some("from-custom-provider"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_circuit_breaker_open_on_first_lane_candidate_falls_through_to_second() {
+        // Lane has 2 candidates; the first is failing and trips its
+        // circuit, the second is healthy.
+        let router = AdaptiveRouter::new(
+            vec![
+                // Slot 0 — fast-chat lane's first candidate, failing.
+                Arc::new(MockProvider {
+                    name: "wisemodel",
+                    model: "kimi-k2.6",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "503 down",
+                }),
+                // Slot 1 — fast-chat lane's second candidate, healthy.
+                Arc::new(MockProvider {
+                    name: "deepseek",
+                    model: "deepseek-chat",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                // Slot 2 — outside any lane, low-priority backstop.
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        );
+        // Trip the circuit on slot 0 first via a non-lane call.
+        let _ = router.chat(&[], &[], &ChatConfig::default()).await;
+        assert!(router.slots[0].metrics.is_circuit_open(1));
+
+        // Now lane scope `FastChat` — the first candidate is
+        // circuit-open, so the router should advance to the second
+        // (`deepseek-chat`) rather than fall through to anthropic.
+        let mut cfg = crate::LaneRoutingConfig::default();
+        cfg.topic_lanes
+            .insert("loop".to_string(), crate::Lane::FastChat);
+        let ctx = crate::LaneContext::for_topic(Some("loop:test"), Some(&cfg));
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-deepseek"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_general_is_no_op() {
+        // A `General` lane has no candidates and must not change
+        // anything about how the router behaves vs. an absent scope.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::LaneContext {
+            lane: Some(crate::Lane::General),
+            config: None,
+        };
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-primary"));
     }
 }

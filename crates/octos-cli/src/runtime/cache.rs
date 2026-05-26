@@ -584,6 +584,7 @@ mod tests {
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
+            lane_routing: None,
         })
     }
 
