@@ -4,6 +4,7 @@ use eyre::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::HardwareLifecycle;
+use crate::manifest_validator::{ValidationProfile, validate_manifest_schemas_with};
 
 /// The type of plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,9 +130,16 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tools: Vec<ToolDefinition>,
 
-    /// Hook event names for hook-type plugins.
+    /// Hook declarations. For `type: "hook"` plugins this is the array
+    /// of event names (strings). Skill manifests (e.g. `skill-evolve`)
+    /// use a richer object form `{event, command, timeout_ms,
+    /// tool_filter}` that `octos-agent` re-parses through its own
+    /// `SkillHookDef` type — see `octos-agent/src/plugins/manifest.rs`.
+    /// We accept both shapes here so discovery doesn't silently drop
+    /// skills with object hooks (the failure mode that bit
+    /// `skill-evolve` prior to RFC-2).
     #[serde(default)]
-    pub hooks: Vec<String>,
+    pub hooks: Vec<serde_json::Value>,
 
     /// Requirements for gating.
     #[serde(default, alias = "requirements")]
@@ -158,10 +166,18 @@ pub struct PluginManifest {
 
 impl PluginManifest {
     /// Parse a manifest from a JSON string.
+    ///
+    /// RFC-2 (issue #1291): after structural validation, every tool's
+    /// `input_schema` is run through [`validate_manifest_schemas_with`]
+    /// using the profile selected by `OCTOS_MANIFEST_VALIDATION`
+    /// (defaults to `strict`). The schema-validation failure mode is a
+    /// composite error: every violation is reported on its own line so
+    /// authors can fix them all in a single round-trip.
     pub fn from_json(json: &str) -> Result<Self> {
         let manifest: PluginManifest =
             serde_json::from_str(json).wrap_err("failed to parse manifest JSON")?;
         manifest.validate()?;
+        manifest.validate_schemas()?;
         Ok(manifest)
     }
 
@@ -170,6 +186,7 @@ impl PluginManifest {
         let contents = std::fs::read_to_string(path)
             .wrap_err_with(|| format!("failed to read manifest at {}", path.display()))?;
         Self::from_json(&contents)
+            .wrap_err_with(|| format!("manifest validation failed for {}", path.display()))
     }
 
     /// Resolve the effective plugin type.
@@ -216,6 +233,31 @@ impl PluginManifest {
             }
         }
         Ok(())
+    }
+
+    /// RFC-2: run every tool's `input_schema` through the schema
+    /// validator using the env-driven profile. The default profile
+    /// (`strict`) catches today's mofa-slides v0.5.0 bug class. Errors
+    /// are flattened to one line per violation so the operator sees
+    /// every problem in a single round-trip.
+    fn validate_schemas(&self) -> Result<()> {
+        let profile = ValidationProfile::from_env();
+        match validate_manifest_schemas_with(self, profile) {
+            Ok(()) => Ok(()),
+            Err(errs) => {
+                let detail = errs
+                    .iter()
+                    .map(|e| format!("  - {e}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                bail!(
+                    "plugin '{}' has {} schema violation(s):\n{}\n\nSet OCTOS_MANIFEST_VALIDATION=lenient to relax the strict octos profile, or =off to disable validation entirely.",
+                    self.id,
+                    errs.len(),
+                    detail
+                );
+            }
+        }
     }
 }
 
@@ -287,6 +329,46 @@ mod tests {
         let m = PluginManifest::from_json(json).unwrap();
         assert_eq!(m.effective_type(), PluginType::Hook);
         assert_eq!(m.hooks.len(), 2);
+        // Legacy string form preserved as JSON strings.
+        assert!(m.hooks[0].is_string());
+    }
+
+    /// RFC-2: skill-evolve and similar manifests use the richer object
+    /// hook form `{event, command, timeout_ms, tool_filter}`. Discovery
+    /// must accept it without losing the structure; `octos-agent`
+    /// re-parses the value into `SkillHookDef` downstream.
+    #[test]
+    fn parse_skill_with_object_form_hooks() {
+        let json = r#"{
+            "name": "skill-evolve",
+            "version": "0.1.0",
+            "tools": [{
+                "name": "skill_evolve",
+                "description": "Manage skill evolution patches",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "apply", "discard"] }
+                    },
+                    "required": ["action"]
+                }
+            }],
+            "hooks": [{
+                "event": "after_tool_call",
+                "command": ["./main", "--hook"],
+                "timeout_ms": 30000,
+                "tool_filter": []
+            }]
+        }"#;
+        let m = PluginManifest::from_json(json).expect("skill-evolve manifest must parse");
+        assert_eq!(m.id, "skill-evolve");
+        assert_eq!(m.hooks.len(), 1);
+        // Richer object shape is preserved for the downstream re-parser.
+        assert!(m.hooks[0].is_object());
+        assert_eq!(
+            m.hooks[0].get("event").and_then(|v| v.as_str()),
+            Some("after_tool_call")
+        );
     }
 
     #[test]
@@ -310,6 +392,9 @@ mod tests {
 
     #[test]
     fn legacy_name_field_maps_to_id() {
+        // RFC-2: `input_schema` must declare `type: "object"` and a
+        // (possibly empty) `properties` map. Empty `{}` no longer
+        // passes the strict validator.
         let json = r#"{
             "name": "news",
             "version": "1.0.0",
@@ -319,7 +404,10 @@ mod tests {
                     "name": "news_fetch",
                     "description": "Fetch news",
                     "entrypoint": "target/release/news_fetch",
-                    "input_schema": {}
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {}
+                    }
                 }
             ]
         }"#;
@@ -420,5 +508,32 @@ mod tests {
         assert_eq!(m.timeout_secs, Some(15));
         assert_eq!(m.requires_network, Some(true));
         assert_eq!(m.effective_type(), PluginType::Tool);
+    }
+
+    /// RFC-2: reproduce the 2026-05-25 mofa-slides v0.5.0 incident and
+    /// confirm `from_json` rejects it with a descriptive error
+    /// pointing at the offending field. End-to-end test for the
+    /// integration between `validate_schemas` and `from_json`.
+    #[test]
+    fn rfc2_rejects_bare_anyof_branch_at_load_time() {
+        let json = r#"{
+            "id": "mofa-slides",
+            "version": "0.5.0",
+            "tools": [{
+                "name": "mofa_slides",
+                "description": "Generate slides",
+                "input_schema": {
+                    "type": "object",
+                    "anyOf": [
+                        { "required": ["slides"] },
+                        { "required": ["input"] }
+                    ]
+                }
+            }]
+        }"#;
+        let err = PluginManifest::from_json(json).expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("schema violation"), "msg = {msg}");
+        assert!(msg.contains("anyOf"), "msg = {msg}");
     }
 }

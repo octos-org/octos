@@ -9,6 +9,38 @@ use serde::{Deserialize, Serialize};
 
 use super::Executable;
 
+/// RFC-2 (issue #1291): validate a skill directory's `manifest.json`
+/// against the strict octos JSON schema validator before we commit
+/// the install to disk.
+///
+/// Behaviour
+/// ---------
+/// - If the skill has no `manifest.json`, this is a no-op (pure SKILL.md
+///   skills are not affected — they don't ship tool schemas).
+/// - If the manifest fails to parse OR fails strict schema validation,
+///   we bail with the structured violation list so the operator sees
+///   every problem at once.
+/// - Operators who need to install a known-bad manifest can set
+///   `OCTOS_MANIFEST_VALIDATION=lenient` (Draft 07 sanity only) or
+///   `=off` (skip entirely). Default is `strict`.
+fn validate_skill_manifest(skill_dir: &Path) -> Result<()> {
+    let manifest_path = skill_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    // `PluginManifest::from_file` runs both structural and schema
+    // validation, threading through `OCTOS_MANIFEST_VALIDATION` for
+    // the strict-rule layer.
+    octos_plugin::PluginManifest::from_file(&manifest_path)
+        .map(|_| ())
+        .wrap_err_with(|| {
+            format!(
+                "manifest at {} failed RFC-2 schema validation\n\nSet OCTOS_MANIFEST_VALIDATION=lenient to skip the strict octos rules, or =off to skip validation entirely.",
+                manifest_path.display()
+            )
+        })
+}
+
 // ── Public types for programmatic access ─────────────────────────────
 
 /// Information about an installed skill (for programmatic use).
@@ -349,6 +381,12 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
     std::fs::create_dir_all(skills_dir)?;
     let dest = skills_dir.join(&name);
 
+    // RFC-2: reject malformed manifests BEFORE we copy anything to
+    // disk. We only validate when we're actually going to copy: a
+    // skip path (existing install, no `--force`) preserves whatever
+    // the user already has — validating a fresh source then would
+    // surface a spurious failure for an install that we never
+    // intended to write.
     if dest.exists() && !force {
         println!(
             "  {} '{}' already exists (use --force to overwrite)",
@@ -362,6 +400,7 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
         });
     }
 
+    validate_skill_manifest(src)?;
     if dest.exists() {
         std::fs::remove_dir_all(&dest)?;
     }
@@ -900,9 +939,39 @@ fn install_via_git_result(
             .to_string_lossy()
             .to_string();
 
-        // Install the target skill/dir
+        // RFC-2 (codex follow-up, 2026-05-25): pre-flight validate
+        // the target subdir AND every auto-detected shared dep that
+        // we'll actually copy BEFORE we touch the user-visible
+        // skills dir. Skip-only paths (already installed, no
+        // `--force`) are NOT validated — a user with a working
+        // skill already in place must not be blocked just because
+        // the cloned repo's copy of that skill/dep has a malformed
+        // manifest.
         let dest = skills_dir.join(&name);
-        if dest.exists() && !force {
+        let will_copy_target = !dest.exists() || force;
+        if will_copy_target {
+            validate_skill_manifest(&src)?;
+        }
+        let shared_deps: Vec<String> = {
+            let skill_md_path = src.join("SKILL.md");
+            if skill_md_path.exists() {
+                let content = std::fs::read_to_string(&skill_md_path)?;
+                find_shared_deps(&content, &clone_dir, &name)
+            } else {
+                Vec::new()
+            }
+        };
+        // Validate only the deps the copy loop will actually touch.
+        for dep in &shared_deps {
+            let dep_dest = skills_dir.join(dep);
+            let will_copy = !dep_dest.exists() || force;
+            if will_copy {
+                validate_skill_manifest(&clone_dir.join(dep))?;
+            }
+        }
+
+        // Install the target skill/dir
+        if !will_copy_target {
             println!(
                 "  {} '{}' already exists (use --force to overwrite)",
                 "SKIP".yellow(),
@@ -921,27 +990,22 @@ fn install_via_git_result(
             }
         }
 
-        // Auto-detect shared dependencies referenced in SKILL.md
-        let skill_md_path = src.join("SKILL.md");
-        if skill_md_path.exists() {
-            let content = std::fs::read_to_string(&skill_md_path)?;
-            let shared = find_shared_deps(&content, &clone_dir, &name);
-            for dep in shared {
-                let dep_src = clone_dir.join(&dep);
-                let dep_dest = skills_dir.join(&dep);
-                if dep_dest.exists() && !force {
-                    println!(
-                        "  {} dependency '{}' already exists (use --force to overwrite)",
-                        "SKIP".yellow(),
-                        dep
-                    );
-                } else {
-                    if dep_dest.exists() {
-                        std::fs::remove_dir_all(&dep_dest)?;
-                    }
-                    copy_dir_recursive(&dep_src, &dep_dest)?;
-                    deps_installed.push(dep);
+        // Now copy every shared dep we already validated above.
+        for dep in shared_deps {
+            let dep_src = clone_dir.join(&dep);
+            let dep_dest = skills_dir.join(&dep);
+            if dep_dest.exists() && !force {
+                println!(
+                    "  {} dependency '{}' already exists (use --force to overwrite)",
+                    "SKIP".yellow(),
+                    dep
+                );
+            } else {
+                if dep_dest.exists() {
+                    std::fs::remove_dir_all(&dep_dest)?;
                 }
+                copy_dir_recursive(&dep_src, &dep_dest)?;
+                deps_installed.push(dep);
             }
         }
     } else {
@@ -949,7 +1013,13 @@ fn install_via_git_result(
         if clone_dir.join("SKILL.md").exists() {
             // Single-skill repo: install as repo_name/
             let dest = skills_dir.join(&spec.repo_name);
-            if dest.exists() && !force {
+            let will_copy = !dest.exists() || force;
+            // RFC-2: validate only when we'll actually copy — a
+            // skip path preserves the user's existing install.
+            if will_copy {
+                validate_skill_manifest(&clone_dir)?;
+            }
+            if !will_copy {
                 println!(
                     "  {} '{}' already exists (use --force to overwrite)",
                     "SKIP".yellow(),
@@ -964,7 +1034,12 @@ fn install_via_git_result(
                 installed.push(spec.repo_name.clone());
             }
         } else {
-            // Multi-skill repo: copy all top-level directories
+            // Multi-skill repo: pre-flight validate every subdir we
+            // intend to copy before touching the skills dir. Skip-
+            // only subdirs are NOT validated so a malformed sibling
+            // in the cloned repo doesn't block users whose existing
+            // installs are unrelated.
+            let mut multi_copies: Vec<(PathBuf, String)> = Vec::new();
             for entry in std::fs::read_dir(&clone_dir)? {
                 let entry = entry?;
                 if !entry.file_type()?.is_dir() {
@@ -974,23 +1049,29 @@ fn install_via_git_result(
                 if name.starts_with('.') {
                     continue;
                 }
-
                 let dest = skills_dir.join(&name);
-                if dest.exists() && !force {
+                let will_copy = !dest.exists() || force;
+                if will_copy {
+                    validate_skill_manifest(&entry.path())?;
+                    multi_copies.push((entry.path(), name));
+                } else {
                     println!(
                         "  {} '{}' already exists (use --force to overwrite)",
                         "SKIP".yellow(),
                         name
                     );
                     skipped.push(name);
-                    continue;
                 }
+            }
+            // Now actually copy the validated subdirs.
+            for (src_path, name) in multi_copies {
+                let dest = skills_dir.join(&name);
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
-                copy_dir_recursive(&entry.path(), &dest)?;
+                copy_dir_recursive(&src_path, &dest)?;
 
-                if entry.path().join("SKILL.md").exists() {
+                if src_path.join("SKILL.md").exists() {
                     installed.push(name);
                 } else {
                     deps_installed.push(name);
@@ -1887,5 +1968,149 @@ fi
         std::fs::write(skill_dir.join("main"), "#!/usr/bin/env bash\necho ok\n").unwrap();
 
         assert!(has_installed_skill_executable(&skill_dir, "mofa-fm"));
+    }
+
+    /// RFC-2 (issue #1291): a skill that ships the mofa-slides v0.5.0
+    /// `anyOf`-without-`type` shape must be rejected at install time
+    /// with a descriptive error, BEFORE we copy the skill onto disk.
+    /// The skills dir must remain unchanged after the failure.
+    #[test]
+    fn install_from_local_rejects_invalid_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bad-skill");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "# bad\n").unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{
+              "id": "bad-skill",
+              "version": "0.1.0",
+              "tools": [{
+                "name": "do_thing",
+                "description": "...",
+                "input_schema": {
+                  "type": "object",
+                  "anyOf": [
+                    { "required": ["a"] },
+                    { "required": ["b"] }
+                  ]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let skills_dir = tmp.path().join("skills");
+        let err = install_skill(
+            &skills_dir,
+            &src.to_string_lossy(),
+            /* force */ false,
+            "main",
+        )
+        .expect_err("install must reject malformed manifest");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RFC-2") || msg.contains("schema violation"),
+            "expected RFC-2 violation message, got: {msg}"
+        );
+        // Critically — skills_dir must NOT contain the bad skill.
+        assert!(
+            !skills_dir.join("bad-skill").exists(),
+            "validator must run before copy; bad-skill dir leaked"
+        );
+    }
+
+    /// RFC-2 (codex round 3, 2026-05-25): a malformed local manifest
+    /// whose destination already exists and `--force` is NOT set must
+    /// NOT block the install — the skip path preserves whatever the
+    /// user already has, so validating a (possibly bad) source we're
+    /// not going to copy would surface a spurious failure.
+    #[test]
+    fn install_from_local_skips_validation_when_dest_exists_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bad-skill");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "# bad\n").unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{
+              "id": "bad-skill",
+              "version": "0.1.0",
+              "tools": [{
+                "name": "do_thing",
+                "description": "...",
+                "input_schema": {
+                  "type": "object",
+                  "anyOf": [
+                    { "required": ["a"] },
+                    { "required": ["b"] }
+                  ]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let skills_dir = tmp.path().join("skills");
+        // Pre-populate the dest so install_skill takes the skip path.
+        let dest = skills_dir.join("bad-skill");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("SKILL.md"), "# existing\n").unwrap();
+
+        let result = install_skill(
+            &skills_dir,
+            &src.to_string_lossy(),
+            /* force */ false,
+            "main",
+        )
+        .expect("skip path must not invoke validation");
+        assert!(result.installed.is_empty());
+        assert_eq!(result.skipped, vec!["bad-skill".to_string()]);
+        // The existing install must remain intact.
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "# existing\n"
+        );
+    }
+
+    /// RFC-2: a clean, valid local skill manifest is still accepted by
+    /// the install path. Sanity test that the validator hook didn't
+    /// regress the happy path.
+    #[test]
+    fn install_from_local_accepts_valid_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("good-skill");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "# good\n").unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{
+              "id": "good-skill",
+              "version": "0.1.0",
+              "tools": [{
+                "name": "do_thing",
+                "description": "Does a thing.",
+                "input_schema": {
+                  "type": "object",
+                  "properties": {
+                    "x": { "type": "string" }
+                  },
+                  "required": ["x"]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let skills_dir = tmp.path().join("skills");
+        let result = install_skill(
+            &skills_dir,
+            &src.to_string_lossy(),
+            /* force */ false,
+            "main",
+        )
+        .expect("clean manifest must install");
+        assert_eq!(result.installed, vec!["good-skill".to_string()]);
+        assert!(skills_dir.join("good-skill").join("manifest.json").exists());
     }
 }

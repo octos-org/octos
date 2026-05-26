@@ -982,7 +982,7 @@ mod tests {
         // Write manifest
         std::fs::write(
             plugin_dir.join("manifest.json"),
-            r#"{"name": "my-plugin", "version": "1.0", "tools": [{"name": "greet", "description": "Greet someone"}]}"#,
+            r#"{"name": "my-plugin", "version": "1.0", "tools": [{"name": "greet", "description": "Greet someone", "input_schema": {"type": "object", "properties": {}}}]}"#,
         ).unwrap();
 
         // Write executable
@@ -1015,7 +1015,7 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(exec_content));
 
         let manifest = format!(
-            r#"{{"name": "hash-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d"}}]}}"#
+            r#"{{"name": "hash-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
@@ -1038,7 +1038,7 @@ mod tests {
         let plugin_dir = dir.path().join("bad-hash");
         std::fs::create_dir(&plugin_dir).unwrap();
 
-        let manifest = r#"{"name": "bad-hash", "version": "1.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "tools": [{"name": "t", "description": "d"}]}"#;
+        let manifest = r#"{"name": "bad-hash", "version": "1.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]}"#;
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
         let exec_path = plugin_dir.join("bad-hash");
@@ -1080,7 +1080,7 @@ mod tests {
         let manifest = r#"{
             "name": "unsigned-plugin",
             "version": "1.0",
-            "tools": [{"name": "t", "description": "d"}]
+            "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
         }"#;
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
@@ -1121,7 +1121,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho ok";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "signed-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d"}}]}}"#
+            r#"{{"name": "signed-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("signed-plugin");
@@ -1224,7 +1224,7 @@ mod tests {
                     "command": "/bin/echo",
                     "args": ["unauthorized"]
                 }}],
-                "tools": [{{"name": "t", "description": "d"}}]
+                "tools": [{{"name": "t", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]
             }}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
@@ -1282,7 +1282,8 @@ mod tests {
                 "tools": [{{
                     "name": "do_thing",
                     "description": "d",
-                    "spawn_only": true
+                    "spawn_only": true,
+                    "input_schema": {{"type": "object", "properties": {{}}}}
                 }}]
             }}"#
         );
@@ -1336,7 +1337,7 @@ mod tests {
                     "command": "/bin/echo",
                     "args": ["legacy-mcp"]
                 }}],
-                "tools": [{{"name": "t2", "description": "d"}}]
+                "tools": [{{"name": "t2", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]
             }}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
@@ -1401,7 +1402,7 @@ mod tests {
         let manifest = r#"{
             "name": "unsigned-legacy",
             "version": "1.0",
-            "tools": [{"name": "t", "description": "d"}]
+            "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
         }"#;
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("unsigned-legacy");
@@ -1434,7 +1435,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho original";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "swap-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "swap_tool", "description": "d"}}]}}"#
+            r#"{{"name": "swap-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "swap_tool", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("swap-plugin");
@@ -1482,7 +1483,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "manifest-swap", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "ms_tool", "description": "d"}}]}}"#
+            r#"{{"name": "manifest-swap", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "ms_tool", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), &manifest).unwrap();
         let exec_path = plugin_dir.join("manifest-swap");
@@ -1534,7 +1535,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "intact-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "intact_tool", "description": "d"}}]}}"#
+            r#"{{"name": "intact-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "intact_tool", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("intact-plugin");
@@ -1592,7 +1593,7 @@ mod tests {
         std::fs::create_dir(&plugin_dir).unwrap();
         std::fs::write(
             plugin_dir.join("manifest.json"),
-            r#"{"name": "evil-plugin", "version": "1.0", "tools": [{"name": "evil", "description": "d"}]}"#,
+            r#"{"name": "evil-plugin", "version": "1.0", "tools": [{"name": "evil", "description": "d", "input_schema": {"type": "object", "properties": {}}}]}"#,
         )
         .unwrap();
 
@@ -1641,9 +1642,9 @@ mod tests {
                     "name": "risk-plugin-first",
                     "version": "1.0",
                     "tools": [
-                        {{"name": "{declared_tool}", "description": "declared", "risk": "medium"}},
-                        {{"name": "{missing_tool}", "description": "missing first", "risk": "high"}},
-                        {{"name": "{blank_tool}", "description": "blank first", "risk": "high"}}
+                        {{"name": "{declared_tool}", "description": "declared", "risk": "medium", "input_schema": {{"type": "object", "properties": {{}}}}}},
+                        {{"name": "{missing_tool}", "description": "missing first", "risk": "high", "input_schema": {{"type": "object", "properties": {{}}}}}},
+                        {{"name": "{blank_tool}", "description": "blank first", "risk": "high", "input_schema": {{"type": "object", "properties": {{}}}}}}
                     ]
                 }}"#
             ),
@@ -1675,8 +1676,8 @@ mod tests {
                     "name": "risk-plugin-second",
                     "version": "1.0",
                     "tools": [
-                        {{"name": "{missing_tool}", "description": "missing second"}},
-                        {{"name": "{blank_tool}", "description": "blank second", "risk": "   "}}
+                        {{"name": "{missing_tool}", "description": "missing second", "input_schema": {{"type": "object", "properties": {{}}}}}},
+                        {{"name": "{blank_tool}", "description": "blank second", "risk": "   ", "input_schema": {{"type": "object", "properties": {{}}}}}}
                     ]
                 }}"#
             ),
@@ -1708,7 +1709,7 @@ mod tests {
             r#"{
   "name": "mofa-publish",
   "version": "0.1.0",
-  "tools": [{"name": "mofa_publish", "description": "deploy"}]
+  "tools": [{"name": "mofa_publish", "description": "deploy", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -1777,7 +1778,7 @@ mod tests {
             r#"{
   "name": "mofa-podcast",
   "version": "0.4.5",
-  "tools": [{"name": "podcast_generate", "description": "podcast"}]
+  "tools": [{"name": "podcast_generate", "description": "podcast", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -1812,7 +1813,7 @@ edition = "2021"
             r#"{
   "name": "mofa-publish",
   "version": "0.1.0",
-  "tools": [{"name": "mofa_publish", "description": "deploy"}]
+  "tools": [{"name": "mofa_publish", "description": "deploy", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -1857,7 +1858,7 @@ edition = "2021"
             r#"{
   "name": "perm-plugin",
   "version": "0.1.0",
-  "tools": [{"name": "perm_tool", "description": "perm"}]
+  "tools": [{"name": "perm_tool", "description": "perm", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -2021,8 +2022,8 @@ edition = "2021"
                 "name": "evil-env-plugin",
                 "version": "1.0",
                 "tools": [
-                    {"name": "good_tool", "description": "ok", "env": ["MY_VAR"]},
-                    {"name": "bad_tool", "description": "bad", "env": ["LD_PRELOAD"]}
+                    {"name": "good_tool", "description": "ok", "env": ["MY_VAR"], "input_schema": {"type": "object", "properties": {}}},
+                    {"name": "bad_tool", "description": "bad", "env": ["LD_PRELOAD"], "input_schema": {"type": "object", "properties": {}}}
                 ]
             }"#,
         )
@@ -2062,7 +2063,7 @@ edition = "2021"
             r#"{
                 "name": "eq-plugin",
                 "version": "1.0",
-                "tools": [{"name": "bad", "description": "d", "env": ["FOO=bar"]}]
+                "tools": [{"name": "bad", "description": "d", "env": ["FOO=bar"], "input_schema": {"type": "object", "properties": {}}}]
             }"#,
         )
         .unwrap();
@@ -2093,7 +2094,8 @@ edition = "2021"
                 format!(
                     r#"{{"name": "shared-skill", "version": "1.0",
                           "tools": [{{"name": "shared_tool",
-                                     "description": "from-{marker}"}}]}}"#
+                                     "description": "from-{marker}",
+                                     "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
                 ),
             )
             .unwrap();

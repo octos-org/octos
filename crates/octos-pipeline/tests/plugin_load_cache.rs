@@ -74,7 +74,11 @@ fn create_stub_plugin(plugins_root: &Path, name: &str) -> PathBuf {
             "sha256": "{hash}",
             "tools": [{{
                 "name": "{tool_name}",
-                "description": "stub tool from plugin {name}"
+                "description": "stub tool from plugin {name}",
+                "input_schema": {{
+                    "type": "object",
+                    "properties": {{}}
+                }}
             }}]
         }}"#,
         tool_name = name.replace('-', "_"),
