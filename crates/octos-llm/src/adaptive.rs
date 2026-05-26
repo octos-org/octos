@@ -1786,8 +1786,24 @@ impl AdaptiveRouter {
         }
         let mut matched: Vec<usize> = Vec::new();
         for (want_provider, want_model) in &candidates {
+            // Codex P2 follow-up #2: when a profile override
+            // specifies a tagged candidate like `moonshot@autodl`,
+            // honor the tag with an exact match so operators can
+            // pin to a specific endpoint. Untagged candidates
+            // (built-in defaults, plain family names) match against
+            // the normalized slot label so endpoint-tagged slots
+            // still light up. The decision is per-candidate, not
+            // per-slot: a tagged candidate only matches a tagged
+            // slot with the exact same label.
+            let want_is_tagged = want_provider.contains('@');
             for (i, slot) in self.slots.iter().enumerate() {
-                if normalized_provider_name(slot.provider.provider_name()) == want_provider.as_str()
+                let slot_name = slot.provider.provider_name();
+                let provider_matches = if want_is_tagged {
+                    slot_name == want_provider.as_str()
+                } else {
+                    normalized_provider_name(slot_name) == want_provider.as_str()
+                };
+                if provider_matches
                     && slot.provider.model_id() == want_model
                     && !matched.contains(&i)
                 {
@@ -4661,6 +4677,54 @@ mod tests {
         // Should pick the tagged wisemodel slot, not the
         // out-of-lane openrouter slot.
         assert_eq!(resp.content.as_deref(), Some("from-wisemodel@autodl"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_tagged_candidate_in_override_matches_only_tagged_slot() {
+        // Codex P2 follow-up #2: a profile override that names an
+        // endpoint-tagged label (e.g. `moonshot@autodl`) MUST pin to
+        // exactly that slot — the untagged `moonshot` slot or a
+        // differently-tagged `moonshot@other` slot should NOT
+        // satisfy the override.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "k2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "moonshot@autodl",
+                    model: "k2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let mut cfg = crate::LaneRoutingConfig::default();
+        cfg.topic_lanes
+            .insert("loop".to_string(), crate::Lane::CodeCapable);
+        cfg.lane_models.insert(
+            crate::Lane::CodeCapable,
+            vec![("moonshot@autodl".to_string(), "k2".to_string())],
+        );
+        let ctx = crate::LaneContext::for_topic(Some("loop:test"), Some(&cfg));
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Tagged candidate MUST pick the tagged slot, not the
+        // untagged primary.
+        assert_eq!(resp.content.as_deref(), Some("from-moonshot@autodl"));
     }
 
     #[tokio::test]
