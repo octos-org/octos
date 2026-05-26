@@ -306,6 +306,19 @@ pub struct ProfileRuntime {
     /// loop. `None` keeps the legacy behaviour when no hooks are
     /// configured (the agent's default `hooks: None` field).
     pub hook_executor: Option<Arc<HookExecutor>>,
+
+    /// RFC-3 (#1292) — per-topic model lane routing config (overrides
+    /// only; built-in defaults always apply on top of this).
+    ///
+    /// When `Some`, the session-actor and the WS turn handler use this
+    /// to resolve `session.topic()` to a [`octos_llm::Lane`] and pass
+    /// it to the chat call via [`octos_llm::with_lane_context`]. When
+    /// `None`, the built-in defaults from `octos_llm::lane` still apply
+    /// for the well-known prefixes (slides / site / podcast / research
+    /// / code); profiles that haven't opted into RFC-3 see no behavior
+    /// change because the [`octos_llm::AdaptiveRouter`] silently falls
+    /// through when zero candidates match.
+    pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
 }
 
 /// Which OS process is calling [`ProfileRuntime::bootstrap`].
@@ -957,6 +970,7 @@ impl ProfileRuntime {
             cron_service: Some(cron_service),
             pipeline_factory,
             hook_executor,
+            lane_routing: profile.config.lane_routing.clone(),
         }))
     }
 }

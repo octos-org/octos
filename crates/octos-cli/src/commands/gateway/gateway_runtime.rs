@@ -1218,6 +1218,13 @@ impl GatewayRuntime {
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
             adaptive_router: adaptive_router_ref,
+            // RFC-3 (#1292): no UserProfile in scope here (CLI-only
+            // `octos gateway` entry point — see the inline-assembly
+            // branch above for the "no profile" path); use built-in
+            // defaults. The per-profile path through
+            // `ProfileFactory::create_actor_factory_for_profile`
+            // threads the profile's `lane_routing` field.
+            lane_routing: None,
             memory_store: Some(memory_store.clone()),
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),

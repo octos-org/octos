@@ -15,6 +15,7 @@ pub mod credential_pool;
 pub mod embedding;
 mod failover;
 mod fallback;
+pub mod lane;
 pub mod pricing;
 mod provider;
 pub mod responsiveness;
@@ -65,6 +66,10 @@ pub use error::{LlmError, LlmErrorKind};
 pub use failover::ProviderChain;
 pub use fallback::FallbackProvider;
 pub use high_level::LlmClient;
+pub use lane::{
+    LANE_CONTEXT, Lane, LaneContext, LaneRoutingConfig, current_lane_context,
+    default_lane_candidates, resolve_lane_for_topic, topic_prefix, with_lane_context,
+};
 pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{

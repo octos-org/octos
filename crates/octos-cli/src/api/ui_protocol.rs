@@ -16015,6 +16015,19 @@ async fn run_standalone_turn(
         session_id: Some(session_id.0.clone()),
         turn_id: Some(turn_id.0.to_string()),
     };
+    // RFC-3 (#1292): resolve the session's topic to a capability lane
+    // and stamp it onto a task-local so the AdaptiveRouter narrows
+    // candidate-selection to the lane's `(provider, model)` list. The
+    // gateway/SessionActor side does the same — both turn paths need
+    // identical plumbing for slides/code/research topics to land on
+    // the right model regardless of which transport opened the
+    // session. Built-in defaults apply when the profile has no
+    // `lane_routing` block, so fleet profiles see no behavior change
+    // unless they opt in via config.
+    let lane_ctx = octos_llm::LaneContext::for_topic(
+        session_id.topic(),
+        session_runtime.profile.lane_routing.as_ref(),
+    );
     // Wave-4c (#945): feed turn-end latency into the AdaptiveRouter's
     // per-session auto-escalation state machine so the web/serve path
     // benefits from the same Lane → Hedge auto-flip the gateway has had
@@ -16042,11 +16055,20 @@ async fn run_standalone_turn(
     let (final_reply_tx, final_reply_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
+        // RFC-3 (#1292): wrap the agent.process_message future in the
+        // lane scope FIRST (innermost task-local), then router
+        // context, so the AdaptiveRouter sees both when chat()
+        // recurses through the agent loop. Lane and router contexts
+        // are orthogonal — lane filters slot eligibility, router
+        // context attributes failover events.
         let result = octos_llm::with_router_context(
             router_ctx,
-            octos_agent::tools::TOOL_APPROVAL_CTX.scope(
-                approval_requester,
-                request_agent.process_message(&prompt, &history, turn_media_paths),
+            octos_llm::with_lane_context(
+                lane_ctx,
+                octos_agent::tools::TOOL_APPROVAL_CTX.scope(
+                    approval_requester,
+                    request_agent.process_message(&prompt, &history, turn_media_paths),
+                ),
             ),
         )
         .await;
@@ -30454,6 +30476,7 @@ ignore = []
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
+            lane_routing: None,
         })
     }
 

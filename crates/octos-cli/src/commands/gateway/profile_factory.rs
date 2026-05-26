@@ -917,6 +917,11 @@ impl ProfileActorFactoryBuilder {
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
             adaptive_router,
+            // RFC-3 (#1292): thread per-profile topic→lane overrides
+            // through to the ActorFactory so the SessionActor's
+            // agent_task spawn can build the lane context off
+            // `profile.config.lane_routing`. None = built-in defaults.
+            lane_routing: effective_profile.config.lane_routing.clone(),
             memory_store: Some(self.memory_store.clone()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
