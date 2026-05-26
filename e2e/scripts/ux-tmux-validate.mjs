@@ -1188,6 +1188,21 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
   if (!report.ok) {
     problems.push(`backpressure-report.json is not parseable JSON: ${report.error}`);
   } else {
+    const coverage = report.value.coverage;
+    const hasTrueTerminalDropCoverage =
+      coverage === 'true-dropped-turn-completed'
+      || coverage === 'forced-turn-completed-drop'
+      || (
+        isPlainObject(coverage)
+        && (
+          coverage.true_dropped_turn_completed === true
+          || coverage.terminal_drop_forced === true
+          || coverage.writer_channel_turn_completed_drop === true
+        )
+      );
+    if (!hasTrueTerminalDropCoverage) {
+      problems.push('backpressure report must prove true dropped turn/completed writer-channel coverage; fixture-only protocol/replay_lossy recovery is not sufficient');
+    }
     const droppedCount = Number(report.value.replay_lossy?.dropped_count);
     if (!Number.isFinite(droppedCount) || droppedCount <= 0) {
       problems.push(`backpressure report replay_lossy.dropped_count must be > 0, got ${report.value.replay_lossy?.dropped_count ?? '<missing>'}`);
@@ -1230,7 +1245,7 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
     'dropped_completion_backpressure_contract',
     problems.length === 0,
     problems.length === 0
-      ? 'fixture-backed protocol/replay_lossy recovery is visible, terminal, and snapshot-backed'
+      ? 'true dropped turn/completed backpressure coverage is visible, terminal, and snapshot-backed'
       : `dropped-completion/backpressure contract problems: ${problems.join('; ')}`,
     [
       'tui-capture-replay-lossy.txt',
