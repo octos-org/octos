@@ -99,11 +99,22 @@ const OUT_ROOT = path.resolve(__dirname, '..', 'test-results-round12-slides');
 // Round-14 retest finding: pptx artefacts can land on disk 9-15 minutes
 // after the `generate` reply, but the spec was timing out at ~10min and
 // reporting "P0-A not closed" even when SSH proved the file existed.
-// Bumping the per-phase budget to 20 minutes and the test cap to 22 min
-// so the spec's measurement no longer races skill completion. The SSH
-// disk-check below provides a safety net for any residual races.
+// Per-phase budgets are bumped so the spec's measurement no longer races
+// skill completion. The SSH disk-check below provides a safety net for
+// any residual races.
+//
+// Total budget math (codex review fix): SLIDE_BUDGET_MS is the cap for
+// EACH of `generate` (1x) + optional `go` (1x) + the post-confirm
+// SLIDES_DEADLINE_MS poll loop. Worst case is roughly:
+//   60s init + 90s design + 20min generate + 30s early-hit poll
+//   + 20min optional `go` + 20min post-confirm wait + screenshot/SSH
+// We size TEST_TIMEOUT_MS to cover the realistic worst case where
+// `generate` AND the post-confirm loop both ride out the full 20min,
+// without exploding the 22min cap-the-old-spec-was-using too far. In
+// practice round-14 generate completed in 9-15min, so 50min cap is
+// 3x headroom but won't ride out idle.
 const SLIDE_BUDGET_MS = 20 * 60 * 1000; // 20-min generate-phase wait
-const TEST_TIMEOUT_MS = 22 * 60 * 1000;
+const TEST_TIMEOUT_MS = 50 * 60 * 1000; // hard cap, ~3x p99 generate
 const SLIDES_DEADLINE_MS = 20 * 60 * 1000; // post-confirm DOM/WS wait
 
 const PROFILE = process.env.OCTOS_PROFILE || 'dspfac';
@@ -365,12 +376,21 @@ interface DiskCheckResult {
  *   - ~/.octos/profiles/<profile>/data/users/  (per-user workspace root)
  *   - newer than the session-start marker
  *   - *.pptx
- *   - optionally filter to paths that mention the session_id slug
+ *   - filter to paths that mention deckSlug and/or session-id slug
  *
  * The session_id captured from WS frames usually looks like
  * `web-1779765683811-5ko0o5#slides r14-deck-bot-mpm2jbdm`; the disk
  * directory uses the encoded form, so we extract the short slug after
  * `#slides ` if present, which is what shows up in the file path.
+ *
+ * Codex P2 fix: previously we joined `deckSlug|<session-id-slug>` with a
+ * `|`, but when `cap.sessionId` was empty the trailing pipe produced an
+ * empty alternative — which grep matches against every line. That would
+ * have made the disk-check pass on any unrelated .pptx left over from a
+ * concurrent or prior run on the host. Now we only join non-empty
+ * patterns. If we have NO patterns at all (very early failure with no
+ * deckSlug), we don't pipe through grep — we just take the raw `find`
+ * output and let the per-line filter below catch only real .pptx.
  */
 function diskCheckPptx(
   trial: HostTrial,
@@ -379,16 +399,24 @@ function diskCheckPptx(
 ): DiskCheckResult {
   const marker = markerPath(trial.short);
   const profileRoot = `~/.octos/profiles/${PROFILE}/data/users`;
-  // Use `-newer` to scope to files dropped AFTER our session-start
-  // marker. Allow either deckSlug match OR session-id-slug match in the
-  // path — disk layout differs slightly across hosts and we want the
-  // disk-check to be robust to encoding.
+  // Sanitize the patterns: keep only alnum and dashes, replace other
+  // characters with `.` so they match-any in BRE. Empty patterns get
+  // dropped, NOT joined.
+  const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9-]/g, '.');
   const slug = (cap.sessionId || '').split('#').pop() || '';
+  const patterns = [sanitize(deckSlug), sanitize(slug)].filter(
+    (p) => p.length > 0,
+  );
+  const baseFind = `find ${profileRoot} -name '*.pptx' -newer ${marker} 2>/dev/null`;
+  // If we have patterns, filter via grep; if not, fall back to the raw
+  // find (the spec's session marker already restricts it to files
+  // dropped AFTER our session started, so this isn't unbounded). The
+  // `|| true` suffix keeps grep's no-match exit-1 from breaking the
+  // SSH command — see `man grep -c "exit status"`.
   const findCmd =
-    `find ${profileRoot} -name '*.pptx' -newer ${marker} 2>/dev/null | ` +
-    `grep -E '${deckSlug.replace(/[^a-zA-Z0-9-]/g, '.')}|${slug
-      .replace(/[^a-zA-Z0-9 -]/g, '.')
-      .replace(/ /g, '.')}' || true`;
+    patterns.length > 0
+      ? `${baseFind} | grep -E '${patterns.join('|')}' || true`
+      : `${baseFind} || true`;
   const r = runSsh(trial.sshHost, findCmd, 20_000);
   if (!r.ok) {
     return { pptxOnDisk: null, diskPaths: [], diskErr: r.err, marker };
