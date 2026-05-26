@@ -164,6 +164,19 @@ pub(super) fn emit_file_attached(
 /// and do not propagate. Callers MUST run this after the persist /
 /// `turn/spawn_complete` block so the placement context (turn_id,
 /// session_id) is stable. No-op when both source lists are empty.
+///
+/// **P0-A wire-gap (2026-05-26):** the helper strips any `#<topic>`
+/// suffix from the incoming `session_id` before publishing each
+/// envelope onto the ledger. The SPA subscribes only to the BASE
+/// SessionKey via `session/open`; `handle_turn_start` folds the topic
+/// into `params.session_id` but never re-subscribes. Result: every
+/// `file_attached` event published on a topic-suffixed broadcast
+/// bucket fans out to zero subscribers. Publishing on the base key
+/// keeps the live subscribers (and replay) receiving the envelope.
+///
+/// The SPA dedupes by `tool_call_id` client-side, so the loss of
+/// topic info on the wire has no UX cost — see the rationale in
+/// 35a68cb9 (the topic-scope-filter exemption companion fix).
 pub(super) fn emit_files_attached_from_background(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -173,6 +186,10 @@ pub(super) fn emit_files_attached_from_background(
     tool_call_id: Option<String>,
 ) {
     use std::collections::BTreeSet;
+    // P0-A wire-gap fix: publish on the base SessionKey (no `#<topic>`
+    // suffix). The SPA's `session/open` subscription is keyed on the
+    // base form; topic-suffixed broadcasts reach zero live subscribers.
+    let base_session = SessionKey(session_id.base_key().to_owned());
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for path in media.iter().chain(envelope_media.iter()) {
         if path.is_empty() {
@@ -184,7 +201,7 @@ pub(super) fn emit_files_attached_from_background(
         let mime = mime_from_path(path);
         emit_file_attached(
             ledger,
-            session_id,
+            &base_session,
             turn_id,
             path.clone(),
             tool_call_id.clone(),
@@ -1052,5 +1069,167 @@ mod tests {
             None,
             "files without extension fall back to None"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P0-A REAL fix — wire-gap regression coverage (2026-05-26).
+    //
+    // Deep-trace found that `emit_files_attached_from_background` was
+    // publishing each `file/attached` envelope onto a topic-suffixed
+    // SessionKey broadcast bucket (e.g. `web-x#slides`). The SPA's
+    // `session/open` subscription is keyed only on the base SessionKey;
+    // `handle_turn_start` folds the topic into `params.session_id` but
+    // never re-subscribes. Every published frame therefore reached zero
+    // live subscribers (fleet evidence: bot mini2 session
+    // web-1779812289419-27ht74, seq=92 file/attached landed on
+    // `web-…#slides` bucket with zero subscribers).
+    //
+    // The fix strips the topic at the emit site so the envelope lands
+    // on the base bucket where the SPA actually listens. The companion
+    // 35a68cb9 topic-scope-filter exemption is correct on its own but
+    // wasn't the load-bearing fix because there were no subscribers to
+    // filter at all.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// P0-A unit invariant — when the caller passes a topic-suffixed
+    /// session key, every `file/attached` envelope must publish on the
+    /// BASE (no-topic) SessionKey so the SPA's session/open
+    /// subscription actually receives it.
+    #[test]
+    fn emit_files_attached_from_background_publishes_on_base_session_key_not_topic_suffix() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        // Caller-side key is topic-suffixed (mirrors what
+        // `handle_turn_start` produces after folding `params.topic` into
+        // `params.session_id`).
+        let topic_session = SessionKey::with_topic("api", "p0a-base-key", "slides");
+        let base_session = SessionKey::new("api", "p0a-base-key");
+        let turn_id = TurnId::new();
+
+        // Subscribe on the BASE key (this is what the SPA does via
+        // `session/open` — see ui_protocol.rs:7479).
+        let mut base_subscriber = ledger.subscribe(&base_session);
+        // Subscribe on the topic-suffixed key too, so we can prove the
+        // envelope is NOT being published there (pre-fix behaviour).
+        let mut topic_subscriber = ledger.subscribe(&topic_session);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &topic_session,
+            &turn_id,
+            &["/tmp/deck.pptx".to_string()],
+            &[],
+            Some("tc-p0a".into()),
+        );
+
+        // Base subscriber MUST receive the frame.
+        let event = base_subscriber
+            .try_recv()
+            .expect("base SessionKey subscriber must receive file/attached");
+        match &event.event {
+            crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                UiNotification::FileAttached(payload),
+            ) => {
+                assert_eq!(
+                    payload.session_id, base_session,
+                    "embedded session_id must be the base form (no topic suffix)",
+                );
+                assert_eq!(payload.path, "/tmp/deck.pptx");
+            }
+            other => panic!("expected FileAttached, got {other:?}"),
+        }
+
+        // Topic-suffixed subscriber MUST NOT receive the frame — that's
+        // the bucket that was previously fanning out to zero subscribers
+        // in production.
+        assert!(
+            topic_subscriber.try_recv().is_err(),
+            "topic-suffixed broadcast bucket must NOT receive the envelope; \
+             publishing there is the bug — the SPA never subscribes to it",
+        );
+    }
+
+    /// P0-A integration — a subscriber that opened on the base
+    /// SessionKey (the SPA's actual session/open shape) receives a
+    /// `file/attached` envelope emitted by a spawn_only completion whose
+    /// `session_id` carries the topic suffix. Pre-fix this dropped the
+    /// frame on the floor.
+    #[test]
+    fn base_session_subscriber_receives_file_attached_when_emit_carries_topic_suffix() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let base_session = SessionKey::new("api", "p0a-integration");
+        // Spawn_only completion's session_id carries the topic
+        // (production shape after handle_turn_start folds params.topic).
+        let topic_session = SessionKey::with_topic("api", "p0a-integration", "slides");
+        let turn_id = TurnId::new();
+
+        let mut subscriber = ledger.subscribe(&base_session);
+
+        // Production shape: `mofa_slides` Satisfied path with one PPTX
+        // artefact, emitted onto a topic-suffixed session_id.
+        let deck = "/Users/cloud/.octos/profiles/dspfac/data/slides/p0a/output/deck.pptx";
+        emit_files_attached_from_background(
+            &ledger,
+            &topic_session,
+            &turn_id,
+            &[deck.to_string()],
+            &[],
+            Some("tc-p0a-integration".into()),
+        );
+
+        let event = subscriber.try_recv().expect(
+            "base SessionKey subscriber must receive file/attached \
+                     even when the emit site carries a topic-suffixed session_id",
+        );
+        let rpc = event
+            .event
+            .clone()
+            .into_rpc_notification()
+            .expect("serializes");
+        assert_eq!(rpc.method, methods::FILE_ATTACHED);
+        if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+            UiNotification::FileAttached(payload),
+        ) = &event.event
+        {
+            assert_eq!(payload.path, deck);
+            // Embedded session_id is also rewritten to the base form so
+            // the wire shape is internally consistent (clients keying
+            // off `event.session_id` see the bare form, matching the
+            // bucket the frame actually rode).
+            assert_eq!(payload.session_id, base_session);
+        } else {
+            panic!("expected FileAttached, got {:?}", event.event);
+        }
+    }
+
+    /// P0-A defensive — when the emit site already passes the BASE
+    /// SessionKey (no topic suffix), behaviour is identical to pre-fix.
+    /// Pins that the strip is idempotent and doesn't accidentally regress
+    /// the bare-session case the existing helper tests cover.
+    #[test]
+    fn emit_files_attached_from_background_idempotent_for_base_session_input() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let base_session = SessionKey::new("api", "p0a-idempotent");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&base_session);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &base_session,
+            &turn_id,
+            &["/tmp/report.md".to_string()],
+            &[],
+            None,
+        );
+
+        let event = subscriber.try_recv().expect("base subscriber receives");
+        if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+            UiNotification::FileAttached(payload),
+        ) = &event.event
+        {
+            assert_eq!(payload.session_id, base_session);
+            assert_eq!(payload.path, "/tmp/report.md");
+        } else {
+            panic!("expected FileAttached");
+        }
     }
 }
