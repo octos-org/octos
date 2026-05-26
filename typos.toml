@@ -47,6 +47,9 @@ abd = "abd"
 # "string"). Allowlist the misspelling so the typos lint doesn't flag the
 # negative-test JSON literal.
 strng = "strng"
+# Basic Regular Expression — referenced in slides validator spec comments
+# explaining the regex escape behavior for find -name patterns.
+BRE = "BRE"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]
