@@ -1764,6 +1764,16 @@ impl AdaptiveRouter {
     /// compat anchor — profiles that don't carry a topic resolve to
     /// `General`, get `None` back, and never observe a behavior
     /// change.
+    ///
+    /// **Codex P2 follow-up:** `provider_name()` for OpenAI-compatible
+    /// providers (DeepSeek / Moonshot / Wisemodel via
+    /// `OpenAIProvider::with_base_url`) is endpoint-tagged as
+    /// `name@endpoint` (e.g. `moonshot@autodl`). Lane defaults and
+    /// profile config use untagged family identifiers, so the
+    /// comparison normalizes via [`normalized_provider_name`] which
+    /// strips any `@suffix` before matching. Without this
+    /// normalization, `code:*` against a Wisemodel-backed profile
+    /// would produce zero matches and silently fall through.
     fn lane_filtered_slot_indices(&self) -> Option<Vec<usize>> {
         let ctx = crate::lane::current_lane_context();
         let lane = ctx.lane?;
@@ -1777,7 +1787,7 @@ impl AdaptiveRouter {
         let mut matched: Vec<usize> = Vec::new();
         for (want_provider, want_model) in &candidates {
             for (i, slot) in self.slots.iter().enumerate() {
-                if slot.provider.provider_name() == want_provider
+                if normalized_provider_name(slot.provider.provider_name()) == want_provider.as_str()
                     && slot.provider.model_id() == want_model
                     && !matched.contains(&i)
                 {
@@ -1925,13 +1935,21 @@ impl AdaptiveRouter {
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let best_idx = scored[0].0;
 
-        // Probe: with some probability, redirect to a stale non-primary provider
+        // Probe: with some probability, redirect to a stale non-primary provider.
+        // RFC-3 (#1292) — codex P2: when a lane filter is active,
+        // restrict probe targets to the lane's eligible slots so a
+        // probe under `slides:*`/`code:*` can never route the user
+        // turn to an out-of-lane model.
         if self.slots.len() > 1 && self.should_probe() {
             // Find a stale provider that isn't the best
             for (i, slot) in self.slots.iter().enumerate() {
                 if i != best_idx
                     && slot.metrics.is_stale(self.config.probe_interval_secs)
                     && !slot.metrics.is_circuit_open(self.config.failure_threshold)
+                    && match lane_eligible {
+                        Some(ref eligible) => eligible.contains(&i),
+                        None => true,
+                    }
                 {
                     debug!(
                         probe_provider = slot.provider.provider_name(),
@@ -1987,15 +2005,32 @@ impl AdaptiveRouter {
         // Pick the cheapest alternate provider for hedging. When cost data is
         // available, always hedge with the lowest-cost provider. Falls back to
         // score-based selection when no cost data exists.
+        //
+        // RFC-3 (#1292) — codex P2: when a lane filter is active,
+        // confine hedge alternates to the lane's eligible slots so a
+        // race under `slides:*`/`code:*` can't be won by an
+        // out-of-lane model. When the filter excludes every
+        // alternate, the hedge skips (`None` return) and the caller
+        // falls back to the single-provider path against the
+        // primary — preserving lane integrity at the cost of
+        // hedging on that turn.
         let primary_name = self.slots[primary_idx].provider.provider_name();
+        let lane_eligible = self.lane_filtered_slot_indices();
         let candidates: Vec<(usize, &AdaptiveSlot)> = self
             .slots
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                *i != primary_idx
-                    && s.provider.provider_name() != primary_name
-                    && !s.metrics.is_circuit_open(self.config.failure_threshold)
+                if *i == primary_idx
+                    || s.provider.provider_name() == primary_name
+                    || s.metrics.is_circuit_open(self.config.failure_threshold)
+                {
+                    return false;
+                }
+                match lane_eligible {
+                    Some(ref eligible) => eligible.contains(i),
+                    None => true,
+                }
             })
             .collect();
         let alternate_idx = {
@@ -2417,6 +2452,20 @@ impl LlmProvider for AdaptiveRouter {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Normalize a `provider_name()` for RFC-3 (#1292) lane matching.
+///
+/// `OpenAIProvider::with_base_url` tags the provider label with the
+/// endpoint suffix when a non-canonical base URL is in play
+/// (`moonshot@autodl`, `deepseek@api`, etc. — see
+/// `openai.rs:with_base_url`). Lane defaults and profile config use
+/// untagged family identifiers (`moonshot`, `deepseek`,
+/// `wisemodel`), so this helper strips the `@suffix` before
+/// comparison. Anthropic / Gemini / native OpenAI return their bare
+/// name and pass through unchanged.
+fn normalized_provider_name(name: &str) -> &str {
+    name.split_once('@').map(|(p, _)| p).unwrap_or(name)
+}
 
 /// Build the score-ordered failover candidate list for a router after
 /// the primary slot has errored. RFC-3 (#1292) preference: when
@@ -4566,5 +4615,105 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-primary"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_normalizes_endpoint_tagged_provider_names() {
+        // Codex P2 follow-up: profiles using OpenAI-compatible
+        // providers carry endpoint-tagged labels (e.g.
+        // `wisemodel@autodl`). The lane filter normalizes by
+        // stripping the `@suffix` before matching against lane
+        // candidate strings.
+        let router = AdaptiveRouter::new(
+            vec![
+                // Out-of-lane (untagged).
+                Arc::new(MockProvider {
+                    name: "openrouter",
+                    model: "gpt-4o-mini",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                // In-lane after `@` strip: `wisemodel@autodl` →
+                // `wisemodel` matches the FastChat default.
+                Arc::new(MockProvider {
+                    name: "wisemodel@autodl",
+                    model: "kimi-k2.6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let mut cfg = crate::LaneRoutingConfig::default();
+        cfg.topic_lanes.insert("loop".into(), crate::Lane::FastChat);
+        let ctx = crate::LaneContext::for_topic(Some("loop:t"), Some(&cfg));
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Should pick the tagged wisemodel slot, not the
+        // out-of-lane openrouter slot.
+        assert_eq!(resp.content.as_deref(), Some("from-wisemodel@autodl"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_hedge_confines_alternate_to_lane_when_filter_active() {
+        // Codex P2 follow-up: under `AdaptiveMode::Hedge`, the
+        // alternate hedge target must be in-lane. Build a chain
+        // where the lane candidate is a SLOW out-of-priority slot
+        // and a non-lane slot is fast: without the fix, hedge would
+        // race the fast non-lane slot and return its content; with
+        // the fix, hedge skips when no in-lane alternate is healthy
+        // and the single-provider path runs against the primary.
+        //
+        // Topology:
+        //   slot 0 primary = `anthropic / claude-sonnet-4-6` (in lane, fast)
+        //   slot 1 alt     = `openrouter / out-of-lane` (fast, NOT in lane)
+        // Expectation: hedge candidate set is empty (the only
+        // out-of-lane slot is filtered out), so hedge falls through
+        // and the response comes from the primary.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "openrouter",
+                    model: "out-of-lane",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        let ctx = crate::LaneContext::for_topic(Some("slides:demo"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Lane filter excludes openrouter from the hedge alternate
+        // set, so the only hedge candidate is none → fall through
+        // to single-provider path against the primary (anthropic
+        // is in-lane).
+        assert_eq!(resp.content.as_deref(), Some("from-anthropic"));
     }
 }
