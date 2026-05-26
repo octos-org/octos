@@ -18521,11 +18521,17 @@ fn appui_evidence_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+static APPUI_EVIDENCE_JSONL_APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn append_appui_evidence_jsonl(name: &str, value: Value) {
     let Some(dir) = appui_evidence_dir() else {
         return;
     };
-    if let Err(error) = std::fs::create_dir_all(&dir) {
+    append_appui_evidence_jsonl_at(&dir, name, value);
+}
+
+fn append_appui_evidence_jsonl_at(dir: &Path, name: &str, value: Value) {
+    if let Err(error) = std::fs::create_dir_all(dir) {
         tracing::debug!(%error, "failed to create AppUI evidence directory");
         return;
     }
@@ -18537,13 +18543,24 @@ fn append_appui_evidence_jsonl(name: &str, value: Value) {
             return;
         }
     };
+    let mut line = line.into_bytes();
+    line.push(b'\n');
+    let _append_guard = APPUI_EVIDENCE_JSONL_APPEND_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::debug!(%error, "failed to create AppUI evidence parent directory");
+            return;
+        }
+    }
     if let Err(error) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .and_then(|mut file| {
             use std::io::Write;
-            writeln!(file, "{line}")
+            file.write_all(&line)
         })
     {
         tracing::debug!(%error, "failed to append AppUI evidence");
@@ -19265,6 +19282,41 @@ mod tests {
             .iter()
             .map(String::as_str)
             .collect()
+    }
+
+    #[test]
+    fn appui_evidence_jsonl_append_keeps_concurrent_rows_parseable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appui-transcript.jsonl");
+        let thread_count = 12;
+        let rows_per_thread = 40;
+
+        std::thread::scope(|scope| {
+            for worker in 0..thread_count {
+                let dir = dir.path().to_path_buf();
+                scope.spawn(move || {
+                    for row in 0..rows_per_thread {
+                        append_appui_evidence_jsonl_at(
+                            &dir,
+                            "appui-transcript.jsonl",
+                            json!({
+                                "worker": worker,
+                                "row": row,
+                                "payload": "x".repeat(512),
+                            }),
+                        );
+                    }
+                });
+            }
+        });
+
+        let contents = std::fs::read_to_string(path).expect("jsonl contents");
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), thread_count * rows_per_thread);
+        for (index, line) in lines.iter().enumerate() {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("line {index} is malformed JSONL: {error}: {line}"));
+        }
     }
 
     fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
