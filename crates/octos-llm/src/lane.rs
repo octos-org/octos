@@ -82,10 +82,26 @@ impl Lane {
 /// `InstructionStrong`, `CodeCapable`, and `FastChat` carry opinionated
 /// lists. `General` returns an empty vec on purpose — its semantics are
 /// "no filter; use the profile-default chain".
+///
+/// # Production fleet coverage (RFC-3 follow-up)
+///
+/// The dspfac fleet (mini1/3/5) runs `moonshot` + `deepseek` providers
+/// — NOT `wisemodel`. The 2026-05-25 round-14 retest confirmed the
+/// `provider_name == candidate_provider` filter found zero matches and
+/// fell through to the per-profile primary (`deepseek-v4-pro`), which
+/// doesn't follow long structured prompts strongly enough to invoke
+/// `mofa_slides`. Production providers are now pinned into each
+/// opinionated lane so RFC-3 is no longer inert on the live fleet.
+/// `wisemodel` entries are kept for backward compatibility with
+/// non-fleet profiles. Order: `anthropic` first (premium user pick),
+/// then production providers (fleet match), then legacy compat.
 pub fn default_lane_candidates(lane: Lane) -> Vec<(String, String)> {
     let pairs: &[(&str, &str)] = match lane {
         Lane::InstructionStrong => &[
             ("anthropic", "claude-sonnet-4-6"),
+            // Production fleet primary lane for instruction-following.
+            ("moonshot", "kimi-k2.5"),
+            // Legacy compat: non-fleet profiles routing via wisemodel.
             ("wisemodel", "kimi-k2.5"),
             ("openai", "gpt-4.1"),
         ],
@@ -93,9 +109,14 @@ pub fn default_lane_candidates(lane: Lane) -> Vec<(String, String)> {
             ("anthropic", "claude-sonnet-4-6"),
             ("openai", "gpt-4.1"),
             ("deepseek", "deepseek-coder"),
+            // Production fleet fallback: k2.5 is decent at code too.
+            ("moonshot", "kimi-k2.5"),
         ],
         Lane::General => &[],
         Lane::FastChat => &[
+            // Production fleet primary for short-turn chat.
+            ("moonshot", "kimi-k2.6"),
+            // Legacy compat: non-fleet profiles routing via wisemodel.
             ("wisemodel", "kimi-k2.6"),
             ("deepseek", "deepseek-chat"),
             ("openai", "gpt-4o-mini"),
@@ -450,6 +471,110 @@ mod tests {
 
         // General is intentionally empty (no filter).
         assert!(default_lane_candidates(Lane::General).is_empty());
+    }
+
+    // ── Production fleet coverage (RFC-3 follow-up) ─────────────────
+    //
+    // The dspfac fleet (mini1/3/5) runs `moonshot` + `deepseek` providers
+    // — not `wisemodel`. The 2026-05-25 round-14 retest confirmed the
+    // lane filter found zero matches and fell through to the per-profile
+    // primary (deepseek-v4-pro), which doesn't follow long structured
+    // prompts strongly enough to invoke `mofa_slides`. These tests pin
+    // the production providers into the built-in defaults so RFC-3 is
+    // no longer inert on the live fleet.
+
+    #[test]
+    fn instruction_strong_default_includes_moonshot_kimi_k25() {
+        let strong = default_lane_candidates(Lane::InstructionStrong);
+        assert!(
+            strong
+                .iter()
+                .any(|(p, m)| p == "moonshot" && m == "kimi-k2.5"),
+            "moonshot/kimi-k2.5 must appear in InstructionStrong defaults \
+             so dspfac fleet sessions match the lane filter; current list: {:?}",
+            strong,
+        );
+    }
+
+    #[test]
+    fn instruction_strong_filter_matches_dspfac_fleet_shape() {
+        // Simulate the dspfac fleet's slot list (primary + fallback).
+        // The 2026-05-25 round-14 retest observed exactly this shape on
+        // mini1 — primary `deepseek-v4-pro`, fallback `moonshot/kimi-k2.6`
+        // — and the lane filter returned zero matches against the old
+        // `[anthropic, wisemodel, openai]` defaults.
+        let fleet_slots: Vec<(&str, &str)> = vec![
+            ("deepseek", "deepseek-v4-pro"),
+            ("moonshot", "kimi-k2.6"),
+            ("moonshot", "kimi-k2.5"),
+        ];
+        let defaults = default_lane_candidates(Lane::InstructionStrong);
+        let matched: Vec<_> = fleet_slots
+            .iter()
+            .filter(|(p, m)| defaults.iter().any(|(dp, dm)| dp == p && dm == m))
+            .collect();
+        assert!(
+            !matched.is_empty(),
+            "InstructionStrong filter found zero matches against fleet \
+             slots — RFC-3 still inert. defaults={:?} slots={:?}",
+            defaults,
+            fleet_slots,
+        );
+    }
+
+    #[test]
+    fn fast_chat_default_includes_moonshot_kimi_k26() {
+        let fast = default_lane_candidates(Lane::FastChat);
+        assert!(
+            fast.iter()
+                .any(|(p, m)| p == "moonshot" && m == "kimi-k2.6"),
+            "moonshot/kimi-k2.6 must appear in FastChat defaults so dspfac \
+             fleet primary matches the lane filter; current list: {:?}",
+            fast,
+        );
+    }
+
+    #[test]
+    fn code_capable_default_includes_moonshot_for_fleet_fallback() {
+        // The fleet's secondary slot is k2.5 on moonshot. Including it
+        // in CodeCapable keeps `code:*` sessions on a known-good model
+        // when the LLM picks deepseek-coder isn't available.
+        let code = default_lane_candidates(Lane::CodeCapable);
+        assert!(
+            code.iter()
+                .any(|(p, m)| p == "moonshot" && m == "kimi-k2.5"),
+            "moonshot/kimi-k2.5 must appear in CodeCapable defaults; \
+             current list: {:?}",
+            code,
+        );
+    }
+
+    #[test]
+    fn fast_chat_keeps_wisemodel_for_backward_compat() {
+        // Compat sanity: wisemodel/kimi-k2.6 must remain so non-fleet
+        // profiles already routing through wisemodel still match.
+        let fast = default_lane_candidates(Lane::FastChat);
+        assert!(
+            fast.iter()
+                .any(|(p, m)| p == "wisemodel" && m == "kimi-k2.6"),
+            "wisemodel/kimi-k2.6 must remain in FastChat defaults for \
+             backward compatibility; current list: {:?}",
+            fast,
+        );
+    }
+
+    #[test]
+    fn instruction_strong_keeps_anthropic_at_front() {
+        // Per task spec: anthropic stays at index 0 because users
+        // routinely route claude-sonnet for `slides:*` and friends.
+        let strong = default_lane_candidates(Lane::InstructionStrong);
+        assert_eq!(
+            strong.first().map(|(p, m)| (p.as_str(), m.as_str())),
+            Some(("anthropic", "claude-sonnet-4-6")),
+            "anthropic/claude-sonnet-4-6 must remain at the front of \
+             InstructionStrong defaults; current list: {:?}",
+            strong,
+        );
     }
 
     // ── LaneContext shape ───────────────────────────────────────────
