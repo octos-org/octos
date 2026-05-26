@@ -103,19 +103,23 @@ const OUT_ROOT = path.resolve(__dirname, '..', 'test-results-round12-slides');
 // skill completion. The SSH disk-check below provides a safety net for
 // any residual races.
 //
-// Total budget math (codex review fix): SLIDE_BUDGET_MS is the cap for
-// EACH of `generate` (1x) + optional `go` (1x) + the post-confirm
-// SLIDES_DEADLINE_MS poll loop. Worst case is roughly:
+// Total budget math (codex review 2x fix): SLIDE_BUDGET_MS is the cap
+// for EACH of `generate` (1x) + optional `go` (1x) + the post-confirm
+// SLIDES_DEADLINE_MS poll loop. Worst-case path is:
 //   60s init + 90s design + 20min generate + 30s early-hit poll
-//   + 20min optional `go` + 20min post-confirm wait + screenshot/SSH
-// We size TEST_TIMEOUT_MS to cover the realistic worst case where
-// `generate` AND the post-confirm loop both ride out the full 20min,
-// without exploding the 22min cap-the-old-spec-was-using too far. In
-// practice round-14 generate completed in 9-15min, so 50min cap is
-// 3x headroom but won't ride out idle.
+//   + 20min optional `go` + 20min post-confirm wait
+//   + ~10s screenshot/SSH disk-check/writeResult tail
+// = ~61.5 min. In practice `go` rarely fires AND if it does, it's the
+// same "generate" work just with extra latency from the round-trip;
+// we never bill BOTH for 20min. But Playwright doesn't know that, so
+// we size TEST_TIMEOUT_MS for the formal worst case (75min) — the
+// only cost is a longer leash on a hung test, which we'd want to
+// debug anyway. The disk-check + writeResult MUST be guaranteed to
+// run, since proving "pptx on disk" is the whole point of this
+// patch.
 const SLIDE_BUDGET_MS = 20 * 60 * 1000; // 20-min generate-phase wait
-const TEST_TIMEOUT_MS = 50 * 60 * 1000; // hard cap, ~3x p99 generate
 const SLIDES_DEADLINE_MS = 20 * 60 * 1000; // post-confirm DOM/WS wait
+const TEST_TIMEOUT_MS = 75 * 60 * 1000; // hard cap for the whole test
 
 const PROFILE = process.env.OCTOS_PROFILE || 'dspfac';
 
