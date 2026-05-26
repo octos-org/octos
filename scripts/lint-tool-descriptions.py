@@ -39,7 +39,12 @@ CONTENT_NOUNS: dict[str, tuple[str, ...]] = {
         "landing page",
         "landing pages",
     ),
-    "video": ("video", "videos", "youtube", "short", "shorts"),
+    # `short`/`shorts` intentionally excluded — too commonly used as the
+    # adjective "a short clip" / "the short summary" to safely flag without
+    # qualifying context. mofa-youtube currently does not advertise "Shorts"
+    # support, so dropping these aliases eliminates a false-positive class
+    # (see harness-starter-audio "a short WAV clip").
+    "video": ("video", "videos", "youtube"),
     "podcast": ("podcast", "podcasts"),
     "cards": ("card", "cards"),
     "comic": ("comic", "comics"),
