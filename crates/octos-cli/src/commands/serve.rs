@@ -713,6 +713,9 @@ impl ServeCommand {
             // invalidates every grant (see
             // `crate::api::preview_tokens` for the design rationale).
             preview_tokens,
+            work_secret_store: Arc::new(
+                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&data_dir),
+            ),
             // Issue #1009: owning sweeper handle. `Drop` aborts the
             // tokio task when the last `Arc<AppState>` is released,
             // replacing the previous `_preview_sweeper` local that

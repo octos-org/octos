@@ -117,6 +117,7 @@ use crate::context_manager::{
     CompactContextPolicy, ContextCompactionRecord, ContextManager, ForkPolicy, PromptBuildPolicy,
     PromptFrame, load_or_rebuild_context_manager, persist_context_manager_snapshot,
 };
+use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
@@ -3813,24 +3814,102 @@ pub async fn ws_handler(
         ui_protocol_connection(
             socket,
             state,
-            connection_profile_id,
-            routed_profile_id,
-            features,
-            headers,
-            auth_identity,
+            UiProtocolConnectionOptions {
+                connection_profile_id,
+                routed_profile_id,
+                features,
+                headers,
+                identity: auth_identity,
+                session_ingress_scope: None,
+            },
         )
     })
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionIngressScope {
+    session_id: SessionKey,
+    token: String,
+}
+
+/// Upgrade a work-secret authenticated socket into the UI Protocol dispatcher.
+///
+/// The route that calls this function has already validated the token for
+/// `session_id`. The dispatcher revalidates on every client frame and applies
+/// a session-scope gate before executing any RPC.
+pub(crate) async fn ws_handler_for_session_ingress(
+    state: Arc<AppState>,
+    session_id: SessionKey,
+    profile_id: Option<String>,
+    token: String,
+    headers: HeaderMap,
+    uri: Uri,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), true) {
+        WsOriginDecision::Allow => {}
+        WsOriginDecision::RejectDisallowed { origin } => {
+            tracing::warn!(
+                target: "octos::ui_protocol::session_ingress",
+                origin = %origin,
+                "rejected session ingress WS upgrade from disallowed Origin"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "disallowed origin").into_response();
+        }
+        WsOriginDecision::RejectMalformed => {
+            return (axum::http::StatusCode::FORBIDDEN, "invalid origin").into_response();
+        }
+    }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let connection_profile_id =
+        profile_id.or_else(|| session_id.profile_id().map(ToOwned::to_owned));
+    let auth_identity = connection_profile_id.clone().map(|id| AuthIdentity::User {
+        id,
+        role: UserRole::User,
+    });
+    let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
+    let scope = SessionIngressScope { session_id, token };
+    ws.on_upgrade(move |socket| {
+        ui_protocol_connection(
+            socket,
+            state,
+            UiProtocolConnectionOptions {
+                connection_profile_id,
+                routed_profile_id: None,
+                features,
+                headers,
+                identity: auth_identity,
+                session_ingress_scope: Some(scope),
+            },
+        )
+    })
+}
+
+struct UiProtocolConnectionOptions {
+    connection_profile_id: Option<String>,
+    routed_profile_id: Option<String>,
+    features: ConnectionUiFeatures,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    session_ingress_scope: Option<SessionIngressScope>,
 }
 
 async fn ui_protocol_connection(
     socket: WebSocket,
     state: Arc<AppState>,
-    connection_profile_id: Option<String>,
-    routed_profile_id: Option<String>,
-    mut features: ConnectionUiFeatures,
-    connection_headers: HeaderMap,
-    connection_identity: Option<AuthIdentity>,
+    options: UiProtocolConnectionOptions,
 ) {
+    let UiProtocolConnectionOptions {
+        connection_profile_id,
+        routed_profile_id,
+        mut features,
+        headers: connection_headers,
+        identity: connection_identity,
+        session_ingress_scope,
+    } = options;
     let (ws_sink, mut ws_rx) = socket.split();
     // Decouple the network sink from request handlers via a bounded channel
     // and a dedicated drainer task. No handler ever holds a lock across an
@@ -3951,6 +4030,16 @@ async fn ui_protocol_connection(
             WsMessage::Ping(_) => continue,
             _ => continue,
         };
+        if let Some(scope) = session_ingress_scope.as_ref() {
+            if state
+                .work_secret_store
+                .validate(&scope.session_id.0, &scope.token)
+                .is_err()
+            {
+                let _ = close_ws_with_code(&ws, 1008, "session_ingress_revoked");
+                break;
+            }
+        }
 
         let request = match parse_ws_text_frame(text.as_str()) {
             Ok(ParsedFrame::Request(request)) => request,
@@ -4010,6 +4099,13 @@ async fn ui_protocol_connection(
                 continue;
             }
         };
+        if let Some(scope) = session_ingress_scope.as_ref() {
+            if let Err(error) = validate_session_ingress_command_scope(&command, &scope.session_id)
+            {
+                let _ = send_rpc_error(&ws, Some(id), error);
+                continue;
+            }
+        }
 
         match command {
             UiCommand::ProfileLocalCreate(params) => {
@@ -8045,6 +8141,84 @@ fn route_rpc_command(
         }
     }
     UiCommand::from_rpc_request(request)
+}
+
+fn string_session_with_optional_topic(session_id: &str, topic: Option<&str>) -> SessionKey {
+    session_key_with_optional_topic(&SessionKey(session_id.to_owned()), topic)
+}
+
+fn validate_session_ingress_command_scope(
+    command: &UiCommand,
+    allowed_session_id: &SessionKey,
+) -> Result<(), RpcError> {
+    let actual = match command {
+        UiCommand::ProfileLocalCreate(_)
+        | UiCommand::SessionList(_)
+        | UiCommand::SystemStatusGet(_)
+        | UiCommand::ContentList(_)
+        | UiCommand::ContentDelete(_)
+        | UiCommand::ContentBulkDelete(_) => {
+            return Err(RpcError::invalid_request(
+                "session ingress credentials may only call session-scoped methods",
+            ));
+        }
+        UiCommand::SessionOpen(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::TurnStart(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::TurnInterrupt(params) => params.session_id.clone(),
+        UiCommand::ApprovalRespond(params) => params.session_id.clone(),
+        UiCommand::UserQuestionRespond(params) => params.session_id.clone(),
+        UiCommand::ApprovalScopesList(params) => params.session_id.clone(),
+        UiCommand::PermissionProfileList(params) => params.session_id.clone(),
+        UiCommand::PermissionProfileSet(params) => params.session_id.clone(),
+        UiCommand::DiffPreviewGet(params) => params.session_id.clone(),
+        UiCommand::TaskList(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::TaskCancel(params) => params.session_id.clone().ok_or_else(|| {
+            RpcError::invalid_params(
+                "session ingress task/cancel requires params.session_id to enforce scope",
+            )
+        })?,
+        UiCommand::TaskRestartFromNode(params) => params.session_id.clone().ok_or_else(|| {
+            RpcError::invalid_params(
+                "session ingress task/restart_from_node requires params.session_id to enforce scope",
+            )
+        })?,
+        UiCommand::TaskOutputRead(params) => params.session_id.clone(),
+        UiCommand::TaskArtifactList(params) => params.session_id.clone(),
+        UiCommand::TaskArtifactRead(params) => params.session_id.clone(),
+        UiCommand::SessionHydrate(params) => params.session_id.clone(),
+        UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
+        UiCommand::TurnStateGet(params) => params.session_id.clone(),
+        UiCommand::SessionSnapshot(params) => {
+            string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::SessionMessagesPage(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionStatusGet(params) => {
+            string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::SessionFilesList(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionTasksList(params) => {
+            string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::SessionWorkspaceGet(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionTitleSet(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionDelete(params) => SessionKey(params.session_id.clone()),
+        UiCommand::RouterSetMode(params) => params.session_id.clone(),
+        UiCommand::RouterGetMetrics(params) => params.session_id.clone(),
+    };
+
+    if actual == *allowed_session_id {
+        Ok(())
+    } else {
+        Err(RpcError::invalid_request(
+            "session ingress credential is scoped to a different session",
+        ))
+    }
 }
 
 fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
@@ -30780,6 +30954,38 @@ ignore = []
                 "{method} must reject with METHOD_NOT_SUPPORTED even with no header",
             );
         }
+    }
+
+    #[test]
+    fn session_ingress_scope_accepts_matching_topic_folded_turn() {
+        let allowed = SessionKey("dspfac:local:tui#coding".into());
+        let command = UiCommand::TurnStart(TurnStartParams {
+            session_id: SessionKey("dspfac:local:tui".into()),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "hello".into(),
+            }],
+            media: Vec::new(),
+            topic: Some("coding".into()),
+            rewrite_for: None,
+        });
+        validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
+    }
+
+    #[test]
+    fn session_ingress_scope_rejects_global_methods_and_mismatched_sessions() {
+        let allowed = SessionKey("dspfac:local:tui".into());
+        let global = UiCommand::SystemStatusGet(SystemStatusGetParams {});
+        assert!(validate_session_ingress_command_scope(&global, &allowed).is_err());
+
+        let mismatched = UiCommand::SessionOpen(SessionOpenParams {
+            session_id: SessionKey("other:local:tui".into()),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            after: None,
+        });
+        assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
     }
 
     /// Codex review 2026-05-12 (BLOCK 1, companion): the legacy

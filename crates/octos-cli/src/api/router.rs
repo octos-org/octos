@@ -20,6 +20,7 @@ use super::frps_plugin;
 use super::handlers;
 use super::metrics;
 use super::purge;
+use super::session_ingress;
 use super::solo_auth;
 use super::static_files;
 use super::swarm as swarm_api;
@@ -675,6 +676,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/preview-signed/{token}/{*path}",
             get(handlers::serve_signed_preview),
+        )
+        .route(
+            "/v1/session_ingress/ws/{session_id}",
+            get(session_ingress::ws_handler),
         )
         .merge(webhook_routes)
         .merge(version_routes)

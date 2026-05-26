@@ -24,6 +24,7 @@ pub mod preview;
 pub mod preview_tokens;
 pub mod purge;
 mod router;
+pub(crate) mod session_ingress;
 pub(crate) mod solo_auth;
 pub(crate) mod specialist_runner;
 mod static_files;
@@ -314,6 +315,13 @@ pub struct AppState {
     /// invalidates every outstanding grant. See
     /// [`crate::api::preview_tokens`] for full design rationale.
     pub preview_tokens: SharedPreviewTokens,
+    /// Persistent session-ingress grant store for external CLI agents.
+    ///
+    /// `octos auth issue-work-secret` writes short-lived grants here and
+    /// `/v1/session_ingress/ws/{session_id}` revalidates the token on
+    /// every frame, so revocation applies to already-open sockets without
+    /// requiring a daemon restart.
+    pub work_secret_store: Arc<octos_agent::bridge::work_secret::WorkSecretGrantStore>,
     /// Owning handle to the background sweeper task spawned for
     /// `preview_tokens` (issue #1009). Storing it here ties the
     /// task's lifetime to `AppState`: when the last `Arc<AppState>` is
@@ -380,6 +388,9 @@ impl AppState {
             task_query_store: None,
             appui_default_session_cwd: None,
             preview_tokens: Arc::new(PreviewTokens::new()),
+            work_secret_store: Arc::new(
+                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&tmp),
+            ),
             // Tests don't spawn the sweeper. Tests that exercise the
             // sweeper either drive `sweep_expired_all` directly or
             // build their own `PreviewSweeperHandle::spawn(...)`.

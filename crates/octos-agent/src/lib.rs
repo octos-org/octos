@@ -13,6 +13,7 @@ pub mod agents;
 pub mod approval;
 pub mod behaviour;
 pub mod bootstrap;
+pub mod bridge;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 pub mod bundled_pipelines;
