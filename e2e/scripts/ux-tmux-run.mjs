@@ -137,7 +137,7 @@ const scenarios = new Map([
       runner: 'dropped-completion-backpressure',
       finalMarker: 'M19_DROPPED_COMPLETION_FINAL_LINE',
       prompt:
-        'M9 replay-lossy fixture for M18 reconnect-style replay. This covers protocol/replay_lossy recovery, not a forced dropped turn/completed send failure.',
+        'M9 replay-lossy fixture with forced dropped turn/completed writer-channel backpressure. Drive the forced terminal drop and recover through replay.',
     },
   ],
   [
@@ -831,7 +831,8 @@ function runBackpressureReplayProbe(ctx, env) {
       OCTOS_M19_BACKPRESSURE_PROFILE_ID: ctx.profileId,
       OCTOS_M19_BACKPRESSURE_SESSION_ID: ctx.sessionId,
       OCTOS_M19_BACKPRESSURE_WORKSPACE: ctx.workdir,
-      OCTOS_M19_BACKPRESSURE_PROMPT: ctx.scenario.prompt,
+      OCTOS_M19_BACKPRESSURE_PROMPT:
+        'M9 replay-lossy fixture for post-drop protocol probe after TUI recovery.',
     },
     stdio: 'inherit',
   });
@@ -903,6 +904,18 @@ function runDroppedCompletionBackpressureScenario(ctx, action, env) {
   if (drive.error) throw drive.error;
   if (drive.status !== 0) status = drive.status || 1;
   captureTmuxPane(ctx.sessionName, path.join(ctx.scenarioDir, 'tui-capture-backpressure-final.txt'));
+  if (status === 0) {
+    const recovery = action('send-turn', true, {
+      OCTOS_TUI_SOAK_PROMPT: 'After forced terminal-drop recovery, reply with exactly OK.',
+      OCTOS_TUI_SOAK_TURN_WAIT_SECS: process.env.OCTOS_TUI_SOAK_BACKPRESSURE_RECOVERY_WAIT_SECS || '8',
+    });
+    if (recovery.error) throw recovery.error;
+    if (recovery.status !== 0) status = recovery.status || 1;
+    captureTmuxPane(
+      ctx.sessionName,
+      path.join(ctx.scenarioDir, 'tui-capture-backpressure-post-recovery.txt'),
+    );
+  }
   if (status === 0) status = runBackpressureReplayProbe(ctx, env);
   return status;
 }

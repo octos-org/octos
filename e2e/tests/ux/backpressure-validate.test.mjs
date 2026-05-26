@@ -49,7 +49,7 @@ function artifactSummary(dir, names) {
   return Object.fromEntries(names.map((name) => [name, { path: join(dir, name), exists: true, bytes: 1 }]));
 }
 
-function appuiRows() {
+function appuiRows({ terminal = 'legacy' } = {}) {
   const methods = [
     'config/capabilities/list',
     'profile/local/create',
@@ -65,14 +65,28 @@ function appuiRows() {
     rows.push({ direction: 'client_to_server', frame: { jsonrpc: '2.0', id, method, params: {} } });
     rows.push({ direction: 'server_to_client', frame: { jsonrpc: '2.0', id, result: { ok: true } } });
   });
-  rows.push({
-    direction: 'server_to_client',
-    frame: { jsonrpc: '2.0', method: 'turn/completed', params: { session_id: 'ux-backpressure-session' } },
-  });
+  if (terminal === 'envelope') {
+    rows.push({
+      direction: 'server_to_client',
+      frame: {
+        jsonrpc: '2.0',
+        method: 'projection/envelope',
+        params: {
+          thread_id: 'ux-backpressure-turn',
+          payload: { type: 'turn_completed', data: { token_usage: {} } },
+        },
+      },
+    });
+  } else {
+    rows.push({
+      direction: 'server_to_client',
+      frame: { jsonrpc: '2.0', method: 'turn/completed', params: { session_id: 'ux-backpressure-session' } },
+    });
+  }
   return rows;
 }
 
-function makeArtifactDir({ trueDropCoverage }) {
+function makeArtifactDir({ trueDropCoverage, terminal = 'legacy' }) {
   const dir = mkdtempSync(join(tmpdir(), 'octos-backpressure-validate-'));
   mkdirSync(dir, { recursive: true });
 
@@ -94,6 +108,7 @@ function makeArtifactDir({ trueDropCoverage }) {
       ...requiredArtifacts,
       'tui-capture-replay-lossy.txt',
       'tui-capture-backpressure-final.txt',
+      'tui-capture-backpressure-post-recovery.txt',
       'notification-log.jsonl',
       'backpressure-report.json',
       'websocket-transcript.jsonl',
@@ -101,10 +116,21 @@ function makeArtifactDir({ trueDropCoverage }) {
   });
   writeFileSync(join(dir, 'launch-command.txt'), 'octos-tui --mode protocol\n', 'utf8');
   writeFileSync(join(dir, 'input-replay.log'), 'line trigger backpressure\n', 'utf8');
-  writeFileSync(join(dir, 'server.log'), 'server completed without lifecycle drop text\n', 'utf8');
+  writeFileSync(
+    join(dir, 'server.log'),
+    trueDropCoverage
+      ? [
+        'forced turn/completed writer channel full fixture; aborting connection',
+        'lifecycle notification not delivered; entry remains in ledger as delivery_failed',
+        'writer channel full for lifecycle frame turn/completed',
+      ].join('\n')
+      : 'server completed without lifecycle drop text\n',
+    'utf8',
+  );
   writeFileSync(join(dir, 'tui-capture.txt'), 'Chat ready\nComposer\n state Idle\n', 'utf8');
   writeFileSync(join(dir, 'tui-capture-replay-lossy.txt'), 'Replay lossy: dropped durable notifications\nComposer\n state Idle\n', 'utf8');
   writeFileSync(join(dir, 'tui-capture-backpressure-final.txt'), 'Recovered after backpressure\nComposer\n state Idle\n', 'utf8');
+  writeFileSync(join(dir, 'tui-capture-backpressure-post-recovery.txt'), 'OK\nDone\nComposer\n state Idle\n', 'utf8');
   writeJson(join(dir, 'terminal-size.json'), {
     schema: 'octos.ux.terminal_size.v1',
     cols: 100,
@@ -114,7 +140,7 @@ function makeArtifactDir({ trueDropCoverage }) {
     schema: 'octos.ux.runtime_policy_stamp.v1',
     stamp: {},
   });
-  writeJsonl(join(dir, 'appui-transcript.jsonl'), appuiRows());
+  writeJsonl(join(dir, 'appui-transcript.jsonl'), appuiRows({ terminal }));
   writeJsonl(join(dir, 'notification-log.jsonl'), [
     {
       direction: 'server_to_client',
@@ -140,7 +166,21 @@ function makeArtifactDir({ trueDropCoverage }) {
       : 'fixture-backed protocol/replay_lossy recovery; does not force a real dropped turn/completed writer-channel failure',
     session_id: 'ux-backpressure-session',
     replay_lossy: { dropped_count: 1 },
-    terminal: { method: 'turn/completed', params: {} },
+    terminal: terminal === 'envelope'
+      ? {
+        method: 'projection/envelope',
+        legacy_equivalent: 'turn/completed',
+        payload_type: 'turn_completed',
+        thread_id: 'ux-backpressure-turn',
+        params: {
+          thread_id: 'ux-backpressure-turn',
+          payload: { type: 'turn_completed', data: { token_usage: {} } },
+        },
+      }
+      : { method: 'turn/completed', params: {} },
+    forced_terminal_drop: {
+      server_log_detected: trueDropCoverage,
+    },
     snapshot: { session_id: 'ux-backpressure-session' },
   });
   return dir;
@@ -171,6 +211,17 @@ test('fixture-only replay-lossy report does not satisfy dropped-completion contr
 
 test('true terminal-drop coverage marker satisfies dropped-completion contract', () => {
   const dir = makeArtifactDir({ trueDropCoverage: true });
+  const out = runValidator(dir);
+  const validation = JSON.parse(out);
+  const check = validation.checks.find((entry) => entry.id === 'dropped_completion_backpressure_contract');
+  assert.equal(validation.status, 'passed');
+  assert.equal(check.status, 'passed');
+  assert.match(check.detail, /true dropped turn\/completed backpressure coverage/);
+});
+
+
+test('projection envelope terminal coverage satisfies dropped-completion contract', () => {
+  const dir = makeArtifactDir({ trueDropCoverage: true, terminal: 'envelope' });
   const out = runValidator(dir);
   const validation = JSON.parse(out);
   const check = validation.checks.find((entry) => entry.id === 'dropped_completion_backpressure_contract');

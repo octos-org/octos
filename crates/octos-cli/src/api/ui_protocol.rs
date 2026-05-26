@@ -920,6 +920,7 @@ enum M9ProtocolFixture {
     ToolEvents,
     Approval,
     ReplayLossy,
+    ReplayLossyForcedTerminalDrop,
     TaskOutput,
     M14CodexP0ToolParity,
     M15LiveSubagents,
@@ -950,6 +951,13 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
         || prompt_lower.contains("#969")
     {
         Some(M9ProtocolFixture::M14CodexP0ToolParity)
+    } else if (prompt_lower.contains("m9 replay-lossy fixture")
+        || prompt_lower.contains("replay-lossy"))
+        && (prompt_lower.contains("forced dropped turn/completed")
+            || prompt_lower.contains("force true dropped turn/completed")
+            || prompt_lower.contains("forced terminal drop"))
+    {
+        Some(M9ProtocolFixture::ReplayLossyForcedTerminalDrop)
     } else if prompt_lower.contains("m9 replay-lossy fixture")
         || prompt_lower.contains("replay-lossy")
     {
@@ -14476,15 +14484,15 @@ async fn run_m9_fixture_turn(
                 }
             }
         }
-        M9ProtocolFixture::ReplayLossy => {
+        M9ProtocolFixture::ReplayLossy | M9ProtocolFixture::ReplayLossyForcedTerminalDrop => {
             ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
             emit_replay_lossy_opportunistic(&ws, &ledger, &session_id.0);
-            if m9_fixture_delay_or_interrupt(
-                &mut interrupt_rx,
-                std::time::Duration::from_millis(20),
-            )
-            .await
-            {
+            let delay = if matches!(fixture, M9ProtocolFixture::ReplayLossyForcedTerminalDrop) {
+                std::time::Duration::from_millis(250)
+            } else {
+                std::time::Duration::from_millis(20)
+            };
+            if m9_fixture_delay_or_interrupt(&mut interrupt_rx, delay).await {
                 M9FixtureOutcome::Interrupted
             } else {
                 M9FixtureOutcome::Completed
@@ -14598,18 +14606,29 @@ async fn run_m9_fixture_turn(
 
     match outcome {
         M9FixtureOutcome::Completed => {
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Completed,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                None,
-                // M9 fixtures replay canned events; no live LLM token data.
-                None,
-            )
-            .await;
+            if matches!(fixture, M9ProtocolFixture::ReplayLossyForcedTerminalDrop) {
+                try_emit_completed_terminal_with_forced_backpressure(
+                    &turn_state,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                )
+                .await;
+            } else {
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Completed,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    None,
+                    // M9 fixtures replay canned events; no live LLM token data.
+                    None,
+                )
+                .await;
+            }
         }
         M9FixtureOutcome::Errored { code, message } => {
             try_emit_terminal(
@@ -19896,6 +19915,38 @@ fn emit_envelope_for_legacy_notification(
     let _ = ledger.emit_envelope(session_id, thread_id, payload, client_message_id);
 }
 
+async fn try_emit_completed_terminal_with_forced_backpressure(
+    turn_state: &TokioMutex<TurnState>,
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) {
+    let Some(TerminalTransition { ack, .. }) =
+        transition_to_terminal(turn_state, TerminalReason::Completed).await
+    else {
+        return;
+    };
+
+    let _ = send_notification_lifecycle_forced_backpressure_fixture(
+        ws,
+        ledger,
+        UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+        }),
+    );
+
+    if let Some(ack) = ack {
+        let _ = ack.send(());
+    }
+}
+
 /// Dispatch a single non-terminal progress JSON value out to the WS / ledger.
 ///
 /// Extracted from `run_standalone_turn` so the spawn_only post-terminal drain
@@ -22167,6 +22218,38 @@ fn send_notification_lifecycle(
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_lifecycle_forced_backpressure_fixture(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let event = ledger.append_notification_from(notification, ws.connection_id);
+    let method = ledger_event_method(&event.event).to_string();
+    let _frame = frame_from_ledger(event.event)
+        .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
+    metrics::counter!("ws.send.error.lifecycle").increment(1);
+    ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        method = %method,
+        reason = "forced_backpressure",
+        "forced turn/completed writer channel full fixture; aborting connection"
+    );
+    eprintln!("forced turn/completed writer channel full fixture; aborting connection: {method}");
+    ws.mark_failed();
+    let reason = "writer channel full for lifecycle frame turn/completed";
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        method = %method,
+        reason = %reason,
+        "lifecycle notification not delivered; entry remains in ledger as delivery_failed"
+    );
+    eprintln!(
+        "lifecycle notification not delivered; entry remains in ledger as delivery_failed: {reason}"
+    );
+    Err(SendError::LifecycleFailure(reason.into()))
 }
 
 fn send_notification_durable(
@@ -33074,6 +33157,53 @@ ignore = []
         // silently dropped).
         let second = send_rpc_result(&ws, "2".into(), json!({"ok": true}));
         assert!(matches!(second, Err(SendError::LifecycleFailure(_))));
+    }
+
+    #[tokio::test]
+    async fn forced_backpressure_fixture_ledgers_terminal_and_latches_failed() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+
+        let result = send_notification_lifecycle_forced_backpressure_fixture(
+            &ws,
+            &ledger,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            }),
+        );
+
+        assert!(matches!(result, Err(SendError::LifecycleFailure(_))));
+        assert!(
+            ws.is_failed(),
+            "forced lifecycle backpressure must close the socket"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "forced lifecycle backpressure should not live-send the terminal frame"
+        );
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay after start cursor");
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(event))
+                if event.turn_id == turn_id
+        )));
     }
 
     #[tokio::test]

@@ -144,6 +144,36 @@ function isAcceptableJsonRpcError(frame) {
   return [...ACCEPTABLE_IDEMPOTENT_ERROR_CODES].some((known) => message.includes(known));
 }
 
+function reportProvesForcedTerminalDrop(report) {
+  if (!report.ok) return false;
+  const coverage = report.value.coverage;
+  const hasTrueTerminalDropCoverage =
+    coverage === 'true-dropped-turn-completed'
+    || coverage === 'forced-turn-completed-drop'
+    || (
+      isPlainObject(coverage)
+      && (
+        coverage.true_dropped_turn_completed === true
+        || coverage.terminal_drop_forced === true
+        || coverage.writer_channel_turn_completed_drop === true
+      )
+    );
+  return hasTrueTerminalDropCoverage
+    && report.value.forced_terminal_drop?.server_log_detected === true;
+}
+
+function reportTerminalProvesCompletion(value) {
+  const terminal = value?.terminal;
+  if (!isPlainObject(terminal)) return false;
+  if (terminal.method === 'turn/completed') return true;
+  return terminal.method === 'projection/envelope'
+    && terminal.legacy_equivalent === 'turn/completed'
+    && (
+      terminal.payload_type === 'turn_completed'
+      || terminal.params?.payload?.type === 'turn_completed'
+    );
+}
+
 function artifactPath(artifactDir, name) {
   return path.join(artifactDir, name);
 }
@@ -598,6 +628,10 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     : ['tui-capture.txt'];
   if (!captureNames.includes('tui-capture.txt')) captureNames.unshift('tui-capture.txt');
   const serverLog = readText(artifactPath(artifactDir, 'server.log'));
+  const report = readJson(artifactPath(artifactDir, 'backpressure-report.json'));
+  const expectedForcedTerminalDrop =
+    scenarioId === 'dropped-completion-backpressure'
+    && reportProvesForcedTerminalDrop(report);
   const problems = [];
   let mainCaptureText = '';
   for (const captureName of captureNames) {
@@ -629,7 +663,7 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     problems.push(`server.log could not be read: ${serverLog.error}`);
   } else {
     const serverDrop = lineMatches(serverLog.text, SERVER_DROPPED_TURN_PATTERN);
-    if (serverDrop) {
+    if (serverDrop && !expectedForcedTerminalDrop) {
       problems.push(`server_dropped_turn_completed at line ${serverDrop.line}: server log contains dropped turn/completed lifecycle evidence`);
     }
     if (mainCaptureText && CAPTURE_STUCK_RUNNING_PATTERN.test(mainCaptureText) && serverDrop) {
@@ -1159,6 +1193,7 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
 
   const replayCapture = readText(artifactPath(artifactDir, 'tui-capture-replay-lossy.txt'));
   const finalCapture = readText(artifactPath(artifactDir, 'tui-capture-backpressure-final.txt'));
+  const postRecoveryCapture = readText(artifactPath(artifactDir, 'tui-capture-backpressure-post-recovery.txt'));
   const report = readJson(artifactPath(artifactDir, 'backpressure-report.json'));
   const parsedNotifications = parseJsonl(artifactPath(artifactDir, 'notification-log.jsonl'));
   const parsedWs = parseJsonl(artifactPath(artifactDir, 'websocket-transcript.jsonl'));
@@ -1185,6 +1220,16 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
   } else if (CAPTURE_STUCK_RUNNING_PATTERN.test(finalCapture.text)) {
     problems.push('final backpressure capture still shows a running task state');
   }
+  if (!postRecoveryCapture.ok) {
+    problems.push(`tui-capture-backpressure-post-recovery.txt could not be read: ${postRecoveryCapture.error}`);
+  } else {
+    if (CAPTURE_STUCK_RUNNING_PATTERN.test(postRecoveryCapture.text)) {
+      problems.push('post-recovery backpressure capture still shows a running task state');
+    }
+    if (!/\bOK\b/.test(postRecoveryCapture.text) && !/\bDone\b/.test(postRecoveryCapture.text)) {
+      problems.push('post-recovery backpressure capture does not show the next prompt settling successfully');
+    }
+  }
   if (!report.ok) {
     problems.push(`backpressure-report.json is not parseable JSON: ${report.error}`);
   } else {
@@ -1203,12 +1248,15 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
     if (!hasTrueTerminalDropCoverage) {
       problems.push('backpressure report must prove true dropped turn/completed writer-channel coverage; fixture-only protocol/replay_lossy recovery is not sufficient');
     }
+    if (report.value.forced_terminal_drop?.server_log_detected !== true) {
+      problems.push('backpressure report is missing server-log evidence for the forced turn/completed writer-channel drop');
+    }
     const droppedCount = Number(report.value.replay_lossy?.dropped_count);
     if (!Number.isFinite(droppedCount) || droppedCount <= 0) {
       problems.push(`backpressure report replay_lossy.dropped_count must be > 0, got ${report.value.replay_lossy?.dropped_count ?? '<missing>'}`);
     }
-    if (report.value.terminal?.method !== 'turn/completed') {
-      problems.push(`backpressure report terminal method must be turn/completed, got ${report.value.terminal?.method ?? '<missing>'}`);
+    if (!reportTerminalProvesCompletion(report.value)) {
+      problems.push(`backpressure report terminal must prove turn/completed, got ${report.value.terminal?.method ?? '<missing>'}`);
     }
     if (report.value.session_id !== scenario.value.session_id) {
       problems.push('backpressure report session_id does not match scenario session_id');
@@ -1250,9 +1298,11 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
     [
       'tui-capture-replay-lossy.txt',
       'tui-capture-backpressure-final.txt',
+      'tui-capture-backpressure-post-recovery.txt',
       'notification-log.jsonl',
       'backpressure-report.json',
       'websocket-transcript.jsonl',
+      'server.log',
     ],
   );
 }
