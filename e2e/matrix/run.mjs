@@ -754,12 +754,17 @@ async function runScenario(scenario, ctx, repoRoot, octosBin, runTimeoutMs) {
   for (const log of [stderrLog, transcriptLog]) fs.closeSync(fs.openSync(log, 'a'));
 
   if (scenario.skip_reason) {
+    const requiredSkip = scenario.required === true;
     const summary = {
       name: scenario.name,
       tier: scenario.tier,
       transport: scenario.transport,
-      status: 'skipped',
+      required: requiredSkip,
+      status: requiredSkip ? 'failed' : 'skipped',
       skip_reason: scenario.skip_reason,
+      failure_reason: requiredSkip
+        ? 'required scenario cannot be skipped'
+        : null,
       validators: scenario.validators || [],
       steps: [],
     };
