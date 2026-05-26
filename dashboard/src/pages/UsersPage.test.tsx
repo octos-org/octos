@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import UsersPage from './UsersPage'
@@ -74,6 +74,21 @@ describe('UsersPage destructive confirmations', () => {
     })
   })
 
+  it('cancels allowlist removal without calling the API', async () => {
+    const user = userEvent.setup()
+
+    render(<UsersPage />)
+
+    await screen.findAllByText('alice@example.com')
+    await user.click(screen.getByRole('button', { name: 'Remove' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Remove Allowlisted Email' })
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByRole('dialog', { name: 'Remove Allowlisted Email' })).not.toBeInTheDocument()
+    expect(mockApi.deleteAllowedEmail).not.toHaveBeenCalled()
+  })
+
   it('uses ConfirmDialog instead of native confirm for account deletion', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm')
     const user = userEvent.setup()
@@ -93,5 +108,21 @@ describe('UsersPage destructive confirmations', () => {
     await waitFor(() => {
       expect(mockApi.deleteUser).toHaveBeenCalledWith('alice')
     })
+  })
+
+  it('closes the account deletion dialog with Escape without calling the API', async () => {
+    const user = userEvent.setup()
+
+    render(<UsersPage />)
+
+    await screen.findAllByText('alice@example.com')
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+
+    expect(screen.getByRole('dialog', { name: 'Delete Account' })).toBeInTheDocument()
+
+    await user.keyboard('{Escape}')
+
+    expect(screen.queryByRole('dialog', { name: 'Delete Account' })).not.toBeInTheDocument()
+    expect(mockApi.deleteUser).not.toHaveBeenCalled()
   })
 })
