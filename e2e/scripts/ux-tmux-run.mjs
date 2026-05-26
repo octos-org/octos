@@ -157,13 +157,15 @@ const scenarios = new Map([
 
 function usage() {
   return `Usage:
-  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run]
+  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run] [--keep-session] [--no-validate]
   node e2e/scripts/ux-tmux-run.mjs --self-test [${defaultScenarioId}]
 
 Options:
-  --dry-run      Write the artifact skeleton without launching tmux.
-  --self-test    Write and validate the artifact skeleton without launching tmux.
-  --help         Show this help.
+  --dry-run       Write the artifact skeleton without launching tmux.
+  --keep-session  Leave tmux sessions running after a real run.
+  --no-validate   Skip automatic ux:tmux:validate after a dry or real run.
+  --self-test     Write and validate the artifact skeleton without launching tmux.
+  --help          Show this help.
 
 Scenarios:
   ${[...scenarios.keys()].join(', ')}
@@ -180,6 +182,8 @@ Environment:
 function parseArgs(argv) {
   let scenarioId = null;
   let dryRun = false;
+  let keepSession = false;
+  let noValidate = false;
   let selfTest = false;
   let help = false;
 
@@ -187,6 +191,10 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--keep-session') {
+      keepSession = true;
+    } else if (arg === '--no-validate') {
+      noValidate = true;
     } else if (arg === '--self-test' || arg === 'self-test') {
       selfTest = true;
     } else if (arg === '--scenario') {
@@ -211,6 +219,8 @@ function parseArgs(argv) {
   return {
     scenarioId: scenarioId || defaultScenarioId,
     dryRun,
+    keepSession,
+    noValidate,
     selfTest,
     help,
   };
@@ -639,6 +649,21 @@ function refreshSummaryArtifacts(ctx, validationStatus = null) {
   writeJson(summaryPath, summary);
 }
 
+function skipValidation(ctx) {
+  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
+  if (fs.existsSync(summaryPath)) {
+    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+    summary.validation_status = 'skipped';
+    summary.validation_skipped = true;
+    summary.artifacts = Object.fromEntries(
+      collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
+    );
+    writeJson(summaryPath, summary);
+  }
+  console.log(`Validation skipped (--no-validate): ${ctx.scenarioDir}`);
+  return 0;
+}
+
 function missingRunnerBlocker(ctx) {
   if (!fs.existsSync(ctx.lowerRunner)) {
     return `octos-tui tmux runner is missing: ${ctx.lowerRunner}`;
@@ -869,7 +894,7 @@ function runnerSteps(ctx) {
   return ['start', 'drive-solo'];
 }
 
-function runLowerRunner(ctx) {
+function runLowerRunner(ctx, options = {}) {
   const shouldInitProfileLlm = ctx.scenario.runner === 'provider-missing' ? '0' : '1';
   const env = {
     ...process.env,
@@ -941,7 +966,7 @@ function runLowerRunner(ctx) {
   if (capture.error && status === 0) throw capture.error;
   if (capture.status !== 0 && status === 0) status = capture.status || 1;
 
-  if (process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
+  if (!options.keepSession && process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
     action('stop', false);
   }
 
@@ -959,7 +984,7 @@ function runValidation(ctx) {
   return status;
 }
 
-function realMode(ctx) {
+function realMode(ctx, options = {}) {
   if (!ctx.scenario.runner) {
     const blocker = ctx.scenario.blockedMessage || `scenario ${ctx.scenario.id} has no real tmux runner yet`;
     writeArtifactSkeleton(ctx, {
@@ -971,7 +996,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -987,7 +1012,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${runnerBlocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -1003,7 +1028,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -1019,7 +1044,7 @@ function realMode(ctx) {
 
   let status = 1;
   try {
-    status = runLowerRunner(ctx);
+    status = runLowerRunner(ctx, { keepSession: options.keepSession });
   } finally {
     writeArtifactSkeleton(ctx, {
       mode: 'run',
@@ -1030,12 +1055,12 @@ function realMode(ctx) {
       realTmuxLaunched: true,
     });
   }
-  const validationStatus = runValidation(ctx);
+  const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
   console.log(`UX tmux artifacts: ${ctx.scenarioDir}`);
   return status === 0 ? validationStatus : status;
 }
 
-function dryRun(ctx) {
+function dryRun(ctx, options = {}) {
   writeArtifactSkeleton(ctx, {
     mode: 'dry-run',
     status: 'blocked',
@@ -1044,7 +1069,7 @@ function dryRun(ctx) {
     placeholderArtifacts: true,
     realTmuxLaunched: false,
   });
-  const validationStatus = runValidation(ctx);
+  const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
   console.log(`Dry run wrote UX tmux artifact skeleton: ${ctx.scenarioDir}`);
   return validationStatus;
 }
@@ -1076,8 +1101,8 @@ function main() {
 
   const ctx = resolveContext(args);
   if (args.selfTest) return selfTest(ctx);
-  if (args.dryRun) return dryRun(ctx);
-  return realMode(ctx);
+  if (args.dryRun) return dryRun(ctx, { noValidate: args.noValidate });
+  return realMode(ctx, { keepSession: args.keepSession, noValidate: args.noValidate });
 }
 
 try {
