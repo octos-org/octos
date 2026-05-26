@@ -932,17 +932,32 @@ fn install_via_git_result(
             );
         }
 
-        // RFC-2: validate the manifest BEFORE we copy anything to the
-        // user-visible skills dir. A malformed manifest aborts the
-        // install with the structured violation list — no half-broken
-        // skill directory left behind.
-        validate_skill_manifest(&src)?;
-
         let name = Path::new(subdir)
             .file_name()
             .unwrap()
             .to_string_lossy()
             .to_string();
+
+        // RFC-2 (codex follow-up, 2026-05-25): pre-flight validate
+        // the target subdir AND every auto-detected shared dep
+        // BEFORE we touch the user-visible skills dir. The earlier
+        // attempt validated deps after the target copy, which left
+        // a partial install on disk when a dep's manifest was
+        // malformed. We now collect every dep ahead of time so a
+        // single failed validation bails before any copy.
+        validate_skill_manifest(&src)?;
+        let shared_deps: Vec<String> = {
+            let skill_md_path = src.join("SKILL.md");
+            if skill_md_path.exists() {
+                let content = std::fs::read_to_string(&skill_md_path)?;
+                find_shared_deps(&content, &clone_dir, &name)
+            } else {
+                Vec::new()
+            }
+        };
+        for dep in &shared_deps {
+            validate_skill_manifest(&clone_dir.join(dep))?;
+        }
 
         // Install the target skill/dir
         let dest = skills_dir.join(&name);
@@ -965,35 +980,22 @@ fn install_via_git_result(
             }
         }
 
-        // Auto-detect shared dependencies referenced in SKILL.md.
-        // RFC-2 follow-up (codex P2, 2026-05-25): every shared dep
-        // must pass `validate_skill_manifest` BEFORE we copy it,
-        // otherwise a malformed sibling skill bypasses the install
-        // guarantee even though the targeted subdir was clean.
-        let skill_md_path = src.join("SKILL.md");
-        if skill_md_path.exists() {
-            let content = std::fs::read_to_string(&skill_md_path)?;
-            let shared = find_shared_deps(&content, &clone_dir, &name);
-            for dep in shared {
-                let dep_src = clone_dir.join(&dep);
-                let dep_dest = skills_dir.join(&dep);
-                if dep_dest.exists() && !force {
-                    println!(
-                        "  {} dependency '{}' already exists (use --force to overwrite)",
-                        "SKIP".yellow(),
-                        dep
-                    );
-                } else {
-                    // Pre-flight validation — bails the install if a
-                    // dep manifest is malformed, leaving nothing
-                    // half-written on disk.
-                    validate_skill_manifest(&dep_src)?;
-                    if dep_dest.exists() {
-                        std::fs::remove_dir_all(&dep_dest)?;
-                    }
-                    copy_dir_recursive(&dep_src, &dep_dest)?;
-                    deps_installed.push(dep);
+        // Now copy every shared dep we already validated above.
+        for dep in shared_deps {
+            let dep_src = clone_dir.join(&dep);
+            let dep_dest = skills_dir.join(&dep);
+            if dep_dest.exists() && !force {
+                println!(
+                    "  {} dependency '{}' already exists (use --force to overwrite)",
+                    "SKIP".yellow(),
+                    dep
+                );
+            } else {
+                if dep_dest.exists() {
+                    std::fs::remove_dir_all(&dep_dest)?;
                 }
+                copy_dir_recursive(&dep_src, &dep_dest)?;
+                deps_installed.push(dep);
             }
         }
     } else {
