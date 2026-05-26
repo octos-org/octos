@@ -15048,6 +15048,17 @@ async fn run_standalone_turn(
     // pattern in `SessionActor`.
     let goal_turn_start = goal_context.as_ref().map(|_| std::time::Instant::now());
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
+    // Stamp the per-turn snapshot with this session's key so
+    // `spawn::register_with_lineage` writes `session_key:
+    // Some(<session_id.0>)` onto every `BackgroundTask` it tracks
+    // (`spawn.rs:2672`). Without this, `snapshot_excluding` clears
+    // `session_key` to `None` and the
+    // `TaskSupervisor::get_tasks_for_session` filter
+    // (`task_supervisor.rs:2237`) drops every task — `session/tasks.list`
+    // returns `[]` even after the live supervisor is registered with
+    // `SessionTaskQueryStore` below. Mirrors `session_actor.rs:2671`
+    // for the WS path.
+    tool_registry.set_session_key(session_id.to_string());
     // M11-F regression fix REG-1 follow-up round 2 (codex review):
     // re-register a fresh `ActivateToolsTool` on this per-turn
     // snapshot so `wire_activate_tools()` below rewires THIS
@@ -15246,6 +15257,24 @@ async fn run_standalone_turn(
                 error = %error,
                 "failed to enable AppUI turn task-supervisor persistence"
             );
+        }
+        // Register the per-turn supervisor with `SessionTaskQueryStore`
+        // so `session/tasks.list` and `session/status.get` can see live
+        // spawn_only tasks after the SPA closes + reopens the chat
+        // tab mid-flight. The gateway path does this at
+        // `session_actor.rs:2668-2669`; the WS turn handler used to
+        // skip it, so `query_json` returned `[]` on reopen, the
+        // session-task tracker rendered empty, and the runtime tore
+        // down its `watchSession` subscriber when `has_bg_tasks=false`.
+        //
+        // The store holds a `Weak<TaskSupervisor>` so dropping the
+        // per-turn `tool_registry` at end of turn lets the entry get
+        // pruned naturally by `lookup_live_supervisor`. `register` is
+        // safe to call even when `task_query_store` was wired into
+        // `AppState` (production); in tests with `None`, the WS path
+        // simply skips the registration without erroring.
+        if let Some(store) = state.task_query_store.as_ref() {
+            store.register(&session_id, &task_supervisor, &bg_data_dir);
         }
         tool_registry.register(octos_agent::CheckBackgroundTasksTool::new(
             task_supervisor.clone(),
@@ -21500,6 +21529,101 @@ ignore = []
                 "{name} must be visible on non-slides session topics",
             );
         }
+    }
+
+    /// Regression: the WS turn handler (`run_standalone_turn`) MUST
+    /// register the per-turn `TaskSupervisor` with
+    /// `SessionTaskQueryStore` so `session/tasks.list` and
+    /// `session/status.get` can locate live spawn_only tasks after the
+    /// SPA closes + reopens a chat tab mid-flight.
+    ///
+    /// The bug (triaged in `/tmp/task-tracker-reload-triage.md`): the
+    /// WS path called `session_runtime.tools.snapshot_excluding(&[])`,
+    /// which spins up a fresh `Arc::new(TaskSupervisor::new())` at
+    /// `registry.rs:829`, but never registered it with
+    /// `SessionTaskQueryStore` the way the gateway path does at
+    /// `session_actor.rs:2668-2669`. Result: `query_json(session_key)`
+    /// returned `[]` on reopen, the session-task tracker rendered
+    /// empty, and the runtime tore down its `watchSession` subscriber
+    /// when `has_bg_tasks=false`.
+    ///
+    /// This test pins the registration sequence used by the WS path:
+    ///   1. `snapshot_excluding(&[])` produces a registry with a fresh
+    ///      supervisor (and `session_key: None`).
+    ///   2. `set_session_key(session_id.to_string())` stamps the
+    ///      registry so `spawn::register_with_lineage` writes
+    ///      `session_key = Some(...)` onto each tracked task.
+    ///   3. `store.register(&session_id, &supervisor, &data_dir)` makes
+    ///      the supervisor reachable via the
+    ///      `SessionTaskQueryStore::query_json` walk.
+    ///
+    /// After those three steps a task registered through
+    /// `register_with_lineage(..., Some(session_key))` is reachable via
+    /// `query_json(session_key)` — and a regression that re-deletes
+    /// either step would flip this test red.
+    #[test]
+    fn ws_turn_handler_registers_supervisor_with_task_query_store() {
+        let session_id = SessionKey("web:tester#turn-track-reopen".to_owned());
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Mirror the WS path: build a parent registry the same way
+        // SessionRuntime does, then snapshot it for the per-turn slot.
+        let parent = octos_agent::ToolRegistry::with_builtins(temp.path());
+        let mut tool_registry = parent.snapshot_excluding(&[]);
+
+        // Step 1: stamp the per-turn snapshot with the session key so
+        // tasks registered through it inherit `session_key:
+        // Some(<key>)`. Without this, the
+        // `TaskSupervisor::get_tasks_for_session` filter at
+        // `task_supervisor.rs:2237` drops every task.
+        tool_registry.set_session_key(session_id.to_string());
+
+        // Step 2: extract the per-turn supervisor and register it in
+        // the store, mirroring `session_actor.rs:2668-2669`. This is
+        // the line the WS turn handler was missing.
+        let task_supervisor = tool_registry.supervisor();
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        store.register(&session_id, &task_supervisor, temp.path());
+
+        // Before any spawn_only task fires, the supervisor exists but
+        // owns no tasks — `query_json` returns an empty array (NOT
+        // missing — that would mean the supervisor wasn't registered).
+        let empty = store.query_json(&session_id.to_string());
+        assert_eq!(
+            empty,
+            serde_json::Value::Array(vec![]),
+            "registered-but-empty supervisor must return [] (not absent)",
+        );
+
+        // Step 3: simulate a spawn_only task registering through
+        // `register_with_lineage` with `session_key = Some(...)`. This
+        // is what `spawn::Inner::execute_background` does at
+        // `spawn.rs:2668-2675`.
+        let task_id = task_supervisor.register_with_lineage(
+            "podcast_generate",
+            "call-track-track",
+            Some(&session_id.0),
+            None,
+        );
+        task_supervisor.mark_running(&task_id);
+
+        // Now `query_json` MUST surface the live task. The pre-fix
+        // behaviour was either `[]` (no supervisor registered) OR a
+        // panic on stale-Weak prune; the fix turns this into a
+        // single-element array carrying the running task.
+        let result = store.query_json(&session_id.to_string());
+        let tasks = result
+            .as_array()
+            .expect("query_json must produce an array even when empty");
+        assert_eq!(
+            tasks.len(),
+            1,
+            "WS-path registration must make spawn_only tasks visible via \
+             SessionTaskQueryStore::query_json — got: {result}",
+        );
+        assert_eq!(tasks[0]["id"], task_id);
+        assert_eq!(tasks[0]["tool_name"], "podcast_generate");
+        assert_eq!(tasks[0]["status"], "running");
     }
 
     #[test]
