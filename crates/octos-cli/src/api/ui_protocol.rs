@@ -7606,6 +7606,25 @@ fn ledger_event_matches_topic_scope(
     event: &UiProtocolLedgerEvent,
     topic_scope: Option<&str>,
 ) -> bool {
+    // P0-A exemption: `file/attached` envelopes are intrinsically
+    // session-scoped via their `tool_call_id` (the SPA already binds
+    // each attachment to the originating turn/tool client-side). The
+    // event type has no `topic` field, so `UiNotification::topic()`
+    // falls back to `SessionKey.topic()` — meaning any emit site that
+    // constructs the event with a session_id stripped of (or pre-
+    // dating) the `#<topic>` suffix produces `event.topic() == None`
+    // and the strict equality below drops it for a topic-scoped
+    // subscriber. The slides soak round-13 regression captured this
+    // exact gap: `file/attached` landed on the ledger but never
+    // reached the SPA. Exempting the variant closes the wire gap with
+    // no functional cost — clients route the attachment via
+    // `tool_call_id` regardless of topic scope.
+    if matches!(
+        event,
+        UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_))
+    ) {
+        return true;
+    }
     let event_topic = event
         .topic()
         .map(str::trim)
@@ -28984,6 +29003,116 @@ ignore = []
 
         abort_live_forwarders(&forwarders_alpha, &ledger).await;
         abort_live_forwarders(&forwarders_beta, &ledger).await;
+    }
+
+    /// P0-A regression: slides soak round-13 captured `file/attached`
+    /// envelopes that landed durably on the ledger (seq 91 in the
+    /// fleet ledger evidence) but never reached the SPA. The capability
+    /// gate passes (`event.file_attached.v1` was negotiated) and
+    /// broadcast fan-out succeeded — the surviving filter dropping
+    /// the event is `ledger_event_matches_topic_scope`. The
+    /// `FileAttachedEvent` struct has no `topic` field, so its
+    /// `UiNotification::topic()` impl falls back to the
+    /// `SessionKey.topic()` suffix. Any emit site that constructs the
+    /// event with a session_id that does NOT carry the `#<topic>`
+    /// suffix (e.g. a future caller passing the base session, or a
+    /// pre-stamp `bg_session_id` capture) results in
+    /// `event.topic() == None` while the topic-scoped subscriber
+    /// expects `Some("slides")` — the filter mismatches and the event
+    /// is silently dropped.
+    ///
+    /// File/attached is intrinsically session-scoped via its
+    /// `tool_call_id` — the SPA already knows which turn/tool produced
+    /// the artefact, so topic scoping adds no value and only risks
+    /// false negatives. This end-to-end test pins the invariant that a
+    /// `file/attached` emitted on the topic-suffixed broadcast key
+    /// reaches a topic-scoped subscriber. The companion unit test
+    /// (`ledger_event_matches_topic_scope_exempts_file_attached`)
+    /// covers the filter-only invariant for the bare-event /
+    /// mismatched-topic shapes that the broadcast-fan-out path can't
+    /// reach without monkey-patching the ledger.
+    #[tokio::test]
+    async fn live_forwarder_delivers_file_attached_to_topic_scoped_subscriber() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        // Subscriber opens on the topic-suffixed broadcast key — matches
+        // the SPA's session/open with `topic: "slides"`.
+        let topic_session = SessionKey("local:slides-soak#slides".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&topic_session);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            topic_session.clone(),
+            0,
+            ws.connection_id(),
+            features_for_file_attached_test(true),
+            Some("slides".into()),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        let file_attached_matching = file_attached_for(&topic_session);
+        ledger.append_notification(file_attached_matching);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("topic-matching file/attached frame")
+            .expect("ws open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::FILE_ATTACHED),
+            "file/attached on the matching-topic session must reach the subscriber",
+        );
+
+        abort_live_forwarders(&forwarders, &ledger).await;
+    }
+
+    /// Complementary unit test for `ledger_event_matches_topic_scope`:
+    /// `file/attached` events MUST always match a topic-scoped
+    /// subscriber, regardless of whether the event itself carries a
+    /// topic. Companion to
+    /// `live_forwarder_delivers_file_attached_to_topic_scoped_subscriber`
+    /// — guards the filter in isolation so a refactor that re-routes
+    /// the call site can't silently break the exemption.
+    #[test]
+    fn ledger_event_matches_topic_scope_exempts_file_attached() {
+        let bare_session = SessionKey("local:slides-soak".into());
+        let topic_session = SessionKey("local:slides-soak#slides".into());
+        let other_topic_session = SessionKey("local:slides-soak#other".into());
+
+        // Bare event, topic-scoped subscriber: pre-fix → DROP; post-fix → PASS.
+        let bare_event = UiProtocolLedgerEvent::Notification(file_attached_for(&bare_session));
+        assert!(
+            ledger_event_matches_topic_scope(&bare_event, Some("slides")),
+            "file/attached with no topic must reach a topic-scoped subscriber"
+        );
+
+        // Topic-suffixed event, topic-scoped subscriber: always PASSED.
+        let topic_event = UiProtocolLedgerEvent::Notification(file_attached_for(&topic_session));
+        assert!(
+            ledger_event_matches_topic_scope(&topic_event, Some("slides")),
+            "file/attached with matching topic must reach a topic-scoped subscriber"
+        );
+
+        // Mismatched topic, topic-scoped subscriber: pre-fix → DROP;
+        // post-fix → PASS (file/attached is exempt from topic scoping).
+        let other_event =
+            UiProtocolLedgerEvent::Notification(file_attached_for(&other_topic_session));
+        assert!(
+            ledger_event_matches_topic_scope(&other_event, Some("slides")),
+            "file/attached is exempt from topic-scope filtering — \
+             a non-matching event.topic must NOT block delivery"
+        );
+
+        // Bare subscriber, topic-suffixed event: always PASSED by the
+        // exemption too (defensive consistency).
+        assert!(
+            ledger_event_matches_topic_scope(&topic_event, None),
+            "file/attached must reach a bare (no-topic) subscriber"
+        );
     }
 
     #[tokio::test]
