@@ -99,7 +99,13 @@ pub fn default_lane_candidates(lane: Lane) -> Vec<(String, String)> {
     let pairs: &[(&str, &str)] = match lane {
         Lane::InstructionStrong => &[
             ("anthropic", "claude-sonnet-4-6"),
-            // Production fleet primary lane for instruction-following.
+            // Production fleet fallback observed on 2026-05-25 mini1
+            // round-14 retest: primary `deepseek-v4-pro`, fallback
+            // `moonshot/kimi-k2.6`. Pin k2.6 FIRST so the documented
+            // shape actually matches — pinning only k2.5 would leave
+            // the lane inert because mini1's fallback is k2.6.
+            ("moonshot", "kimi-k2.6"),
+            // Production fleet alternative (mini3/5 declared primary).
             ("moonshot", "kimi-k2.5"),
             // Legacy compat: non-fleet profiles routing via wisemodel.
             ("wisemodel", "kimi-k2.5"),
@@ -491,34 +497,80 @@ mod tests {
                 .iter()
                 .any(|(p, m)| p == "moonshot" && m == "kimi-k2.5"),
             "moonshot/kimi-k2.5 must appear in InstructionStrong defaults \
-             so dspfac fleet sessions match the lane filter; current list: {:?}",
+             (mini3/5 declared primary); current list: {:?}",
             strong,
         );
     }
 
     #[test]
-    fn instruction_strong_filter_matches_dspfac_fleet_shape() {
-        // Simulate the dspfac fleet's slot list (primary + fallback).
-        // The 2026-05-25 round-14 retest observed exactly this shape on
-        // mini1 — primary `deepseek-v4-pro`, fallback `moonshot/kimi-k2.6`
-        // — and the lane filter returned zero matches against the old
-        // `[anthropic, wisemodel, openai]` defaults.
-        let fleet_slots: Vec<(&str, &str)> = vec![
-            ("deepseek", "deepseek-v4-pro"),
-            ("moonshot", "kimi-k2.6"),
-            ("moonshot", "kimi-k2.5"),
-        ];
+    fn instruction_strong_default_includes_moonshot_kimi_k26() {
+        // The mini1 round-14 fallback slot is k2.6 (NOT k2.5). The lane
+        // filter must match this exact `(provider, model)` pair, otherwise
+        // slides/research sessions still fall through to deepseek-v4-pro.
+        // Codex review (PR #1305 round 1) flagged this gap. The fix MUST
+        // pin k2.6 into InstructionStrong, not only k2.5.
+        let strong = default_lane_candidates(Lane::InstructionStrong);
+        assert!(
+            strong
+                .iter()
+                .any(|(p, m)| p == "moonshot" && m == "kimi-k2.6"),
+            "moonshot/kimi-k2.6 must appear in InstructionStrong defaults \
+             — this is the observed mini1 fallback slot. current list: {:?}",
+            strong,
+        );
+    }
+
+    #[test]
+    fn instruction_strong_filter_matches_documented_mini1_shape() {
+        // EXACT documented mini1 shape from the 2026-05-25 round-14
+        // retest — primary `deepseek-v4-pro`, fallback `moonshot/kimi-k2.6`.
+        // No padding slots; this is the literal chain the AdaptiveRouter
+        // saw on the live fleet. The lane filter MUST return at least
+        // one match here, otherwise RFC-3 is still inert on production.
+        let mini1_slots: Vec<(&str, &str)> =
+            vec![("deepseek", "deepseek-v4-pro"), ("moonshot", "kimi-k2.6")];
         let defaults = default_lane_candidates(Lane::InstructionStrong);
-        let matched: Vec<_> = fleet_slots
+        let matched: Vec<_> = mini1_slots
             .iter()
             .filter(|(p, m)| defaults.iter().any(|(dp, dm)| dp == p && dm == m))
             .collect();
         assert!(
             !matched.is_empty(),
-            "InstructionStrong filter found zero matches against fleet \
-             slots — RFC-3 still inert. defaults={:?} slots={:?}",
+            "InstructionStrong filter found zero matches against the \
+             documented mini1 chain — RFC-3 still inert on production. \
+             defaults={:?} slots={:?}",
             defaults,
-            fleet_slots,
+            mini1_slots,
+        );
+        // And confirm the match is on the fallback slot specifically.
+        assert!(
+            matched
+                .iter()
+                .any(|(p, m)| *p == "moonshot" && *m == "kimi-k2.6"),
+            "InstructionStrong must match the mini1 fallback (moonshot/kimi-k2.6); \
+             matched slots: {:?}",
+            matched,
+        );
+    }
+
+    #[test]
+    fn instruction_strong_filter_matches_mini3_mini5_shape() {
+        // mini3 and mini5 declare `moonshot/kimi-k2.5` as primary.
+        // Keep this shape covered too — both production sub-fleets
+        // must hit the lane filter.
+        let slots: Vec<(&str, &str)> =
+            vec![("moonshot", "kimi-k2.5"), ("deepseek", "deepseek-v4-pro")];
+        let defaults = default_lane_candidates(Lane::InstructionStrong);
+        let matched: Vec<_> = slots
+            .iter()
+            .filter(|(p, m)| defaults.iter().any(|(dp, dm)| dp == p && dm == m))
+            .collect();
+        assert!(
+            !matched.is_empty(),
+            "InstructionStrong filter found zero matches against the \
+             mini3/5 declared chain. defaults={:?} slots={:?}",
+            defaults,
+            slots,
         );
     }
 
