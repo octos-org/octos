@@ -66,6 +66,33 @@ pub struct DoraToolMapping {
     /// DEPRECATED — see `dora_node_id`.
     #[serde(default)]
     pub dora_output_id: Option<String>,
+    /// Optional SPEC-V1 verb path used on the bridge URL. When `None`,
+    /// `tool_name` is used (back-compat). Set this when `tool_name` is the
+    /// LLM-facing sanitized form (e.g., `vendor_agibot_a2_motion_set_action`)
+    /// but the bridge expects the original dotted verb on its URL (e.g.,
+    /// `vendor.agibot.a2.motion.set_action`). Both Anthropic and OpenAI tool
+    /// APIs require names to match `^[a-zA-Z0-9_-]+$` and reject dots.
+    #[serde(default)]
+    pub verb_path: Option<String>,
+}
+
+/// Sanitize a SPEC-V1 verb (e.g. `vendor.agibot.a2.motion.set_action`) into a
+/// name that satisfies the LLM provider tool-name pattern `^[a-zA-Z0-9_-]+$`.
+/// Any character outside the allowed set becomes `_`. Empty input returns
+/// `_` to keep the result non-empty.
+pub fn sanitize_tool_name(raw: &str) -> String {
+    if raw.is_empty() {
+        return "_".to_string();
+    }
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Top-level bridge configuration.
@@ -118,8 +145,15 @@ impl DoraToolBridge {
             .input_schema
             .clone()
             .unwrap_or_else(|| serde_json::json!({"type": "object", "additionalProperties": true}));
+        // The HttpTool's `name` doubles as the URL path on the bridge — use
+        // `verb_path` when set so the LLM-facing `tool_name` can be a sanitized
+        // form (no dots) while dispatch hits the original SPEC-V1 verb.
+        let url_path = mapping
+            .verb_path
+            .clone()
+            .unwrap_or_else(|| mapping.tool_name.clone());
         let inner = HttpTool::new(
-            mapping.tool_name.clone(),
+            url_path,
             mapping.description.clone(),
             mapping.bridge_base_url.clone(),
             schema,
@@ -212,6 +246,7 @@ mod tests {
     fn sample_mapping() -> DoraToolMapping {
         DoraToolMapping {
             tool_name: "navigate_to".to_string(),
+            verb_path: None,
             description: "Navigate robot to a waypoint".to_string(),
             bridge_base_url: "http://127.0.0.1:8765".to_string(),
             safety_tier: SafetyTier::SafeMotion,
@@ -221,6 +256,89 @@ mod tests {
             dora_node_id: None,
             dora_output_id: None,
         }
+    }
+
+    #[test]
+    fn sanitize_tool_name_replaces_dots_with_underscores() {
+        assert_eq!(
+            sanitize_tool_name("vendor.agibot.a2.motion.set_action"),
+            "vendor_agibot_a2_motion_set_action",
+        );
+    }
+
+    #[test]
+    fn sanitize_tool_name_preserves_already_clean_names() {
+        assert_eq!(sanitize_tool_name("robot_heartbeat"), "robot_heartbeat");
+        assert_eq!(sanitize_tool_name("read_file"), "read_file");
+        assert_eq!(sanitize_tool_name("set-action"), "set-action");
+    }
+
+    #[test]
+    fn sanitize_tool_name_handles_empty_input() {
+        assert_eq!(sanitize_tool_name(""), "_");
+    }
+
+    #[test]
+    fn sanitize_tool_name_replaces_arbitrary_disallowed_chars() {
+        // Slash, space, colon all become `_`.
+        assert_eq!(sanitize_tool_name("foo bar/baz:qux"), "foo_bar_baz_qux");
+    }
+
+    #[test]
+    fn dora_bridge_uses_verb_path_for_url_when_set() {
+        // verb_path is the dotted SPEC-V1 verb; tool_name is sanitized for LLM.
+        let mapping = DoraToolMapping {
+            tool_name: "vendor_agibot_a2_motion_set_action".to_string(),
+            verb_path: Some("vendor.agibot.a2.motion.set_action".to_string()),
+            description: "Set action".to_string(),
+            bridge_base_url: "http://127.0.0.1:8765".to_string(),
+            safety_tier: SafetyTier::SafeMotion,
+            concurrency_class: None,
+            input_schema: None,
+            timeout_secs: 5,
+            dora_node_id: None,
+            dora_output_id: None,
+        };
+        let bridge = DoraToolBridge::new(mapping).unwrap();
+        // Tool::name() returns the sanitized form shown to the LLM.
+        assert_eq!(bridge.name(), "vendor_agibot_a2_motion_set_action");
+        // The inner HttpTool uses verb_path for its URL — verify by hitting a
+        // wiremock that only answers on the dotted-verb path.
+    }
+
+    #[tokio::test]
+    async fn dora_bridge_dispatches_to_verb_path_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The bridge must POST to the dotted verb, NOT the sanitized name.
+        Mock::given(method("POST"))
+            .and(path("/tools/vendor.agibot.a2.motion.set_action"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "code": "0", "msg": "", "data": {"applied": true}
+            })))
+            .mount(&server)
+            .await;
+
+        let mapping = DoraToolMapping {
+            tool_name: "vendor_agibot_a2_motion_set_action".to_string(),
+            verb_path: Some("vendor.agibot.a2.motion.set_action".to_string()),
+            description: "Set action".to_string(),
+            bridge_base_url: server.uri(),
+            safety_tier: SafetyTier::SafeMotion,
+            concurrency_class: None,
+            input_schema: None,
+            timeout_secs: 5,
+            dora_node_id: None,
+            dora_output_id: None,
+        };
+        let bridge = DoraToolBridge::new(mapping).unwrap();
+        let result = bridge
+            .execute(&serde_json::json!({"action": "RL_LOCOMOTION_DEFAULT"}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected dispatch via verb_path to succeed");
     }
 
     #[test]
@@ -336,6 +454,7 @@ mod tests {
 
         let mapping = DoraToolMapping {
             tool_name: "robot.heartbeat".into(),
+            verb_path: None,
             description: "heartbeat".into(),
             bridge_base_url: server.uri(),
             safety_tier: SafetyTier::Observe,
@@ -372,6 +491,7 @@ mod tests {
 
         let mapping = DoraToolMapping {
             tool_name: "slow".into(),
+            verb_path: None,
             description: "slow".into(),
             bridge_base_url: server.uri(),
             safety_tier: SafetyTier::Observe,

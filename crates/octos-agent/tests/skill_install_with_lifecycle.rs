@@ -212,40 +212,43 @@ async fn install_with_http_discovery_registers_http_tools() {
     assert!(result.is_ok(), "activate_skill failed: {:?}", result.err());
 
     let activated = result.unwrap();
+    // SPEC-V1 verbs sanitize their dotted names for LLM provider compatibility
+    // (both Anthropic and OpenAI reject dots in tool names). Original verbs are
+    // preserved as `DoraToolMapping.verb_path` for HTTP URL dispatch.
     assert!(
         activated
             .tool_names
-            .contains(&"install3.observe.read".to_string()),
-        "expected install3.observe.read in {:?}",
+            .contains(&"install3_observe_read".to_string()),
+        "expected install3_observe_read in {:?}",
         activated.tool_names
     );
     assert!(
-        activated.tool_names.contains(&"install3.estop".to_string()),
-        "expected install3.estop in {:?}",
+        activated.tool_names.contains(&"install3_estop".to_string()),
+        "expected install3_estop in {:?}",
         activated.tool_names
     );
     assert!(
         activated
             .tool_names
-            .contains(&"install3.motion.go".to_string()),
-        "expected install3.motion.go in {:?}",
+            .contains(&"install3_motion_go".to_string()),
+        "expected install3_motion_go in {:?}",
         activated.tool_names
     );
     assert!(
-        registry.get("install3.observe.read").is_some(),
-        "install3.observe.read should be registered"
+        registry.get("install3_observe_read").is_some(),
+        "install3_observe_read should be registered"
     );
     assert!(
-        registry.get("install3.estop").is_some(),
-        "install3.estop should be registered"
+        registry.get("install3_estop").is_some(),
+        "install3_estop should be registered"
     );
     assert!(
-        registry.get("install3.motion.go").is_some(),
-        "install3.motion.go should be registered"
+        registry.get("install3_motion_go").is_some(),
+        "install3_motion_go should be registered"
     );
 
     // Execute one tool via the registry to verify HTTP round-trip still works.
-    let tool = registry.get("install3.observe.read").unwrap();
+    let tool = registry.get("install3_observe_read").unwrap();
     let exec_result = tool.execute(&json!({})).await.unwrap();
     assert!(
         exec_result.success,
@@ -258,20 +261,23 @@ async fn install_with_http_discovery_registers_http_tools() {
         exec_result.output
     );
 
-    // Tier resolution must work end-to-end through the install path.
+    // Tier resolution must work end-to-end through the install path. Note the
+    // resolver uses the ORIGINAL dotted name for tool_overrides matching
+    // (catalog returns dotted; manifest overrides keyed by dotted), then the
+    // resulting tool registers under the sanitized name.
     let snap = robot_groups::snapshot();
     assert_eq!(
-        snap.tier_of("install3.observe.read"),
+        snap.tier_of("install3_observe_read"),
         Some(SafetyTier::Observe),
         "catalog safety_tier should win"
     );
     assert_eq!(
-        snap.tier_of("install3.estop"),
+        snap.tier_of("install3_estop"),
         Some(SafetyTier::EmergencyOverride),
         "tool_overrides should win over manifest default when catalog omits tier"
     );
     assert_eq!(
-        snap.tier_of("install3.motion.go"),
+        snap.tier_of("install3_motion_go"),
         Some(SafetyTier::SafeMotion),
         "manifest required_safety_tier is the fallback"
     );

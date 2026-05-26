@@ -47,12 +47,15 @@ async fn load_into_registers_http_tools_from_catalog() {
     .await
     .expect("load_into should succeed");
 
+    // Names are sanitized for LLM provider tool-name pattern compatibility:
+    // dots become underscores. The original SPEC-V1 verb is preserved in
+    // DoraToolMapping.verb_path for bridge URL dispatch.
     assert!(
-        registry.get_tool("robot.heartbeat").is_some(),
+        registry.get_tool("robot_heartbeat").is_some(),
         "HTTP-discovered tool missing from registry"
     );
     assert_eq!(
-        robot_groups::snapshot().tier_of("robot.heartbeat"),
+        robot_groups::snapshot().tier_of("robot_heartbeat"),
         Some(SafetyTier::Observe),
         "catalog safety_tier should win"
     );
@@ -94,9 +97,10 @@ async fn load_into_falls_back_to_manifest_required_safety_tier_when_catalog_omit
     .await
     .unwrap();
 
-    assert!(registry.get_tool("vendor.x.y.motion.go").is_some());
+    // Sanitized: dots in the catalog name become underscores at registration.
+    assert!(registry.get_tool("vendor_x_y_motion_go").is_some());
     assert_eq!(
-        robot_groups::snapshot().tier_of("vendor.x.y.motion.go"),
+        robot_groups::snapshot().tier_of("vendor_x_y_motion_go"),
         Some(SafetyTier::SafeMotion),
         "manifest required_safety_tier should be the fallback"
     );
@@ -139,9 +143,12 @@ async fn load_into_uses_tool_overrides_when_present() {
     .await
     .unwrap();
 
-    assert!(registry.get_tool("robot.estop").is_some());
+    // Sanitized: tool_overrides key in the manifest uses the dotted SPEC-V1
+    // verb; the resolver matches it before sanitization, then the resulting
+    // tool registers under the sanitized name.
+    assert!(registry.get_tool("robot_estop").is_some());
     assert_eq!(
-        robot_groups::snapshot().tier_of("robot.estop"),
+        robot_groups::snapshot().tier_of("robot_estop"),
         Some(SafetyTier::EmergencyOverride),
         "tool_overrides should beat manifest default"
     );
@@ -183,17 +190,19 @@ async fn activate_skill_registers_http_tools_and_robot_groups() {
         .await
         .expect("activate_skill should succeed");
 
+    // Sanitized: install path uses the same `install_http_tools_from_catalog`
+    // helper, so the tool registers under the sanitized name `install_robot_move`.
     assert!(
         result
             .tool_names
-            .contains(&"install.robot.move".to_string())
+            .contains(&"install_robot_move".to_string())
     );
     assert!(
-        registry.get_tool("install.robot.move").is_some(),
+        registry.get_tool("install_robot_move").is_some(),
         "install-time HTTP-discovered tool missing from registry"
     );
     assert_eq!(
-        robot_groups::snapshot().tier_of("install.robot.move"),
+        robot_groups::snapshot().tier_of("install_robot_move"),
         Some(SafetyTier::SafeMotion),
         "install path must enrol tools in robot_groups (mirrors runtime path)"
     );

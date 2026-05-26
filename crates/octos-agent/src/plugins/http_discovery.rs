@@ -150,8 +150,18 @@ pub async fn install_http_tools_from_catalog(
                     .unwrap_or(crate::permissions::SafetyTier::Observe)
             });
 
+        // SPEC-V1 verbs use dotted names (e.g. `vendor.agibot.a2.motion.set_action`)
+        // which both Anthropic and OpenAI tool-use APIs reject (they require
+        // `^[a-zA-Z0-9_-]+$`). Show the LLM a sanitized form and keep the
+        // dotted verb as the URL path the bridge dispatches against.
+        let sanitized_name = crate::tools::dora_bridge::sanitize_tool_name(&entry.name);
         let mapping = DoraToolMapping {
-            tool_name: entry.name.clone(),
+            tool_name: sanitized_name.clone(),
+            verb_path: if sanitized_name != entry.name {
+                Some(entry.name.clone())
+            } else {
+                None
+            },
             description: entry.description.clone(),
             bridge_base_url: base_url.to_string(),
             safety_tier: tier,
@@ -168,7 +178,7 @@ pub async fn install_http_tools_from_catalog(
         // behaviour) doesn't leave a stale tier mapping behind. Today
         // `register_arc` is infallible / overwrites, but the ordering is the
         // safer invariant to lock in.
-        let tool_name = entry.name.clone();
+        let tool_name = sanitized_name.clone();
         registry.register_arc(Arc::new(bridge) as Arc<dyn Tool>);
         robot_groups::with_registry_mut(|reg| {
             reg.insert(tool_name.clone(), tier);
