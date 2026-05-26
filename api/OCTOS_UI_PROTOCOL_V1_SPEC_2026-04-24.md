@@ -350,25 +350,49 @@ Commands:
 - `session/open`
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `turn/start`
-- `review/start` (capability-gated, accepted `UPCR-2026-019`)
 - `turn/interrupt`
 - `approval/respond`
+- `approval/scopes/list` (accepted `UPCR-2026-007`)
 - `permission/profile/list`, `permission/profile/set`
   (accepted `UPCR-2026-018`)
 - `diff/preview/get`
-- `task/output/read`
 - `task/list` (capability-gated, accepted `UPCR-2026-005`)
 - `task/cancel` (capability-gated, accepted `UPCR-2026-005`)
 - `task/restart_from_node` (capability-gated, accepted `UPCR-2026-005`)
+- `task/output/read`
+- `session/hydrate` (capability-gated, accepted `UPCR-2026-009`)
+- `thread/graph/get` (capability-gated, accepted `UPCR-2026-010`)
+- `turn/state/get` (capability-gated, accepted `UPCR-2026-011`)
+- `agent/list`, `agent/status/read`, `agent/output/read`,
+  `agent/artifact/list`, `agent/artifact/read`, `agent/interrupt`,
+  `agent/close` (capability-gated, accepted `UPCR-2026-021`)
+- `task/artifact/list`, `task/artifact/read`
+  (capability-gated, accepted `UPCR-2026-019`)
+- `session/goal/get`, `session/goal/set`, `session/goal/clear`
+  (capability-gated, accepted `UPCR-2026-021`)
+- `loop/create`, `loop/list`, `loop/delete`, `loop/pause`, `loop/resume`,
+  `loop/fire_now` (capability-gated, accepted `UPCR-2026-021`)
+- `review/start` (capability-gated, accepted `UPCR-2026-019`)
+- `session/list`, `session/snapshot`, `session/messages_page`,
+  `session/status.get`, `session/files.list`, `session/tasks.list`,
+  `session/workspace.get`, `session/title.set`, `session/delete`,
+  `system/status.get`, `content/list`, `content/delete`,
+  `content/bulk_delete` (capability-gated M12 auxiliary REST-to-WS surface)
+- `router/set_mode`, `router/get_metrics` (Wave4-A routing control surface)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`)
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/skills/list`, `profile/skills/registry/search`,
+  `profile/skills/install`, `profile/skills/remove`
+  (AppUI runtime skill management surface)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
+- `onboarding/workspace_probe` (accepted `UPCR-2026-018`)
 
 Notifications:
 
+- `session/open`
 - `turn/started`
 - `turn/completed`
 - `turn/error`
@@ -377,9 +401,29 @@ Notifications:
 - `tool/progress`
 - `tool/completed`
 - `approval/requested`
+- `approval/auto_resolved`
+- `approval/decided`
+- `approval/cancelled`
 - `task/updated`
 - `task/output/delta`
+- `progress/updated`
 - `warning`
+- `protocol/replay_lossy`
+- `message/persisted` (capability-gated, accepted `UPCR-2026-012`)
+- `turn/spawn_complete` (capability-gated spawn completion event)
+- `file/attached` (capability-gated, accepted `UPCR-2026-014`)
+- `session/event` (capability-gated legacy session-event bridge,
+  accepted `UPCR-2026-014`)
+- `router/status`, `router/failover` (Wave4-A routing notifications)
+- `queue/state` (Wave4-A pending-queue snapshot)
+- `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
+  (capability-gated, accepted `UPCR-2026-021`)
+- `session/goal/updated`, `session/goal/cleared`
+  (capability-gated, accepted `UPCR-2026-021`)
+- `loop/updated`, `loop/fired`, `loop/completed`
+  (capability-gated, accepted `UPCR-2026-021`)
+- `context/compaction_completed`, `context/normalization_reported`
+  (capability-gated M16 context lifecycle notifications)
 
 ## 7. Command Semantics
 
