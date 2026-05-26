@@ -99,14 +99,20 @@ pub fn default_lane_candidates(lane: Lane) -> Vec<(String, String)> {
     let pairs: &[(&str, &str)] = match lane {
         Lane::InstructionStrong => &[
             ("anthropic", "claude-sonnet-4-6"),
-            // Production fleet fallback observed on 2026-05-25 mini1
-            // round-14 retest: primary `deepseek-v4-pro`, fallback
-            // `moonshot/kimi-k2.6`. Pin k2.6 FIRST so the documented
-            // shape actually matches — pinning only k2.5 would leave
-            // the lane inert because mini1's fallback is k2.6.
-            ("moonshot", "kimi-k2.6"),
-            // Production fleet alternative (mini3/5 declared primary).
+            // Production fleet declared primary (mini3/5). k2.5 is the
+            // stronger instruction-following model in the kimi family;
+            // pin it AHEAD of k2.6 so `select_provider` in Off/Hedge
+            // mode (which walks the lane-eligible list in candidate
+            // order) picks k2.5 first when both are configured. Codex
+            // round-2 P2 flagged that reversing this would route mini3/5
+            // turns to the faster fallback instead of the operator's
+            // declared primary.
             ("moonshot", "kimi-k2.5"),
+            // Production fleet fallback observed on 2026-05-25 mini1
+            // round-14 retest (primary `deepseek-v4-pro`, fallback
+            // `moonshot/kimi-k2.6`). MUST be present so the mini1 chain
+            // matches; ordered AFTER k2.5 per the precedence above.
+            ("moonshot", "kimi-k2.6"),
             // Legacy compat: non-fleet profiles routing via wisemodel.
             ("wisemodel", "kimi-k2.5"),
             ("openai", "gpt-4.1"),
@@ -550,6 +556,36 @@ mod tests {
             "InstructionStrong must match the mini1 fallback (moonshot/kimi-k2.6); \
              matched slots: {:?}",
             matched,
+        );
+    }
+
+    #[test]
+    fn instruction_strong_orders_k25_before_k26() {
+        // Codex round-2 P2: `select_provider` in Off/Hedge mode walks the
+        // lane-eligible list in candidate-declaration order. If a profile
+        // has BOTH moonshot/kimi-k2.5 (mini3/5 declared primary, stronger
+        // instruction-following) and moonshot/kimi-k2.6 (mini1 fallback,
+        // faster) in its chain, the lane filter must pick k2.5 first so
+        // the operator's declared primary wins. Pin the relative order
+        // of these two entries here so a future re-shuffle can't silently
+        // demote the primary.
+        let strong = default_lane_candidates(Lane::InstructionStrong);
+        let k25_idx = strong
+            .iter()
+            .position(|(p, m)| p == "moonshot" && m == "kimi-k2.5")
+            .expect("k2.5 must be present");
+        let k26_idx = strong
+            .iter()
+            .position(|(p, m)| p == "moonshot" && m == "kimi-k2.6")
+            .expect("k2.6 must be present");
+        assert!(
+            k25_idx < k26_idx,
+            "moonshot/kimi-k2.5 (primary) must precede moonshot/kimi-k2.6 \
+             (fallback) so Off/Hedge mode picks k2.5 when both are in the \
+             chain; got k2.5_idx={} k2.6_idx={}, list={:?}",
+            k25_idx,
+            k26_idx,
+            strong,
         );
     }
 
