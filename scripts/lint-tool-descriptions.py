@@ -161,11 +161,35 @@ def load_tools(paths: Iterable[Path]) -> tuple[list[ToolDescription], list[str]]
     return tools, errors
 
 
+SOURCE_PATH_HINTS: tuple[str, ...] = (
+    # Workspace source-of-truth roots whose copies must be preferred when the
+    # same `(manifest_name, tool_name)` appears in both the source dir and a
+    # snapshot dir (e.g. `.crew/bundled-app-skills/...`). Without this hint
+    # `sorted()` makes the snapshot win because dot-prefixed paths sort first,
+    # which leaves stale descriptions shadowing freshly-fixed source manifests.
+    "crates/app-skills/",
+    "crates/platform-skills/",
+)
+
+
+def _is_source_path(path: Path) -> bool:
+    posix = path.as_posix()
+    return any(hint in posix for hint in SOURCE_PATH_HINTS)
+
+
 def lint_tools(tools: Iterable[ToolDescription]) -> list[str]:
     failures: list[str] = []
     unique_tools: dict[tuple[str, str], ToolDescription] = {}
     for tool in tools:
-        unique_tools.setdefault(tool.identity, tool)
+        existing = unique_tools.get(tool.identity)
+        if existing is None:
+            unique_tools[tool.identity] = tool
+            continue
+        # Prefer the source-of-truth manifest over snapshot copies so a fix
+        # to `crates/app-skills/<x>/manifest.json` is the one we lint, not
+        # the stale `.crew/bundled-app-skills/<x>/manifest.json` snapshot.
+        if _is_source_path(tool.manifest) and not _is_source_path(existing.manifest):
+            unique_tools[tool.identity] = tool
 
     for noun, aliases in CONTENT_NOUNS.items():
         mentioned = group_mentions(unique_tools.values(), aliases)
@@ -328,6 +352,74 @@ def run_self_test() -> None:
         failures = lint_tools(tools)
         if failures:
             raise AssertionError("\n".join(failures))
+
+        # Fixture 3 — when the same `(manifest_name, tool_name)` appears in a
+        # snapshot and the source-of-truth path, dedup must keep the source
+        # entry so a fix in `crates/app-skills/...` actually gets checked.
+        snapshot = root / "snapshot" / "deep-crawl" / "manifest.json"
+        source = root / "crates" / "app-skills" / "deep-crawl" / "manifest.json"
+        site2 = root / "mofa-site-2" / "manifest.json"
+        snapshot.parent.mkdir(parents=True)
+        source.parent.mkdir(parents=True)
+        site2.parent.mkdir()
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "name": "deep-crawl",
+                    "tools": [
+                        {
+                            "name": "deep_crawl",
+                            # Stale: missing disclaimer.
+                            "description": "Crawl a website.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        source.write_text(
+            json.dumps(
+                {
+                    "name": "deep-crawl",
+                    "tools": [
+                        {
+                            "name": "deep_crawl",
+                            # Fresh: has disclaimer for mofa_site_2.
+                            "description": (
+                                "Crawl a website. NOT for site - use "
+                                "`mofa_site_2` for site."
+                            ),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        site2.write_text(
+            json.dumps(
+                {
+                    "name": "mofa-site-2",
+                    "tools": [
+                        {
+                            "name": "mofa_site_2",
+                            "description": "Generate static websites and sites.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        tools, errors = load_tools(
+            manifest_paths([snapshot.parent.parent, source.parent.parent.parent, site2.parent])
+        )
+        if errors:
+            raise AssertionError(errors)
+        failures = lint_tools(tools)
+        if failures:
+            raise AssertionError(
+                "snapshot-shadow fixture should pass because source manifest "
+                "carries the disclaimer:\n" + "\n".join(failures)
+            )
 
 
 def parse_args() -> argparse.Namespace:
