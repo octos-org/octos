@@ -28,6 +28,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const MANIFEST = resolve(REPO_ROOT, "e2e", "matrix", "octos-ux.toml");
+const CAPABILITY_GATE = resolve(REPO_ROOT, "e2e", "matrix", "ux-capabilities.json");
 const CLI = resolve(REPO_ROOT, "e2e", "scripts", "ux-scenario-list.mjs");
 
 const EXPECTED_IDS = [
@@ -63,6 +64,13 @@ function makeEnv({
     envHas: (k) => envVars.has(k),
     knownCapabilities: capabilities,
   };
+}
+
+function loadCapabilityGate() {
+  const parsed = JSON.parse(readFileSync(CAPABILITY_GATE, "utf8"));
+  assert.equal(parsed.schema, "octos.ux.capabilities.v1");
+  assert.ok(Array.isArray(parsed.capabilities));
+  return new Set(parsed.capabilities);
 }
 
 test("manifest parses and declares all umbrella-required scenarios", () => {
@@ -212,6 +220,34 @@ test("classifyRunnability reports blocked when capability missing", () => {
   const r = classifyRunnability(scenario, env);
   assert.equal(r.status, "blocked");
   assert.ok(r.reasons.length > 0);
+});
+
+test("capability gate promotes restart-reconnect without promoting task-subagent-tree", () => {
+  const manifest = loadManifest({ path: MANIFEST });
+  const capabilities = loadCapabilityGate();
+  const restartReconnect = manifest.scenarios.find((s) => s.id === "restart-reconnect");
+  const taskSubagentTree = manifest.scenarios.find((s) => s.id === "task-subagent-tree");
+
+  for (const cap of restartReconnect.requiredCapabilities) {
+    assert.ok(capabilities.has(cap), `capability gate missing ${cap}`);
+  }
+
+  const restartStatus = classifyRunnability(
+    restartReconnect,
+    makeEnv({ capabilities }),
+  );
+  assert.equal(restartStatus.status, "runnable");
+  assert.deepEqual(restartStatus.reasons, []);
+
+  const taskStatus = classifyRunnability(
+    taskSubagentTree,
+    makeEnv({ capabilities }),
+  );
+  assert.equal(taskStatus.status, "blocked");
+  assert.ok(
+    taskStatus.reasons.some((reason) => reason.includes("task/spawn")),
+    "task-subagent-tree should remain blocked until task capabilities land",
+  );
 });
 
 test("classifyRunnability honors quarantine flag", () => {

@@ -1,0 +1,11 @@
+{
+  "schema": "octos.ux.capabilities.v1",
+  "source": "validated local M19 restart/reconnect artifact evidence",
+  "capabilities": [
+    "protocol/replay_lossy",
+    "session/hydrate",
+    "session/resume",
+    "session/snapshot",
+    "transport/reconnect"
+  ]
+}
