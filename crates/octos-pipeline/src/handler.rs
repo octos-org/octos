@@ -72,6 +72,7 @@ impl CachedPluginRegistration {
 fn build_cached_plugin_registration(
     plugin_dirs: &[PathBuf],
     require_signed: bool,
+    verified_cache_dir: Option<PathBuf>,
 ) -> CachedPluginRegistration {
     if plugin_dirs.is_empty() {
         return CachedPluginRegistration::default();
@@ -92,6 +93,7 @@ fn build_cached_plugin_registration(
             work_dir: None,
             synthesis_config: None,
             require_signed,
+            verified_cache_dir,
         },
     );
     let elapsed = started.elapsed();
@@ -313,6 +315,12 @@ pub struct CodergenHandler {
     /// is the missing wiring that lets cross-domain episodes
     /// contaminate worker prompts.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Override the directory used to store verified-exe copies
+    /// (`PluginLoadOptions::verified_cache_dir`). When `None`, the
+    /// loader picks `~/.octos/cache/verified/` (production) or a
+    /// per-process tempdir (`cfg(test)` inside octos-agent). Tests
+    /// pass a tempdir here to isolate from the user's cache.
+    plugin_verified_cache_dir: Option<PathBuf>,
 }
 
 impl CodergenHandler {
@@ -337,7 +345,17 @@ impl CodergenHandler {
             host_context: crate::host_context::PipelineHostContext::default(),
             plugin_cache: Arc::new(OnceLock::new()),
             embedder: None,
+            plugin_verified_cache_dir: None,
         }
+    }
+
+    /// Override where plugin verified-exe copies live. Production
+    /// callers leave this unset; tests pass a tempdir.
+    pub fn with_plugin_verified_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.plugin_verified_cache_dir = dir;
+        // Reset the cache so a builder-time override is honoured.
+        self.plugin_cache = Arc::new(OnceLock::new());
+        self
     }
 
     /// NEW-06 fix: attach the parent embedder. Each per-node worker
@@ -491,6 +509,7 @@ impl CodergenHandler {
                 Arc::new(build_cached_plugin_registration(
                     &self.plugin_dirs,
                     self.plugin_require_signed,
+                    self.plugin_verified_cache_dir.clone(),
                 ))
             })
             .clone()

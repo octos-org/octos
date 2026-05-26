@@ -723,6 +723,7 @@ impl GatewayRuntime {
                             // is `false` (backward compatible — unsigned plugins
                             // still load with a warning).
                             require_signed: config.plugins.require_signed,
+                            verified_cache_dir: None,
                         },
                     ) {
                         Ok(result) => plugin_result = result,

@@ -2462,6 +2462,7 @@ impl Tool for SpawnTool {
                         work_dir: Some(&self.working_dir),
                         synthesis_config: None,
                         require_signed: self.plugin_require_signed,
+                        verified_cache_dir: None,
                     },
                 );
             }
@@ -2891,6 +2892,7 @@ impl Tool for SpawnTool {
                             work_dir: Some(&working_dir),
                             synthesis_config: None,
                             require_signed: plugin_require_signed,
+                            verified_cache_dir: None,
                         },
                     );
                 }

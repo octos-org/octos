@@ -273,6 +273,7 @@ impl ChatCommand {
                     work_dir: None,
                     synthesis_config: None,
                     require_signed: config.plugins.require_signed,
+                    verified_cache_dir: None,
                 },
             ) {
                 Ok(result) => plugin_result = result,

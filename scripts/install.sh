@@ -562,8 +562,16 @@ write_octos_service() {
         <string>--auth-token</string>
         <string>$AUTH_TOKEN</string>
     </array>
+    <!--
+      UserName: prefer SUDO_USER (the operator who invoked sudo) over `whoami`.
+      When this installer is run as `sudo ./install.sh`, `whoami` resolves to
+      `root` and the daemon would start as root — which then writes its caches
+      (e.g. `.main_verified` under skill dirs) with root ownership, locking out
+      the operator's interactive `octos` CLI. Falling back to `whoami` keeps
+      the non-sudo path working unchanged.
+    -->
     <key>UserName</key>
-    <string>$(whoami)</string>
+    <string>${SUDO_USER:-$(whoami)}</string>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
