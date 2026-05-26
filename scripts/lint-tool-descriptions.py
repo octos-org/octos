@@ -356,7 +356,11 @@ def run_self_test() -> None:
         # Fixture 3 — when the same `(manifest_name, tool_name)` appears in a
         # snapshot and the source-of-truth path, dedup must keep the source
         # entry so a fix in `crates/app-skills/...` actually gets checked.
-        snapshot = root / "snapshot" / "deep-crawl" / "manifest.json"
+        # Snapshot lives under `.crew/bundled-app-skills/` so it sorts *before*
+        # `crates/app-skills/` via `sorted()`. Without source-preference dedup
+        # the stale snapshot would shadow the fixed source and this fixture
+        # would fail.
+        snapshot = root / ".crew" / "bundled-app-skills" / "deep-crawl" / "manifest.json"
         source = root / "crates" / "app-skills" / "deep-crawl" / "manifest.json"
         site2 = root / "mofa-site-2" / "manifest.json"
         snapshot.parent.mkdir(parents=True)
@@ -409,9 +413,18 @@ def run_self_test() -> None:
             ),
             encoding="utf-8",
         )
-        tools, errors = load_tools(
-            manifest_paths([snapshot.parent.parent, source.parent.parent.parent, site2.parent])
-        )
+        # `snapshot.parent.parent.parent` == `<root>/.crew`,
+        # `source.parent.parent.parent` == `<root>/crates`. Sanity check the
+        # path-sort assumption that motivates the source-preference dedup.
+        roots = [snapshot.parent.parent.parent, source.parent.parent.parent, site2.parent]
+        scanned = manifest_paths(roots)
+        if scanned.index(snapshot) >= scanned.index(source):
+            raise AssertionError(
+                "fixture invariant: `.crew/...` snapshot must sort before "
+                "`crates/...` source so dedup actually exercises the "
+                "source-preference branch"
+            )
+        tools, errors = load_tools(scanned)
         if errors:
             raise AssertionError(errors)
         failures = lint_tools(tools)
