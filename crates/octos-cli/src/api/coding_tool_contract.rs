@@ -781,13 +781,6 @@ fn required_tool_status_entry(
     entry.insert("capability".into(), json!(spec.capability));
     entry.insert("policy".into(), json!(spec.policy));
 
-    if disabled_model_tools.contains(spec.name) {
-        entry.insert("status".into(), json!(TOOL_STATUS_DISABLED_BY_POLICY));
-        entry.insert("backend_tool".into(), json!(spec.name));
-        entry.insert("detail".into(), json!("disabled by effective tool policy"));
-        return Value::Object(entry);
-    }
-
     if available_model_tools.contains(spec.name) {
         entry.insert("status".into(), json!(TOOL_STATUS_AVAILABLE));
         entry.insert("backend_tool".into(), json!(spec.name));
@@ -798,6 +791,9 @@ fn required_tool_status_entry(
     // recoverable through `activate_tools`. Surface it as `deferred` so
     // clients can render "available, currently inactive" UX; it counts
     // as available for the contract's `missing_required_tools` filter.
+    // The live registry can include deferred tools in the disabled set
+    // because `specs()` hides them while `tool_names()` still reports
+    // them as registered, so deferred must win over disabled-by-policy.
     if deferred_model_tools.contains(spec.name) {
         entry.insert("status".into(), json!(TOOL_STATUS_DEFERRED));
         entry.insert("backend_tool".into(), json!(spec.name));
@@ -805,6 +801,13 @@ fn required_tool_status_entry(
             "detail".into(),
             json!("registered but currently auto-deferred; recoverable via activate_tools"),
         );
+        return Value::Object(entry);
+    }
+
+    if disabled_model_tools.contains(spec.name) {
+        entry.insert("status".into(), json!(TOOL_STATUS_DISABLED_BY_POLICY));
+        entry.insert("backend_tool".into(), json!(spec.name));
+        entry.insert("detail".into(), json!("disabled by effective tool policy"));
         return Value::Object(entry);
     }
 
@@ -1169,6 +1172,41 @@ mod tests {
 
         let apply_patch = required_tool(contract, "apply_patch");
         assert_eq!(apply_patch["status"], json!(TOOL_STATUS_AVAILABLE));
+    }
+
+    #[test]
+    fn deferred_required_tools_win_over_registered_hidden_policy_status() {
+        // The live AppUI status path derives disabled tools from
+        // `tool_names() - specs()`. Auto-deferred P0 tools therefore
+        // appear in both disabled_model_tools and deferred_model_tools;
+        // the contract must still report them as recoverable deferred
+        // tools so the real UX gate does not fail M19 readiness.
+        let deferred = &[
+            "exec_command",
+            "write_stdin",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ];
+        let available = &["apply_patch", "update_plan", "request_user_input"];
+        let context = ToolStatusListContext {
+            available_model_tools: available,
+            disabled_model_tools: deferred,
+            deferred_model_tools: deferred,
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let contract = &payload["coding_tool_contract"];
+
+        assert_eq!(contract["status"], json!("ready"));
+        assert_eq!(contract["missing_required_tools"], json!([]));
+        for name in deferred {
+            let tool = required_tool(contract, name);
+            assert_eq!(tool["status"], json!(TOOL_STATUS_DEFERRED), "{name}");
+            assert_eq!(tool["backend_tool"], json!(name), "{name}");
+        }
     }
 
     #[test]
