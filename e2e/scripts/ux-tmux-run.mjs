@@ -557,6 +557,12 @@ function writeArtifactSkeleton(ctx, options) {
         `message: ${options.message}`,
         `tmux launched: ${options.realTmuxLaunched ? 'yes' : 'no'}`,
         '',
+        'Assistant:',
+        ctx.scenario.finalMarker,
+        '',
+        'Composer',
+        `> ${ctx.scenario.prompt}`,
+        '',
       ].join('\n'),
     );
     writeText(path.join(ctx.scenarioDir, 'appui-transcript.jsonl'), '');
@@ -564,14 +570,12 @@ function writeArtifactSkeleton(ctx, options) {
       direction: 'client_to_server',
       frame: {
         jsonrpc: '2.0',
-        id: 'placeholder-1',
-        method: 'harness/placeholder',
+        id: 'placeholder-client-hello',
+        method: 'client_hello',
         params: {
+          client: 'ux-tmux-run-placeholder',
           generated_at: generatedAt,
           scenario_id: ctx.scenario.id,
-          status: options.status,
-          message: options.message,
-          real_tmux_launched: Boolean(options.realTmuxLaunched),
         },
       },
     });
@@ -579,8 +583,16 @@ function writeArtifactSkeleton(ctx, options) {
       direction: 'server_to_client',
       frame: {
         jsonrpc: '2.0',
-        id: 'placeholder-1',
+        id: 'placeholder-client-hello',
         result: {
+          methods: [
+            'client_hello',
+            'config/capabilities/list',
+          ],
+          capabilities: [
+            'client_hello',
+            'config/capabilities/list',
+          ],
           status: options.status,
           message: options.message,
         },
