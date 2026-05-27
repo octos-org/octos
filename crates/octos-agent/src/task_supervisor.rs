@@ -888,27 +888,61 @@ impl AckAndPending {
         evicted
     }
 
-    /// Remove a pending entry by `task_id`. Does NOT scan the
-    /// insertion-order queue (that cleanup happens lazily in
-    /// `insert_pending` when an evicted slot is encountered).
+    /// Remove a pending entry by `task_id` AND its companion entry
+    /// from `pending_insertion_order` so the FIFO queue cannot grow
+    /// without bound.
+    ///
+    /// Codex round-3 MAJOR (PR #1324 follow-up): the round-2 cap only
+    /// fires when `pending.len()` exceeds [`MAX_PENDING_FAILURES`]. In
+    /// the common fail-before-ack → ack-drain cycle the HashMap
+    /// returns to zero each round, so the cap is never hit and the
+    /// VecDeque grows linearly forever. Popping the matching id here
+    /// keeps both collections in lockstep.
     fn remove_pending(&mut self, task_id: &str) -> Option<PendingFailure> {
-        self.pending.remove(task_id)
+        let removed = self.pending.remove(task_id);
+        if removed.is_some() {
+            self.forget_pending_in_order(task_id);
+        }
+        removed
     }
 
     /// Drain every pending failure matching `tool_call_id`. Returns
-    /// the drained entries; the insertion-order queue is left to
-    /// self-heal in `insert_pending`'s skip-stale loop.
+    /// the drained entries; the insertion-order queue is updated in
+    /// lockstep so the VecDeque cannot leak across drain cycles.
+    ///
+    /// Codex round-3 MAJOR (PR #1324 follow-up): same leak class as
+    /// `remove_pending` — when no eviction is ever triggered, the
+    /// `pending_insertion_order` queue would otherwise accumulate one
+    /// entry per failure forever. Pop in lockstep here.
     fn drain_pending_for_tool_call(&mut self, tool_call_id: &str) -> Vec<PendingFailure> {
         let mut hits = Vec::new();
-        self.pending.retain(|_, pf| {
+        let mut drained_ids: Vec<String> = Vec::new();
+        self.pending.retain(|task_id, pf| {
             if pf.tool_call_id == tool_call_id {
+                drained_ids.push(task_id.clone());
                 hits.push(pf.clone());
                 false // remove
             } else {
                 true // keep
             }
         });
+        for task_id in &drained_ids {
+            self.forget_pending_in_order(task_id);
+        }
         hits
+    }
+
+    /// Remove `task_id` from `pending_insertion_order` if present.
+    /// `VecDeque::remove` is O(n) but the deque is bounded at
+    /// [`MAX_PENDING_FAILURES`] (256), so the linear scan is cheap.
+    fn forget_pending_in_order(&mut self, task_id: &str) {
+        if let Some(pos) = self
+            .pending_insertion_order
+            .iter()
+            .position(|tid| tid == task_id)
+        {
+            self.pending_insertion_order.remove(pos);
+        }
     }
 
     /// Mark `task_id` as having dispatched its failure signal. Returns
@@ -4117,6 +4151,118 @@ mod tests {
         assert!(
             !guard.emitted_task_ids.contains(&first_task_id),
             "oldest emitted task_id must be evicted",
+        );
+    }
+
+    /// Codex round-3 MAJOR (PR #1324): the `pending_insertion_order`
+    /// VecDeque must stay bounded across many fail-before-ack →
+    /// ack-drain cycles, even though the cap inside `insert_pending`
+    /// never fires (the HashMap returns to size 0 after every drain).
+    ///
+    /// Previously the VecDeque grew by one entry per cycle forever
+    /// because `drain_pending_for_tool_call` removed from the map but
+    /// left the task_id sitting in the queue. With ~1M cycles in a
+    /// long-running supervisor that would leak ~1M Strings (~50 MB).
+    #[test]
+    fn pending_insertion_order_does_not_leak_after_drain_cycles() {
+        let supervisor = TaskSupervisor::new();
+        let _collected = collect_failure_signals(&supervisor);
+
+        // 4× the cap so we cleanly exercise the regression. Each
+        // iteration uses a distinct (task_id, tool_call_id) so the
+        // pending stash is keyed uniquely, then the synth-ack drains
+        // it via `drain_pending_for_tool_call`.
+        let n = MAX_PENDING_FAILURES * 4;
+        for i in 0..n {
+            let tcid = format!("call-drain-{i:06}");
+            let tid = supervisor.register("fm_tts", &tcid, None);
+            // mark_failed before any synth-ack stashes a pending entry.
+            supervisor.mark_failed(&tid, format!("boom-{i}"));
+            // synth-ack drains the pending entry — the HashMap returns
+            // to 0 each cycle so the cap in `insert_pending` never
+            // fires, exposing the VecDeque leak in the un-fixed code.
+            supervisor.mark_synth_ack_emitted(&tcid);
+        }
+
+        let guard = supervisor.ack_and_pending.lock().unwrap();
+        assert!(
+            guard.pending.is_empty(),
+            "pending map must drain to empty after every cycle, found {} entries",
+            guard.pending.len(),
+        );
+        assert!(
+            guard.pending_insertion_order.len() <= MAX_PENDING_FAILURES,
+            "pending_insertion_order leaked: {} entries (cap {})",
+            guard.pending_insertion_order.len(),
+            MAX_PENDING_FAILURES,
+        );
+        // Strictest assertion: the queue should actually be EMPTY
+        // because every pending entry was drained. The `<= cap`
+        // assertion above is the round-3 contract; this tighter one
+        // documents the ideal state.
+        assert!(
+            guard.pending_insertion_order.is_empty(),
+            "pending_insertion_order must be empty after all entries are drained, found {} entries",
+            guard.pending_insertion_order.len(),
+        );
+    }
+
+    /// Codex round-3 MAJOR (PR #1324): companion to the drain test
+    /// above for the `remove_pending` path. `remove_pending` is called
+    /// from `drain_pending_failure_for_task` (defensive cleanup in
+    /// `mark_completed` / `cancel`) and must also pop the
+    /// `pending_insertion_order` entry. Same leak class.
+    ///
+    /// In normal supervisor flow `mark_failed` makes the task
+    /// terminal, so `mark_completed` and `cancel` short-circuit before
+    /// reaching `remove_pending` — exercising it from the public API
+    /// is awkward. We test the lockstep invariant directly on
+    /// `AckAndPending` instead, which is what the round-3 fix
+    /// guarantees regardless of how `remove_pending` is reached.
+    #[test]
+    fn pending_insertion_order_does_not_leak_after_remove_cycles() {
+        let mut state = AckAndPending::default();
+        let n = MAX_PENDING_FAILURES * 4;
+        for i in 0..n {
+            let task_id = format!("task-remove-{i:06}");
+            let tcid = format!("call-remove-{i:06}");
+            state.insert_pending(
+                task_id.clone(),
+                PendingFailure {
+                    tool_call_id: tcid,
+                    signal: SpawnOnlyFailureSignal {
+                        task_id: task_id.clone(),
+                        tool_name: "fm_tts".into(),
+                        tool_input: Value::Null,
+                        error_message: format!("boom-{i}"),
+                        suggested_alternatives: Vec::new(),
+                        parent_session_key: None,
+                        originating_client_message_id: None,
+                    },
+                },
+            );
+            let removed = state.remove_pending(&task_id);
+            assert!(
+                removed.is_some(),
+                "iteration {i}: remove_pending should return the inserted entry",
+            );
+        }
+
+        assert!(
+            state.pending.is_empty(),
+            "pending map must drain to empty after every cycle, found {} entries",
+            state.pending.len(),
+        );
+        assert!(
+            state.pending_insertion_order.len() <= MAX_PENDING_FAILURES,
+            "pending_insertion_order leaked under remove path: {} entries (cap {})",
+            state.pending_insertion_order.len(),
+            MAX_PENDING_FAILURES,
+        );
+        assert!(
+            state.pending_insertion_order.is_empty(),
+            "pending_insertion_order must be empty after all entries are removed, found {} entries",
+            state.pending_insertion_order.len(),
         );
     }
 
