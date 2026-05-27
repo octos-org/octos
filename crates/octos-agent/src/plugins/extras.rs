@@ -9,7 +9,7 @@ use tracing::warn;
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
 
-use super::manifest::{PluginManifest, SkillHookDef, SkillMcpServer};
+use super::manifest::{PluginManifest, SkillDiscovery, SkillHookDef, SkillMcpServer};
 
 /// Resolved extras from a skill manifest, ready to merge into agent config.
 #[derive(Debug, Default)]
@@ -47,6 +47,18 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
                 );
             }
         }
+    }
+
+    // PR-C of the SKILL.md rethink: when the manifest declares a
+    // `discovery` block, render a short skill card into the system
+    // prompt so the LLM learns where the skill dir is and what to
+    // read or list first. The card coexists with the legacy SKILL.md
+    // auto-inject below — PR-D + PR-E remove the auto-inject after
+    // per-skill migrations land.
+    if let Some(discovery) = &manifest.discovery {
+        extras
+            .prompt_fragments
+            .push(render_skill_card(manifest, discovery, skill_dir));
     }
 
     // Auto-inject SKILL.md when skill has spawn_only tools so the LLM
@@ -102,6 +114,67 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
     }
 
     extras
+}
+
+/// Render a skill card from manifest discovery hints (PR-C of the SKILL.md
+/// rethink). Output is a fixed-shape text block, ~5-10 lines, suitable for
+/// concatenating into the system prompt alongside (or eventually instead
+/// of) the legacy SKILL.md auto-inject.
+///
+/// Shape:
+/// ```text
+/// - name: <plugin_name>
+///   purpose: <discovery.summary OR "(no summary)">
+///   tools: <comma-separated tool names>
+///   skill_dir: <absolute path>
+///   if you need:
+///     - <hint[0].when> → read <path> OR list <pattern>
+///     ...
+/// ```
+///
+/// When `discovery.hints` is empty, the `if you need:` section is omitted
+/// so the card stays compact (4 lines).
+fn render_skill_card(
+    manifest: &PluginManifest,
+    discovery: &SkillDiscovery,
+    skill_dir: &Path,
+) -> String {
+    let purpose = discovery.summary.as_deref().unwrap_or("(no summary)");
+    let tools = manifest
+        .tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut card = String::with_capacity(256);
+    card.push_str(&format!("- name: {}\n", manifest.name));
+    card.push_str(&format!("  purpose: {purpose}\n"));
+    card.push_str(&format!("  tools: {tools}\n"));
+    card.push_str(&format!("  skill_dir: {}\n", skill_dir.display()));
+
+    if !discovery.hints.is_empty() {
+        card.push_str("  if you need:\n");
+        for hint in &discovery.hints {
+            let action = match (&hint.read, &hint.list) {
+                (Some(r), Some(l)) => format!("read {r} OR list {l}"),
+                (Some(r), None) => format!("read {r}"),
+                (None, Some(l)) => format!("list {l}"),
+                // Deser-time validation rejects (None, None), but
+                // render defensively in case a future construction path
+                // bypasses parse-time validation.
+                (None, None) => continue,
+            };
+            card.push_str(&format!("    - {} → {action}\n", hint.when));
+        }
+    }
+
+    // Strip trailing newline so successive fragments don't accumulate
+    // double blank lines when joined.
+    if card.ends_with('\n') {
+        card.pop();
+    }
+    card
 }
 
 /// Convert a skill MCP server declaration into a runtime `McpServerConfig`.
@@ -309,6 +382,7 @@ mod tests {
             mcp_servers: vec![],
             hooks: vec![],
             prompts: None,
+            discovery: None,
         };
         let extras = resolve_extras(&manifest, Path::new("/skills/test"));
         assert!(extras.mcp_servers.is_empty());
@@ -337,6 +411,7 @@ mod tests {
             prompts: Some(SkillPrompts {
                 include: vec!["prompts/*.md".into()],
             }),
+            discovery: None,
         };
         let extras = resolve_extras(&manifest, dir.path());
         assert_eq!(extras.prompt_fragments.len(), 2);
@@ -346,6 +421,217 @@ mod tests {
                 .prompt_fragments
                 .iter()
                 .any(|f| f.contains("Be careful"))
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // SKILL.md PR-C: skill card rendering from discovery field
+    // ------------------------------------------------------------------
+
+    fn manifest_for_card_test(
+        name: &str,
+        tools: Vec<&str>,
+        discovery: Option<crate::plugins::manifest::SkillDiscovery>,
+        any_spawn_only: bool,
+    ) -> PluginManifest {
+        use crate::plugins::manifest::PluginToolDef;
+        PluginManifest {
+            name: name.into(),
+            version: "1.0.0".into(),
+            tools: tools
+                .into_iter()
+                .map(|t| PluginToolDef {
+                    name: t.into(),
+                    description: "desc".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    spawn_only: any_spawn_only,
+                    env: vec![],
+                    risk: None,
+                    spawn_only_message: None,
+                    concurrency_class: None,
+                })
+                .collect(),
+            sha256: None,
+            binaries: HashMap::new(),
+            requires_network: false,
+            timeout_secs: None,
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompts: None,
+            discovery,
+        }
+    }
+
+    #[test]
+    fn extras_renders_skill_card_when_discovery_present() {
+        use crate::plugins::manifest::{DiscoveryHint, SkillDiscovery};
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+
+        let discovery = SkillDiscovery {
+            summary: Some("Generate AI presentation slides.".into()),
+            hints: vec![
+                DiscoveryHint {
+                    when: "user asks for editable PPT".into(),
+                    read: Some("SKILL.md#mode-2".into()),
+                    list: None,
+                },
+                DiscoveryHint {
+                    when: "picking a style".into(),
+                    read: None,
+                    list: Some("styles/*.toml".into()),
+                },
+            ],
+        };
+
+        let manifest = manifest_for_card_test(
+            "mofa-slides",
+            vec!["slides_generate", "slides_preview"],
+            Some(discovery),
+            false, // no spawn_only — only the card should appear
+        );
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        // Card is the only fragment.
+        assert_eq!(
+            extras.prompt_fragments.len(),
+            1,
+            "expected exactly one fragment (the skill card); got {:?}",
+            extras.prompt_fragments
+        );
+        let card = &extras.prompt_fragments[0];
+
+        assert!(
+            card.contains("name: mofa-slides"),
+            "card missing name line: {card}"
+        );
+        assert!(
+            card.contains("purpose: Generate AI presentation slides."),
+            "card missing purpose line: {card}"
+        );
+        assert!(
+            card.contains("tools: slides_generate, slides_preview"),
+            "card missing tools line: {card}"
+        );
+        assert!(
+            card.contains(&format!("skill_dir: {}", skill_dir.display())),
+            "card missing skill_dir line: {card}"
+        );
+        assert!(
+            card.contains("if you need:"),
+            "card missing 'if you need:' header: {card}"
+        );
+        assert!(
+            card.contains("user asks for editable PPT"),
+            "card missing first hint when: {card}"
+        );
+        assert!(
+            card.contains("read SKILL.md#mode-2"),
+            "card missing first hint read target: {card}"
+        );
+        assert!(
+            card.contains("picking a style"),
+            "card missing second hint when: {card}"
+        );
+        assert!(
+            card.contains("list styles/*.toml"),
+            "card missing second hint list target: {card}"
+        );
+
+        // Cap at ~10 lines total.
+        let line_count = card.lines().count();
+        assert!(
+            line_count <= 10,
+            "card too long ({line_count} lines): {card}"
+        );
+    }
+
+    #[test]
+    fn extras_omits_skill_card_when_discovery_absent() {
+        // No discovery + no spawn_only + nothing else → no fragments.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest_for_card_test("legacy", vec!["t"], None, false);
+        let extras = resolve_extras(&manifest, dir.path());
+        assert!(
+            extras.prompt_fragments.is_empty(),
+            "expected no fragments without discovery; got {:?}",
+            extras.prompt_fragments
+        );
+    }
+
+    #[test]
+    fn extras_renders_card_alongside_legacy_auto_inject() {
+        use crate::plugins::manifest::{DiscoveryHint, SkillDiscovery};
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+        // Legacy auto-inject writes SKILL.md content into the prompt.
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Legacy SKILL.md\nMode 1: foo. Mode 2: bar.\n",
+        )
+        .unwrap();
+
+        let discovery = SkillDiscovery {
+            summary: Some("Modes 1+2 for slides.".into()),
+            hints: vec![DiscoveryHint {
+                when: "user wants editable PPT".into(),
+                read: Some("SKILL.md#mode-2".into()),
+                list: None,
+            }],
+        };
+        // any_spawn_only=true → triggers legacy auto-inject.
+        let manifest = manifest_for_card_test(
+            "mofa-slides",
+            vec!["slides_generate"],
+            Some(discovery),
+            true,
+        );
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        assert_eq!(
+            extras.prompt_fragments.len(),
+            2,
+            "expected card + legacy auto-inject; got {:?}",
+            extras.prompt_fragments
+        );
+
+        let has_card = extras
+            .prompt_fragments
+            .iter()
+            .any(|f| f.contains("name: mofa-slides") && f.contains("purpose:"));
+        let has_legacy = extras
+            .prompt_fragments
+            .iter()
+            .any(|f| f.contains("Legacy SKILL.md") && f.contains("Mode 1: foo"));
+
+        assert!(has_card, "card fragment missing");
+        assert!(has_legacy, "legacy SKILL.md fragment missing");
+    }
+
+    #[test]
+    fn extras_renders_card_with_empty_hints() {
+        use crate::plugins::manifest::SkillDiscovery;
+
+        let dir = tempfile::tempdir().unwrap();
+        let discovery = SkillDiscovery {
+            summary: Some("Minimal skill.".into()),
+            hints: vec![],
+        };
+        let manifest = manifest_for_card_test("minimal-skill", vec!["t"], Some(discovery), false);
+
+        let extras = resolve_extras(&manifest, dir.path());
+        assert_eq!(extras.prompt_fragments.len(), 1);
+        let card = &extras.prompt_fragments[0];
+
+        assert!(card.contains("name: minimal-skill"));
+        assert!(card.contains("purpose: Minimal skill."));
+        assert!(card.contains("tools: t"));
+        // No "if you need:" section when hints are empty.
+        assert!(
+            !card.contains("if you need:"),
+            "empty hints should NOT render 'if you need:' header: {card}"
         );
     }
 }

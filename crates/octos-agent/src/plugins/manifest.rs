@@ -4,6 +4,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer};
 
+/// Maximum number of discovery hints a skill manifest may declare.
+///
+/// The hints render into the LLM system prompt as a per-skill "skill card";
+/// growing the list without bound would silently push out other system
+/// prompt content. 8 keeps each card to a ~10-line budget.
+pub const MAX_DISCOVERY_HINTS: usize = 8;
+
 /// A plugin manifest (manifest.json).
 #[derive(Debug, Deserialize)]
 pub struct PluginManifest {
@@ -43,6 +50,16 @@ pub struct PluginManifest {
     /// Prompt fragments to inject into the system prompt.
     #[serde(default)]
     pub prompts: Option<SkillPrompts>,
+    /// Optional LLM-facing discovery hints.
+    ///
+    /// When present, `resolve_extras` renders a short "skill card" into the
+    /// system prompt so the agent learns (1) the skill exists, (2) where
+    /// its directory lives, and (3) which files to read or list first.
+    /// This is the opt-in migration affordance for the SKILL.md rethink:
+    /// plugins that add `discovery` get the card; plugins without it keep
+    /// the legacy SKILL.md auto-inject only (see `extras.rs`).
+    #[serde(default, deserialize_with = "deserialize_discovery")]
+    pub discovery: Option<SkillDiscovery>,
 }
 
 impl PluginManifest {
@@ -70,6 +87,108 @@ where
         )),
         other => Ok(other),
     }
+}
+
+/// LLM-facing discovery hints declared by a skill manifest.
+///
+/// The renderer in `extras.rs` turns this into a short skill card pushed
+/// into `SkillExtras.prompt_fragments`. The card tells the agent the skill
+/// exists, where its directory lives, and which paths to read or list to
+/// learn more. See PR-C of the SKILL.md rethink.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct SkillDiscovery {
+    /// One-line description of what the skill does. Falls back to
+    /// `"(no summary)"` in the rendered card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Up to `MAX_DISCOVERY_HINTS` pointers the LLM can follow on its
+    /// own (via the already-allowlisted `read_file`/`glob`/`list_dir`
+    /// tools from PR-A + PR-B).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<DiscoveryHint>,
+}
+
+/// A single discovery hint: when this trigger applies, the LLM should
+/// either read a file or list a glob pattern under the skill directory.
+///
+/// At least one of `read` or `list` must be set; both is allowed (the
+/// renderer joins them with " OR "). Paths are validated at parse time
+/// to reject `..` traversal — discovery hints feed the system prompt,
+/// so a hostile manifest could otherwise nudge the LLM to read arbitrary
+/// files via the now-permissive skill-dir scope from PR-A.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DiscoveryHint {
+    /// Human-readable trigger condition, e.g.
+    /// `"user asks for editable PPT"`.
+    pub when: String,
+    /// Path (or fragment-anchored path) to read. Relative to the skill
+    /// directory. Must not contain `..`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    /// Glob pattern to list. Relative to the skill directory. Must not
+    /// contain `..`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+}
+
+/// Validating deserializer for `PluginManifest::discovery`.
+///
+/// Enforces:
+/// * At most `MAX_DISCOVERY_HINTS` hints.
+/// * Neither `read` nor `list` may contain `..` (path traversal).
+/// * Each hint must declare at least one of `read` or `list`.
+///
+/// A rejected manifest is a hard error at parse time so a malicious or
+/// typo'd discovery block never reaches the LLM-facing renderer.
+fn deserialize_discovery<'de, D>(d: D) -> Result<Option<SkillDiscovery>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let maybe = Option::<SkillDiscovery>::deserialize(d)?;
+    let Some(disc) = maybe else {
+        return Ok(None);
+    };
+
+    if disc.hints.len() > MAX_DISCOVERY_HINTS {
+        return Err(D::Error::custom(format!(
+            "manifest.discovery.hints declares {} entries; the maximum allowed is {} (MAX_DISCOVERY_HINTS)",
+            disc.hints.len(),
+            MAX_DISCOVERY_HINTS
+        )));
+    }
+
+    for (idx, hint) in disc.hints.iter().enumerate() {
+        if hint.read.is_none() && hint.list.is_none() {
+            return Err(D::Error::custom(format!(
+                "manifest.discovery.hints[{idx}] declares neither `read` nor `list`; at least one is required"
+            )));
+        }
+        if let Some(path) = &hint.read
+            && hint_path_has_traversal(path)
+        {
+            return Err(D::Error::custom(format!(
+                "manifest.discovery.hints[{idx}].read contains path traversal (..): {path:?}"
+            )));
+        }
+        if let Some(pattern) = &hint.list
+            && hint_path_has_traversal(pattern)
+        {
+            return Err(D::Error::custom(format!(
+                "manifest.discovery.hints[{idx}].list contains path traversal (..): {pattern:?}"
+            )));
+        }
+    }
+
+    Ok(Some(disc))
+}
+
+/// Return `true` if a discovery-hint path (or glob pattern) contains a
+/// `..` traversal segment. Splits on both `/` and `\` to cover Windows
+/// authors editing manifests on Unix and vice versa, then matches the
+/// trimmed segment exactly so `..foo` (legitimate filename) survives.
+fn hint_path_has_traversal(path: &str) -> bool {
+    path.split(['/', '\\']).any(|seg| seg.trim() == "..")
 }
 
 /// An MCP server declared by a skill manifest.
@@ -840,6 +959,150 @@ mod tests {
         assert_eq!(
             def_with_concurrency(Some("   ")).classify_concurrency_class(),
             ConcurrencyClassClassification::Unset
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // SKILL.md PR-C: discovery field
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn manifest_parses_with_discovery_field() {
+        let json = r#"{
+            "name": "mofa-slides",
+            "version": "0.6.1",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "summary": "Generate AI presentation slides with full-bleed Gemini images.",
+                "hints": [
+                    { "when": "user asks for editable PPT", "read": "SKILL.md#mode-2" },
+                    { "when": "picking a style", "list": "styles/*.toml" },
+                    { "when": "authoring custom styles", "read": "docs/custom-styles.md" }
+                ]
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        let discovery = manifest.discovery.expect("discovery present");
+        assert_eq!(
+            discovery.summary.as_deref(),
+            Some("Generate AI presentation slides with full-bleed Gemini images.")
+        );
+        assert_eq!(discovery.hints.len(), 3);
+        assert_eq!(discovery.hints[0].when, "user asks for editable PPT");
+        assert_eq!(discovery.hints[0].read.as_deref(), Some("SKILL.md#mode-2"));
+        assert!(discovery.hints[0].list.is_none());
+        assert_eq!(discovery.hints[1].when, "picking a style");
+        assert!(discovery.hints[1].read.is_none());
+        assert_eq!(discovery.hints[1].list.as_deref(), Some("styles/*.toml"));
+        assert_eq!(discovery.hints[2].when, "authoring custom styles");
+        assert_eq!(
+            discovery.hints[2].read.as_deref(),
+            Some("docs/custom-styles.md")
+        );
+    }
+
+    #[test]
+    fn manifest_parses_without_discovery_field() {
+        let json = r#"{
+            "name": "legacy-plugin",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.discovery.is_none());
+    }
+
+    #[test]
+    fn manifest_rejects_too_many_hints() {
+        // 9 hints — exceeds MAX_DISCOVERY_HINTS (8).
+        let json = r#"{
+            "name": "noisy",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "summary": "Too many hints.",
+                "hints": [
+                    { "when": "a", "read": "a.md" },
+                    { "when": "b", "read": "b.md" },
+                    { "when": "c", "read": "c.md" },
+                    { "when": "d", "read": "d.md" },
+                    { "when": "e", "read": "e.md" },
+                    { "when": "f", "read": "f.md" },
+                    { "when": "g", "read": "g.md" },
+                    { "when": "h", "read": "h.md" },
+                    { "when": "i", "read": "i.md" }
+                ]
+            }
+        }"#;
+        let err =
+            serde_json::from_str::<PluginManifest>(json).expect_err("9 hints must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hints") && msg.contains("8"),
+            "error must mention hint cap; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_traversal_in_hint_read() {
+        let json = r#"{
+            "name": "evil",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "hints": [
+                    { "when": "exfil", "read": "../etc/passwd" }
+                ]
+            }
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json)
+            .expect_err("traversal in `read` must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("..") || msg.to_lowercase().contains("traversal"),
+            "error must mention traversal; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_traversal_in_hint_list() {
+        let json = r#"{
+            "name": "evil",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "hints": [
+                    { "when": "exfil", "list": "../../*" }
+                ]
+            }
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json)
+            .expect_err("traversal in `list` must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("..") || msg.to_lowercase().contains("traversal"),
+            "error must mention traversal; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_hint_with_no_read_or_list() {
+        let json = r#"{
+            "name": "blank",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "hints": [
+                    { "when": "user wants thing" }
+                ]
+            }
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json)
+            .expect_err("hint with neither read nor list must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("read") || msg.to_lowercase().contains("list"),
+            "error must explain hint needs read or list; got: {msg}"
         );
     }
 }
