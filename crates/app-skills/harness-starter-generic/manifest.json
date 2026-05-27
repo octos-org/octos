@@ -21,5 +21,8 @@
         "required": ["label"]
       }
     }
-  ]
+  ],
+  "discovery": {
+    "summary": "Minimal harnessed single-artifact starter template; writes one text file under output/ and relies on the workspace contract to verify and deliver it."
+  }
 }

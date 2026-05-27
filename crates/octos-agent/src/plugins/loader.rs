@@ -12,7 +12,7 @@ use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
-use super::extras::{SkillExtras, resolve_extras};
+use super::extras::{SKILL_EXPLORATION_PREAMBLE, SkillExtras, resolve_extras};
 use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
 use super::tool::{PluginTool, SynthesisConfig};
 
@@ -90,7 +90,27 @@ impl PluginLoadResult {
     fn merge_extras(&mut self, extras: SkillExtras) {
         self.mcp_servers.extend(extras.mcp_servers);
         self.hooks.extend(extras.hooks);
-        self.prompt_fragments.extend(extras.prompt_fragments);
+        // PR-F: dedup the generic exploration preamble across plugins.
+        // Each discovery-bearing plugin pushes the same constant string
+        // through `resolve_extras`; keeping every copy would balloon the
+        // system prompt with N identical paragraphs (`N` = number of
+        // skills that ship a `discovery` block). The first occurrence
+        // wins; later duplicates of the same exact string are dropped.
+        // Non-preamble fragments (skill cards, prompts.include outputs)
+        // are NOT deduped — distinct cards must survive.
+        let mut have_preamble = self
+            .prompt_fragments
+            .iter()
+            .any(|f| f.as_str() == SKILL_EXPLORATION_PREAMBLE);
+        for frag in extras.prompt_fragments {
+            if frag.as_str() == SKILL_EXPLORATION_PREAMBLE {
+                if have_preamble {
+                    continue;
+                }
+                have_preamble = true;
+            }
+            self.prompt_fragments.push(frag);
+        }
     }
 }
 
@@ -2425,5 +2445,95 @@ edition = "2021"
                 skill_entries,
             );
         }
+    }
+
+    /// PR-F: the loader's `merge_extras` step folds duplicate
+    /// `SKILL_EXPLORATION_PREAMBLE` strings across plugins so the
+    /// system prompt only contains the preamble once even when N
+    /// plugins each declare a `discovery` block. Distinct skill cards
+    /// must survive — the dedup only collapses the constant string.
+    #[test]
+    fn merge_extras_dedupes_preamble_across_plugins() {
+        let mut result = PluginLoadResult::default();
+
+        // First plugin: preamble + card-one.
+        let e1 = SkillExtras {
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompt_fragments: vec![
+                SKILL_EXPLORATION_PREAMBLE.to_string(),
+                "- name: card-one\n  purpose: a\n  tools: t1\n  skill_dir: /tmp/a".to_string(),
+            ],
+            spawn_only_tools: vec![],
+            spawn_only_messages: Default::default(),
+        };
+        result.merge_extras(e1);
+
+        // Second plugin: preamble (duplicate) + card-two.
+        let e2 = SkillExtras {
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompt_fragments: vec![
+                SKILL_EXPLORATION_PREAMBLE.to_string(),
+                "- name: card-two\n  purpose: b\n  tools: t2\n  skill_dir: /tmp/b".to_string(),
+            ],
+            spawn_only_tools: vec![],
+            spawn_only_messages: Default::default(),
+        };
+        result.merge_extras(e2);
+
+        // Third plugin: preamble (duplicate) + card-three.
+        let e3 = SkillExtras {
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompt_fragments: vec![
+                SKILL_EXPLORATION_PREAMBLE.to_string(),
+                "- name: card-three\n  purpose: c\n  tools: t3\n  skill_dir: /tmp/c".to_string(),
+            ],
+            spawn_only_tools: vec![],
+            spawn_only_messages: Default::default(),
+        };
+        result.merge_extras(e3);
+
+        // Preamble appears exactly once across the merged result.
+        let preamble_count = result
+            .prompt_fragments
+            .iter()
+            .filter(|f| f.as_str() == SKILL_EXPLORATION_PREAMBLE)
+            .count();
+        assert_eq!(
+            preamble_count, 1,
+            "preamble must be deduped to a single occurrence; got {preamble_count} \
+             in {:?}",
+            result.prompt_fragments
+        );
+
+        // All three cards survive.
+        assert!(
+            result
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("name: card-one"))
+        );
+        assert!(
+            result
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("name: card-two"))
+        );
+        assert!(
+            result
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("name: card-three"))
+        );
+
+        // Length: 1 preamble + 3 cards = 4 fragments total.
+        assert_eq!(
+            result.prompt_fragments.len(),
+            4,
+            "expected 4 fragments (1 preamble + 3 cards); got {:?}",
+            result.prompt_fragments
+        );
     }
 }

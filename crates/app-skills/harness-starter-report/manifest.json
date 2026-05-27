@@ -25,5 +25,8 @@
         "required": ["topic"]
       }
     }
-  ]
+  ],
+  "discovery": {
+    "summary": "Harnessed report-generator starter template; ships a markdown deliverable under reports/ and gates delivery on file_size_min:256 with structured on_failure notification."
+  }
 }

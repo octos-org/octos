@@ -11,6 +11,24 @@ use crate::mcp::McpServerConfig;
 
 use super::manifest::{PluginManifest, SkillDiscovery, SkillHookDef, SkillMcpServer};
 
+/// One-paragraph generic preamble pushed once per `resolve_extras` invocation
+/// (before any plugin cards). Tells the LLM the skill_dir is read-accessible
+/// via the existing file tools and to treat the skill source as the source
+/// of truth rather than guessing from the card's summary.
+///
+/// PR-F replaced PR-C/D's per-hint curation with this generic instruction
+/// after observing (a) hand-curated trigger phrases didn't survive doc
+/// renames, and (b) the hints implicitly narrowed LLM curiosity vs. the
+/// "you have the filesystem, go look" model that Claude Code's skill loader
+/// uses successfully.
+pub const SKILL_EXPLORATION_PREAMBLE: &str = "\
+Active plugin skill directories are listed below as cards. Each `skill_dir` \
+is read-accessible via `read_file`, `glob`, `list_dir`, `grep`. When you need \
+a format schema, a worked example, the available styles/templates, or any \
+other detail beyond the card's summary, READ the relevant files (SKILL.md, \
+docs/*, examples/*, schemas, etc.) before guessing. The code and examples in \
+skill_dir are the source of truth; the card is just a pointer.";
+
 /// Resolved extras from a skill manifest, ready to merge into agent config.
 #[derive(Debug, Default)]
 pub struct SkillExtras {
@@ -28,7 +46,19 @@ pub struct SkillExtras {
 /// - MCP: resolves relative commands against `skill_dir`, looks up env var names
 ///   from the process environment.
 /// - Hooks: parses event strings into `HookEvent`, resolves relative command paths.
+/// - Discovery: renders a short 5-line skill card (PR-F) preceded by a
+///   generic exploration preamble emitted once per call.
 /// - Prompts: expands glob patterns against `skill_dir`, reads `.md` files.
+///
+/// PR-E note: the legacy "auto-inject the full SKILL.md body for spawn_only
+/// plugins" code path has been removed. The discovery card + preamble are
+/// the structured replacement; an explicit `prompts.include` glob is the
+/// escape hatch for skills that still want a prompt fragment embedded.
+///
+/// PR-F note: only one preamble survives per session (multiple plugins all
+/// push the same constant string; the loader's merge step folds duplicates
+/// before serialising into the system prompt). The card itself collapsed
+/// to 5 lines (name / purpose / tools / skill_dir).
 pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtras {
     let mut extras = SkillExtras::default();
 
@@ -49,45 +79,23 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
         }
     }
 
-    // PR-C of the SKILL.md rethink: when the manifest declares a
-    // `discovery` block, render a short skill card into the system
-    // prompt so the LLM learns where the skill dir is and what to
-    // read or list first. The card coexists with the legacy SKILL.md
-    // auto-inject below — PR-D + PR-E remove the auto-inject after
-    // per-skill migrations land.
+    // PR-F: emit the generic exploration preamble + the 5-line card.
+    // Per-hint curation from PR-C/D is gone — the preamble tells the
+    // LLM to explore the skill_dir directly via the already-allowlisted
+    // file tools.
+    //
+    // `resolve_extras` runs once per plugin; every discovery-bearing
+    // plugin pushes the same preamble constant. Downstream merge code
+    // (`PluginLoadResult::merge_extras`) is responsible for keeping only
+    // the first preamble occurrence so the final system prompt has it
+    // exactly once. See `extras_emits_exploration_preamble_once_per_session`.
     if let Some(discovery) = &manifest.discovery {
         extras
             .prompt_fragments
+            .push(SKILL_EXPLORATION_PREAMBLE.to_string());
+        extras
+            .prompt_fragments
             .push(render_skill_card(manifest, discovery, skill_dir));
-    }
-
-    // Auto-inject SKILL.md when skill has spawn_only tools so the LLM
-    // knows how to access deferred tools via spawn.
-    //
-    // M10 Phase 4 (codex round 2 P2): the `read_task_output` contract
-    // teaching is NOT injected globally here. The `extras.prompt_fragments`
-    // are merged into the system prompt on every agent that loads the
-    // skill — including CLI chat / swarm workers whose registries do not
-    // wire `read_task_output`. Without registry-aware gating those agents
-    // would learn about a tool they cannot call. Instead, the
-    // `spawn_only_handle_message` envelope itself documents the contract
-    // inline (`read_with`, `read_modes`, and the `summary` field), so
-    // only agents that actually emit the new envelope teach the LLM
-    // about it — automatic and consistent with the gating in
-    // `execution.rs::is_tool_visible`.
-    //
-    // PR-D1 of the SKILL.md rethink: a plugin can opt out of this legacy
-    // auto-inject by setting `skill_md_auto_inject: false` in its manifest.
-    // The flag defaults to `true` so unmigrated plugins keep current
-    // behavior; PR-D2 (mofa-skills) opts each mofa-* skill in, and PR-E
-    // eventually flips the default.
-    if manifest.skill_md_auto_inject && manifest.tools.iter().any(|t| t.spawn_only) {
-        let skill_md = skill_dir.join("SKILL.md");
-        if skill_md.exists() {
-            if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                extras.prompt_fragments.push(content);
-            }
-        }
     }
 
     if let Some(prompts) = &manifest.prompts {
@@ -122,24 +130,22 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
     extras
 }
 
-/// Render a skill card from manifest discovery hints (PR-C of the SKILL.md
-/// rethink). Output is a fixed-shape text block, ~5-10 lines, suitable for
-/// concatenating into the system prompt alongside (or eventually instead
-/// of) the legacy SKILL.md auto-inject.
+/// Render a 5-line skill card from manifest discovery (PR-F).
 ///
-/// Shape:
+/// Output is a fixed-shape text block, suitable for concatenating into
+/// the system prompt alongside the generic exploration preamble. The
+/// `if you need:` section from PR-C/D is gone; the preamble tells the
+/// LLM the skill_dir is read-accessible and to look there instead of
+/// trusting the card.
+///
+/// Shape (4 newline-separated lines; the final `skill_dir` line has no
+/// trailing newline so successive fragments don't accumulate blanks):
 /// ```text
 /// - name: <plugin_name>
 ///   purpose: <discovery.summary OR "(no summary)">
 ///   tools: <comma-separated tool names>
 ///   skill_dir: <absolute path>
-///   if you need:
-///     - <hint[0].when> → read <path> OR list <pattern>
-///     ...
 /// ```
-///
-/// When `discovery.hints` is empty, the `if you need:` section is omitted
-/// so the card stays compact (4 lines).
 fn render_skill_card(
     manifest: &PluginManifest,
     discovery: &SkillDiscovery,
@@ -157,29 +163,7 @@ fn render_skill_card(
     card.push_str(&format!("- name: {}\n", manifest.name));
     card.push_str(&format!("  purpose: {purpose}\n"));
     card.push_str(&format!("  tools: {tools}\n"));
-    card.push_str(&format!("  skill_dir: {}\n", skill_dir.display()));
-
-    if !discovery.hints.is_empty() {
-        card.push_str("  if you need:\n");
-        for hint in &discovery.hints {
-            let action = match (&hint.read, &hint.list) {
-                (Some(r), Some(l)) => format!("read {r} OR list {l}"),
-                (Some(r), None) => format!("read {r}"),
-                (None, Some(l)) => format!("list {l}"),
-                // Deser-time validation rejects (None, None), but
-                // render defensively in case a future construction path
-                // bypasses parse-time validation.
-                (None, None) => continue,
-            };
-            card.push_str(&format!("    - {} → {action}\n", hint.when));
-        }
-    }
-
-    // Strip trailing newline so successive fragments don't accumulate
-    // double blank lines when joined.
-    if card.ends_with('\n') {
-        card.pop();
-    }
+    card.push_str(&format!("  skill_dir: {}", skill_dir.display()));
     card
 }
 
@@ -389,7 +373,6 @@ mod tests {
             hooks: vec![],
             prompts: None,
             discovery: None,
-            skill_md_auto_inject: true,
         };
         let extras = resolve_extras(&manifest, Path::new("/skills/test"));
         assert!(extras.mcp_servers.is_empty());
@@ -419,7 +402,6 @@ mod tests {
                 include: vec!["prompts/*.md".into()],
             }),
             discovery: None,
-            skill_md_auto_inject: true,
         };
         let extras = resolve_extras(&manifest, dir.path());
         assert_eq!(extras.prompt_fragments.len(), 2);
@@ -433,7 +415,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // SKILL.md PR-C: skill card rendering from discovery field
+    // SKILL.md PR-F: 5-line skill card + generic exploration preamble
     // ------------------------------------------------------------------
 
     fn manifest_for_card_test(
@@ -441,20 +423,6 @@ mod tests {
         tools: Vec<&str>,
         discovery: Option<crate::plugins::manifest::SkillDiscovery>,
         any_spawn_only: bool,
-    ) -> PluginManifest {
-        manifest_for_card_test_with_flag(name, tools, discovery, any_spawn_only, true)
-    }
-
-    /// Variant of `manifest_for_card_test` that exposes the PR-D1
-    /// `skill_md_auto_inject` flag. The shorter helper above wraps this
-    /// with `skill_md_auto_inject: true` (the default) to keep older
-    /// tests readable.
-    fn manifest_for_card_test_with_flag(
-        name: &str,
-        tools: Vec<&str>,
-        discovery: Option<crate::plugins::manifest::SkillDiscovery>,
-        any_spawn_only: bool,
-        skill_md_auto_inject: bool,
     ) -> PluginManifest {
         use crate::plugins::manifest::PluginToolDef;
         PluginManifest {
@@ -481,52 +449,57 @@ mod tests {
             hooks: vec![],
             prompts: None,
             discovery,
-            skill_md_auto_inject,
         }
     }
 
+    /// PR-F: a manifest with `discovery.summary` set produces exactly the
+    /// 4-line card (`- name`, `  purpose`, `  tools`, `  skill_dir`) plus
+    /// the generic exploration preamble. No `if you need:` section.
     #[test]
-    fn extras_renders_skill_card_when_discovery_present() {
-        use crate::plugins::manifest::{DiscoveryHint, SkillDiscovery};
+    fn extras_renders_5_line_card_with_summary() {
+        use crate::plugins::manifest::SkillDiscovery;
 
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path();
 
         let discovery = SkillDiscovery {
             summary: Some("Generate AI presentation slides.".into()),
-            hints: vec![
-                DiscoveryHint {
-                    when: "user asks for editable PPT".into(),
-                    read: Some("SKILL.md#mode-2".into()),
-                    list: None,
-                },
-                DiscoveryHint {
-                    when: "picking a style".into(),
-                    read: None,
-                    list: Some("styles/*.toml".into()),
-                },
-            ],
         };
 
         let manifest = manifest_for_card_test(
             "mofa-slides",
             vec!["slides_generate", "slides_preview"],
             Some(discovery),
-            false, // no spawn_only — only the card should appear
+            false,
         );
 
         let extras = resolve_extras(&manifest, skill_dir);
-        // Card is the only fragment.
+        // Expect: [preamble, card]
         assert_eq!(
             extras.prompt_fragments.len(),
-            1,
-            "expected exactly one fragment (the skill card); got {:?}",
+            2,
+            "expected preamble + card; got {:?}",
             extras.prompt_fragments
         );
-        let card = &extras.prompt_fragments[0];
 
+        let preamble = &extras.prompt_fragments[0];
         assert!(
-            card.contains("name: mofa-slides"),
+            preamble.contains("Active plugin skill directories")
+                && preamble.contains("read_file")
+                && preamble.contains("source of truth"),
+            "preamble missing expected wording: {preamble}"
+        );
+
+        let card = &extras.prompt_fragments[1];
+        // 4 lines because the trailing newline is stripped from the
+        // skill_dir line (no `if you need:` section).
+        let line_count = card.lines().count();
+        assert_eq!(
+            line_count, 4,
+            "card must be exactly 4 lines (name/purpose/tools/skill_dir); got {line_count}: {card}"
+        );
+        assert!(
+            card.contains("- name: mofa-slides"),
             "card missing name line: {card}"
         );
         assert!(
@@ -541,38 +514,47 @@ mod tests {
             card.contains(&format!("skill_dir: {}", skill_dir.display())),
             "card missing skill_dir line: {card}"
         );
+        // PR-F: no more "if you need:" hint section.
         assert!(
-            card.contains("if you need:"),
-            "card missing 'if you need:' header: {card}"
-        );
-        assert!(
-            card.contains("user asks for editable PPT"),
-            "card missing first hint when: {card}"
-        );
-        assert!(
-            card.contains("read SKILL.md#mode-2"),
-            "card missing first hint read target: {card}"
-        );
-        assert!(
-            card.contains("picking a style"),
-            "card missing second hint when: {card}"
-        );
-        assert!(
-            card.contains("list styles/*.toml"),
-            "card missing second hint list target: {card}"
-        );
-
-        // Cap at ~10 lines total.
-        let line_count = card.lines().count();
-        assert!(
-            line_count <= 10,
-            "card too long ({line_count} lines): {card}"
+            !card.contains("if you need:"),
+            "PR-F card must NOT contain 'if you need:': {card}"
         );
     }
 
+    /// PR-F: when `discovery.summary` is `None`, the purpose line falls
+    /// back to the `(no summary)` placeholder. The card still has all
+    /// four lines so downstream parsing stays stable.
     #[test]
-    fn extras_omits_skill_card_when_discovery_absent() {
-        // No discovery + no spawn_only + nothing else → no fragments.
+    fn extras_renders_card_without_summary_uses_placeholder() {
+        use crate::plugins::manifest::SkillDiscovery;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+
+        let discovery = SkillDiscovery { summary: None };
+
+        let manifest = manifest_for_card_test("noisy-skill", vec!["t"], Some(discovery), false);
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        assert_eq!(extras.prompt_fragments.len(), 2);
+
+        let card = &extras.prompt_fragments[1];
+        assert_eq!(
+            card.lines().count(),
+            4,
+            "card must still be 4 lines when summary is missing"
+        );
+        assert!(
+            card.contains("purpose: (no summary)"),
+            "missing-summary placeholder not used: {card}"
+        );
+    }
+
+    /// PR-F: when no manifest declares `discovery`, neither the preamble
+    /// nor a card fires. The preamble is a discovery-gated companion,
+    /// not a constant system-prompt header.
+    #[test]
+    fn extras_omits_preamble_and_card_when_discovery_absent() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = manifest_for_card_test("legacy", vec!["t"], None, false);
         let extras = resolve_extras(&manifest, dir.path());
@@ -583,234 +565,131 @@ mod tests {
         );
     }
 
+    /// PR-E regression carryover: a spawn_only plugin with a SKILL.md
+    /// file on disk must NOT have its body injected. PR-E already
+    /// removed that path; PR-F adds the discovery-gated preamble +
+    /// card on top, so a spawn_only plugin WITHOUT a discovery block
+    /// still produces zero fragments.
     #[test]
-    fn extras_renders_card_alongside_legacy_auto_inject() {
-        use crate::plugins::manifest::{DiscoveryHint, SkillDiscovery};
-
+    fn extras_skips_legacy_body_for_spawn_only_skill_with_skill_md_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path();
-        // Legacy auto-inject writes SKILL.md content into the prompt.
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "# Legacy SKILL.md\nMode 1: foo. Mode 2: bar.\n",
+            "# Legacy SKILL.md\nPre-PR-E this body would be injected.\n",
         )
         .unwrap();
 
-        let discovery = SkillDiscovery {
-            summary: Some("Modes 1+2 for slides.".into()),
-            hints: vec![DiscoveryHint {
-                when: "user wants editable PPT".into(),
-                read: Some("SKILL.md#mode-2".into()),
-                list: None,
-            }],
-        };
-        // any_spawn_only=true → triggers legacy auto-inject.
         let manifest = manifest_for_card_test(
-            "mofa-slides",
-            vec!["slides_generate"],
-            Some(discovery),
-            true,
-        );
-
-        let extras = resolve_extras(&manifest, skill_dir);
-        assert_eq!(
-            extras.prompt_fragments.len(),
-            2,
-            "expected card + legacy auto-inject; got {:?}",
-            extras.prompt_fragments
-        );
-
-        let has_card = extras
-            .prompt_fragments
-            .iter()
-            .any(|f| f.contains("name: mofa-slides") && f.contains("purpose:"));
-        let has_legacy = extras
-            .prompt_fragments
-            .iter()
-            .any(|f| f.contains("Legacy SKILL.md") && f.contains("Mode 1: foo"));
-
-        assert!(has_card, "card fragment missing");
-        assert!(has_legacy, "legacy SKILL.md fragment missing");
-    }
-
-    #[test]
-    fn extras_renders_card_with_empty_hints() {
-        use crate::plugins::manifest::SkillDiscovery;
-
-        let dir = tempfile::tempdir().unwrap();
-        let discovery = SkillDiscovery {
-            summary: Some("Minimal skill.".into()),
-            hints: vec![],
-        };
-        let manifest = manifest_for_card_test("minimal-skill", vec!["t"], Some(discovery), false);
-
-        let extras = resolve_extras(&manifest, dir.path());
-        assert_eq!(extras.prompt_fragments.len(), 1);
-        let card = &extras.prompt_fragments[0];
-
-        assert!(card.contains("name: minimal-skill"));
-        assert!(card.contains("purpose: Minimal skill."));
-        assert!(card.contains("tools: t"));
-        // No "if you need:" section when hints are empty.
-        assert!(
-            !card.contains("if you need:"),
-            "empty hints should NOT render 'if you need:' header: {card}"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // SKILL.md PR-D1: skill_md_auto_inject opt-out gates legacy SKILL.md
-    // ------------------------------------------------------------------
-
-    /// Opting out (`skill_md_auto_inject: false`) skips the legacy
-    /// auto-inject even when the manifest has a `spawn_only` tool and a
-    /// `SKILL.md` is present on disk. This is the migration end-state for
-    /// step 2 of the rethink — the new discovery card replaces the
-    /// always-injected SKILL.md body.
-    #[test]
-    fn extras_skips_legacy_auto_inject_when_opted_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "# Legacy SKILL.md\nShould NOT be injected when opted out.\n",
-        )
-        .unwrap();
-
-        let manifest = manifest_for_card_test_with_flag(
-            "opted-out",
+            "legacy-spawn-only",
             vec!["bg_tool"],
-            None,  // no discovery — purely a legacy-gate test
-            true,  // any_spawn_only triggers the legacy auto-inject path
-            false, // skill_md_auto_inject opt-out
+            None, // no discovery
+            true, // spawn_only — would have triggered legacy auto-inject
         );
 
         let extras = resolve_extras(&manifest, skill_dir);
         assert!(
             extras.prompt_fragments.is_empty(),
-            "opted-out plugin must not inject SKILL.md; got {:?}",
+            "legacy SKILL.md auto-inject must be gone; got {:?}",
             extras.prompt_fragments
         );
     }
 
-    /// Default behavior (no explicit flag in the manifest, mirrored here
-    /// by passing `skill_md_auto_inject: true`) preserves the legacy
-    /// auto-inject so unmigrated plugins keep working.
+    /// PR-F: the generic exploration preamble must appear exactly ONCE
+    /// per loader-side merge of plugin fragments, even when multiple
+    /// plugins each declare a `discovery` block.
+    ///
+    /// `resolve_extras` itself is called per-plugin, so each
+    /// discovery-bearing plugin pushes the same preamble constant onto
+    /// its own `prompt_fragments` Vec. The loader's `merge_extras` step
+    /// folds duplicates — see `PluginLoadResult::merge_extras` in
+    /// loader.rs — so the final session-wide prompt has the preamble
+    /// once and every distinct card.
+    ///
+    /// This test pins both halves: per-plugin emit AND merge-side dedup.
+    /// A regression in either the constant string or the dedup logic
+    /// surfaces here rather than during a fleet soak.
     #[test]
-    fn extras_runs_legacy_auto_inject_when_opted_in_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "# Legacy SKILL.md\nUnmigrated default behavior.\n",
-        )
-        .unwrap();
+    fn extras_emits_exploration_preamble_once_per_session() {
+        use crate::plugins::manifest::SkillDiscovery;
 
-        // `manifest_for_card_test` constructs with skill_md_auto_inject:true
-        // — the default — so this exercises the "field omitted" path.
-        let manifest = manifest_for_card_test(
-            "legacy-default",
-            vec!["bg_tool"],
-            None,
-            true, // spawn_only present
+        let dir = tempfile::tempdir().unwrap();
+
+        let m1 = manifest_for_card_test(
+            "plugin-one",
+            vec!["t1"],
+            Some(SkillDiscovery {
+                summary: Some("First skill.".into()),
+            }),
+            false,
+        );
+        let m2 = manifest_for_card_test(
+            "plugin-two",
+            vec!["t2"],
+            Some(SkillDiscovery {
+                summary: Some("Second skill.".into()),
+            }),
+            false,
         );
 
-        let extras = resolve_extras(&manifest, skill_dir);
+        let e1 = resolve_extras(&m1, dir.path());
+        let e2 = resolve_extras(&m2, dir.path());
+
+        // Pre-merge: both invocations push the preamble.
+        let combined: Vec<String> = e1
+            .prompt_fragments
+            .iter()
+            .chain(e2.prompt_fragments.iter())
+            .cloned()
+            .collect();
+        let preamble_count = combined
+            .iter()
+            .filter(|f| f.as_str() == SKILL_EXPLORATION_PREAMBLE)
+            .count();
         assert_eq!(
-            extras.prompt_fragments.len(),
-            1,
-            "default plugin must inject SKILL.md exactly once; got {:?}",
-            extras.prompt_fragments
-        );
-        assert!(
-            extras.prompt_fragments[0].contains("Unmigrated default behavior."),
-            "fragment must contain SKILL.md body; got {:?}",
-            extras.prompt_fragments[0]
-        );
-    }
-
-    /// Explicit `true` is equivalent to the default — confirms the gate
-    /// does not silently invert when a manifest opts in loudly.
-    #[test]
-    fn extras_runs_legacy_auto_inject_when_explicitly_true() {
-        let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "# Legacy SKILL.md\nExplicit opt-in body.\n",
-        )
-        .unwrap();
-
-        let manifest = manifest_for_card_test_with_flag(
-            "explicit-legacy",
-            vec!["bg_tool"],
-            None,
-            true,
-            true, // explicit opt-in
+            preamble_count, 2,
+            "each `resolve_extras` call must push the preamble; got {preamble_count} \
+             in {combined:?}"
         );
 
-        let extras = resolve_extras(&manifest, skill_dir);
-        assert_eq!(extras.prompt_fragments.len(), 1);
-        assert!(extras.prompt_fragments[0].contains("Explicit opt-in body."));
-    }
-
-    /// Migration end-state regression: when both `discovery` is present
-    /// AND `skill_md_auto_inject: false` is set, the skill card renders
-    /// but the legacy SKILL.md body does not. This is the configuration
-    /// PR-D2 will produce per migrated mofa-* skill.
-    #[test]
-    fn extras_skips_legacy_but_renders_card_when_discovery_present_and_opted_out() {
-        use crate::plugins::manifest::{DiscoveryHint, SkillDiscovery};
-
-        let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "# Legacy SKILL.md\nShould NOT appear when opted out.\n",
-        )
-        .unwrap();
-
-        let discovery = SkillDiscovery {
-            summary: Some("Migrated skill.".into()),
-            hints: vec![DiscoveryHint {
-                when: "user wants editable PPT".into(),
-                read: Some("SKILL.md#mode-2".into()),
-                list: None,
-            }],
-        };
-
-        let manifest = manifest_for_card_test_with_flag(
-            "mofa-slides",
-            vec!["slides_generate"],
-            Some(discovery),
-            true,  // spawn_only tool present (would normally trigger legacy)
-            false, // but auto-inject is opted out
-        );
-
-        let extras = resolve_extras(&manifest, skill_dir);
+        // Post-merge dedup: only the first preamble survives.
+        let deduped = dedup_preamble(combined.clone());
+        let after = deduped
+            .iter()
+            .filter(|f| f.as_str() == SKILL_EXPLORATION_PREAMBLE)
+            .count();
         assert_eq!(
-            extras.prompt_fragments.len(),
-            1,
-            "migrated plugin must yield card-only (no legacy body); got {:?}",
-            extras.prompt_fragments
+            after, 1,
+            "merge-side dedup must keep exactly one preamble; got {after} in {deduped:?}"
         );
-        let card = &extras.prompt_fragments[0];
-        assert!(card.contains("name: mofa-slides"), "card missing: {card}");
-        assert!(
-            card.contains("purpose: Migrated skill."),
-            "card missing purpose: {card}"
-        );
-        assert!(
-            !card.contains("Should NOT appear"),
-            "legacy SKILL.md body leaked into the card: {card}"
-        );
-        assert!(
-            !extras
-                .prompt_fragments
-                .iter()
-                .any(|f| f.contains("Should NOT appear")),
-            "legacy SKILL.md body leaked as a separate fragment: {:?}",
-            extras.prompt_fragments
-        );
+
+        // The two distinct skill cards must both survive dedup (the
+        // dedup only collapses the preamble, not the cards).
+        assert!(deduped.iter().any(|f| f.contains("name: plugin-one")));
+        assert!(deduped.iter().any(|f| f.contains("name: plugin-two")));
+    }
+
+    /// Test-side helper that models the merge-step dedup the loader
+    /// applies when concatenating per-plugin fragments. Pinning the
+    /// contract here lets `PluginLoadResult::merge_extras` (loader.rs)
+    /// re-use the same constant string match without re-testing the
+    /// substring invariant from scratch.
+    fn dedup_preamble(fragments: Vec<String>) -> Vec<String> {
+        let mut seen = false;
+        fragments
+            .into_iter()
+            .filter(|frag| {
+                if frag.as_str() == SKILL_EXPLORATION_PREAMBLE {
+                    if seen {
+                        false
+                    } else {
+                        seen = true;
+                        true
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect()
     }
 }

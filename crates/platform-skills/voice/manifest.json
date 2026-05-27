@@ -118,5 +118,8 @@
         "required": ["model_type"]
       }
     }
-  ]
+  ],
+  "discovery": {
+    "summary": "On-device ASR + preset-voice TTS (Qwen3 on Apple Silicon) with emotion/speed control and model lifecycle. Voice cloning lives in sibling skill mofa-fm."
+  }
 }

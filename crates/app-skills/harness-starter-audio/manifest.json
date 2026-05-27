@@ -25,5 +25,8 @@
         "required": ["label"]
       }
     }
-  ]
+  ],
+  "discovery": {
+    "summary": "Harnessed audio-artifact starter template; produces a tiny 440 Hz WAV stub under audio/ and verifies it via file_exists + file_size_min:4096."
+  }
 }
