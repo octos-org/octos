@@ -574,9 +574,16 @@ impl PluginTool {
             ) {
                 if let Some(path) = value.as_str() {
                     let absolute = absolutise_against_base(path, join_base);
-                    let classification = scope.classify_lexical_path(&absolute);
+                    // Codex round-2 BLOCKER 1: canonical-classify to
+                    // close the ancestor-symlink escape — a `skill_dir`
+                    // (or any zone root) containing
+                    // `link -> /outside` previously let the lexical
+                    // check accept `<skill_dir>/link/secret` as
+                    // `InSkillDir`.
+                    let (classification, normalised) =
+                        classify_canonical_for_plugin_arg(scope, &absolute);
                     let resolved =
-                        accept_for_intent(&classification, &absolute, path, PathIntent::Read)?;
+                        accept_for_intent(&classification, &normalised, path, PathIntent::Read)?;
                     // Codex round-1 P2 + round-2 P2 (scope review):
                     // basename rescue ONLY fires for `InWorkspace`.
                     // Shared zones and granted dirs (when missing)
@@ -596,9 +603,10 @@ impl PluginTool {
             if matches!(key.as_str(), "out" | "slide_dir") {
                 if let Some(path) = value.as_str() {
                     let absolute = absolutise_against_base(path, join_base);
-                    let classification = scope.classify_lexical_path(&absolute);
+                    let (classification, normalised) =
+                        classify_canonical_for_plugin_arg(scope, &absolute);
                     let resolved =
-                        accept_for_intent(&classification, &absolute, path, PathIntent::Write)?;
+                        accept_for_intent(&classification, &normalised, path, PathIntent::Write)?;
                     rewritten.insert(key.clone(), serde_json::Value::String(resolved));
                     continue;
                 }
@@ -629,10 +637,15 @@ impl PluginTool {
                         candidate.is_absolute() || trimmed.contains('/') || trimmed.contains('\\');
                     if looks_like_path {
                         let absolute = absolutise_against_base(trimmed, join_base);
-                        let classification = scope.classify_lexical_path(&absolute);
+                        // Codex round-2 BLOCKER 1: canonical-classify
+                        // the style path so a symlink anywhere on the
+                        // chain (including inside a skill_dir) is
+                        // resolved before the prefix comparison.
+                        let (classification, normalised) =
+                            classify_canonical_for_plugin_arg(scope, &absolute);
                         let resolved = accept_for_intent(
                             &classification,
-                            &absolute,
+                            &normalised,
                             trimmed,
                             PathIntent::Read,
                         )?;
@@ -689,10 +702,15 @@ impl PluginTool {
                             .and_then(|value| value.as_str())
                         {
                             let absolute = absolutise_against_base(source_image, join_base);
-                            let classification = scope.classify_lexical_path(&absolute);
+                            // Codex round-2 BLOCKER 1: canonical-classify
+                            // per-slide source images for the same
+                            // symlink-escape closure as the top-level
+                            // input-path keys.
+                            let (classification, normalised) =
+                                classify_canonical_for_plugin_arg(scope, &absolute);
                             let resolved = accept_for_intent(
                                 &classification,
-                                &absolute,
+                                &normalised,
                                 source_image,
                                 PathIntent::Read,
                             )?;
@@ -1203,8 +1221,8 @@ enum PathIntent {
 /// Lexically join `raw_path` against `base` when relative; return it
 /// unchanged when already absolute. Mirrors
 /// [`absolutize_path_in_work_dir`] but without the `..` guard — the
-/// downstream [`SessionScope::classify_lexical_path`] already refuses
-/// `ParentDir` components via its lexical normalisation step.
+/// downstream [`classify_for_canonical`] applies a strict lexical
+/// `..` refusal before canonicalising.
 ///
 /// `base` is the registry-rebound `self.work_dir` when set, else
 /// `scope.workspace()` — see `rewrite_args_with_scope` doc and codex
@@ -1216,6 +1234,66 @@ fn absolutise_against_base(raw_path: &str, base: &std::path::Path) -> std::path:
     } else {
         base.join(candidate)
     }
+}
+
+/// Codex round-2 BLOCKER 1 fix (PR #1327 review): classify a plugin-arg
+/// absolute path using the canonical containment guard
+/// [`SessionScope::classify_canonical_path`] so a `skill_dir`
+/// containing `link -> /outside` cannot smuggle
+/// `<skill_dir>/link/secret` through as `InSkillDir`. Mirrors the
+/// containment path that file tools use in `tools/mod.rs::resolve_for_scope`.
+///
+/// Pipeline:
+/// 1. Lexically normalise (collapse `.`, refuse `..`). A traversal
+///    surface returns `PathClassification::OutOfScope` immediately so
+///    the canonicalize walk can't accidentally resurface inside a zone
+///    after climbing out.
+/// 2. Canonicalise the normalised candidate AND each zone root, then
+///    apply the same workspace > granted_dirs > skill_read_zones >
+///    shared_zones order as `classify_lexical_path`.
+///
+/// Returns the (lexically-normalised, NOT canonicalised) absolute path
+/// alongside the classification so callers feed `accept_for_intent` and
+/// the basename-rescue helper the same lexical form they used before
+/// (the canonicalisation is for the classification check only). When
+/// the path fails the `..` guard the classification is
+/// `PathClassification::OutOfScope` and the returned path is the
+/// best-effort lexical join (unused by `accept_for_intent` on the
+/// refuse arm).
+fn classify_canonical_for_plugin_arg(
+    scope: &SessionScope,
+    absolute: &std::path::Path,
+) -> (PathClassification, std::path::PathBuf) {
+    match lexical_normalise_strict_local(absolute) {
+        Some(normalised) => {
+            let classification = scope.classify_canonical_path(&normalised);
+            (classification, normalised)
+        }
+        // Round-2 BLOCKER 1: refuse `..` here too. The bespoke
+        // `classify_lexical_path` path used to swallow this via its
+        // own lexical normalise; we replicate that contract so the
+        // accept/refuse error message stays identical.
+        None => (PathClassification::OutOfScope, absolute.to_path_buf()),
+    }
+}
+
+/// Local copy of `tools::lexical_normalise_strict` (codex round-2
+/// BLOCKER 1). The `tools` module's helper is `pub(crate)` but plugin
+/// tooling can't import it directly without dragging in the entire
+/// `tools/mod.rs` symbol set; this keeps the plugin-tool dependency
+/// surface narrow.
+fn lexical_normalise_strict_local(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    Some(out)
 }
 
 /// Accept or refuse the absolute path based on the pre-computed
@@ -1250,6 +1328,19 @@ fn accept_for_intent(
         (PathClassification::InSharedZone { zone }, PathIntent::Write) => Err(eyre::eyre!(
             "path '{raw_path}' rejected: shared zone '{}' is read-only — writes refused per SessionScope policy",
             zone.display()
+        )),
+        // PR-A: read-only plugin skill dirs follow the same policy as
+        // shared zones — reads allowed, writes refused. Plugin tools
+        // rarely touch their own skill_dir at runtime (skills usually
+        // operate inside the host-provided work_dir), but the match
+        // arm has to be exhaustive and the read/write split here is
+        // consistent with `tools/mod.rs::resolve_for_scope`.
+        (PathClassification::InSkillDir { .. }, PathIntent::Read) => {
+            Ok(absolute.to_string_lossy().into_owned())
+        }
+        (PathClassification::InSkillDir { skill_dir }, PathIntent::Write) => Err(eyre::eyre!(
+            "path '{raw_path}' rejected: plugin skill dir '{}' is read-only — writes refused per SessionScope policy",
+            skill_dir.display()
         )),
         // Out of scope: refuse for both intents. Echo the raw path so
         // the LLM sees what was refused (matches the round-3/4
@@ -1347,11 +1438,20 @@ fn rescue_workspace_input_existence(
     // probe `<workspace>/skill-output/..`, which is still inside the
     // scope but a future widening could regress; reject silently
     // when it escapes.
+    //
+    // Codex round-2 BLOCKER 1: use canonical classification so a
+    // symlinked rescue chain can't sneak the path back out of the
+    // workspace. The rescue always reports `InWorkspace` today (the
+    // resolver only emits workspace-relative paths) but the canonical
+    // check is defence in depth for any future widening that lets the
+    // resolver return scope-external paths.
     let rescued_abs = std::path::PathBuf::from(&rescued);
-    match scope.classify_lexical_path(&rescued_abs) {
+    let (classification, _normalised) = classify_canonical_for_plugin_arg(scope, &rescued_abs);
+    match classification {
         PathClassification::InWorkspace => rescued,
         PathClassification::InGrantedDir { .. }
         | PathClassification::InSharedZone { .. }
+        | PathClassification::InSkillDir { .. }
         | PathClassification::OutOfScope => lexical_absolute.to_string(),
     }
 }
@@ -5873,6 +5973,177 @@ mod tests {
         assert!(
             msg.contains("SKILL.md"),
             "error must reference SKILL.md custom-style authoring: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Codex round-2 BLOCKER 1 (PR #1327 review): canonical-classify
+    // symlink-escape tests. A skill_dir containing
+    // `link -> /outside` previously let
+    // `<skill_dir>/link/secret` slip through as `InSkillDir`.
+    // These pin the fix.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_refuses_input_path_using_symlink_escape_inside_skill_dir() {
+        // Build:
+        //   workspace/              (scope workspace)
+        //   skill_dir/link -> outside/
+        //   outside/secret.txt      (the file the symlink targets)
+        //
+        // Attempting to read `<skill_dir>/link/secret.txt` must be
+        // refused — the canonical classify path resolves the symlink
+        // before the prefix comparison so the candidate lands at
+        // `outside/secret.txt`, which is outside the skill_dir.
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let skill_dir = tempfile::tempdir().expect("skill dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"AGENT_MUST_NEVER_READ_THIS").unwrap();
+        let link = skill_dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create symlink");
+
+        // The skill_read_zone is the canonical (resolved) skill_dir,
+        // mirroring what `runtime/session.rs` /  `chat.rs` /
+        // `ActorFactory::spawn` configure after the round-2 BLOCKER 2
+        // fix-closed canonicalisation.
+        let canonical_skill_dir = std::fs::canonicalize(skill_dir.path()).expect("canonicalize");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .expect("build solo scope")
+            .with_skill_read_zones(vec![canonical_skill_dir])
+            .expect("attach skill_read_zone");
+
+        let tool = PluginTool::new(
+            "plug".into(),
+            input_path_def("audio_path"),
+            PathBuf::from("/bin/true"),
+        );
+
+        // Plugin would pass `<skill_dir>/link/secret.txt` lexically.
+        let candidate = link.join("secret.txt").to_string_lossy().into_owned();
+        let err = tool
+            .rewrite_args_with_scope(
+                &json!({"audio_path": candidate.clone()}),
+                &scope,
+                scope.workspace(),
+            )
+            .expect_err(
+                "scope must refuse a skill_dir/symlink/<file> candidate after canonical classify",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&candidate),
+            "error must echo the rejected raw path: {msg}",
+        );
+        // Wording follows the OutOfScope arm of `accept_for_intent` — the
+        // canonical classify drops the candidate out of every zone, so
+        // the scope-aware refusal text applies.
+        assert!(
+            msg.contains("escapes plugin work dir"),
+            "error must surface OutOfScope refusal wording: {msg}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_refuses_output_path_using_symlink_escape_inside_workspace() {
+        // Same symlink-escape closure for output keys. Build:
+        //   workspace/link -> outside/
+        //   outside/                 (writable bait location)
+        //
+        // The bespoke #1186 / #1189 chain refused this case because of
+        // its `..` guard; the SessionScope contract has to reach the
+        // same answer without `..` — the canonical classify finds the
+        // candidate is outside the workspace once the symlink is
+        // resolved and refuses the write.
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let link = workspace.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create symlink");
+
+        let scope = solo_scope_at(workspace.path());
+        let def = PluginToolDef {
+            name: "phase2b_output_tool".to_string(),
+            description: "fixture".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"out": {"type": "string"}}
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+
+        let candidate = link.join("artifact.bin").to_string_lossy().into_owned();
+        let err = tool
+            .rewrite_args_with_scope(
+                &json!({"out": candidate.clone()}),
+                &scope,
+                scope.workspace(),
+            )
+            .expect_err(
+                "scope must refuse a workspace/symlink/<artifact> output candidate \
+                 after canonical classify",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&candidate),
+            "error must echo the rejected raw path: {msg}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_accepts_input_path_inside_real_skill_dir_under_canonical_classify() {
+        // Positive baseline: when the skill_dir really contains the
+        // requested file (no symlinks involved), canonical classify
+        // must still accept it. Without this we'd have no proof the
+        // BLOCKER 1 fix didn't tighten reads off-cliff.
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let skill_dir = tempfile::tempdir().expect("skill dir");
+        let manifest = skill_dir.path().join("SKILL.md");
+        std::fs::write(&manifest, b"# example").unwrap();
+        let canonical_skill_dir = std::fs::canonicalize(skill_dir.path()).expect("canonicalize");
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .expect("build solo scope")
+            .with_skill_read_zones(vec![canonical_skill_dir.clone()])
+            .expect("attach skill_read_zone");
+
+        let tool = PluginTool::new(
+            "plug".into(),
+            input_path_def("audio_path"),
+            PathBuf::from("/bin/true"),
+        );
+
+        // Pass the canonical form on the way in so the lexical-side
+        // prefix check inside `classify_canonical_path` lines up on
+        // platforms (macOS) where `/var/folders/...` is itself a
+        // symlink to `/private/var/folders/...`. Production callers
+        // already pass canonical paths because `with_skill_read_zones`
+        // is fed the canonicalised list per the round-2 BLOCKER 2 fix.
+        let candidate = canonical_skill_dir
+            .join("SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        let rewritten = tool
+            .rewrite_args_with_scope(
+                &json!({"audio_path": candidate.clone()}),
+                &scope,
+                scope.workspace(),
+            )
+            .expect("real skill_dir path must be accepted");
+        let path_in = rewritten
+            .get("audio_path")
+            .and_then(|v| v.as_str())
+            .expect("audio_path key must round-trip");
+        assert!(
+            path_in.starts_with(&*canonical_skill_dir.to_string_lossy()),
+            "accepted path must remain inside the canonical skill_dir: {path_in}"
         );
     }
 }

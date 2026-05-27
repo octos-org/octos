@@ -37,7 +37,7 @@ use octos_bus::{
 use octos_core::AgentId;
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
-    OutboundMessage, SessionKey,
+    OutboundMessage, SessionKey, SessionScope, is_safe_session_id,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, FailoverEvent, LlmProvider, ProviderRouter,
@@ -2367,6 +2367,18 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Profile id (= tenant id in [`SessionScope::multi_tenant`]). Used
+    /// to construct a per-session [`SessionScope`] when spawning gateway
+    /// session actors. `None` for the top-level admin factory (the
+    /// admin path constructs its own scope) and for test fixtures that
+    /// don't exercise the scope wiring.
+    ///
+    /// Codex round-2 MAJOR 3 (PR #1327 review): without this the
+    /// gateway-spawned session actors had `ctx.session_scope = None`,
+    /// so `read_file` fell back to the workspace-only legacy resolver
+    /// and couldn't reach the per-profile skill_dirs the SKILL.md
+    /// auto-inject teaches the agent about.
+    pub profile_id: Option<String>,
     /// Plugin directories for SpawnTool subagents to load plugin tools.
     pub plugin_dirs: Vec<std::path::PathBuf>,
     /// Extra environment variables for plugin processes in subagents.
@@ -2433,6 +2445,92 @@ impl ToolRegistryFactory for SnapshotToolRegistryFactory {
         // Re-bind cwd-bound tools to the per-user workspace while
         // preserving non-cwd tools (web_search, browser, MCP, plugins, etc.)
         self.base.rebind_cwd(workspace, sandbox)
+    }
+}
+
+/// Codex round-2 MAJOR 3 (PR #1327 review): construct the per-session
+/// [`SessionScope`] for gateway-routed actors. Factored out of
+/// `ActorFactory::spawn` so the wiring can be unit-tested without
+/// having to drive an entire actor through a tokio mpsc channel.
+///
+/// Returns `Some(scope)` when:
+/// - `profile_id` is `Some` (per-profile actors created by
+///   `ProfileFactory::build` always supply it; the admin / test
+///   ActorFactory leaves it `None`), AND
+/// - `session_key.base_key()` satisfies [`is_safe_session_id`] (SPA
+///   `web-/slides-/site-` shapes pass; channel-prefixed `api:...`
+///   shapes do not — those route through the legacy resolver).
+///
+/// Returns `None` (= legacy resolver) for the admin path, the
+/// channel-prefixed shapes, or when the scope builder rejects the
+/// inputs entirely.
+///
+/// Fail-closed canonicalisation per round-2 BLOCKER 2: any
+/// `plugin_dir` that fails canonicalize is dropped (logged at `warn`).
+/// Mirrors `runtime/session.rs` and `commands/chat.rs`.
+pub(crate) fn build_gateway_session_scope(
+    profile_id: Option<&str>,
+    data_dir: &std::path::Path,
+    session_key: &SessionKey,
+    plugin_dirs: &[std::path::PathBuf],
+) -> Option<Arc<SessionScope>> {
+    let session_id_raw = session_key.base_key().to_string();
+    let Some(profile_id) = profile_id else {
+        tracing::debug!(
+            session = %session_key,
+            "ActorFactory::spawn skipping SessionScope: factory has no profile_id (admin / test path)",
+        );
+        return None;
+    };
+    if !is_safe_session_id(&session_id_raw) {
+        tracing::debug!(
+            profile_id = %profile_id,
+            session = %session_key,
+            "ActorFactory::spawn skipping SessionScope: session id outside is_safe_session_id alphabet \
+             (legacy channel-prefixed shape)",
+        );
+        return None;
+    }
+    match SessionScope::multi_tenant_with_default_zones(
+        data_dir.to_path_buf(),
+        profile_id.to_string(),
+        session_id_raw.clone(),
+    ) {
+        Ok(scope) => {
+            // Round-2 BLOCKER 2: fail-closed canonicalisation. Drop
+            // any plugin dir that can't be canonicalised so a later
+            // symlink replacement can't be legitimised as `InSkillDir`.
+            let skill_dirs = octos_core::canonicalize_skill_read_zones(plugin_dirs);
+            match scope.with_skill_read_zones(skill_dirs) {
+                Ok(scope) => Some(Arc::new(scope)),
+                Err(err) => {
+                    tracing::warn!(
+                        profile_id = %profile_id,
+                        session = %session_key,
+                        error = %err,
+                        "ActorFactory::spawn with_skill_read_zones rejected one or more plugin_dirs; \
+                         attaching scope without skill_read_zones",
+                    );
+                    SessionScope::multi_tenant_with_default_zones(
+                        data_dir.to_path_buf(),
+                        profile_id.to_string(),
+                        session_id_raw,
+                    )
+                    .map(Arc::new)
+                    .ok()
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                profile_id = %profile_id,
+                session = %session_key,
+                error = %err,
+                "ActorFactory::spawn SessionScope construction failed; \
+                 continuing without scope",
+            );
+            None
+        }
     }
 }
 
@@ -3115,6 +3213,22 @@ impl ActorFactory {
                 self.data_dir.clone(),
                 context_manager.clone(),
             ));
+
+        // Codex round-2 MAJOR 3 (PR #1327 review): construct a
+        // per-session SessionScope so gateway-spawned actors get the
+        // same skill_read_zones wiring that `runtime/session.rs` gives
+        // SPA web sessions. Without this the agent's `ctx.session_scope`
+        // stayed `None` for every gateway-routed session, so
+        // `read_file` fell back to the workspace-only legacy resolver
+        // and could not reach the per-profile skill_dirs the
+        // SKILL.md auto-inject teaches the agent to use.
+        let session_scope_arc = build_gateway_session_scope(
+            self.profile_id.as_deref(),
+            &self.data_dir,
+            &session_key,
+            &self.plugin_dirs,
+        );
+
         let mut agent = Agent::new(agent_id, session_llm, tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
@@ -3129,6 +3243,9 @@ impl ActorFactory {
             // surface output and status to dashboards.
             .with_subagent_output_router(self.subagent_output_router.clone())
             .with_subagent_summary_generator(subagent_summary_generator);
+        if let Some(scope) = session_scope_arc.clone() {
+            agent = agent.with_session_scope(scope);
+        }
 
         if let Some(ref embedder) = self.embedder {
             agent = agent.with_embedder(embedder.clone());
@@ -12826,6 +12943,7 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            profile_id: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             plugin_require_signed: false,
@@ -15066,5 +15184,203 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Codex round-2 MAJOR 3 (PR #1327 review): gateway session scope
+    // wiring. Pins that `ActorFactory::spawn` (via
+    // `build_gateway_session_scope`) attaches a non-None SessionScope
+    // with the expected skill_read_zones for per-profile gateway
+    // actors. Pre-fix the agent's `ctx.session_scope` stayed `None`
+    // for every gateway-routed session, so `read_file` fell back to
+    // the workspace-only legacy resolver.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_gateway_session_scope_attaches_scope_for_per_profile_session() {
+        // Per-profile gateway path: `ProfileFactory::build` sets
+        // `profile_id: Some(..)` and supplies plugin_dirs. The session
+        // id is a safe SPA shape (`web-...`). SPA WS sessions construct
+        // `SessionKey` with the bare session id (no channel prefix)
+        // so `base_key()` passes `is_safe_session_id`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        // Two plugin dirs: one exists (gets canonicalised in), one
+        // missing (gets dropped fail-closed).
+        let plugin_a = tmp.path().join("skills").join("mofa-slides");
+        std::fs::create_dir_all(&plugin_a).unwrap();
+        let plugin_missing = tmp.path().join("skills").join("ghost-skill");
+        let plugin_dirs = vec![plugin_a.clone(), plugin_missing.clone()];
+
+        let session_key = SessionKey("web-1779574360679-o8x9kv".to_string());
+        // Sanity: pin that the test fixture matches the production
+        // SPA path that routes through `runtime/session.rs`.
+        assert!(
+            octos_core::is_safe_session_id(session_key.base_key()),
+            "test fixture must use a safe SPA session id",
+        );
+        let scope =
+            build_gateway_session_scope(Some("dspfac"), &data_dir, &session_key, &plugin_dirs)
+                .expect("per-profile + safe session id must build a scope");
+
+        // The factory's data_dir maps to scope.root (the profile data
+        // dir in the multi-tenant constructor).
+        assert_eq!(
+            scope.root(),
+            data_dir.as_path(),
+            "scope root mirrors data_dir"
+        );
+        // skill_read_zones contains the canonicalised existing
+        // plugin_dir AND drops the missing one (round-2 BLOCKER 2
+        // fail-closed).
+        let zones = scope.skill_read_zones();
+        assert_eq!(
+            zones.len(),
+            1,
+            "fail-closed canonicalise must drop missing plugin_dir: zones = {zones:?}"
+        );
+        let canon_plugin_a = std::fs::canonicalize(&plugin_a).unwrap();
+        assert_eq!(zones[0], canon_plugin_a);
+    }
+
+    #[test]
+    fn build_gateway_session_scope_returns_none_for_admin_factory() {
+        // Top-level / admin factory path: `profile_id: None`. We MUST
+        // NOT construct a scope because the admin factory's data_dir
+        // isn't laid out as the per-profile multi-tenant shape.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey("web-1779574360679-o8x9kv".to_string());
+        let scope = build_gateway_session_scope(None, tmp.path(), &session_key, &[]);
+        assert!(
+            scope.is_none(),
+            "admin factory (profile_id = None) must skip scope construction",
+        );
+    }
+
+    #[test]
+    fn build_gateway_session_scope_returns_none_for_unsafe_session_id() {
+        // Channel-prefixed legacy shapes (`api:web-1234`,
+        // `telegram:12345`, etc.) produce a `base_key()` containing
+        // `:`, which fails `is_safe_session_id`. We MUST route those
+        // through the legacy resolver (= None) rather than building a
+        // scope against the unsafe id.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::new("telegram", "12345");
+        // Sanity: pin the regression — channel-prefixed shape really
+        // fails the safe-id check.
+        assert!(
+            !octos_core::is_safe_session_id(session_key.base_key()),
+            "this test relies on channel-prefixed keys failing is_safe_session_id; \
+             update the test if SessionKey's representation changes",
+        );
+
+        let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[]);
+        assert!(
+            scope.is_none(),
+            "unsafe session id must skip scope (legacy resolver path)",
+        );
+    }
+
+    #[test]
+    fn build_gateway_session_scope_handles_empty_plugin_dirs() {
+        // Edge: profile_id set, session id safe, but plugin_dirs empty
+        // (profile has no installed skills). Scope must still build —
+        // just with empty skill_read_zones.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey("web-empty".to_string());
+        let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[])
+            .expect("empty plugin_dirs is a legitimate configuration");
+        assert!(
+            scope.skill_read_zones().is_empty(),
+            "no plugin_dirs => no skill_read_zones",
+        );
+    }
+
+    #[test]
+    fn build_gateway_session_scope_drops_all_missing_plugin_dirs() {
+        // Edge: all plugin_dirs are missing — fail-closed drops them
+        // all, scope still builds (empty skill_read_zones is safe).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey("web-allmissing".to_string());
+        let plugin_dirs = vec![
+            tmp.path().join("skills").join("ghost-a"),
+            tmp.path().join("skills").join("ghost-b"),
+        ];
+        let scope =
+            build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &plugin_dirs)
+                .expect("scope must still build when every plugin_dir is missing");
+        assert!(
+            scope.skill_read_zones().is_empty(),
+            "every plugin_dir missing => no skill_read_zones (fail-closed)",
+        );
+    }
+
+    /// Codex round-2 MAJOR (PR #1327 review): cross-profile isolation
+    /// is structurally correct by construction — each profile's
+    /// `SessionScope` only carries that profile's `plugin_dirs` as
+    /// `skill_read_zones`, so a session bound to profile A can never
+    /// resolve profile B's skill_dir to `InSkillDir`. This test pins
+    /// the invariant explicitly so a future refactor that widens
+    /// `plugin_dirs` (e.g. union across profiles, global skill cache)
+    /// can't silently regress the boundary.
+    #[test]
+    fn build_gateway_session_scope_classifies_cross_profile_skill_dir_as_out_of_scope() {
+        use octos_core::PathClassification;
+
+        let root = tempfile::TempDir::new().unwrap();
+
+        // Profile A: data_dir + one skill_dir with a file inside.
+        let profile_a_data = root.path().join("profile_a");
+        let profile_a_skill = profile_a_data.join("skills").join("mofa-slides");
+        std::fs::create_dir_all(profile_a_skill.join("styles")).unwrap();
+        let profile_a_skill_file = profile_a_skill.join("styles").join("nb-pro.toml");
+        std::fs::write(&profile_a_skill_file, "[meta]\nname = 'nb-pro'\n").unwrap();
+
+        // Profile B: separate data_dir + a different skill_dir with a
+        // file inside. Lives outside profile A's data_dir entirely.
+        let profile_b_data = root.path().join("profile_b");
+        let profile_b_skill = profile_b_data.join("skills").join("mofa-cards");
+        std::fs::create_dir_all(profile_b_skill.join("styles")).unwrap();
+        let profile_b_skill_file = profile_b_skill.join("styles").join("custom.toml");
+        std::fs::write(&profile_b_skill_file, "[meta]\nname = 'custom'\n").unwrap();
+
+        // Build a `SessionScope` for profile A using ONLY profile A's
+        // plugin_dirs. This is exactly the production wiring: each
+        // `ProfileFactory` constructs scopes from its own
+        // `plugin_dirs`, never from another profile's.
+        let session_key = SessionKey("web-cross-profile".to_string());
+        let plugin_dirs = vec![profile_a_skill.clone()];
+        let scope = build_gateway_session_scope(
+            Some("profile_a"),
+            &profile_a_data,
+            &session_key,
+            &plugin_dirs,
+        )
+        .expect("scope build for profile A must succeed");
+
+        // Positive control: profile A's OWN skill file classifies as
+        // `InSkillDir`. If this regresses, the test fixture is broken
+        // (not the cross-profile assertion below).
+        let a_classification = scope.classify_canonical_path(&profile_a_skill_file);
+        assert!(
+            matches!(a_classification, PathClassification::InSkillDir { .. }),
+            "profile A's own skill file must be InSkillDir under profile A's scope; \
+             got {a_classification:?}",
+        );
+
+        // The invariant under test: profile B's skill file MUST
+        // classify as `OutOfScope` because profile B's skill_dir is
+        // not in profile A's `skill_read_zones`, not in profile A's
+        // workspace, and not in profile A's shared zones
+        // (`<profile_a>/skills`, `<profile_a>/research`). A future
+        // change that, e.g., merged all profiles' plugin_dirs into a
+        // global pool would flip this to `InSkillDir` and the test
+        // would catch it.
+        let b_classification = scope.classify_canonical_path(&profile_b_skill_file);
+        assert!(
+            matches!(b_classification, PathClassification::OutOfScope),
+            "profile B's skill file MUST be OutOfScope under profile A's scope; \
+             got {b_classification:?}",
+        );
     }
 }

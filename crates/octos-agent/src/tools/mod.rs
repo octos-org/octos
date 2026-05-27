@@ -38,7 +38,7 @@ use eyre::Result;
 use octos_core::TokenUsage;
 
 use crate::progress::ProgressReporter;
-use octos_core::{PathClassification, ScopeMode, SessionScope};
+use octos_core::{PathClassification, SessionScope};
 
 /// Registry of [`AgentDefinition`]-style manifests available to tools.
 ///
@@ -877,7 +877,13 @@ fn resolve_for_scope(
         Some(p) => p,
         None => return Err("Path outside session scope"),
     };
-    match classify_canonical(scope, &lex_normalised) {
+    // PR-A round-2 (codex BLOCKER 1 follow-up): delegate the canonical
+    // containment guard to `SessionScope::classify_canonical_path` so
+    // every consumer (file tools here, plugin tools in
+    // `plugins/tool.rs`) shares one implementation. The helper lives in
+    // `octos-core` next to `classify_lexical_path` because it has no
+    // dependency on tool-side state.
+    match scope.classify_canonical_path(&lex_normalised) {
         PathClassification::InWorkspace => Ok(lex_normalised),
         PathClassification::InGrantedDir { .. } => Ok(lex_normalised),
         PathClassification::InSharedZone { .. } => {
@@ -887,47 +893,25 @@ fn resolve_for_scope(
                 Ok(lex_normalised)
             }
         }
+        // PR-A: read-only plugin skill dirs. Mirror the
+        // `InSharedZone` policy — reads pass through, writes refuse.
+        // The SKILL.md auto-inject teaches the agent to read files
+        // under the plugin's install directory but never write back.
+        PathClassification::InSkillDir { .. } => {
+            if for_write {
+                Err("Writes to plugin skill directories are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
         PathClassification::OutOfScope => Err("Path outside session scope"),
     }
-}
-
-/// Classify a path against a scope after canonicalizing both sides.
-/// Closes the ancestor-symlink hole in
-/// [`SessionScope::classify_lexical_path`]. Returns the same
-/// [`PathClassification`] shape so callers can read it the same way.
-fn classify_canonical(scope: &SessionScope, lex_normalised_abs: &Path) -> PathClassification {
-    let canon = canonicalize_lossy(lex_normalised_abs);
-    let canon_ws = canonical_root_lossy(scope.workspace());
-    if canon.starts_with(&canon_ws) {
-        return PathClassification::InWorkspace;
-    }
-    match scope.mode() {
-        ScopeMode::Solo { granted_dirs } => {
-            for granted in granted_dirs {
-                let canon_grant = canonical_root_lossy(granted);
-                if canon.starts_with(&canon_grant) {
-                    return PathClassification::InGrantedDir {
-                        granted_dir: granted.clone(),
-                    };
-                }
-            }
-        }
-        ScopeMode::MultiTenant { .. } => {
-            for zone in scope.shared_zones() {
-                let canon_zone = canonical_root_lossy(zone);
-                if canon.starts_with(&canon_zone) {
-                    return PathClassification::InSharedZone { zone: zone.clone() };
-                }
-            }
-        }
-    }
-    PathClassification::OutOfScope
 }
 
 /// Lexical normalise (collapse `.`, refuse `..`). Mirrors the helper
 /// inside `octos_core::session_scope` so the canonicalize walk above
 /// can't absorb a traversal escape.
-fn lexical_normalise_strict(path: &Path) -> Option<PathBuf> {
+pub(crate) fn lexical_normalise_strict(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -938,43 +922,6 @@ fn lexical_normalise_strict(path: &Path) -> Option<PathBuf> {
         }
     }
     Some(out)
-}
-
-/// Canonicalize a path, recovering when the leaf doesn't exist yet
-/// (writes target new files). Mirrors
-/// [`octos_bus::file_handle::canonicalize_lossy`]: walks ancestors to
-/// find the longest existing prefix, canonicalizes that (resolving
-/// symlinked ancestors), and re-attaches the suffix. The input must
-/// already be lexically normalised (no `..`) so the re-attached
-/// suffix is a real would-be on-disk location.
-fn canonicalize_lossy(path: &Path) -> PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon;
-    }
-    let mut existing: &Path = path;
-    let mut suffix = PathBuf::new();
-    while let Some(parent) = existing.parent() {
-        if let Some(name) = existing.file_name() {
-            let mut next_suffix = PathBuf::from(name);
-            next_suffix.push(&suffix);
-            suffix = next_suffix;
-        }
-        existing = parent;
-        if let Ok(canon) = std::fs::canonicalize(existing) {
-            return canon.join(suffix);
-        }
-        if existing.as_os_str().is_empty() {
-            break;
-        }
-    }
-    path.to_path_buf()
-}
-
-/// Canonicalize a root, falling back to the input when the root
-/// doesn't exist (rare for `scope.workspace()` but possible in tests
-/// that pass a not-yet-created directory).
-fn canonical_root_lossy(root: &Path) -> PathBuf {
-    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// Syntactic path normalization (no filesystem access). Collapses `.`
@@ -1458,6 +1405,100 @@ mod path_tests {
         // canonical target outside the workspace.
         assert_eq!(resolved, workspace.path().join("secret"));
         assert_ne!(resolved, target);
+    }
+
+    // -------- PR-A: skill_read_zones resolve-for-scope behaviour --------
+
+    /// Reads from a registered skill_dir succeed via the read-side
+    /// resolver. The classifier (canonicalize-both-sides path)
+    /// reports `InSkillDir` and `for_write=false` accepts it.
+    #[test]
+    fn read_file_from_skill_dir_resolves_under_skill_read_zone() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let skill_file = skill.path().join("SKILL.md");
+        std::fs::write(&skill_file, b"# skill").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .expect("skill_dir is absolute");
+
+        let resolved = resolve_path_for_session_scope_read(&scope, &skill_file.to_string_lossy())
+            .expect("read inside skill_dir must succeed");
+        // The lexical absolute form passes through unchanged
+        // (canonicalisation is only used for classification).
+        assert_eq!(resolved, skill_file);
+    }
+
+    /// PR-A core invariant: write attempts inside a registered
+    /// skill_dir are refused even though reads succeed.
+    /// `for_write=true` (the write-side resolver) must take the
+    /// `InSkillDir` branch and bail with the read-only message.
+    #[test]
+    fn write_file_to_skill_dir_classifies_in_skill_dir_but_resolve_for_write_refuses() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let skill_file = skill.path().join("SKILL.md");
+        std::fs::write(&skill_file, b"# skill").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .expect("skill_dir is absolute");
+
+        // Read side: accept.
+        let read_ok = resolve_path_for_session_scope_read(&scope, &skill_file.to_string_lossy());
+        assert!(read_ok.is_ok(), "read must succeed inside skill_dir");
+
+        // Write side: refuse. The error text comes from the
+        // `InSkillDir` arm of `resolve_for_scope`.
+        let write_err = resolve_path_for_session_scope_write(&scope, &skill_file.to_string_lossy())
+            .expect_err("write must refuse inside skill_dir");
+        assert!(
+            write_err.contains("Writes to plugin skill directories are not permitted"),
+            "expected skill-dir read-only message, got: {write_err}"
+        );
+    }
+
+    /// Writes inside the workspace still succeed when skill_read_zones
+    /// are configured (additive — no regression to existing tools).
+    #[test]
+    fn write_to_workspace_still_works_when_skill_read_zones_configured() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .unwrap();
+        let target = workspace.path().join("out.txt");
+        let resolved = resolve_path_for_session_scope_write(&scope, &target.to_string_lossy())
+            .expect("writes inside workspace must succeed");
+        assert_eq!(resolved, target);
+    }
+
+    /// Reads outside any registered zone still refuse after
+    /// skill_read_zones land. Pre-PR-A out-of-scope paths must keep
+    /// failing.
+    #[test]
+    fn read_outside_skill_dir_and_workspace_still_refused() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let outside = tempfile::tempdir().expect("outside tmpdir");
+        std::fs::write(outside.path().join("secret"), b"x").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .unwrap();
+
+        let target = outside.path().join("secret");
+        let err = resolve_path_for_session_scope_read(&scope, &target.to_string_lossy())
+            .expect_err("path outside scope must be refused");
+        assert!(
+            err.contains("Path outside session scope"),
+            "expected out-of-scope refusal, got: {err}"
+        );
     }
 }
 

@@ -319,7 +319,46 @@ impl SessionRuntime {
                 profile.profile_id.clone(),
                 session_id_raw.clone(),
             ) {
-                Ok(scope) => Some(Arc::new(scope)),
+                Ok(scope) => {
+                    // PR-A: thread the per-profile plugin install
+                    // directories through to the scope so file tools
+                    // (`read_file` today, glob/grep/list_dir in
+                    // PR-B) can reach the SKILL.md content the
+                    // agent's system prompt references.
+                    //
+                    // Codex round-2 BLOCKER 2 (PR #1327 review): SKIP
+                    // dirs that fail canonicalize (fail-closed). A
+                    // missing dir has no readable SKILL content yet,
+                    // so dropping it is the safe fallback. Keeping the
+                    // raw path was a fail-open vulnerability: if the
+                    // raw path is later created/replaced as a symlink
+                    // to `/etc`, `classify_canonical_path` would
+                    // canonicalize both candidate and zone root to
+                    // `/etc` and allow reads as `InSkillDir`. The
+                    // shared helper logs a warning per skip.
+                    let skill_dirs =
+                        octos_core::canonicalize_skill_read_zones(&profile.plugin_dirs);
+                    let scope = scope
+                        .with_skill_read_zones(skill_dirs)
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                profile_id = %profile.profile_id,
+                                session = %session_key,
+                                error = %err,
+                                "with_skill_read_zones rejected one or more plugin_dirs; \
+                                 continuing without skill_read_zones (read_file may not reach SKILL.md references)",
+                            );
+                            // Reconstruct the scope without skill
+                            // zones — non-fatal additive feature.
+                            SessionScope::multi_tenant_with_default_zones(
+                                profile.data_dir.clone(),
+                                profile.profile_id.clone(),
+                                session_id_raw.clone(),
+                            )
+                            .expect("scope was buildable above; rebuilding with the same inputs must succeed")
+                        });
+                    Some(Arc::new(scope))
+                }
                 Err(err) => {
                     tracing::warn!(
                         profile_id = %profile.profile_id,

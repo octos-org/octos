@@ -25,7 +25,8 @@ pub use message::AgentMessage;
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
     MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, SESSION_SCOPE_SCHEMA_VERSION, ScopeMode,
-    SessionScope, SessionScopeError, is_safe_session_id,
+    SessionScope, SessionScopeError, canonical_root_lossy, canonicalize_lossy,
+    canonicalize_skill_read_zones, is_safe_session_id,
 };
 pub use task::{
     DecisionRecord, FileRecord, SESSION_SUMMARY_SCHEMA_VERSION, STALE_DECISION_PREFIX,
