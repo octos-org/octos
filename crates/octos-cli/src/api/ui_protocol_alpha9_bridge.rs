@@ -112,6 +112,20 @@ pub(super) fn emit_turn_completed_full(
         session_result,
     });
     let _ = ledger.append_notification(notification);
+
+    // UPCR-2026-014 M9-γ dual-emit: parallel canonical `turn_completed`
+    // envelope. The hard-barrier inside `emit_envelope` flips the
+    // thread's `completed` flag; any further envelope on the same
+    // thread is dropped at the live emit site (spec § 14.6).
+    let token_usage = octos_core::ui_protocol::EnvelopeTokenUsage {
+        input_tokens: tokens_in.map(u64::from).unwrap_or(0),
+        output_tokens: tokens_out.map(u64::from).unwrap_or(0),
+        reasoning_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+    };
+    let payload = octos_core::ui_protocol::Payload::TurnCompleted { token_usage };
+    let _ = ledger.emit_envelope(session_id, turn_id.0.to_string(), payload, None);
 }
 
 /// Append a `file/attached.v1` envelope when a tool surfaces an
@@ -151,11 +165,41 @@ pub(super) fn emit_file_attached(
             .filter(|t| !t.is_empty())
             .map(ToOwned::to_owned),
         turn_id: turn_id.clone(),
-        path,
+        path: path.clone(),
         tool_call_id,
-        mime,
+        mime: mime.clone(),
     });
     let _ = ledger.append_notification(notification);
+
+    // UPCR-2026-014 M9-γ dual-emit: parallel canonical
+    // `file_attached` envelope. `mime` defaults to
+    // `application/octet-stream` (spec § 14.5 mandates a value); a
+    // warning is logged on metadata read failure so soak monitoring
+    // can surface broken artefact deliveries (file deleted between
+    // tool-end and emit, permissions, etc.).
+    let size_bytes = match std::fs::metadata(&path) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            tracing::warn!(
+                target: "octos::ui_protocol::envelope",
+                path = %path,
+                ?error,
+                "file/attached envelope: fs::metadata failed; emitting size_bytes=0",
+            );
+            0
+        }
+    };
+    let envelope_mime = mime
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    let payload = octos_core::ui_protocol::Payload::FileAttached {
+        path,
+        mime: envelope_mime,
+        size_bytes,
+    };
+    let _ = ledger.emit_envelope(session_id, turn_id.0.to_string(), payload, None);
 }
 
 /// Emit one `file/attached` envelope per delivered artefact when a
@@ -642,12 +686,19 @@ mod tests {
             None,
         );
 
-        // Session A receives all four envelopes.
+        // Session A receives all four legacy envelopes PLUS the M9-γ
+        // dual-emit envelope for `turn_completed_full` (the
+        // `file_attached` dual-emit is barriered out because
+        // `turn_completed_full` already flipped the thread's
+        // `completed` flag).
         let mut count_a = 0;
         while sub_a.try_recv().is_ok() {
             count_a += 1;
         }
-        assert_eq!(count_a, 4, "session A receives all four envelopes");
+        assert_eq!(
+            count_a, 5,
+            "session A receives 4 legacy + 1 M9-γ turn_completed envelope (post-completion file_attached envelope barriered)",
+        );
 
         // Session B receives nothing — no cross-delivery.
         assert!(

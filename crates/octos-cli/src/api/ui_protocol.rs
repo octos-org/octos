@@ -28,9 +28,10 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
     ContentListParams, ContextCompactionCompletedEvent, ContextNormalizationReportedEvent,
-    HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent, MessagePersistedEvent,
-    MessagePersistedSource, OutputCursor, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest,
-    RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent,
+    MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor, Payload,
+    ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
@@ -2568,7 +2569,75 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
             // connections happens via the `send_ledger_event_durable`
             // path that the standard notification fan-out already
             // exercises.
+            let event_for_envelope = event.clone();
+            let message_for_envelope = message.clone();
             let _appended = ledger.append_notification(UiNotification::MessagePersisted(event));
+
+            // UPCR-2026-014 M9-γ dual-emit: in parallel with the legacy
+            // `message/persisted` envelope, append a canonical
+            // `projection/envelope` event. For Assistant rows we emit
+            // `Payload::AssistantPersisted` (carries the durable
+            // `MessageMeta`). For User rows we emit `Payload::UserMessage`
+            // — the turn root — including `client_message_id` so the
+            // optimistic `<GhostBubble>` overlay can match its server
+            // reflection. Tool rows are NOT rendered as envelopes (they
+            // appear as `Payload::ToolEnd` via `forward_progress_event`).
+            //
+            // Note: we resist the temptation to inspect
+            // `MessagePersistedSource::Background` here and suppress the
+            // envelope dual-emit for `BackgroundResultSender` persists —
+            // the per-connection live filter
+            // (`live_event_passes_capability_filter`) already routes
+            // legacy and envelope deliveries into mutually exclusive
+            // wire shapes, so the envelope is what
+            // `projection.envelope.v1` clients see; legacy clients see
+            // the suppressed-or-not `message/persisted` row.
+            let Some(thread_id) = message_for_envelope.thread_id.clone() else {
+                return;
+            };
+            let media_for_meta = event_for_envelope.media.clone();
+            let message_id = event_for_envelope.message_id.clone();
+            let persisted_at = event_for_envelope.persisted_at;
+            let cmid = event_for_envelope.client_message_id.clone();
+            match message_for_envelope.role {
+                MessageRole::Assistant => {
+                    let text = event_for_envelope.content.unwrap_or_default();
+                    let payload = Payload::AssistantPersisted {
+                        text,
+                        meta: MessageMeta {
+                            message_id,
+                            persisted_at,
+                            media: media_for_meta,
+                        },
+                    };
+                    let _ = ledger.emit_envelope(&session_key, thread_id, payload, None);
+                }
+                MessageRole::User => {
+                    let text = event_for_envelope.content.unwrap_or_default();
+                    // `UserMessage` MUST carry the `files: Vec<FileRef>`
+                    // turn-root shape. We don't have IANA mime + size
+                    // metadata on the legacy `media` field — populate a
+                    // best-effort `FileRef` per attachment so the
+                    // projection's UserView renders the attachment chip.
+                    let files: Vec<FileRef> = media_for_meta
+                        .iter()
+                        .map(|path| {
+                            let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                            FileRef {
+                                path: path.clone(),
+                                mime: "application/octet-stream".into(),
+                                size_bytes,
+                            }
+                        })
+                        .collect();
+                    let payload = Payload::UserMessage { text, files };
+                    let _ = ledger.emit_envelope(&session_key, thread_id, payload, cmid);
+                }
+                MessageRole::Tool | MessageRole::System => {
+                    // Tool persists surface as `Payload::ToolEnd` via the
+                    // progress mapper; system rows don't render in chat.
+                }
+            }
         });
     octos_bus::set_message_commit_observer(Some(observer));
 }
@@ -7806,6 +7875,44 @@ fn live_event_passes_capability_filter(
         if let UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_)) = event {
             return false;
         }
+    }
+    // UPCR-2026-014 M9-γ cutover: per-connection mutual exclusion.
+    //
+    // Connections that NEGOTIATED `projection.envelope.v1` see canonical
+    // `projection/envelope` envelopes ONLY — the legacy notifications
+    // they supersede are filtered out on this side. Connections that did
+    // NOT negotiate see legacy notifications ONLY — envelopes are
+    // filtered out. This is the cutover gate that makes the M9-γ
+    // projection contract enforceable end-to-end without dual-rendering
+    // the same logical event in two shapes.
+    //
+    // Legacy events superseded by envelopes per spec § 14.7:
+    //   - message/delta             → assistant_delta envelope
+    //   - message/persisted         → assistant_persisted or user_message envelope
+    //   - tool/started              → tool_start envelope
+    //   - tool/progress             → tool_progress envelope
+    //   - tool/completed            → tool_end envelope
+    //   - file/attached             → file_attached envelope
+    //   - turn/completed            → turn_completed envelope
+    //
+    // Note: the legacy *emit* sites stay in place — clients that did
+    // NOT negotiate the feature still need them. What this gate
+    // changes is the per-connection wire delivery.
+    if features.projection_envelope {
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::MessageDelta(_)
+            | UiNotification::MessagePersisted(_)
+            | UiNotification::ToolStarted(_)
+            | UiNotification::ToolProgress(_)
+            | UiNotification::ToolCompleted(_)
+            | UiNotification::FileAttached(_)
+            | UiNotification::TurnCompleted(_),
+        ) = event
+        {
+            return false;
+        }
+    } else if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_)) = event {
+        return false;
     }
     true
 }
@@ -17317,6 +17424,8 @@ async fn try_emit_terminal(
     match reason {
         TerminalReason::Completed => {
             let details = completion_details.unwrap_or_default();
+            let tokens_in = details.tokens_in;
+            let tokens_out = details.tokens_out;
             let _ = send_notification_lifecycle(
                 ws,
                 ledger,
@@ -17330,10 +17439,32 @@ async fn try_emit_terminal(
                     // removed in M9-α-5/α-6 (PR #855); issue #1332 wires
                     // the same values straight from the agent task's
                     // `done` event so the WS path is no longer dormant.
-                    tokens_in: details.tokens_in,
-                    tokens_out: details.tokens_out,
+                    tokens_in,
+                    tokens_out,
                     session_result: details.session_result,
                 }),
+            );
+            // UPCR-2026-014 M9-γ dual-emit: parallel canonical
+            // `turn_completed` envelope. The hard-barrier inside
+            // `emit_envelope` flips the thread's `completed` flag, so
+            // any further envelope on the same thread is dropped at
+            // the live emit site (spec § 14.6). Token usage zero-fills
+            // reasoning / cache_read / cache_write until the upstream
+            // propagation lands (legacy `tokens_in`/`tokens_out` are
+            // `Option<u32>` and only the first two are populated
+            // today).
+            let token_usage = EnvelopeTokenUsage {
+                input_tokens: tokens_in.map(u64::from).unwrap_or(0),
+                output_tokens: tokens_out.map(u64::from).unwrap_or(0),
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            };
+            let _ = ledger.emit_envelope(
+                session_id,
+                turn_id.0.to_string(),
+                Payload::TurnCompleted { token_usage },
+                None,
             );
         }
         TerminalReason::Errored => {
@@ -17349,6 +17480,94 @@ async fn try_emit_terminal(
     if let Some(ack) = ack {
         let _ = ack.send(());
     }
+}
+
+/// UPCR-2026-014 M9-γ dual-emit helper for `MessageDelta` /
+/// `ToolStarted` / `ToolProgress` / `ToolCompleted` (the legacy
+/// notifications surfaced by `forward_progress_event`).
+///
+/// For every legacy notification produced by the progress mapper, this
+/// helper appends a parallel `projection/envelope` notification to the
+/// ledger. The per-connection live filter
+/// (`live_event_passes_capability_filter`) routes each connection to
+/// exactly one shape — legacy clients see only the legacy event,
+/// `projection.envelope.v1` clients see only the envelope.
+///
+/// Mapping from the legacy notification's `turn_id` (UUIDv7 from
+/// `pre_stamp_turn_thread_id`) to envelope `thread_id`: stringify the
+/// turn UUID. This mirrors the convention that
+/// `pre_stamp_turn_thread_id` uses for assistant/tool row writes, so
+/// envelopes and persisted message rows share the same thread identity.
+///
+/// `ToolCompleted.success` mapping (lossy per § 14.2 + ADR):
+///   - `Some(true)`  → `EnvelopeToolEndStatus::Complete`
+///   - `Some(false)` → `EnvelopeToolEndStatus::Error`
+///   - `None`        → `EnvelopeToolEndStatus::Complete` (fallback;
+///     legacy emits without a success bit are rare and the projection
+///     treats them as a clean exit).
+///
+/// `Skipped` and `Aborted` variants require future signal sources
+/// (deadline-skip plumbing, interrupt propagation) and are NOT
+/// reachable through `ToolCompleted` today.
+fn emit_envelope_for_legacy_notification(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    notification: &UiNotification,
+) {
+    use octos_core::ui_protocol::EnvelopeToolEndStatus;
+    let (thread_id, payload, client_message_id): (String, Payload, Option<String>) =
+        match notification {
+            UiNotification::MessageDelta(event) => (
+                event.turn_id.0.to_string(),
+                Payload::AssistantDelta {
+                    text: event.text.clone(),
+                },
+                None,
+            ),
+            UiNotification::ToolStarted(event) => (
+                event.turn_id.0.to_string(),
+                Payload::ToolStart {
+                    tool_call_id: event.tool_call_id.clone(),
+                    name: event.tool_name.clone(),
+                },
+                None,
+            ),
+            UiNotification::ToolProgress(event) => {
+                let Some(message) = event.message.clone() else {
+                    return;
+                };
+                (
+                    event.turn_id.0.to_string(),
+                    Payload::ToolProgress {
+                        tool_call_id: event.tool_call_id.clone(),
+                        message,
+                    },
+                    None,
+                )
+            }
+            UiNotification::ToolCompleted(event) => {
+                let status = match event.success {
+                    Some(true) | None => EnvelopeToolEndStatus::Complete,
+                    Some(false) => EnvelopeToolEndStatus::Error,
+                };
+                let error = match status {
+                    EnvelopeToolEndStatus::Error => event.output_preview.clone(),
+                    _ => None,
+                };
+                (
+                    event.turn_id.0.to_string(),
+                    Payload::ToolEnd {
+                        tool_call_id: event.tool_call_id.clone(),
+                        status,
+                        error,
+                        reason: None,
+                    },
+                    None,
+                )
+            }
+            _ => return,
+        };
+    let _ = ledger.emit_envelope(session_id, thread_id, payload, client_message_id);
 }
 
 /// Dispatch a single non-terminal progress JSON value out to the WS / ledger.
@@ -17409,6 +17628,13 @@ fn forward_progress_event(
         &mut mapping,
     );
     for notification in mapping.notifications {
+        // UPCR-2026-014 M9-γ dual-emit: every legacy notification gets a
+        // canonical envelope appended to the ledger alongside it. The
+        // per-connection live filter (`live_event_passes_capability_filter`)
+        // routes each connection to exactly one shape: legacy clients see
+        // only the legacy notification, projection.envelope.v1 clients
+        // see only the envelope.
+        emit_envelope_for_legacy_notification(ledger, session_id, &notification);
         match notification {
             UiNotification::MessageDelta(_) => {
                 *saw_delta = true;
@@ -18439,7 +18665,15 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // hashes, not replay cursors. The durable ledger cursor is on
             // the surrounding LedgeredUiProtocolEvent.
             | UiNotification::ContextCompactionCompleted(_)
-            | UiNotification::ContextNormalizationReported(_) => None,
+            | UiNotification::ContextNormalizationReported(_)
+            // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
+            // `seq` allocated by `ThreadSeqAllocator`, not the per-session
+            // `UiCursor` the legacy ledger replay uses. The durable
+            // ledger cursor on the surrounding `LedgeredUiProtocolEvent`
+            // is still authoritative for replay; envelopes don't
+            // contribute their per-thread seq into the cursor stream
+            // (which would mix two non-comparable scales).
+            | UiNotification::Envelope(_) => None,
         },
         UiProtocolLedgerEvent::Progress(_) => None,
     }
@@ -30242,6 +30476,343 @@ ignore = []
             live_event_passes_capability_filter(&normalization, new),
             "clients with context.lifecycle.v1 receive normalization events",
         );
+    }
+
+    // ========================================================================
+    // UPCR-2026-014 M9-γ — per-connection envelope/legacy mutual exclusion.
+    // ========================================================================
+
+    fn projection_envelope_event_for(session: &SessionKey) -> UiNotification {
+        UiNotification::Envelope(octos_core::ui_protocol::EnvelopeNotification {
+            session_id: session.clone(),
+            topic: None,
+            envelope: octos_core::ui_protocol::Envelope {
+                thread_id: "thread-1".into(),
+                seq: 1,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "x".into() },
+            },
+        })
+    }
+
+    fn features_for_projection_envelope_test(projection_envelope: bool) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            // Pre-existing capability flags are enabled so the *only*
+            // gate being exercised is the M9-γ projection.envelope.v1
+            // mutual exclusion — the test would otherwise be polluted by
+            // the `message_persisted` and `spawn_complete` gates above.
+            projection_envelope,
+            message_persisted: true,
+            spawn_complete: true,
+            file_attached: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Per-connection envelope/legacy mutual exclusion is the cutover
+    /// mechanism for M9-γ (spec § 14.7). A connection that negotiated
+    /// `projection.envelope.v1` sees ONLY canonical envelopes for the
+    /// events that surface had legacy analogs; a connection that did
+    /// NOT negotiate sees ONLY the legacy events and never the envelope.
+    #[test]
+    fn capability_filter_envelope_legacy_mutual_exclusion() {
+        let session = SessionKey("local:envelope-gate".into());
+        let envelope_event =
+            UiProtocolLedgerEvent::Notification(projection_envelope_event_for(&session));
+        let delta_event =
+            UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                text: "hello".into(),
+            }));
+        let tool_started =
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolStarted(ToolStartedEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                tool_call_id: "tc-1".into(),
+                tool_name: "shell".into(),
+                arguments: None,
+            }));
+        let tool_progress =
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolProgress(ToolProgressEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                tool_call_id: "tc-1".into(),
+                message: Some("step".into()),
+                progress_pct: None,
+            }));
+        let tool_completed = UiProtocolLedgerEvent::Notification(UiNotification::ToolCompleted(
+            ToolCompletedEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                tool_call_id: "tc-1".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                output_preview: None,
+                duration_ms: None,
+            },
+        ));
+        let turn_completed = UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        ));
+        let message_persisted =
+            UiProtocolLedgerEvent::Notification(message_persisted_for(&session));
+        let file_attached = UiProtocolLedgerEvent::Notification(file_attached_for(&session));
+
+        // Legacy client (projection_envelope=false): receives ALL legacy
+        // events; envelope is filtered out.
+        let legacy = features_for_projection_envelope_test(false);
+        assert!(
+            !live_event_passes_capability_filter(&envelope_event, legacy),
+            "legacy client must NOT receive projection/envelope notifications",
+        );
+        for (label, ev) in [
+            ("MessageDelta", &delta_event),
+            ("ToolStarted", &tool_started),
+            ("ToolProgress", &tool_progress),
+            ("ToolCompleted", &tool_completed),
+            ("TurnCompleted", &turn_completed),
+            ("MessagePersisted", &message_persisted),
+            ("FileAttached", &file_attached),
+        ] {
+            assert!(
+                live_event_passes_capability_filter(ev, legacy),
+                "legacy client must STILL receive legacy {label} notifications",
+            );
+        }
+
+        // Envelope client (projection_envelope=true): receives ONLY the
+        // envelope; legacy variants superseded by envelopes are
+        // filtered out.
+        let envelope_client = features_for_projection_envelope_test(true);
+        assert!(
+            live_event_passes_capability_filter(&envelope_event, envelope_client),
+            "envelope client receives projection/envelope notifications",
+        );
+        for (label, ev) in [
+            ("MessageDelta", &delta_event),
+            ("ToolStarted", &tool_started),
+            ("ToolProgress", &tool_progress),
+            ("ToolCompleted", &tool_completed),
+            ("TurnCompleted", &turn_completed),
+            ("MessagePersisted", &message_persisted),
+            ("FileAttached", &file_attached),
+        ] {
+            assert!(
+                !live_event_passes_capability_filter(ev, envelope_client),
+                "envelope client must NOT receive legacy {label} notifications",
+            );
+        }
+    }
+
+    /// UPCR-2026-014 M9-γ per-payload dual-emit: every legacy
+    /// notification surfaced by `forward_progress_event` triggers a
+    /// parallel `projection/envelope` ledger append. The test exercises
+    /// the helper that wires the dual-emit
+    /// (`emit_envelope_for_legacy_notification`) so a future refactor
+    /// can't silently drop a variant from the dual surface.
+    #[test]
+    fn emit_envelope_for_legacy_notification_covers_every_progress_variant() {
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:dual-emit".into());
+
+        // The progress-mapper emits these four notification variants —
+        // each must yield a corresponding envelope.
+        let turn_id = TurnId::new();
+        let cases: Vec<(UiNotification, &'static str)> = vec![
+            (
+                UiNotification::MessageDelta(MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: "delta".into(),
+                }),
+                "assistant_delta",
+            ),
+            (
+                UiNotification::ToolStarted(ToolStartedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    tool_call_id: "tc-1".into(),
+                    tool_name: "shell".into(),
+                    arguments: None,
+                }),
+                "tool_start",
+            ),
+            (
+                UiNotification::ToolProgress(ToolProgressEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    tool_call_id: "tc-1".into(),
+                    message: Some("hello".into()),
+                    progress_pct: None,
+                }),
+                "tool_progress",
+            ),
+            (
+                UiNotification::ToolCompleted(ToolCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    tool_call_id: "tc-1".into(),
+                    tool_name: "shell".into(),
+                    success: Some(true),
+                    output_preview: None,
+                    duration_ms: None,
+                }),
+                "tool_end",
+            ),
+        ];
+
+        let mut expected_types: Vec<&str> = cases.iter().map(|(_, t)| *t).collect();
+
+        for (notif, _expected_type) in &cases {
+            emit_envelope_for_legacy_notification(&ledger, &session_id, notif);
+        }
+
+        let baseline = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        let envelope_types: Vec<String> = replay
+            .iter()
+            .filter_map(|e| match &e.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
+                    match &env.envelope.payload {
+                        Payload::AssistantDelta { .. } => Some("assistant_delta".into()),
+                        Payload::ToolStart { .. } => Some("tool_start".into()),
+                        Payload::ToolProgress { .. } => Some("tool_progress".into()),
+                        Payload::ToolEnd { .. } => Some("tool_end".into()),
+                        Payload::FileAttached { .. } => Some("file_attached".into()),
+                        Payload::TurnCompleted { .. } => Some("turn_completed".into()),
+                        Payload::AssistantPersisted { .. } => Some("assistant_persisted".into()),
+                        Payload::UserMessage { .. } => Some("user_message".into()),
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Order-sensitive: envelopes are appended in the order the
+        // notifications arrive, so we expect the exact slice.
+        expected_types.sort();
+        let mut got_types = envelope_types.clone();
+        got_types.sort();
+        assert_eq!(
+            got_types,
+            expected_types
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "every progress-variant must dual-emit; got {envelope_types:?}",
+        );
+    }
+
+    /// Replay-vs-live divergence: the live-emit hard barrier in
+    /// `UiProtocolLedger::emit_envelope` DROPS post-completion envelopes,
+    /// but ledger replay (`replay_after`) returns the FULL durable
+    /// history. This is the documented semantics from spec § 14.6 — a
+    /// client that reconnects with a pre-completion cursor still sees
+    /// every envelope that was emitted, and applies the barrier itself.
+    #[test]
+    fn live_emit_hard_barrier_does_not_affect_ledger_replay() {
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:replay-vs-live".into());
+        let thread_id = "thread-rl".to_owned();
+
+        // Live-emit path: AssistantDelta + TurnCompleted, then a
+        // post-completion AssistantDelta which the hard barrier drops.
+        let a = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::AssistantDelta { text: "a".into() },
+                None,
+            )
+            .expect("first emit accepted");
+        let completed = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::TurnCompleted {
+                    token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+                },
+                None,
+            )
+            .expect("turn_completed accepted");
+        let dropped = ledger.emit_envelope(
+            &session_id,
+            thread_id.clone(),
+            Payload::AssistantDelta {
+                text: "should be barrier-dropped".into(),
+            },
+            None,
+        );
+        assert!(
+            dropped.is_none(),
+            "live-emit must drop the post-completion envelope at the barrier",
+        );
+
+        // Now: pre-seed the ledger with a raw post-completion envelope
+        // (bypassing emit_envelope) so the on-disk / in-memory ring
+        // carries it. This models the "old durable record from before
+        // the barrier was tightened" replay scenario.
+        let raw = UiNotification::Envelope(octos_core::ui_protocol::EnvelopeNotification {
+            session_id: session_id.clone(),
+            topic: None,
+            envelope: octos_core::ui_protocol::Envelope {
+                thread_id: thread_id.clone(),
+                seq: 99,
+                client_message_id: None,
+                payload: Payload::AssistantDelta {
+                    text: "raw post-completion".into(),
+                },
+            },
+        });
+        let raw_appended = ledger.append_notification(raw);
+
+        // Replay returns everything appended — the live-emit barrier
+        // does NOT prune the ledger, only the live wire delivery.
+        let baseline = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        let envelope_count = replay
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_))
+                )
+            })
+            .count();
+        assert!(
+            envelope_count >= 3,
+            "ledger replay must return ALL envelopes including post-completion raw appends \
+             (live-emit barrier applies only at emit, not at replay); got {envelope_count}",
+        );
+        // Sanity: the original live-accepted envelopes are present.
+        let cursors: Vec<u64> = replay.iter().map(|e| e.cursor.seq).collect();
+        assert!(cursors.contains(&a.cursor.seq));
+        assert!(cursors.contains(&completed.cursor.seq));
+        assert!(cursors.contains(&raw_appended.cursor.seq));
     }
 
     /// End-to-end through the live forwarder for a NEW client (negotiated

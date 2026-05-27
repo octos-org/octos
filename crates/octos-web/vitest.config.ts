@@ -7,7 +7,10 @@ export default defineConfig({
   test: {
     environment: 'node',
     globals: false,
-    include: ['src/state/__tests__/**/*.test.ts'],
+    include: [
+      'src/state/__tests__/**/*.test.ts',
+      'src/runtime/__tests__/**/*.test.ts',
+    ],
     // The fixture-replay engine is allocation-light and entirely
     // synchronous; a single thread is faster than the pool overhead.
     pool: 'threads',

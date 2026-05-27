@@ -60,8 +60,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
-    RpcError, RpcNotification, SessionOpened, TurnCompletedEvent, UiCursor, UiNotification,
-    UiProgressEvent, methods,
+    Envelope, EnvelopeNotification, Payload, RpcError, RpcNotification, SessionOpened,
+    TurnCompletedEvent, UiCursor, UiNotification, UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -304,10 +304,26 @@ struct LedgerInner {
     /// channel is bounded — slow consumers see `Lagged(_)` and should fall
     /// back to cursor replay rather than block the producer.
     subscribers: HashMap<SessionKey, broadcast::Sender<LedgeredUiProtocolEvent>>,
+    /// UPCR-2026-014 M9-γ ThreadSeqAllocator + hard-barrier state per
+    /// `(SessionKey, thread_id)` for the canonical projection envelope.
+    /// `next_seq` is the next `seq: u64` to issue (1-based, strictly
+    /// monotonic within the thread). `completed` flips to `true` the
+    /// first time a `Payload::TurnCompleted` envelope is emitted; any
+    /// further envelope on the same thread is DROPPED at the live emit
+    /// site and counted in `octos_projection_post_completion_drop_total`.
+    thread_seq: HashMap<(SessionKey, String), ThreadSeqState>,
     /// Process-lifetime aggregate counters.
     evicted_count: u64,
     dropped_count: u64,
     on_disk_bytes: u64,
+}
+
+/// Per-thread sequence allocator + hard-barrier state.
+/// See [`LedgerInner::thread_seq`] for usage.
+#[derive(Debug, Default, Clone)]
+struct ThreadSeqState {
+    next_seq: u64,
+    completed: bool,
 }
 
 impl LedgerInner {
@@ -316,6 +332,7 @@ impl LedgerInner {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
             subscribers: HashMap::new(),
+            thread_seq: HashMap::new(),
             evicted_count: 0,
             dropped_count: 0,
             on_disk_bytes: 0,
@@ -609,6 +626,154 @@ impl UiProtocolLedger {
             UiProtocolLedgerEvent::Progress(event),
             Some(from_connection),
         )
+    }
+
+    /// UPCR-2026-014 (M9-γ) — emit a canonical projection envelope with
+    /// server-allocated `seq` and hard-barrier enforcement.
+    ///
+    /// Per [§ 14.6 of the v1 spec](../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md),
+    /// every envelope for a `(session_id, thread_id)` pair gets a
+    /// strictly-monotonic `seq: u64` issued from 1; once a
+    /// [`Payload::TurnCompleted`] envelope is emitted for a thread, any
+    /// further envelope on that thread is DROPPED at the live emit site
+    /// and counted in the
+    /// `octos_projection_post_completion_drop_total` metric.
+    ///
+    /// Returns the [`LedgeredUiProtocolEvent`] when the envelope is
+    /// emitted, or `None` when the hard barrier dropped it (the metric
+    /// is already bumped on the drop path).
+    ///
+    /// The drop is applied at the *live* emit site only — ledger replay
+    /// (post-reconnect) bypasses the drop, so a client that reconnects
+    /// with a pre-completion cursor still observes the full envelope
+    /// history.
+    pub(crate) fn emit_envelope(
+        &self,
+        session_id: &SessionKey,
+        thread_id: String,
+        payload: Payload,
+        client_message_id: Option<String>,
+    ) -> Option<LedgeredUiProtocolEvent> {
+        let (seq, dropped_kind) = self.allocate_envelope_seq(session_id, &thread_id, &payload);
+        if let Some(kind) = dropped_kind {
+            metrics::counter!(
+                "octos_projection_post_completion_drop_total",
+                "kind" => kind,
+            )
+            .increment(1);
+            return None;
+        }
+        let topic = session_id.topic().map(ToOwned::to_owned);
+        let envelope = Envelope {
+            thread_id,
+            seq,
+            client_message_id,
+            payload,
+        };
+        let notification = UiNotification::Envelope(EnvelopeNotification {
+            session_id: session_id.clone(),
+            topic,
+            envelope,
+        });
+        Some(self.append(UiProtocolLedgerEvent::Notification(notification), None))
+    }
+
+    /// Per-thread envelope seq allocator with hard-barrier check.
+    ///
+    /// Returns `(seq, Some(metric_kind))` when the hard barrier dropped
+    /// the emit. The metric kinds are:
+    ///   - `"duplicate_completed"` — a second `TurnCompleted` on the
+    ///     same thread.
+    ///   - `"post_completion"` — any non-`TurnCompleted` payload on a
+    ///     thread that already saw `TurnCompleted`.
+    ///
+    /// The first `emit_envelope` call for a `(session, thread)` pair
+    /// after process restart scans the durable ledger for existing
+    /// envelopes matching this thread and resumes from `max(seq) + 1` —
+    /// daemon restart MUST NOT reissue `seq=1` for a thread the client
+    /// already saw.
+    fn allocate_envelope_seq(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        payload: &Payload,
+    ) -> (u64, Option<&'static str>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (session_id.clone(), thread_id.to_owned());
+        let needs_recovery = !inner.thread_seq.contains_key(&key);
+        if needs_recovery {
+            // Scan the in-memory ring AND the disk-snapshot tail for
+            // existing envelopes matching this `(session, thread)` so
+            // the allocator continues from `max(seq) + 1`. The disk
+            // path is only consulted when the session has not been
+            // hydrated yet.
+            let recovered = self.recover_thread_seq_state(session_id, thread_id, &inner);
+            inner.thread_seq.insert(key.clone(), recovered);
+        }
+        let state = inner
+            .thread_seq
+            .get_mut(&key)
+            .expect("thread_seq entry inserted above");
+        // Hard barrier per spec § 14.6.
+        let is_turn_completed = matches!(payload, Payload::TurnCompleted { .. });
+        if state.completed {
+            let kind = if is_turn_completed {
+                "duplicate_completed"
+            } else {
+                "post_completion"
+            };
+            // Return the would-be-next seq for diagnostics; the caller
+            // doesn't use it on the drop path.
+            return (state.next_seq, Some(kind));
+        }
+        if state.next_seq == 0 {
+            state.next_seq = 1;
+        }
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.saturating_add(1);
+        if is_turn_completed {
+            state.completed = true;
+        }
+        (seq, None)
+    }
+
+    /// Daemon-restart recovery for the per-thread seq allocator.
+    ///
+    /// Walks the in-memory ring (already hydrated from disk via
+    /// `recover()` at startup) for envelopes matching `(session, thread)`
+    /// and returns a `ThreadSeqState` whose `next_seq` continues from
+    /// `max(observed seq) + 1`. If a `TurnCompleted` is observed in the
+    /// ring, `completed` is preserved so the hard barrier survives the
+    /// restart.
+    ///
+    /// O(N) over the in-memory ring for the session — acceptable because
+    /// the allocator recovery runs at most once per `(session, thread)`
+    /// pair per process lifetime (subsequent calls hit the `thread_seq`
+    /// map).
+    fn recover_thread_seq_state(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        inner: &LedgerInner,
+    ) -> ThreadSeqState {
+        let mut state = ThreadSeqState::default();
+        let Some(session_state) = inner.sessions.get(session_id) else {
+            return state;
+        };
+        for entry in &session_state.entries {
+            if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) = &entry.event
+            {
+                if ev.envelope.thread_id == thread_id {
+                    if ev.envelope.seq >= state.next_seq {
+                        state.next_seq = ev.envelope.seq + 1;
+                    }
+                    if matches!(ev.envelope.payload, Payload::TurnCompleted { .. }) {
+                        state.completed = true;
+                    }
+                }
+            }
+        }
+        state
     }
 
     fn append(
@@ -1525,6 +1690,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::LoopCompleted(event) => &event.session_id,
         UiNotification::ContextCompactionCompleted(event) => &event.session_id,
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
+        UiNotification::Envelope(event) => &event.session_id,
     }
 }
 
@@ -2318,5 +2484,216 @@ mod tests {
         drop(rx);
         // After all receivers drop, the orphaned sender is removed.
         assert_eq!(ledger.prune_idle_subscribers(), 1);
+    }
+
+    // ======================================================================
+    // UPCR-2026-014 M9-γ ThreadSeqAllocator + hard-barrier invariants.
+    // ======================================================================
+
+    fn envelope_seq(ledgered: &LedgeredUiProtocolEvent) -> u64 {
+        match &ledgered.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) => ev.envelope.seq,
+            other => panic!("expected envelope ledger event, got {other:?}"),
+        }
+    }
+
+    fn envelope_payload(ledgered: &LedgeredUiProtocolEvent) -> Payload {
+        match &ledgered.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) => {
+                ev.envelope.payload.clone()
+            }
+            other => panic!("expected envelope ledger event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_seq_allocator_issues_monotonic_seq_within_thread() {
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:thread-seq".into());
+        let thread_id = "thread-A".to_owned();
+
+        let a = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::AssistantDelta { text: "a".into() },
+                None,
+            )
+            .expect("first emit");
+        let b = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::AssistantDelta { text: "b".into() },
+                None,
+            )
+            .expect("second emit");
+        let c = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::AssistantDelta { text: "c".into() },
+                None,
+            )
+            .expect("third emit");
+
+        assert_eq!(envelope_seq(&a), 1);
+        assert_eq!(envelope_seq(&b), 2);
+        assert_eq!(envelope_seq(&c), 3);
+    }
+
+    #[test]
+    fn thread_seq_allocator_is_independent_across_threads() {
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:multi-thread".into());
+
+        let a1 = ledger
+            .emit_envelope(
+                &session_id,
+                "thread-A".into(),
+                Payload::AssistantDelta { text: "a1".into() },
+                None,
+            )
+            .unwrap();
+        let b1 = ledger
+            .emit_envelope(
+                &session_id,
+                "thread-B".into(),
+                Payload::AssistantDelta { text: "b1".into() },
+                None,
+            )
+            .unwrap();
+        let a2 = ledger
+            .emit_envelope(
+                &session_id,
+                "thread-A".into(),
+                Payload::AssistantDelta { text: "a2".into() },
+                None,
+            )
+            .unwrap();
+        let b2 = ledger
+            .emit_envelope(
+                &session_id,
+                "thread-B".into(),
+                Payload::AssistantDelta { text: "b2".into() },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(envelope_seq(&a1), 1);
+        assert_eq!(envelope_seq(&a2), 2);
+        assert_eq!(envelope_seq(&b1), 1);
+        assert_eq!(envelope_seq(&b2), 2);
+    }
+
+    #[test]
+    fn hard_barrier_drops_post_completion_envelopes() {
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:barrier".into());
+        let thread_id = "thread-X".to_owned();
+
+        let _ = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::AssistantDelta { text: "hi".into() },
+                None,
+            )
+            .expect("pre-completion emit");
+        let completed = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id.clone(),
+                Payload::TurnCompleted {
+                    token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+                },
+                None,
+            )
+            .expect("turn_completed emit");
+        assert!(matches!(
+            envelope_payload(&completed),
+            Payload::TurnCompleted { .. }
+        ));
+
+        // Post-completion: ANY further envelope on this thread is dropped.
+        let dropped = ledger.emit_envelope(
+            &session_id,
+            thread_id.clone(),
+            Payload::AssistantDelta {
+                text: "should be dropped".into(),
+            },
+            None,
+        );
+        assert!(dropped.is_none(), "post-completion emit must be dropped");
+
+        // A second TurnCompleted is also dropped.
+        let dup = ledger.emit_envelope(
+            &session_id,
+            thread_id,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+            None,
+        );
+        assert!(
+            dup.is_none(),
+            "duplicate TurnCompleted on the same thread must be dropped"
+        );
+    }
+
+    #[test]
+    fn thread_seq_allocator_recovers_from_in_memory_ledger() {
+        // Daemon restart simulation: pre-fill the ring with envelopes
+        // bearing explicit seqs (as if recovered from disk via `recover`),
+        // then call `emit_envelope` on a fresh allocator — it MUST
+        // continue from max(seq) + 1, not reset to 1.
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:restart".into());
+        let thread_id = "thread-R".to_owned();
+
+        // Pre-seed: bypass `emit_envelope` and append raw envelopes so the
+        // `thread_seq` map is NOT populated (simulating the post-restart
+        // state where the ring is hydrated from disk but the per-thread
+        // allocator hasn't observed an emit yet).
+        for seq in [1u64, 2, 3, 4] {
+            let envelope = Envelope {
+                thread_id: thread_id.clone(),
+                seq,
+                client_message_id: None,
+                payload: Payload::AssistantDelta {
+                    text: format!("delta-{seq}"),
+                },
+            };
+            let notif = UiNotification::Envelope(EnvelopeNotification {
+                session_id: session_id.clone(),
+                topic: None,
+                envelope,
+            });
+            let _ = ledger.append_notification(notif);
+        }
+        // Confirm the ring carries 4 envelopes (replay from seq=0).
+        let baseline = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        assert_eq!(replay.len(), 4);
+
+        // Now emit_envelope: the allocator must resume from seq=5.
+        let recovered = ledger
+            .emit_envelope(
+                &session_id,
+                thread_id,
+                Payload::AssistantDelta {
+                    text: "post-recovery".into(),
+                },
+                None,
+            )
+            .expect("emit after recovery");
+        assert_eq!(
+            envelope_seq(&recovered),
+            5,
+            "ThreadSeqAllocator must continue from max(seq) + 1 after restart"
+        );
     }
 }
