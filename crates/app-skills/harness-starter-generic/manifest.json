@@ -1,6 +1,6 @@
 {
   "name": "harness-starter-generic",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "octos",
   "description": "Minimal starter for a single-artifact harnessed custom app. Writes a text file under output/ and lets the workspace contract deliver it.",
   "timeout_secs": 30,

@@ -1,6 +1,6 @@
 {
   "name": "harness-starter-report",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "octos",
   "description": "Starter for a harnessed report-generator custom app. Writes a markdown file under reports/ and lets the workspace contract deliver it.",
   "timeout_secs": 60,

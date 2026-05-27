@@ -1,6 +1,6 @@
 {
   "name": "harness-starter-audio",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "octos",
   "description": "Starter for a harnessed audio custom app. Synthesizes a minimal WAV file under audio/ and lets the workspace contract deliver it.",
   "timeout_secs": 120,

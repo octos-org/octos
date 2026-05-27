@@ -1,6 +1,6 @@
 {
   "name": "harness-starter-coding",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "octos",
   "description": "Starter for a harnessed coding-assistant custom app. Produces a diff artifact and a file-list preview under patches/.",
   "timeout_secs": 90,
