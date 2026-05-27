@@ -15314,4 +15314,73 @@ mod tests {
             "every plugin_dir missing => no skill_read_zones (fail-closed)",
         );
     }
+
+    /// Codex round-2 MAJOR (PR #1327 review): cross-profile isolation
+    /// is structurally correct by construction — each profile's
+    /// `SessionScope` only carries that profile's `plugin_dirs` as
+    /// `skill_read_zones`, so a session bound to profile A can never
+    /// resolve profile B's skill_dir to `InSkillDir`. This test pins
+    /// the invariant explicitly so a future refactor that widens
+    /// `plugin_dirs` (e.g. union across profiles, global skill cache)
+    /// can't silently regress the boundary.
+    #[test]
+    fn build_gateway_session_scope_classifies_cross_profile_skill_dir_as_out_of_scope() {
+        use octos_core::PathClassification;
+
+        let root = tempfile::TempDir::new().unwrap();
+
+        // Profile A: data_dir + one skill_dir with a file inside.
+        let profile_a_data = root.path().join("profile_a");
+        let profile_a_skill = profile_a_data.join("skills").join("mofa-slides");
+        std::fs::create_dir_all(profile_a_skill.join("styles")).unwrap();
+        let profile_a_skill_file = profile_a_skill.join("styles").join("nb-pro.toml");
+        std::fs::write(&profile_a_skill_file, "[meta]\nname = 'nb-pro'\n").unwrap();
+
+        // Profile B: separate data_dir + a different skill_dir with a
+        // file inside. Lives outside profile A's data_dir entirely.
+        let profile_b_data = root.path().join("profile_b");
+        let profile_b_skill = profile_b_data.join("skills").join("mofa-cards");
+        std::fs::create_dir_all(profile_b_skill.join("styles")).unwrap();
+        let profile_b_skill_file = profile_b_skill.join("styles").join("custom.toml");
+        std::fs::write(&profile_b_skill_file, "[meta]\nname = 'custom'\n").unwrap();
+
+        // Build a `SessionScope` for profile A using ONLY profile A's
+        // plugin_dirs. This is exactly the production wiring: each
+        // `ProfileFactory` constructs scopes from its own
+        // `plugin_dirs`, never from another profile's.
+        let session_key = SessionKey("web-cross-profile".to_string());
+        let plugin_dirs = vec![profile_a_skill.clone()];
+        let scope = build_gateway_session_scope(
+            Some("profile_a"),
+            &profile_a_data,
+            &session_key,
+            &plugin_dirs,
+        )
+        .expect("scope build for profile A must succeed");
+
+        // Positive control: profile A's OWN skill file classifies as
+        // `InSkillDir`. If this regresses, the test fixture is broken
+        // (not the cross-profile assertion below).
+        let a_classification = scope.classify_canonical_path(&profile_a_skill_file);
+        assert!(
+            matches!(a_classification, PathClassification::InSkillDir { .. }),
+            "profile A's own skill file must be InSkillDir under profile A's scope; \
+             got {a_classification:?}",
+        );
+
+        // The invariant under test: profile B's skill file MUST
+        // classify as `OutOfScope` because profile B's skill_dir is
+        // not in profile A's `skill_read_zones`, not in profile A's
+        // workspace, and not in profile A's shared zones
+        // (`<profile_a>/skills`, `<profile_a>/research`). A future
+        // change that, e.g., merged all profiles' plugin_dirs into a
+        // global pool would flip this to `InSkillDir` and the test
+        // would catch it.
+        let b_classification = scope.classify_canonical_path(&profile_b_skill_file);
+        assert!(
+            matches!(b_classification, PathClassification::OutOfScope),
+            "profile B's skill file MUST be OutOfScope under profile A's scope; \
+             got {b_classification:?}",
+        );
+    }
 }
