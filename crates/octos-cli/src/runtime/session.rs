@@ -324,17 +324,20 @@ impl SessionRuntime {
                     // directories through to the scope so file tools
                     // (`read_file` today, glob/grep/list_dir in
                     // PR-B) can reach the SKILL.md content the
-                    // agent's system prompt references. Canonicalize
-                    // each entry so symlinked plugin install roots
-                    // line up with the canonicalized candidate paths
-                    // the tools-side resolver compares against. Fall
-                    // back to the raw path when canonicalize fails
-                    // (the dir may not exist on bootstrap retry).
-                    let skill_dirs: Vec<std::path::PathBuf> = profile
-                        .plugin_dirs
-                        .iter()
-                        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-                        .collect();
+                    // agent's system prompt references.
+                    //
+                    // Codex round-2 BLOCKER 2 (PR #1327 review): SKIP
+                    // dirs that fail canonicalize (fail-closed). A
+                    // missing dir has no readable SKILL content yet,
+                    // so dropping it is the safe fallback. Keeping the
+                    // raw path was a fail-open vulnerability: if the
+                    // raw path is later created/replaced as a symlink
+                    // to `/etc`, `classify_canonical_path` would
+                    // canonicalize both candidate and zone root to
+                    // `/etc` and allow reads as `InSkillDir`. The
+                    // shared helper logs a warning per skip.
+                    let skill_dirs =
+                        octos_core::canonicalize_skill_read_zones(&profile.plugin_dirs);
                     let scope = scope
                         .with_skill_read_zones(skill_dirs)
                         .unwrap_or_else(|err| {

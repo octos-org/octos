@@ -3848,7 +3848,9 @@ dependencies = [
  "eyre",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio-test",
+ "tracing",
  "uuid",
 ]
 

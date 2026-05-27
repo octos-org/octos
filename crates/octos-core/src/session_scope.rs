@@ -667,6 +667,133 @@ impl SessionScope {
         }
         PathClassification::OutOfScope
     }
+
+    /// Classify `path` against this scope after canonicalising both
+    /// sides. Closes the ancestor-symlink hole in
+    /// [`Self::classify_lexical_path`]: a symlink anywhere on the
+    /// `path` chain (or inside one of the scope roots) is resolved
+    /// before the prefix comparison, so a skill_dir containing
+    /// `link -> /outside` cannot smuggle `<skill_dir>/link/secret` as
+    /// `InSkillDir`.
+    ///
+    /// Input MUST be lexically normalised (no `..` components). Callers
+    /// that don't have a pre-normalised path should call
+    /// [`Self::classify_lexical_path`] first (which rejects `..`) and
+    /// only fall through to this method when they need the canonical
+    /// containment guarantee.
+    ///
+    /// Same return shape as [`Self::classify_lexical_path`]. The reported
+    /// `skill_dir` / `zone` / `granted_dir` is the un-canonicalised form
+    /// (matches what callers configured) so log messages and tests stay
+    /// readable; the comparison itself uses canonicalised roots.
+    ///
+    /// Filesystem access: canonicalises `path` and every zone root via
+    /// [`canonicalize_lossy`] (walks ancestors when the leaf is missing,
+    /// e.g. for writes that target new files). When a path or root
+    /// can't be canonicalised at all, the lossy fallback is the input
+    /// itself, which keeps `OutOfScope` as the default-deny answer for
+    /// fully-virtual paths.
+    pub fn classify_canonical_path(&self, path: &Path) -> PathClassification {
+        let canon = canonicalize_lossy(path);
+        let canon_ws = canonical_root_lossy(&self.workspace);
+        if canon.starts_with(&canon_ws) {
+            return PathClassification::InWorkspace;
+        }
+        if let ScopeMode::Solo { granted_dirs } = &self.mode {
+            for granted in granted_dirs {
+                let canon_grant = canonical_root_lossy(granted);
+                if canon.starts_with(&canon_grant) {
+                    return PathClassification::InGrantedDir {
+                        granted_dir: granted.clone(),
+                    };
+                }
+            }
+        }
+        for skill_dir in &self.skill_read_zones {
+            let canon_skill = canonical_root_lossy(skill_dir);
+            if canon.starts_with(&canon_skill) {
+                return PathClassification::InSkillDir {
+                    skill_dir: skill_dir.clone(),
+                };
+            }
+        }
+        if let ScopeMode::MultiTenant { shared_zones, .. } = &self.mode {
+            for zone in shared_zones {
+                let canon_zone = canonical_root_lossy(zone);
+                if canon.starts_with(&canon_zone) {
+                    return PathClassification::InSharedZone { zone: zone.clone() };
+                }
+            }
+        }
+        PathClassification::OutOfScope
+    }
+}
+
+/// Canonicalise a path, walking ancestors when the leaf doesn't exist
+/// yet (writes targeting new files inside an existing directory).
+/// Mirrors `octos_agent::tools::canonicalize_lossy` (and
+/// `octos_bus::file_handle::canonicalize_lossy`). Re-exported here so
+/// `SessionScope::classify_canonical_path` and the canonicalize-then-skip
+/// helper in the CLI can share one implementation.
+///
+/// The input must already be lexically normalised (no `..`) so the
+/// re-attached suffix names a real would-be on-disk location.
+pub fn canonicalize_lossy(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut existing: &Path = path;
+    let mut suffix = PathBuf::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            let mut next_suffix = PathBuf::from(name);
+            next_suffix.push(&suffix);
+            suffix = next_suffix;
+        }
+        existing = parent;
+        if let Ok(canon) = std::fs::canonicalize(existing) {
+            return canon.join(suffix);
+        }
+        if existing.as_os_str().is_empty() {
+            break;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Canonicalise a zone root, falling back to the input when the root
+/// doesn't exist (rare for `scope.workspace()` but possible in tests
+/// that pass a not-yet-created directory).
+pub fn canonical_root_lossy(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// Canonicalise a list of skill plugin directories, dropping (with a
+/// warning log) any entry whose canonicalisation fails. Fail-closed:
+/// when the path can't be canonicalised — typically because it does
+/// not exist on disk yet — we drop it rather than keeping the raw form,
+/// because a raw path is later vulnerable to symlink replacement
+/// (`/tmp/missing -> /etc`) that the canonicalize-on-classify guard
+/// would then legitimise.
+///
+/// Returns the canonicalised list in input order, minus skipped
+/// entries. A missing dir has no readable SKILL content yet, so
+/// dropping it is the safe fallback; the agent loses a read zone it
+/// can't reach anyway.
+pub fn canonicalize_skill_read_zones(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .filter_map(|p| match std::fs::canonicalize(p) {
+            Ok(canon) => Some(canon),
+            Err(e) => {
+                tracing::warn!(
+                    path = %p.display(),
+                    err = %e,
+                    "skipping skill_read_zone (canonicalize failed; fail-closed)",
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Allowed alphabet for session ids that participate in the on-disk
@@ -1175,5 +1302,144 @@ mod tests {
         // the schema version without updating this test (and the
         // module-level history comment on the constant).
         assert_eq!(SESSION_SCOPE_SCHEMA_VERSION, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Codex round-2 BLOCKER 2 (PR #1327 review): canonicalize-then-skip
+    // helper. The pre-fix loop kept the raw path when canonicalize
+    // failed; that was fail-open — a later symlink replacement
+    // (`/tmp/missing -> /etc`) would canonicalise both candidate and
+    // zone root to `/etc` at classify time and accept reads.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn canonicalize_skill_read_zones_skips_missing_paths() {
+        // Two inputs: one real on-disk dir, one missing path. The fail-
+        // closed helper must KEEP the real dir and SKIP the missing
+        // one. The pre-fix code kept the missing path in raw form,
+        // which was fail-open.
+        let real = tempfile::tempdir().expect("create real skill dir");
+        let missing = real.path().join("does-not-exist");
+        let input = vec![real.path().to_path_buf(), missing.clone()];
+        let out = canonicalize_skill_read_zones(&input);
+        assert_eq!(out.len(), 1, "missing entry must be dropped: out = {out:?}");
+        let canonical_real = std::fs::canonicalize(real.path()).expect("canonicalize real");
+        assert_eq!(out[0], canonical_real);
+    }
+
+    #[test]
+    fn canonicalize_skill_read_zones_handles_all_missing_paths() {
+        // Edge case: every entry fails canonicalize. Helper must
+        // return an empty vec (no fail-open fallbacks). Caller then
+        // constructs the scope with empty `skill_read_zones`, which
+        // is the safe state.
+        let parent = tempfile::tempdir().expect("create parent dir");
+        let input = vec![parent.path().join("ghost-a"), parent.path().join("ghost-b")];
+        let out = canonicalize_skill_read_zones(&input);
+        assert!(
+            out.is_empty(),
+            "every entry missing must drop them all: out = {out:?}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_skill_read_zones_preserves_order_when_all_present() {
+        // Order-stability test: helper drops failures but preserves
+        // input order for surviving entries. Callers (the scope
+        // builders) rely on the classifier consulting zones in
+        // declaration order.
+        let a = tempfile::tempdir().expect("a");
+        let b = tempfile::tempdir().expect("b");
+        let c = tempfile::tempdir().expect("c");
+        let input = vec![
+            a.path().to_path_buf(),
+            b.path().to_path_buf(),
+            c.path().to_path_buf(),
+        ];
+        let out = canonicalize_skill_read_zones(&input);
+        assert_eq!(out.len(), 3, "no entries should drop: out = {out:?}");
+        let canon_a = std::fs::canonicalize(a.path()).expect("canon a");
+        let canon_b = std::fs::canonicalize(b.path()).expect("canon b");
+        let canon_c = std::fs::canonicalize(c.path()).expect("canon c");
+        assert_eq!(out, vec![canon_a, canon_b, canon_c]);
+    }
+
+    // -----------------------------------------------------------------
+    // Codex round-2 BLOCKER 1 (PR #1327 review): canonical classify
+    // exposed as a SessionScope method so plugin tools and file tools
+    // share one symlink-safe gate.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_canonical_path_refuses_symlink_escape_from_skill_dir() {
+        // Build:
+        //   skill_dir/link -> outside/
+        //   outside/                  (target of the symlink)
+        //   classify <skill_dir>/link/secret must NOT be InSkillDir;
+        //   canonical classify resolves through `link` and lands at
+        //   `outside/secret`, which is outside the zone => OutOfScope.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = tempfile::tempdir().expect("skill_dir");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = skill_dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create symlink");
+
+        // Use the *canonical* skill_dir on both sides so the lexical
+        // prefix actually matches before canonicalisation. On macOS the
+        // tmpdir lives under `/var/folders/...` which canonicalises to
+        // `/private/var/folders/...`; if the skill_dir we configure
+        // doesn't share the candidate's lexical prefix, the lexical
+        // classify already returns OutOfScope and we can't pin the
+        // regression scenario.
+        let canonical_skill = std::fs::canonicalize(skill_dir.path()).expect("canon skill");
+        let workspace_canon = std::fs::canonicalize(workspace.path()).expect("canon workspace");
+        let canonical_link = canonical_skill.join("link");
+        let candidate = canonical_link.join("secret");
+
+        let scope = SessionScope::solo(workspace_canon, vec![])
+            .expect("build solo scope")
+            .with_skill_read_zones(vec![canonical_skill.clone()])
+            .expect("attach skill_read_zone");
+
+        // Lexical classify accepts because the lexical path is
+        // `<skill_dir>/link/secret` and `link` is a Normal component
+        // before the canonical walk happens. Pin that this is the
+        // exact regression scenario.
+        assert!(
+            matches!(
+                scope.classify_lexical_path(&candidate),
+                PathClassification::InSkillDir { .. }
+            ),
+            "lexical classify wrongly accepts symlink escape — the bug we're fixing",
+        );
+        // Canonical classify must refuse.
+        assert_eq!(
+            scope.classify_canonical_path(&candidate),
+            PathClassification::OutOfScope,
+            "canonical classify must refuse <skill_dir>/symlink/<file> when the symlink escapes",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_canonical_path_accepts_real_skill_dir_files() {
+        // Positive baseline: when no symlinks are involved, canonical
+        // classify must still accept files under a skill_dir.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = tempfile::tempdir().expect("skill_dir");
+        let manifest = skill_dir.path().join("SKILL.md");
+        std::fs::write(&manifest, b"# fixture").unwrap();
+        let canonical_skill = std::fs::canonicalize(skill_dir.path()).expect("canon skill");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .expect("build solo scope")
+            .with_skill_read_zones(vec![canonical_skill.clone()])
+            .expect("attach skill_read_zone");
+        match scope.classify_canonical_path(&manifest) {
+            PathClassification::InSkillDir { skill_dir: dir } => {
+                assert_eq!(dir, canonical_skill, "report the configured skill_dir form");
+            }
+            other => panic!("expected InSkillDir for real skill_dir file, got {other:?}"),
+        }
     }
 }

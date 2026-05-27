@@ -454,15 +454,16 @@ impl ChatCommand {
         };
         // PR-A: thread the per-profile plugin install directories
         // through to the scope so `read_file` can reach the SKILL.md
-        // content the agent's system prompt auto-injects. Each entry
-        // is canonicalized so symlinked plugin install roots line up
-        // with the canonicalized candidate paths the tools-side
-        // resolver compares against; raw path is used when
-        // canonicalize fails (e.g. dir not yet created).
-        let canonical_skill_dirs: Vec<PathBuf> = plugin_dirs
-            .iter()
-            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-            .collect();
+        // content the agent's system prompt auto-injects.
+        //
+        // Codex round-2 BLOCKER 2 (PR #1327 review): SKIP dirs that
+        // fail canonicalize (fail-closed). Keeping the raw path was a
+        // fail-open vulnerability — a later symlink replacement
+        // (`/tmp/missing -> /etc`) would canonicalise both sides to
+        // `/etc` and allow reads as `InSkillDir`. The shared helper in
+        // `octos-core` drops the entry and logs a warning per skip.
+        let canonical_skill_dirs: Vec<PathBuf> =
+            octos_core::canonicalize_skill_read_zones(&plugin_dirs);
         let session_scope = {
             let base = SessionScope::solo(absolute_cwd.clone(), Vec::new()).expect(
                 "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",

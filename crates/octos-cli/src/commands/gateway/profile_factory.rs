@@ -924,6 +924,11 @@ impl ProfileActorFactoryBuilder {
             // `profile.config.lane_routing`. None = built-in defaults.
             lane_routing: effective_profile.config.lane_routing.clone(),
             memory_store: Some(self.memory_store.clone()),
+            // Codex round-2 MAJOR 3 (PR #1327 review): expose the
+            // profile_id so `ActorFactory::spawn` can build a per-
+            // session SessionScope (multi-tenant) and attach the
+            // canonicalised skill_read_zones to gateway-spawned actors.
+            profile_id: Some(profile_id.to_string()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
             // Section B (codex review P1.1): propagate the profile's
