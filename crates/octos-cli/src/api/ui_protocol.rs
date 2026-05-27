@@ -42,8 +42,8 @@ use octos_core::ui_protocol::{
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
-    TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
@@ -12702,6 +12702,8 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 None,
+                // M9 fixtures replay canned events; no live LLM token data.
+                None,
             )
             .await;
         }
@@ -12714,6 +12716,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some((code, message.as_str())),
+                None,
             )
             .await;
         }
@@ -12742,6 +12745,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some(("interrupted", "turn interrupted by client")),
+                None,
             )
             .await;
         }
@@ -13507,6 +13511,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13522,6 +13527,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13541,6 +13547,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13562,6 +13569,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13777,6 +13785,7 @@ async fn run_native_code_review_turn(
                     &session_id,
                     &turn_id,
                     Some(("interrupted", "review/start interrupted by client")),
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13893,6 +13902,10 @@ async fn run_native_code_review_turn(
         &ledger,
         &session_id,
         &turn_id,
+        None,
+        // review/start scatter-join does not run a single LLM turn end
+        // to end; the summary message is emitted ad-hoc. No aggregated
+        // token data is in scope here.
         None,
     )
     .await;
@@ -14956,6 +14969,7 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             Some(("runtime_unavailable", error.as_str())),
+            None,
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -14980,6 +14994,7 @@ async fn run_standalone_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -15001,6 +15016,7 @@ async fn run_standalone_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -15169,6 +15185,9 @@ async fn run_standalone_turn(
             &ledger,
             &session_id,
             &turn_id,
+            None,
+            // Slash-command shortcut bypasses the LLM entirely; the
+            // reply is canned and no token meter ran.
             None,
         )
         .await;
@@ -16152,6 +16171,15 @@ async fn run_standalone_turn(
                 // Defer the send until below the persist block.
                 let mut captured_final_reply = response.content.clone();
                 let mut cursor = None;
+                // Issue #1332: capture the wire `message_id` for the
+                // final assistant row so the `done` event can surface
+                // it on `turn/completed.session_result.message_id`.
+                // Format mirrors `MessageCommitObserver`:
+                // `{session_id}:{committed_seq}:{timestamp_ns}`. Only
+                // populated on the success branch of
+                // `add_message_with_seq`, so the consumer sees a
+                // `Some` only when the durable row actually exists.
+                let mut final_assistant_message_id: Option<String> = None;
                 // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
                 // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
                 // error). Track whether the assistant row carrying
@@ -16342,6 +16370,15 @@ async fn run_standalone_turn(
                             });
                             if is_final_assistant_carrier {
                                 final_assistant_persisted = true;
+                                // Issue #1332: stamp the wire message_id
+                                // for the carrier row so `done` can
+                                // populate `session_result.message_id`.
+                                let ts_ns = saved_for_context
+                                    .timestamp
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0);
+                                final_assistant_message_id =
+                                    Some(format!("{}:{seq}:{ts_ns}", agent_session_id.0,));
                             }
                             if let Some(content) = preamble_assistant_content {
                                 last_persisted_preamble_assistant = Some(content);
@@ -16498,6 +16535,18 @@ async fn run_standalone_turn(
                                         seq: seq as u64,
                                     });
                                     final_assistant_persisted = true;
+                                    // Issue #1332: stamp message_id for
+                                    // the synthesised final-assistant
+                                    // row too (parity with the carrier
+                                    // branch above so `done`'s
+                                    // `session_result` is populated
+                                    // whichever branch wrote the row).
+                                    let ts_ns = saved_for_context
+                                        .timestamp
+                                        .timestamp_nanos_opt()
+                                        .unwrap_or(0);
+                                    final_assistant_message_id =
+                                        Some(format!("{}:{seq}:{ts_ns}", agent_session_id.0,));
                                 }
                             }
                         }
@@ -16542,12 +16591,18 @@ async fn run_standalone_turn(
                     None
                 };
                 let _ = final_reply_tx.send(final_send);
+                // Issue #1332: include `message_id` so the consumer
+                // can build `TurnSessionResult` for the
+                // `turn/completed` lifecycle envelope. Absent when no
+                // final-assistant row persisted (no synthesis +
+                // skipped carrier + JSONL write failures).
                 let done = json!({
                     "type": "done",
                     "content": response.content,
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                     "cursor": cursor,
+                    "message_id": final_assistant_message_id,
                     "thread_id": turn_thread_id_for_done,
                 });
                 let _ = progress_tx_for_result.send(done.to_string()).await;
@@ -16651,6 +16706,48 @@ async fn run_standalone_turn(
                 final_tokens_consumed = final_tokens_consumed
                     .saturating_add(tokens_in)
                     .saturating_add(tokens_out);
+                // Issue #1332: thread `done` payload data into the
+                // `turn/completed` lifecycle event. Tokens come from the
+                // same `response.token_usage` values the cost accountant
+                // sees; `session_result` is built from the cursor +
+                // message_id the persist block stamped when the final
+                // assistant row committed. The SSE bridge that
+                // originally fed these fields was removed in
+                // M9-α-5/α-6 (PR #855) — without this wiring the
+                // capability-gated fields stayed `None` for every
+                // WS-driven turn, leaving capability-aware clients
+                // unable to tell "no data" from "stub".
+                let done_cursor: Option<UiCursor> = event
+                    .get("cursor")
+                    .filter(|value| !value.is_null())
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+                let done_message_id = event
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let session_result = match (&done_cursor, done_message_id) {
+                    (Some(cursor), Some(message_id)) => Some(TurnSessionResult {
+                        committed_seq: cursor.seq,
+                        message_id,
+                        // `turn/start` does not carry a per-prompt
+                        // `client_message_id` (see `TurnStartParams`),
+                        // so the originating-cmid lookup degrades to
+                        // `None` on the WS path. The gateway path
+                        // (`SessionActor::*`) carries cmids end to end
+                        // — once that path also pipes through
+                        // `TurnCompletionDetails`, this branch picks
+                        // up cmid naturally.
+                        client_message_id: None,
+                    }),
+                    _ => None,
+                };
+                let details = TurnCompletionDetails {
+                    cursor: done_cursor,
+                    tokens_in: Some(u32::try_from(tokens_in).unwrap_or(u32::MAX)),
+                    tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
+                    session_result,
+                };
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -16662,6 +16759,7 @@ async fn run_standalone_turn(
                     &session_id,
                     &turn_id,
                     None,
+                    Some(details),
                 )
                 .await;
                 break;
@@ -16681,6 +16779,7 @@ async fn run_standalone_turn(
                     &session_id,
                     &turn_id,
                     Some(("runtime_error", message.as_str())),
+                    None,
                 )
                 .await;
                 break;
@@ -16752,6 +16851,7 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             Some(("interrupted", "turn interrupted by client")),
+            None,
         )
         .await;
     }
@@ -17076,9 +17176,28 @@ fn classify_runtime_error_message(error: &eyre::Report) -> String {
     error.to_string()
 }
 
+/// UPCR-2026-014 follow-up (issue #1332): optional token + session_result
+/// payload threaded from the agent-task `done` event into the lifecycle
+/// `turn/completed` emit. None on error/interrupt paths and on paths that
+/// have no LLM token data (M9 fixture, slash-command shortcut, review/start).
+#[derive(Debug, Default, Clone)]
+struct TurnCompletionDetails {
+    cursor: Option<UiCursor>,
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+    session_result: Option<TurnSessionResult>,
+}
+
 /// Atomically transition state and emit exactly one terminal event. No-op if
 /// the state is already `Terminal(_)`. See `transition_to_terminal` for the
 /// state-machine details.
+///
+/// `completion_details` is consulted only when `expected_reason` is
+/// `Completed`; ignored otherwise. Populated on the standalone-turn path
+/// from `done` (input/output tokens + cursor + per-row identity); left as
+/// `None` for paths that do not run the LLM (slash command, review/start
+/// scatter-join, M9 fixture replays).
+#[allow(clippy::too_many_arguments)]
 async fn try_emit_terminal(
     turn_state: &TokioMutex<TurnState>,
     expected_reason: TerminalReason,
@@ -17087,6 +17206,7 @@ async fn try_emit_terminal(
     session_id: &SessionKey,
     turn_id: &TurnId,
     error_payload: Option<(&str, &str)>,
+    completion_details: Option<TurnCompletionDetails>,
 ) {
     let Some(TerminalTransition { reason, ack }) =
         transition_to_terminal(turn_state, expected_reason).await
@@ -17099,6 +17219,7 @@ async fn try_emit_terminal(
     // but the ledger is still appended so reconnect-replay can catch up.
     match reason {
         TerminalReason::Completed => {
+            let details = completion_details.unwrap_or_default();
             let _ = send_notification_lifecycle(
                 ws,
                 ledger,
@@ -17106,15 +17227,15 @@ async fn try_emit_terminal(
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id: turn_id.clone(),
-                    cursor: None,
-                    // UPCR-2026-014 (M9-α-9) addendum fields; the WS
-                    // lifecycle path doesn't have token usage /
-                    // session_result threaded yet — those land via the
-                    // SSE bridge in α-9. Leaving them None preserves
-                    // the pre-addendum wire shape for WS-driven turns.
-                    tokens_in: None,
-                    tokens_out: None,
-                    session_result: None,
+                    cursor: details.cursor,
+                    // UPCR-2026-014 (M9-α-9) addendum fields. The SSE
+                    // bridge that originally fed `session_result` was
+                    // removed in M9-α-5/α-6 (PR #855); issue #1332 wires
+                    // the same values straight from the agent task's
+                    // `done` event so the WS path is no longer dormant.
+                    tokens_in: details.tokens_in,
+                    tokens_out: details.tokens_out,
+                    session_result: details.session_result,
                 }),
             );
         }
@@ -21264,6 +21385,136 @@ ignore = []
                 text: "x".into(),
             }));
         assert_eq!(ledger_event_cursor(&delta), None);
+    }
+
+    /// Issue #1332: when the standalone-turn `done` event carries
+    /// token totals + cursor + final-assistant message_id, the
+    /// `turn/completed` lifecycle envelope must surface them on
+    /// `tokens_in`, `tokens_out`, and `session_result` rather than the
+    /// dormant-stub `None` triple. Drives `try_emit_terminal` directly
+    /// because the spawn pipeline is too wide to fixture; the helper
+    /// is the wire-side closure that issue #1332 modified.
+    #[tokio::test]
+    async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+        let cursor = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 17,
+        };
+        let details = TurnCompletionDetails {
+            cursor: Some(cursor.clone()),
+            tokens_in: Some(123),
+            tokens_out: Some(456),
+            session_result: Some(TurnSessionResult {
+                committed_seq: cursor.seq,
+                message_id: format!("{}:{}:{}", session_id.0, cursor.seq, 99_999),
+                client_message_id: Some("cmid-user-1".into()),
+            }),
+        };
+
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+            Some(details.clone()),
+        )
+        .await;
+
+        let mut completed_frame: Option<String> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let WsMessage::Text(text) = msg {
+                if text.contains("\"method\":\"turn/completed\"") {
+                    completed_frame = Some(text.to_string());
+                    break;
+                }
+            }
+        }
+        let frame = completed_frame.expect("turn/completed must be emitted");
+        assert!(
+            frame.contains("\"tokens_in\":123"),
+            "tokens_in must surface from completion details: {frame}"
+        );
+        assert!(
+            frame.contains("\"tokens_out\":456"),
+            "tokens_out must surface from completion details: {frame}"
+        );
+        assert!(
+            frame.contains("\"session_result\""),
+            "session_result must surface when populated: {frame}"
+        );
+        assert!(
+            frame.contains("\"committed_seq\":17"),
+            "session_result.committed_seq must mirror cursor.seq: {frame}"
+        );
+        assert!(
+            frame.contains("\"client_message_id\":\"cmid-user-1\""),
+            "session_result.client_message_id must round-trip: {frame}"
+        );
+        assert!(
+            frame.contains("\"cursor\""),
+            "top-level cursor must be threaded too: {frame}"
+        );
+    }
+
+    /// Companion negative test: paths that do not run an LLM (slash
+    /// command shortcut, M9 fixture, review/start) pass `None` for
+    /// `completion_details`. The wire shape must degrade gracefully to
+    /// the pre-#1332 envelope with no token fields surfaced, so capability
+    /// clients keying off `tokens_in == None` aren't misled.
+    #[tokio::test]
+    async fn try_emit_terminal_with_no_details_omits_token_fields() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+            None,
+        )
+        .await;
+
+        let mut completed_frame: Option<String> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let WsMessage::Text(text) = msg {
+                if text.contains("\"method\":\"turn/completed\"") {
+                    completed_frame = Some(text.to_string());
+                    break;
+                }
+            }
+        }
+        let frame = completed_frame.expect("turn/completed must be emitted");
+        // `serde(skip_serializing_if = "Option::is_none")` on each field
+        // means a `None` triple should NOT appear on the wire.
+        assert!(
+            !frame.contains("\"tokens_in\""),
+            "tokens_in must be omitted when details are None: {frame}"
+        );
+        assert!(
+            !frame.contains("\"tokens_out\""),
+            "tokens_out must be omitted when details are None: {frame}"
+        );
+        assert!(
+            !frame.contains("\"session_result\""),
+            "session_result must be omitted when details are None: {frame}"
+        );
     }
 
     #[test]
