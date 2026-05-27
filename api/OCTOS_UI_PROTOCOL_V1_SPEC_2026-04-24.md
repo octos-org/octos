@@ -1540,6 +1540,131 @@ topic for client-side scoping.
 
 Marks the abnormal terminal event for a turn.
 
+### `turn/spawn_complete`
+
+Completion-as-new-envelope event for `spawn_only` background tool results.
+Carries the late assistant `content` plus optional `media` attachments and
+the originating user prompt's `client_message_id` under
+`response_to_client_message_id`, so the client can render a NEW assistant
+bubble under the correct user prompt without splice-merging into the existing
+spawn-acknowledgement bubble.
+
+Capability gate: `event.spawn_complete.v1`. When the capability is not
+negotiated, the same durable row appears as `message/persisted` instead — the
+ledger commit is unchanged, only the wire kind flips.
+
+Required fields: `session_id`, `task_id`, `seq`, `message_id`, `source`,
+`cursor`, `persisted_at`, `content`. Optional fields: `topic`, `turn_id`,
+`thread_id`, `tool_call_id`, `response_to_client_message_id`, `media`.
+
+Full field set and semantics are documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `approval/auto_resolved`
+
+Notification emitted when an incoming approval request was auto-resolved by
+a previously recorded scope policy entry, instead of surfacing a fresh
+`approval/requested` to the client.
+
+Required fields: `session_id`, `approval_id`, `turn_id`, `tool_name`,
+`scope`, `scope_match`, `decision`. Full field set documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `approval/decided`
+
+Durable record of an approval decision (manual or auto-resolved). Replayed
+on reconnect so a client that connected after the decision renders the
+approval card as Decided rather than as still pending. Carries identifiers
+and decision metadata only; payload bodies (command strings, diffs) are
+intentionally omitted for compliance / PII reasons.
+
+Required fields: `session_id`, `approval_id`, `turn_id`, `decision`,
+`decided_at`, `decided_by`, `auto_resolved`. Optional fields: `scope`,
+`policy_id`, `client_note`. Full field set documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `approval/cancelled`
+
+Durable notification announcing that a previously pending approval was
+cancelled by the server before any client could respond. The reason registry
+is open: clients should treat unknown reasons as opaque strings and may add
+new entries as future drains land (e.g. `session_closed`). Initial values:
+`turn_interrupted`.
+
+Required fields: `session_id`, `approval_id`, `turn_id`, `reason`. Full
+field set documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `progress/updated`
+
+Standalone rich progress notification payload for kinds that do not fit
+the first-wave `turn/*`, `tool/*`, or `task/*` envelopes — status pills,
+retry-with-backoff banners, file-mutation notices, and token / cost
+heartbeats.
+
+Required fields: `session_id`, `metadata`. Optional field: `turn_id`. The
+`metadata.kind` field is an open registry; initial values include `status`,
+`retry_backoff`, `file_mutation`, and `token_cost_update`. Full field set,
+typed sub-objects, and forward-compat `extra` map documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+`progress/updated` is a durable ledger event. Each frame is committed to
+the per-session append-only ledger before the wire frame is enqueued, so
+`session/open` replay returns the entries that ledger retention still
+covers. Under per-connection backpressure a live-socket drop is reported
+via `protocol/replay_lossy` (see § 9); the dropped `progress/updated`
+frames are still recoverable from the ledger. Clients SHOULD treat the
+latest received `progress/updated` of a given `metadata.kind` as
+authoritative for UI rendering.
+
+### `context/compaction_completed`
+
+Notification that a server-owned context-manager compaction pass committed.
+Carries the post-compaction `context_state` and a typed `compaction` record
+with counts (`input_item_count`, `retained_count`, `dropped_count`), token
+estimates before/after, and hash anchors for the input and replacement
+transcripts.
+
+Capability gate: `context.lifecycle.v1`.
+
+Required fields: `session_id`, `context_state`, `compaction`. Full field
+set, `UiContextState` shape, and `UiContextCompactionRecord` shape
+documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `context/normalization_reported`
+
+Notification that a prompt-normalization pass ran ahead of an LLM call.
+Carries counts of repaired / dropped / synthetic / truncated items so AppUI
+can render context-hygiene status without re-running normalization locally.
+
+Capability gate: `context.lifecycle.v1`.
+
+Required fields: `session_id`, `context_state`, `normalization`. Full field
+set and the `UiContextNormalizationReport` shape documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `protocol/replay_lossy`
+
+Wire signal that one or more durable notifications were dropped due to
+per-connection backpressure. The client should diverge from its cursor and
+rehydrate via REST snapshot or `session/open` replay. Carries the last
+durable cursor so the client can resume cleanly.
+
+`protocol/replay_lossy` is itself a durable ledger event. The "lossy" name
+describes the condition it reports (other durable notifications were
+dropped from the live socket under per-connection backpressure), not its
+own durability — the reference server appends the signal to the per-session
+ledger via the same write-ahead path as every other durable notification
+before attempting the wire send. Reconnecting and issuing a fresh
+`session/open` replays both the `protocol/replay_lossy` signal and the
+durable events that the per-connection ring dropped. See § 9 for reconnect
+rules.
+
+Required fields: `session_id`, `dropped_count`. Optional field:
+`last_durable_cursor`. Full field set documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
 ## 9. Reconnect and Cursor Rules
 
 The protocol needs explicit reconnect semantics. `UI Protocol v1` should treat these as part of the contract, not implementation detail.
@@ -1555,6 +1680,18 @@ The durable/ephemeral split should be explicit:
 
 - durable: ordered replayable protocol events
 - ephemeral: in-flight deltas not yet attached to a durable cursor boundary
+
+When a connected client falls behind its per-connection backpressure ring,
+the server emits `protocol/replay_lossy` (see § 8) carrying the last durable
+cursor it is confident the client observed. The client must diverge from its
+local cursor and rehydrate via `session/open` replay or REST snapshot. The
+`protocol/replay_lossy` signal is itself committed to the durable ledger via
+the same write-ahead path as every other durable notification — its name
+reports a *backlog* condition (durable frames dropped from the live socket)
+rather than its own durability, so reconnecting clients observe the signal
+on replay alongside the surrounding durable events. The full wire contract
+for the signal is documented by
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
 
 ### 9.1 Ledger Durability Contract (M9-FIX-05 / #643)
 
