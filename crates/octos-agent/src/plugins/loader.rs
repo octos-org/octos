@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, eyre};
 use octos_plugin::{LifecycleExecutor, ToolDiscovery};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -190,32 +190,32 @@ impl PluginLoader {
 
             if let Some(manifest) = manifest_for_discovery {
                 if let octos_plugin::ToolDiscovery::Http { base_url } = &manifest.tool_discovery {
-                    match install_http_tools_from_catalog(registry, base_url, Some(&manifest)).await
-                    {
-                        Ok(names) => {
-                            let count = names.len();
-                            result.tool_count += count;
-                            result.tool_names.extend(names);
-                            info!(
-                                plugin_dir = %path.display(),
-                                base_url = %base_url,
-                                count = count,
-                                "registered HTTP-discovered tools at startup",
-                            );
-                        }
-                        Err(e) => {
-                            // Startup is the only safe window to notice a missing
-                            // bridge; this is safety-critical for robotics. Use
-                            // `error!` so it isn't swallowed by default log
-                            // filters. We still `continue` rather than abort the
-                            // whole load so other skills come up.
-                            tracing::error!(
-                                plugin_dir = %path.display(),
-                                error = %e,
-                                "HTTP tool discovery failed; skill registered ZERO tools (was the bridge offline?). Manual restart required after fixing.",
-                            );
-                        }
-                    }
+                    // PR #1260 review (Finding 2): hard-fail when HTTP
+                    // discovery can't reach the bridge or parse the
+                    // catalog. Silently registering zero tools left the
+                    // skill operationally identical to a broken install
+                    // — observable only by reading log files. A returned
+                    // error forces the CLI/agent to surface the problem
+                    // at the very next operator interaction.
+                    let names =
+                        install_http_tools_from_catalog(registry, base_url, Some(&manifest))
+                            .await
+                            .wrap_err_with(|| {
+                                format!(
+                                    "HTTP tool discovery failed for skill at {} (bridge {})",
+                                    path.display(),
+                                    base_url
+                                )
+                            })?;
+                    let count = names.len();
+                    result.tool_count += count;
+                    result.tool_names.extend(names);
+                    info!(
+                        plugin_dir = %path.display(),
+                        base_url = %base_url,
+                        count = count,
+                        "registered HTTP-discovered tools at startup",
+                    );
                     // HTTP-discovery skills do NOT fall through to the
                     // binary-protocol loader — they ship no native binary.
                     continue;

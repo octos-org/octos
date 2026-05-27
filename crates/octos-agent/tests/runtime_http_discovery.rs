@@ -1,6 +1,8 @@
 //! Verifies that PluginLoader::load_into_with_options re-registers HTTP-discovered
 //! tools on every startup — fixes Critical #1 from the PR #1260 code review.
 
+use std::net::{SocketAddr, TcpListener};
+
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{method, path};
@@ -205,5 +207,96 @@ async fn activate_skill_registers_http_tools_and_robot_groups() {
         robot_groups::snapshot().tier_of("install_robot_move"),
         Some(SafetyTier::SafeMotion),
         "install path must enrol tools in robot_groups (mirrors runtime path)"
+    );
+}
+
+/// PR #1260 review (Finding 2): startup-time HTTP discovery failure must
+/// not register zero tools and return success — that leaves an installed
+/// HTTP-backed skill silently unavailable until manual restart. The
+/// loader must hard-fail so the operator notices and CI catches the
+/// regression.
+#[tokio::test]
+async fn load_into_hard_fails_when_http_bridge_unreachable() {
+    // Grab a real loopback port, then immediately drop the listener so
+    // connections to it get "connection refused" — emulates a bridge that
+    // crashed before the agent restarted.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    drop(listener);
+    let dead_base_url = format!("http://{}", addr);
+
+    let dir = tempdir().unwrap();
+    let skill_dir = dir.path().join("offline-bridge-robot");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let manifest = json!({
+        "name": "offline-bridge-robot",
+        "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_discovery": { "type": "http", "base_url": dead_base_url }
+    });
+    std::fs::write(
+        skill_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = ToolRegistry::new();
+    let err = PluginLoader::load_into_with_options(
+        &mut registry,
+        &[dir.path().to_path_buf()],
+        &[],
+        Default::default(),
+    )
+    .await
+    .expect_err("load_into must fail when an HTTP-discovery skill cannot reach its bridge");
+
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("http")
+            || msg.to_lowercase().contains("bridge")
+            || msg.to_lowercase().contains("discovery"),
+        "error should name the failed transport, got: {msg}"
+    );
+}
+
+/// Companion to the above: a catalog endpoint that returns malformed JSON
+/// must also fail-fast, not silently register zero tools.
+#[tokio::test]
+async fn load_into_hard_fails_when_catalog_returns_garbage() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tools"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not valid json {{{"))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let skill_dir = dir.path().join("garbage-catalog-robot");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let manifest = json!({
+        "name": "garbage-catalog-robot",
+        "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_discovery": { "type": "http", "base_url": server.uri() }
+    });
+    std::fs::write(
+        skill_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut registry = ToolRegistry::new();
+    let err = PluginLoader::load_into_with_options(
+        &mut registry,
+        &[dir.path().to_path_buf()],
+        &[],
+        Default::default(),
+    )
+    .await
+    .expect_err("load_into must fail when catalog response cannot be parsed");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("http") || msg.contains("bridge") || msg.contains("discovery"),
+        "error should name the failed transport, got: {msg}"
     );
 }
