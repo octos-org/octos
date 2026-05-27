@@ -60,6 +60,32 @@ pub struct PluginManifest {
     /// the legacy SKILL.md auto-inject only (see `extras.rs`).
     #[serde(default, deserialize_with = "deserialize_discovery")]
     pub discovery: Option<SkillDiscovery>,
+    /// When false, this plugin opts out of having its SKILL.md auto-injected
+    /// into the system prompt. Used in combination with `discovery` (PR-C) to
+    /// migrate plugins from legacy auto-inject to on-demand discovery.
+    ///
+    /// Migration is intentionally three steps so each stage stays revertable:
+    ///   1. Add `discovery` so both legacy auto-inject AND the new skill
+    ///      card render (validate the card works in production).
+    ///   2. Set `skill_md_auto_inject: false` so only the card renders.
+    ///   3. Trim SKILL.md body to <=80 lines now that the LLM reads it on
+    ///      demand instead of having it shoved into every system prompt.
+    ///
+    /// Decoupling step 2 from step 1 via an explicit flag (rather than an
+    /// implicit "presence of discovery disables legacy") is what lets each
+    /// step be independently revertable — see PR-D1.
+    ///
+    /// Default: true (legacy behavior preserved for unmigrated plugins).
+    #[serde(default = "default_true")]
+    pub skill_md_auto_inject: bool,
+}
+
+/// Serde default helper for `bool` fields whose absence should deserialize
+/// to `true`. Locally scoped: `PluginManifest::skill_md_auto_inject` is the
+/// only field in this module that needs it today, but adding more later
+/// (e.g. a `legacy_card_inject` flag) should reuse this helper.
+fn default_true() -> bool {
+    true
 }
 
 impl PluginManifest {
@@ -74,6 +100,13 @@ impl PluginManifest {
     /// check meant a discovery-only manifest became a silent no-op under
     /// strict mode, and a signed tool plugin with discovery had its skill
     /// card dropped without any warning.
+    ///
+    /// PR-D1 note: `skill_md_auto_inject` is intentionally NOT counted as an
+    /// extra. The semantics are inverted relative to the other fields —
+    /// setting it to `false` *removes* an injected fragment rather than
+    /// adding one — so it does not affect whether the manifest carries
+    /// surfaces beyond its tool list. The loader's strict-mode reasoning
+    /// about extras-only manifests therefore continues to apply unchanged.
     pub fn has_extras(&self) -> bool {
         !self.mcp_servers.is_empty()
             || !self.hooks.is_empty()
@@ -1177,5 +1210,59 @@ mod tests {
             msg.to_lowercase().contains("read") || msg.to_lowercase().contains("list"),
             "error must explain hint needs read or list; got: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // SKILL.md PR-D1: skill_md_auto_inject opt-out flag
+    // ------------------------------------------------------------------
+
+    /// A manifest that omits the field must deserialize to `true` so
+    /// unmigrated plugins keep current behavior (legacy SKILL.md
+    /// auto-inject still runs for `spawn_only` tools).
+    #[test]
+    fn manifest_defaults_skill_md_auto_inject_to_true() {
+        let json = r#"{
+            "name": "legacy",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(
+            manifest.skill_md_auto_inject,
+            "missing field must default to true (preserves legacy auto-inject)"
+        );
+    }
+
+    /// Explicit `false` opts the plugin out of the legacy SKILL.md
+    /// auto-inject. This is the migration knob PR-D2 will set per skill
+    /// after the new discovery card lands and soaks.
+    #[test]
+    fn manifest_parses_explicit_skill_md_auto_inject_false() {
+        let json = r#"{
+            "name": "migrated",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "skill_md_auto_inject": false
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(
+            !manifest.skill_md_auto_inject,
+            "explicit false must turn off the legacy auto-inject gate"
+        );
+    }
+
+    /// Explicit `true` is equivalent to omitting the field but must still
+    /// be parseable so operators can be loud about opting in during the
+    /// migration window.
+    #[test]
+    fn manifest_parses_explicit_skill_md_auto_inject_true() {
+        let json = r#"{
+            "name": "explicit-legacy",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "skill_md_auto_inject": true
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.skill_md_auto_inject);
     }
 }
