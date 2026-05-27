@@ -75,7 +75,13 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
     // only agents that actually emit the new envelope teach the LLM
     // about it — automatic and consistent with the gating in
     // `execution.rs::is_tool_visible`.
-    if manifest.tools.iter().any(|t| t.spawn_only) {
+    //
+    // PR-D1 of the SKILL.md rethink: a plugin can opt out of this legacy
+    // auto-inject by setting `skill_md_auto_inject: false` in its manifest.
+    // The flag defaults to `true` so unmigrated plugins keep current
+    // behavior; PR-D2 (mofa-skills) opts each mofa-* skill in, and PR-E
+    // eventually flips the default.
+    if manifest.skill_md_auto_inject && manifest.tools.iter().any(|t| t.spawn_only) {
         let skill_md = skill_dir.join("SKILL.md");
         if skill_md.exists() {
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
@@ -383,6 +389,7 @@ mod tests {
             hooks: vec![],
             prompts: None,
             discovery: None,
+            skill_md_auto_inject: true,
         };
         let extras = resolve_extras(&manifest, Path::new("/skills/test"));
         assert!(extras.mcp_servers.is_empty());
@@ -412,6 +419,7 @@ mod tests {
                 include: vec!["prompts/*.md".into()],
             }),
             discovery: None,
+            skill_md_auto_inject: true,
         };
         let extras = resolve_extras(&manifest, dir.path());
         assert_eq!(extras.prompt_fragments.len(), 2);
@@ -433,6 +441,20 @@ mod tests {
         tools: Vec<&str>,
         discovery: Option<crate::plugins::manifest::SkillDiscovery>,
         any_spawn_only: bool,
+    ) -> PluginManifest {
+        manifest_for_card_test_with_flag(name, tools, discovery, any_spawn_only, true)
+    }
+
+    /// Variant of `manifest_for_card_test` that exposes the PR-D1
+    /// `skill_md_auto_inject` flag. The shorter helper above wraps this
+    /// with `skill_md_auto_inject: true` (the default) to keep older
+    /// tests readable.
+    fn manifest_for_card_test_with_flag(
+        name: &str,
+        tools: Vec<&str>,
+        discovery: Option<crate::plugins::manifest::SkillDiscovery>,
+        any_spawn_only: bool,
+        skill_md_auto_inject: bool,
     ) -> PluginManifest {
         use crate::plugins::manifest::PluginToolDef;
         PluginManifest {
@@ -459,6 +481,7 @@ mod tests {
             hooks: vec![],
             prompts: None,
             discovery,
+            skill_md_auto_inject,
         }
     }
 
@@ -632,6 +655,162 @@ mod tests {
         assert!(
             !card.contains("if you need:"),
             "empty hints should NOT render 'if you need:' header: {card}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // SKILL.md PR-D1: skill_md_auto_inject opt-out gates legacy SKILL.md
+    // ------------------------------------------------------------------
+
+    /// Opting out (`skill_md_auto_inject: false`) skips the legacy
+    /// auto-inject even when the manifest has a `spawn_only` tool and a
+    /// `SKILL.md` is present on disk. This is the migration end-state for
+    /// step 2 of the rethink — the new discovery card replaces the
+    /// always-injected SKILL.md body.
+    #[test]
+    fn extras_skips_legacy_auto_inject_when_opted_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Legacy SKILL.md\nShould NOT be injected when opted out.\n",
+        )
+        .unwrap();
+
+        let manifest = manifest_for_card_test_with_flag(
+            "opted-out",
+            vec!["bg_tool"],
+            None,  // no discovery — purely a legacy-gate test
+            true,  // any_spawn_only triggers the legacy auto-inject path
+            false, // skill_md_auto_inject opt-out
+        );
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        assert!(
+            extras.prompt_fragments.is_empty(),
+            "opted-out plugin must not inject SKILL.md; got {:?}",
+            extras.prompt_fragments
+        );
+    }
+
+    /// Default behavior (no explicit flag in the manifest, mirrored here
+    /// by passing `skill_md_auto_inject: true`) preserves the legacy
+    /// auto-inject so unmigrated plugins keep working.
+    #[test]
+    fn extras_runs_legacy_auto_inject_when_opted_in_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Legacy SKILL.md\nUnmigrated default behavior.\n",
+        )
+        .unwrap();
+
+        // `manifest_for_card_test` constructs with skill_md_auto_inject:true
+        // — the default — so this exercises the "field omitted" path.
+        let manifest = manifest_for_card_test(
+            "legacy-default",
+            vec!["bg_tool"],
+            None,
+            true, // spawn_only present
+        );
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        assert_eq!(
+            extras.prompt_fragments.len(),
+            1,
+            "default plugin must inject SKILL.md exactly once; got {:?}",
+            extras.prompt_fragments
+        );
+        assert!(
+            extras.prompt_fragments[0].contains("Unmigrated default behavior."),
+            "fragment must contain SKILL.md body; got {:?}",
+            extras.prompt_fragments[0]
+        );
+    }
+
+    /// Explicit `true` is equivalent to the default — confirms the gate
+    /// does not silently invert when a manifest opts in loudly.
+    #[test]
+    fn extras_runs_legacy_auto_inject_when_explicitly_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Legacy SKILL.md\nExplicit opt-in body.\n",
+        )
+        .unwrap();
+
+        let manifest = manifest_for_card_test_with_flag(
+            "explicit-legacy",
+            vec!["bg_tool"],
+            None,
+            true,
+            true, // explicit opt-in
+        );
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        assert_eq!(extras.prompt_fragments.len(), 1);
+        assert!(extras.prompt_fragments[0].contains("Explicit opt-in body."));
+    }
+
+    /// Migration end-state regression: when both `discovery` is present
+    /// AND `skill_md_auto_inject: false` is set, the skill card renders
+    /// but the legacy SKILL.md body does not. This is the configuration
+    /// PR-D2 will produce per migrated mofa-* skill.
+    #[test]
+    fn extras_skips_legacy_but_renders_card_when_discovery_present_and_opted_out() {
+        use crate::plugins::manifest::{DiscoveryHint, SkillDiscovery};
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Legacy SKILL.md\nShould NOT appear when opted out.\n",
+        )
+        .unwrap();
+
+        let discovery = SkillDiscovery {
+            summary: Some("Migrated skill.".into()),
+            hints: vec![DiscoveryHint {
+                when: "user wants editable PPT".into(),
+                read: Some("SKILL.md#mode-2".into()),
+                list: None,
+            }],
+        };
+
+        let manifest = manifest_for_card_test_with_flag(
+            "mofa-slides",
+            vec!["slides_generate"],
+            Some(discovery),
+            true,  // spawn_only tool present (would normally trigger legacy)
+            false, // but auto-inject is opted out
+        );
+
+        let extras = resolve_extras(&manifest, skill_dir);
+        assert_eq!(
+            extras.prompt_fragments.len(),
+            1,
+            "migrated plugin must yield card-only (no legacy body); got {:?}",
+            extras.prompt_fragments
+        );
+        let card = &extras.prompt_fragments[0];
+        assert!(card.contains("name: mofa-slides"), "card missing: {card}");
+        assert!(
+            card.contains("purpose: Migrated skill."),
+            "card missing purpose: {card}"
+        );
+        assert!(
+            !card.contains("Should NOT appear"),
+            "legacy SKILL.md body leaked into the card: {card}"
+        );
+        assert!(
+            !extras
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("Should NOT appear")),
+            "legacy SKILL.md body leaked as a separate fragment: {:?}",
+            extras.prompt_fragments
         );
     }
 }
