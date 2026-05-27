@@ -49,14 +49,14 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
-    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
-    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
     approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
@@ -923,6 +923,15 @@ struct ConnectionUiFeatures {
     /// where the richer envelopes' placement logic dropped PPTX
     /// deliveries on the SPA's chat thread.
     file_attached: bool,
+    /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
+    /// the client opts in to the canonical [`Envelope`] shape (spec
+    /// § 14) for projected events. γ-1 wires capability negotiation
+    /// only — no emit site references this flag yet, and legacy
+    /// `message/delta`, `message/persisted`, `tool/*`, and
+    /// `turn/completed` notifications continue to flow on the wire.
+    /// γ-2 (follow-up) gates emission on this flag; γ-3 deletes the
+    /// legacy notifications.
+    projection_envelope: bool,
     /// M12 Phase D-1 `auxiliary.rest_to_ws.v1` negotiated. Unlocks the
     /// thirteen auxiliary JSON-RPC methods (`session/list`,
     /// `session/snapshot`, `session/messages_page`, `session/status.get`,
@@ -997,6 +1006,11 @@ impl ConnectionUiFeatures {
             ),
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
+            projection_envelope: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+            ),
             auxiliary_rest_to_ws_v1: has_ui_feature(
                 headers,
                 query,
@@ -1046,6 +1060,7 @@ impl ConnectionUiFeatures {
             message_persisted: true,
             spawn_complete: true,
             file_attached: true,
+            projection_envelope: true,
             auxiliary_rest_to_ws_v1: true,
             coding_autonomy_v1: true,
             coding_agent_control_v1: true,
@@ -1081,6 +1096,7 @@ impl ConnectionUiFeatures {
             message_persisted: has(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
+            projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
             coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
@@ -1139,6 +1155,9 @@ impl ConnectionUiFeatures {
         }
         if self.file_attached {
             requested.push(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1);
+        }
+        if self.projection_envelope {
+            requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
         }
         if self.auxiliary_rest_to_ws_v1 {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
@@ -22181,6 +22200,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -22241,6 +22261,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -22346,6 +22367,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -22406,6 +22428,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -22459,6 +22482,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -22555,6 +22579,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -24341,6 +24366,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -24678,6 +24704,85 @@ ignore = []
                 "{method} must NOT be advertised without auxiliary.rest_to_ws.v1"
             );
         }
+    }
+
+    // ----- M9-γ-1: projection.envelope.v1 capability negotiation -----
+    //
+    // γ-1 wires capability negotiation only — no emit site references the
+    // new field yet, and legacy notifications continue to flow on the wire.
+    // The tests below mirror the `event.spawn_complete.v1` recipe and
+    // capture each of the six wiring sites (struct field, header parse,
+    // stdio defaults, requested-token rebuild, negotiated advertisement,
+    // notification methods list) so γ-2 emit-site wiring can land
+    // additively without touching the negotiation surface.
+
+    #[test]
+    fn projection_envelope_v1_negotiated_capabilities_include_only_when_requested() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.projection_envelope);
+        let capabilities = features.negotiated_capabilities();
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+    }
+
+    #[test]
+    fn projection_envelope_v1_negotiated_capabilities_omit_when_not_requested() {
+        let mut headers = HeaderMap::new();
+        // Request a different feature so `header_present == true` but
+        // `projection.envelope.v1` is strictly opt-in.
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(!features.projection_envelope);
+        let capabilities = features.negotiated_capabilities();
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+    }
+
+    #[test]
+    fn projection_envelope_v1_in_stdio_defaults() {
+        // Stdio mode opts in to every known feature by construction so
+        // `octos serve --stdio` clients see the full v1 surface without
+        // needing to send a feature header.
+        let features = ConnectionUiFeatures::stdio_defaults();
+        assert!(features.projection_envelope);
+        let capabilities = features.negotiated_capabilities();
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+    }
+
+    #[test]
+    fn projection_envelope_client_hello_feature_tokens_round_trip() {
+        let features = ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1],
+            false,
+        );
+        assert!(features.projection_envelope);
+        assert!(features.header_present);
+        assert!(!features.stdio_transport);
+        let capabilities = features.negotiated_capabilities();
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+    }
+
+    #[test]
+    fn projection_envelope_method_in_notification_methods_list() {
+        assert!(
+            octos_core::ui_protocol::UI_PROTOCOL_NOTIFICATION_METHODS
+                .contains(&octos_core::ui_protocol::methods::PROJECTION_ENVELOPE),
+            "projection/envelope must be reserved in the notification methods list"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::methods::PROJECTION_ENVELOPE,
+            "projection/envelope"
+        );
     }
 
     #[test]

@@ -976,6 +976,14 @@ pub mod methods {
     /// event mirroring the SSE `file:` frame from `files_to_send` tool
     /// surfaces.
     pub const FILE_ATTACHED: &str = "file/attached";
+    /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
+    /// envelope notification (spec § 14). γ-1 reserves the method name
+    /// in the notification methods list as part of capability negotiation
+    /// wire-up; γ-2 (follow-up) will gate emission on the
+    /// `projection.envelope.v1` feature and delete the legacy
+    /// `message/delta`, `message/persisted`, `tool/*`, and
+    /// `turn/completed` notifications it supersedes.
+    pub const PROJECTION_ENVELOPE: &str = "projection/envelope";
     /// UPCR-2026-014 (M9-α-9) `session/event` — wrapper envelope for
     /// legacy `/api/sessions/:id/events/stream` SSE frames bridged onto
     /// the unified v1 surface.
@@ -1140,6 +1148,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::MESSAGE_PERSISTED,
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
+    methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
     methods::ROUTER_STATUS,
     methods::ROUTER_FAILOVER,
@@ -5833,6 +5842,7 @@ mod tests {
                 "message/persisted",
                 "turn/spawn_complete",
                 "file/attached",
+                "projection/envelope",
                 "session/event",
                 "router/status",
                 "router/failover",
@@ -5995,6 +6005,7 @@ mod tests {
                     "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
+                    "projection/envelope",
                     "session/event",
                     "router/status",
                     "router/failover",
