@@ -748,6 +748,56 @@ pub struct TaskSupervisor {
     /// post-spawn failure is the only way it can learn the truth. That
     /// is the gap this set closes.
     synth_ack_emitted_tool_call_ids: Arc<Mutex<HashSet<String>>>,
+    /// Codex round-4 BLOCKER (PR #1324 follow-up): two-phase failure
+    /// emission.
+    ///
+    /// `tokio::spawn` in `execution.rs::handle_spawn_only_branch` (line
+    /// ~493) dispatches the background task BEFORE `loop_runner.rs`
+    /// records the synth-ack at line ~1356. A fast post-spawn failure
+    /// (e.g. plugin binary missing, instant validator rejection) can
+    /// fire `notify_failure` while `synth_ack_emitted_tool_call_ids`
+    /// is still empty. `Mutex<HashSet<_>>` makes the writes thread-safe
+    /// but does NOT impose a happens-before ordering on the
+    /// supervisor's `notify_failure` versus the `loop_runner`'s
+    /// `mark_synth_ack_emitted` — so the failure path can land first
+    /// and observe `was_synth_ack_emitted=false`, permanently dropping
+    /// the recovery signal.
+    ///
+    /// Fix: when `notify_failure` runs before the synth-ack arrives,
+    /// stash the would-be `SpawnOnlyFailureSignal` here keyed by the
+    /// supervisor's unique `task_id`. The value carries the
+    /// associated `tool_call_id` so `mark_synth_ack_emitted(tc_id)`
+    /// can scan and drain ALL pending tasks under that
+    /// `tool_call_id` — important for pipeline cascade, where many
+    /// child tasks share the parent's `tool_call_id`. Entries are
+    /// also drained on `mark_completed` (the task succeeded — no
+    /// recovery needed). The map stays bounded because every
+    /// `notify_failure` pending entry is settled by exactly one of:
+    /// synth-ack arrival, completion, or supervisor drop.
+    pending_failures: Arc<Mutex<HashMap<String, PendingFailure>>>,
+    /// Companion to `pending_failures` (Codex round-4 BLOCKER): tracks
+    /// unique `task_id`s for which the failure callback already fired.
+    /// Keyed by `task_id` (not `tool_call_id`) because pipeline
+    /// cascades have many tasks under the same `tool_call_id` and
+    /// each child must fire its own signal (see
+    /// `mark_descendants_failed_emits_progress_and_failure_signal_per_child`).
+    /// Guards the deferred-emission replay path and a sibling
+    /// `mark_failed` for the same task so each task fires at most one
+    /// `SpawnOnlyFailureSignal`.
+    failure_signal_emitted_task_ids: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Pending failure entry — see the field-level doc on
+/// `TaskSupervisor::pending_failures`.
+#[derive(Debug, Clone)]
+struct PendingFailure {
+    /// The `tool_call_id` of the failed task. Used by
+    /// `mark_synth_ack_emitted` to identify which pending entries to
+    /// drain when an ack arrives for that id.
+    tool_call_id: String,
+    /// The failure signal payload that `notify_failure` would have
+    /// dispatched if the synth-ack had already been recorded.
+    signal: SpawnOnlyFailureSignal,
 }
 
 impl Default for TaskSupervisor {
@@ -769,6 +819,8 @@ impl TaskSupervisor {
             progress_reporter: Arc::new(Mutex::new(None)),
             cancel_tokens: Arc::new(CancelTokenStore::default()),
             synth_ack_emitted_tool_call_ids: Arc::new(Mutex::new(HashSet::new())),
+            pending_failures: Arc::new(Mutex::new(HashMap::new())),
+            failure_signal_emitted_task_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -781,15 +833,52 @@ impl TaskSupervisor {
     /// The set is the load-bearing signal for the post-spawn failure
     /// feedback loop — see the field-level doc on
     /// `synth_ack_emitted_tool_call_ids`. Idempotent.
+    ///
+    /// Codex round-4 BLOCKER (PR #1324 follow-up): after recording the
+    /// ack, drain any pending failure for this `tool_call_id` and emit
+    /// the `SpawnOnlyFailureSignal` NOW. This closes the
+    /// `tokio::spawn` → `notify_failure` → `mark_synth_ack_emitted`
+    /// race where a fast post-spawn failure arrives before the
+    /// foreground `loop_runner` recorded the ack. See the field-level
+    /// doc on `pending_failures` for the full ordering argument.
     pub fn mark_synth_ack_emitted(&self, tool_call_id: &str) {
         if tool_call_id.is_empty() {
             return;
         }
-        let mut guard = self
-            .synth_ack_emitted_tool_call_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.insert(tool_call_id.to_string());
+        {
+            let mut guard = self
+                .synth_ack_emitted_tool_call_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.insert(tool_call_id.to_string());
+        }
+        // Drain every pending failure that arrived before the synth-ack
+        // was recorded for this `tool_call_id`. Pipeline cascades have
+        // multiple tasks sharing one `tool_call_id`, so we collect ALL
+        // matching entries — not just one — and dispatch each. Lock
+        // order: `pending_failures` is taken AFTER releasing
+        // `synth_ack_emitted_tool_call_ids` so we never hold both at
+        // once.
+        let drained: Vec<PendingFailure> = {
+            let mut guard = self
+                .pending_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut hits = Vec::new();
+            guard.retain(|_task_id, pf| {
+                if pf.tool_call_id == tool_call_id {
+                    hits.push(pf.clone());
+                    false // remove
+                } else {
+                    true // keep
+                }
+            });
+            hits
+        };
+        for pf in drained {
+            let task_id = pf.signal.task_id.clone();
+            self.dispatch_failure_signal(&task_id, pf.signal);
+        }
     }
 
     /// True iff the synth-ack was emitted for `tool_call_id` via
@@ -1026,6 +1115,14 @@ impl TaskSupervisor {
         self.persist_snapshot(&snapshot);
         self.notify_change(&snapshot);
         self.emit_progress_for_state(&snapshot);
+        // Codex round-4 BLOCKER (PR #1324 follow-up): if a cancelled
+        // task happened to have a pending failure stash (defensive —
+        // cancel + late mark_failed normally would no-op via the
+        // terminal guard, but the entry could exist if mark_failed
+        // landed before cancel transitioned the task), drop it so a
+        // later mark_synth_ack_emitted doesn't surface a recovery
+        // signal for a task the user / system already cancelled.
+        self.drain_pending_failure_for_task(task_id);
         Ok(())
     }
 
@@ -1847,6 +1944,15 @@ impl TaskSupervisor {
             self.persist_snapshot(task);
             self.notify_change(task);
             self.emit_progress_for_state(task);
+            // Codex round-4 BLOCKER (PR #1324 follow-up): drain any
+            // pending failure stash for this task's unique task_id.
+            // Normally `mark_failed` is the only path that inserts
+            // (and the terminal guard in `mark_failed` prevents a
+            // completion after a failure today). Defensive cleanup
+            // ensures a stale entry can't fire later when a sibling
+            // task's `mark_synth_ack_emitted` arrives on the same
+            // tool_call_id.
+            self.drain_pending_failure_for_task(&task.id);
         }
     }
 
@@ -1962,40 +2068,152 @@ impl TaskSupervisor {
     /// failure callback has been registered. The error_message is taken
     /// from the task's `error` field (set immediately before this call).
     ///
-    /// **Synth-ack gate**: only emits the signal when the LLM previously
-    /// received the "Background work started for `<tool>`." synth-ack for
-    /// this task's `tool_call_id` (recorded via
-    /// [`Self::mark_synth_ack_emitted`]). When the synth-ack was
-    /// suppressed (sibling-error or pre-flight short-circuit), the LLM
-    /// already saw an error tool_result in its iteration — injecting a
-    /// synthetic recovery prompt would double-signal it. The field-level
-    /// doc on `synth_ack_emitted_tool_call_ids` explains both skip-paths.
+    /// **Synth-ack gate (two-phase)**: emits or defers based on whether
+    /// the LLM previously received the "Background work started for
+    /// `<tool>`." synth-ack for this task's `tool_call_id` (recorded via
+    /// [`Self::mark_synth_ack_emitted`]):
+    ///
+    /// * **Ack already emitted** → build the signal and dispatch via
+    ///   [`Self::dispatch_failure_signal`] immediately. Idempotent on
+    ///   replay via `failure_signal_emitted_task_ids`.
+    /// * **Ack not yet emitted** → stash the signal in
+    ///   `pending_failures` keyed by `task_id` (carrying its
+    ///   `tool_call_id`) and return without dispatching. When
+    ///   `mark_synth_ack_emitted` later runs for the same
+    ///   `tool_call_id`, it scans the map, drains every pending
+    ///   entry under that id (pipeline cascade has many tasks under
+    ///   one tool_call_id), and emits each signal then.
+    ///   This closes the `tokio::spawn` → `mark_synth_ack_emitted` race
+    ///   in `execution.rs::handle_spawn_only_branch` where a fast
+    ///   failure can hit before the foreground records the ack
+    ///   (Codex round-4 BLOCKER, PR #1324 follow-up).
+    /// * **Ack permanently suppressed** (sibling-error / pre-flight
+    ///   short-circuit) → the pending entry sits in the map until the
+    ///   session shuts down or the supervisor is dropped. The LLM
+    ///   already saw the sibling error / `[VALIDATION FAILED]`
+    ///   tool_result, so the absence of an emitted signal is the
+    ///   correct behaviour. Memory pressure is bounded because
+    ///   `MAX_CHILDREN_PER_PARENT` already caps the per-session task
+    ///   count; the pending map can never exceed that cap.
     fn notify_failure(&self, task: &BackgroundTask) {
-        if !self.was_synth_ack_emitted(&task.tool_call_id) {
+        if task.tool_call_id.is_empty() {
+            // Defensive: an empty id can't be matched by the synth-ack
+            // set, so we could never drain a deferred entry. Treat
+            // this as "skip" — the LLM already saw something else for
+            // this code path (tasks that bypassed id-bearing dispatch).
             tracing::debug!(
                 task_id = %task.id,
                 tool_name = %task.tool_name,
-                tool_call_id = %task.tool_call_id,
-                "skipping SpawnOnlyFailureSignal: synth-ack was never emitted for this tool_call_id (LLM already saw an error tool_result)",
+                "skipping SpawnOnlyFailureSignal: task has empty tool_call_id (cannot key synth-ack lookup)",
             );
             return;
         }
-        let guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(cb) = guard.as_ref() else {
-            return;
-        };
-        let error_message = task.error.clone().unwrap_or_default();
-        let suggested_alternatives = parse_alternatives(&error_message);
+        // Idempotency guard: if a previous `notify_failure` (or a
+        // drained pending entry) already fired the signal for this
+        // task_id, suppress. Protects against:
+        //   * `mark_failed` called twice (live + cascade-fail).
+        //   * BLOCKER race: failure landed before ack, was stashed,
+        //     drained by `mark_synth_ack_emitted`, and now a sibling
+        //     path calls `mark_failed` again on the same task.
+        // Note: keyed by `task_id` (unique), NOT `tool_call_id`,
+        // because pipeline cascade has many tasks sharing the parent's
+        // `tool_call_id` and each child must fire its own signal.
+        {
+            let emitted = self
+                .failure_signal_emitted_task_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if emitted.contains(&task.id) {
+                tracing::debug!(
+                    task_id = %task.id,
+                    tool_call_id = %task.tool_call_id,
+                    "skipping SpawnOnlyFailureSignal: already emitted for this task_id",
+                );
+                return;
+            }
+        }
         let signal = SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
             tool_name: task.tool_name.clone(),
             tool_input: task.tool_input.clone().unwrap_or(Value::Null),
-            error_message,
-            suggested_alternatives,
+            error_message: task.error.clone().unwrap_or_default(),
+            suggested_alternatives: parse_alternatives(task.error.as_deref().unwrap_or("")),
             parent_session_key: task.parent_session_key.clone(),
             originating_client_message_id: task.originating_client_message_id.clone(),
         };
-        cb(&signal);
+        if self.was_synth_ack_emitted(&task.tool_call_id) {
+            self.dispatch_failure_signal(&task.id, signal);
+        } else {
+            // Two-phase: stash and wait for the ack. The pending map
+            // is keyed by `task_id` (unique) and carries the
+            // `tool_call_id` so `mark_synth_ack_emitted` can scan and
+            // drain all matching entries — required for cascade where
+            // many tasks share one tool_call_id.
+            tracing::debug!(
+                task_id = %task.id,
+                tool_name = %task.tool_name,
+                tool_call_id = %task.tool_call_id,
+                "deferring SpawnOnlyFailureSignal: synth-ack not yet recorded (will emit on ack or stay pending if ack is suppressed)",
+            );
+            let mut pending = self
+                .pending_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending.insert(
+                task.id.clone(),
+                PendingFailure {
+                    tool_call_id: task.tool_call_id.clone(),
+                    signal,
+                },
+            );
+        }
+    }
+
+    /// Internal helper: drop any pending failure stash for `task_id`
+    /// (the supervisor's unique task identifier). Called from
+    /// terminal paths that should invalidate a deferred failure
+    /// (currently `mark_completed`). No-op when nothing is pending.
+    fn drain_pending_failure_for_task(&self, task_id: &str) -> Option<PendingFailure> {
+        if task_id.is_empty() {
+            return None;
+        }
+        let mut pending = self
+            .pending_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.remove(task_id)
+    }
+
+    /// Internal helper: fire the failure callback and mark the
+    /// `task_id` as emitted so future replays / cascade paths observe
+    /// the idempotency guard. Called both from `notify_failure`
+    /// (ack-already-emitted path) and from `mark_synth_ack_emitted`
+    /// (drained pending entry path). Keyed by unique `task_id` so
+    /// pipeline cascades — where N tasks share one `tool_call_id` —
+    /// fire one signal per task. Lock discipline: takes `on_failure`
+    /// and `failure_signal_emitted_task_ids` separately and never
+    /// together.
+    fn dispatch_failure_signal(&self, task_id: &str, signal: SpawnOnlyFailureSignal) {
+        {
+            let mut emitted = self
+                .failure_signal_emitted_task_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Re-check inside the lock to defeat any narrow race
+            // where two callers observe `!contains` and both proceed
+            // to dispatch. The first to reach this line wins.
+            if !emitted.insert(task_id.to_string()) {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "dispatch_failure_signal: another path already emitted; suppressing",
+                );
+                return;
+            }
+        }
+        let guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cb) = guard.as_ref() {
+            cb(&signal);
+        }
     }
 
     /// Record the child-session contract outcome for a task.
@@ -3354,6 +3572,197 @@ mod tests {
         supervisor.mark_synth_ack_emitted("");
         assert!(!supervisor.was_synth_ack_emitted(""));
         assert!(!supervisor.was_synth_ack_emitted("call-missing"));
+    }
+
+    // ── Codex round-4 BLOCKER (PR #1324 follow-up): two-phase
+    // failure emission closes the spawn-vs-ack race ─────────────
+
+    /// Race scenario: `tokio::spawn` in execution.rs dispatches the
+    /// background task BEFORE loop_runner.rs records the synth-ack
+    /// (the spawn happens at line ~493, the synth-ack at line ~1356).
+    /// A fast post-spawn failure (plugin binary missing, instant
+    /// validator reject, etc.) can run `notify_failure` while
+    /// `synth_ack_emitted_tool_call_ids` is still empty. Pre-fix:
+    /// the would-be `SpawnOnlyFailureSignal` was dropped and the LLM
+    /// stayed in "Background work started" limbo forever. Post-fix:
+    /// the failure is stashed in `pending_failures` and emitted
+    /// when `mark_synth_ack_emitted` later arrives.
+    #[test]
+    fn failure_before_synth_ack_emits_recovery_when_ack_arrives() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register_with_input(
+            "fm_tts",
+            "call-race",
+            Some("api:session"),
+            Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
+        );
+        // Failure lands BEFORE the synth-ack is recorded — exactly the
+        // race described in the codex BLOCKER. Pre-fix this dropped
+        // the signal forever; post-fix it stashes for replay.
+        supervisor.mark_failed(&task_id, "post-spawn boom".to_string());
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "no signal must fire before the synth-ack lands"
+        );
+
+        // Foreground loop_runner finally records the synth-ack — the
+        // stashed failure should now reach the callback.
+        supervisor.mark_synth_ack_emitted("call-race");
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(
+            signals.len(),
+            1,
+            "deferred failure must emit exactly one signal when the ack arrives"
+        );
+        assert_eq!(signals[0].task_id, task_id);
+        assert_eq!(signals[0].tool_name, "fm_tts");
+        assert!(signals[0].error_message.contains("post-spawn boom"));
+        assert_eq!(
+            signals[0].parent_session_key.as_deref(),
+            Some("api:session")
+        );
+    }
+
+    /// Companion to `failure_before_synth_ack_emits_recovery_when_ack_arrives`:
+    /// once the deferred-failure path has fired exactly one signal,
+    /// any sibling `mark_failed` call on the same task must NOT
+    /// double-fire. The codex BLOCKER spec calls this out as
+    /// `failure_signal_idempotent_on_double_emit`.
+    #[test]
+    fn failure_signal_idempotent_on_double_emit() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-double", None);
+        // Fail-before-ack → stash.
+        supervisor.mark_failed(&task_id, "first failure".to_string());
+        // Ack → drain + dispatch once.
+        supervisor.mark_synth_ack_emitted("call-double");
+        // Subsequent mark_failed calls (production analog: cascade
+        // path + the original failure path racing) must observe the
+        // idempotency guard.
+        supervisor.mark_failed(&task_id, "duplicate failure".to_string());
+        supervisor.mark_failed(&task_id, "third failure".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(
+            signals.len(),
+            1,
+            "exactly one signal must fire even with repeated mark_failed + ack drain"
+        );
+        assert_eq!(signals[0].task_id, task_id);
+    }
+
+    /// The deferred-failure stash for one `tool_call_id` must not
+    /// interfere with normal failure-signal delivery for any other
+    /// `tool_call_id`. Codex BLOCKER spec calls this
+    /// `pending_failure_does_not_block_other_call_ids`.
+    #[test]
+    fn pending_failure_does_not_block_other_call_ids() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+
+        // Task A: fails before its ack arrives → goes pending.
+        let task_a = supervisor.register("fm_tts", "call-A", None);
+        supervisor.mark_failed(&task_a, "boom A".to_string());
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "A's failure should still be pending — no ack yet"
+        );
+
+        // Task B: independent tool_call_id, normal ordering (ack
+        // before failure) → must signal normally without being
+        // blocked by A's pending stash.
+        let task_b = supervisor.register("fm_tts", "call-B", None);
+        supervisor.mark_synth_ack_emitted("call-B");
+        supervisor.mark_failed(&task_b, "boom B".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(
+            signals.len(),
+            1,
+            "B must emit normally even while A sits in the pending map"
+        );
+        assert_eq!(signals[0].task_id, task_b);
+        assert!(signals[0].error_message.contains("boom B"));
+
+        // Finalise A — once its ack arrives the pending stash drains.
+        supervisor.mark_synth_ack_emitted("call-A");
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(
+            signals.len(),
+            2,
+            "A's pending entry must emit exactly once when its ack arrives"
+        );
+        assert_eq!(signals[1].task_id, task_a);
+        assert!(signals[1].error_message.contains("boom A"));
+    }
+
+    /// Codex round-4 MAJOR (PR #1324): the synth-ack must be recorded
+    /// under the SANITIZED `tool_call_id` that the dispatcher used to
+    /// register the background task. Test as a direct supervisor-level
+    /// guard: simulate the production caller (loop_runner.rs:1357)
+    /// passing the sanitized id through, and verify the recovery
+    /// signal fires. Without the fix, loop_runner.rs records the raw
+    /// `call:1` while the supervisor stored the task under `call_1`,
+    /// so `was_synth_ack_emitted` misses and the recovery path is
+    /// permanently dropped.
+    #[test]
+    fn spawn_only_synth_ack_records_sanitized_id_when_id_has_colon() {
+        // Mirror the canonical sanitization rule from
+        // `agent::message_repair::sanitize_tool_call_id` (module is
+        // private, so we encode the contract inline): every char
+        // outside `[A-Za-z0-9_-]` maps to `_`. This is the same
+        // mapping the dispatcher applies before storing the
+        // BackgroundTask in the supervisor.
+        let raw_id = "call:1";
+        let sanitized: String = raw_id
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+                _ => '_',
+            })
+            .collect();
+        assert_eq!(
+            sanitized, "call_1",
+            "sanitize_tool_call_id contract: `:` → `_` (precondition)"
+        );
+
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+
+        // The dispatcher stores the supervised task under the
+        // SANITIZED tool_call_id (see execution.rs:438).
+        let task_id = supervisor.register("fm_tts", &sanitized, Some("api:session"));
+
+        // Post-MAJOR-fix loop_runner.rs records the synth-ack from
+        // `sanitized_response.tool_calls` — i.e. with `call_1`, not
+        // `call:1`. Simulate exactly that path.
+        supervisor.mark_synth_ack_emitted(&sanitized);
+        assert!(
+            supervisor.was_synth_ack_emitted(&sanitized),
+            "supervisor must observe synth-ack under the sanitized id"
+        );
+        // The raw id was never recorded — confirm we didn't
+        // accidentally key on the un-sanitized form.
+        assert!(
+            !supervisor.was_synth_ack_emitted(raw_id),
+            "supervisor must NOT observe synth-ack under the raw `call:1` id"
+        );
+
+        // Post-spawn failure runs through the supervisor with the
+        // sanitized id (because that's what the BackgroundTask carries).
+        supervisor.mark_failed(&task_id, "post-spawn boom".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(
+            signals.len(),
+            1,
+            "recovery signal must fire when synth-ack and supervisor task share the SANITIZED id"
+        );
+        assert_eq!(signals[0].task_id, task_id);
+        assert!(signals[0].error_message.contains("post-spawn boom"));
     }
 
     // ── F004 B2: TaskSupervisor → ToolProgress bridge ─────────────────────
