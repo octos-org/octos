@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "octos",
   "description": "OminiX voice skill: ASR, preset-voice TTS with emotion/speed control, and model management via local Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm instead.",
   "timeout_secs": 600,
@@ -118,5 +118,15 @@
         "required": ["model_type"]
       }
     }
-  ]
+  ],
+  "discovery": {
+    "summary": "On-device ASR + preset-voice TTS (Qwen3 on Apple Silicon) with emotion/speed control and model lifecycle. Voice cloning lives in sibling skill mofa-fm.",
+    "hints": [
+      { "when": "user asks for voice cloning or a custom voice profile", "read": "SKILL.md" },
+      { "when": "picking a preset speaker or wiring TTS parameters", "read": "docs/api-reference.md" },
+      { "when": "choosing or composing an emotion / style prompt", "read": "docs/emotion-prompts.md" },
+      { "when": "checking server discovery, endpoints, or fallback behavior", "read": "docs/api-reference.md" },
+      { "when": "ominix-api may be down (emotion prompt + fallback gotcha)", "read": "SKILL.md" }
+    ]
+  }
 }
