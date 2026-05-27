@@ -613,7 +613,7 @@ impl ProfileRuntime {
                     // `config_from_profile` so operators can opt into
                     // strict signature enforcement per deployment.
                     require_signed: config.plugins.require_signed,
-                    verified_cache_dir: None,
+                    verified_cache_dir: Some(effective_octos_home.join("cache").join("verified")),
                 },
             ) {
                 Ok(result) => plugin_result = result,
@@ -1593,7 +1593,11 @@ mod tests {
                 "name": "issue-87-probe",
                 "version": "1.0",
                 "tools": [
-                    {"name": "issue_87_probe", "description": "Issue #87 profile skill probe"}
+                    {
+                        "name": "issue_87_probe",
+                        "description": "Issue #87 profile skill probe",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }
                 ]
             }"#,
         )
@@ -1617,7 +1621,14 @@ mod tests {
 
         assert!(
             rt.tool_specs.get("issue_87_probe").is_some(),
-            "per-profile skill tool must load for sub-account profiles"
+            "per-profile skill tool must load for sub-account profiles; plugin_dirs={:?}; plugin_tool_names={:?}; registered_tools={:?}",
+            rt.plugin_dirs,
+            rt.plugin_tool_names,
+            rt.tool_specs
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>(),
         );
         assert!(
             rt.tool_specs.get("shell").is_some(),
