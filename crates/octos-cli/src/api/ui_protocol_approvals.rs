@@ -330,6 +330,7 @@ pub(super) fn build_decided_event(
         .unwrap_or_else(TurnId::new);
     ApprovalDecidedEvent {
         session_id: params.session_id.clone(),
+        topic: params.session_id.topic().map(ToOwned::to_owned),
         approval_id: params.approval_id.clone(),
         turn_id,
         // FIX-01: `ApprovalDecision` is non-Copy (`Unknown(String)`); clone

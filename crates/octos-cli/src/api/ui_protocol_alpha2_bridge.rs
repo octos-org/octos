@@ -72,6 +72,7 @@ impl ProgressReporter for LedgerToolProgressReporter {
         {
             let notification = UiNotification::ToolProgress(ToolProgressEvent {
                 session_id: self.session_id.clone(),
+                topic: self.session_id.topic().map(ToOwned::to_owned),
                 turn_id: self.turn_id.clone(),
                 tool_call_id: tool_id.clone(),
                 message: Some(message.clone()),

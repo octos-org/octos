@@ -117,6 +117,20 @@ pub(super) fn emit_turn_completed_full(
 /// Append a `file/attached.v1` envelope when a tool surfaces an
 /// artifact via `files_to_send`. Mirrors the SSE `file:` frame.
 ///
+/// `topic` is taken as a separate argument (rather than reading from
+/// `session_id.topic()`) because the P0-A wire-gap fix in
+/// [`emit_files_attached_from_background`] strips the topic suffix
+/// from `session_id` BEFORE calling here — the strip is required so
+/// the envelope rides on the base broadcast bucket the SPA actually
+/// subscribes to. Topic must therefore be captured at the upstream
+/// emit site (before stripping) and threaded in explicitly so the
+/// event's `topic` field still carries it; otherwise the topic-scoped
+/// classifier (`ledger_event_matches_topic_scope`) reads `None` and
+/// silently drops the frame. The append-time safety net
+/// (`stamp_topic_from_session`) cannot recover because it pulls topic
+/// from `session_id`, which has already been stripped. See #1336
+/// round-2 BLOCKER for the deep-trace rationale.
+///
 /// `tool_call_id` is optional because not every file-emission path
 /// runs inside a tool execution (rare; reserved for background-result
 /// futures). `mime` is also optional — clients fall back to extension
@@ -124,6 +138,7 @@ pub(super) fn emit_turn_completed_full(
 pub(super) fn emit_file_attached(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
+    topic: Option<&str>,
     turn_id: &TurnId,
     path: String,
     tool_call_id: Option<String>,
@@ -131,6 +146,10 @@ pub(super) fn emit_file_attached(
 ) {
     let notification = UiNotification::FileAttached(FileAttachedEvent {
         session_id: session_id.clone(),
+        topic: topic
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(ToOwned::to_owned),
         turn_id: turn_id.clone(),
         path,
         tool_call_id,
@@ -186,6 +205,12 @@ pub(super) fn emit_files_attached_from_background(
     tool_call_id: Option<String>,
 ) {
     use std::collections::BTreeSet;
+    // #1336 round-2: capture topic BEFORE stripping the suffix below.
+    // The strip is required for routing (SPA subscribes on base only),
+    // but the event itself must still carry the topic so the
+    // topic-scoped classifier accepts it. See [`emit_file_attached`]
+    // for the full rationale.
+    let topic = session_id.topic().map(ToOwned::to_owned);
     // P0-A wire-gap fix: publish on the base SessionKey (no `#<topic>`
     // suffix). The SPA's `session/open` subscription is keyed on the
     // base form; topic-suffixed broadcasts reach zero live subscribers.
@@ -202,6 +227,7 @@ pub(super) fn emit_files_attached_from_background(
         emit_file_attached(
             ledger,
             &base_session,
+            topic.as_deref(),
             turn_id,
             path.clone(),
             tool_call_id.clone(),
@@ -467,6 +493,7 @@ mod tests {
         emit_file_attached(
             &ledger,
             &session_id,
+            None,
             &turn_id,
             "/tmp/output.png".into(),
             Some("tc-1".into()),
@@ -506,6 +533,7 @@ mod tests {
         emit_file_attached(
             &ledger,
             &session_id,
+            None,
             &turn_id,
             "/tmp/bare.txt".into(),
             None,
@@ -597,7 +625,15 @@ mod tests {
                 client_message_id: None,
             }),
         );
-        emit_file_attached(&ledger, &session_a, &turn_id, "/tmp/x".into(), None, None);
+        emit_file_attached(
+            &ledger,
+            &session_a,
+            None,
+            &turn_id,
+            "/tmp/x".into(),
+            None,
+            None,
+        );
         emit_session_event(
             &ledger,
             &session_a,
@@ -1228,8 +1264,97 @@ mod tests {
         {
             assert_eq!(payload.session_id, base_session);
             assert_eq!(payload.path, "/tmp/report.md");
+            assert!(
+                payload.topic.is_none(),
+                "bare session_id emit must preserve the no-topic shape",
+            );
         } else {
             panic!("expected FileAttached");
         }
+    }
+
+    /// #1336 round-2 (codex BLOCK): the original P0-A fix (`a303991c`)
+    /// stripped the topic suffix from `session_id` BEFORE building the
+    /// `FileAttachedEvent`, so the helper saw a bare session and the
+    /// emitted event ended up with `topic: None`. After the
+    /// `ledger_event_matches_topic_scope` exemption was removed in
+    /// favour of consulting the explicit `event.topic` field, an event
+    /// with `topic: None` is silently dropped by a topic-scoped
+    /// subscriber — re-introducing the exact failure mode P0-A
+    /// originally closed. The append-time safety net
+    /// (`stamp_topic_from_session`) can't recover because `session_id`
+    /// has already been stripped, so its `session_id.topic()` returns
+    /// `None` and it bails out at the early-return guard.
+    ///
+    /// The fix preserves topic on the event itself BEFORE the strip:
+    /// the caller captures `session_id.topic()` and passes it
+    /// separately into `emit_file_attached`, which sets the event's
+    /// `topic` field explicitly. The base SessionKey routing
+    /// (subscribers on the base key) is unchanged.
+    ///
+    /// Pre-fix: this assertion fails because `event.topic` is `None`.
+    /// Post-fix: `event.topic` is `Some("slides")` so the topic-scoped
+    /// classifier (which reads `event.topic()` first) accepts the
+    /// event.
+    #[test]
+    fn emit_files_attached_from_background_preserves_topic_on_event_when_session_id_stripped() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let base_session = SessionKey::new("api", "p0a-round2");
+        // Caller-side session_id carries the `#slides` topic suffix —
+        // mirrors the production shape that surfaced the bug.
+        let topic_session = SessionKey::with_topic("api", "p0a-round2", "slides");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&base_session);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &topic_session,
+            &turn_id,
+            &["/tmp/deck.pptx".to_string()],
+            &[],
+            Some("tc-round2".into()),
+        );
+
+        let event = subscriber
+            .try_recv()
+            .expect("base subscriber receives file/attached");
+        let (payload, notification_topic) = match &event.event {
+            crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                notification @ UiNotification::FileAttached(payload),
+            ) => (payload.clone(), notification.topic().map(ToOwned::to_owned)),
+            other => panic!("expected FileAttached, got {other:?}"),
+        };
+
+        // Routing invariant (P0-A): the embedded session_id is the
+        // BASE form so the SPA's `session/open` subscription receives it.
+        assert_eq!(
+            payload.session_id, base_session,
+            "embedded session_id must be the base form (no topic suffix)",
+        );
+
+        // Topic invariant (#1336 round-2 BLOCKER): the event's `topic`
+        // field must be populated from the ORIGINAL topic-suffixed
+        // session_id BEFORE the strip — otherwise the topic-scoped
+        // classifier drops the event silently.
+        assert_eq!(
+            payload.topic.as_deref(),
+            Some("slides"),
+            "event.topic must be preserved from the original session_id; \
+             the strip site captures it BEFORE rebuilding the base SessionKey",
+        );
+
+        // `UiNotification::topic()` (the helper the classifier consults)
+        // must surface the explicit field so a topic-scoped subscriber
+        // accepts the event. Pre-fix this returned None because the
+        // base-stripped `session_id` had no `#topic` suffix to fall
+        // back on either — both the explicit field and the suffix
+        // fallback were empty, and the classifier dropped the event.
+        assert_eq!(
+            notification_topic.as_deref(),
+            Some("slides"),
+            "UiNotification::topic() (read by the topic-scope classifier) \
+             must return the explicit event.topic so the topic-scoped \
+             subscriber routes the envelope correctly",
+        );
     }
 }

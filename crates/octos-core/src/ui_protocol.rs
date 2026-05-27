@@ -4109,6 +4109,14 @@ pub struct MessageDeltaEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStartedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key — populated from the originating
+    /// `SessionKey.topic()` BEFORE any `base_key()` strip. Carried on
+    /// the wire so a topic-scoped subscriber routes the event correctly
+    /// even when the emit-side `session_id` was reconstructed from
+    /// `base_key()`. Closes the P0-A class routing drop (#1329); see
+    /// `UiNotification::topic()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -4119,6 +4127,9 @@ pub struct ToolStartedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolProgressEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4130,6 +4141,9 @@ pub struct ToolProgressEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCompletedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -4326,6 +4340,9 @@ impl ApprovalRequestedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalAutoResolvedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub tool_name: String,
@@ -4344,6 +4361,9 @@ pub struct ApprovalAutoResolvedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecidedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub decision: ApprovalDecision,
@@ -4370,6 +4390,7 @@ impl ApprovalDecidedEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             decision,
@@ -4389,6 +4410,9 @@ impl ApprovalDecidedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalCancelledEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub reason: String,
@@ -4402,6 +4426,7 @@ impl ApprovalCancelledEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
@@ -4853,6 +4878,13 @@ pub struct ReplayLossyEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileAttachedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    /// Closes the P0-A regression that motivated the prior
+    /// `ledger_event_matches_topic_scope` exemption — now that the
+    /// field exists, the classifier consults the explicit topic and
+    /// the exemption is no longer needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     /// Filesystem path or URL the tool produced.
     pub path: String,
@@ -5107,7 +5139,23 @@ impl UiNotification {
             Self::MessageDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::ToolStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::ToolProgress(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ToolCompleted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::ApprovalRequested(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalAutoResolved(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalDecided(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
@@ -5124,6 +5172,9 @@ impl UiNotification {
             Self::TurnSpawnComplete(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::FileAttached(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::SessionEventBridged(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -5138,13 +5189,20 @@ impl UiNotification {
         match self {
             Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
         }
@@ -8146,6 +8204,7 @@ mod tests {
             .with_timezone(&Utc);
         let event = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
             session_id: session_id.clone(),
+            topic: None,
             approval_id: approval_id.clone(),
             turn_id: turn_id.clone(),
             decision: ApprovalDecision::Approve,
@@ -10067,6 +10126,393 @@ mod tests {
         assert!(
             caps.supports_method(methods::ROUTER_GET_METRICS),
             "router/get_metrics must be a supported command method"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #1329 — topic-scope routing class fix
+    //
+    // The 6 events listed below (ToolStarted/Progress/Completed,
+    // ApprovalAutoResolved/Decided/Cancelled), plus FileAttached
+    // (already covered by the P0-A regression), gained an explicit
+    // `topic: Option<String>` field. `UiNotification::topic()` now
+    // consults that field FIRST and only falls back to
+    // `SessionKey.topic()`. Each test:
+    //   1. Builds the event with an explicit `topic` field — `topic()`
+    //      returns the field's value, even when `session_id` was
+    //      stripped to `base_key()` (the P0-A failure mode).
+    //   2. Builds the same event with a topic-suffixed session_id but
+    //      NO explicit topic — `topic()` falls back to the suffix
+    //      (backward compat; `stamp_topic_from_session` then promotes
+    //      it to the explicit field at append time).
+    //   3. Builds the event with neither — `topic()` returns `None`.
+    // -----------------------------------------------------------------
+
+    fn topic_session() -> SessionKey {
+        SessionKey("local:slides-soak#slides".into())
+    }
+
+    fn bare_session() -> SessionKey {
+        SessionKey("local:slides-soak".into())
+    }
+
+    #[test]
+    fn tool_started_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(
+            with_field.topic(),
+            Some("slides"),
+            "explicit topic field wins over base_key() session_id"
+        );
+
+        let fallback = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(
+            fallback.topic(),
+            Some("slides"),
+            "missing explicit topic falls back to session_id suffix"
+        );
+
+        let neither = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-3".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(neither.topic(), None, "no topic anywhere → None");
+    }
+
+    #[test]
+    fn tool_progress_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            message: Some("step 1".into()),
+            progress_pct: Some(25.0),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            message: None,
+            progress_pct: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn tool_completed_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: Some(10),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_auto_resolved_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_decided_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_cancelled_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    /// #1329 sibling test: FileAttached gained the same `topic` field
+    /// as the 6 ApprovalDecided-class events; verify the same access
+    /// rule (explicit first, suffix fallback). This was the bug the
+    /// P0-A exemption patched; with explicit field, the exemption is
+    /// no longer needed.
+    #[test]
+    fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: Some("tc-slides".into()),
+            mime: None,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: None,
+            mime: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    /// `stamp_topic_from_session` MUST populate the new explicit
+    /// `topic` field for the 6 vulnerable variants (and FileAttached)
+    /// from the SessionKey suffix when the field is absent. This is
+    /// the safety net that runs in `into_rpc_notification`: even if a
+    /// caller forgets to stamp, the wire-emit path stamps it for them
+    /// so a topic-scoped subscriber always routes the event correctly.
+    #[test]
+    fn stamp_topic_from_session_populates_new_topic_class_events() {
+        // ToolStarted
+        let mut event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        event.stamp_topic_from_session();
+        assert_eq!(event.topic(), Some("slides"));
+        if let UiNotification::ToolStarted(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        } else {
+            panic!("event variant changed unexpectedly");
+        }
+
+        // ToolProgress
+        let mut event = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            message: None,
+            progress_pct: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ToolProgress(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ToolCompleted
+        let mut event = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ToolCompleted(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalAutoResolved
+        let mut event = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalAutoResolved(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalDecided
+        let mut event = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalDecided(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalCancelled
+        let mut event = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalCancelled(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // FileAttached (sibling)
+        let mut event = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: None,
+            mime: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::FileAttached(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+    }
+
+    /// #1329 wire-shape guarantee: the new `topic` field must
+    /// serialize when present and stay omitted when absent (so v0
+    /// clients never see a surprise field). Verified for one
+    /// representative variant (the same `skip_serializing_if` is
+    /// applied uniformly across all 7).
+    #[test]
+    fn tool_started_topic_field_round_trips_on_the_wire() {
+        let event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId(Uuid::from_u128(0x1329)),
+            tool_call_id: "tc-1329".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        let wire = serde_json::to_value(event.clone().into_rpc_notification().expect("serialize"))
+            .expect("to_value");
+        assert_eq!(wire["params"]["topic"], json!("slides"));
+
+        let decoded: RpcNotification<Value> =
+            serde_json::from_value(wire).expect("deserialize wire");
+        let decoded_event = UiNotification::from_rpc_notification(decoded).expect("decode");
+        assert_eq!(decoded_event.topic(), Some("slides"));
+
+        // Absent topic stays omitted.
+        let bare_event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-bare".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        let wire =
+            serde_json::to_value(bare_event.into_rpc_notification().expect("serialize bare"))
+                .expect("to_value");
+        assert!(
+            wire["params"].get("topic").is_none(),
+            "absent topic field must stay omitted on the wire (no v0 breakage)"
         );
     }
 }

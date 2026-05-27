@@ -332,6 +332,7 @@ fn map_tool_start(context: &ProgressMappingContext, event: &Value) -> UiProgress
 
     UiProgressMapping::notifications(vec![UiNotification::ToolStarted(ToolStartedEvent {
         session_id: context.session_id.clone(),
+        topic: context.session_id.topic().map(ToOwned::to_owned),
         turn_id: context.turn_id.clone(),
         tool_call_id,
         tool_name,
@@ -346,6 +347,7 @@ fn map_tool_progress(context: &ProgressMappingContext, event: &Value) -> UiProgr
 
     UiProgressMapping::notifications(vec![UiNotification::ToolProgress(ToolProgressEvent {
         session_id: context.session_id.clone(),
+        topic: context.session_id.topic().map(ToOwned::to_owned),
         turn_id: context.turn_id.clone(),
         tool_call_id,
         message: string_field(event, &["message", "status"]),
@@ -377,6 +379,7 @@ fn map_tool_end(context: &ProgressMappingContext, event: &Value) -> UiProgressMa
     UiProgressMapping {
         notifications: vec![UiNotification::ToolCompleted(ToolCompletedEvent {
             session_id: context.session_id.clone(),
+            topic: context.session_id.topic().map(ToOwned::to_owned),
             turn_id: context.turn_id.clone(),
             tool_call_id,
             tool_name,
