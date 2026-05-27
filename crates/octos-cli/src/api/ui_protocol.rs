@@ -16185,6 +16185,19 @@ async fn run_standalone_turn(
                 // `add_message_with_seq`, so the consumer sees a
                 // `Some` only when the durable row actually exists.
                 let mut final_assistant_message_id: Option<String> = None;
+                // Issue #1337 codex round-2: capture the committed seq
+                // for the assistant carrier row at the SAME moment we
+                // stamp `final_assistant_message_id`. The loop-wide
+                // `cursor` is updated for every persisted row and can
+                // therefore advance past the assistant carrier when an
+                // assistant row with `tool_calls` is followed by tool
+                // rows in the trimmed-dedupe path documented above.
+                // Using `cursor.seq` to build `TurnSessionResult` would
+                // then surface a tool-row seq alongside the assistant
+                // `message_id`, breaking the durable per-row identity
+                // contract. This field pins the seq to the carrier
+                // exactly like `final_assistant_message_id`.
+                let mut final_assistant_committed_seq: Option<u64> = None;
                 // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
                 // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
                 // error). Track whether the assistant row carrying
@@ -16384,6 +16397,14 @@ async fn run_standalone_turn(
                                     .unwrap_or(0);
                                 final_assistant_message_id =
                                     Some(format!("{}:{seq}:{ts_ns}", agent_session_id.0,));
+                                // Issue #1337 codex round-2: pin the
+                                // committed seq to the assistant carrier
+                                // row so `session_result.committed_seq`
+                                // stays aligned with `message_id`. The
+                                // loop's outer `cursor` may advance to a
+                                // following tool row when the assistant
+                                // emitted `tool_calls`.
+                                final_assistant_committed_seq = Some(seq as u64);
                             }
                             if let Some(content) = preamble_assistant_content {
                                 last_persisted_preamble_assistant = Some(content);
@@ -16552,6 +16573,15 @@ async fn run_standalone_turn(
                                         .unwrap_or(0);
                                     final_assistant_message_id =
                                         Some(format!("{}:{seq}:{ts_ns}", agent_session_id.0,));
+                                    // Issue #1337 codex round-2: parity
+                                    // with the carrier branch — pin the
+                                    // committed seq to this synthesised
+                                    // assistant row so the consumer can
+                                    // build `TurnSessionResult` from a
+                                    // seq that actually points at the
+                                    // assistant row (not whatever last
+                                    // touched `cursor`).
+                                    final_assistant_committed_seq = Some(seq as u64);
                                 }
                             }
                         }
@@ -16601,6 +16631,13 @@ async fn run_standalone_turn(
                 // `turn/completed` lifecycle envelope. Absent when no
                 // final-assistant row persisted (no synthesis +
                 // skipped carrier + JSONL write failures).
+                //
+                // Issue #1337 codex round-2: also include
+                // `final_assistant_committed_seq` so the consumer can
+                // build `TurnSessionResult.committed_seq` from the
+                // assistant carrier's seq instead of the loop's last
+                // `cursor.seq` (which may point at a tool row when the
+                // assistant emitted `tool_calls`).
                 let done = json!({
                     "type": "done",
                     "content": response.content,
@@ -16608,6 +16645,7 @@ async fn run_standalone_turn(
                     "tokens_out": response.token_usage.output_tokens,
                     "cursor": cursor,
                     "message_id": final_assistant_message_id,
+                    "final_assistant_committed_seq": final_assistant_committed_seq,
                     "thread_id": turn_thread_id_for_done,
                 });
                 let _ = progress_tx_for_result.send(done.to_string()).await;
@@ -16726,27 +16764,16 @@ async fn run_standalone_turn(
                     .get("cursor")
                     .filter(|value| !value.is_null())
                     .and_then(|value| serde_json::from_value(value.clone()).ok());
-                let done_message_id = event
-                    .get("message_id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
-                let session_result = match (&done_cursor, done_message_id) {
-                    (Some(cursor), Some(message_id)) => Some(TurnSessionResult {
-                        committed_seq: cursor.seq,
-                        message_id,
-                        // `turn/start` does not carry a per-prompt
-                        // `client_message_id` (see `TurnStartParams`),
-                        // so the originating-cmid lookup degrades to
-                        // `None` on the WS path. The gateway path
-                        // (`SessionActor::*`) carries cmids end to end
-                        // — once that path also pipes through
-                        // `TurnCompletionDetails`, this branch picks
-                        // up cmid naturally.
-                        client_message_id: None,
-                    }),
-                    _ => None,
-                };
+                // Issue #1337 codex round-2: prefer the carrier-pinned
+                // committed_seq for `TurnSessionResult`. The
+                // assistant-row carrier captures its seq at stamp time;
+                // the loop's `cursor` may have advanced past it onto a
+                // following tool row in the trimmed-dedupe path (where
+                // an assistant row with tool_calls is followed by tool
+                // rows). Building `session_result.committed_seq` from
+                // `cursor.seq` would break per-row identity because
+                // `message_id` still points at the assistant row.
+                let session_result = build_turn_session_result_from_done(&event);
                 let details = TurnCompletionDetails {
                     cursor: done_cursor,
                     tokens_in: Some(u32::try_from(tokens_in).unwrap_or(u32::MAX)),
@@ -17124,6 +17151,52 @@ struct TerminalTransition {
     ack: Option<oneshot::Sender<()>>,
 }
 
+/// Issue #1337 codex round-2: build a `TurnSessionResult` from the
+/// agent-task `done` JSON. Sources `committed_seq` from the
+/// carrier-pinned `final_assistant_committed_seq` rather than the
+/// loop-wide `cursor.seq`.
+///
+/// Trimmed-dedupe scenario the loop's `cursor.seq` cannot describe
+/// correctly:
+///
+///   1. Assistant carrier row is persisted at seq N (with `tool_calls`).
+///   2. Subsequent tool rows persist at seq N+1, N+2, ...
+///   3. The loop's `cursor` ends up at seq N+2.
+///   4. `final_assistant_message_id` was stamped at the assistant row
+///      (seq N) — that's the durable per-row identity.
+///
+/// Building `TurnSessionResult` from `cursor.seq` here would pair the
+/// assistant's `message_id` (seq N) with a tool-row `committed_seq`
+/// (seq N+2). Capability-aware clients that key off
+/// `session_result.{committed_seq, message_id}` would see a contract
+/// violation. This helper sources `committed_seq` from
+/// `final_assistant_committed_seq` so it pins to the assistant row
+/// regardless of how many tool rows followed in the same turn.
+///
+/// Degrades to `None` when either the carrier seq or the message_id is
+/// absent (no synthesis + skipped carrier + JSONL write failures).
+fn build_turn_session_result_from_done(event: &Value) -> Option<TurnSessionResult> {
+    let committed_seq = event
+        .get("final_assistant_committed_seq")
+        .and_then(Value::as_u64)?;
+    let message_id = event
+        .get("message_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)?;
+    Some(TurnSessionResult {
+        committed_seq,
+        message_id,
+        // `turn/start` does not carry a per-prompt `client_message_id`
+        // (see `TurnStartParams`), so the originating-cmid lookup
+        // degrades to `None` on the WS path. The gateway path
+        // (`SessionActor::*`) carries cmids end to end — once that
+        // path also pipes through `TurnCompletionDetails`, this branch
+        // picks up cmid naturally.
+        client_message_id: None,
+    })
+}
+
 /// Atomically transition the turn state to `Terminal(_)` exactly once.
 /// `Active` → `Terminal(expected)`. `Interrupting { ack }` →
 /// `Terminal(Interrupted)` with `ack` for the caller to signal. `Terminal(_)`
@@ -17202,6 +17275,7 @@ struct TurnCompletionDetails {
 /// from `done` (input/output tokens + cursor + per-row identity); left as
 /// `None` for paths that do not run the LLM (slash command, review/start
 /// scatter-join, M9 fixture replays).
+#[allow(clippy::too_many_arguments)]
 async fn try_emit_terminal(
     turn_state: &TokioMutex<TurnState>,
     expected_reason: TerminalReason,
@@ -21458,7 +21532,7 @@ ignore = []
         );
         assert!(
             frame.contains("\"committed_seq\":17"),
-            "session_result.committed_seq must mirror cursor.seq: {frame}"
+            "session_result.committed_seq must reflect the assistant carrier seq: {frame}"
         );
         assert!(
             frame.contains("\"client_message_id\":\"cmid-user-1\""),
@@ -21520,6 +21594,109 @@ ignore = []
             !frame.contains("\"session_result\""),
             "session_result must be omitted when details are None: {frame}"
         );
+    }
+
+    /// Issue #1337 codex round-2 regression: in the trimmed-dedupe
+    /// path, an assistant carrier with `tool_calls` is persisted at
+    /// seq N, followed by tool rows at seq N+1, N+2. The loop's
+    /// `cursor` therefore advances past the assistant row to the last
+    /// tool row, but `final_assistant_message_id` was stamped at the
+    /// assistant row's seq N. Building `TurnSessionResult` from
+    /// `cursor.seq` would surface `committed_seq=N+2` alongside
+    /// `message_id=session:N:ts` — a per-row-identity contract
+    /// violation. The helper must source `committed_seq` from
+    /// `final_assistant_committed_seq` (pinned at the assistant row)
+    /// not from `cursor`.
+    #[test]
+    fn build_turn_session_result_from_done_pins_seq_to_assistant_carrier_in_trimmed_dedupe() {
+        // Simulate the `done` JSON producer's output for a turn where:
+        //   - assistant carrier persisted at seq N=10 (with tool_calls)
+        //   - tool rows persisted at seq 11, 12
+        //   - loop's outer `cursor` ended at seq 12 (last tool row)
+        //   - `final_assistant_committed_seq` = 10 (assistant carrier)
+        //   - `final_assistant_message_id` = "sess-1:10:<ts_ns>"
+        let assistant_seq: u64 = 10;
+        let last_tool_seq: u64 = 12;
+        let assistant_message_id = format!("sess-1:{assistant_seq}:99999");
+        let done = json!({
+            "type": "done",
+            "content": "hello",
+            "tokens_in": 100,
+            "tokens_out": 200,
+            "cursor": {
+                "stream": "sess-1",
+                "seq": last_tool_seq,
+            },
+            "message_id": assistant_message_id,
+            "final_assistant_committed_seq": assistant_seq,
+            "thread_id": "turn-1",
+        });
+
+        let session_result = build_turn_session_result_from_done(&done)
+            .expect("session_result must be present when both carrier seq + message_id stamped");
+
+        // The fix: committed_seq is pinned to the assistant carrier's
+        // seq (10), NOT the loop's last `cursor.seq` (12).
+        assert_eq!(
+            session_result.committed_seq, assistant_seq,
+            "committed_seq must pin to assistant carrier seq, not last tool-row cursor"
+        );
+        assert_ne!(
+            session_result.committed_seq, last_tool_seq,
+            "committed_seq must NOT be the loop's last-row cursor seq when it points at a tool row"
+        );
+        assert_eq!(
+            session_result.message_id, assistant_message_id,
+            "message_id must reference the assistant carrier row"
+        );
+        assert_eq!(session_result.client_message_id, None);
+    }
+
+    /// Companion: when the carrier seq is missing (no synthesis +
+    /// skipped carrier + JSONL write failure), the helper must return
+    /// `None` so capability-aware clients see "no data" not a stub.
+    #[test]
+    fn build_turn_session_result_from_done_returns_none_without_carrier_seq() {
+        let done = json!({
+            "type": "done",
+            "content": "",
+            "cursor": { "stream": "sess-1", "seq": 5 },
+            "message_id": "sess-1:5:99999",
+            // `final_assistant_committed_seq` deliberately absent —
+            // simulates the no-persist branch.
+        });
+        assert!(build_turn_session_result_from_done(&done).is_none());
+    }
+
+    /// Companion: when the message_id is missing/empty, the helper
+    /// also returns `None` (both fields are required for the
+    /// per-row identity contract).
+    #[test]
+    fn build_turn_session_result_from_done_returns_none_without_message_id() {
+        let done = json!({
+            "type": "done",
+            "final_assistant_committed_seq": 7,
+            "message_id": "",
+        });
+        assert!(build_turn_session_result_from_done(&done).is_none());
+    }
+
+    /// Plain case: no tool calls, no trimmed-dedupe. The assistant
+    /// carrier seq equals the loop's last cursor seq, so
+    /// `committed_seq` matches both — verifies the helper does NOT
+    /// regress the common path.
+    #[test]
+    fn build_turn_session_result_from_done_matches_cursor_seq_without_tool_rows() {
+        let seq: u64 = 5;
+        let done = json!({
+            "type": "done",
+            "cursor": { "stream": "sess-1", "seq": seq },
+            "message_id": format!("sess-1:{seq}:99999"),
+            "final_assistant_committed_seq": seq,
+        });
+        let session_result = build_turn_session_result_from_done(&done).expect("populated");
+        assert_eq!(session_result.committed_seq, seq);
+        assert_eq!(session_result.message_id, format!("sess-1:{seq}:99999"));
     }
 
     #[test]
