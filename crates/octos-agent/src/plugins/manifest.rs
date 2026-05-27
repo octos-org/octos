@@ -63,11 +63,22 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
-    /// Whether this manifest declares any extras (MCP servers, hooks, or prompts).
+    /// Whether this manifest declares any extras (MCP servers, hooks, prompts,
+    /// or discovery).
+    ///
+    /// Round-2 codex review BLOCKER 2: `discovery` MUST be counted here. The
+    /// loader's strict-mode paths use `has_extras()` both to reject
+    /// extras-only manifests (so the operator splits executable + extras into
+    /// two skills they can hash independently) and to warn when dropping
+    /// extras under `plugins.require_signed`. Omitting `discovery` from this
+    /// check meant a discovery-only manifest became a silent no-op under
+    /// strict mode, and a signed tool plugin with discovery had its skill
+    /// card dropped without any warning.
     pub fn has_extras(&self) -> bool {
         !self.mcp_servers.is_empty()
             || !self.hooks.is_empty()
             || self.prompts.as_ref().is_some_and(|p| !p.include.is_empty())
+            || self.discovery.is_some()
     }
 }
 
@@ -164,18 +175,16 @@ where
                 "manifest.discovery.hints[{idx}] declares neither `read` nor `list`; at least one is required"
             )));
         }
-        if let Some(path) = &hint.read
-            && hint_path_has_traversal(path)
-        {
+        if hint.read.as_deref().is_some_and(hint_path_has_traversal) {
             return Err(D::Error::custom(format!(
-                "manifest.discovery.hints[{idx}].read contains path traversal (..): {path:?}"
+                "manifest.discovery.hints[{idx}].read contains path traversal (..): {:?}",
+                hint.read
             )));
         }
-        if let Some(pattern) = &hint.list
-            && hint_path_has_traversal(pattern)
-        {
+        if hint.list.as_deref().is_some_and(hint_path_has_traversal) {
             return Err(D::Error::custom(format!(
-                "manifest.discovery.hints[{idx}].list contains path traversal (..): {pattern:?}"
+                "manifest.discovery.hints[{idx}].list contains path traversal (..): {:?}",
+                hint.list
             )));
         }
     }
@@ -1083,6 +1092,70 @@ mod tests {
             msg.contains("..") || msg.to_lowercase().contains("traversal"),
             "error must mention traversal; got: {msg}"
         );
+    }
+
+    /// Round-2 codex BLOCKER 2 regression: `has_extras()` must report true
+    /// for a manifest whose only extras-bearing field is `discovery`. The
+    /// loader's strict-mode rejection path (`require_signed && tools.is_empty()
+    /// && has_extras()`) and the warn-then-drop path both rely on this; a
+    /// false return here means a discovery-only signed manifest becomes a
+    /// silent no-op instead of either failing closed or being announced in
+    /// logs.
+    #[test]
+    fn has_extras_returns_true_for_discovery_only_manifest() {
+        let json = r#"{
+            "name": "discovery-only",
+            "version": "1.0.0",
+            "tools": [],
+            "discovery": {
+                "summary": "Card-only skill.",
+                "hints": [
+                    { "when": "user asks anything", "read": "SKILL.md" }
+                ]
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.mcp_servers.is_empty());
+        assert!(manifest.hooks.is_empty());
+        assert!(manifest.prompts.is_none());
+        assert!(
+            manifest.has_extras(),
+            "discovery-only manifest must count as extras-bearing"
+        );
+    }
+
+    /// Companion check: a manifest with discovery alongside a tool also
+    /// reports `has_extras() == true`, so the loader's "drop extras under
+    /// require_signed" warn path fires (otherwise the skill card silently
+    /// disappears for signed tool plugins).
+    #[test]
+    fn has_extras_returns_true_when_discovery_paired_with_tool() {
+        let json = r#"{
+            "name": "tool-with-discovery",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "hints": [
+                    { "when": "user asks anything", "read": "SKILL.md" }
+                ]
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.has_extras());
+    }
+
+    /// Negative control: a manifest with no MCP, no hooks, no prompts, and
+    /// no discovery still reports `has_extras() == false` so the loader's
+    /// `tools.is_empty() && has_extras()` reject does not over-fire.
+    #[test]
+    fn has_extras_returns_false_for_bare_manifest() {
+        let json = r#"{
+            "name": "bare",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(!manifest.has_extras());
     }
 
     #[test]
