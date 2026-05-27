@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use globset::{Glob, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSetBuilder};
 use ignore::WalkBuilder;
 use octos_core::{PathClassification, SessionScope};
 use serde::Deserialize;
@@ -259,7 +259,9 @@ fn run_glob_scoped(scope: &SessionScope, pattern: String, limit: usize) -> Resul
     let glob_set = if glob_pattern.is_empty() {
         None
     } else {
-        let glob = Glob::new(&glob_pattern)
+        let glob = GlobBuilder::new(&glob_pattern)
+            .literal_separator(true)
+            .build()
             .wrap_err_with(|| format!("invalid glob pattern: {}", glob_pattern))?;
         let mut builder = GlobSetBuilder::new();
         builder.add(glob);
