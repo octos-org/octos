@@ -4,17 +4,18 @@
 //! body `{"args": <args>}`. Parses the SPEC-VENDOR-NODE-V1 response shape
 //! (`ok`/`code`/`msg`/`data`) and maps it to `ToolResult`.
 //!
-//! Security: the constructor rejects any base_url that does not resolve
-//! to a loopback host. This bridge is designed for co-located bridge
-//! processes only; cross-host transport is out of scope.
+//! Security: the constructor requires the base_url to use a literal
+//! loopback IP (`127.0.0.0/8` or `::1`). Hostnames — including
+//! `localhost` — are rejected because `reqwest` re-resolves DNS at
+//! request time, and a hostname whose resolution changes after
+//! construction would bypass the build-time guard. This bridge is
+//! designed for co-located bridge processes only; cross-host transport
+//! is out of scope.
 //!
-//! **Operator note:** prefer literal `127.0.0.1` or `[::1]` over `localhost`
-//! or any other hostname in skill manifests. The constructor pins loopback
-//! at build time via DNS resolution, but `reqwest` re-resolves at request
-//! time, so a hostname whose DNS later rebinds to a public IP would bypass
-//! the build-time guard. Literal IPs eliminate this TOCTOU window.
+//! **Operator note:** skill manifests must use `127.0.0.1` or `[::1]`
+//! for HTTP `base_url`. `localhost` and any other hostname will be
+//! refused at skill registration time.
 
-use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -93,29 +94,15 @@ fn validate_loopback_url(raw: &str) -> Result<()> {
         .host()
         .ok_or_else(|| eyre!("base_url {raw:?} has no host"))?
     {
-        url::Host::Domain(hostname) => {
-            if hostname == "localhost" {
-                return Ok(());
-            }
-            // Resolve hostname via DNS; require ALL resolved addresses to be loopback.
-            let port = url.port_or_known_default().unwrap_or(80);
-            let mut any = false;
-            for addr in (hostname, port)
-                .to_socket_addrs()
-                .map_err(|e| eyre!("base_url {raw:?}: DNS lookup failed: {e}"))?
-            {
-                any = true;
-                if !addr.ip().is_loopback() {
-                    return Err(eyre!(
-                        "base_url {raw:?} resolves to non-loopback ip {}; only loopback allowed",
-                        addr.ip()
-                    ));
-                }
-            }
-            if !any {
-                return Err(eyre!("base_url {raw:?}: hostname resolved to no addresses"));
-            }
-            Ok(())
+        url::Host::Domain(_) => {
+            // Reject every hostname, including "localhost". reqwest re-resolves
+            // DNS at request time; a hostname whose resolution later flips to
+            // a non-loopback address would slip past any build-time DNS check.
+            // PR #1260 review: close the TOCTOU window by requiring a literal
+            // loopback IP.
+            Err(eyre!(
+                "base_url {raw:?} uses a hostname; only literal loopback IPs (127.0.0.0/8 or [::1]) are allowed"
+            ))
         }
         url::Host::Ipv4(ip) => {
             if ip.is_loopback() {
@@ -272,12 +259,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_loopback_v4_and_v6_and_localhost() {
-        for url in [
-            "http://127.0.0.1:8765",
-            "http://[::1]:8765",
-            "http://localhost:8765",
-        ] {
+    async fn accepts_literal_loopback_ips() {
+        for url in ["http://127.0.0.1:8765", "http://[::1]:8765"] {
             HttpTool::new(
                 "t".into(),
                 "d".into(),
@@ -287,6 +270,46 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("rejected loopback url {url}: {e}"));
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_localhost_hostname_to_close_dns_toctou() {
+        // SPEC-V1 review (PR #1260): even "localhost" must be a literal IP,
+        // because reqwest re-resolves hostnames at request time and a
+        // hostname's DNS may rebind to a non-loopback address between
+        // construction and dispatch.
+        let err = HttpTool::new(
+            "t".into(),
+            "d".into(),
+            "http://localhost:8765".into(),
+            json!({}),
+            DEFAULT_TIMEOUT_SECS,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("literal") || msg.contains("hostname"),
+            "expected hostname-rejection message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_any_domain_hostname_even_if_it_resolves_to_loopback() {
+        // Some hosts have /etc/hosts entries pointing custom names at 127.x;
+        // accepting them would leave the same DNS-rebind TOCTOU open.
+        let err = HttpTool::new(
+            "t".into(),
+            "d".into(),
+            "http://example.com:8765".into(),
+            json!({}),
+            DEFAULT_TIMEOUT_SECS,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("literal") || msg.contains("hostname"),
+            "expected hostname-rejection message, got: {msg}"
+        );
     }
 
     #[tokio::test]
