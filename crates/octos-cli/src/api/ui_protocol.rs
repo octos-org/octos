@@ -2896,6 +2896,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             // runtime decision below.
             let auto = ApprovalAutoResolvedEvent {
                 session_id: self.session_id.clone(),
+                topic: self.session_id.topic().map(ToOwned::to_owned),
                 approval_id: approval_id.clone(),
                 turn_id: self.turn_id.clone(),
                 tool_name: event.tool_name.clone(),
@@ -2919,6 +2920,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             let policy_id = format!("policy:{}:{}", hit.scope_wire(), hit.scope_match);
             let decided_event = ApprovalDecidedEvent {
                 session_id: self.session_id.clone(),
+                topic: self.session_id.topic().map(ToOwned::to_owned),
                 approval_id: approval_id.clone(),
                 turn_id: self.turn_id.clone(),
                 decision: hit.decision.clone(),
@@ -3015,6 +3017,7 @@ fn cancel_approval_after_request_send_failure(
         ledger,
         UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
             session_id: session_id.clone(),
+            topic: session_id.topic().map(ToOwned::to_owned),
             approval_id: cancelled.approval_id,
             turn_id: cancelled.turn_id,
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
@@ -7606,25 +7609,20 @@ fn ledger_event_matches_topic_scope(
     event: &UiProtocolLedgerEvent,
     topic_scope: Option<&str>,
 ) -> bool {
-    // P0-A exemption: `file/attached` envelopes are intrinsically
-    // session-scoped via their `tool_call_id` (the SPA already binds
-    // each attachment to the originating turn/tool client-side). The
-    // event type has no `topic` field, so `UiNotification::topic()`
-    // falls back to `SessionKey.topic()` — meaning any emit site that
-    // constructs the event with a session_id stripped of (or pre-
-    // dating) the `#<topic>` suffix produces `event.topic() == None`
-    // and the strict equality below drops it for a topic-scoped
-    // subscriber. The slides soak round-13 regression captured this
-    // exact gap: `file/attached` landed on the ledger but never
-    // reached the SPA. Exempting the variant closes the wire gap with
-    // no functional cost — clients route the attachment via
-    // `tool_call_id` regardless of topic scope.
-    if matches!(
-        event,
-        UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_))
-    ) {
-        return true;
-    }
+    // Topic scoping consults `event.topic()`, which now reads the
+    // explicit `topic` field carried on every variant whose emit site
+    // can drop the topic suffix from `session_id` (TurnStarted,
+    // MessageDelta, ToolStarted/Progress/Completed, Approval*, Task*,
+    // TurnCompleted/Error/SpawnComplete, MessagePersisted,
+    // FileAttached, SessionEventBridged). #1329 closes the P0-A class
+    // routing drop: emitters populate `topic` from the upstream
+    // SessionKey BEFORE any `base_key()` strip, so a topic-scoped
+    // subscriber routes the event correctly even when `session_id`
+    // was rebuilt from `base_key()` (the gap that previously
+    // dropped `file/attached` in slides soak round-13 and was
+    // patched with a single-variant exemption — the exemption is
+    // no longer needed now that every vulnerable variant carries
+    // explicit topic).
     let event_topic = event
         .topic()
         .map(str::trim)
@@ -12469,11 +12467,13 @@ async fn run_m9_fixture_turn(
         }
         M9ProtocolFixture::ToolEvents => {
             let tool_call_id = format!("m9-tool-{}", turn_id.0);
+            let topic = session_id.topic().map(ToOwned::to_owned);
             let _ = send_notification_durable(
                 &ws,
                 &ledger,
                 UiNotification::ToolStarted(ToolStartedEvent {
                     session_id: session_id.clone(),
+                    topic: topic.clone(),
                     turn_id: turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     tool_name: "list_dir".to_owned(),
@@ -12485,6 +12485,7 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 UiNotification::ToolProgress(ToolProgressEvent {
                     session_id: session_id.clone(),
+                    topic: topic.clone(),
                     turn_id: turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     message: Some("listing workspace".to_owned()),
@@ -12496,6 +12497,7 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 UiNotification::ToolCompleted(ToolCompletedEvent {
                     session_id: session_id.clone(),
+                    topic,
                     turn_id: turn_id.clone(),
                     tool_call_id,
                     tool_name: "list_dir".to_owned(),
@@ -12873,11 +12875,13 @@ async fn m14_codex_tool_call(
     expected_success: bool,
 ) -> Result<octos_agent::ToolResult, String> {
     let tool_call_id = format!("m14-codex-p0-{index}-{tool_name}-{}", env.turn_id.0);
+    let topic = env.session_id.topic().map(ToOwned::to_owned);
     let _ = send_notification_durable(
         env.ws,
         env.ledger,
         UiNotification::ToolStarted(ToolStartedEvent {
             session_id: env.session_id.clone(),
+            topic: topic.clone(),
             turn_id: env.turn_id.clone(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.to_owned(),
@@ -12897,6 +12901,7 @@ async fn m14_codex_tool_call(
         env.ledger,
         UiNotification::ToolCompleted(ToolCompletedEvent {
             session_id: env.session_id.clone(),
+            topic,
             turn_id: env.turn_id.clone(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.to_owned(),
@@ -17871,6 +17876,7 @@ async fn abort_connection_turns(
             let _ = ledger.append_notification(UiNotification::ApprovalCancelled(
                 ApprovalCancelledEvent {
                     session_id: session_id.clone(),
+                    topic: session_id.topic().map(ToOwned::to_owned),
                     approval_id: entry.approval_id,
                     turn_id: entry.turn_id,
                     reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
@@ -27859,6 +27865,7 @@ ignore = []
             .expect("request was registered");
         ledger.append_notification(UiNotification::ApprovalDecided(ApprovalDecidedEvent {
             session_id: session_id.clone(),
+            topic: None,
             approval_id: approval_id.clone(),
             turn_id: decided_turn_id,
             decision: ApprovalDecision::Approve,
@@ -29327,6 +29334,7 @@ ignore = []
     fn file_attached_for(session: &SessionKey) -> UiNotification {
         UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
             session_id: session.clone(),
+            topic: session.topic().map(ToOwned::to_owned),
             turn_id: TurnId::new(),
             path: "/tmp/deck.pptx".into(),
             tool_call_id: Some("tc-slides".into()),
@@ -29621,48 +29629,237 @@ ignore = []
         abort_live_forwarders(&forwarders, &ledger).await;
     }
 
-    /// Complementary unit test for `ledger_event_matches_topic_scope`:
-    /// `file/attached` events MUST always match a topic-scoped
-    /// subscriber, regardless of whether the event itself carries a
-    /// topic. Companion to
-    /// `live_forwarder_delivers_file_attached_to_topic_scoped_subscriber`
-    /// — guards the filter in isolation so a refactor that re-routes
-    /// the call site can't silently break the exemption.
+    /// #1329 (closes the P0-A class routing drop): The 6 events that
+    /// previously had no explicit `topic` field — ToolStarted,
+    /// ToolProgress, ToolCompleted, ApprovalAutoResolved,
+    /// ApprovalDecided, ApprovalCancelled — gained the same
+    /// `topic: Option<String>` field that the 10 already-fixed
+    /// variants carry. With emitters populating the field from the
+    /// upstream `SessionKey.topic()` BEFORE any `base_key()` strip,
+    /// each event reaches a topic-scoped subscriber.
+    ///
+    /// This integration-style test pins the invariant for ALL 6
+    /// variants on the live broadcast path: emit each event on a
+    /// topic-suffixed broadcast key with the explicit `topic` field,
+    /// then assert each frame reaches a topic-scoped subscriber (the
+    /// classifier reads `event.topic()` first, honoring the explicit
+    /// field).
+    #[tokio::test]
+    async fn live_forwarder_delivers_tool_and_approval_events_to_topic_scoped_subscriber() {
+        let (ws, mut rx) = ws_connection_for_test(64);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let topic_session = SessionKey("local:slides-soak#slides".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&topic_session);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            topic_session.clone(),
+            0,
+            ws.connection_id(),
+            ConnectionUiFeatures::default(),
+            Some("slides".into()),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        let turn_id = TurnId::new();
+        let tool_call_id = "tc-1329".to_owned();
+
+        // 1. ToolStarted
+        ledger.append_notification(UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "shell".into(),
+            arguments: None,
+        }));
+
+        // 2. ToolProgress
+        ledger.append_notification(UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            message: Some("running step 1".into()),
+            progress_pct: Some(50.0),
+        }));
+
+        // 3. ToolCompleted
+        ledger.append_notification(UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: Some(10),
+        }));
+
+        // 4. ApprovalAutoResolved
+        ledger.append_notification(UiNotification::ApprovalAutoResolved(
+            ApprovalAutoResolvedEvent {
+                session_id: topic_session.clone(),
+                topic: Some("slides".into()),
+                approval_id: ApprovalId::new(),
+                turn_id: turn_id.clone(),
+                tool_name: "shell".into(),
+                scope: "session".into(),
+                scope_match: "exact".into(),
+                decision: ApprovalDecision::Approve,
+            },
+        ));
+
+        // 5. ApprovalDecided
+        ledger.append_notification(UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: turn_id.clone(),
+            decision: ApprovalDecision::Approve,
+            scope: Some("session".into()),
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        }));
+
+        // 6. ApprovalCancelled
+        ledger.append_notification(UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: turn_id.clone(),
+            reason: "turn_interrupted".into(),
+        }));
+
+        // Verify each method lands on the subscriber. Order matches
+        // emission order — the ledger preserves seq.
+        let expected = [
+            methods::TOOL_STARTED,
+            methods::TOOL_PROGRESS,
+            methods::TOOL_COMPLETED,
+            methods::APPROVAL_AUTO_RESOLVED,
+            methods::APPROVAL_DECIDED,
+            methods::APPROVAL_CANCELLED,
+        ];
+        for method in expected.iter() {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {method}"))
+                .unwrap_or_else(|| panic!("ws closed before {method}"));
+            assert_eq!(
+                frame_method(&frame).as_deref(),
+                Some(*method),
+                "{method} with explicit topic=Some(\"slides\") must reach \
+                 a topic-scoped subscriber (#1329)"
+            );
+        }
+
+        abort_live_forwarders(&forwarders, &ledger).await;
+    }
+
+    /// Mirror of the positive test above: when an event of one of the
+    /// six P0-A class variants carries a NON-MATCHING explicit topic,
+    /// the classifier drops it from the topic-scoped subscriber.
+    /// Topic IS part of the routing key now (no more file/attached-
+    /// style always-deliver exemption).
+    #[tokio::test]
+    async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let topic_session = SessionKey("local:slides-soak#slides".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&topic_session);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            topic_session.clone(),
+            0,
+            ws.connection_id(),
+            ConnectionUiFeatures::default(),
+            Some("slides".into()),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Event carries `topic = "other"` — the classifier must drop
+        // it for the "slides"-scoped subscriber.
+        ledger.append_notification(UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("other".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-other".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "tool/started with topic=\"other\" must NOT reach a \
+             topic=\"slides\" subscriber (#1329 routing-key invariant)"
+        );
+
+        abort_live_forwarders(&forwarders, &ledger).await;
+    }
+
+    /// #1329 follow-up to P0-A: `file/attached` now carries an explicit
+    /// `topic: Option<String>` field. The classifier consults
+    /// `event.topic()`, which reads that field first and falls back to
+    /// the `SessionKey.topic()` suffix. With emitters populating the
+    /// field at the source, the prior `file/attached`-only exemption
+    /// in `ledger_event_matches_topic_scope` is no longer needed — the
+    /// routing follows the same rule as every other variant.
     #[test]
-    fn ledger_event_matches_topic_scope_exempts_file_attached() {
+    fn ledger_event_matches_topic_scope_routes_file_attached_by_topic_field() {
         let bare_session = SessionKey("local:slides-soak".into());
         let topic_session = SessionKey("local:slides-soak#slides".into());
         let other_topic_session = SessionKey("local:slides-soak#other".into());
 
-        // Bare event, topic-scoped subscriber: pre-fix → DROP; post-fix → PASS.
+        // Bare event, topic-scoped subscriber: no topic on the event,
+        // topic on the subscriber → DROP (no longer exempt).
         let bare_event = UiProtocolLedgerEvent::Notification(file_attached_for(&bare_session));
         assert!(
-            ledger_event_matches_topic_scope(&bare_event, Some("slides")),
-            "file/attached with no topic must reach a topic-scoped subscriber"
+            !ledger_event_matches_topic_scope(&bare_event, Some("slides")),
+            "file/attached with no topic must NOT reach a topic-scoped subscriber"
         );
 
-        // Topic-suffixed event, topic-scoped subscriber: always PASSED.
+        // Topic-suffixed event, topic-scoped subscriber: explicit
+        // topic matches → PASS.
         let topic_event = UiProtocolLedgerEvent::Notification(file_attached_for(&topic_session));
         assert!(
             ledger_event_matches_topic_scope(&topic_event, Some("slides")),
             "file/attached with matching topic must reach a topic-scoped subscriber"
         );
 
-        // Mismatched topic, topic-scoped subscriber: pre-fix → DROP;
-        // post-fix → PASS (file/attached is exempt from topic scoping).
+        // Mismatched topic, topic-scoped subscriber: explicit topic
+        // mismatches → DROP. Topic IS part of the routing key now.
         let other_event =
             UiProtocolLedgerEvent::Notification(file_attached_for(&other_topic_session));
         assert!(
-            ledger_event_matches_topic_scope(&other_event, Some("slides")),
-            "file/attached is exempt from topic-scope filtering — \
-             a non-matching event.topic must NOT block delivery"
+            !ledger_event_matches_topic_scope(&other_event, Some("slides")),
+            "file/attached with non-matching topic must NOT reach a topic-scoped subscriber"
         );
 
-        // Bare subscriber, topic-suffixed event: always PASSED by the
-        // exemption too (defensive consistency).
+        // Bare subscriber, topic-suffixed event → DROP (topic on
+        // event, no topic on subscriber).
         assert!(
-            ledger_event_matches_topic_scope(&topic_event, None),
-            "file/attached must reach a bare (no-topic) subscriber"
+            !ledger_event_matches_topic_scope(&topic_event, None),
+            "file/attached with topic must NOT reach a bare (no-topic) subscriber"
+        );
+
+        // Bare event + bare subscriber → PASS (the no-topic case).
+        assert!(
+            ledger_event_matches_topic_scope(&bare_event, None),
+            "file/attached with no topic must reach a bare (no-topic) subscriber"
         );
     }
 

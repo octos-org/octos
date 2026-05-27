@@ -106,6 +106,10 @@ scripts/deploy.sh
 # api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md.
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md
+# Architecture Decision Records — landed under docs/adr/ to keep the
+# top-level docs/ flat for one-off design notes. Allowlist the whole
+# directory so future ADRs don't need per-file edits.
+!docs/adr/*.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
