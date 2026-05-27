@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const repoRoot = resolve(__dirname, '..', '..', '..');
 const runner = resolve(repoRoot, 'e2e', 'scripts', 'ux-tmux-run.mjs');
+const validator = resolve(repoRoot, 'e2e', 'scripts', 'ux-tmux-validate.mjs');
 
 function makeEnv(runId) {
   const root = mkdtempSync(join(tmpdir(), 'octos-ux-tmux-run-test-'));
@@ -54,9 +55,37 @@ test('self-test writes and validates the artifact skeleton', () => {
   const transcript = readFileSync(join(outDir, 'appui-transcript.jsonl'), 'utf8');
   assert.equal(summary.validation_status, 'passed');
   assert.equal(validation.status, 'passed');
+  assert.ok(validation.checks.some((check) => check.id === 'stdio_happy_path_final_marker_visible'));
   assert.match(capture, /M19_STDIO_HAPPY_PATH_FINAL_LINE/);
   assert.match(capture, /\bComposer\b/);
   assert.match(transcript, /"method":"client_hello"/);
+});
+
+test('validator rejects stdio happy-path captures without the final marker answer', () => {
+  const { env, outDir } = makeEnv('ux-run-test-missing-marker');
+  run(['--self-test', 'stdio-happy-path'], env);
+
+  const capturePath = join(outDir, 'tui-capture.txt');
+  const capture = readFileSync(capturePath, 'utf8');
+  writeFileSync(
+    capturePath,
+    capture.replaceAll('M19_STDIO_HAPPY_PATH_FINAL_LINE', 'M19_STDIO_HAPPY_PATH_MISSING'),
+    'utf8',
+  );
+
+  let error = null;
+  try {
+    execFileSync(process.execPath, [validator, outDir], {
+      cwd: repoRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (caught) {
+    error = caught;
+  }
+  assert.ok(error, 'validator should fail when the final marker answer is missing');
+  assert.match(`${error.stdout}\n${error.stderr}`, /stdio_happy_path_final_marker_visible/);
 });
 
 test('dry-run can skip automatic validation', () => {

@@ -32,7 +32,7 @@ const scenarios = new Map([
       runner: 'onboarding-solo',
       finalMarker: 'M19_STDIO_HAPPY_PATH_FINAL_LINE',
       prompt:
-        'Run the stdio happy path UX smoke. Open a session, send one short prompt, and finish with M19_STDIO_HAPPY_PATH_FINAL_LINE.',
+        'Run the stdio happy path UX smoke. Open a session, send one short prompt, and finish with `M19_STDIO_HAPPY_PATH_FINAL_LINE`.',
     },
   ],
   [
@@ -891,6 +891,9 @@ function runnerSteps(ctx) {
   if (ctx.scenario.runner === 'restart-reconnect' || ctx.scenario.runner === 'dropped-completion-backpressure') {
     return [];
   }
+  if (ctx.scenario.id === defaultScenarioId) {
+    return ['start', 'drive-solo', 'send-turn'];
+  }
   if (ctx.scenario.runner === 'provider-missing') {
     return ['start', 'drive-provider-missing', 'drive-solo'];
   }
@@ -957,9 +960,13 @@ function runLowerRunner(ctx, options = {}) {
   } else {
     for (const step of runnerSteps(ctx)) {
       if (status !== 0) break;
-      const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
-        ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
-        : {};
+      const stepEnv = {};
+      if (ctx.scenario.runner === 'provider-missing' && step === 'drive-solo') {
+        stepEnv.OCTOS_TUI_SOAK_INIT_PROFILE_LLM = '1';
+      }
+      if (step === 'send-turn') {
+        stepEnv.OCTOS_TUI_SOAK_PROMPT = ctx.scenario.prompt;
+      }
       const result = action(step, true, stepEnv);
       if (result.error) throw result.error;
       if (result.status !== 0) status = result.status || 1;

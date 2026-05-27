@@ -1280,6 +1280,51 @@ function checkLowerSoakSummary(artifactDir) {
   );
 }
 
+function checkStdioHappyPathFinalMarker(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'stdio_happy_path_final_marker_visible',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (scenario.value.id !== 'stdio-happy-path' && scenario.value.scenario_id !== 'stdio-happy-path') {
+    return makeCheck(
+      'stdio_happy_path_final_marker_visible',
+      true,
+      'stdio happy-path final-marker contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const marker = typeof scenario.value.final_marker === 'string' && scenario.value.final_marker.length > 0
+    ? scenario.value.final_marker
+    : 'M19_STDIO_HAPPY_PATH_FINAL_LINE';
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  if (!capture.ok) {
+    return makeCheck(
+      'stdio_happy_path_final_marker_visible',
+      false,
+      `tui-capture.txt could not be read: ${capture.error}`,
+      ['tui-capture.txt'],
+    );
+  }
+
+  const answerLines = captureLines(capture.text)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(marker) && !line.startsWith('›'));
+  return makeCheck(
+    'stdio_happy_path_final_marker_visible',
+    answerLines.length > 0,
+    answerLines.length > 0
+      ? 'stdio happy-path final marker is visible in captured assistant output'
+      : `stdio happy-path final marker ${marker} is not visible outside the user/composer line`,
+    ['scenario.json', 'tui-capture.txt'],
+  );
+}
+
 function buildValidation(artifactDir) {
   const checks = [
     checkArtifactAbi(artifactDir),
@@ -1295,6 +1340,7 @@ function buildValidation(artifactDir) {
     checkRestartReconnectScenario(artifactDir),
     checkDroppedCompletionBackpressureScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
+    checkStdioHappyPathFinalMarker(artifactDir),
   ];
   const failures = checks
     .filter((check) => check.status === 'failed')
