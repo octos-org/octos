@@ -352,6 +352,20 @@ pub(crate) struct WsConnection {
     /// triggers cleanup immediately rather than waiting indefinitely
     /// for the next client frame.
     failed_notify: Arc<tokio::sync::Notify>,
+    /// Codex #1336 round-2 BLOCKER 1: snapshot of the connection's
+    /// negotiated `ConnectionUiFeatures`. The send-helper layer
+    /// consults this to apply `live_event_passes_capability_filter`
+    /// to DIRECT sends, mirroring what the replay/live-forwarder
+    /// paths already do. Without it, a connection that negotiated
+    /// `projection.envelope.v1` still received the legacy
+    /// `MessageDelta` / `TurnCompleted` / tool / `MessagePersisted`
+    /// frames directly from handler code — violating the mutual
+    /// exclusion the γ cutover gate is supposed to enforce.
+    ///
+    /// Mutated only by `handle_client_hello_rpc` (via
+    /// [`update_live_features`]). Reads are far more frequent than
+    /// writes, so `RwLock` is the right fit.
+    live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
 }
 
 impl WsConnection {
@@ -363,6 +377,7 @@ impl WsConnection {
             connection_id: ConnectionId::next(),
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
+            live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
         }
     }
 
@@ -375,7 +390,33 @@ impl WsConnection {
             connection_id: ConnectionId::next(),
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
+            live_features: Arc::new(std::sync::RwLock::new(
+                ConnectionUiFeatures::stdio_defaults(),
+            )),
         }
+    }
+
+    /// Codex #1336 round-2 BLOCKER 1: snapshot the per-connection
+    /// feature set so the send helpers can apply the same capability
+    /// filter the broadcast forwarder uses. Cheap because
+    /// `ConnectionUiFeatures` is `Copy`.
+    fn snapshot_live_features(&self) -> ConnectionUiFeatures {
+        match self.live_features.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Codex #1336 round-2 BLOCKER 1: update the per-connection
+    /// feature set after `client/hello` negotiation. Called by
+    /// `handle_client_hello_rpc` so subsequent direct-sends apply the
+    /// new filter immediately.
+    fn update_live_features(&self, features: ConnectionUiFeatures) {
+        let mut guard = match self.live_features.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = features;
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -3376,6 +3417,12 @@ async fn ui_protocol_connection(
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
     let writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
     let ws = WsConnection::new(writer_tx);
+    // Codex #1336 round-2 BLOCKER 1: seed the per-connection feature
+    // snapshot from the negotiated `features` so direct-sends apply
+    // the same capability filter the broadcast forwarder uses BEFORE
+    // any RPC traffic. `handle_client_hello_rpc` updates the snapshot
+    // again when the client re-negotiates after the handshake.
+    ws.update_live_features(features);
     let active_turns = active_turns_registry();
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -7306,6 +7353,16 @@ fn handle_client_hello_rpc(
             features.stdio_transport,
         );
     }
+    // Codex #1336 round-2 BLOCKER 1: keep the per-connection feature
+    // snapshot on WsConnection in lockstep with the local `features`
+    // copy. The send-helpers (`send_notification_durable` /
+    // `send_notification_ephemeral` / `send_notification_lifecycle` /
+    // `send_ledger_event_durable`) consult `ws.snapshot_live_features()`
+    // to apply the same `live_event_passes_capability_filter` the
+    // broadcast forwarder uses — without this sync a connection that
+    // negotiated `projection.envelope.v1` mid-session would still
+    // receive legacy frames on direct sends.
+    ws.update_live_features(*features);
     let transport = if features.stdio_transport {
         "stdio"
     } else {
@@ -7750,6 +7807,21 @@ async fn spawn_live_forwarder(
     forwarders: SharedLiveForwarders,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+
+    // Codex #1336 round-2 BLOCKER 1: keep the per-connection feature
+    // snapshot on WsConnection in lockstep with what we received. The
+    // forwarder is the canonical source for "this connection's
+    // negotiated features" — the direct-send helpers
+    // (`send_notification_durable` / `send_notification_ephemeral` /
+    // `send_notification_lifecycle`) read this snapshot to apply the
+    // same `live_event_passes_capability_filter` the forwarder
+    // applies on the broadcast path. Without this sync, a test (or a
+    // production path that forgot to call `update_live_features`
+    // after `client/hello`) could see the forwarder filter the
+    // broadcast copy AND the direct-send path filter it again — or
+    // worse, the direct send pass through legacy frames a
+    // `projection.envelope.v1` client did not negotiate to receive.
+    ws.update_live_features(features);
 
     let session_for_log = session_id.clone();
     let task = tokio::spawn(async move {
@@ -18468,6 +18540,22 @@ fn send_scope_error(ws: &WsConnection, id: String, error: RpcError) {
     let _ = send_rpc_error(ws, Some(id), error);
 }
 
+/// Codex #1336 round-2 BLOCKER 1: per-connection capability filter
+/// applied at the DIRECT-SEND boundary. Mirrors what
+/// [`live_event_passes_capability_filter`] does for the broadcast
+/// forwarder so the per-connection mutual exclusion contract holds
+/// for the originating connection too — not just for other
+/// connections receiving the same event via fan-out.
+///
+/// Returns `true` when the wire frame should be sent on this
+/// connection; `false` when the connection's negotiated feature set
+/// filters it out (e.g. a `projection.envelope.v1` client that must
+/// not receive a legacy `MessageDelta` direct-send).
+fn direct_send_passes_capability_filter(ws: &WsConnection, event: &UiProtocolLedgerEvent) -> bool {
+    let features = ws.snapshot_live_features();
+    live_event_passes_capability_filter(event, features)
+}
+
 fn send_notification_lifecycle(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -18478,6 +18566,17 @@ fn send_notification_lifecycle(
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
+    // Codex #1336 round-2 BLOCKER 1: apply the per-connection
+    // capability filter at the direct-send boundary. Without this, a
+    // connection that negotiated `projection.envelope.v1` would still
+    // receive direct-sent legacy `TurnCompleted` lifecycle frames,
+    // violating the γ cutover gate's mutual exclusion contract. The
+    // ledger append above still happens so the canonical envelope
+    // emit (via `ledger.emit_envelope` on the same handler path)
+    // delivers via the broadcast forwarder.
+    if !direct_send_passes_capability_filter(ws, &event.event) {
+        return Ok(());
+    }
     let frame = frame_from_ledger(event.event)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
     match ws.send_lifecycle(frame) {
@@ -18508,6 +18607,19 @@ fn send_notification_durable(
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
+    // Codex #1336 round-2 BLOCKER 1: apply the per-connection
+    // capability filter at the direct-send boundary. A connection
+    // that negotiated `projection.envelope.v1` must not receive
+    // direct-sent legacy notifications (`MessagePersisted`,
+    // `ToolStarted` / `ToolProgress` / `ToolCompleted`,
+    // `FileAttached`, etc.) — the canonical envelopes emitted by
+    // `ledger.emit_envelope` reach the same connection via the live
+    // forwarder. Ledger append still occurs above so OTHER
+    // connections (without the feature) receive the legacy shape via
+    // their own forwarders.
+    if !direct_send_passes_capability_filter(ws, &event.event) {
+        return Ok(());
+    }
     let frame = match frame_from_ledger(event.event) {
         Some(frame) => frame,
         None => {
@@ -18537,6 +18649,20 @@ fn send_notification_ephemeral(
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
     let method = notification.method().to_string();
+    // Codex #1336 round-2 BLOCKER 1: apply the per-connection
+    // capability filter to ephemeral direct sends too. `MessageDelta`
+    // is the load-bearing case — every keystroke from the LLM is an
+    // ephemeral direct send, and a `projection.envelope.v1` client
+    // expects the canonical envelope shape exclusively.
+    //
+    // Ephemerals are NOT in the ledger so we wrap the notification in
+    // a synthetic `Notification` ledger event for the filter check
+    // only (it never reaches disk). This keeps the filter helper
+    // signature uniform across direct-send paths.
+    let filter_event = UiProtocolLedgerEvent::Notification(notification.clone());
+    if !direct_send_passes_capability_filter(ws, &filter_event) {
+        return Ok(());
+    }
     let rpc = match notification.into_rpc_notification() {
         Ok(rpc) => rpc,
         Err(error) => {
@@ -18563,6 +18689,20 @@ fn send_ledger_event_durable(
     // `event` already carries its cursor (set by the ledger before storage)
     // — pull a copy out before consuming the event into a frame.
     let cursor = ledger_event_cursor(&event);
+    // Codex #1336 round-2 BLOCKER 1: this helper is called from THREE
+    // paths — (a) the live forwarder, which already filters via
+    // `live_event_passes_capability_filter(features)` BEFORE invoking;
+    // (b) the session/open replay loop, which ALSO already filters
+    // before invoking; (c) handler-direct paths that flush a ledger
+    // event they just appended (progress status, opened-event,
+    // synthetic emits) — these always send shapes that aren't gated
+    // by `projection_envelope` (Progress, SessionOpened, etc.).
+    // Adding a second filter pass here would double up with (a) +
+    // (b) — and in tests where the forwarder's `features` arg is set
+    // explicitly without syncing `WsConnection::live_features`, the
+    // second pass would drop events the forwarder approved. The
+    // `send_notification_*` family is where γ-cutover direct sends
+    // arrive and where the per-connection filter is applied.
     let frame = match frame_from_ledger(event) {
         Some(frame) => frame,
         None => return Err(SendError::BackpressureDrop),
@@ -25017,6 +25157,167 @@ ignore = []
             octos_core::ui_protocol::methods::PROJECTION_ENVELOPE,
             "projection/envelope"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Codex #1336 round-2 BLOCKER 1: direct-send capability filter
+    // ────────────────────────────────────────────────────────────────────
+
+    /// A `projection.envelope.v1` connection that direct-sends a
+    /// legacy `MessageDelta` via `send_notification_ephemeral` must
+    /// observe ZERO wire frames on its writer channel. Pre-fix the
+    /// frame was sent directly (bypassing the
+    /// `live_event_passes_capability_filter` gate that the broadcast
+    /// forwarder applies). Post-fix the direct-send helpers consult
+    /// `WsConnection::snapshot_live_features` and apply the same
+    /// filter so the connection's mutual exclusion contract holds
+    /// even on the originating handler's direct path.
+    #[tokio::test]
+    async fn direct_ephemeral_send_drops_legacy_message_delta_for_projection_envelope_connection() {
+        use octos_core::ui_protocol::MessageDeltaEvent;
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        // Negotiate projection.envelope.v1.
+        ws.update_live_features(ConnectionUiFeatures {
+            projection_envelope: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        });
+
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:blocker1-eph".into());
+        let notif = UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "hello".into(),
+        });
+
+        // Direct ephemeral send — should be filtered out for this connection.
+        let result = send_notification_ephemeral(&ws, &ledger, notif);
+        assert!(
+            result.is_ok(),
+            "filter-drop returns Ok so callers don't treat it as a fatal error"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "projection.envelope.v1 connection must NOT receive the legacy MessageDelta directly"
+        );
+    }
+
+    /// Mirror of the above for `send_notification_durable`. The γ
+    /// cutover gate filters `ToolStarted` / `ToolCompleted` /
+    /// `MessagePersisted` / `FileAttached` / `TurnCompleted` — the
+    /// canonical envelopes emitted by `ledger.emit_envelope` cover
+    /// the same logical events via the broadcast forwarder.
+    #[tokio::test]
+    async fn direct_durable_send_drops_legacy_tool_completed_for_projection_envelope_connection() {
+        use octos_core::ui_protocol::ToolCompletedEvent;
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures {
+            projection_envelope: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        });
+
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:blocker1-dur".into());
+        let notif = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+
+        let _ = send_notification_durable(&ws, &ledger, notif);
+        assert!(
+            rx.try_recv().is_err(),
+            "projection.envelope.v1 connection must NOT receive the legacy ToolCompleted directly"
+        );
+    }
+
+    /// Defensive: a legacy (non-projection.envelope) connection must
+    /// STILL receive direct sends of `MessageDelta` and tool events.
+    /// The filter is mutual exclusion — without
+    /// `projection.envelope.v1` the legacy shapes are the only thing
+    /// the client knows how to render.
+    #[tokio::test]
+    async fn direct_send_delivers_legacy_frames_to_non_projection_envelope_connection() {
+        use octos_core::ui_protocol::MessageDeltaEvent;
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        // Default features: projection_envelope is false.
+        ws.update_live_features(ConnectionUiFeatures::default());
+
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:blocker1-legacy".into());
+        let notif = UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "should reach legacy client".into(),
+        });
+
+        let _ = send_notification_ephemeral(&ws, &ledger, notif);
+        let frame = rx
+            .try_recv()
+            .expect("legacy client must receive MessageDelta directly");
+        // Sanity-check the frame is a JSON-RPC notification for message/delta.
+        if let WsMessage::Text(text) = frame {
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
+            assert_eq!(value["method"], "message/delta");
+        } else {
+            panic!("expected text frame");
+        }
+    }
+
+    /// A `projection.envelope.v1` connection direct-sending an
+    /// `Envelope` (e.g. via `send_ledger_event_durable`) MUST pass
+    /// through — the envelope is exactly what the connection
+    /// negotiated for.
+    #[tokio::test]
+    async fn direct_send_delivers_envelope_to_projection_envelope_connection() {
+        use octos_core::ui_protocol::{
+            Envelope, EnvelopeNotification, EnvelopeTokenUsage, Payload,
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures {
+            projection_envelope: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        });
+
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:blocker1-env".into());
+        let envelope_notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: session_id.clone(),
+            topic: None,
+            envelope: Envelope {
+                thread_id: "thread-blocker1".into(),
+                seq: 1,
+                client_message_id: None,
+                payload: Payload::TurnCompleted {
+                    token_usage: EnvelopeTokenUsage::default(),
+                },
+            },
+        });
+
+        let _ = send_notification_durable(&ws, &ledger, envelope_notif);
+        let frame = rx
+            .try_recv()
+            .expect("projection.envelope.v1 connection MUST receive envelope direct-sends");
+        if let WsMessage::Text(text) = frame {
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
+            assert_eq!(value["method"], "projection/envelope");
+        } else {
+            panic!("expected text frame");
+        }
     }
 
     #[test]

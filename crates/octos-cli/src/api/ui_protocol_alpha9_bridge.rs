@@ -199,7 +199,16 @@ pub(super) fn emit_file_attached(
         mime: envelope_mime,
         size_bytes,
     };
-    let _ = ledger.emit_envelope(session_id, turn_id.0.to_string(), payload, None);
+    // Codex #1336-round-2 BLOCKER 5: thread the explicit `topic` through
+    // to the envelope. The caller (`emit_files_attached_from_background`)
+    // strips the topic suffix from `session_id` so SPA subscribers on the
+    // BASE bucket receive the envelope, but the envelope itself must
+    // still carry the topic so the topic-scoped classifier accepts it.
+    // Calling `emit_envelope` without the explicit topic would derive
+    // `topic = session_id.topic()` — `None` after the base-key strip —
+    // and silently drop the envelope from topic-scoped subscribers.
+    let _ =
+        ledger.emit_envelope_with_topic(session_id, turn_id.0.to_string(), payload, None, topic);
 }
 
 /// Emit one `file/attached` envelope per delivered artefact when a
@@ -1407,5 +1416,143 @@ mod tests {
              must return the explicit event.topic so the topic-scoped \
              subscriber routes the envelope correctly",
         );
+    }
+
+    /// Codex #1336 round-2 BLOCKER 5: the parallel `projection/envelope`
+    /// frame emitted alongside the legacy `file/attached` notification
+    /// must ALSO carry the topic. The alpha9 bridge strips the topic
+    /// suffix from `session_id` before calling `emit_envelope`, so the
+    /// previous `emit_envelope(session_id, ...)` derived topic via
+    /// `session_id.topic()` — which is now `None` — and the envelope
+    /// shipped with no topic context. Topic-scoped subscribers on the
+    /// envelope filter would silently drop it.
+    ///
+    /// Pre-fix: this assertion would fail because the envelope's
+    /// `topic` field was `None`.
+    /// Post-fix: `emit_envelope_with_topic` threads the captured topic
+    /// through so the envelope's `topic` matches the legacy
+    /// `FileAttached` event's `topic`.
+    #[test]
+    fn emit_files_attached_from_background_preserves_topic_on_envelope_when_session_id_stripped() {
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let base_session = SessionKey::new("api", "blocker5-envelope-topic");
+        let topic_session = SessionKey::with_topic("api", "blocker5-envelope-topic", "slides");
+        let turn_id = TurnId::new();
+        let mut subscriber = ledger.subscribe(&base_session);
+
+        emit_files_attached_from_background(
+            &ledger,
+            &topic_session,
+            &turn_id,
+            &["/tmp/deck.pptx".to_string()],
+            &[],
+            Some("tc-blocker5".into()),
+        );
+
+        // Drain all events, find the envelope notification.
+        let mut envelope_topic: Option<String> = None;
+        let mut envelope_notification_topic: Option<String> = None;
+        while let Ok(event) = subscriber.try_recv() {
+            if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                notification @ UiNotification::Envelope(envelope_notif),
+            ) = &event.event
+            {
+                if matches!(
+                    &envelope_notif.envelope.payload,
+                    octos_core::ui_protocol::Payload::FileAttached { .. }
+                ) {
+                    envelope_topic = envelope_notif.topic.clone();
+                    envelope_notification_topic = notification.topic().map(ToOwned::to_owned);
+                    break;
+                }
+            }
+        }
+
+        let envelope_topic = envelope_topic.expect("file_attached envelope must be emitted");
+        assert_eq!(
+            envelope_topic, "slides",
+            "EnvelopeNotification.topic must be populated from the original \
+             topic-suffixed session_id BEFORE the strip — otherwise the \
+             topic-scoped classifier (UiNotification::topic()) reads None \
+             and drops the envelope from topic-scoped subscribers",
+        );
+        assert_eq!(
+            envelope_notification_topic.as_deref(),
+            Some("slides"),
+            "UiNotification::topic() on the envelope variant must surface \
+             the explicit topic for the topic-scope classifier",
+        );
+    }
+
+    /// Defensive: `emit_envelope_with_topic` honours its explicit topic
+    /// argument. An explicit `Some("…")` is the source of truth and
+    /// overrides any topic the session_id might carry. An explicit
+    /// `None` falls back to the append-time safety net
+    /// (`stamp_topic_from_session`) which reads `session_id.topic()`
+    /// — this preserves the legacy behaviour for callers that did NOT
+    /// strip the topic from session_id.
+    ///
+    /// The BLOCKER 5 bug the new path closes is: callers that DID
+    /// strip the topic from session_id (P0-A wire-gap fix) had no way
+    /// to thread the captured topic through; the envelope ended up
+    /// with `topic = None` AND a stripped session_id with no topic
+    /// fallback. The fix is to let those callers pass `Some(topic)`
+    /// — covered by `emit_files_attached_from_background_preserves_topic_on_envelope_when_session_id_stripped`
+    /// above. This sibling test just pins that an explicit `Some`
+    /// wins over the session_id suffix and that bare-session +
+    /// `None` still works.
+    #[test]
+    fn emit_envelope_with_topic_honours_explicit_topic_over_session_suffix() {
+        use octos_core::ui_protocol::{EnvelopeTokenUsage, Payload};
+
+        let ledger = UiProtocolLedger::new(32);
+
+        // Case 1: bare session, explicit topic Some → envelope has topic.
+        let bare = SessionKey::new("api", "blocker5-explicit-some");
+        let envelope = ledger
+            .emit_envelope_with_topic(
+                &bare,
+                "thread-1".into(),
+                Payload::TurnCompleted {
+                    token_usage: EnvelopeTokenUsage::default(),
+                },
+                None,
+                Some("plan"),
+            )
+            .expect("emit");
+        if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+            UiNotification::Envelope(envelope_notif),
+        ) = &envelope.event
+        {
+            assert_eq!(envelope_notif.topic.as_deref(), Some("plan"));
+        } else {
+            panic!("expected envelope variant");
+        }
+
+        // Case 2: explicit `Some("plan")` wins over the session_id's
+        // own topic suffix — caller provided value is the source of
+        // truth.
+        let suffixed_a = SessionKey::with_topic("api", "blocker5-explicit-wins", "session_topic");
+        let envelope = ledger
+            .emit_envelope_with_topic(
+                &suffixed_a,
+                "thread-2".into(),
+                Payload::AssistantDelta { text: "hi".into() },
+                None,
+                Some("explicit_wins"),
+            )
+            .expect("emit");
+        if let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+            UiNotification::Envelope(envelope_notif),
+        ) = &envelope.event
+        {
+            assert_eq!(
+                envelope_notif.topic.as_deref(),
+                Some("explicit_wins"),
+                "explicit Some(topic) MUST win over session_id.topic()",
+            );
+        } else {
+            panic!("expected envelope variant");
+        }
     }
 }

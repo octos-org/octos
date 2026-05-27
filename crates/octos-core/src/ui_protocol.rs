@@ -3178,53 +3178,39 @@ pub struct Envelope {
 /// envelopes flowing to the right subscriber pane.
 ///
 /// This wrapper carries those routing fields **outside** of the
-/// `envelope` body. The custom `Serialize`/`Deserialize` impls (see
-/// below) project the wire shape down to only the `envelope` field, so
-/// round-tripping a `EnvelopeNotification` through
-/// [`UiNotification::into_rpc_notification`] +
-/// [`UiNotification::from_rpc_notification`] preserves the inner
-/// `Envelope` byte-for-byte. The `session_id` + `topic` are
-/// reconstructed from the JSON-RPC `params` only by the server-internal
-/// ledger path; on a wire-only consume (client) only the envelope is
-/// recovered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `envelope` body so the durable ledger can persist them and recovery
+/// can rebuild the routing context after restart.
+///
+/// **Serialization split (codex #1336 round-2 BLOCKER 4):** the global
+/// `Serialize` / `Deserialize` derive includes ALL fields (envelope +
+/// session_id + topic) so the DURABLE LEDGER round-trips routing
+/// state across daemon restart. The wire shape — bare `Envelope` per
+/// spec § 14.1 — is opted into only at the JSON-RPC boundary in
+/// [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`], where the bare
+/// envelope is extracted/re-wrapped. This is the "structurally honest"
+/// answer: a single global Serialize that strips routing fields means
+/// the ledger's disk records also strip them, and recovery walks the
+/// disk back into an `EnvelopeNotification` with empty `session_id` /
+/// `None` topic — topic-scoped envelope replay after restart silently
+/// loses routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopeNotification {
     /// Session this envelope belongs to. Used for ledger routing and
-    /// broadcast fan-out. Never serialized to the wire (spec § 14.1).
+    /// broadcast fan-out. Stripped from the wire (spec § 14.1) at the
+    /// `into_rpc_notification` boundary; preserved on disk so recovery
+    /// can rebuild routing.
     pub session_id: SessionKey,
     /// Optional topic for topic-scoped live forwarders (#1329 P0-A class
     /// fix). Captured at the emit site BEFORE any `base_key()` strip so
     /// the topic-scope filter routes correctly even when `session_id`
-    /// is the bare base key. Never serialized to the wire.
+    /// is the bare base key. Stripped from the wire at the
+    /// `into_rpc_notification` boundary; preserved on disk so recovery
+    /// can re-route topic-scoped envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
     /// The canonical wire envelope — serializes verbatim per spec § 14.1.
     pub envelope: Envelope,
-}
-
-impl serde::Serialize for EnvelopeNotification {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // The wire shape is the bare `Envelope` per spec § 14.1; the
-        // `session_id` and `topic` are server-internal routing fields
-        // that MUST NOT leak onto the JSON-RPC `params`.
-        self.envelope.serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for EnvelopeNotification {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Decoding from the wire — `session_id` is not present on the
-        // wire; callers that need it must look it up from the RPC
-        // context. Default to an empty SessionKey here (the AppUI
-        // decode path in `from_method_and_params` resets it from the
-        // ambient context before adding to the ledger; pure-wire
-        // consumers only need the `envelope` field).
-        let envelope = Envelope::deserialize(deserializer)?;
-        Ok(Self {
-            session_id: SessionKey(String::new()),
-            topic: None,
-            envelope,
-        })
-    }
 }
 
 /// Draft command payloads for UI protocol v1.
@@ -5330,9 +5316,12 @@ impl UiNotification {
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ): the wire shape per spec § 14.1 is the
             // bare `Envelope` — `session_id` and `topic` are server-internal
-            // routing fields stripped from the wire by
-            // `EnvelopeNotification`'s `Serialize` impl.
-            Self::Envelope(params) => serde_json::to_value(params),
+            // routing fields stripped here at the JSON-RPC boundary. The
+            // `EnvelopeNotification` struct itself uses a derive-based
+            // `Serialize` so the durable ledger persists routing fields
+            // on disk; recovery rebuilds them before rebroadcasting (codex
+            // #1336 round-2 BLOCKER 4).
+            Self::Envelope(params) => serde_json::to_value(&params.envelope),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -5412,7 +5401,21 @@ impl UiNotification {
             // are reconstituted from the ambient ledger context by the
             // server-side decode path (the ledger never round-trips a
             // wire-only envelope back into routing).
-            methods::PROJECTION_ENVELOPE => Ok(Self::Envelope(decode_params(method, params)?)),
+            //
+            // Codex #1336 round-2 BLOCKER 4: the JSON-RPC params carry
+            // ONLY the bare `Envelope` (the wire shape per spec § 14.1) —
+            // decode it into `Envelope` directly and wrap with empty
+            // routing fields. The full-struct `EnvelopeNotification`
+            // serialization is used by the ledger ONLY on disk, never
+            // on the wire.
+            methods::PROJECTION_ENVELOPE => {
+                let envelope: Envelope = decode_params(method, params)?;
+                Ok(Self::Envelope(EnvelopeNotification {
+                    session_id: SessionKey(String::new()),
+                    topic: None,
+                    envelope,
+                }))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -10063,6 +10066,116 @@ mod tests {
             }
             other => panic!("expected Envelope variant, got {other:?}"),
         }
+    }
+
+    /// Codex #1336 round-2 BLOCKER 4: the durable ledger writes records
+    /// via `serde_json::to_string(&LedgerDiskRecord)`, which chains
+    /// through the global `Serialize` impl on `EnvelopeNotification`.
+    /// Before the fix, that global impl stripped `session_id` + `topic`
+    /// to mirror the wire shape — so disk records lost their routing
+    /// context and recovery deserialized them with empty/None routing.
+    /// Topic-scoped envelope replay after restart silently mis-routed.
+    ///
+    /// Post-fix: the global Serialize/Deserialize is derive-based and
+    /// preserves ALL fields. The wire shape is opted into only at the
+    /// JSON-RPC boundary inside `into_rpc_notification`.
+    #[test]
+    fn envelope_notification_serde_preserves_routing_fields_for_disk_persistence() {
+        // Persistent shape: routing fields survive a JSON round-trip.
+        // This is the path the durable ledger uses for its on-disk
+        // records, NOT the wire path.
+        let original = EnvelopeNotification {
+            session_id: SessionKey("local:disk-routing".into()),
+            topic: Some("planning".into()),
+            envelope: Envelope {
+                thread_id: "thread-disk".into(),
+                seq: 7,
+                client_message_id: None,
+                payload: Payload::AssistantDelta {
+                    text: "persisted delta".into(),
+                },
+            },
+        };
+
+        // Serialize the EnvelopeNotification directly (NOT via
+        // into_rpc_notification) — this mirrors how the ledger writes
+        // it inside a LedgerDiskRecord. The output MUST contain the
+        // routing fields.
+        let serialized =
+            serde_json::to_value(&original).expect("EnvelopeNotification serializes for disk");
+        assert_eq!(
+            serialized.get("session_id"),
+            Some(&json!("local:disk-routing")),
+            "session_id must persist on disk so recovery can rebuild routing",
+        );
+        assert_eq!(
+            serialized.get("topic"),
+            Some(&json!("planning")),
+            "topic must persist on disk so topic-scoped recovery routes correctly",
+        );
+        assert!(
+            serialized.get("envelope").is_some(),
+            "envelope body must be present on disk",
+        );
+
+        // Deserialize back — routing fields must round-trip byte-equal.
+        let parsed: EnvelopeNotification = serde_json::from_value(serialized)
+            .expect("EnvelopeNotification deserializes from disk");
+        assert_eq!(
+            parsed, original,
+            "disk round-trip must preserve all fields including routing",
+        );
+
+        // Defensive: a `topic: None` envelope omits the field on disk
+        // (no behavioural change — just keeps the disk shape compact
+        // when topic isn't set).
+        let no_topic = EnvelopeNotification {
+            session_id: SessionKey("local:disk-no-topic".into()),
+            topic: None,
+            envelope: original.envelope.clone(),
+        };
+        let serialized = serde_json::to_value(&no_topic).expect("serialize");
+        assert!(
+            serialized.get("topic").is_none(),
+            "absent topic is omitted on disk; deserialize defaults back to None",
+        );
+        let parsed: EnvelopeNotification = serde_json::from_value(serialized).expect("deserialize");
+        assert_eq!(parsed, no_topic);
+    }
+
+    /// Codex #1336 round-2 BLOCKER 4 — wire shape regression guard.
+    /// `into_rpc_notification` is the ONLY place the wire shape is
+    /// produced; routing fields are stripped here and ONLY here. The
+    /// disk-persistence test above pins that the routing fields DO
+    /// survive when the envelope is serialized directly (not through
+    /// into_rpc_notification).
+    #[test]
+    fn envelope_notification_into_rpc_notification_strips_routing_fields() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:wire-strip".into()),
+            topic: Some("planning".into()),
+            envelope: Envelope {
+                thread_id: "thread-wire".into(),
+                seq: 5,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "x".into() },
+            },
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
+        let params = &rpc.params;
+        assert!(
+            params.get("session_id").is_none(),
+            "wire MUST strip session_id (spec § 14.1)",
+        );
+        assert!(
+            params.get("topic").is_none(),
+            "wire MUST strip topic (spec § 14.1)",
+        );
+        // Bare envelope on the wire — `thread_id`, `seq`, `payload`
+        // are top-level keys (no `envelope` nesting).
+        assert_eq!(params.get("thread_id"), Some(&json!("thread-wire")));
+        assert_eq!(params.get("seq"), Some(&json!(5)));
     }
 
     // ------------------------------------------------------------------
