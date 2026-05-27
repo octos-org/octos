@@ -68,12 +68,21 @@ pub struct PluginLoadOptions<'a> {
     /// spawning. When `false` (the default), the legacy permissive flow is
     /// preserved for backward compatibility.
     pub require_signed: bool,
-    /// Override the directory used to store the verified-exe copy. When
-    /// `None`, the loader resolves to `~/.octos/cache/verified/` so the
-    /// copy lives outside the skill source tree (writing inside the source
-    /// dir taints ownership when the daemon runs as a different uid — see
-    /// 2026-05 fleet skill-dir-root-ownership bug). Tests pass a tempdir
-    /// here for isolation; production callers leave this `None`.
+    /// Override the directory used to store the verified-hash ledger.
+    /// When `None`, the loader resolves to `~/.octos/cache/verified/` so
+    /// the ledger lives outside the skill source tree (writing into the
+    /// source dir taints ownership when the daemon runs as a different
+    /// uid — see 2026-05 fleet skill-dir-root-ownership bug). Tests pass
+    /// a tempdir here for isolation; production callers leave this `None`.
+    ///
+    /// IMPORTANT: only the hash ledger lives here. The plugin binary
+    /// itself executes from its skill source directory so that the
+    /// plugin's asset-resolution (which walks from `exe_parent` to find
+    /// sibling assets like `<skill>/styles/`) keeps working. PR #1319's
+    /// original revision additionally copied the binary bytes into this
+    /// directory and ran from there, which broke asset-bearing plugins
+    /// like `mofa-slides` (#1325). The hash file alone is sufficient to
+    /// solve the skill-dir-ownership goal.
     pub verified_cache_dir: Option<PathBuf>,
 }
 
@@ -408,10 +417,13 @@ impl PluginLoader {
             );
         }
 
-        // Read executable content once for hash verification AND to write a
-        // verified copy. This closes the TOCTOU gap: we hash the bytes we
-        // read, then write those same bytes to a verified path that PluginTool
-        // will execute. The original file can't be swapped after verification.
+        // Read executable content once for hash verification. The
+        // hash is recorded in the verified-hash ledger (cache) so a
+        // restart can short-circuit re-hashing when the in-place
+        // binary is unchanged. The pre-spawn re-hash gate in
+        // `PluginTool::execute` re-reads this same on-disk path and
+        // compares against `load_time_hash` to close the load->exec
+        // TOCTOU window.
         let exe_bytes = std::fs::read(&executable)
             .map_err(|e| eyre::eyre!("cannot read plugin executable: {e}"))?;
 
@@ -457,31 +469,46 @@ impl PluginLoader {
             }
         }
 
-        // Write verified bytes to a path OUTSIDE the skill source dir so
-        // PluginTool executes exactly what we hashed (TOCTOU defence) without
-        // tainting the skill tree's ownership. Writing into the skill dir is
-        // the original 2026-05 fleet bug: when the daemon runs as root (e.g.
-        // from a `sudo`-installed launchd plist), the verified copy lands as
-        // root:wheel and any subsequent chmod/chown by the operator user
-        // fails. The cache lives at `<verified_cache_dir>/<plugin>/main` —
-        // resolved from `PluginLoadOptions::verified_cache_dir` (tests) or
-        // `~/.octos/cache/verified/` (production).
-        let verified_exe = resolve_verified_path(verified_cache_dir.as_deref(), &manifest.name)?;
-        if let Some(parent) = verified_exe.parent() {
+        // Write a verified-hash ledger entry OUTSIDE the skill source dir
+        // recording "we hashed the in-place binary at time T and got hash
+        // H". The ledger lives at `<verified_cache_dir>/<plugin>/hash.txt`
+        // (production: `~/.octos/cache/verified/<plugin>/hash.txt`). The
+        // plugin executes from its skill source directory unchanged so
+        // asset-resolution (sibling `<skill>/styles/`, `<skill>/templates/`,
+        // etc. that plugins like `mofa-slides` walk via `exe_parent`) keeps
+        // working.
+        //
+        // The original 2026-05 ownership taint bug came from writing INTO
+        // the skill dir (`.<name>_verified` sibling); moving the metadata
+        // out alone is enough to fix that. PR #1319 additionally copied
+        // the binary bytes here and ran from the cache copy — that broke
+        // asset-bearing plugins (#1325 — mofa-slides "no styles installed
+        // on this deployment"). The binary-copy did not actually defend
+        // against the threat model either: an attacker with write access
+        // to the skill dir can swap the binary BEFORE the loader hashes,
+        // in which case we cache the wrong hash anyway. The pre-spawn
+        // re-hash gate in `PluginTool::execute` re-reads the in-place
+        // binary and compares against `load_time_hash`, which is what
+        // closes the load->exec TOCTOU window in practice.
+        let verified_hash_path =
+            resolve_verified_hash_path(verified_cache_dir.as_deref(), &manifest.name)?;
+        if let Some(parent) = verified_hash_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 eyre::eyre!("cannot create verified cache dir {}: {e}", parent.display())
             })?;
         }
-        // Remove existing verified file first so we can refresh the copy on restart.
-        let _ = std::fs::remove_file(&verified_exe);
-        std::fs::write(&verified_exe, &exe_bytes)
-            .map_err(|e| eyre::eyre!("cannot write verified executable: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Keep the verified copy executable by the runtime user even when
-            // the skill directory itself is root-owned.
-            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o755))?;
+        // Best-effort ledger refresh: write the current hash so a future
+        // load (same process or a restart) can short-circuit re-hashing
+        // when nothing has changed. Failure to write the ledger MUST NOT
+        // block plugin load — the gate keys on the in-memory
+        // `verified_exe_sha256` we've already computed.
+        if let Err(err) = std::fs::write(&verified_hash_path, &load_time_hash) {
+            warn!(
+                plugin = %manifest.name,
+                cache_path = %verified_hash_path.display(),
+                error = %err,
+                "failed to write verified-hash ledger (continuing — load not blocked)"
+            );
         }
 
         // Collect env vars to filter out
@@ -559,7 +586,18 @@ impl PluginLoader {
                 }
                 let manifest_risk = def.risk.clone();
                 let def = apply_builtin_env_allowlist(&plugin_name, def);
-                let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
+                // Run the plugin from its original skill source dir path
+                // — NOT from the cache. The pre-spawn re-hash gate in
+                // `PluginTool::execute` re-reads this same path and
+                // compares against `load_time_hash` (closes the
+                // load->exec TOCTOU window). Executing in place keeps
+                // plugin asset-resolution intact: skills like mofa-slides
+                // walk from `exe_parent` to find sibling `styles/` /
+                // `templates/` directories that don't exist in the cache
+                // dir. Copying the binary into the cache (the PR #1319
+                // approach) silently broke those plugins on the fleet
+                // (#1325).
+                let mut tool = PluginTool::new(plugin_name.clone(), def, executable.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
                     .with_timeout(timeout);
@@ -948,7 +986,15 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{hash:x}"))
 }
 
-/// Resolve where to store the verified-exe copy for a plugin.
+/// Resolve where to store the verified-hash ledger entry for a plugin.
+///
+/// The cache directory layout is `<base>/<plugin_name>/hash.txt`, where
+/// `hash.txt` contains the SHA-256 (lowercase hex) of the plugin
+/// executable as last hashed by the loader. The directory is a ledger
+/// only — the binary itself stays in the skill source directory so
+/// asset-bearing plugins (`<skill>/styles/`, `<skill>/templates/`, etc.)
+/// keep working. See the comment block at the call site for the full
+/// rationale.
 ///
 /// Resolution order:
 /// 1. Explicit `override_dir` from [`PluginLoadOptions::verified_cache_dir`]
@@ -960,9 +1006,9 @@ fn compute_sha256(path: &Path) -> Result<String> {
 /// 4. `std::env::temp_dir().join("octos-verified")` as a last resort when
 ///    HOME is unavailable (e.g. sandbox).
 ///
-/// Returns `<base>/<plugin_name>/main`. The caller is responsible for
-/// `create_dir_all` on the parent before writing.
-fn resolve_verified_path(override_dir: Option<&Path>, plugin_name: &str) -> Result<PathBuf> {
+/// Returns `<base>/<plugin_name>/hash.txt`. The caller is responsible
+/// for `create_dir_all` on the parent before writing.
+fn resolve_verified_hash_path(override_dir: Option<&Path>, plugin_name: &str) -> Result<PathBuf> {
     // Guard against a plugin name with path separators that would let a
     // malicious manifest escape the cache root. The manifest loader already
     // validates this for tool registration, but we belt-and-brace here so
@@ -979,7 +1025,7 @@ fn resolve_verified_path(override_dir: Option<&Path>, plugin_name: &str) -> Resu
     let base = if let Some(dir) = override_dir {
         dir.to_path_buf()
     } else if cfg!(test) {
-        // Tests that don't care about the verified-exe location still go
+        // Tests that don't care about the verified-hash location still go
         // through this default path; keep them out of the user's real
         // cache (and let TempDir auto-cleanup at process exit).
         test_default_cache_dir()
@@ -988,7 +1034,7 @@ fn resolve_verified_path(override_dir: Option<&Path>, plugin_name: &str) -> Resu
     } else {
         std::env::temp_dir().join("octos-verified")
     };
-    Ok(base.join(plugin_name).join("main"))
+    Ok(base.join(plugin_name).join("hash.txt"))
 }
 
 /// Process-scoped tempdir for tests that don't explicitly pass a
@@ -1011,8 +1057,8 @@ fn test_default_cache_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Non-test stub so the default branch in `resolve_verified_path` compiles
-/// outside `cfg(test)` without a `cfg!(test)` flicker.
+/// Non-test stub so the default branch in `resolve_verified_hash_path`
+/// compiles outside `cfg(test)` without a `cfg!(test)` flicker.
 #[cfg(not(test))]
 #[allow(dead_code)]
 fn test_default_cache_dir() -> PathBuf {
@@ -1513,11 +1559,13 @@ mod tests {
         );
     }
 
-    /// Section C: when the verified-exe bytes on disk are swapped between
-    /// load and invocation, the pre-spawn re-hash gate refuses to spawn the
-    /// process. We simulate the swap by overwriting the verified-cache copy
-    /// (now stored under `verified_cache_dir`, not the skill source tree)
-    /// after `load_into_with_options` returns.
+    /// Section C: when the in-place plugin executable on disk is swapped
+    /// between load and invocation, the pre-spawn re-hash gate refuses
+    /// to spawn the process. After the 2026-05 fleet fix the plugin
+    /// executes from its skill source dir directly (the cache only
+    /// records a hash ledger, not the binary itself) — so the swap is
+    /// simulated by overwriting the in-place binary after
+    /// `load_into_with_options` returns.
     #[cfg(unix)]
     #[tokio::test]
     async fn pre_spawn_rehash_detects_swap() {
@@ -1554,14 +1602,30 @@ mod tests {
         .unwrap();
         assert_eq!(result.tool_count, 1);
 
-        // Swap the verified-cache bytes on disk so the re-hash gate fires.
-        let verified_exe = cache_dir.join("swap-plugin").join("main");
+        // Hash ledger lives in the cache dir; the binary itself is NOT
+        // copied there (the in-place skill binary stays canonical for
+        // asset-resolution). Sanity-check both invariants before we
+        // simulate the tampering.
+        let hash_ledger = cache_dir.join("swap-plugin").join("hash.txt");
         assert!(
-            verified_exe.exists(),
-            "loader must write a verified-exe copy at {}",
-            verified_exe.display()
+            hash_ledger.exists(),
+            "loader must write a verified-hash ledger at {}",
+            hash_ledger.display()
         );
-        std::fs::write(&verified_exe, b"#!/bin/sh\necho TAMPERED").unwrap();
+        let cache_binary = cache_dir.join("swap-plugin").join("main");
+        assert!(
+            !cache_binary.exists(),
+            "binary must NOT be copied into the cache (regression: #1325 \
+             mofa-slides asset-resolution broke when it was); cache contents: {:?}",
+            std::fs::read_dir(cache_dir.join("swap-plugin"))
+                .ok()
+                .map(|rd| rd
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .collect::<Vec<_>>())
+        );
+
+        // Swap the in-place binary so the re-hash gate fires.
+        std::fs::write(&exec_path, b"#!/bin/sh\necho TAMPERED").unwrap();
 
         // Execute the registered tool and assert the gate refused to spawn.
         let tool = registry.get("swap_tool").expect("tool registered");
@@ -1955,7 +2019,7 @@ edition = "2021"
 
     #[cfg(unix)]
     #[test]
-    fn test_verified_executable_is_world_executable() {
+    fn test_in_place_executable_runs_with_existing_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1971,16 +2035,13 @@ edition = "2021"
 }"#,
         )
         .unwrap();
+        let in_place_exec = plugin_dir.join("perm-plugin");
         std::fs::write(
-            plugin_dir.join("perm-plugin"),
+            &in_place_exec,
             "#!/usr/bin/env bash\nset -euo pipefail\necho '{\"output\":\"ok\",\"success\":true}'\n",
         )
         .unwrap();
-        std::fs::set_permissions(
-            plugin_dir.join("perm-plugin"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&in_place_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let cache_dir = dir.path().join("cache");
         let mut registry = ToolRegistry::new();
@@ -1998,10 +2059,33 @@ edition = "2021"
         .unwrap();
         assert_eq!(result.tool_count, 1);
 
-        // Verified copy lives under cache_dir, not the skill source dir.
-        let verified = cache_dir.join("perm-plugin").join("main");
-        let mode = std::fs::metadata(&verified).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755);
+        // The plugin executes from the in-place skill source binary —
+        // not from the cache. The cache only holds a hash ledger; no
+        // binary copy is written there (regression guard for #1325).
+        let hash_ledger = cache_dir.join("perm-plugin").join("hash.txt");
+        assert!(
+            hash_ledger.is_file(),
+            "hash ledger must be written at {}",
+            hash_ledger.display()
+        );
+        let cache_binary = cache_dir.join("perm-plugin").join("main");
+        assert!(
+            !cache_binary.exists(),
+            "binary must NOT be copied into the cache (regression: #1325)"
+        );
+
+        // The in-place binary keeps its 0o755 permissions — the loader
+        // does not chmod the skill source tree under the
+        // skill-dir-ownership cleanup.
+        let mode = std::fs::metadata(&in_place_exec)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "in-place binary must keep its original 0o755 mode"
+        );
     }
 
     #[cfg(unix)]
@@ -2260,14 +2344,21 @@ edition = "2021"
         );
     }
 
-    /// Regression: the verified-exe copy must live OUTSIDE the skill source
-    /// directory so that running `octos serve` as root (or any non-operator
-    /// uid) does not taint the skill tree with foreign ownership and lock
-    /// out the operator's interactive CLI. The cache is keyed by plugin
-    /// name and lives under `verified_cache_dir`.
+    /// Regression: the verified-hash ledger must live OUTSIDE the skill
+    /// source directory so that running `octos serve` as root (or any
+    /// non-operator uid) does not taint the skill tree with foreign
+    /// ownership and lock out the operator's interactive CLI. The cache
+    /// is keyed by plugin name and lives under `verified_cache_dir`.
+    ///
+    /// Additionally pins the post-#1325 invariant: the cache holds only
+    /// a `hash.txt` ledger entry, NOT a copy of the binary. PR #1319's
+    /// original revision copied the bytes to `<cache>/<plugin>/main` and
+    /// ran from there, which broke asset-bearing plugins like
+    /// `mofa-slides` (their `<skill>/styles/` sibling directories did
+    /// not exist under the cache parent).
     #[cfg(unix)]
     #[test]
-    fn verified_path_lives_under_cache_dir_not_skill_dir() {
+    fn verified_hash_lives_under_cache_dir_not_skill_dir() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2297,16 +2388,26 @@ edition = "2021"
         )
         .unwrap();
 
-        // The verified copy must live under cache_dir/<plugin>/main.
-        let expected = cache_dir.join("isolated-plugin").join("main");
+        // The verified-hash ledger must live under
+        // cache_dir/<plugin>/hash.txt.
+        let expected_hash = cache_dir.join("isolated-plugin").join("hash.txt");
         assert!(
-            expected.is_file(),
-            "verified copy must live at {} (got nothing); cache_dir contents: {:?}",
-            expected.display(),
+            expected_hash.is_file(),
+            "verified-hash ledger must live at {} (got nothing); cache_dir contents: {:?}",
+            expected_hash.display(),
             std::fs::read_dir(&cache_dir).ok().map(|rd| {
                 rd.filter_map(|e| e.ok().map(|e| e.path()))
                     .collect::<Vec<_>>()
             }),
+        );
+
+        // Post-#1325: the cache must NOT contain a `main` binary copy.
+        let unwanted_binary = cache_dir.join("isolated-plugin").join("main");
+        assert!(
+            !unwanted_binary.exists(),
+            "cache must not host a copy of the plugin binary (asset-resolution \
+             regression #1325); found {}",
+            unwanted_binary.display(),
         );
 
         // The skill source dir must NOT contain a `.isolated-plugin_verified`
