@@ -1,17 +1,17 @@
-# UPCR-2026-022: Wire Contracts Backfill For 6 Emitted Notifications
+# UPCR-2026-022: Wire Contracts Backfill For 8 Emitted Notifications
 
 Status: Accepted
 Date: 2026-05-27
 
 ## Summary
 
-Document the wire contract for six AppUI notification kinds that reach
+Document the wire contract for eight AppUI notification kinds that reach
 production WebSocket / stdio clients but were never described in
 `OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` § 8 ("Event Semantics"). The events
 ship in `octos-cli` today; this UPCR backfills their typed payload shape so
 clients can rely on a stable field set without reading server code.
 
-The six kinds are:
+The eight kinds are:
 
 1. `turn/spawn_complete` (M10 Phase 1 — `event.spawn_complete.v1`)
 2. `context/compaction_completed` (M16 — `context.lifecycle.v1`)
@@ -311,10 +311,22 @@ heartbeats.
 | `token_cost`      | `UiTokenCostUpdate`        | no       | Typed token / cost update block when `kind = "token_cost_update"`.                         |
 | `extra`           | object<string, JSON value> | no       | Forward-compat extension bag. Flattened into the parent object. Clients must ignore unknown keys. |
 
-Replay behavior: lossy (progress is ephemeral; clients may receive coalesced
-or dropped frames under per-connection backpressure). Clients must treat the
-latest received `progress/updated` as authoritative and must not rely on
-receiving every emitted frame.
+Replay behavior: lossless (durable ledger event). Every `progress/updated`
+emitted on a connected WebSocket is committed to the per-session append-only
+ledger before the wire frame is enqueued — both the
+`LedgerStatusGateReporter` path (status / progress-gate variants via
+`ledger.append_notification(...)` in
+`crates/octos-cli/src/api/ui_protocol_alpha4_bridge.rs`) and the main
+progress-mapping path (via `ledger.append_progress_from(...)` followed by
+`send_ledger_event_durable(...)` in `crates/octos-cli/src/api/ui_protocol.rs`)
+go through the durable write-ahead. Under per-connection backpressure the
+frame may be dropped from the live socket — that drop surfaces as
+`protocol/replay_lossy` (see below), and `session/open` replay returns the
+missing `progress/updated` entries from the ledger ring (or the on-disk log
+when the ring has rolled). Clients SHOULD treat the latest received
+`progress/updated` of a given `metadata.kind` as authoritative for UI
+rendering — newer values supersede older ones — but they can rely on every
+emitted frame being available via replay until ledger retention rolls it off.
 
 Backward compatibility: the kind has shipped since UPCR-2026-007's
 `supported_notifications` list. The `extra` map is intentionally additive so
@@ -336,10 +348,19 @@ durable cursor so the client can resume cleanly.
 | `dropped_count`        | u64         | yes      | Number of durable notifications dropped for this connection since the previous successful replay frame.  |
 | `last_durable_cursor`  | `UiCursor`  | no       | Last cursor the server is confident the client durably observed. Absent only when the server has none.   |
 
-Replay behavior: ephemeral — emitted on the live wire when the per-connection
-ring overflows. It is **not** itself a durable ledger event; reconnecting and
-issuing a fresh `session/open` will replay any durable events that were
-dropped from the live socket.
+Replay behavior: lossless (durable ledger event). The "lossy" in the name
+refers to the condition the signal reports — that one or more *other*
+durable notifications were dropped from the live socket under per-connection
+backpressure — NOT to this signal's own durability. The reference server
+emits the signal via `emit_replay_lossy_opportunistic` in
+`crates/octos-cli/src/api/ui_protocol.rs`, which calls
+`ledger.append_notification_from(...)` BEFORE attempting the wire send. The
+append takes the same write-ahead-to-disk path as every other durable
+notification (`ui_protocol_ledger.rs` `append` → `write_record_locked`), so a
+`session/open` reconnect replays the `protocol/replay_lossy` itself alongside
+the surrounding durable events. After observing the signal on either the
+live socket or via replay, the client diverges from its local cursor and
+rehydrates via `session/open` replay or REST snapshot.
 
 Backward compatibility: the kind has shipped since UPCR-2026-007's
 `supported_notifications` list. Spec § 9 ("Reconnect and Cursor Rules")
@@ -349,7 +370,7 @@ explicitly.
 
 ## Migration
 
-None. All eight (six methods plus the two shared sub-structs
+None. All ten (eight notification methods plus the two shared sub-structs
 `UiContextState` / `UiProgressMetadata`) ship in production today.
 This UPCR backfills documentation. No emitter, no field, no capability gate,
 and no decoder behavior changes.

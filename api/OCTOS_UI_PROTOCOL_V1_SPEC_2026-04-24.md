@@ -1394,7 +1394,14 @@ Required fields: `session_id`, `metadata`. Optional field: `turn_id`. The
 typed sub-objects, and forward-compat `extra` map documented by
 [UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
 
-`progress/updated` is treated as ephemeral for replay purposes (see § 9).
+`progress/updated` is a durable ledger event. Each frame is committed to
+the per-session append-only ledger before the wire frame is enqueued, so
+`session/open` replay returns the entries that ledger retention still
+covers. Under per-connection backpressure a live-socket drop is reported
+via `protocol/replay_lossy` (see § 9); the dropped `progress/updated`
+frames are still recoverable from the ledger. Clients SHOULD treat the
+latest received `progress/updated` of a given `metadata.kind` as
+authoritative for UI rendering.
 
 ### `context/compaction_completed`
 
@@ -1430,9 +1437,15 @@ per-connection backpressure. The client should diverge from its cursor and
 rehydrate via REST snapshot or `session/open` replay. Carries the last
 durable cursor so the client can resume cleanly.
 
-`protocol/replay_lossy` is itself ephemeral; it is not durable-ledgered.
-Reconnecting and issuing a fresh `session/open` will replay any durable
-events that the per-connection ring dropped. See § 9 for reconnect rules.
+`protocol/replay_lossy` is itself a durable ledger event. The "lossy" name
+describes the condition it reports (other durable notifications were
+dropped from the live socket under per-connection backpressure), not its
+own durability — the reference server appends the signal to the per-session
+ledger via the same write-ahead path as every other durable notification
+before attempting the wire send. Reconnecting and issuing a fresh
+`session/open` replays both the `protocol/replay_lossy` signal and the
+durable events that the per-connection ring dropped. See § 9 for reconnect
+rules.
 
 Required fields: `session_id`, `dropped_count`. Optional field:
 `last_durable_cursor`. Full field set documented by
@@ -1457,9 +1470,13 @@ The durable/ephemeral split should be explicit:
 When a connected client falls behind its per-connection backpressure ring,
 the server emits `protocol/replay_lossy` (see § 8) carrying the last durable
 cursor it is confident the client observed. The client must diverge from its
-local cursor and rehydrate via `session/open` replay or REST snapshot, since
-`protocol/replay_lossy` itself is ephemeral and not part of the durable
-ledger. The full wire contract for the signal is documented by
+local cursor and rehydrate via `session/open` replay or REST snapshot. The
+`protocol/replay_lossy` signal is itself committed to the durable ledger via
+the same write-ahead path as every other durable notification — its name
+reports a *backlog* condition (durable frames dropped from the live socket)
+rather than its own durability, so reconnecting clients observe the signal
+on replay alongside the surrounding durable events. The full wire contract
+for the signal is documented by
 [UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
 
 ### 9.1 Ledger Durability Contract (M9-FIX-05 / #643)
