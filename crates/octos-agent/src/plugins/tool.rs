@@ -1735,6 +1735,108 @@ fn normalize_mofa_style_name(style: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
+/// Pre-flight validator for `mofa_slides`' `style` argument.
+///
+/// Mirrors the `RunPipelineTool::pre_flight_validate` pattern (PR #1015): catch
+/// known-bad LLM-generated input synchronously in the foreground so the
+/// spawn_only intercept records the failure on `iter_tool_success` and the LLM
+/// sees a `[VALIDATION FAILED] …` tool_result in its next iteration. Without
+/// this, the foreground intercept emits the synth-ack ("Background work
+/// started for `mofa_slides`.") to the LLM, the plugin later writes
+/// `{"success":false,"output":"style not found"}`, but the LLM-side
+/// conversation has already moved on — only the UI sees the failure and the
+/// model never retries with a corrected style.
+///
+/// Scope is deliberately narrow:
+/// - missing / empty `style` → `Ok` (plugin's default-style path).
+/// - path-like `style` (absolute, contains `/` or `\`) → `Ok` (the
+///   path-rewriter in `rewrite_workspace_file_args` /
+///   `rewrite_args_with_scope` validates these against the workspace boundary
+///   with proper traversal hardening — we don't double-validate here).
+/// - bare-name `style` → check `<skill_dir>/styles/<name>.toml` and
+///   `<work_dir>/styles/<name>.toml` and `Err` with the available names + an
+///   authoring hint when neither exists.
+fn validate_mofa_slides_style(
+    args: &serde_json::Value,
+    skill_dir: Option<&std::path::Path>,
+    work_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let Some(style) = args.get("style").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let trimmed = style.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // Path-like values are validated by the workspace-scope rewriter; skip
+    // here so a `style: "/abs/path/foo.toml"` doesn't double-fail with a
+    // less-informative "not found" error before the rewriter runs.
+    let candidate = std::path::Path::new(trimmed);
+    if candidate.is_absolute() || trimmed.contains('/') || trimmed.contains('\\') {
+        return Ok(());
+    }
+
+    let filename = if trimmed.ends_with(".toml") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.toml")
+    };
+
+    for dir in [skill_dir, work_dir].into_iter().flatten() {
+        if dir.join("styles").join(&filename).exists() {
+            return Ok(());
+        }
+    }
+
+    let mut msg = format!("style '{trimmed}' not found");
+    let builtin = list_available_styles(skill_dir);
+    if !builtin.is_empty() {
+        msg.push_str("\nAvailable built-in styles: ");
+        msg.push_str(&builtin.join(", "));
+    }
+    let custom = list_available_styles(work_dir);
+    if !custom.is_empty() {
+        msg.push_str("\nAvailable workspace custom styles: ");
+        msg.push_str(&custom.join(", "));
+    }
+    if let Some(wd) = work_dir {
+        msg.push_str(&format!(
+            "\nHint: author a workspace custom style at {}/styles/{trimmed}.toml.",
+            wd.display()
+        ));
+    }
+    Err(msg)
+}
+
+/// List `*.toml` style filenames (stem only) under `<dir>/styles/`. Returns
+/// `Vec::new()` when `dir` is `None`, when `styles/` does not exist, or when
+/// the read fails — callers treat an empty list as "nothing to suggest" and
+/// fall through to the path hint, so an IO error here degrades gracefully.
+fn list_available_styles(dir: Option<&std::path::Path>) -> Vec<String> {
+    let Some(dir) = dir else {
+        return Vec::new();
+    };
+    let styles_dir = dir.join("styles");
+    let Ok(entries) = std::fs::read_dir(&styles_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[async_trait]
 impl Tool for PluginTool {
     fn name(&self) -> &str {
@@ -1794,6 +1896,28 @@ impl Tool for PluginTool {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Synchronous foreground validation of LLM-generated arguments.
+    ///
+    /// Currently gated to `mofa_slides` only: catches `style="..."` bare-name
+    /// values that don't resolve to a `<skill_dir>/styles/<name>.toml` or
+    /// `<work_dir>/styles/<name>.toml` before the spawn_only intercept hands
+    /// the call off to a background task. This closes the spawn_only
+    /// synth-ack gap (LLM was told "started" while the plugin later wrote
+    /// `success:false` only the UI ever saw — see the doc comment on
+    /// `validate_mofa_slides_style`). The check is intentionally cheap (path
+    /// existence + a single `read_dir` for the error message) so the
+    /// foreground turn isn't blocked.
+    ///
+    /// Other plugin tools fall through to the trait default (`Ok`).
+    async fn pre_flight_validate(&self, args: &serde_json::Value) -> Result<(), String> {
+        if self.tool_def.name == "mofa_slides" {
+            let skill_dir = self.executable.parent();
+            let work_dir = self.work_dir.as_deref();
+            validate_mofa_slides_style(args, skill_dir, work_dir)?;
+        }
+        Ok(())
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -5424,6 +5548,175 @@ mod tests {
             rewritten["script_path"].as_str().unwrap(),
             script.to_string_lossy().to_string(),
             "legacy rescue must continue to bridge workspace-root scripts"
+        );
+    }
+
+    // ---- mofa_slides style pre-flight validator ----
+    //
+    // These cover the synth-ack gap closed in
+    // `Tool::pre_flight_validate` for `mofa_slides`: invalid `style=`
+    // values used to slip past the spawn_only intercept and the LLM
+    // never saw the plugin's later `success:false`. The pre-flight now
+    // catches bare-name styles synchronously so the LLM gets a
+    // `[VALIDATION FAILED]` tool_result instead of the misleading
+    // synth-ack.
+
+    /// Helper: build a temp `skill_dir` with `styles/<name>.toml` entries.
+    fn make_skill_dir_with_styles(styles: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create skill_dir");
+        let styles_dir = dir.path().join("styles");
+        std::fs::create_dir_all(&styles_dir).expect("mkdir styles");
+        for name in styles {
+            std::fs::write(styles_dir.join(format!("{name}.toml")), b"").expect("write style");
+        }
+        dir
+    }
+
+    #[test]
+    fn mofa_slides_preflight_accepts_builtin_style() {
+        let skill_dir =
+            make_skill_dir_with_styles(&["nb-pro", "puer-tea", "modern-cn", "vintage-jp"]);
+
+        let result =
+            validate_mofa_slides_style(&json!({"style": "nb-pro"}), Some(skill_dir.path()), None);
+
+        assert!(
+            result.is_ok(),
+            "built-in style must pass pre-flight: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_accepts_workspace_custom_style() {
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let work_dir = make_skill_dir_with_styles(&["custom-brand"]);
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "custom-brand"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "workspace custom style must pass pre-flight: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_rejects_missing_style() {
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro", "puer-tea"]);
+        let work_dir = make_skill_dir_with_styles(&["custom-brand"]);
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "puer-woodcut"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        let Err(msg) = result else {
+            panic!("expected pre-flight to reject invalid style, got Ok");
+        };
+        assert!(
+            msg.contains("not found"),
+            "error must mention 'not found': {msg}"
+        );
+        assert!(
+            msg.contains("Available built-in styles"),
+            "error must list available built-in styles: {msg}"
+        );
+        // Built-in names should be present, sorted/joined.
+        assert!(msg.contains("nb-pro"), "error must list nb-pro: {msg}");
+        assert!(msg.contains("puer-tea"), "error must list puer-tea: {msg}");
+        // Workspace custom styles listed separately.
+        assert!(
+            msg.contains("Available workspace custom styles"),
+            "error must list workspace customs: {msg}"
+        );
+        assert!(
+            msg.contains("custom-brand"),
+            "error must list custom-brand: {msg}"
+        );
+        // Hint to author under work_dir/styles/.
+        assert!(
+            msg.contains(&format!(
+                "{}/styles/puer-woodcut.toml",
+                work_dir.path().display()
+            )),
+            "error must hint at the workspace authoring path: {msg}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_passes_when_no_style_arg() {
+        // No styles dir at all on disk — pre-flight must NOT touch the
+        // filesystem when the LLM omits `style`. The plugin's
+        // default-style fallback path is what runs in production.
+        let skill_dir = tempfile::tempdir().expect("create skill_dir");
+        let work_dir = tempfile::tempdir().expect("create work_dir");
+
+        for args in [json!({}), json!({"style": ""}), json!({"style": "   "})] {
+            let result =
+                validate_mofa_slides_style(&args, Some(skill_dir.path()), Some(work_dir.path()));
+            assert!(
+                result.is_ok(),
+                "missing/empty style must pass pre-flight (args={args:?}): {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_slides_preflight_only_fires_for_mofa_slides_tool() {
+        // A plugin tool with a different name must NOT be gated by the
+        // mofa_slides style check, even when it carries a bogus `style`
+        // arg — the pre-flight is intentionally scoped to one tool.
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let executable = skill_dir.path().join("other-binary");
+        std::fs::write(&executable, b"").expect("write fake exe");
+
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"style": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, executable);
+
+        let result = tool
+            .pre_flight_validate(&json!({"style": "does-not-exist"}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "non-mofa_slides tool must skip pre-flight even with bad style: {result:?}"
+        );
+
+        // And the mofa_slides tool with the same bogus style MUST fail.
+        let mofa_def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides".to_string(),
+            input_schema: json!({"type": "object", "properties": {"style": {"type": "string"}}}),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let mofa_executable = skill_dir.path().join("mofa-slides");
+        std::fs::write(&mofa_executable, b"").expect("write fake mofa exe");
+        let mofa_tool = PluginTool::new("mofa-slides".into(), mofa_def, mofa_executable);
+        let mofa_result = mofa_tool
+            .pre_flight_validate(&json!({"style": "does-not-exist"}))
+            .await;
+        assert!(
+            mofa_result.is_err(),
+            "mofa_slides MUST reject bad style at pre-flight: {mofa_result:?}"
         );
     }
 }
