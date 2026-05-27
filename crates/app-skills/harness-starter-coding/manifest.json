@@ -35,10 +35,6 @@
     }
   ],
   "discovery": {
-    "summary": "Harnessed coding-assistant starter template; ships a unified-diff primary artifact plus a file-list preview under patches/ and gates delivery on file_size_min:64.",
-    "hints": [
-      { "when": "adapting this starter into a real coding assistant (similar-based diffing, git apply check, etc.)", "read": "SKILL.md" },
-      { "when": "looking at the multi-artifact workspace contract", "read": "workspace-policy.toml" }
-    ]
+    "summary": "Harnessed coding-assistant starter template; ships a unified-diff primary artifact plus a file-list preview under patches/ and gates delivery on file_size_min:64."
   }
 }

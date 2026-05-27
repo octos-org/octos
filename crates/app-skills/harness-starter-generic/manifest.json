@@ -23,10 +23,6 @@
     }
   ],
   "discovery": {
-    "summary": "Minimal harnessed single-artifact starter template; writes one text file under output/ and relies on the workspace contract to verify and deliver it.",
-    "hints": [
-      { "when": "adapting this starter into a new harnessed custom app", "read": "SKILL.md" },
-      { "when": "looking at the full workspace contract", "read": "workspace-policy.toml" }
-    ]
+    "summary": "Minimal harnessed single-artifact starter template; writes one text file under output/ and relies on the workspace contract to verify and deliver it."
   }
 }

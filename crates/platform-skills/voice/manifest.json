@@ -120,13 +120,6 @@
     }
   ],
   "discovery": {
-    "summary": "On-device ASR + preset-voice TTS (Qwen3 on Apple Silicon) with emotion/speed control and model lifecycle. Voice cloning lives in sibling skill mofa-fm.",
-    "hints": [
-      { "when": "user asks for voice cloning or a custom voice profile", "read": "SKILL.md" },
-      { "when": "picking a preset speaker or wiring TTS parameters", "read": "docs/api-reference.md" },
-      { "when": "choosing or composing an emotion / style prompt", "read": "docs/emotion-prompts.md" },
-      { "when": "checking server discovery, endpoints, or fallback behavior", "read": "docs/api-reference.md" },
-      { "when": "ominix-api may be down (emotion prompt + fallback gotcha)", "read": "SKILL.md" }
-    ]
+    "summary": "On-device ASR + preset-voice TTS (Qwen3 on Apple Silicon) with emotion/speed control and model lifecycle. Voice cloning lives in sibling skill mofa-fm."
   }
 }
