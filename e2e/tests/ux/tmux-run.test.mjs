@@ -50,8 +50,13 @@ test('self-test writes and validates the artifact skeleton', () => {
 
   const summary = readJson(join(outDir, 'summary.json'));
   const validation = readJson(join(outDir, 'validation.json'));
+  const capture = readFileSync(join(outDir, 'tui-capture.txt'), 'utf8');
+  const transcript = readFileSync(join(outDir, 'appui-transcript.jsonl'), 'utf8');
   assert.equal(summary.validation_status, 'passed');
   assert.equal(validation.status, 'passed');
+  assert.match(capture, /M19_STDIO_HAPPY_PATH_FINAL_LINE/);
+  assert.match(capture, /\bComposer\b/);
+  assert.match(transcript, /"method":"client_hello"/);
 });
 
 test('dry-run can skip automatic validation', () => {
