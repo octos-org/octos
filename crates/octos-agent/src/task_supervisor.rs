@@ -722,6 +722,32 @@ pub struct TaskSupervisor {
     /// `register*` and dropped on terminal transitions to keep memory usage
     /// proportional to active tasks.
     cancel_tokens: Arc<CancelTokenStore>,
+    /// Set of `tool_call_id`s for which the spawn_only "Background work
+    /// started for `<tool>`." synth-ack was actually emitted to the LLM
+    /// (see `loop_runner.rs` synth-ack gate).
+    ///
+    /// This is the load-bearing gate for the post-spawn failure feedback
+    /// loop: `notify_failure` only fires `SpawnOnlyFailureSignal` for tasks
+    /// whose `tool_call_id` is in this set. Two failure modes that skip
+    /// the signal correctly:
+    ///
+    /// 1. **Pre-flight validation failures** (`Tool::pre_flight_validate`
+    ///    returned `Err`) early-return BEFORE supervisor registration, so
+    ///    `mark_failed` is never called for them. The LLM already saw the
+    ///    synchronous `[VALIDATION FAILED]` tool_result — no recovery
+    ///    needed.
+    /// 2. **Sibling-error suppression**: a spawn_only sibling tool in the
+    ///    same batch errored, so the synth-ack gate suppressed the ack
+    ///    (see `any_tool_invocation_errored`). The spawn_only task IS
+    ///    registered (tokio::spawn happened) but the LLM already saw the
+    ///    sibling's error and will react on its next iteration. Injecting
+    ///    a recovery prompt for the spawn_only's eventual post-spawn
+    ///    failure would double-signal the LLM.
+    ///
+    /// When the synth-ack DID fire, the LLM was told success — the
+    /// post-spawn failure is the only way it can learn the truth. That
+    /// is the gap this set closes.
+    synth_ack_emitted_tool_call_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for TaskSupervisor {
@@ -742,7 +768,44 @@ impl TaskSupervisor {
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
             cancel_tokens: Arc::new(CancelTokenStore::default()),
+            synth_ack_emitted_tool_call_ids: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Record that the spawn_only synth-ack ("Background work started for
+    /// `<tool>`.") was emitted to the LLM for `tool_call_id`. Called from
+    /// the synth-ack gate in `loop_runner.rs` for every spawn_only tool
+    /// call in a turn whose synth-ack actually fires (gated by
+    /// `any_tool_invocation_errored`).
+    ///
+    /// The set is the load-bearing signal for the post-spawn failure
+    /// feedback loop — see the field-level doc on
+    /// `synth_ack_emitted_tool_call_ids`. Idempotent.
+    pub fn mark_synth_ack_emitted(&self, tool_call_id: &str) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .synth_ack_emitted_tool_call_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(tool_call_id.to_string());
+    }
+
+    /// True iff the synth-ack was emitted for `tool_call_id` via
+    /// [`Self::mark_synth_ack_emitted`]. Used by `notify_failure` to gate
+    /// `SpawnOnlyFailureSignal` emission so post-spawn failures only
+    /// trigger a recovery turn when the LLM was previously told the
+    /// background task started successfully.
+    pub fn was_synth_ack_emitted(&self, tool_call_id: &str) -> bool {
+        if tool_call_id.is_empty() {
+            return false;
+        }
+        let guard = self
+            .synth_ack_emitted_tool_call_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.contains(tool_call_id)
     }
 
     /// Enable append-only persistence for task snapshots and restore existing state.
@@ -1898,7 +1961,25 @@ impl TaskSupervisor {
     /// Emit a `SpawnOnlyFailureSignal` for a freshly-failed task, if a
     /// failure callback has been registered. The error_message is taken
     /// from the task's `error` field (set immediately before this call).
+    ///
+    /// **Synth-ack gate**: only emits the signal when the LLM previously
+    /// received the "Background work started for `<tool>`." synth-ack for
+    /// this task's `tool_call_id` (recorded via
+    /// [`Self::mark_synth_ack_emitted`]). When the synth-ack was
+    /// suppressed (sibling-error or pre-flight short-circuit), the LLM
+    /// already saw an error tool_result in its iteration — injecting a
+    /// synthetic recovery prompt would double-signal it. The field-level
+    /// doc on `synth_ack_emitted_tool_call_ids` explains both skip-paths.
     fn notify_failure(&self, task: &BackgroundTask) {
+        if !self.was_synth_ack_emitted(&task.tool_call_id) {
+            tracing::debug!(
+                task_id = %task.id,
+                tool_name = %task.tool_name,
+                tool_call_id = %task.tool_call_id,
+                "skipping SpawnOnlyFailureSignal: synth-ack was never emitted for this tool_call_id (LLM already saw an error tool_result)",
+            );
+            return;
+        }
         let guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cb) = guard.as_ref() else {
             return;
@@ -3013,6 +3094,10 @@ mod tests {
             Some("api:session"),
             Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
         );
+        // Synth-ack gate: simulate the LLM having seen the
+        // "Background work started for `fm_tts`." ack — production wires
+        // this from `loop_runner.rs` when the synth-ack fires.
+        supervisor.mark_synth_ack_emitted("call-1");
         supervisor.mark_running(&task_id);
         supervisor.mark_failed(
             &task_id,
@@ -3078,6 +3163,7 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         let collected = collect_failure_signals(&supervisor);
         let task_id = supervisor.register("fm_tts", "call-4", None);
+        supervisor.mark_synth_ack_emitted("call-4");
         supervisor.mark_running(&task_id);
         supervisor.mark_failed(&task_id, "first failure".to_string());
         // re-marking should NOT re-fire the signal — guards against runaway
@@ -3102,6 +3188,7 @@ mod tests {
             "format": "mp3",
         });
         let task_id = supervisor.register_with_input("fm_tts", "call-5", None, Some(input.clone()));
+        supervisor.mark_synth_ack_emitted("call-5");
         supervisor.mark_failed(&task_id, "internal error".to_string());
 
         let signals = collected.lock().unwrap().clone();
@@ -3135,6 +3222,7 @@ mod tests {
         let collected = collect_failure_signals(&supervisor);
         let task_id = supervisor.register("fm_tts", "call-6", None);
         supervisor.set_tool_input(&task_id, serde_json::json!({"voice": "yangmi"}));
+        supervisor.mark_synth_ack_emitted("call-6");
         supervisor.mark_failed(&task_id, "voice missing".to_string());
 
         let signals = collected.lock().unwrap().clone();
@@ -3150,6 +3238,7 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         let collected = collect_failure_signals(&supervisor);
         let task_id = supervisor.register("fm_tts", "call-dedup", None);
+        supervisor.mark_synth_ack_emitted("call-dedup");
         supervisor.mark_failed(&task_id, "first".to_string());
         supervisor.mark_failed(&task_id, "second".to_string());
         assert_eq!(collected.lock().unwrap().len(), 1);
@@ -3160,6 +3249,7 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         let collected = collect_failure_signals(&supervisor);
         let task_id = supervisor.register("fm_tts", "call-alts", None);
+        supervisor.mark_synth_ack_emitted("call-alts");
         supervisor.mark_failed(
             &task_id,
             "voice missing. available: vivian, serena, longxiang.".to_string(),
@@ -3186,6 +3276,7 @@ mod tests {
         let input = serde_json::json!({"voice": "yangmi", "text": "hello"});
         let task_id =
             supervisor.register_with_input("fm_tts", "call-prompt", None, Some(input.clone()));
+        supervisor.mark_synth_ack_emitted("call-prompt");
         supervisor.mark_failed(&task_id, "voice missing".to_string());
         let signals = collected.lock().unwrap().clone();
         assert_eq!(signals.len(), 1);
@@ -3198,11 +3289,71 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         let collected = collect_failure_signals(&supervisor);
         let task_id = supervisor.register("fm_tts", "call-7", None);
+        supervisor.mark_synth_ack_emitted("call-7");
         supervisor.mark_failed(&task_id, "boom".to_string());
 
         let signals = collected.lock().unwrap().clone();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].tool_input, Value::Null);
+    }
+
+    /// Synth-ack gate (PR feat/spawn-only-failure-feedback-loop): when the
+    /// LLM never received the "Background work started for `<tool>`." ack
+    /// for this task's `tool_call_id` (because the synth-ack gate
+    /// suppressed it — sibling-error mode), the supervisor MUST NOT emit
+    /// a `SpawnOnlyFailureSignal` on the eventual post-spawn failure. The
+    /// LLM already saw the sibling error in its iteration and will react
+    /// — injecting a synthetic recovery prompt would double-signal.
+    #[test]
+    fn should_not_emit_failure_signal_when_synth_ack_was_never_emitted() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-no-ack", None);
+        supervisor.mark_running(&task_id);
+        // No mark_synth_ack_emitted call — production analog: sibling tool
+        // errored in this batch so loop_runner.rs suppressed the ack.
+        supervisor.mark_failed(&task_id, "post-spawn error".to_string());
+
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "failure signal must be suppressed when synth-ack never went to the LLM",
+        );
+    }
+
+    #[test]
+    fn should_emit_failure_signal_only_after_synth_ack_recorded_for_tool_call_id() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+
+        // First task — synth-ack was suppressed, failure must NOT signal.
+        let suppressed_task = supervisor.register("fm_tts", "call-suppressed", None);
+        supervisor.mark_failed(&suppressed_task, "boom A".to_string());
+
+        // Second task — synth-ack fired, failure MUST signal.
+        let acked_task = supervisor.register("fm_tts", "call-acked", None);
+        supervisor.mark_synth_ack_emitted("call-acked");
+        supervisor.mark_failed(&acked_task, "boom B".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(
+            signals.len(),
+            1,
+            "exactly one failure signal — the synth-acked task — must reach the callback",
+        );
+        assert_eq!(signals[0].task_id, acked_task);
+    }
+
+    #[test]
+    fn mark_synth_ack_emitted_is_idempotent_and_ignores_empty_id() {
+        let supervisor = TaskSupervisor::new();
+        // Idempotent on repeated calls.
+        supervisor.mark_synth_ack_emitted("call-x");
+        supervisor.mark_synth_ack_emitted("call-x");
+        assert!(supervisor.was_synth_ack_emitted("call-x"));
+        // Empty / unknown id remains untracked.
+        supervisor.mark_synth_ack_emitted("");
+        assert!(!supervisor.was_synth_ack_emitted(""));
+        assert!(!supervisor.was_synth_ack_emitted("call-missing"));
     }
 
     // ── F004 B2: TaskSupervisor → ToolProgress bridge ─────────────────────
@@ -4520,6 +4671,10 @@ mod tests {
         let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-sig"));
         let c1 = supervisor.register("pipeline:setup", parent_tcid, Some("sess-sig"));
         let c2 = supervisor.register("pipeline:analyze", parent_tcid, Some("sess-sig"));
+        // Children inherit the parent's tool_call_id; mark the synth-ack
+        // for that id so post-spawn failure signals fire (production wires
+        // this from the synth-ack gate in `loop_runner.rs`).
+        supervisor.mark_synth_ack_emitted(parent_tcid);
         supervisor.mark_running(&parent);
         supervisor.mark_running(&c1);
         supervisor.mark_running(&c2);

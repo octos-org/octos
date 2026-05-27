@@ -1338,6 +1338,27 @@ impl Agent {
                                     );
                                 } else {
                                     self.emit_cost_update(turn.total_usage(), &response);
+                                    // Post-spawn failure feedback loop
+                                    // (feat/spawn-only-failure-feedback-loop):
+                                    // record that the synth-ack went out for
+                                    // every spawn_only tool_call_id in this
+                                    // turn. The supervisor's `notify_failure`
+                                    // gates `SpawnOnlyFailureSignal` emission
+                                    // on this set so an eventual post-spawn
+                                    // failure (Gemini API error, plugin
+                                    // crash, late validator rejection) can
+                                    // reach the session actor and drive a
+                                    // recovery turn. Sibling-error
+                                    // suppression (the `if` branch above)
+                                    // intentionally skips this — the LLM
+                                    // already saw the sibling's error
+                                    // tool_result.
+                                    let supervisor = self.tools.supervisor();
+                                    for tc in &response.tool_calls {
+                                        if self.tools.is_spawn_only(&tc.name) {
+                                            supervisor.mark_synth_ack_emitted(&tc.id);
+                                        }
+                                    }
                                     let background_tools = response
                                         .tool_calls
                                         .iter()
