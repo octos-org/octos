@@ -1251,6 +1251,19 @@ fn accept_for_intent(
             "path '{raw_path}' rejected: shared zone '{}' is read-only — writes refused per SessionScope policy",
             zone.display()
         )),
+        // PR-A: read-only plugin skill dirs follow the same policy as
+        // shared zones — reads allowed, writes refused. Plugin tools
+        // rarely touch their own skill_dir at runtime (skills usually
+        // operate inside the host-provided work_dir), but the match
+        // arm has to be exhaustive and the read/write split here is
+        // consistent with `tools/mod.rs::resolve_for_scope`.
+        (PathClassification::InSkillDir { .. }, PathIntent::Read) => {
+            Ok(absolute.to_string_lossy().into_owned())
+        }
+        (PathClassification::InSkillDir { skill_dir }, PathIntent::Write) => Err(eyre::eyre!(
+            "path '{raw_path}' rejected: plugin skill dir '{}' is read-only — writes refused per SessionScope policy",
+            skill_dir.display()
+        )),
         // Out of scope: refuse for both intents. Echo the raw path so
         // the LLM sees what was refused (matches the round-3/4
         // bespoke-validator error contract).
@@ -1352,6 +1365,7 @@ fn rescue_workspace_input_existence(
         PathClassification::InWorkspace => rescued,
         PathClassification::InGrantedDir { .. }
         | PathClassification::InSharedZone { .. }
+        | PathClassification::InSkillDir { .. }
         | PathClassification::OutOfScope => lexical_absolute.to_string(),
     }
 }

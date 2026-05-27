@@ -319,7 +319,43 @@ impl SessionRuntime {
                 profile.profile_id.clone(),
                 session_id_raw.clone(),
             ) {
-                Ok(scope) => Some(Arc::new(scope)),
+                Ok(scope) => {
+                    // PR-A: thread the per-profile plugin install
+                    // directories through to the scope so file tools
+                    // (`read_file` today, glob/grep/list_dir in
+                    // PR-B) can reach the SKILL.md content the
+                    // agent's system prompt references. Canonicalize
+                    // each entry so symlinked plugin install roots
+                    // line up with the canonicalized candidate paths
+                    // the tools-side resolver compares against. Fall
+                    // back to the raw path when canonicalize fails
+                    // (the dir may not exist on bootstrap retry).
+                    let skill_dirs: Vec<std::path::PathBuf> = profile
+                        .plugin_dirs
+                        .iter()
+                        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                        .collect();
+                    let scope = scope
+                        .with_skill_read_zones(skill_dirs)
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                profile_id = %profile.profile_id,
+                                session = %session_key,
+                                error = %err,
+                                "with_skill_read_zones rejected one or more plugin_dirs; \
+                                 continuing without skill_read_zones (read_file may not reach SKILL.md references)",
+                            );
+                            // Reconstruct the scope without skill
+                            // zones — non-fatal additive feature.
+                            SessionScope::multi_tenant_with_default_zones(
+                                profile.data_dir.clone(),
+                                profile.profile_id.clone(),
+                                session_id_raw.clone(),
+                            )
+                            .expect("scope was buildable above; rebuilding with the same inputs must succeed")
+                        });
+                    Some(Arc::new(scope))
+                }
                 Err(err) => {
                     tracing::warn!(
                         profile_id = %profile.profile_id,

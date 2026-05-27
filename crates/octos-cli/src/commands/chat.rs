@@ -311,7 +311,7 @@ impl ChatCommand {
             cwd.clone(),
             data_dir.clone(),
             tools.provider_policy().cloned(),
-            plugin_dirs,
+            plugin_dirs.clone(),
             config.plugins.require_signed,
             create_embedder(&config),
         );
@@ -452,9 +452,33 @@ impl ChatCommand {
                 .wrap_err("failed to absolutize --cwd: current_dir() unavailable")?
                 .join(&cwd)
         };
-        let session_scope = Arc::new(SessionScope::solo(absolute_cwd, Vec::new()).expect(
-            "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
-        ));
+        // PR-A: thread the per-profile plugin install directories
+        // through to the scope so `read_file` can reach the SKILL.md
+        // content the agent's system prompt auto-injects. Each entry
+        // is canonicalized so symlinked plugin install roots line up
+        // with the canonicalized candidate paths the tools-side
+        // resolver compares against; raw path is used when
+        // canonicalize fails (e.g. dir not yet created).
+        let canonical_skill_dirs: Vec<PathBuf> = plugin_dirs
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
+        let session_scope = {
+            let base = SessionScope::solo(absolute_cwd.clone(), Vec::new()).expect(
+                "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
+            );
+            let scope = base
+                .with_skill_read_zones(canonical_skill_dirs)
+                .unwrap_or_else(|err| {
+                    eprintln!(
+                        "Warning: with_skill_read_zones rejected one or more plugin_dirs: {err}; \
+                         continuing without skill_read_zones (read_file may not reach SKILL.md references)"
+                    );
+                    SessionScope::solo(absolute_cwd.clone(), Vec::new())
+                        .expect("absolutized cwd still valid")
+                });
+            Arc::new(scope)
+        };
 
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)

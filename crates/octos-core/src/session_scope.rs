@@ -127,7 +127,15 @@ use serde::Serialize;
 
 /// Schema version of the [`SessionScope`] shape. Bump on incompatible
 /// changes.
-pub const SESSION_SCOPE_SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+/// - v1: workspace + shared_zones (MultiTenant) / workspace +
+///   granted_dirs (Solo).
+/// - v2 (PR-A SKILL.md injection rethink): adds `skill_read_zones`,
+///   a read-only allowlist that lets file tools reach plugin
+///   `skill_dir` trees. Writes remain workspace-only. Additive — old
+///   callers that pass an empty list keep v1 behaviour.
+pub const SESSION_SCOPE_SCHEMA_VERSION: u32 = 2;
 
 /// Default name of the per-session workspace subdirectory inside
 /// `<root>/users/<session_id>/`. Held as a constant so the resolver
@@ -188,6 +196,11 @@ pub enum SessionScopeError {
         users_subtree: PathBuf,
         zone: PathBuf,
     },
+
+    /// A `skill_read_zone` is not absolute. Skill directories must be
+    /// absolute so they can be compared unambiguously against caller
+    /// paths (same invariant as `granted_dirs`).
+    SkillReadZoneNotAbsolute(usize, PathBuf),
 }
 
 impl std::fmt::Display for SessionScopeError {
@@ -236,6 +249,11 @@ impl std::fmt::Display for SessionScopeError {
                 zone.display(),
                 users_subtree.display()
             ),
+            Self::SkillReadZoneNotAbsolute(idx, p) => write!(
+                f,
+                "skill_read_zones[{idx}] must be absolute, got: {}",
+                p.display()
+            ),
         }
     }
 }
@@ -266,13 +284,22 @@ pub enum PathClassification {
     /// Reads and writes allowed; the user explicitly granted access
     /// via a Claude-Code-style permission prompt.
     InGrantedDir { granted_dir: PathBuf },
+    /// Path is inside one of `scope.skill_read_zones` (any mode).
+    /// **Reads allowed; writes refused.** Used by the auto-injected
+    /// plugin SKILL.md guidance so the agent can `read_file` against
+    /// references the SKILL.md mentions (helper scripts, example
+    /// data, etc.) without needing per-skill workspace copies.
+    /// Workspace and granted_dirs still take precedence — if a path
+    /// happens to be inside both, the higher-trust zone wins.
+    InSkillDir { skill_dir: PathBuf },
     /// Path is outside every declared zone (workspace, shared_zones,
-    /// granted_dirs). Refuse — this is either a tenant-boundary
-    /// escape (multi-tenant) or a path the user has not granted
-    /// (solo). The previous `InRootButOutsideZones` variant was
-    /// dropped per codex round-1 review: with `shared_data == root`
-    /// it was unreachable; with named shared zones, there are no
-    /// "almost legitimate" paths to distinguish from full escapes.
+    /// granted_dirs, skill_read_zones). Refuse — this is either a
+    /// tenant-boundary escape (multi-tenant) or a path the user has
+    /// not granted (solo). The previous `InRootButOutsideZones`
+    /// variant was dropped per codex round-1 review: with
+    /// `shared_data == root` it was unreachable; with named shared
+    /// zones, there are no "almost legitimate" paths to distinguish
+    /// from full escapes.
     OutOfScope,
 }
 
@@ -355,6 +382,27 @@ pub struct SessionScope {
     /// system. Per codex round-1: typed mode-specific fields prevent
     /// illegal-state construction.
     mode: ScopeMode,
+    /// Read-only allowlist of plugin `skill_dir` trees the agent may
+    /// reach with read-side file tools (`read_file` today; `glob` /
+    /// `grep` / `list_dir` in PR-B). **Reads allowed; writes
+    /// refused.** Cross-mode (both solo and multi-tenant carry it)
+    /// because the SKILL.md auto-inject in
+    /// `octos-agent/src/plugins/extras.rs` happens regardless of
+    /// scope mode — the agent needs the same read access in both.
+    ///
+    /// Empty by default. Callers opt in by passing a non-empty vec
+    /// to [`Self::multi_tenant`] / [`Self::solo`] or layering on
+    /// with [`Self::with_skill_read_zones`]. Each entry must be
+    /// absolute (canonicalisation is the caller's responsibility —
+    /// the tools-side `resolve_for_scope` canonicalizes both sides
+    /// before comparing, matching how `InSharedZone` is handled).
+    ///
+    /// Classification order: workspace, then granted_dirs, then
+    /// `skill_read_zones`, then shared_zones, then OutOfScope. Per
+    /// the PR-A spec, workspace and granted_dirs always win as the
+    /// higher-priority classifications even when a skill_dir happens
+    /// to live inside them.
+    skill_read_zones: Vec<PathBuf>,
 }
 
 /// Canonical names of shared zones under `<root>` for the dspfac /
@@ -431,6 +479,7 @@ impl SessionScope {
                 session_id,
                 shared_zones,
             },
+            skill_read_zones: Vec::new(),
         })
     }
 
@@ -470,6 +519,7 @@ impl SessionScope {
             workspace: cwd.clone(),
             root: cwd,
             mode: ScopeMode::Solo { granted_dirs },
+            skill_read_zones: Vec::new(),
         })
     }
 
@@ -494,6 +544,39 @@ impl SessionScope {
 
     pub fn mode(&self) -> &ScopeMode {
         &self.mode
+    }
+
+    /// Return the read-only plugin skill directories the agent may
+    /// reach. See the `skill_read_zones` field doc on [`SessionScope`].
+    pub fn skill_read_zones(&self) -> &[PathBuf] {
+        &self.skill_read_zones
+    }
+
+    /// Return a new `SessionScope` with `skill_read_zones` replacing
+    /// any previously-set list.
+    ///
+    /// Each entry MUST be absolute. The caller is responsible for
+    /// canonicalising paths (the tools-side `resolve_for_scope`
+    /// canonicalizes both sides before comparing, matching the
+    /// existing `InSharedZone` containment guard).
+    ///
+    /// Cross-mode: both solo and multi-tenant accept skill read zones
+    /// because the auto-injected SKILL.md guidance fires regardless
+    /// of scope mode. The classifier consults this list AFTER
+    /// workspace and granted_dirs so the higher-trust zones still win
+    /// when paths overlap (e.g. a skill_dir nested inside the
+    /// workspace would classify as `InWorkspace`, not `InSkillDir`).
+    pub fn with_skill_read_zones(mut self, dirs: Vec<PathBuf>) -> Result<Self, SessionScopeError> {
+        for (idx, dir) in dirs.iter().enumerate() {
+            if !dir.is_absolute() {
+                return Err(SessionScopeError::SkillReadZoneNotAbsolute(
+                    idx,
+                    dir.clone(),
+                ));
+            }
+        }
+        self.skill_read_zones = dirs;
+        Ok(self)
     }
 
     /// Return a new `SessionScope` with `dir` added to `granted_dirs`.
@@ -545,21 +628,40 @@ impl SessionScope {
         if normalised.starts_with(&self.workspace) {
             return PathClassification::InWorkspace;
         }
-        match &self.mode {
-            ScopeMode::Solo { granted_dirs } => {
-                for granted in granted_dirs {
-                    if normalised.starts_with(granted) {
-                        return PathClassification::InGrantedDir {
-                            granted_dir: granted.clone(),
-                        };
-                    }
+        // Per-mode high-trust zones come next. For solo this is
+        // `granted_dirs` (user-approved); for multi-tenant we
+        // intentionally defer `shared_zones` until AFTER
+        // `skill_read_zones` per the PR-A classification order
+        // (workspace > granted_dirs > skill_read_zones > shared_zones).
+        if let ScopeMode::Solo { granted_dirs } = &self.mode {
+            for granted in granted_dirs {
+                if normalised.starts_with(granted) {
+                    return PathClassification::InGrantedDir {
+                        granted_dir: granted.clone(),
+                    };
                 }
             }
-            ScopeMode::MultiTenant { shared_zones, .. } => {
-                for zone in shared_zones {
-                    if normalised.starts_with(zone) {
-                        return PathClassification::InSharedZone { zone: zone.clone() };
-                    }
+        }
+        // Read-only plugin skill directories. Consulted AFTER
+        // workspace and granted_dirs so the higher-priority zones
+        // still classify a path inside both (degenerate case where a
+        // skill_dir is nested inside the workspace) as `InWorkspace`,
+        // not `InSkillDir`. Consulted BEFORE shared_zones because
+        // skill dirs are plugin-installed read material, not the
+        // declared cross-session "research/skills" zones; treating
+        // them the same would let plugin paths inherit
+        // `InSharedZone` semantics by accident.
+        for skill_dir in &self.skill_read_zones {
+            if normalised.starts_with(skill_dir) {
+                return PathClassification::InSkillDir {
+                    skill_dir: skill_dir.clone(),
+                };
+            }
+        }
+        if let ScopeMode::MultiTenant { shared_zones, .. } = &self.mode {
+            for zone in shared_zones {
+                if normalised.starts_with(zone) {
+                    return PathClassification::InSharedZone { zone: zone.clone() };
                 }
             }
         }
@@ -879,5 +981,199 @@ mod tests {
             err,
             SessionScopeError::GrantNotAllowedInMultiTenant
         ));
+    }
+
+    // -------- PR-A: skill_read_zones --------
+
+    /// Read paths inside a registered skill_dir classify as
+    /// [`PathClassification::InSkillDir`]. This is the lexical
+    /// classification check — `tools/mod.rs::resolve_for_scope`
+    /// layers the canonicalize-both-sides treatment and the
+    /// read/write split on top.
+    #[test]
+    fn read_file_from_allowlisted_skill_dir_classifies_in_skill_dir() {
+        let workspace = abs("/octos/profiles/dspfac/data");
+        let skill_dir = abs("/octos/plugins/mofa-podcast");
+        let scope = mt_default(&workspace, "web-1")
+            .with_skill_read_zones(vec![skill_dir.clone()])
+            .expect("absolute skill_dir is valid");
+        assert_eq!(
+            scope.classify_lexical_path(&skill_dir.join("SKILL.md")),
+            PathClassification::InSkillDir {
+                skill_dir: skill_dir.clone()
+            }
+        );
+        assert_eq!(
+            scope.classify_lexical_path(&skill_dir.join("data/example.json")),
+            PathClassification::InSkillDir { skill_dir }
+        );
+    }
+
+    /// A path that resolves outside the skill_dir via `..` traversal
+    /// must classify as `OutOfScope`, never `InSkillDir`. The
+    /// lexical normaliser rejects `..` outright per the existing
+    /// contract — this pins that behaviour for skill_read_zones too.
+    #[test]
+    fn traversal_attempt_in_skill_dir_classifies_out_of_scope() {
+        let workspace = abs("/octos/profiles/dspfac/data");
+        let skill_dir = abs("/octos/plugins/mofa-podcast");
+        let scope = mt_default(&workspace, "web-1")
+            .with_skill_read_zones(vec![skill_dir.clone()])
+            .unwrap();
+        // Lexical `..` is refused at the normaliser layer, regardless
+        // of whether the canonical destination would land inside the
+        // skill_dir.
+        let traversal = skill_dir.join("../../../etc/passwd");
+        assert_eq!(
+            scope.classify_lexical_path(&traversal),
+            PathClassification::OutOfScope
+        );
+    }
+
+    /// Multiple skill_dirs all participate — the classifier returns
+    /// the matching dir, not the first/last entry by chance.
+    #[test]
+    fn multiple_skill_dirs_all_classify_in_skill_dir() {
+        let workspace = abs("/octos/profiles/dspfac/data");
+        let dirs = [
+            abs("/octos/plugins/mofa-podcast"),
+            abs("/octos/plugins/mofa-research"),
+            abs("/octos/plugins/mofa-slides"),
+        ];
+        let scope = mt_default(&workspace, "web-1")
+            .with_skill_read_zones(dirs.to_vec())
+            .unwrap();
+        for dir in &dirs {
+            assert_eq!(
+                scope.classify_lexical_path(&dir.join("SKILL.md")),
+                PathClassification::InSkillDir {
+                    skill_dir: dir.clone()
+                },
+                "expected InSkillDir match for {}",
+                dir.display()
+            );
+        }
+    }
+
+    /// Degenerate case: a skill_dir that happens to live inside the
+    /// workspace must still classify as `InWorkspace`. Workspace
+    /// takes precedence so writes to the dir keep working (writes to
+    /// `InSkillDir` are refused, writes to `InWorkspace` succeed).
+    #[test]
+    fn workspace_path_still_wins_over_skill_dir() {
+        let workspace = abs("/octos/profiles/dspfac/data");
+        // Pretend a skill dir was registered inside the workspace
+        // tree (e.g. someone moved a skill_dir into
+        // `<data>/users/web-1/workspace/skill-copy/`).
+        let session_workspace = workspace.join("users/web-1/workspace");
+        let nested_skill = session_workspace.join("skill-copy");
+        let scope = mt_default(&workspace, "web-1")
+            .with_skill_read_zones(vec![nested_skill.clone()])
+            .unwrap();
+        let inner = nested_skill.join("manifest.json");
+        assert_eq!(
+            scope.classify_lexical_path(&inner),
+            PathClassification::InWorkspace,
+            "workspace must outrank skill_read_zones even when a skill_dir is nested inside it",
+        );
+    }
+
+    /// Solo mode also accepts skill_read_zones (the SKILL.md
+    /// auto-inject fires regardless of scope mode, so solo callers
+    /// need the same allowlist).
+    #[test]
+    fn solo_with_skill_read_zones_classifies_in_skill_dir() {
+        let cwd = abs("/home/yc/my-project");
+        let skill_dir = abs("/opt/octos/plugins/mofa-podcast");
+        let scope = SessionScope::solo(cwd, vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill_dir.clone()])
+            .unwrap();
+        assert_eq!(
+            scope.classify_lexical_path(&skill_dir.join("SKILL.md")),
+            PathClassification::InSkillDir { skill_dir }
+        );
+    }
+
+    /// Solo `granted_dirs` must outrank `skill_read_zones`. Grants
+    /// are explicit user approvals and carry full read+write rights;
+    /// skill dirs are read-only. If a skill_dir overlapped with a
+    /// granted dir, a path inside both would classify as
+    /// `InGrantedDir` (read+write) rather than `InSkillDir` (read
+    /// only).
+    #[test]
+    fn solo_granted_dir_outranks_skill_read_zone() {
+        let cwd = abs("/home/yc/my-project");
+        let shared_parent = abs("/opt/octos/plugins");
+        let nested = shared_parent.join("mofa-podcast");
+        let scope = SessionScope::solo(cwd, vec![shared_parent.clone()])
+            .unwrap()
+            .with_skill_read_zones(vec![nested.clone()])
+            .unwrap();
+        assert_eq!(
+            scope.classify_lexical_path(&nested.join("SKILL.md")),
+            PathClassification::InGrantedDir {
+                granted_dir: shared_parent
+            }
+        );
+    }
+
+    /// Multi-tenant: skill_read_zones consult AFTER workspace but
+    /// BEFORE shared_zones. If a skill_dir overlapped with a shared
+    /// zone, the skill_dir wins. The classification order matters
+    /// because writes are refused for both, but `InSharedZone` carries
+    /// the cross-session-zone semantics from the host while
+    /// `InSkillDir` is plugin-install material.
+    #[test]
+    fn skill_read_zone_outranks_shared_zone() {
+        let data = abs("/octos/profiles/dspfac/data");
+        let shared_research = data.join("research");
+        let nested_skill = shared_research.join("mofa-podcast");
+        let scope = mt_default(&data, "web-1")
+            .with_skill_read_zones(vec![nested_skill.clone()])
+            .unwrap();
+        assert_eq!(
+            scope.classify_lexical_path(&nested_skill.join("SKILL.md")),
+            PathClassification::InSkillDir {
+                skill_dir: nested_skill
+            }
+        );
+    }
+
+    /// Empty `skill_read_zones` (the default) leaves classification
+    /// behaviour identical to v1 — `InSkillDir` is never returned
+    /// and pre-PR-A callers see no observable change.
+    #[test]
+    fn empty_skill_read_zones_preserves_v1_classification() {
+        let data = abs("/octos/profiles/dspfac/data");
+        let scope = mt_default(&data, "web-1");
+        assert!(scope.skill_read_zones().is_empty());
+        // Pick a path that would have been `InSkillDir` if the zone
+        // had been registered.
+        let outside = abs("/octos/plugins/mofa-podcast/SKILL.md");
+        assert_eq!(
+            scope.classify_lexical_path(&outside),
+            PathClassification::OutOfScope
+        );
+    }
+
+    #[test]
+    fn with_skill_read_zones_refuses_relative_paths() {
+        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
+        let err = scope
+            .with_skill_read_zones(vec![PathBuf::from("relative/skill")])
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionScopeError::SkillReadZoneNotAbsolute(0, _)),
+            "expected SkillReadZoneNotAbsolute, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_version_bumped_to_v2_for_skill_read_zones() {
+        // Pin the PR-A bump so a future PR cannot silently revert
+        // the schema version without updating this test (and the
+        // module-level history comment on the constant).
+        assert_eq!(SESSION_SCOPE_SCHEMA_VERSION, 2);
     }
 }
