@@ -1163,6 +1163,220 @@ values when applicable:
 - `coding_tool_missing`
 - `exec_session_unknown`
 
+### M12 Phase D: Auxiliary RPC
+
+M12 Phase D-1 added thirteen auxiliary JSON-RPC methods that migrated the
+non-chat data plane from REST onto the same `/api/ui-protocol/ws` JSON-RPC
+connection that already carries chat. See
+`docs/adr/m12-phase-d-auxiliary-rest-to-ws.md` for migration rationale,
+endpoint inventory, and Phase D-1 → D-5 plan.
+
+Capability feature:
+
+- `auxiliary.rest_to_ws.v1` (`UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1` in
+  `crates/octos-core/src/ui_protocol.rs`)
+
+Negotiation is **strict opt-in**: a client that does not negotiate the feature
+receives `method_not_supported` (`-32004`) on every method below, even when no
+feature header is sent. This is what makes Phase D-1 truly additive — clients
+that have not been updated cannot trip into the new methods without explicit
+negotiation. Phase D-5 retired the corresponding REST routes; clients that
+have not migrated now receive `404` from the legacy URLs.
+
+Common error envelope (all methods):
+
+- `unknown_session` (`-32100`) with `data.session_id` — session-scoped methods
+  when the addressed session is not in the server's session table
+- `resource_not_found` (`-32170`) with `data.resource_type = "content"` and
+  `data.identifier` — non-session methods (content/*) when the addressed row
+  is missing
+- `invalid_params` (`-32602`) — schema validation failure, including
+  per-method caps and validation rules (see individual entries below)
+- `runtime_not_ready` — REST 503 (gateway-proxied method on a standalone
+  server)
+- `auth_unavailable` (`-32120`) — content methods called without a usable
+  identity (the dispatcher additionally closes the WS connection with
+  `1008 auth_expired` so the client's auth-expired flow can clear the token)
+- `method_not_supported` (`-32004`) — capability not negotiated
+- `internal_error` (`-32603`) — REST 5xx other than 503; non-JSON REST body
+
+The dispatcher also surfaces `data.rest_status` (REST status code) and an
+optional `data.detail` field (REST handler's human-readable error text,
+capped at 2 KiB) so panels can render REST-source error messages without a
+second round trip.
+
+Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
+(`SessionListParams`/`SessionListResult`, …, `ContentBulkDeleteParams`/
+`ContentBulkDeleteResult`).
+
+#### `session/list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/sessions`
+- Params type: `SessionListParams` (empty object).
+- Result type: `SessionListResult` — `{ sessions: SessionInfo[] }`. The
+  `sessions` field forwards the JSON body of the legacy REST handler
+  verbatim (one `SessionInfo` per entry).
+- Errors: collection endpoint; an unexpected 404 surfaces as
+  `resource_not_found` with `data.resource_type = "session"` rather than
+  `unknown_session`.
+
+#### `session/snapshot`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: combined `GET /api/sessions/{id}/status` + `/files` + `/tasks`
+  (single bootstrap round trip).
+- Params type: `SessionSnapshotParams` — `{ session_id: string, topic?: string }`.
+- Result type: `SessionSnapshotResult` — `{ status, files, tasks }`. Each
+  field carries the JSON body of the corresponding legacy REST endpoint
+  verbatim. The dispatcher fans the three calls out concurrently and
+  surfaces the first error.
+- Errors: `unknown_session` with `data.session_id` on REST 404.
+
+#### `session/messages_page`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/sessions/{id}/messages`
+- Params type: `SessionMessagesPageParams` —
+  `{ session_id: string, limit?: number, offset?: number,
+  since_seq?: number, topic?: string }`. `limit` defaults to
+  `SESSION_MESSAGES_PAGE_DEFAULT_LIMIT` (100) and is clamped to
+  `SESSION_MESSAGES_PAGE_MAX_LIMIT` (500); `offset` is clamped to
+  `SESSION_MESSAGES_PAGE_MAX_OFFSET` (10 000). These clamps match the
+  legacy REST handler.
+- Result type: `SessionMessagesPageResult` —
+  `{ messages, has_more: bool, next_offset: number }`. `messages` forwards
+  the REST handler's `MessageInfo[]`. `has_more` is `true` when the
+  returned page is exactly `limit` entries; `next_offset` is `offset + len`.
+- Errors: `unknown_session` on REST 404; `runtime_not_ready` on REST 503
+  (gateway-proxied method on standalone server). NOTE: the original REST
+  contract returned an empty page silently for some 404 cases. The WS
+  dispatcher mirrors the REST handler at `handlers.rs:767` / `handlers.rs:783`
+  precisely so 404 → `unknown_session` and 503 → `runtime_not_ready`.
+
+#### `session/status.get`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/sessions/{id}/status` (status-pill poller; separate
+  from `session/snapshot` so periodic polling does not pay for files/tasks).
+- Params type: `SessionStatusGetParams` — `{ session_id: string, topic?: string }`.
+- Result type: `SessionStatusGetResult` —
+  `{ status: { active, has_deferred_files, has_bg_tasks, ... },
+  context_state?: UiContextState }`. The `context_state` field is folded in
+  when `context.lifecycle.v1` is also negotiated for the connection (same
+  shape as `session/status/read`).
+- Errors: `unknown_session` on REST 404.
+
+#### `session/files.list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/sessions/{id}/files`
+- Params type: `SessionFilesListParams` — `{ session_id: string }`.
+- Result type: `SessionFilesListResult` — `{ files: SessionFileInfo[] }`.
+- Errors: `unknown_session` on REST 404.
+
+#### `session/tasks.list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/sessions/{id}/tasks`
+- Params type: `SessionTasksListParams` — `{ session_id: string, topic?: string }`.
+- Result type: `SessionTasksListResult` — `{ tasks: BackgroundTaskInfo[] }`.
+  Proxied from the gateway in multi-session deployments; empty in
+  standalone mode.
+- Errors: `unknown_session` on REST 404.
+
+#### `session/workspace.get`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/sessions/{id}/workspace-contract`
+- Params type: `SessionWorkspaceGetParams` — `{ session_id: string }`.
+- Result type: `SessionWorkspaceGetResult` —
+  `{ contracts: WorkspaceContractStatus[] }`.
+- Errors: `unknown_session` on REST 404.
+
+#### `session/title.set`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `PATCH /api/sessions/{id}/title`
+- Params type: `SessionTitleSetParams` — `{ session_id: string, title: string }`.
+  `title` is trimmed; an empty or whitespace-only title returns
+  `invalid_params`. Length is capped at `SESSION_TITLE_SET_MAX_CHARS`
+  (200 characters); over-length returns `invalid_params` (matches the
+  legacy REST handler at `handlers.rs:1162`).
+- Result type: `SessionTitleSetResult` — `{ session_id, title }`. The REST
+  endpoint returned `204 No Content`; the WS shape lifts the resolved title
+  into the response body so the SPA can roundtrip the rename without a
+  follow-up read.
+- Errors: `unknown_session` on REST 404; `invalid_params` on title
+  validation failure.
+
+#### `session/delete`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `DELETE /api/sessions/{id}`
+- Params type: `SessionDeleteParams` — `{ session_id: string }`.
+- Result type: `SessionDeleteResult` (empty object; the REST endpoint
+  returned `204 No Content`).
+- Errors: `unknown_session` on REST 404.
+
+#### `system/status.get`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/status` (the agent/server status, distinct from
+  `/api/auth/status` which stays REST).
+- Params type: `SystemStatusGetParams` (empty object).
+- Result type: `SystemStatusGetResult` — `{ status: StatusResponse }`.
+  `status` carries the JSON body of the legacy REST handler
+  (`handlers.rs:2592`).
+- Errors: `internal_error` on JSON serialization failure (no addressable
+  resource).
+
+#### `content/list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/content`
+- Params type: `ContentListParams` — `{ filters?: object }`. `filters`
+  mirrors the REST `ContentQuery` shape (`category`, `search`, `from`,
+  `to`, `sort`, `limit`, `offset`, `session_id`). Empty / null filters
+  fall back to the REST default (no filtering). Invalid filter JSON
+  returns `invalid_params`.
+- Result type: `ContentListResult` — `{ entries: ContentEntry[], total: number }`.
+- Errors: `auth_unavailable` (`-32120`) with WS close code `1008 auth_expired`
+  if the connection has no usable identity; `invalid_params` on filter
+  parse failure; `resource_not_found` with `data.resource_type = "content"`
+  on REST 404 (collection endpoint — id is empty).
+
+#### `content/delete`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `DELETE /api/my/content/{id}`
+- Params type: `ContentDeleteParams` — `{ id: string }`.
+- Result type: `ContentDeleteResult` — `{ deleted: bool }`. `deleted` is
+  `true` when the row was removed and `false` when the id was not in the
+  catalog (the REST handler returned the same boolean inside
+  `ActionResponse.ok`).
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "content"` and
+  `data.identifier = <id>` on REST 404 (previously misclassified as
+  `unknown_session`; corrected in codex review 2026-05-12).
+
+#### `content/bulk_delete`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `POST /api/my/content/bulk-delete`
+- Params type: `ContentBulkDeleteParams` — `{ ids: string[] }`. `ids` is
+  capped at `CONTENT_BULK_DELETE_MAX_IDS` (256); over-cap requests are
+  rejected with `invalid_params` before any catalog write-lock is taken
+  (`data.max_ids`, `data.requested_ids`). This prevents a single
+  oversized request from monopolizing the catalog write-lock and is a
+  finer check than the coarser 1 MiB WS frame limit.
+- Result type: `ContentBulkDeleteResult` — `{ deleted: number }`. `deleted`
+  is the row count parsed back out of the REST handler's
+  `ActionResponse.message` ("N item(s) deleted.").
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` on the over-cap guard; `resource_not_found` with
+  `data.resource_type = "content"` on REST 404 (collection endpoint).
+
 ## 8. Event Semantics
 
 ### `turn/started`
