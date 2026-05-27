@@ -42,8 +42,8 @@ use octos_core::ui_protocol::{
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
-    TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
@@ -2896,6 +2896,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             // runtime decision below.
             let auto = ApprovalAutoResolvedEvent {
                 session_id: self.session_id.clone(),
+                topic: self.session_id.topic().map(ToOwned::to_owned),
                 approval_id: approval_id.clone(),
                 turn_id: self.turn_id.clone(),
                 tool_name: event.tool_name.clone(),
@@ -2919,6 +2920,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             let policy_id = format!("policy:{}:{}", hit.scope_wire(), hit.scope_match);
             let decided_event = ApprovalDecidedEvent {
                 session_id: self.session_id.clone(),
+                topic: self.session_id.topic().map(ToOwned::to_owned),
                 approval_id: approval_id.clone(),
                 turn_id: self.turn_id.clone(),
                 decision: hit.decision.clone(),
@@ -3015,6 +3017,7 @@ fn cancel_approval_after_request_send_failure(
         ledger,
         UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
             session_id: session_id.clone(),
+            topic: session_id.topic().map(ToOwned::to_owned),
             approval_id: cancelled.approval_id,
             turn_id: cancelled.turn_id,
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
@@ -7606,25 +7609,20 @@ fn ledger_event_matches_topic_scope(
     event: &UiProtocolLedgerEvent,
     topic_scope: Option<&str>,
 ) -> bool {
-    // P0-A exemption: `file/attached` envelopes are intrinsically
-    // session-scoped via their `tool_call_id` (the SPA already binds
-    // each attachment to the originating turn/tool client-side). The
-    // event type has no `topic` field, so `UiNotification::topic()`
-    // falls back to `SessionKey.topic()` — meaning any emit site that
-    // constructs the event with a session_id stripped of (or pre-
-    // dating) the `#<topic>` suffix produces `event.topic() == None`
-    // and the strict equality below drops it for a topic-scoped
-    // subscriber. The slides soak round-13 regression captured this
-    // exact gap: `file/attached` landed on the ledger but never
-    // reached the SPA. Exempting the variant closes the wire gap with
-    // no functional cost — clients route the attachment via
-    // `tool_call_id` regardless of topic scope.
-    if matches!(
-        event,
-        UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_))
-    ) {
-        return true;
-    }
+    // Topic scoping consults `event.topic()`, which now reads the
+    // explicit `topic` field carried on every variant whose emit site
+    // can drop the topic suffix from `session_id` (TurnStarted,
+    // MessageDelta, ToolStarted/Progress/Completed, Approval*, Task*,
+    // TurnCompleted/Error/SpawnComplete, MessagePersisted,
+    // FileAttached, SessionEventBridged). #1329 closes the P0-A class
+    // routing drop: emitters populate `topic` from the upstream
+    // SessionKey BEFORE any `base_key()` strip, so a topic-scoped
+    // subscriber routes the event correctly even when `session_id`
+    // was rebuilt from `base_key()` (the gap that previously
+    // dropped `file/attached` in slides soak round-13 and was
+    // patched with a single-variant exemption — the exemption is
+    // no longer needed now that every vulnerable variant carries
+    // explicit topic).
     let event_topic = event
         .topic()
         .map(str::trim)
@@ -12469,11 +12467,13 @@ async fn run_m9_fixture_turn(
         }
         M9ProtocolFixture::ToolEvents => {
             let tool_call_id = format!("m9-tool-{}", turn_id.0);
+            let topic = session_id.topic().map(ToOwned::to_owned);
             let _ = send_notification_durable(
                 &ws,
                 &ledger,
                 UiNotification::ToolStarted(ToolStartedEvent {
                     session_id: session_id.clone(),
+                    topic: topic.clone(),
                     turn_id: turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     tool_name: "list_dir".to_owned(),
@@ -12485,6 +12485,7 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 UiNotification::ToolProgress(ToolProgressEvent {
                     session_id: session_id.clone(),
+                    topic: topic.clone(),
                     turn_id: turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     message: Some("listing workspace".to_owned()),
@@ -12496,6 +12497,7 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 UiNotification::ToolCompleted(ToolCompletedEvent {
                     session_id: session_id.clone(),
+                    topic,
                     turn_id: turn_id.clone(),
                     tool_call_id,
                     tool_name: "list_dir".to_owned(),
@@ -12702,6 +12704,8 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 None,
+                // M9 fixtures replay canned events; no live LLM token data.
+                None,
             )
             .await;
         }
@@ -12714,6 +12718,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some((code, message.as_str())),
+                None,
             )
             .await;
         }
@@ -12742,6 +12747,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some(("interrupted", "turn interrupted by client")),
+                None,
             )
             .await;
         }
@@ -12869,11 +12875,13 @@ async fn m14_codex_tool_call(
     expected_success: bool,
 ) -> Result<octos_agent::ToolResult, String> {
     let tool_call_id = format!("m14-codex-p0-{index}-{tool_name}-{}", env.turn_id.0);
+    let topic = env.session_id.topic().map(ToOwned::to_owned);
     let _ = send_notification_durable(
         env.ws,
         env.ledger,
         UiNotification::ToolStarted(ToolStartedEvent {
             session_id: env.session_id.clone(),
+            topic: topic.clone(),
             turn_id: env.turn_id.clone(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.to_owned(),
@@ -12893,6 +12901,7 @@ async fn m14_codex_tool_call(
         env.ledger,
         UiNotification::ToolCompleted(ToolCompletedEvent {
             session_id: env.session_id.clone(),
+            topic,
             turn_id: env.turn_id.clone(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.to_owned(),
@@ -13507,6 +13516,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13522,6 +13532,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13541,6 +13552,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13562,6 +13574,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13777,6 +13790,7 @@ async fn run_native_code_review_turn(
                     &session_id,
                     &turn_id,
                     Some(("interrupted", "review/start interrupted by client")),
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -13893,6 +13907,10 @@ async fn run_native_code_review_turn(
         &ledger,
         &session_id,
         &turn_id,
+        None,
+        // review/start scatter-join does not run a single LLM turn end
+        // to end; the summary message is emitted ad-hoc. No aggregated
+        // token data is in scope here.
         None,
     )
     .await;
@@ -14956,6 +14974,7 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             Some(("runtime_unavailable", error.as_str())),
+            None,
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -14980,6 +14999,7 @@ async fn run_standalone_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -15001,6 +15021,7 @@ async fn run_standalone_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -15169,6 +15190,9 @@ async fn run_standalone_turn(
             &ledger,
             &session_id,
             &turn_id,
+            None,
+            // Slash-command shortcut bypasses the LLM entirely; the
+            // reply is canned and no token meter ran.
             None,
         )
         .await;
@@ -16152,6 +16176,15 @@ async fn run_standalone_turn(
                 // Defer the send until below the persist block.
                 let mut captured_final_reply = response.content.clone();
                 let mut cursor = None;
+                // Issue #1332: capture the wire `message_id` for the
+                // final assistant row so the `done` event can surface
+                // it on `turn/completed.session_result.message_id`.
+                // Format mirrors `MessageCommitObserver`:
+                // `{session_id}:{committed_seq}:{timestamp_ns}`. Only
+                // populated on the success branch of
+                // `add_message_with_seq`, so the consumer sees a
+                // `Some` only when the durable row actually exists.
+                let mut final_assistant_message_id: Option<String> = None;
                 // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
                 // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
                 // error). Track whether the assistant row carrying
@@ -16342,6 +16375,15 @@ async fn run_standalone_turn(
                             });
                             if is_final_assistant_carrier {
                                 final_assistant_persisted = true;
+                                // Issue #1332: stamp the wire message_id
+                                // for the carrier row so `done` can
+                                // populate `session_result.message_id`.
+                                let ts_ns = saved_for_context
+                                    .timestamp
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0);
+                                final_assistant_message_id =
+                                    Some(format!("{}:{seq}:{ts_ns}", agent_session_id.0,));
                             }
                             if let Some(content) = preamble_assistant_content {
                                 last_persisted_preamble_assistant = Some(content);
@@ -16498,6 +16540,18 @@ async fn run_standalone_turn(
                                         seq: seq as u64,
                                     });
                                     final_assistant_persisted = true;
+                                    // Issue #1332: stamp message_id for
+                                    // the synthesised final-assistant
+                                    // row too (parity with the carrier
+                                    // branch above so `done`'s
+                                    // `session_result` is populated
+                                    // whichever branch wrote the row).
+                                    let ts_ns = saved_for_context
+                                        .timestamp
+                                        .timestamp_nanos_opt()
+                                        .unwrap_or(0);
+                                    final_assistant_message_id =
+                                        Some(format!("{}:{seq}:{ts_ns}", agent_session_id.0,));
                                 }
                             }
                         }
@@ -16542,12 +16596,18 @@ async fn run_standalone_turn(
                     None
                 };
                 let _ = final_reply_tx.send(final_send);
+                // Issue #1332: include `message_id` so the consumer
+                // can build `TurnSessionResult` for the
+                // `turn/completed` lifecycle envelope. Absent when no
+                // final-assistant row persisted (no synthesis +
+                // skipped carrier + JSONL write failures).
                 let done = json!({
                     "type": "done",
                     "content": response.content,
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                     "cursor": cursor,
+                    "message_id": final_assistant_message_id,
                     "thread_id": turn_thread_id_for_done,
                 });
                 let _ = progress_tx_for_result.send(done.to_string()).await;
@@ -16651,6 +16711,48 @@ async fn run_standalone_turn(
                 final_tokens_consumed = final_tokens_consumed
                     .saturating_add(tokens_in)
                     .saturating_add(tokens_out);
+                // Issue #1332: thread `done` payload data into the
+                // `turn/completed` lifecycle event. Tokens come from the
+                // same `response.token_usage` values the cost accountant
+                // sees; `session_result` is built from the cursor +
+                // message_id the persist block stamped when the final
+                // assistant row committed. The SSE bridge that
+                // originally fed these fields was removed in
+                // M9-α-5/α-6 (PR #855) — without this wiring the
+                // capability-gated fields stayed `None` for every
+                // WS-driven turn, leaving capability-aware clients
+                // unable to tell "no data" from "stub".
+                let done_cursor: Option<UiCursor> = event
+                    .get("cursor")
+                    .filter(|value| !value.is_null())
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+                let done_message_id = event
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let session_result = match (&done_cursor, done_message_id) {
+                    (Some(cursor), Some(message_id)) => Some(TurnSessionResult {
+                        committed_seq: cursor.seq,
+                        message_id,
+                        // `turn/start` does not carry a per-prompt
+                        // `client_message_id` (see `TurnStartParams`),
+                        // so the originating-cmid lookup degrades to
+                        // `None` on the WS path. The gateway path
+                        // (`SessionActor::*`) carries cmids end to end
+                        // — once that path also pipes through
+                        // `TurnCompletionDetails`, this branch picks
+                        // up cmid naturally.
+                        client_message_id: None,
+                    }),
+                    _ => None,
+                };
+                let details = TurnCompletionDetails {
+                    cursor: done_cursor,
+                    tokens_in: Some(u32::try_from(tokens_in).unwrap_or(u32::MAX)),
+                    tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
+                    session_result,
+                };
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -16662,6 +16764,7 @@ async fn run_standalone_turn(
                     &session_id,
                     &turn_id,
                     None,
+                    Some(details),
                 )
                 .await;
                 break;
@@ -16681,6 +16784,7 @@ async fn run_standalone_turn(
                     &session_id,
                     &turn_id,
                     Some(("runtime_error", message.as_str())),
+                    None,
                 )
                 .await;
                 break;
@@ -16752,6 +16856,7 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             Some(("interrupted", "turn interrupted by client")),
+            None,
         )
         .await;
     }
@@ -17076,9 +17181,27 @@ fn classify_runtime_error_message(error: &eyre::Report) -> String {
     error.to_string()
 }
 
+/// UPCR-2026-014 follow-up (issue #1332): optional token + session_result
+/// payload threaded from the agent-task `done` event into the lifecycle
+/// `turn/completed` emit. None on error/interrupt paths and on paths that
+/// have no LLM token data (M9 fixture, slash-command shortcut, review/start).
+#[derive(Debug, Default, Clone)]
+struct TurnCompletionDetails {
+    cursor: Option<UiCursor>,
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+    session_result: Option<TurnSessionResult>,
+}
+
 /// Atomically transition state and emit exactly one terminal event. No-op if
 /// the state is already `Terminal(_)`. See `transition_to_terminal` for the
 /// state-machine details.
+///
+/// `completion_details` is consulted only when `expected_reason` is
+/// `Completed`; ignored otherwise. Populated on the standalone-turn path
+/// from `done` (input/output tokens + cursor + per-row identity); left as
+/// `None` for paths that do not run the LLM (slash command, review/start
+/// scatter-join, M9 fixture replays).
 async fn try_emit_terminal(
     turn_state: &TokioMutex<TurnState>,
     expected_reason: TerminalReason,
@@ -17087,6 +17210,7 @@ async fn try_emit_terminal(
     session_id: &SessionKey,
     turn_id: &TurnId,
     error_payload: Option<(&str, &str)>,
+    completion_details: Option<TurnCompletionDetails>,
 ) {
     let Some(TerminalTransition { reason, ack }) =
         transition_to_terminal(turn_state, expected_reason).await
@@ -17099,6 +17223,7 @@ async fn try_emit_terminal(
     // but the ledger is still appended so reconnect-replay can catch up.
     match reason {
         TerminalReason::Completed => {
+            let details = completion_details.unwrap_or_default();
             let _ = send_notification_lifecycle(
                 ws,
                 ledger,
@@ -17106,15 +17231,15 @@ async fn try_emit_terminal(
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id: turn_id.clone(),
-                    cursor: None,
-                    // UPCR-2026-014 (M9-α-9) addendum fields; the WS
-                    // lifecycle path doesn't have token usage /
-                    // session_result threaded yet — those land via the
-                    // SSE bridge in α-9. Leaving them None preserves
-                    // the pre-addendum wire shape for WS-driven turns.
-                    tokens_in: None,
-                    tokens_out: None,
-                    session_result: None,
+                    cursor: details.cursor,
+                    // UPCR-2026-014 (M9-α-9) addendum fields. The SSE
+                    // bridge that originally fed `session_result` was
+                    // removed in M9-α-5/α-6 (PR #855); issue #1332 wires
+                    // the same values straight from the agent task's
+                    // `done` event so the WS path is no longer dormant.
+                    tokens_in: details.tokens_in,
+                    tokens_out: details.tokens_out,
+                    session_result: details.session_result,
                 }),
             );
         }
@@ -17677,6 +17802,7 @@ async fn abort_connection_turns(
             let _ = ledger.append_notification(UiNotification::ApprovalCancelled(
                 ApprovalCancelledEvent {
                     session_id: session_id.clone(),
+                    topic: session_id.topic().map(ToOwned::to_owned),
                     approval_id: entry.approval_id,
                     turn_id: entry.turn_id,
                     reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
@@ -21264,6 +21390,136 @@ ignore = []
                 text: "x".into(),
             }));
         assert_eq!(ledger_event_cursor(&delta), None);
+    }
+
+    /// Issue #1332: when the standalone-turn `done` event carries
+    /// token totals + cursor + final-assistant message_id, the
+    /// `turn/completed` lifecycle envelope must surface them on
+    /// `tokens_in`, `tokens_out`, and `session_result` rather than the
+    /// dormant-stub `None` triple. Drives `try_emit_terminal` directly
+    /// because the spawn pipeline is too wide to fixture; the helper
+    /// is the wire-side closure that issue #1332 modified.
+    #[tokio::test]
+    async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+        let cursor = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 17,
+        };
+        let details = TurnCompletionDetails {
+            cursor: Some(cursor.clone()),
+            tokens_in: Some(123),
+            tokens_out: Some(456),
+            session_result: Some(TurnSessionResult {
+                committed_seq: cursor.seq,
+                message_id: format!("{}:{}:{}", session_id.0, cursor.seq, 99_999),
+                client_message_id: Some("cmid-user-1".into()),
+            }),
+        };
+
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+            Some(details.clone()),
+        )
+        .await;
+
+        let mut completed_frame: Option<String> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let WsMessage::Text(text) = msg {
+                if text.contains("\"method\":\"turn/completed\"") {
+                    completed_frame = Some(text.to_string());
+                    break;
+                }
+            }
+        }
+        let frame = completed_frame.expect("turn/completed must be emitted");
+        assert!(
+            frame.contains("\"tokens_in\":123"),
+            "tokens_in must surface from completion details: {frame}"
+        );
+        assert!(
+            frame.contains("\"tokens_out\":456"),
+            "tokens_out must surface from completion details: {frame}"
+        );
+        assert!(
+            frame.contains("\"session_result\""),
+            "session_result must surface when populated: {frame}"
+        );
+        assert!(
+            frame.contains("\"committed_seq\":17"),
+            "session_result.committed_seq must mirror cursor.seq: {frame}"
+        );
+        assert!(
+            frame.contains("\"client_message_id\":\"cmid-user-1\""),
+            "session_result.client_message_id must round-trip: {frame}"
+        );
+        assert!(
+            frame.contains("\"cursor\""),
+            "top-level cursor must be threaded too: {frame}"
+        );
+    }
+
+    /// Companion negative test: paths that do not run an LLM (slash
+    /// command shortcut, M9 fixture, review/start) pass `None` for
+    /// `completion_details`. The wire shape must degrade gracefully to
+    /// the pre-#1332 envelope with no token fields surfaced, so capability
+    /// clients keying off `tokens_in == None` aren't misled.
+    #[tokio::test]
+    async fn try_emit_terminal_with_no_details_omits_token_fields() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+            None,
+        )
+        .await;
+
+        let mut completed_frame: Option<String> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let WsMessage::Text(text) = msg {
+                if text.contains("\"method\":\"turn/completed\"") {
+                    completed_frame = Some(text.to_string());
+                    break;
+                }
+            }
+        }
+        let frame = completed_frame.expect("turn/completed must be emitted");
+        // `serde(skip_serializing_if = "Option::is_none")` on each field
+        // means a `None` triple should NOT appear on the wire.
+        assert!(
+            !frame.contains("\"tokens_in\""),
+            "tokens_in must be omitted when details are None: {frame}"
+        );
+        assert!(
+            !frame.contains("\"tokens_out\""),
+            "tokens_out must be omitted when details are None: {frame}"
+        );
+        assert!(
+            !frame.contains("\"session_result\""),
+            "session_result must be omitted when details are None: {frame}"
+        );
     }
 
     #[test]
@@ -27432,6 +27688,7 @@ ignore = []
             .expect("request was registered");
         ledger.append_notification(UiNotification::ApprovalDecided(ApprovalDecidedEvent {
             session_id: session_id.clone(),
+            topic: None,
             approval_id: approval_id.clone(),
             turn_id: decided_turn_id,
             decision: ApprovalDecision::Approve,
@@ -28900,6 +29157,7 @@ ignore = []
     fn file_attached_for(session: &SessionKey) -> UiNotification {
         UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
             session_id: session.clone(),
+            topic: session.topic().map(ToOwned::to_owned),
             turn_id: TurnId::new(),
             path: "/tmp/deck.pptx".into(),
             tool_call_id: Some("tc-slides".into()),
@@ -29194,48 +29452,237 @@ ignore = []
         abort_live_forwarders(&forwarders, &ledger).await;
     }
 
-    /// Complementary unit test for `ledger_event_matches_topic_scope`:
-    /// `file/attached` events MUST always match a topic-scoped
-    /// subscriber, regardless of whether the event itself carries a
-    /// topic. Companion to
-    /// `live_forwarder_delivers_file_attached_to_topic_scoped_subscriber`
-    /// — guards the filter in isolation so a refactor that re-routes
-    /// the call site can't silently break the exemption.
+    /// #1329 (closes the P0-A class routing drop): The 6 events that
+    /// previously had no explicit `topic` field — ToolStarted,
+    /// ToolProgress, ToolCompleted, ApprovalAutoResolved,
+    /// ApprovalDecided, ApprovalCancelled — gained the same
+    /// `topic: Option<String>` field that the 10 already-fixed
+    /// variants carry. With emitters populating the field from the
+    /// upstream `SessionKey.topic()` BEFORE any `base_key()` strip,
+    /// each event reaches a topic-scoped subscriber.
+    ///
+    /// This integration-style test pins the invariant for ALL 6
+    /// variants on the live broadcast path: emit each event on a
+    /// topic-suffixed broadcast key with the explicit `topic` field,
+    /// then assert each frame reaches a topic-scoped subscriber (the
+    /// classifier reads `event.topic()` first, honoring the explicit
+    /// field).
+    #[tokio::test]
+    async fn live_forwarder_delivers_tool_and_approval_events_to_topic_scoped_subscriber() {
+        let (ws, mut rx) = ws_connection_for_test(64);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let topic_session = SessionKey("local:slides-soak#slides".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&topic_session);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            topic_session.clone(),
+            0,
+            ws.connection_id(),
+            ConnectionUiFeatures::default(),
+            Some("slides".into()),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        let turn_id = TurnId::new();
+        let tool_call_id = "tc-1329".to_owned();
+
+        // 1. ToolStarted
+        ledger.append_notification(UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "shell".into(),
+            arguments: None,
+        }));
+
+        // 2. ToolProgress
+        ledger.append_notification(UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            message: Some("running step 1".into()),
+            progress_pct: Some(50.0),
+        }));
+
+        // 3. ToolCompleted
+        ledger.append_notification(UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            turn_id: turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: Some(10),
+        }));
+
+        // 4. ApprovalAutoResolved
+        ledger.append_notification(UiNotification::ApprovalAutoResolved(
+            ApprovalAutoResolvedEvent {
+                session_id: topic_session.clone(),
+                topic: Some("slides".into()),
+                approval_id: ApprovalId::new(),
+                turn_id: turn_id.clone(),
+                tool_name: "shell".into(),
+                scope: "session".into(),
+                scope_match: "exact".into(),
+                decision: ApprovalDecision::Approve,
+            },
+        ));
+
+        // 5. ApprovalDecided
+        ledger.append_notification(UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: turn_id.clone(),
+            decision: ApprovalDecision::Approve,
+            scope: Some("session".into()),
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        }));
+
+        // 6. ApprovalCancelled
+        ledger.append_notification(UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session.clone(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: turn_id.clone(),
+            reason: "turn_interrupted".into(),
+        }));
+
+        // Verify each method lands on the subscriber. Order matches
+        // emission order — the ledger preserves seq.
+        let expected = [
+            methods::TOOL_STARTED,
+            methods::TOOL_PROGRESS,
+            methods::TOOL_COMPLETED,
+            methods::APPROVAL_AUTO_RESOLVED,
+            methods::APPROVAL_DECIDED,
+            methods::APPROVAL_CANCELLED,
+        ];
+        for method in expected.iter() {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {method}"))
+                .unwrap_or_else(|| panic!("ws closed before {method}"));
+            assert_eq!(
+                frame_method(&frame).as_deref(),
+                Some(*method),
+                "{method} with explicit topic=Some(\"slides\") must reach \
+                 a topic-scoped subscriber (#1329)"
+            );
+        }
+
+        abort_live_forwarders(&forwarders, &ledger).await;
+    }
+
+    /// Mirror of the positive test above: when an event of one of the
+    /// six P0-A class variants carries a NON-MATCHING explicit topic,
+    /// the classifier drops it from the topic-scoped subscriber.
+    /// Topic IS part of the routing key now (no more file/attached-
+    /// style always-deliver exemption).
+    #[tokio::test]
+    async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let topic_session = SessionKey("local:slides-soak#slides".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&topic_session);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            topic_session.clone(),
+            0,
+            ws.connection_id(),
+            ConnectionUiFeatures::default(),
+            Some("slides".into()),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Event carries `topic = "other"` — the classifier must drop
+        // it for the "slides"-scoped subscriber.
+        ledger.append_notification(UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session.clone(),
+            topic: Some("other".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-other".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "tool/started with topic=\"other\" must NOT reach a \
+             topic=\"slides\" subscriber (#1329 routing-key invariant)"
+        );
+
+        abort_live_forwarders(&forwarders, &ledger).await;
+    }
+
+    /// #1329 follow-up to P0-A: `file/attached` now carries an explicit
+    /// `topic: Option<String>` field. The classifier consults
+    /// `event.topic()`, which reads that field first and falls back to
+    /// the `SessionKey.topic()` suffix. With emitters populating the
+    /// field at the source, the prior `file/attached`-only exemption
+    /// in `ledger_event_matches_topic_scope` is no longer needed — the
+    /// routing follows the same rule as every other variant.
     #[test]
-    fn ledger_event_matches_topic_scope_exempts_file_attached() {
+    fn ledger_event_matches_topic_scope_routes_file_attached_by_topic_field() {
         let bare_session = SessionKey("local:slides-soak".into());
         let topic_session = SessionKey("local:slides-soak#slides".into());
         let other_topic_session = SessionKey("local:slides-soak#other".into());
 
-        // Bare event, topic-scoped subscriber: pre-fix → DROP; post-fix → PASS.
+        // Bare event, topic-scoped subscriber: no topic on the event,
+        // topic on the subscriber → DROP (no longer exempt).
         let bare_event = UiProtocolLedgerEvent::Notification(file_attached_for(&bare_session));
         assert!(
-            ledger_event_matches_topic_scope(&bare_event, Some("slides")),
-            "file/attached with no topic must reach a topic-scoped subscriber"
+            !ledger_event_matches_topic_scope(&bare_event, Some("slides")),
+            "file/attached with no topic must NOT reach a topic-scoped subscriber"
         );
 
-        // Topic-suffixed event, topic-scoped subscriber: always PASSED.
+        // Topic-suffixed event, topic-scoped subscriber: explicit
+        // topic matches → PASS.
         let topic_event = UiProtocolLedgerEvent::Notification(file_attached_for(&topic_session));
         assert!(
             ledger_event_matches_topic_scope(&topic_event, Some("slides")),
             "file/attached with matching topic must reach a topic-scoped subscriber"
         );
 
-        // Mismatched topic, topic-scoped subscriber: pre-fix → DROP;
-        // post-fix → PASS (file/attached is exempt from topic scoping).
+        // Mismatched topic, topic-scoped subscriber: explicit topic
+        // mismatches → DROP. Topic IS part of the routing key now.
         let other_event =
             UiProtocolLedgerEvent::Notification(file_attached_for(&other_topic_session));
         assert!(
-            ledger_event_matches_topic_scope(&other_event, Some("slides")),
-            "file/attached is exempt from topic-scope filtering — \
-             a non-matching event.topic must NOT block delivery"
+            !ledger_event_matches_topic_scope(&other_event, Some("slides")),
+            "file/attached with non-matching topic must NOT reach a topic-scoped subscriber"
         );
 
-        // Bare subscriber, topic-suffixed event: always PASSED by the
-        // exemption too (defensive consistency).
+        // Bare subscriber, topic-suffixed event → DROP (topic on
+        // event, no topic on subscriber).
         assert!(
-            ledger_event_matches_topic_scope(&topic_event, None),
-            "file/attached must reach a bare (no-topic) subscriber"
+            !ledger_event_matches_topic_scope(&topic_event, None),
+            "file/attached with topic must NOT reach a bare (no-topic) subscriber"
+        );
+
+        // Bare event + bare subscriber → PASS (the no-topic case).
+        assert!(
+            ledger_event_matches_topic_scope(&bare_event, None),
+            "file/attached with no topic must reach a bare (no-topic) subscriber"
         );
     }
 

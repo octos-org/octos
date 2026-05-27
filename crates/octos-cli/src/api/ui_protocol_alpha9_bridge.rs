@@ -131,6 +131,7 @@ pub(super) fn emit_file_attached(
 ) {
     let notification = UiNotification::FileAttached(FileAttachedEvent {
         session_id: session_id.clone(),
+        topic: session_id.topic().map(ToOwned::to_owned),
         turn_id: turn_id.clone(),
         path,
         tool_call_id,
