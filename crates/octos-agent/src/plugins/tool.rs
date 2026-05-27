@@ -1735,6 +1735,151 @@ fn normalize_mofa_style_name(style: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
+/// Pre-flight validator for `mofa_slides`' `style` argument.
+///
+/// Mirrors the `RunPipelineTool::pre_flight_validate` pattern (PR #1015): catch
+/// known-bad LLM-generated input synchronously in the foreground so the
+/// spawn_only intercept records the failure on `iter_tool_success` and the LLM
+/// sees a `[VALIDATION FAILED] …` tool_result in its next iteration. Without
+/// this, the foreground intercept emits the synth-ack ("Background work
+/// started for `mofa_slides`.") to the LLM, the plugin later writes
+/// `{"success":false,"output":"style not found"}`, but the LLM-side
+/// conversation has already moved on — only the UI sees the failure and the
+/// model never retries with a corrected style.
+///
+/// Scope is deliberately narrow:
+/// - missing / empty `style` → `Ok` (plugin's default-style path).
+/// - any non-empty `style` (bare name, `name.toml`, absolute path, slash-
+///   containing path, traversal) → normalize to a basename stem (same shape
+///   `normalize_mofa_style_name` produces at the rewriter), then look for
+///   `<dir>/styles/<stem>.toml` under each candidate directory.
+///
+/// Candidate directories searched, in order:
+///   1. `<skill_dir>/styles/<stem>.toml` — built-in styles shipped with the
+///      plugin.
+///   2. `<work_dir>/styles/<stem>.toml` — `SessionRuntime` binds plugin
+///      `work_dir` to `<workspace>/skill-output`, so this covers styles
+///      authored under that subdirectory.
+///   3. `<work_dir.parent()>/styles/<stem>.toml` — covers the workspace-root
+///      `styles/` directory that `slides_default.txt:62` instructs the LLM
+///      to author into. Without this probe, a valid custom style at
+///      `<workspace>/styles/foo.toml` would be falsely rejected when the
+///      plugin runs from `<workspace>/skill-output`.
+///
+/// Codex review on PR #1323:
+/// - BLOCKER: previously only `<work_dir>/styles/`, falsely rejecting
+///   workspace-root customs the prompt tells the LLM to create.
+/// - MAJOR: previously bare `if path-like → Ok` skipped path-shaped values,
+///   so `style: "../etc/passwd"` bypassed pre-flight and surfaced as a
+///   background failure only the UI saw. Now the basename is normalized
+///   first (matching the `normalize_mofa_style_name` rewriter) so traversal,
+///   absolute paths, and slash-containing values are all validated against
+///   the same on-disk lookup as bare names.
+fn validate_mofa_slides_style(
+    args: &serde_json::Value,
+    skill_dir: Option<&std::path::Path>,
+    work_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let Some(style) = args.get("style").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let trimmed = style.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // Mirror the rewriter at tool.rs:609 / tool.rs:778: take the basename and
+    // strip any `.toml` suffix. The rewriter will normalize a path-shaped
+    // value to this same stem before the plugin sees it, so the pre-flight
+    // MUST validate the post-normalization name — otherwise traversal /
+    // absolute / slash-prefixed values slip past and fail in the background.
+    let Some(stem) = normalize_mofa_style_name(trimmed) else {
+        return Err(format!(
+            "style '{trimmed}' is not a valid style name (must normalize to a non-empty basename). \
+            See SKILL.md `Custom styles (full TOML)` section."
+        ));
+    };
+    let filename = format!("{stem}.toml");
+
+    let parent_probe = work_dir
+        .filter(|wd| {
+            wd.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == "skill-output")
+                .unwrap_or(false)
+        })
+        .and_then(|wd| wd.parent());
+
+    for dir in [skill_dir, work_dir, parent_probe].into_iter().flatten() {
+        if dir.join("styles").join(&filename).exists() {
+            return Ok(());
+        }
+    }
+
+    let mut msg = format!("style '{trimmed}' not found");
+    let builtin = list_available_styles(skill_dir);
+    if !builtin.is_empty() {
+        msg.push_str("\nAvailable built-in styles: ");
+        msg.push_str(&builtin.join(", "));
+    }
+    let mut custom_dirs: Vec<&std::path::Path> = Vec::new();
+    if let Some(wd) = work_dir {
+        custom_dirs.push(wd);
+    }
+    if let Some(parent) = parent_probe {
+        custom_dirs.push(parent);
+    }
+    let mut custom: Vec<String> = custom_dirs
+        .iter()
+        .flat_map(|dir| list_available_styles(Some(dir)))
+        .collect();
+    custom.sort();
+    custom.dedup();
+    if !custom.is_empty() {
+        msg.push_str("\nAvailable workspace custom styles: ");
+        msg.push_str(&custom.join(", "));
+    }
+    // Use the normalized stem in the authoring hint so a caller-supplied
+    // `style: "foo.toml"` does not become `styles/foo.toml.toml`.
+    let hint_root = parent_probe.or(work_dir);
+    if let Some(wd) = hint_root {
+        msg.push_str(&format!(
+            "\nHint: author a workspace custom style at {}/styles/{stem}.toml.",
+            wd.display()
+        ));
+    }
+    msg.push_str("\nSee SKILL.md `Custom styles (full TOML)` section.");
+    Err(msg)
+}
+
+/// List `*.toml` style filenames (stem only) under `<dir>/styles/`. Returns
+/// `Vec::new()` when `dir` is `None`, when `styles/` does not exist, or when
+/// the read fails — callers treat an empty list as "nothing to suggest" and
+/// fall through to the path hint, so an IO error here degrades gracefully.
+fn list_available_styles(dir: Option<&std::path::Path>) -> Vec<String> {
+    let Some(dir) = dir else {
+        return Vec::new();
+    };
+    let styles_dir = dir.join("styles");
+    let Ok(entries) = std::fs::read_dir(&styles_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[async_trait]
 impl Tool for PluginTool {
     fn name(&self) -> &str {
@@ -1794,6 +1939,28 @@ impl Tool for PluginTool {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Synchronous foreground validation of LLM-generated arguments.
+    ///
+    /// Currently gated to `mofa_slides` only: catches `style="..."` bare-name
+    /// values that don't resolve to a `<skill_dir>/styles/<name>.toml` or
+    /// `<work_dir>/styles/<name>.toml` before the spawn_only intercept hands
+    /// the call off to a background task. This closes the spawn_only
+    /// synth-ack gap (LLM was told "started" while the plugin later wrote
+    /// `success:false` only the UI ever saw — see the doc comment on
+    /// `validate_mofa_slides_style`). The check is intentionally cheap (path
+    /// existence + a single `read_dir` for the error message) so the
+    /// foreground turn isn't blocked.
+    ///
+    /// Other plugin tools fall through to the trait default (`Ok`).
+    async fn pre_flight_validate(&self, args: &serde_json::Value) -> Result<(), String> {
+        if self.tool_def.name == "mofa_slides" {
+            let skill_dir = self.executable.parent();
+            let work_dir = self.work_dir.as_deref();
+            validate_mofa_slides_style(args, skill_dir, work_dir)?;
+        }
+        Ok(())
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -5424,6 +5591,288 @@ mod tests {
             rewritten["script_path"].as_str().unwrap(),
             script.to_string_lossy().to_string(),
             "legacy rescue must continue to bridge workspace-root scripts"
+        );
+    }
+
+    // ---- mofa_slides style pre-flight validator ----
+    //
+    // These cover the synth-ack gap closed in
+    // `Tool::pre_flight_validate` for `mofa_slides`: invalid `style=`
+    // values used to slip past the spawn_only intercept and the LLM
+    // never saw the plugin's later `success:false`. The pre-flight now
+    // catches bare-name styles synchronously so the LLM gets a
+    // `[VALIDATION FAILED]` tool_result instead of the misleading
+    // synth-ack.
+
+    /// Helper: build a temp `skill_dir` with `styles/<name>.toml` entries.
+    fn make_skill_dir_with_styles(styles: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create skill_dir");
+        let styles_dir = dir.path().join("styles");
+        std::fs::create_dir_all(&styles_dir).expect("mkdir styles");
+        for name in styles {
+            std::fs::write(styles_dir.join(format!("{name}.toml")), b"").expect("write style");
+        }
+        dir
+    }
+
+    #[test]
+    fn mofa_slides_preflight_accepts_builtin_style() {
+        let skill_dir =
+            make_skill_dir_with_styles(&["nb-pro", "puer-tea", "modern-cn", "vintage-jp"]);
+
+        let result =
+            validate_mofa_slides_style(&json!({"style": "nb-pro"}), Some(skill_dir.path()), None);
+
+        assert!(
+            result.is_ok(),
+            "built-in style must pass pre-flight: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_accepts_workspace_custom_style() {
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let work_dir = make_skill_dir_with_styles(&["custom-brand"]);
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "custom-brand"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "workspace custom style must pass pre-flight: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_rejects_missing_style() {
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro", "puer-tea"]);
+        let work_dir = make_skill_dir_with_styles(&["custom-brand"]);
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "puer-woodcut"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        let Err(msg) = result else {
+            panic!("expected pre-flight to reject invalid style, got Ok");
+        };
+        assert!(
+            msg.contains("not found"),
+            "error must mention 'not found': {msg}"
+        );
+        assert!(
+            msg.contains("Available built-in styles"),
+            "error must list available built-in styles: {msg}"
+        );
+        // Built-in names should be present, sorted/joined.
+        assert!(msg.contains("nb-pro"), "error must list nb-pro: {msg}");
+        assert!(msg.contains("puer-tea"), "error must list puer-tea: {msg}");
+        // Workspace custom styles listed separately.
+        assert!(
+            msg.contains("Available workspace custom styles"),
+            "error must list workspace customs: {msg}"
+        );
+        assert!(
+            msg.contains("custom-brand"),
+            "error must list custom-brand: {msg}"
+        );
+        // Hint to author under work_dir/styles/.
+        assert!(
+            msg.contains(&format!(
+                "{}/styles/puer-woodcut.toml",
+                work_dir.path().display()
+            )),
+            "error must hint at the workspace authoring path: {msg}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_passes_when_no_style_arg() {
+        // No styles dir at all on disk — pre-flight must NOT touch the
+        // filesystem when the LLM omits `style`. The plugin's
+        // default-style fallback path is what runs in production.
+        let skill_dir = tempfile::tempdir().expect("create skill_dir");
+        let work_dir = tempfile::tempdir().expect("create work_dir");
+
+        for args in [json!({}), json!({"style": ""}), json!({"style": "   "})] {
+            let result =
+                validate_mofa_slides_style(&args, Some(skill_dir.path()), Some(work_dir.path()));
+            assert!(
+                result.is_ok(),
+                "missing/empty style must pass pre-flight (args={args:?}): {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_slides_preflight_only_fires_for_mofa_slides_tool() {
+        // A plugin tool with a different name must NOT be gated by the
+        // mofa_slides style check, even when it carries a bogus `style`
+        // arg — the pre-flight is intentionally scoped to one tool.
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let executable = skill_dir.path().join("other-binary");
+        std::fs::write(&executable, b"").expect("write fake exe");
+
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"style": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, executable);
+
+        let result = tool
+            .pre_flight_validate(&json!({"style": "does-not-exist"}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "non-mofa_slides tool must skip pre-flight even with bad style: {result:?}"
+        );
+
+        // And the mofa_slides tool with the same bogus style MUST fail.
+        let mofa_def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides".to_string(),
+            input_schema: json!({"type": "object", "properties": {"style": {"type": "string"}}}),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let mofa_executable = skill_dir.path().join("mofa-slides");
+        std::fs::write(&mofa_executable, b"").expect("write fake mofa exe");
+        let mofa_tool = PluginTool::new("mofa-slides".into(), mofa_def, mofa_executable);
+        let mofa_result = mofa_tool
+            .pre_flight_validate(&json!({"style": "does-not-exist"}))
+            .await;
+        assert!(
+            mofa_result.is_err(),
+            "mofa_slides MUST reject bad style at pre-flight: {mofa_result:?}"
+        );
+    }
+
+    // ---- Codex review on PR #1323 regression tests ----
+    //
+    // These guard the BLOCKER + MAJOR + MINOR findings: workspace-root
+    // custom styles when `work_dir` is `<workspace>/skill-output`,
+    // path-shaped style values that the mofa rewriter would otherwise
+    // normalize to a missing basename, and the `.toml.toml` hint bug.
+
+    #[test]
+    fn mofa_slides_preflight_accepts_workspace_root_custom_style_when_work_dir_is_skill_output() {
+        // SessionRuntime binds the plugin work_dir to
+        // `<workspace>/skill-output` (see runtime/session.rs:222), but the
+        // slides prompt tells the LLM to author custom styles at
+        // workspace-root `styles/{name}.toml` (slides_default.txt:62). The
+        // pre-flight must probe `work_dir.parent()/styles/` when work_dir
+        // basename is `skill-output`, otherwise a valid workspace-root
+        // custom is falsely rejected.
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let workspace_styles = workspace.path().join("styles");
+        std::fs::create_dir_all(&workspace_styles).expect("mkdir workspace styles");
+        std::fs::write(workspace_styles.join("foo.toml"), b"").expect("write workspace style");
+        let work_dir = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&work_dir).expect("mkdir skill-output");
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "foo"}),
+            Some(skill_dir.path()),
+            Some(&work_dir),
+        );
+
+        assert!(
+            result.is_ok(),
+            "workspace-root custom style at <ws>/styles/foo.toml must pass pre-flight \
+             when work_dir=<ws>/skill-output: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_rejects_traversal_style() {
+        // The mofa rewriter normalizes "../etc/passwd" to basename "passwd"
+        // (see normalize_mofa_style_name + tool.rs:609). Pre-flight must
+        // validate that normalized basename so the bypass doesn't surface
+        // as a background `success:false` the LLM never sees.
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let work_dir = tempfile::tempdir().expect("create work_dir");
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "../etc/passwd"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        let Err(msg) = result else {
+            panic!("expected pre-flight to reject traversal style, got Ok");
+        };
+        assert!(
+            msg.contains("not found") || msg.contains("not a valid style name"),
+            "error must signal rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_rejects_absolute_path_style() {
+        // The rewriter normalizes "/tmp/missing.toml" to basename
+        // "missing" before the plugin runs (tool.rs:778). Pre-flight must
+        // validate that, not skip path-shaped values.
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let work_dir = tempfile::tempdir().expect("create work_dir");
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "/tmp/missing.toml"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        assert!(
+            result.is_err(),
+            "absolute-path style with missing basename must fail pre-flight: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mofa_slides_preflight_hint_does_not_double_toml_suffix() {
+        // When the LLM passes `style: "foo.toml"` and the file doesn't
+        // exist, the authoring hint must say `styles/foo.toml`, not
+        // `styles/foo.toml.toml`. The hint formatter must use the
+        // normalized stem.
+        let skill_dir = make_skill_dir_with_styles(&["nb-pro"]);
+        let work_dir = tempfile::tempdir().expect("create work_dir");
+
+        let result = validate_mofa_slides_style(
+            &json!({"style": "foo.toml"}),
+            Some(skill_dir.path()),
+            Some(work_dir.path()),
+        );
+
+        let Err(msg) = result else {
+            panic!("expected pre-flight to reject missing 'foo.toml', got Ok");
+        };
+        assert!(
+            !msg.contains("foo.toml.toml"),
+            "authoring hint must not double the .toml suffix: {msg}"
+        );
+        assert!(
+            msg.contains("styles/foo.toml"),
+            "authoring hint must reference styles/foo.toml: {msg}"
+        );
+        assert!(
+            msg.contains("SKILL.md"),
+            "error must reference SKILL.md custom-style authoring: {msg}"
         );
     }
 }
