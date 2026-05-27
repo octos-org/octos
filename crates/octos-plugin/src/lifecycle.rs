@@ -75,7 +75,7 @@ pub struct LifecycleStep {
     /// Timeout for this step in milliseconds. Kept in milliseconds rather
     /// than seconds so tests can exercise sub-second timeouts without
     /// sleeping for real wallclock seconds.
-    #[serde(default = "default_timeout_ms", alias = "timeout_ms")]
+    #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Number of retry attempts on failure.
     #[serde(default)]

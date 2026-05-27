@@ -175,6 +175,12 @@ pub struct PluginManifest {
     /// without this field behave exactly as they did before RP02.
     #[serde(default)]
     pub hardware_lifecycle: Option<HardwareLifecycle>,
+
+    /// How this skill's tools are discovered. Defaults to `Static`
+    /// (enumerated in `tools`); `Http` triggers dynamic discovery from
+    /// a localhost bridge.
+    #[serde(default)]
+    pub tool_discovery: ToolDiscovery,
 }
 
 impl PluginManifest {
