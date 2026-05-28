@@ -330,6 +330,7 @@ impl PluginLoader {
         let manifest_load_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         let manifest: PluginManifest = serde_json::from_str(&content)
             .map_err(|e| eyre::eyre!("invalid manifest.json: {e}"))?;
+        validate_manifest_tool_schemas(&manifest)?;
 
         // Section B (codex review P1.2 + follow-up): under strict signing,
         // REJECT any extras-only manifest before we resolve extras or
@@ -540,10 +541,9 @@ impl PluginLoader {
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
         // Collect spawn_only tool names and messages before consuming
-        // manifest.tools. Tools that fail manifest validation below are
-        // skipped — drop them from the spawn_only metadata too so the
-        // execution loop doesn't try to auto-background a tool that was
-        // never registered.
+        // manifest.tools. Schema validation has already rejected provider-
+        // incompatible tool schemas; tools that fail registration hygiene
+        // below are skipped, so drop them from spawn_only metadata too.
         let spawn_only_names: Vec<String> = manifest
             .tools
             .iter()
@@ -667,6 +667,45 @@ impl PluginLoader {
 
         Ok((tools, extras))
     }
+}
+
+fn validate_manifest_tool_schemas(manifest: &PluginManifest) -> Result<()> {
+    validate_manifest_tool_schemas_with(manifest, octos_plugin::ValidationProfile::from_env())
+}
+
+fn validate_manifest_tool_schemas_with(
+    manifest: &PluginManifest,
+    profile: octos_plugin::ValidationProfile,
+) -> Result<()> {
+    if matches!(profile, octos_plugin::ValidationProfile::Off) {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    for tool in &manifest.tools {
+        errors.extend(octos_plugin::validate_schema(
+            &tool.name,
+            octos_plugin::SchemaKind::Input,
+            &tool.input_schema,
+            profile,
+        ));
+    }
+
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    let details = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    eyre::bail!(
+        "plugin '{}' has {} schema violation(s):\n{}\n\nSet OCTOS_MANIFEST_VALIDATION=lenient to relax the strict octos profile, or =off to disable validation entirely.",
+        manifest.name,
+        errors.len(),
+        details
+    );
 }
 
 fn apply_builtin_env_allowlist(plugin_name: &str, mut def: PluginToolDef) -> PluginToolDef {
@@ -1155,6 +1194,60 @@ mod tests {
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn manifest_tool_schema_validation_rejects_untyped_anyof_branch() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{
+              "name": "bad-schema-plugin",
+              "version": "1.0",
+              "tools": [{
+                "name": "mofa_slides",
+                "description": "Generate slides",
+                "input_schema": {
+                  "type": "object",
+                  "anyOf": [
+                    { "required": ["slides"] },
+                    { "required": ["input"] }
+                  ]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let err =
+            validate_manifest_tool_schemas_with(&manifest, octos_plugin::ValidationProfile::Strict)
+                .expect_err("strict schema validation must reject provider-hostile schemas");
+        let msg = err.to_string();
+        assert!(msg.contains("plugin 'bad-schema-plugin'"));
+        assert!(msg.contains("/anyOf/0"));
+        assert!(msg.contains("must declare a `type`"));
+    }
+
+    #[test]
+    fn manifest_tool_schema_validation_honors_lenient_profile() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{
+              "name": "legacy-schema-plugin",
+              "version": "1.0",
+              "tools": [{
+                "name": "legacy_tool",
+                "description": "Legacy",
+                "input_schema": {
+                  "type": "object",
+                  "anyOf": [
+                    { "required": ["legacy"] }
+                  ]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        validate_manifest_tool_schemas_with(&manifest, octos_plugin::ValidationProfile::Lenient)
+            .expect("lenient profile should preserve the documented escape hatch");
     }
 
     #[cfg(unix)]
