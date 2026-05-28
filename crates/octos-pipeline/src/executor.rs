@@ -1371,10 +1371,22 @@ impl PipelineExecutor {
     /// as the synthetic tool name (`pipeline:<node_id>`) and the
     /// `parent_tool_call_id` from the host context as the
     /// `tool_call_id` so the UI can stitch the node tree under the
-    /// invoking run_pipeline pill. Returns `None` when no supervisor
-    /// is wired (legacy callers).
-    fn register_node_task(&self, node_id: &str) -> Option<String> {
-        let supervisor = self.config.host_context.task_supervisor.as_ref()?;
+    /// invoking run_pipeline pill.
+    ///
+    /// NEW-18b — uses the supervisor's strict
+    /// [`octos_agent::task_supervisor::TaskSupervisor::try_register_node_task`]
+    /// entry point so a child registration against an already-terminal
+    /// parent (e.g. orphan-swept on restart) is refused. Returns:
+    /// * `Ok(None)` when no supervisor is wired (legacy callers).
+    /// * `Ok(Some(task_id))` on a successful registration.
+    /// * `Err(reason)` when the parent is terminal OR the cap fires.
+    ///   The caller short-circuits the local node future so dropped
+    ///   workers don't continue burning CPU/tokens against a parent
+    ///   that no longer has a live failure-recovery path.
+    fn register_node_task(&self, node_id: &str) -> Result<Option<String>, String> {
+        let Some(supervisor) = self.config.host_context.task_supervisor.as_ref() else {
+            return Ok(None);
+        };
         let parent_tool_call_id = self
             .config
             .host_context
@@ -1383,14 +1395,26 @@ impl PipelineExecutor {
             .unwrap_or("");
         let session_key = self.config.host_context.parent_session_key.as_deref();
         let tool_name = format!("pipeline:{node_id}");
-        let task_id = supervisor.register(&tool_name, parent_tool_call_id, session_key);
-        info!(
-            node = %node_id,
-            task_id = %task_id,
-            parent_tool_call_id = %parent_tool_call_id,
-            "registered pipeline node child task"
-        );
-        Some(task_id)
+        match supervisor.try_register_node_task(&tool_name, parent_tool_call_id, session_key) {
+            Ok(task_id) => {
+                info!(
+                    node = %node_id,
+                    task_id = %task_id,
+                    parent_tool_call_id = %parent_tool_call_id,
+                    "registered pipeline node child task"
+                );
+                Ok(Some(task_id))
+            }
+            Err(err) => {
+                warn!(
+                    node = %node_id,
+                    parent_tool_call_id = %parent_tool_call_id,
+                    error = %err,
+                    "pipeline node child registration refused; aborting node future"
+                );
+                Err(err.to_string())
+            }
+        }
     }
 
     /// Reserve sub-budget for a single LLM-call node. Returns:
@@ -2408,7 +2432,30 @@ impl PipelineExecutor {
             // the session actor) bridges every state transition onto
             // the SSE stream so the chat UI's NodeCard can render the
             // node tree live.
-            let node_task_id = self.register_node_task(&node.id);
+            //
+            // NEW-18b — refuse to register when the parent task is
+            // already terminal (e.g. orphan-swept on serve restart).
+            // Bail out of the executor loop instead of letting the
+            // straggler worker burn CPU/tokens producing output that
+            // will never be reaped by the dead parent.
+            let node_task_id = match self.register_node_task(&node.id) {
+                Ok(opt) => opt,
+                Err(reason) => {
+                    warn!(
+                        node = %node.id,
+                        reason = %reason,
+                        "pipeline executor aborting: parent task is terminal — registration refused"
+                    );
+                    return Ok(PipelineResult {
+                        output: format!("Pipeline aborted before node '{}': {reason}", node.id),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
+            };
             if let Some(ref id) = node_task_id {
                 node_task_ids.insert(node.id.clone(), id.clone());
                 if let Some(ref supervisor) = self.config.host_context.task_supervisor {

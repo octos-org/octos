@@ -37,7 +37,7 @@ use octos_bus::{
 use octos_core::AgentId;
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
-    OutboundMessage, SessionKey,
+    OutboundMessage, SessionKey, SessionScope, is_safe_session_id,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, FailoverEvent, LlmProvider, ProviderRouter,
@@ -129,6 +129,24 @@ const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(5);
 const DEFAULT_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const DEFAULT_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
 const DEFAULT_CONTEXT_COMPACT_KEEP_ITEMS: usize = 16;
+
+/// Maximum number of CONSECUTIVE auto-recovery turns the session actor will
+/// dispatch in response to spawn_only post-spawn failures before bailing
+/// out. The dedup-on-task-id (`recovered_tasks` HashSet) caps repeated
+/// signals from the SAME task at 1; this is a separate cap on the chain of
+/// distinct task failures (LLM retries the same broken approach with new
+/// tool_call_ids and they all fail). Reset to 0 on a user-initiated turn.
+///
+/// Default 2 = the LLM gets up to two corrective rounds before the actor
+/// gives up and emits a final UI banner ("Background failure could not be
+/// recovered after N attempts"). Higher values risk runaway loops on
+/// pathological inputs; lower values short-circuit legitimate two-step
+/// recoveries (e.g. "pick a valid voice → MiniMax rate-limit on retry").
+///
+/// Configurable at runtime via `OCTOS_MAX_CONSECUTIVE_RECOVERY_TURNS`. Clamped
+/// to `[1, 10]` so a misconfigured env var cannot disable the cap or
+/// runaway the loop.
+const MAX_CONSECUTIVE_RECOVERY_TURNS: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PersistedSessionMessage {
@@ -2342,9 +2360,25 @@ pub struct ActorFactory {
     /// Side-channel to the AdaptiveRouter for responsiveness feedback.
     /// None when adaptive routing is disabled or using a static provider chain.
     pub adaptive_router: Option<Arc<AdaptiveRouter>>,
+    /// RFC-3 (#1292): per-profile topic→lane override block, mirrored
+    /// onto every actor at spawn time. `None` keeps the built-in
+    /// defaults from [`octos_llm::lane`] active without further wiring.
+    pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Profile id (= tenant id in [`SessionScope::multi_tenant`]). Used
+    /// to construct a per-session [`SessionScope`] when spawning gateway
+    /// session actors. `None` for the top-level admin factory (the
+    /// admin path constructs its own scope) and for test fixtures that
+    /// don't exercise the scope wiring.
+    ///
+    /// Codex round-2 MAJOR 3 (PR #1327 review): without this the
+    /// gateway-spawned session actors had `ctx.session_scope = None`,
+    /// so `read_file` fell back to the workspace-only legacy resolver
+    /// and couldn't reach the per-profile skill_dirs the SKILL.md
+    /// auto-inject teaches the agent about.
+    pub profile_id: Option<String>,
     /// Plugin directories for SpawnTool subagents to load plugin tools.
     pub plugin_dirs: Vec<std::path::PathBuf>,
     /// Extra environment variables for plugin processes in subagents.
@@ -2411,6 +2445,92 @@ impl ToolRegistryFactory for SnapshotToolRegistryFactory {
         // Re-bind cwd-bound tools to the per-user workspace while
         // preserving non-cwd tools (web_search, browser, MCP, plugins, etc.)
         self.base.rebind_cwd(workspace, sandbox)
+    }
+}
+
+/// Codex round-2 MAJOR 3 (PR #1327 review): construct the per-session
+/// [`SessionScope`] for gateway-routed actors. Factored out of
+/// `ActorFactory::spawn` so the wiring can be unit-tested without
+/// having to drive an entire actor through a tokio mpsc channel.
+///
+/// Returns `Some(scope)` when:
+/// - `profile_id` is `Some` (per-profile actors created by
+///   `ProfileFactory::build` always supply it; the admin / test
+///   ActorFactory leaves it `None`), AND
+/// - `session_key.base_key()` satisfies [`is_safe_session_id`] (SPA
+///   `web-/slides-/site-` shapes pass; channel-prefixed `api:...`
+///   shapes do not — those route through the legacy resolver).
+///
+/// Returns `None` (= legacy resolver) for the admin path, the
+/// channel-prefixed shapes, or when the scope builder rejects the
+/// inputs entirely.
+///
+/// Fail-closed canonicalisation per round-2 BLOCKER 2: any
+/// `plugin_dir` that fails canonicalize is dropped (logged at `warn`).
+/// Mirrors `runtime/session.rs` and `commands/chat.rs`.
+pub(crate) fn build_gateway_session_scope(
+    profile_id: Option<&str>,
+    data_dir: &std::path::Path,
+    session_key: &SessionKey,
+    plugin_dirs: &[std::path::PathBuf],
+) -> Option<Arc<SessionScope>> {
+    let session_id_raw = session_key.base_key().to_string();
+    let Some(profile_id) = profile_id else {
+        tracing::debug!(
+            session = %session_key,
+            "ActorFactory::spawn skipping SessionScope: factory has no profile_id (admin / test path)",
+        );
+        return None;
+    };
+    if !is_safe_session_id(&session_id_raw) {
+        tracing::debug!(
+            profile_id = %profile_id,
+            session = %session_key,
+            "ActorFactory::spawn skipping SessionScope: session id outside is_safe_session_id alphabet \
+             (legacy channel-prefixed shape)",
+        );
+        return None;
+    }
+    match SessionScope::multi_tenant_with_default_zones(
+        data_dir.to_path_buf(),
+        profile_id.to_string(),
+        session_id_raw.clone(),
+    ) {
+        Ok(scope) => {
+            // Round-2 BLOCKER 2: fail-closed canonicalisation. Drop
+            // any plugin dir that can't be canonicalised so a later
+            // symlink replacement can't be legitimised as `InSkillDir`.
+            let skill_dirs = octos_core::canonicalize_skill_read_zones(plugin_dirs);
+            match scope.with_skill_read_zones(skill_dirs) {
+                Ok(scope) => Some(Arc::new(scope)),
+                Err(err) => {
+                    tracing::warn!(
+                        profile_id = %profile_id,
+                        session = %session_key,
+                        error = %err,
+                        "ActorFactory::spawn with_skill_read_zones rejected one or more plugin_dirs; \
+                         attaching scope without skill_read_zones",
+                    );
+                    SessionScope::multi_tenant_with_default_zones(
+                        data_dir.to_path_buf(),
+                        profile_id.to_string(),
+                        session_id_raw,
+                    )
+                    .map(Arc::new)
+                    .ok()
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                profile_id = %profile_id,
+                session = %session_key,
+                error = %err,
+                "ActorFactory::spawn SessionScope construction failed; \
+                 continuing without scope",
+            );
+            None
+        }
     }
 }
 
@@ -2951,6 +3071,19 @@ impl ActorFactory {
         if is_slides {
             tools.activate("group:media");
 
+            // Structural guardrail (fix/slides-session-tool-allowlist):
+            // hide every `mofa_*` plugin tool except `mofa_slides` so a
+            // weaker fallback model (e.g. kimi-k2.6 on mini1 dspfac,
+            // 2026-05-24) cannot misroute the slides workflow to
+            // `mofa_site` / `mofa_youtube` / etc. when the
+            // "ALWAYS use mofa_slides" rule buried in
+            // `prompts/slides_default.txt` is not strong enough on its
+            // own. The non-`mofa_*` tool surface (web_search, file
+            // tools, shell, send_file, contract / task checks)
+            // is unaffected — see
+            // `tools::policy::keep_tool_in_slides_session`.
+            tools.retain(octos_agent::keep_tool_in_slides_session);
+
             // Scaffold slides project INTO the workspace so file tools
             // (read_file, write_file, mofa_slides) all resolve the same paths.
             // The earlier scaffold in gateway_dispatcher writes to data_dir
@@ -3080,6 +3213,22 @@ impl ActorFactory {
                 self.data_dir.clone(),
                 context_manager.clone(),
             ));
+
+        // Codex round-2 MAJOR 3 (PR #1327 review): construct a
+        // per-session SessionScope so gateway-spawned actors get the
+        // same skill_read_zones wiring that `runtime/session.rs` gives
+        // SPA web sessions. Without this the agent's `ctx.session_scope`
+        // stayed `None` for every gateway-routed session, so
+        // `read_file` fell back to the workspace-only legacy resolver
+        // and could not reach the per-profile skill_dirs the
+        // SKILL.md auto-inject teaches the agent to use.
+        let session_scope_arc = build_gateway_session_scope(
+            self.profile_id.as_deref(),
+            &self.data_dir,
+            &session_key,
+            &self.plugin_dirs,
+        );
+
         let mut agent = Agent::new(agent_id, session_llm, tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
@@ -3094,6 +3243,9 @@ impl ActorFactory {
             // surface output and status to dashboards.
             .with_subagent_output_router(self.subagent_output_router.clone())
             .with_subagent_summary_generator(subagent_summary_generator);
+        if let Some(scope) = session_scope_arc.clone() {
+            agent = agent.with_session_scope(scope);
+        }
 
         if let Some(ref embedder) = self.embedder {
             agent = agent.with_embedder(embedder.clone());
@@ -3165,6 +3317,7 @@ impl ActorFactory {
             queue_mode: self.queue_mode,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: self.adaptive_router.clone(),
+            lane_routing: self.lane_routing.clone(),
             memory_store: self.memory_store.clone(),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -3175,6 +3328,7 @@ impl ActorFactory {
             context_manager,
             retry_state_path: Some(retry_state_path),
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -3638,6 +3792,14 @@ struct SessionActor {
     responsiveness: ResponsivenessObserver,
     /// Side-channel to AdaptiveRouter for toggling auto-protection.
     adaptive_router: Option<Arc<AdaptiveRouter>>,
+    /// RFC-3 (#1292) — per-profile topic→lane overrides. `None`
+    /// means "use built-in defaults"; built-ins still apply on
+    /// every turn via `LaneContext::for_topic(topic, None)`.
+    /// Stashed on the actor (not re-resolved off ProfileRuntime
+    /// every turn) so a hot-reload that swaps the profile's
+    /// `lane_routing` field doesn't race the lane-context build
+    /// inside the agent_task spawn.
+    lane_routing: Option<octos_llm::LaneRoutingConfig>,
     /// Memory store for saving long research reports out-of-band.
     memory_store: Option<Arc<MemoryStore>>,
     /// Active overflow task counter for concurrency limiting.
@@ -3674,6 +3836,15 @@ struct SessionActor {
     /// turn (M8.9). Caps recovery at one attempt per task so a recovery
     /// turn that itself fails cannot ignite a runaway loop.
     recovered_tasks: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// Counter of CONSECUTIVE recovery turns the actor has dispatched in
+    /// response to spawn_only post-spawn failures (PR
+    /// feat/spawn-only-failure-feedback-loop). Reset to 0 on a
+    /// user-initiated turn; incremented every time a `RecoveryHint` drives
+    /// an inbound. When the counter reaches
+    /// [`MAX_CONSECUTIVE_RECOVERY_TURNS`] the actor emits a final UI
+    /// banner instead of dispatching another recovery so the loop cannot
+    /// run away on pathological LLM retries with new tool_call_ids.
+    consecutive_recovery_turns: Arc<StdMutex<u32>>,
     /// Codex pre-merge review of #748 P1.2: cmid of the inbound currently
     /// being handled by `try_handle_command`. `send_reply` reads this so
     /// slash-command replies + `_completion` events stamp `thread_id` from
@@ -3782,6 +3953,51 @@ impl SessionActor {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.insert(task_id.to_string())
+    }
+
+    /// Effective ceiling on consecutive recovery turns, env-overridable via
+    /// `OCTOS_MAX_CONSECUTIVE_RECOVERY_TURNS`. Clamped to `[1, 10]` so a
+    /// misconfigured value cannot disable the cap entirely.
+    fn max_consecutive_recovery_turns(&self) -> u32 {
+        if let Ok(raw) = std::env::var("OCTOS_MAX_CONSECUTIVE_RECOVERY_TURNS") {
+            if let Ok(value) = raw.parse::<u32>() {
+                return value.clamp(1, 10);
+            }
+        }
+        MAX_CONSECUTIVE_RECOVERY_TURNS
+    }
+
+    /// Try to begin a recovery turn. Increments the consecutive-recovery
+    /// counter and returns `true` if the new count is `<= max`. Returns
+    /// `false` once the cap is exceeded so the caller can emit a final
+    /// banner instead of dispatching another LLM turn.
+    ///
+    /// Companion to [`Self::claim_recovery_slot`]: the per-task slot
+    /// dedupes repeated signals from the same task, while this counter
+    /// caps the chain of *distinct* failed tasks (LLM retries the same
+    /// broken approach with new tool_call_ids and they keep failing).
+    fn try_begin_recovery_turn(&self) -> bool {
+        let mut guard = self
+            .consecutive_recovery_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let max = self.max_consecutive_recovery_turns();
+        if *guard >= max {
+            return false;
+        }
+        *guard += 1;
+        true
+    }
+
+    /// Reset the consecutive-recovery counter to 0. Called when a
+    /// user-initiated inbound is about to be processed — once the user
+    /// re-engages we no longer count the prior chain as "consecutive".
+    fn reset_consecutive_recovery_turns(&self) {
+        let mut guard = self
+            .consecutive_recovery_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = 0;
     }
 
     fn context_compact_threshold_tokens(&self) -> usize {
@@ -4313,6 +4529,34 @@ impl SessionActor {
                                     tool_name,
                                     "skipping duplicate recovery hint"
                                 );
+                                continue;
+                            }
+                            // Consecutive-recovery cap
+                            // (feat/spawn-only-failure-feedback-loop): a
+                            // distinct, second-or-later task failing AGAIN
+                            // (the LLM retried its broken approach with a
+                            // new tool_call_id) is still bounded by
+                            // MAX_CONSECUTIVE_RECOVERY_TURNS. Above the
+                            // cap, emit a final user-visible banner via
+                            // the same persisted-notification path the
+                            // background-result consumer uses, then bail
+                            // out instead of dispatching another LLM
+                            // turn. The counter resets on every user-
+                            // initiated turn (see `process_inbound`).
+                            if !self.try_begin_recovery_turn() {
+                                let max = self.max_consecutive_recovery_turns();
+                                warn!(
+                                    session = %self.session_key,
+                                    task_id,
+                                    tool_name,
+                                    max,
+                                    "consecutive recovery cap exceeded — emitting final banner instead of dispatching another LLM turn"
+                                );
+                                let banner = format!(
+                                    "Background failure could not be recovered after {max} attempts. The last failure was on `{tool_name}`. Please review the error and try a different approach.",
+                                );
+                                self.deliver_background_notification(banner, Vec::new(), None)
+                                    .await;
                                 continue;
                             }
                             debug!(
@@ -5911,6 +6155,17 @@ impl SessionActor {
         // this stamp the gateway's failover surfacing would never fire.
         let router_session_id = self.session_key.to_string();
         let router_turn_id = client_message_id.clone();
+        // RFC-3 (#1292): resolve the session's topic to a capability
+        // lane (slides/code/research/etc. → InstructionStrong /
+        // CodeCapable / etc.) and pass it to the AdaptiveRouter via
+        // `with_lane_context`. The WS turn path in `ui_protocol.rs`
+        // does the same — both paths must stay in lockstep so
+        // model selection is identical whether a session is opened
+        // through gateway or web. Pre-RFC-3 behavior persists for
+        // profiles without `lane_routing` config (built-in defaults
+        // resolve unknown prefixes to General, which is a no-op).
+        let lane_ctx =
+            octos_llm::LaneContext::for_topic(self.session_key.topic(), self.lane_routing.as_ref());
 
         // Snapshot for overflow tasks: conversation context BEFORE the
         // primary task, EXCLUDING the primary user message.  Overflow needs
@@ -5922,19 +6177,25 @@ impl SessionActor {
 
         let mut agent_task = tokio::spawn(async move {
             let start = Instant::now();
+            // RFC-3 (#1292): innermost task-local is the lane scope so
+            // each agent-loop iteration's chat() call sees both the
+            // lane filter and the failover-routing context.
             let result = octos_llm::with_router_context(
                 octos_llm::RouterContext {
                     session_id: Some(router_session_id),
                     turn_id: router_turn_id,
                 },
-                tokio::time::timeout(
-                    session_timeout,
-                    agent.process_message_tracked_with_attachments(
-                        &content,
-                        &history_for_agent,
-                        media,
-                        attachments,
-                        &tracker,
+                octos_llm::with_lane_context(
+                    lane_ctx,
+                    tokio::time::timeout(
+                        session_timeout,
+                        agent.process_message_tracked_with_attachments(
+                            &content,
+                            &history_for_agent,
+                            media,
+                            attachments,
+                            &tracker,
+                        ),
                     ),
                 ),
             )
@@ -7249,6 +7510,25 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // Consecutive-recovery cap reset
+        // (feat/spawn-only-failure-feedback-loop): user-initiated turns
+        // break the "recovery chain" — once the user re-engages we no
+        // longer count the prior auto-recoveries against the cap. Master
+        // continuations are server-driven and don't represent user
+        // re-engagement, so they're excluded too. The recovery hint
+        // path stamps `_recovery_turn = true` in metadata via
+        // `synthetic_recovery_inbound`; any inbound without that flag
+        // counts as user-initiated for this reset.
+        let is_recovery_turn = inbound
+            .metadata
+            .get("_recovery_turn")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let is_master_continuation_inbound = inbound_is_master_continuation(&inbound);
+        if !is_recovery_turn && !is_master_continuation_inbound {
+            self.reset_consecutive_recovery_turns();
+        }
+
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
         // M8.10 PR #2: capture the user's client_message_id so every
@@ -9619,6 +9899,7 @@ mod tests {
             queue_mode,
             responsiveness,
             adaptive_router,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9629,6 +9910,7 @@ mod tests {
             context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -9688,6 +9970,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9698,6 +9981,7 @@ mod tests {
             context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -9838,6 +10122,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9848,6 +10133,7 @@ mod tests {
             context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -9960,6 +10246,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -9970,6 +10257,7 @@ mod tests {
             context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -10078,6 +10366,7 @@ mod tests {
             queue_mode: QueueMode::Followup,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -10088,6 +10377,7 @@ mod tests {
             context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -10168,6 +10458,7 @@ mod tests {
             queue_mode: QueueMode::Speculative,
             responsiveness,
             adaptive_router: Some(router),
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -10178,6 +10469,7 @@ mod tests {
             context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -10257,6 +10549,7 @@ mod tests {
             queue_mode: QueueMode::Speculative,
             responsiveness,
             adaptive_router: Some(router),
+            lane_routing: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -10267,6 +10560,7 @@ mod tests {
             context_manager: test_context_manager(&session_key),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
         };
 
@@ -12647,7 +12941,9 @@ mod tests {
             pending_messages: Arc::new(Mutex::new(HashMap::new())),
             queue_mode: QueueMode::Followup,
             adaptive_router: None,
+            lane_routing: None,
             memory_store: None,
+            profile_id: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             plugin_require_signed: false,
@@ -13566,6 +13862,11 @@ mod tests {
             Some("cli:test"),
             Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
         );
+        // Synth-ack gate (feat/spawn-only-failure-feedback-loop): mark
+        // the synth-ack as emitted so post-spawn failure produces a
+        // SpawnOnlyFailureSignal. Production wires this from
+        // `loop_runner.rs` when the synth-ack actually fires.
+        supervisor.mark_synth_ack_emitted("call-int-1");
         supervisor.mark_failed(
             &task_id,
             "voice 'yangmi' not registered. available: vivian, serena.".into(),
@@ -13657,6 +13958,7 @@ mod tests {
             Some(serde_json::json!({"query": "rust news"})),
             Some(ORIGINATING_CMID.to_string()),
         );
+        supervisor.mark_synth_ack_emitted("call-738");
         supervisor.mark_failed(&task_id, "MiniMax 429 rate limited".into());
 
         let mut responses = Vec::new();
@@ -14451,6 +14753,399 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    // ───────────────────────── Post-spawn failure feedback loop ──────────────────────────
+    //
+    // Tests for the spawn_only post-spawn failure → synthetic recovery
+    // turn pipeline (PR feat/spawn-only-failure-feedback-loop). The
+    // supervisor-side synth-ack gate has unit coverage in
+    // `task_supervisor::tests`; these are end-to-end against the running
+    // actor.
+
+    /// Wire a TaskSupervisor to the actor's RecoveryHint inbox exactly the
+    /// way `SessionActor::spawn` does in production. Returns the
+    /// supervisor so tests can drive `mark_synth_ack_emitted` +
+    /// `mark_failed`.
+    fn wire_supervisor_to_actor_inbox(
+        tx: &mpsc::Sender<ActorMessage>,
+    ) -> Arc<octos_agent::TaskSupervisor> {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+                originating_client_message_id: signal.originating_client_message_id.clone(),
+            });
+        });
+        supervisor
+    }
+
+    /// Test 1: post-spawn failure AFTER the synth-ack fired drives a
+    /// recovery turn — the LLM sees a synthetic user message and produces
+    /// a follow-up response. This is the core behaviour the PR enables:
+    /// the model can no longer silently believe a spawn_only call
+    /// succeeded when the plugin process later failed.
+    #[tokio::test]
+    async fn background_failure_with_synth_ack_triggers_recovery_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("acked-after-fail"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let supervisor = wire_supervisor_to_actor_inbox(&tx);
+        let task_id = supervisor.register_with_input(
+            "mofa_slides",
+            "call-spawn-fb-1",
+            Some("cli:test"),
+            Some(serde_json::json!({"topic": "rust"})),
+        );
+        supervisor.mark_synth_ack_emitted("call-spawn-fb-1");
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "Gemini API: 429 quota exceeded".to_string());
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if responses.iter().any(|r| r.contains("acked-after-fail")) {
+                break;
+            }
+        }
+        assert!(
+            responses.iter().any(|c| c.contains("acked-after-fail")),
+            "LLM must react to the synthetic recovery prompt, got: {responses:?}",
+        );
+
+        // The synthetic user message MUST land in persisted history so
+        // the LLM has it on its next turn — Design A constraint.
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let recovery_prompts: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::User
+                    && m.content.contains("[system-internal]")
+                    && m.content.contains("mofa_slides")
+            })
+            .collect();
+        assert_eq!(
+            recovery_prompts.len(),
+            1,
+            "exactly one recovery prompt expected in history, got: {:?}",
+            session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    /// Test 2: post-spawn failure WITHOUT a prior synth-ack is a no-op.
+    /// Production path: the synth-ack gate suppressed the ack because a
+    /// sibling tool errored in the same batch; the LLM already saw that
+    /// error and reacted. Re-injecting a recovery prompt for the
+    /// eventual post-spawn failure would double-signal the model.
+    #[tokio::test]
+    async fn background_failure_without_synth_ack_no_op() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("should-not-run"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let supervisor = wire_supervisor_to_actor_inbox(&tx);
+        let task_id = supervisor.register_with_input(
+            "mofa_slides",
+            "call-spawn-fb-2",
+            Some("cli:test"),
+            Some(serde_json::json!({"topic": "rust"})),
+        );
+        // Deliberately omit `mark_synth_ack_emitted` — simulates the
+        // sibling-error suppression path.
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "plugin crash".to_string());
+
+        // Give the inbox a window to deliver a hypothetical RecoveryHint.
+        let push = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            push.is_err()
+                || push
+                    .ok()
+                    .flatten()
+                    .map(|m| m.content)
+                    .filter(|c| c.contains("should-not-run"))
+                    .is_none(),
+            "no recovery LLM turn should fire when the synth-ack was suppressed",
+        );
+
+        // History must not contain a recovery prompt either.
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let recovery_present = session
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content.contains("[system-internal]"));
+        assert!(
+            !recovery_present,
+            "no recovery prompt should be persisted: {:?}",
+            session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    /// Test 3: the success path is unchanged — a spawn_only task that
+    /// reaches `mark_completed` must NOT emit a recovery turn even when
+    /// the synth-ack was previously recorded.
+    #[tokio::test]
+    async fn background_success_path_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("should-not-run"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let supervisor = wire_supervisor_to_actor_inbox(&tx);
+        let task_id = supervisor.register("mofa_slides", "call-spawn-fb-3", Some("cli:test"));
+        supervisor.mark_synth_ack_emitted("call-spawn-fb-3");
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec!["/tmp/deck.pptx".to_string()]);
+
+        let push = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        let leaked = push
+            .ok()
+            .flatten()
+            .map(|m| m.content)
+            .filter(|c| c.contains("should-not-run"));
+        assert!(
+            leaked.is_none(),
+            "success transition must not produce a recovery turn: {leaked:?}",
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    /// Test 4: two failure events for the same task_id (e.g. cascade
+    /// path + direct path racing) must result in at most one recovery
+    /// turn. The supervisor-side `was_already_failed` guard handles
+    /// this, with the actor-side `recovered_tasks` slot as defense in
+    /// depth.
+    #[tokio::test]
+    async fn background_failure_dedup_on_repeated_payloads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(50), make_response("first-run")),
+                (
+                    Duration::from_millis(50),
+                    make_response("must-not-run-twice"),
+                ),
+            ],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let supervisor = wire_supervisor_to_actor_inbox(&tx);
+        let task_id = supervisor.register("mofa_slides", "call-spawn-fb-4", Some("cli:test"));
+        supervisor.mark_synth_ack_emitted("call-spawn-fb-4");
+        supervisor.mark_failed(&task_id, "first fail".to_string());
+        // Second mark_failed must not re-fire the signal — supervisor guard.
+        supervisor.mark_failed(&task_id, "second fail".to_string());
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+        }
+        let first_seen = responses.iter().any(|c| c.contains("first-run"));
+        let second_seen = responses.iter().any(|c| c.contains("must-not-run-twice"));
+        assert!(first_seen, "first recovery should run: {responses:?}");
+        assert!(
+            !second_seen,
+            "second recovery must be suppressed: {responses:?}",
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    /// Test 5: when the LLM repeatedly retries a failing tool with new
+    /// `tool_call_id`s, the actor caps the chain at
+    /// MAX_CONSECUTIVE_RECOVERY_TURNS distinct recovery turns and emits a
+    /// final banner instead of dispatching another LLM turn. The
+    /// per-task `recovered_tasks` slot doesn't help here because each
+    /// retry has a fresh task_id; `consecutive_recovery_turns` is the
+    /// safeguard.
+    #[tokio::test]
+    async fn background_failure_recovery_capped_at_max_retries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Provide more responses than the cap allows so we can detect
+        // "did the third LLM turn happen?" — if the cap works, only the
+        // first two responses ever reach the rx channel.
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(50), make_response("recovery-1")),
+                (Duration::from_millis(50), make_response("recovery-2")),
+                (
+                    Duration::from_millis(50),
+                    make_response("recovery-3-MUST-NOT-RUN"),
+                ),
+            ],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let supervisor = wire_supervisor_to_actor_inbox(&tx);
+
+        // Three distinct failed tasks back-to-back, each with their own
+        // tool_call_id and synth-ack — simulates LLM retrying with
+        // corrected-but-still-broken inputs.
+        for n in 0..3 {
+            let tcid = format!("call-cap-{n}");
+            let task_id = supervisor.register("mofa_slides", &tcid, Some("cli:test"));
+            supervisor.mark_synth_ack_emitted(&tcid);
+            supervisor.mark_failed(&task_id, format!("fail #{n}"));
+            // Pace the marks so the actor processes them in order — without
+            // this, the second mark_failed could race the first recovery
+            // turn's `claim_recovery_slot` and the per-task dedup might
+            // mask the cap test.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let mut responses = Vec::new();
+        let mut banners = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if msg.content.contains("could not be recovered") {
+                banners.push(msg.content.clone());
+            } else if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if !banners.is_empty()
+                && responses.iter().filter(|c| c.contains("recovery-")).count() >= 2
+            {
+                break;
+            }
+        }
+        // The first two recovery LLM turns must have run.
+        assert!(
+            responses.iter().any(|c| c.contains("recovery-1")),
+            "first recovery should run, got: {responses:?}",
+        );
+        assert!(
+            responses.iter().any(|c| c.contains("recovery-2")),
+            "second recovery should run, got: {responses:?}",
+        );
+        // The third must NOT run — the cap kicks in before the LLM is
+        // invoked.
+        assert!(
+            !responses
+                .iter()
+                .any(|c| c.contains("recovery-3-MUST-NOT-RUN")),
+            "third recovery beyond the cap must not invoke the LLM, got: {responses:?}",
+        );
+        // The banner MUST land instead.
+        assert!(
+            banners
+                .iter()
+                .any(|c| c.contains("Background failure could not be recovered")),
+            "final banner expected once cap exceeded, got: {banners:?}",
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    /// User-initiated turns must reset the consecutive-recovery counter
+    /// so a future failure chain isn't pre-loaded by historical
+    /// recoveries. Asserts the bookkeeping invariant directly through
+    /// the test-only snapshot accessor.
+    #[tokio::test]
+    async fn user_turn_resets_consecutive_recovery_counter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(50), make_response("recovery-A")),
+                (Duration::from_millis(50), make_response("user-reply")),
+            ],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let supervisor = wire_supervisor_to_actor_inbox(&tx);
+        let task_id = supervisor.register("mofa_slides", "call-reset-1", Some("cli:test"));
+        supervisor.mark_synth_ack_emitted("call-reset-1");
+        supervisor.mark_failed(&task_id, "boom".to_string());
+
+        // Wait for the recovery turn to land.
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if responses.iter().any(|c| c.contains("recovery-A")) {
+                break;
+            }
+        }
+        assert!(responses.iter().any(|c| c.contains("recovery-A")));
+
+        // Push a USER inbound — counter should drop back to 0 inside
+        // `process_inbound`.
+        tx.send(ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "test".into(),
+                content: "Hello".into(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+                message_id: None,
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        })
+        .await
+        .unwrap();
+
+        // Wait for the user-reply to confirm process_inbound ran.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut user_reply_seen = false;
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if msg.content.contains("user-reply") {
+                user_reply_seen = true;
+                break;
+            }
+        }
+        assert!(
+            user_reply_seen,
+            "user inbound must drive the second LLM turn"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
     /// B3.4 (codex P1 fix) — failovers stamped with `None` originator
     /// MUST be dropped silently rather than leaked to every subscriber.
     /// A `None` originator means the publisher did not call
@@ -14489,5 +15184,203 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Codex round-2 MAJOR 3 (PR #1327 review): gateway session scope
+    // wiring. Pins that `ActorFactory::spawn` (via
+    // `build_gateway_session_scope`) attaches a non-None SessionScope
+    // with the expected skill_read_zones for per-profile gateway
+    // actors. Pre-fix the agent's `ctx.session_scope` stayed `None`
+    // for every gateway-routed session, so `read_file` fell back to
+    // the workspace-only legacy resolver.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_gateway_session_scope_attaches_scope_for_per_profile_session() {
+        // Per-profile gateway path: `ProfileFactory::build` sets
+        // `profile_id: Some(..)` and supplies plugin_dirs. The session
+        // id is a safe SPA shape (`web-...`). SPA WS sessions construct
+        // `SessionKey` with the bare session id (no channel prefix)
+        // so `base_key()` passes `is_safe_session_id`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        // Two plugin dirs: one exists (gets canonicalised in), one
+        // missing (gets dropped fail-closed).
+        let plugin_a = tmp.path().join("skills").join("mofa-slides");
+        std::fs::create_dir_all(&plugin_a).unwrap();
+        let plugin_missing = tmp.path().join("skills").join("ghost-skill");
+        let plugin_dirs = vec![plugin_a.clone(), plugin_missing.clone()];
+
+        let session_key = SessionKey("web-1779574360679-o8x9kv".to_string());
+        // Sanity: pin that the test fixture matches the production
+        // SPA path that routes through `runtime/session.rs`.
+        assert!(
+            octos_core::is_safe_session_id(session_key.base_key()),
+            "test fixture must use a safe SPA session id",
+        );
+        let scope =
+            build_gateway_session_scope(Some("dspfac"), &data_dir, &session_key, &plugin_dirs)
+                .expect("per-profile + safe session id must build a scope");
+
+        // The factory's data_dir maps to scope.root (the profile data
+        // dir in the multi-tenant constructor).
+        assert_eq!(
+            scope.root(),
+            data_dir.as_path(),
+            "scope root mirrors data_dir"
+        );
+        // skill_read_zones contains the canonicalised existing
+        // plugin_dir AND drops the missing one (round-2 BLOCKER 2
+        // fail-closed).
+        let zones = scope.skill_read_zones();
+        assert_eq!(
+            zones.len(),
+            1,
+            "fail-closed canonicalise must drop missing plugin_dir: zones = {zones:?}"
+        );
+        let canon_plugin_a = std::fs::canonicalize(&plugin_a).unwrap();
+        assert_eq!(zones[0], canon_plugin_a);
+    }
+
+    #[test]
+    fn build_gateway_session_scope_returns_none_for_admin_factory() {
+        // Top-level / admin factory path: `profile_id: None`. We MUST
+        // NOT construct a scope because the admin factory's data_dir
+        // isn't laid out as the per-profile multi-tenant shape.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey("web-1779574360679-o8x9kv".to_string());
+        let scope = build_gateway_session_scope(None, tmp.path(), &session_key, &[]);
+        assert!(
+            scope.is_none(),
+            "admin factory (profile_id = None) must skip scope construction",
+        );
+    }
+
+    #[test]
+    fn build_gateway_session_scope_returns_none_for_unsafe_session_id() {
+        // Channel-prefixed legacy shapes (`api:web-1234`,
+        // `telegram:12345`, etc.) produce a `base_key()` containing
+        // `:`, which fails `is_safe_session_id`. We MUST route those
+        // through the legacy resolver (= None) rather than building a
+        // scope against the unsafe id.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::new("telegram", "12345");
+        // Sanity: pin the regression — channel-prefixed shape really
+        // fails the safe-id check.
+        assert!(
+            !octos_core::is_safe_session_id(session_key.base_key()),
+            "this test relies on channel-prefixed keys failing is_safe_session_id; \
+             update the test if SessionKey's representation changes",
+        );
+
+        let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[]);
+        assert!(
+            scope.is_none(),
+            "unsafe session id must skip scope (legacy resolver path)",
+        );
+    }
+
+    #[test]
+    fn build_gateway_session_scope_handles_empty_plugin_dirs() {
+        // Edge: profile_id set, session id safe, but plugin_dirs empty
+        // (profile has no installed skills). Scope must still build —
+        // just with empty skill_read_zones.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey("web-empty".to_string());
+        let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[])
+            .expect("empty plugin_dirs is a legitimate configuration");
+        assert!(
+            scope.skill_read_zones().is_empty(),
+            "no plugin_dirs => no skill_read_zones",
+        );
+    }
+
+    #[test]
+    fn build_gateway_session_scope_drops_all_missing_plugin_dirs() {
+        // Edge: all plugin_dirs are missing — fail-closed drops them
+        // all, scope still builds (empty skill_read_zones is safe).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey("web-allmissing".to_string());
+        let plugin_dirs = vec![
+            tmp.path().join("skills").join("ghost-a"),
+            tmp.path().join("skills").join("ghost-b"),
+        ];
+        let scope =
+            build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &plugin_dirs)
+                .expect("scope must still build when every plugin_dir is missing");
+        assert!(
+            scope.skill_read_zones().is_empty(),
+            "every plugin_dir missing => no skill_read_zones (fail-closed)",
+        );
+    }
+
+    /// Codex round-2 MAJOR (PR #1327 review): cross-profile isolation
+    /// is structurally correct by construction — each profile's
+    /// `SessionScope` only carries that profile's `plugin_dirs` as
+    /// `skill_read_zones`, so a session bound to profile A can never
+    /// resolve profile B's skill_dir to `InSkillDir`. This test pins
+    /// the invariant explicitly so a future refactor that widens
+    /// `plugin_dirs` (e.g. union across profiles, global skill cache)
+    /// can't silently regress the boundary.
+    #[test]
+    fn build_gateway_session_scope_classifies_cross_profile_skill_dir_as_out_of_scope() {
+        use octos_core::PathClassification;
+
+        let root = tempfile::TempDir::new().unwrap();
+
+        // Profile A: data_dir + one skill_dir with a file inside.
+        let profile_a_data = root.path().join("profile_a");
+        let profile_a_skill = profile_a_data.join("skills").join("mofa-slides");
+        std::fs::create_dir_all(profile_a_skill.join("styles")).unwrap();
+        let profile_a_skill_file = profile_a_skill.join("styles").join("nb-pro.toml");
+        std::fs::write(&profile_a_skill_file, "[meta]\nname = 'nb-pro'\n").unwrap();
+
+        // Profile B: separate data_dir + a different skill_dir with a
+        // file inside. Lives outside profile A's data_dir entirely.
+        let profile_b_data = root.path().join("profile_b");
+        let profile_b_skill = profile_b_data.join("skills").join("mofa-cards");
+        std::fs::create_dir_all(profile_b_skill.join("styles")).unwrap();
+        let profile_b_skill_file = profile_b_skill.join("styles").join("custom.toml");
+        std::fs::write(&profile_b_skill_file, "[meta]\nname = 'custom'\n").unwrap();
+
+        // Build a `SessionScope` for profile A using ONLY profile A's
+        // plugin_dirs. This is exactly the production wiring: each
+        // `ProfileFactory` constructs scopes from its own
+        // `plugin_dirs`, never from another profile's.
+        let session_key = SessionKey("web-cross-profile".to_string());
+        let plugin_dirs = vec![profile_a_skill.clone()];
+        let scope = build_gateway_session_scope(
+            Some("profile_a"),
+            &profile_a_data,
+            &session_key,
+            &plugin_dirs,
+        )
+        .expect("scope build for profile A must succeed");
+
+        // Positive control: profile A's OWN skill file classifies as
+        // `InSkillDir`. If this regresses, the test fixture is broken
+        // (not the cross-profile assertion below).
+        let a_classification = scope.classify_canonical_path(&profile_a_skill_file);
+        assert!(
+            matches!(a_classification, PathClassification::InSkillDir { .. }),
+            "profile A's own skill file must be InSkillDir under profile A's scope; \
+             got {a_classification:?}",
+        );
+
+        // The invariant under test: profile B's skill file MUST
+        // classify as `OutOfScope` because profile B's skill_dir is
+        // not in profile A's `skill_read_zones`, not in profile A's
+        // workspace, and not in profile A's shared zones
+        // (`<profile_a>/skills`, `<profile_a>/research`). A future
+        // change that, e.g., merged all profiles' plugin_dirs into a
+        // global pool would flip this to `InSkillDir` and the test
+        // would catch it.
+        let b_classification = scope.classify_canonical_path(&profile_b_skill_file);
+        assert!(
+            matches!(b_classification, PathClassification::OutOfScope),
+            "profile B's skill file MUST be OutOfScope under profile A's scope; \
+             got {b_classification:?}",
+        );
     }
 }

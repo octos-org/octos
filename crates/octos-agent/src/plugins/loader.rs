@@ -3,8 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eyre::{Result, WrapErr, eyre};
-use octos_plugin::{LifecycleExecutor, ToolDiscovery};
+use eyre::Result;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -13,8 +12,7 @@ use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
-use super::extras::{SkillExtras, resolve_extras};
-use super::http_discovery::install_http_tools_from_catalog;
+use super::extras::{SKILL_EXPLORATION_PREAMBLE, SkillExtras, resolve_extras};
 use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
 use super::tool::{PluginTool, SynthesisConfig};
 
@@ -70,13 +68,49 @@ pub struct PluginLoadOptions<'a> {
     /// spawning. When `false` (the default), the legacy permissive flow is
     /// preserved for backward compatibility.
     pub require_signed: bool,
+    /// Override the directory used to store the verified-hash ledger.
+    /// When `None`, the loader resolves to `~/.octos/cache/verified/` so
+    /// the ledger lives outside the skill source tree (writing into the
+    /// source dir taints ownership when the daemon runs as a different
+    /// uid — see 2026-05 fleet skill-dir-root-ownership bug). Tests pass
+    /// a tempdir here for isolation; production callers leave this `None`.
+    ///
+    /// IMPORTANT: only the hash ledger lives here. The plugin binary
+    /// itself executes from its skill source directory so that the
+    /// plugin's asset-resolution (which walks from `exe_parent` to find
+    /// sibling assets like `<skill>/styles/`) keeps working. PR #1319's
+    /// original revision additionally copied the binary bytes into this
+    /// directory and ran from there, which broke asset-bearing plugins
+    /// like `mofa-slides` (#1325). The hash file alone is sufficient to
+    /// solve the skill-dir-ownership goal.
+    pub verified_cache_dir: Option<PathBuf>,
 }
 
 impl PluginLoadResult {
     fn merge_extras(&mut self, extras: SkillExtras) {
         self.mcp_servers.extend(extras.mcp_servers);
         self.hooks.extend(extras.hooks);
-        self.prompt_fragments.extend(extras.prompt_fragments);
+        // PR-F: dedup the generic exploration preamble across plugins.
+        // Each discovery-bearing plugin pushes the same constant string
+        // through `resolve_extras`; keeping every copy would balloon the
+        // system prompt with N identical paragraphs (`N` = number of
+        // skills that ship a `discovery` block). The first occurrence
+        // wins; later duplicates of the same exact string are dropped.
+        // Non-preamble fragments (skill cards, prompts.include outputs)
+        // are NOT deduped — distinct cards must survive.
+        let mut have_preamble = self
+            .prompt_fragments
+            .iter()
+            .any(|f| f.as_str() == SKILL_EXPLORATION_PREAMBLE);
+        for frag in extras.prompt_fragments {
+            if frag.as_str() == SKILL_EXPLORATION_PREAMBLE {
+                if have_preamble {
+                    continue;
+                }
+                have_preamble = true;
+            }
+            self.prompt_fragments.push(frag);
+        }
     }
 }
 
@@ -96,16 +130,16 @@ impl PluginLoader {
     ///
     /// Returns a `PluginLoadResult` with tool count and any resolved extras
     /// (MCP servers, hooks, prompt fragments).
-    pub async fn load_into(
+    pub fn load_into(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
     ) -> Result<PluginLoadResult> {
-        Self::load_into_with_work_dir(registry, dirs, extra_env, None).await
+        Self::load_into_with_work_dir(registry, dirs, extra_env, None)
     }
 
     /// Like `load_into`, but sets a working directory for plugin processes.
-    pub async fn load_into_with_work_dir(
+    pub fn load_into_with_work_dir(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
@@ -119,9 +153,9 @@ impl PluginLoader {
                 work_dir,
                 synthesis_config: None,
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
-        .await
     }
 
     /// Full-featured loader that accepts arbitrary [`PluginLoadOptions`].
@@ -129,12 +163,7 @@ impl PluginLoader {
     /// New host-controlled config (e.g. `synthesis_config`) is plumbed
     /// through here so older `load_into` callers keep working without
     /// signature churn.
-    ///
-    /// Async because skills with `tool_discovery = Http { base_url }` issue
-    /// a `GET <base_url>/tools` request at every startup so HTTP-discovered
-    /// tools re-register on each `octos chat` / `octos gateway` / `octos serve`
-    /// boot (fixes Critical #1 from the PR #1260 review).
-    pub async fn load_into_with_options(
+    pub fn load_into_with_options(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
@@ -176,52 +205,6 @@ impl PluginLoader {
 
         for plugin in discovered {
             let path = plugin.path;
-            // Critical #1 fix from PR #1260 review: HTTP-discovered tools
-            // previously only registered during `activate_skill` at install
-            // time, so they vanished on every agent restart. Pre-parse the
-            // manifest here to detect `tool_discovery = Http { base_url }`
-            // and re-register the catalog on every startup. Re-parse is
-            // cheap (single JSON read per skill dir) and only happens once
-            // per process boot.
-            let manifest_path = path.join("manifest.json");
-            let manifest_for_discovery = std::fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<PluginManifest>(&s).ok());
-
-            if let Some(manifest) = manifest_for_discovery {
-                if let octos_plugin::ToolDiscovery::Http { base_url } = &manifest.tool_discovery {
-                    // PR #1260 review (Finding 2): hard-fail when HTTP
-                    // discovery can't reach the bridge or parse the
-                    // catalog. Silently registering zero tools left the
-                    // skill operationally identical to a broken install
-                    // — observable only by reading log files. A returned
-                    // error forces the CLI/agent to surface the problem
-                    // at the very next operator interaction.
-                    let names =
-                        install_http_tools_from_catalog(registry, base_url, Some(&manifest))
-                            .await
-                            .wrap_err_with(|| {
-                                format!(
-                                    "HTTP tool discovery failed for skill at {} (bridge {})",
-                                    path.display(),
-                                    base_url
-                                )
-                            })?;
-                    let count = names.len();
-                    result.tool_count += count;
-                    result.tool_names.extend(names);
-                    info!(
-                        plugin_dir = %path.display(),
-                        base_url = %base_url,
-                        count = count,
-                        "registered HTTP-discovered tools at startup",
-                    );
-                    // HTTP-discovery skills do NOT fall through to the
-                    // binary-protocol loader — they ship no native binary.
-                    continue;
-                }
-            }
-
             // Re-parse via the agent-side manifest type below: octos_plugin's
             // PluginManifest is a structural subset and doesn't model
             // mcp_servers / hooks / prompts / spawn_only. Discovery has
@@ -308,6 +291,7 @@ impl PluginLoader {
                 work_dir,
                 synthesis_config: None,
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
     }
@@ -335,6 +319,7 @@ impl PluginLoader {
         let work_dir = options.work_dir;
         let synthesis_config = options.synthesis_config;
         let require_signed = options.require_signed;
+        let verified_cache_dir = options.verified_cache_dir.clone();
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
@@ -452,10 +437,13 @@ impl PluginLoader {
             );
         }
 
-        // Read executable content once for hash verification AND to write a
-        // verified copy. This closes the TOCTOU gap: we hash the bytes we
-        // read, then write those same bytes to a verified path that PluginTool
-        // will execute. The original file can't be swapped after verification.
+        // Read executable content once for hash verification. The
+        // hash is recorded in the verified-hash ledger (cache) so a
+        // restart can short-circuit re-hashing when the in-place
+        // binary is unchanged. The pre-spawn re-hash gate in
+        // `PluginTool::execute` re-reads this same on-disk path and
+        // compares against `load_time_hash` to close the load->exec
+        // TOCTOU window.
         let exe_bytes = std::fs::read(&executable)
             .map_err(|e| eyre::eyre!("cannot read plugin executable: {e}"))?;
 
@@ -501,22 +489,46 @@ impl PluginLoader {
             }
         }
 
-        // Write verified bytes to a sibling file so PluginTool executes
-        // exactly what we hashed (prevents TOCTOU file swap attacks).
-        let verified_exe = plugin_dir.join(format!(
-            ".{}_verified",
-            executable.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        // Remove existing verified file first so we can refresh the copy on restart.
-        let _ = std::fs::remove_file(&verified_exe);
-        std::fs::write(&verified_exe, &exe_bytes)
-            .map_err(|e| eyre::eyre!("cannot write verified executable: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Keep the verified copy executable by the runtime user even when
-            // the skill directory itself is root-owned.
-            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o755))?;
+        // Write a verified-hash ledger entry OUTSIDE the skill source dir
+        // recording "we hashed the in-place binary at time T and got hash
+        // H". The ledger lives at `<verified_cache_dir>/<plugin>/hash.txt`
+        // (production: `~/.octos/cache/verified/<plugin>/hash.txt`). The
+        // plugin executes from its skill source directory unchanged so
+        // asset-resolution (sibling `<skill>/styles/`, `<skill>/templates/`,
+        // etc. that plugins like `mofa-slides` walk via `exe_parent`) keeps
+        // working.
+        //
+        // The original 2026-05 ownership taint bug came from writing INTO
+        // the skill dir (`.<name>_verified` sibling); moving the metadata
+        // out alone is enough to fix that. PR #1319 additionally copied
+        // the binary bytes here and ran from the cache copy — that broke
+        // asset-bearing plugins (#1325 — mofa-slides "no styles installed
+        // on this deployment"). The binary-copy did not actually defend
+        // against the threat model either: an attacker with write access
+        // to the skill dir can swap the binary BEFORE the loader hashes,
+        // in which case we cache the wrong hash anyway. The pre-spawn
+        // re-hash gate in `PluginTool::execute` re-reads the in-place
+        // binary and compares against `load_time_hash`, which is what
+        // closes the load->exec TOCTOU window in practice.
+        let verified_hash_path =
+            resolve_verified_hash_path(verified_cache_dir.as_deref(), &manifest.name)?;
+        if let Some(parent) = verified_hash_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                eyre::eyre!("cannot create verified cache dir {}: {e}", parent.display())
+            })?;
+        }
+        // Best-effort ledger refresh: write the current hash so a future
+        // load (same process or a restart) can short-circuit re-hashing
+        // when nothing has changed. Failure to write the ledger MUST NOT
+        // block plugin load — the gate keys on the in-memory
+        // `verified_exe_sha256` we've already computed.
+        if let Err(err) = std::fs::write(&verified_hash_path, &load_time_hash) {
+            warn!(
+                plugin = %manifest.name,
+                cache_path = %verified_hash_path.display(),
+                error = %err,
+                "failed to write verified-hash ledger (continuing — load not blocked)"
+            );
         }
 
         // Collect env vars to filter out
@@ -594,7 +606,18 @@ impl PluginLoader {
                 }
                 let manifest_risk = def.risk.clone();
                 let def = apply_builtin_env_allowlist(&plugin_name, def);
-                let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
+                // Run the plugin from its original skill source dir path
+                // — NOT from the cache. The pre-spawn re-hash gate in
+                // `PluginTool::execute` re-reads this same path and
+                // compares against `load_time_hash` (closes the
+                // load->exec TOCTOU window). Executing in place keeps
+                // plugin asset-resolution intact: skills like mofa-slides
+                // walk from `exe_parent` to find sibling `styles/` /
+                // `templates/` directories that don't exist in the cache
+                // dir. Copying the binary into the cache (the PR #1319
+                // approach) silently broke those plugins on the fleet
+                // (#1325).
+                let mut tool = PluginTool::new(plugin_name.clone(), def, executable.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
                     .with_timeout(timeout);
@@ -983,6 +1006,85 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{hash:x}"))
 }
 
+/// Resolve where to store the verified-hash ledger entry for a plugin.
+///
+/// The cache directory layout is `<base>/<plugin_name>/hash.txt`, where
+/// `hash.txt` contains the SHA-256 (lowercase hex) of the plugin
+/// executable as last hashed by the loader. The directory is a ledger
+/// only — the binary itself stays in the skill source directory so
+/// asset-bearing plugins (`<skill>/styles/`, `<skill>/templates/`, etc.)
+/// keep working. See the comment block at the call site for the full
+/// rationale.
+///
+/// Resolution order:
+/// 1. Explicit `override_dir` from [`PluginLoadOptions::verified_cache_dir`]
+///    (used by tests to isolate from the real cache).
+/// 2. Under `cargo test`, a process-scoped tempdir auto-cleaned at exit —
+///    keeps the test suite from polluting `~/.octos/cache/verified/` and
+///    avoids cross-test races on shared plugin names.
+/// 3. `~/.octos/cache/verified/` derived from `dirs::home_dir()`.
+/// 4. `std::env::temp_dir().join("octos-verified")` as a last resort when
+///    HOME is unavailable (e.g. sandbox).
+///
+/// Returns `<base>/<plugin_name>/hash.txt`. The caller is responsible
+/// for `create_dir_all` on the parent before writing.
+fn resolve_verified_hash_path(override_dir: Option<&Path>, plugin_name: &str) -> Result<PathBuf> {
+    // Guard against a plugin name with path separators that would let a
+    // malicious manifest escape the cache root. The manifest loader already
+    // validates this for tool registration, but we belt-and-brace here so
+    // future call sites that bypass tool validation still land in a safe
+    // subdir.
+    if plugin_name.contains('/')
+        || plugin_name.contains('\\')
+        || plugin_name == "."
+        || plugin_name == ".."
+        || plugin_name.is_empty()
+    {
+        eyre::bail!("plugin name {plugin_name:?} not safe for cache path");
+    }
+    let base = if let Some(dir) = override_dir {
+        dir.to_path_buf()
+    } else if cfg!(test) {
+        // Tests that don't care about the verified-hash location still go
+        // through this default path; keep them out of the user's real
+        // cache (and let TempDir auto-cleanup at process exit).
+        test_default_cache_dir()
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".octos").join("cache").join("verified")
+    } else {
+        std::env::temp_dir().join("octos-verified")
+    };
+    Ok(base.join(plugin_name).join("hash.txt"))
+}
+
+/// Process-scoped tempdir for tests that don't explicitly pass a
+/// `verified_cache_dir`. Created once on first access; auto-cleaned when
+/// the test process exits. Without this, every test would write into the
+/// dev machine's real `~/.octos/cache/verified/` and tests reusing the
+/// same plugin name in parallel would race.
+#[cfg(test)]
+fn test_default_cache_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static TEST_CACHE: OnceLock<tempfile::TempDir> = OnceLock::new();
+    TEST_CACHE
+        .get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("octos-verified-test-")
+                .tempdir()
+                .expect("create test verified cache tempdir")
+        })
+        .path()
+        .to_path_buf()
+}
+
+/// Non-test stub so the default branch in `resolve_verified_hash_path`
+/// compiles outside `cfg(test)` without a `cfg!(test)` flicker.
+#[cfg(not(test))]
+#[allow(dead_code)]
+fn test_default_cache_dir() -> PathBuf {
+    PathBuf::new()
+}
+
 /// Check if a path is a regular executable file (Unix).
 /// Rejects symlinks as defense-in-depth against link-swap attacks.
 #[cfg(unix)]
@@ -1006,29 +1108,27 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    #[tokio::test]
-    async fn test_load_nonexistent_dir() {
+    #[test]
+    fn test_load_nonexistent_dir() {
         let mut registry = ToolRegistry::new();
         let result =
-            PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")], &[])
-                .await;
+            PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")], &[]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().tool_count, 0);
     }
 
-    #[tokio::test]
-    async fn test_load_empty_dir() {
+    #[test]
+    fn test_load_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 0);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_load_plugin_with_manifest() {
+    #[test]
+    fn test_load_plugin_with_manifest() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1038,7 +1138,7 @@ mod tests {
         // Write manifest
         std::fs::write(
             plugin_dir.join("manifest.json"),
-            r#"{"name": "my-plugin", "version": "1.0", "tools": [{"name": "greet", "description": "Greet someone"}]}"#,
+            r#"{"name": "my-plugin", "version": "1.0", "tools": [{"name": "greet", "description": "Greet someone", "input_schema": {"type": "object", "properties": {}}}]}"#,
         ).unwrap();
 
         // Write executable
@@ -1051,16 +1151,15 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_hash_verification_pass() {
+    #[test]
+    fn test_hash_verification_pass() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1072,7 +1171,7 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(exec_content));
 
         let manifest = format!(
-            r#"{{"name": "hash-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d"}}]}}"#
+            r#"{{"name": "hash-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
@@ -1081,22 +1180,21 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_hash_verification_fail() {
+    #[test]
+    fn test_hash_verification_fail() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("bad-hash");
         std::fs::create_dir(&plugin_dir).unwrap();
 
-        let manifest = r#"{"name": "bad-hash", "version": "1.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "tools": [{"name": "t", "description": "d"}]}"#;
+        let manifest = r#"{"name": "bad-hash", "version": "1.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]}"#;
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
         let exec_path = plugin_dir.join("bad-hash");
@@ -1105,9 +1203,8 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         // Should succeed overall (skips failed plugin) but register 0 tools
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 0);
     }
 
@@ -1127,8 +1224,8 @@ mod tests {
     /// time when `require_signed = true` — instead of the legacy "warn and
     /// proceed" path.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn require_signed_rejects_unsigned_plugin() {
+    #[test]
+    fn require_signed_rejects_unsigned_plugin() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1139,7 +1236,7 @@ mod tests {
         let manifest = r#"{
             "name": "unsigned-plugin",
             "version": "1.0",
-            "tools": [{"name": "t", "description": "d"}]
+            "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
         }"#;
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
@@ -1156,9 +1253,9 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
-        .await
         .unwrap();
         assert_eq!(
             result.tool_count, 0,
@@ -1169,8 +1266,8 @@ mod tests {
     /// Section B: with `require_signed = true`, signed plugins (those that
     /// declare a matching `manifest.sha256`) still load normally.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn require_signed_accepts_signed_plugin() {
+    #[test]
+    fn require_signed_accepts_signed_plugin() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1181,7 +1278,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho ok";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "signed-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d"}}]}}"#
+            r#"{{"name": "signed-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("signed-plugin");
@@ -1197,9 +1294,9 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
-        .await
         .unwrap();
         assert_eq!(
             result.tool_count, 1,
@@ -1212,8 +1309,8 @@ mod tests {
     /// is rejected because the `manifest.sha256` field can never anchor a
     /// hash check for its executable extras — the load path otherwise
     /// returns extras unconditionally on `tools.is_empty()`.
-    #[tokio::test]
-    async fn require_signed_rejects_extras_only_skill() {
+    #[test]
+    fn require_signed_rejects_extras_only_skill() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("extras-only");
         std::fs::create_dir(&plugin_dir).unwrap();
@@ -1243,9 +1340,9 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
-        .await
         .unwrap();
         assert_eq!(
             result.tool_count, 0,
@@ -1266,8 +1363,8 @@ mod tests {
     /// installing executable extras while keeping the executable hash
     /// matching.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn require_signed_drops_extras_on_mixed_signed_manifest() {
+    #[test]
+    fn require_signed_drops_extras_on_mixed_signed_manifest() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1286,7 +1383,7 @@ mod tests {
                     "command": "/bin/echo",
                     "args": ["unauthorized"]
                 }}],
-                "tools": [{{"name": "t", "description": "d"}}]
+                "tools": [{{"name": "t", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]
             }}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
@@ -1303,9 +1400,9 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
-        .await
         .unwrap();
         assert_eq!(result.tool_count, 1, "signed tool still registers");
         assert!(
@@ -1326,8 +1423,8 @@ mod tests {
     /// so it's not covered by `manifest.sha256` — and an unsigned edit to
     /// SKILL.md would otherwise still slip into the agent system prompt.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn require_signed_drops_auto_skill_md_for_spawn_only() {
+    #[test]
+    fn require_signed_drops_auto_skill_md_for_spawn_only() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1345,7 +1442,8 @@ mod tests {
                 "tools": [{{
                     "name": "do_thing",
                     "description": "d",
-                    "spawn_only": true
+                    "spawn_only": true,
+                    "input_schema": {{"type": "object", "properties": {{}}}}
                 }}]
             }}"#
         );
@@ -1364,9 +1462,9 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
-        .await
         .unwrap();
         assert_eq!(result.tool_count, 1);
         assert!(
@@ -1380,8 +1478,8 @@ mod tests {
     /// mixed manifest installs both the tool AND the extras (legacy
     /// behaviour — no regression).
     #[cfg(unix)]
-    #[tokio::test]
-    async fn require_signed_off_keeps_mixed_extras_on_signed_manifest() {
+    #[test]
+    fn require_signed_off_keeps_mixed_extras_on_signed_manifest() {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -1400,7 +1498,7 @@ mod tests {
                     "command": "/bin/echo",
                     "args": ["legacy-mcp"]
                 }}],
-                "tools": [{{"name": "t2", "description": "d"}}]
+                "tools": [{{"name": "t2", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]
             }}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
@@ -1409,9 +1507,8 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(
             result.mcp_servers.len(),
@@ -1423,8 +1520,8 @@ mod tests {
     /// Section B (codex review follow-up): under permissive mode, an
     /// extras-only skill still loads its extras as it always did — this
     /// is a backward-compatibility check.
-    #[tokio::test]
-    async fn require_signed_off_keeps_extras_only_skill_loading() {
+    #[test]
+    fn require_signed_off_keeps_extras_only_skill_loading() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("extras-only-legacy");
         std::fs::create_dir(&plugin_dir).unwrap();
@@ -1441,9 +1538,8 @@ mod tests {
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 0, "extras-only skill registers no tools");
         assert_eq!(
             result.mcp_servers.len(),
@@ -1456,8 +1552,8 @@ mod tests {
     /// unsigned plugins still load with a warning — backward compatibility
     /// is preserved.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn require_signed_off_keeps_legacy_unsigned_path() {
+    #[test]
+    fn require_signed_off_keeps_legacy_unsigned_path() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1467,7 +1563,7 @@ mod tests {
         let manifest = r#"{
             "name": "unsigned-legacy",
             "version": "1.0",
-            "tools": [{"name": "t", "description": "d"}]
+            "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
         }"#;
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("unsigned-legacy");
@@ -1475,19 +1571,21 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(
             result.tool_count, 1,
             "unsigned plugin must still load under the legacy default"
         );
     }
 
-    /// Section C: when the verified-exe bytes on disk are swapped between
-    /// load and invocation, the pre-spawn re-hash gate refuses to spawn the
-    /// process. We simulate the swap by overwriting `.<name>_verified`
-    /// after `load_into` returns.
+    /// Section C: when the in-place plugin executable on disk is swapped
+    /// between load and invocation, the pre-spawn re-hash gate refuses
+    /// to spawn the process. After the 2026-05 fleet fix the plugin
+    /// executes from its skill source dir directly (the cache only
+    /// records a hash ledger, not the binary itself) — so the swap is
+    /// simulated by overwriting the in-place binary after
+    /// `load_into_with_options` returns.
     #[cfg(unix)]
     #[tokio::test]
     async fn pre_spawn_rehash_detects_swap() {
@@ -1501,26 +1599,53 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho original";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "swap-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "swap_tool", "description": "d"}}]}}"#
+            r#"{{"name": "swap-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "swap_tool", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("swap-plugin");
         std::fs::write(&exec_path, exec_content).unwrap();
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        let cache_dir = dir.path().join("cache");
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: Some(cache_dir.clone()),
+            },
+        )
+        .unwrap();
         assert_eq!(result.tool_count, 1);
 
-        // Swap the verified-exe bytes on disk so the re-hash gate fires.
-        let verified_exe = plugin_dir.join(".swap-plugin_verified");
+        // Hash ledger lives in the cache dir; the binary itself is NOT
+        // copied there (the in-place skill binary stays canonical for
+        // asset-resolution). Sanity-check both invariants before we
+        // simulate the tampering.
+        let hash_ledger = cache_dir.join("swap-plugin").join("hash.txt");
         assert!(
-            verified_exe.exists(),
-            "loader must write a verified-exe sibling"
+            hash_ledger.exists(),
+            "loader must write a verified-hash ledger at {}",
+            hash_ledger.display()
         );
-        std::fs::write(&verified_exe, b"#!/bin/sh\necho TAMPERED").unwrap();
+        let cache_binary = cache_dir.join("swap-plugin").join("main");
+        assert!(
+            !cache_binary.exists(),
+            "binary must NOT be copied into the cache (regression: #1325 \
+             mofa-slides asset-resolution broke when it was); cache contents: {:?}",
+            std::fs::read_dir(cache_dir.join("swap-plugin"))
+                .ok()
+                .map(|rd| rd
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .collect::<Vec<_>>())
+        );
+
+        // Swap the in-place binary so the re-hash gate fires.
+        std::fs::write(&exec_path, b"#!/bin/sh\necho TAMPERED").unwrap();
 
         // Execute the registered tool and assert the gate refused to spawn.
         let tool = registry.get("swap_tool").expect("tool registered");
@@ -1550,7 +1675,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "manifest-swap", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "ms_tool", "description": "d"}}]}}"#
+            r#"{{"name": "manifest-swap", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "ms_tool", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), &manifest).unwrap();
         let exec_path = plugin_dir.join("manifest-swap");
@@ -1566,9 +1691,9 @@ mod tests {
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
+                verified_cache_dir: None,
             },
         )
-        .await
         .unwrap();
 
         // Swap manifest.json on disk to a different value. Note: we keep
@@ -1603,7 +1728,7 @@ mod tests {
         let exec_content = b"#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'";
         let hash = format!("{:x}", Sha256::digest(exec_content));
         let manifest = format!(
-            r#"{{"name": "intact-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "intact_tool", "description": "d"}}]}}"#
+            r#"{{"name": "intact-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "intact_tool", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
         );
         std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
         let exec_path = plugin_dir.join("intact-plugin");
@@ -1611,9 +1736,7 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
 
         let tool = registry.get("intact_tool").expect("tool registered");
         let result = tool.execute(&serde_json::json!({})).await.unwrap();
@@ -1647,8 +1770,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_plugin_loader_rejects_symlink_executable() {
+    #[test]
+    fn test_plugin_loader_rejects_symlink_executable() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1663,7 +1786,7 @@ mod tests {
         std::fs::create_dir(&plugin_dir).unwrap();
         std::fs::write(
             plugin_dir.join("manifest.json"),
-            r#"{"name": "evil-plugin", "version": "1.0", "tools": [{"name": "evil", "description": "d"}]}"#,
+            r#"{"name": "evil-plugin", "version": "1.0", "tools": [{"name": "evil", "description": "d", "input_schema": {"type": "object", "properties": {}}}]}"#,
         )
         .unwrap();
 
@@ -1671,9 +1794,8 @@ mod tests {
         std::os::unix::fs::symlink(&real_exec, plugin_dir.join("evil-plugin")).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         // Should not load any tools because the executable is a symlink
         assert_eq!(
             result.tool_count, 0,
@@ -1682,8 +1804,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_loader_registers_manifest_approval_risk_and_overwrites_unspecified() {
+    #[test]
+    fn test_loader_registers_manifest_approval_risk_and_overwrites_unspecified() {
         use std::os::unix::fs::PermissionsExt;
 
         fn write_plugin(root: &Path, plugin_name: &str, manifest: String) {
@@ -1713,9 +1835,9 @@ mod tests {
                     "name": "risk-plugin-first",
                     "version": "1.0",
                     "tools": [
-                        {{"name": "{declared_tool}", "description": "declared", "risk": "medium"}},
-                        {{"name": "{missing_tool}", "description": "missing first", "risk": "high"}},
-                        {{"name": "{blank_tool}", "description": "blank first", "risk": "high"}}
+                        {{"name": "{declared_tool}", "description": "declared", "risk": "medium", "input_schema": {{"type": "object", "properties": {{}}}}}},
+                        {{"name": "{missing_tool}", "description": "missing first", "risk": "high", "input_schema": {{"type": "object", "properties": {{}}}}}},
+                        {{"name": "{blank_tool}", "description": "blank first", "risk": "high", "input_schema": {{"type": "object", "properties": {{}}}}}}
                     ]
                 }}"#
             ),
@@ -1723,7 +1845,6 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         let first = PluginLoader::load_into(&mut registry, &[first_root.path().to_path_buf()], &[])
-            .await
             .unwrap();
         assert_eq!(first.tool_count, 3);
         assert_eq!(
@@ -1748,8 +1869,8 @@ mod tests {
                     "name": "risk-plugin-second",
                     "version": "1.0",
                     "tools": [
-                        {{"name": "{missing_tool}", "description": "missing second"}},
-                        {{"name": "{blank_tool}", "description": "blank second", "risk": "   "}}
+                        {{"name": "{missing_tool}", "description": "missing second", "input_schema": {{"type": "object", "properties": {{}}}}}},
+                        {{"name": "{blank_tool}", "description": "blank second", "risk": "   ", "input_schema": {{"type": "object", "properties": {{}}}}}}
                     ]
                 }}"#
             ),
@@ -1757,7 +1878,6 @@ mod tests {
 
         let second =
             PluginLoader::load_into(&mut registry, &[second_root.path().to_path_buf()], &[])
-                .await
                 .unwrap();
         assert_eq!(second.tool_count, 2);
         assert_eq!(
@@ -1771,8 +1891,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_loader_bootstraps_script_skill_wrapper() {
+    #[test]
+    fn test_loader_bootstraps_script_skill_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
         std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
@@ -1782,7 +1902,7 @@ mod tests {
             r#"{
   "name": "mofa-publish",
   "version": "0.1.0",
-  "tools": [{"name": "mofa_publish", "description": "deploy"}]
+  "tools": [{"name": "mofa_publish", "description": "deploy", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -1793,9 +1913,8 @@ mod tests {
         .unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert!(plugin_dir.join("main").exists());
     }
@@ -1852,7 +1971,7 @@ mod tests {
             r#"{
   "name": "mofa-podcast",
   "version": "0.4.5",
-  "tools": [{"name": "podcast_generate", "description": "podcast"}]
+  "tools": [{"name": "podcast_generate", "description": "podcast", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -1887,7 +2006,7 @@ edition = "2021"
             r#"{
   "name": "mofa-publish",
   "version": "0.1.0",
-  "tools": [{"name": "mofa_publish", "description": "deploy"}]
+  "tools": [{"name": "mofa_publish", "description": "deploy", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
@@ -1919,8 +2038,8 @@ edition = "2021"
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_verified_executable_is_world_executable() {
+    #[test]
+    fn test_in_place_executable_runs_with_existing_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1932,30 +2051,61 @@ edition = "2021"
             r#"{
   "name": "perm-plugin",
   "version": "0.1.0",
-  "tools": [{"name": "perm_tool", "description": "perm"}]
+  "tools": [{"name": "perm_tool", "description": "perm", "input_schema": {"type": "object", "properties": {}}}]
 }"#,
         )
         .unwrap();
+        let in_place_exec = plugin_dir.join("perm-plugin");
         std::fs::write(
-            plugin_dir.join("perm-plugin"),
+            &in_place_exec,
             "#!/usr/bin/env bash\nset -euo pipefail\necho '{\"output\":\"ok\",\"success\":true}'\n",
         )
         .unwrap();
-        std::fs::set_permissions(
-            plugin_dir.join("perm-plugin"),
-            std::fs::Permissions::from_mode(0o755),
+        std::fs::set_permissions(&in_place_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cache_dir = dir.path().join("cache");
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: Some(cache_dir.clone()),
+            },
         )
         .unwrap();
-
-        let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
         assert_eq!(result.tool_count, 1);
 
-        let verified = plugin_dir.join(".perm-plugin_verified");
-        let mode = std::fs::metadata(&verified).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755);
+        // The plugin executes from the in-place skill source binary —
+        // not from the cache. The cache only holds a hash ledger; no
+        // binary copy is written there (regression guard for #1325).
+        let hash_ledger = cache_dir.join("perm-plugin").join("hash.txt");
+        assert!(
+            hash_ledger.is_file(),
+            "hash ledger must be written at {}",
+            hash_ledger.display()
+        );
+        let cache_binary = cache_dir.join("perm-plugin").join("main");
+        assert!(
+            !cache_binary.exists(),
+            "binary must NOT be copied into the cache (regression: #1325)"
+        );
+
+        // The in-place binary keeps its 0o755 permissions — the loader
+        // does not chmod the skill source tree under the
+        // skill-dir-ownership cleanup.
+        let mode = std::fs::metadata(&in_place_exec)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "in-place binary must keep its original 0o755 mode"
+        );
     }
 
     #[cfg(unix)]
@@ -2007,6 +2157,7 @@ edition = "2021"
                 work_dir: None,
                 synthesis_config: Some(cfg),
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -2065,6 +2216,7 @@ edition = "2021"
                 work_dir: None,
                 synthesis_config: Some(cfg),
                 require_signed: false,
+                verified_cache_dir: None,
             },
         )
         .unwrap();
@@ -2083,8 +2235,8 @@ edition = "2021"
     /// at registration time so the malicious entry never reaches the
     /// runtime gate.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn loader_skips_tool_with_invalid_env_allowlist_entry() {
+    #[test]
+    fn loader_skips_tool_with_invalid_env_allowlist_entry() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2097,8 +2249,8 @@ edition = "2021"
                 "name": "evil-env-plugin",
                 "version": "1.0",
                 "tools": [
-                    {"name": "good_tool", "description": "ok", "env": ["MY_VAR"]},
-                    {"name": "bad_tool", "description": "bad", "env": ["LD_PRELOAD"]}
+                    {"name": "good_tool", "description": "ok", "env": ["MY_VAR"], "input_schema": {"type": "object", "properties": {}}},
+                    {"name": "bad_tool", "description": "bad", "env": ["LD_PRELOAD"], "input_schema": {"type": "object", "properties": {}}}
                 ]
             }"#,
         )
@@ -2113,9 +2265,8 @@ edition = "2021"
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
 
         // good_tool registered, bad_tool skipped.
         assert_eq!(result.tool_count, 1);
@@ -2126,8 +2277,8 @@ edition = "2021"
     /// Pin that registration-time validation rejects manifests with
     /// `env` entries containing `=` (a shell-injection vector).
     #[cfg(unix)]
-    #[tokio::test]
-    async fn loader_skips_tool_with_equals_in_env_name() {
+    #[test]
+    fn loader_skips_tool_with_equals_in_env_name() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2139,7 +2290,7 @@ edition = "2021"
             r#"{
                 "name": "eq-plugin",
                 "version": "1.0",
-                "tools": [{"name": "bad", "description": "d", "env": ["FOO=bar"]}]
+                "tools": [{"name": "bad", "description": "d", "env": ["FOO=bar"], "input_schema": {"type": "object", "properties": {}}}]
             }"#,
         )
         .unwrap();
@@ -2152,15 +2303,14 @@ edition = "2021"
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
-            .await
-            .unwrap();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 0);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn duplicate_plugin_id_first_dir_wins() {
+    #[test]
+    fn duplicate_plugin_id_first_dir_wins() {
         use std::os::unix::fs::PermissionsExt;
 
         let write_skill = |dir: &std::path::Path, marker: &str| {
@@ -2171,7 +2321,8 @@ edition = "2021"
                 format!(
                     r#"{{"name": "shared-skill", "version": "1.0",
                           "tools": [{{"name": "shared_tool",
-                                     "description": "from-{marker}"}}]}}"#
+                                     "description": "from-{marker}",
+                                     "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
                 ),
             )
             .unwrap();
@@ -2198,7 +2349,6 @@ edition = "2021"
             &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
             &[],
         )
-        .await
         .unwrap();
 
         assert_eq!(
@@ -2213,171 +2363,177 @@ edition = "2021"
             "first dir (dir_a / corrected) must win — got the shadow copy"
         );
     }
-}
 
-// ── Lifecycle-aware install / uninstall ──────────────────────────────
+    /// Regression: the verified-hash ledger must live OUTSIDE the skill
+    /// source directory so that running `octos serve` as root (or any
+    /// non-operator uid) does not taint the skill tree with foreign
+    /// ownership and lock out the operator's interactive CLI. The cache
+    /// is keyed by plugin name and lives under `verified_cache_dir`.
+    ///
+    /// Additionally pins the post-#1325 invariant: the cache holds only
+    /// a `hash.txt` ledger entry, NOT a copy of the binary. PR #1319's
+    /// original revision copied the bytes to `<cache>/<plugin>/main` and
+    /// ran from there, which broke asset-bearing plugins like
+    /// `mofa-slides` (their `<skill>/styles/` sibling directories did
+    /// not exist under the cache parent).
+    #[cfg(unix)]
+    #[test]
+    fn verified_hash_lives_under_cache_dir_not_skill_dir() {
+        use std::os::unix::fs::PermissionsExt;
 
-/// Result of a lifecycle-aware skill activation.
-#[derive(Debug)]
-pub struct SkillActivateResult {
-    /// Names of all tools registered (static or HTTP-discovered).
-    pub tool_names: Vec<String>,
-}
-
-/// Run hardware lifecycle phases (preflight → init → ready_check) and then
-/// register the skill's tools (static binary-protocol or HTTP-discovered)
-/// into `registry`.
-///
-/// This is an **async** entry point designed for use by the CLI install
-/// path (bridged via a single-threaded tokio runtime) and by tests. It
-/// does NOT copy files — the skill directory must already exist on disk.
-///
-/// Returns an error (and registers **no** tools) if any critical lifecycle
-/// phase fails or if HTTP tool discovery returns a non-2xx response.
-pub async fn activate_skill(
-    registry: &mut ToolRegistry,
-    skill_dir: &Path,
-    extra_env: &[(String, String)],
-) -> Result<SkillActivateResult> {
-    use octos_plugin::{LifecyclePhase, NoSandbox};
-
-    let manifest_path = skill_dir.join("manifest.json");
-    if !manifest_path.exists() {
-        // No manifest → nothing to activate. Skills without manifest.json
-        // are app-level docs only and have no tools or lifecycle.
-        return Ok(SkillActivateResult { tool_names: vec![] });
-    }
-    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        eyre!(
-            "could not read manifest.json in {}: {e}",
-            skill_dir.display()
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("isolated-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{"name": "isolated-plugin", "version": "1.0", "tools": [{"name": "iso_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}]}"#,
         )
-    })?;
-    let manifest: PluginManifest = serde_json::from_str(&content)
-        .map_err(|e| eyre!("invalid manifest.json in {}: {e}", skill_dir.display()))?;
+        .unwrap();
+        let exec_path = plugin_dir.join("isolated-plugin");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho hi").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let skill_name = manifest.name.clone();
+        let cache_dir = dir.path().join("cache-root");
+        let mut registry = ToolRegistry::new();
+        PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: Some(cache_dir.clone()),
+            },
+        )
+        .unwrap();
 
-    // 1) Run hardware_lifecycle phases if present.
-    if let Some(lifecycle) = manifest.hardware_lifecycle.as_ref() {
-        let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_dir.to_path_buf());
-        for (phase, steps) in [
-            (LifecyclePhase::Preflight, &lifecycle.preflight),
-            (LifecyclePhase::Init, &lifecycle.init),
-            (LifecyclePhase::ReadyCheck, &lifecycle.ready_check),
-        ] {
-            if steps.is_empty() {
-                continue;
-            }
-            let result = executor.run_phase(phase, steps).await;
-            if !result.success {
-                return Err(eyre!(
-                    "skill {skill_name} {} failed: {}",
-                    phase.as_str(),
-                    result.error.unwrap_or_default()
-                ));
-            }
-            info!(
-                skill = %skill_name,
-                phase = phase.as_str(),
-                "lifecycle phase completed"
+        // The verified-hash ledger must live under
+        // cache_dir/<plugin>/hash.txt.
+        let expected_hash = cache_dir.join("isolated-plugin").join("hash.txt");
+        assert!(
+            expected_hash.is_file(),
+            "verified-hash ledger must live at {} (got nothing); cache_dir contents: {:?}",
+            expected_hash.display(),
+            std::fs::read_dir(&cache_dir).ok().map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .collect::<Vec<_>>()
+            }),
+        );
+
+        // Post-#1325: the cache must NOT contain a `main` binary copy.
+        let unwanted_binary = cache_dir.join("isolated-plugin").join("main");
+        assert!(
+            !unwanted_binary.exists(),
+            "cache must not host a copy of the plugin binary (asset-resolution \
+             regression #1325); found {}",
+            unwanted_binary.display(),
+        );
+
+        // The skill source dir must NOT contain a `.isolated-plugin_verified`
+        // or `.main_verified` sibling — that was the old taint vector.
+        let skill_entries: Vec<_> = std::fs::read_dir(&plugin_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &skill_entries {
+            assert!(
+                !name.ends_with("_verified") && name != ".main_verified",
+                "skill source dir should not contain verified-copy file '{}' (full list: {:?})",
+                name,
+                skill_entries,
             );
         }
     }
 
-    // 2) Tool discovery (static binary-protocol is the existing path;
-    //    Http triggers GET <base_url>/tools registration).
-    let mut tool_names = Vec::new();
-    match &manifest.tool_discovery {
-        ToolDiscovery::Static => {
-            // Important #2 fix from PR #1260 review: load ONLY this skill,
-            // not its parent directory. The previous `load_into(&[parent])`
-            // scanned every sibling skill folder as a side-effect, leaking
-            // their tools into the registry on install.
-            //
-            // Note: `extras` (MCP servers, hooks, prompts) are intentionally
-            // NOT resolved here — `activate_skill`'s contract is tool
-            // registration only; extras flow through
-            // `PluginLoader::load_into_with_options` at runtime startup. If
-            // a use case requires extras at install time, it should go
-            // through a different code path.
-            let (tools, extras) = PluginLoader::load_plugin(skill_dir, extra_env)?;
-            for tool in tools {
-                let name = tool.name().to_string();
-                registry.mark_as_plugin(&name);
-                tool_names.push(name);
-                registry.register(tool);
-            }
-            let _ = extras;
-        }
-        ToolDiscovery::Http { base_url } => {
-            // Important #1 fix from PR #1260 review: use the same helper as
-            // the runtime-startup path (`load_into_with_options`) so a
-            // freshly-installed skill is policy-gated immediately —
-            // registers as `DoraToolBridge` and enrols in `robot_groups`,
-            // rather than as a bare `HttpTool` that flips `concurrency_class`
-            // semantics on next restart.
-            let names = install_http_tools_from_catalog(registry, base_url, Some(&manifest))
-                .await
-                .map_err(|e| {
-                    eyre!("skill {skill_name} HTTP tool discovery from {base_url} failed: {e}")
-                })?;
-            info!(
-                skill = %skill_name,
-                base_url = %base_url,
-                count = names.len(),
-                "HTTP tool discovery completed"
-            );
-            tool_names.extend(names);
-        }
-    }
+    /// PR-F: the loader's `merge_extras` step folds duplicate
+    /// `SKILL_EXPLORATION_PREAMBLE` strings across plugins so the
+    /// system prompt only contains the preamble once even when N
+    /// plugins each declare a `discovery` block. Distinct skill cards
+    /// must survive — the dedup only collapses the constant string.
+    #[test]
+    fn merge_extras_dedupes_preamble_across_plugins() {
+        let mut result = PluginLoadResult::default();
 
-    Ok(SkillActivateResult { tool_names })
-}
+        // First plugin: preamble + card-one.
+        let e1 = SkillExtras {
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompt_fragments: vec![
+                SKILL_EXPLORATION_PREAMBLE.to_string(),
+                "- name: card-one\n  purpose: a\n  tools: t1\n  skill_dir: /tmp/a".to_string(),
+            ],
+            spawn_only_tools: vec![],
+            spawn_only_messages: Default::default(),
+        };
+        result.merge_extras(e1);
 
-/// Run the `shutdown` lifecycle phase for a skill before uninstall.
-///
-/// Best-effort: failures are logged but do not abort the uninstall (since
-/// the alternative is leaving the skill directory on disk, which is worse).
-/// No-op when the manifest has no `hardware_lifecycle` block.
-pub async fn run_shutdown_phase(skill_dir: &Path) {
-    use octos_plugin::{LifecyclePhase, NoSandbox};
+        // Second plugin: preamble (duplicate) + card-two.
+        let e2 = SkillExtras {
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompt_fragments: vec![
+                SKILL_EXPLORATION_PREAMBLE.to_string(),
+                "- name: card-two\n  purpose: b\n  tools: t2\n  skill_dir: /tmp/b".to_string(),
+            ],
+            spawn_only_tools: vec![],
+            spawn_only_messages: Default::default(),
+        };
+        result.merge_extras(e2);
 
-    let manifest_path = skill_dir.join("manifest.json");
-    if !manifest_path.exists() {
-        return;
-    }
-    let content = match std::fs::read_to_string(&manifest_path) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(skill_dir = %skill_dir.display(), error = %e, "shutdown: could not read manifest");
-            return;
-        }
-    };
-    let manifest: PluginManifest = match serde_json::from_str(&content) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(skill_dir = %skill_dir.display(), error = %e, "shutdown: invalid manifest");
-            return;
-        }
-    };
+        // Third plugin: preamble (duplicate) + card-three.
+        let e3 = SkillExtras {
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompt_fragments: vec![
+                SKILL_EXPLORATION_PREAMBLE.to_string(),
+                "- name: card-three\n  purpose: c\n  tools: t3\n  skill_dir: /tmp/c".to_string(),
+            ],
+            spawn_only_tools: vec![],
+            spawn_only_messages: Default::default(),
+        };
+        result.merge_extras(e3);
 
-    if let Some(lifecycle) = manifest.hardware_lifecycle.as_ref() {
-        if lifecycle.shutdown.is_empty() {
-            return;
-        }
-        let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_dir.to_path_buf());
-        let result = executor
-            .run_phase(LifecyclePhase::Shutdown, &lifecycle.shutdown)
-            .await;
-        if !result.success {
-            warn!(
-                skill = %manifest.name,
-                error = ?result.error,
-                "shutdown phase failed (best-effort, continuing removal)"
-            );
-        } else {
-            info!(skill = %manifest.name, "shutdown phase completed");
-        }
+        // Preamble appears exactly once across the merged result.
+        let preamble_count = result
+            .prompt_fragments
+            .iter()
+            .filter(|f| f.as_str() == SKILL_EXPLORATION_PREAMBLE)
+            .count();
+        assert_eq!(
+            preamble_count, 1,
+            "preamble must be deduped to a single occurrence; got {preamble_count} \
+             in {:?}",
+            result.prompt_fragments
+        );
+
+        // All three cards survive.
+        assert!(
+            result
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("name: card-one"))
+        );
+        assert!(
+            result
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("name: card-two"))
+        );
+        assert!(
+            result
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("name: card-three"))
+        );
+
+        // Length: 1 preamble + 3 cards = 4 fragments total.
+        assert_eq!(
+            result.prompt_fragments.len(),
+            4,
+            "expected 4 fragments (1 preamble + 3 cards); got {:?}",
+            result.prompt_fragments
+        );
     }
 }

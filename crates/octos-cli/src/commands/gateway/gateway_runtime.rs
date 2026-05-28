@@ -723,10 +723,9 @@ impl GatewayRuntime {
                             // is `false` (backward compatible — unsigned plugins
                             // still load with a warning).
                             require_signed: config.plugins.require_signed,
+                            verified_cache_dir: None,
                         },
-                    )
-                    .await
-                    {
+                    ) {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),
                     }
@@ -1220,7 +1219,24 @@ impl GatewayRuntime {
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
             adaptive_router: adaptive_router_ref,
+            // RFC-3 (#1292): no UserProfile in scope here (CLI-only
+            // `octos gateway` entry point — see the inline-assembly
+            // branch above for the "no profile" path); use built-in
+            // defaults. The per-profile path through
+            // `ProfileFactory::create_actor_factory_for_profile`
+            // threads the profile's `lane_routing` field.
+            lane_routing: None,
             memory_store: Some(memory_store.clone()),
+            // Codex round-2 MAJOR 3 (PR #1327 review): the top-level
+            // gateway actor factory is the "admin" path that dispatches
+            // by detected profile through `profile_factory.rs`. It
+            // doesn't own a single profile_id of its own; per-profile
+            // sessions go through `ProfileFactory::build` which sets
+            // this field. Leaving it `None` here means the admin
+            // fallback path (no recognised profile, or main profile)
+            // continues without scope wiring — the legacy resolver
+            // still applies inside `tools/mod.rs`.
+            profile_id: None,
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
             // Section B (codex review P1.1): propagate the host

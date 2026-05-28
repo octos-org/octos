@@ -66,14 +66,41 @@ pub struct PluginManifest {
     /// priority than `required_safety_tier`.
     #[serde(default)]
     pub tool_overrides: HashMap<String, crate::permissions::SafetyTier>,
+
+    /// Optional LLM-facing discovery summary.
+    ///
+    /// When present, `resolve_extras` renders a short 5-line "skill card"
+    /// into the system prompt so the agent learns (1) the skill exists,
+    /// (2) which tools it provides, and (3) where its directory lives.
+    /// PR-F dropped the per-hint curation that PR-C/D originally shipped
+    /// in favour of a one-paragraph generic preamble + `read_file`/`glob`/
+    /// `list_dir` exploration over the skill directory (Claude Code's
+    /// "you have the filesystem, go look" model).
+    ///
+    /// Legacy manifests that still declare `discovery.hints: [...]` parse
+    /// cleanly because `SkillDiscovery` does not set
+    /// `deny_unknown_fields` — the unknown field is silently dropped.
+    #[serde(default)]
+    pub discovery: Option<SkillDiscovery>,
 }
 
 impl PluginManifest {
-    /// Whether this manifest declares any extras (MCP servers, hooks, or prompts).
+    /// Whether this manifest declares any extras (MCP servers, hooks, prompts,
+    /// or discovery).
+    ///
+    /// Round-2 codex review BLOCKER 2: `discovery` MUST be counted here. The
+    /// loader's strict-mode paths use `has_extras()` both to reject
+    /// extras-only manifests (so the operator splits executable + extras into
+    /// two skills they can hash independently) and to warn when dropping
+    /// extras under `plugins.require_signed`. Omitting `discovery` from this
+    /// check meant a discovery-only manifest became a silent no-op under
+    /// strict mode, and a signed tool plugin with discovery had its skill
+    /// card dropped without any warning.
     pub fn has_extras(&self) -> bool {
         !self.mcp_servers.is_empty()
             || !self.hooks.is_empty()
             || self.prompts.as_ref().is_some_and(|p| !p.include.is_empty())
+            || self.discovery.is_some()
     }
 }
 
@@ -93,6 +120,26 @@ where
         )),
         other => Ok(other),
     }
+}
+
+/// LLM-facing discovery summary declared by a skill manifest.
+///
+/// PR-F replaced the original per-hint curation (PR-C/D) with a single
+/// `summary` line plus a generic "go read the skill_dir" preamble that
+/// `resolve_extras` emits once per session. The renderer in `extras.rs`
+/// turns this into a short 5-line skill card pushed into
+/// `SkillExtras.prompt_fragments` (name / purpose / tools / skill_dir).
+///
+/// Legacy `hints: [...]` arrays still on disk parse cleanly because this
+/// struct does NOT set `deny_unknown_fields`; serde silently drops the
+/// field. A follow-up will scrub the dead arrays from the 7 mofa-skills
+/// manifests.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct SkillDiscovery {
+    /// One-line description of what the skill does. Falls back to
+    /// `"(no summary)"` in the rendered card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// An MCP server declared by a skill manifest.
@@ -974,5 +1021,153 @@ mod tests {
         let json = r#"{ "name": "s", "version": "0.1.0" }"#;
         let manifest: PluginManifest = serde_json::from_str(json).unwrap();
         assert!(manifest.tool_overrides.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // SKILL.md PR-F: discovery field is summary-only; hints are gone
+    // ------------------------------------------------------------------
+
+    /// PR-F GREEN: a manifest declaring `discovery: { summary: "..." }`
+    /// (and nothing else) parses cleanly and exposes the summary on the
+    /// `SkillDiscovery` value. This is the canonical post-PR-F shape.
+    #[test]
+    fn manifest_parses_discovery_with_only_summary() {
+        let json = r#"{
+            "name": "mofa-slides",
+            "version": "0.7.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "summary": "Generate AI presentation slides with full-bleed Gemini images."
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        let discovery = manifest.discovery.expect("discovery present");
+        assert_eq!(
+            discovery.summary.as_deref(),
+            Some("Generate AI presentation slides with full-bleed Gemini images.")
+        );
+    }
+
+    /// PR-F backwards-tolerance: 7 mofa-skills manifests still ship the
+    /// dead `discovery.hints: [...]` arrays on disk. PR-F must not break
+    /// them — `SkillDiscovery` does NOT set `deny_unknown_fields`, so
+    /// serde silently drops the field. This test pins that contract so a
+    /// future tightening cannot break the migrated mofa-skills.
+    #[test]
+    fn manifest_silently_ignores_legacy_hints_field() {
+        let json = r#"{
+            "name": "legacy-mofa",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "summary": "Card with legacy hints array still on disk.",
+                "hints": [
+                    { "when": "user asks anything", "read": "SKILL.md" },
+                    { "when": "picking a style", "list": "styles/*.toml" }
+                ]
+            }
+        }"#;
+        let manifest: PluginManifest =
+            serde_json::from_str(json).expect("legacy hints field must parse without error");
+        let discovery = manifest.discovery.expect("discovery present");
+        assert_eq!(
+            discovery.summary.as_deref(),
+            Some("Card with legacy hints array still on disk.")
+        );
+    }
+
+    #[test]
+    fn manifest_parses_without_discovery_field() {
+        let json = r#"{
+            "name": "legacy-plugin",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.discovery.is_none());
+    }
+
+    /// Round-2 codex BLOCKER 2 regression: `has_extras()` must report true
+    /// for a manifest whose only extras-bearing field is `discovery`. The
+    /// loader's strict-mode rejection path (`require_signed && tools.is_empty()
+    /// && has_extras()`) and the warn-then-drop path both rely on this; a
+    /// false return here means a discovery-only signed manifest becomes a
+    /// silent no-op instead of either failing closed or being announced in
+    /// logs.
+    #[test]
+    fn has_extras_returns_true_for_discovery_only_manifest() {
+        let json = r#"{
+            "name": "discovery-only",
+            "version": "1.0.0",
+            "tools": [],
+            "discovery": {
+                "summary": "Card-only skill."
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.mcp_servers.is_empty());
+        assert!(manifest.hooks.is_empty());
+        assert!(manifest.prompts.is_none());
+        assert!(
+            manifest.has_extras(),
+            "discovery-only manifest must count as extras-bearing"
+        );
+    }
+
+    /// Companion check: a manifest with discovery alongside a tool also
+    /// reports `has_extras() == true`, so the loader's "drop extras under
+    /// require_signed" warn path fires (otherwise the skill card silently
+    /// disappears for signed tool plugins).
+    #[test]
+    fn has_extras_returns_true_when_discovery_paired_with_tool() {
+        let json = r#"{
+            "name": "tool-with-discovery",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "discovery": {
+                "summary": "Some skill."
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.has_extras());
+    }
+
+    /// Negative control: a manifest with no MCP, no hooks, no prompts, and
+    /// no discovery still reports `has_extras() == false` so the loader's
+    /// `tools.is_empty() && has_extras()` reject does not over-fire.
+    #[test]
+    fn has_extras_returns_false_for_bare_manifest() {
+        let json = r#"{
+            "name": "bare",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(!manifest.has_extras());
+    }
+
+    // ------------------------------------------------------------------
+    // SKILL.md PR-E: legacy skill_md_auto_inject field removal
+    // ------------------------------------------------------------------
+
+    /// PR-E backwards compat: manifests that still declare
+    /// `skill_md_auto_inject` (the PR-D1 opt-out flag) must continue to
+    /// parse cleanly after the field is dropped from `PluginManifest`.
+    /// Serde silently ignores unknown JSON fields because the struct does
+    /// NOT set `deny_unknown_fields`; this test pins that contract so a
+    /// future tightening cannot break the 7 already-migrated mofa-* skill
+    /// manifests on disk.
+    #[test]
+    fn manifest_ignores_legacy_skill_md_auto_inject_field() {
+        let json = r#"{
+            "name": "migrated",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}],
+            "skill_md_auto_inject": false
+        }"#;
+        let manifest: PluginManifest =
+            serde_json::from_str(json).expect("legacy field must parse without error");
+        assert_eq!(manifest.name, "migrated");
+        assert_eq!(manifest.tools.len(), 1);
     }
 }

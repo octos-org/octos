@@ -332,6 +332,7 @@ mod tests {
     fn sample_event(decision: ApprovalDecision) -> ApprovalDecidedEvent {
         ApprovalDecidedEvent {
             session_id: SessionKey("local:test".into()),
+            topic: None,
             approval_id: ApprovalId::new(),
             turn_id: TurnId::new(),
             decision,

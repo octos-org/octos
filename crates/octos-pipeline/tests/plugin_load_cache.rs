@@ -74,7 +74,11 @@ fn create_stub_plugin(plugins_root: &Path, name: &str) -> PathBuf {
             "sha256": "{hash}",
             "tools": [{{
                 "name": "{tool_name}",
-                "description": "stub tool from plugin {name}"
+                "description": "stub tool from plugin {name}",
+                "input_schema": {{
+                    "type": "object",
+                    "properties": {{}}
+                }}
             }}]
         }}"#,
         tool_name = name.replace('-', "_"),
@@ -88,16 +92,25 @@ fn create_stub_plugin(plugins_root: &Path, name: &str) -> PathBuf {
     plugin_dir
 }
 
-/// Acceptance — the cached-plugin path writes the verified-bytes sibling
+/// Acceptance — the cached-plugin path writes the verified-hash ledger
 /// exactly once across many invocations, even when several plugin dirs
 /// are configured. This is the per-node-spawn cost the bug report
 /// flagged: prior to caching every node re-read + re-hashed every
-/// plugin and re-wrote `.<name>_verified` files, so the mtime advanced
-/// on every node execution.
+/// plugin and re-wrote the verified ledger, so the mtime advanced on
+/// every node execution.
+///
+/// Post 2026-05 fix (`fix/skill-dir-root-ownership-bug`) the
+/// verification artifact lives under `verified_cache_dir`, NOT inside
+/// the skill source tree. Post #1325 the cache holds ONLY a `hash.txt`
+/// ledger (not a binary copy), so the plugin still executes from its
+/// in-place skill source binary and asset-resolution keeps working.
+/// The test passes its own tempdir for isolation from the user's real
+/// `~/.octos/cache/verified/`.
 #[tokio::test]
 async fn pipeline_plugin_load_is_cached_across_nodes() {
     let plugins_root = tempfile::tempdir().unwrap();
     let working_dir = tempfile::tempdir().unwrap();
+    let verified_cache = tempfile::tempdir().unwrap();
 
     // Two stub plugins so the test exercises a multi-dir scan.
     create_stub_plugin(plugins_root.path(), "stub-alpha");
@@ -109,32 +122,53 @@ async fn pipeline_plugin_load_is_cached_across_nodes() {
         working_dir.path().to_path_buf(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
-    .with_plugin_dirs(vec![plugins_root.path().to_path_buf()]);
+    .with_plugin_dirs(vec![plugins_root.path().to_path_buf()])
+    .with_plugin_verified_cache_dir(Some(verified_cache.path().to_path_buf()));
 
-    // First load — verified files get written.
-    handler.warm_plugin_cache_for_test().await;
+    // First load — hash ledgers get written under the cache dir.
+    handler.warm_plugin_cache_for_test();
 
-    let alpha_verified = plugins_root.path().join("stub-alpha/.stub-alpha_verified");
-    let beta_verified = plugins_root.path().join("stub-beta/.stub-beta_verified");
+    let alpha_ledger = verified_cache.path().join("stub-alpha").join("hash.txt");
+    let beta_ledger = verified_cache.path().join("stub-beta").join("hash.txt");
     assert!(
-        alpha_verified.exists(),
+        alpha_ledger.exists(),
         "first load should have written {}",
-        alpha_verified.display()
+        alpha_ledger.display()
     );
     assert!(
-        beta_verified.exists(),
+        beta_ledger.exists(),
         "first load should have written {}",
-        beta_verified.display()
+        beta_ledger.display()
     );
 
-    let alpha_mtime_1 = std::fs::metadata(&alpha_verified)
+    // Post-#1325 regression guard: the cache must contain only the
+    // hash ledger, never a copy of the binary. Asset-bearing plugins
+    // (mofa-slides etc.) rely on the binary running in-place so the
+    // `<skill>/styles/` sibling resolves correctly.
+    let alpha_unwanted = verified_cache.path().join("stub-alpha").join("main");
+    let beta_unwanted = verified_cache.path().join("stub-beta").join("main");
+    assert!(
+        !alpha_unwanted.exists() && !beta_unwanted.exists(),
+        "cache must not host a copy of the plugin binary (saw {} or {})",
+        alpha_unwanted.display(),
+        beta_unwanted.display(),
+    );
+
+    // Regression: the verified artifact must NOT taint the skill source dir.
+    let alpha_skill_sibling = plugins_root.path().join("stub-alpha/.stub-alpha_verified");
+    let alpha_skill_sibling_main = plugins_root.path().join("stub-alpha/.main_verified");
+    assert!(
+        !alpha_skill_sibling.exists() && !alpha_skill_sibling_main.exists(),
+        "skill source dir must not host a verified-copy file (saw {} or {})",
+        alpha_skill_sibling.display(),
+        alpha_skill_sibling_main.display(),
+    );
+
+    let alpha_mtime_1 = std::fs::metadata(&alpha_ledger)
         .unwrap()
         .modified()
         .unwrap();
-    let beta_mtime_1 = std::fs::metadata(&beta_verified)
-        .unwrap()
-        .modified()
-        .unwrap();
+    let beta_mtime_1 = std::fs::metadata(&beta_ledger).unwrap().modified().unwrap();
 
     // Sleep long enough that a fresh write would advance mtime past the
     // filesystem's resolution. macOS HFS+/APFS typically resolves to 1 ns
@@ -142,27 +176,26 @@ async fn pipeline_plugin_load_is_cached_across_nodes() {
     // any second `write` visible.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-    // Second + third loads — these would re-write the verified files
-    // under the old (uncached) code path. With caching they must NOT.
-    handler.warm_plugin_cache_for_test().await;
-    handler.warm_plugin_cache_for_test().await;
+    // Second + third loads — these would re-write the ledger entries
+    // under the old (uncached) code path. With the `CodergenHandler`
+    // OnceLock-backed cache they must NOT (the loader is invoked
+    // exactly once per handler).
+    handler.warm_plugin_cache_for_test();
+    handler.warm_plugin_cache_for_test();
 
-    let alpha_mtime_2 = std::fs::metadata(&alpha_verified)
+    let alpha_mtime_2 = std::fs::metadata(&alpha_ledger)
         .unwrap()
         .modified()
         .unwrap();
-    let beta_mtime_2 = std::fs::metadata(&beta_verified)
-        .unwrap()
-        .modified()
-        .unwrap();
+    let beta_mtime_2 = std::fs::metadata(&beta_ledger).unwrap().modified().unwrap();
 
     assert_eq!(
         alpha_mtime_1, alpha_mtime_2,
-        "stub-alpha verified file must NOT be re-written on subsequent loads",
+        "stub-alpha hash ledger must NOT be re-written on subsequent loads",
     );
     assert_eq!(
         beta_mtime_1, beta_mtime_2,
-        "stub-beta verified file must NOT be re-written on subsequent loads",
+        "stub-beta hash ledger must NOT be re-written on subsequent loads",
     );
 }
 
@@ -185,8 +218,8 @@ async fn cached_plugin_registration_exposes_loaded_tools() {
     )
     .with_plugin_dirs(vec![plugins_root.path().to_path_buf()]);
 
-    let names_first = handler.cached_plugin_tool_names_for_test().await;
-    let names_second = handler.cached_plugin_tool_names_for_test().await;
+    let names_first = handler.cached_plugin_tool_names_for_test();
+    let names_second = handler.cached_plugin_tool_names_for_test();
 
     assert_eq!(
         names_first, names_second,
@@ -207,7 +240,7 @@ async fn empty_plugin_dirs_is_a_no_op_fast_path() {
         working_dir.path().to_path_buf(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
-    assert!(handler.cached_plugin_tool_names_for_test().await.is_empty());
+    assert!(handler.cached_plugin_tool_names_for_test().is_empty());
 }
 
 /// Measurement guard — the second cached load must complete in under
@@ -235,12 +268,12 @@ async fn cached_load_is_at_least_an_order_of_magnitude_faster() {
 
     // First load — full cost.
     let cold_start = std::time::Instant::now();
-    handler.warm_plugin_cache_for_test().await;
+    handler.warm_plugin_cache_for_test();
     let cold_elapsed = cold_start.elapsed();
 
     // Second load — must be effectively free.
     let warm_start = std::time::Instant::now();
-    handler.warm_plugin_cache_for_test().await;
+    handler.warm_plugin_cache_for_test();
     let warm_elapsed = warm_start.elapsed();
 
     eprintln!(

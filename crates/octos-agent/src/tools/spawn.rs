@@ -2462,9 +2462,9 @@ impl Tool for SpawnTool {
                         work_dir: Some(&self.working_dir),
                         synthesis_config: None,
                         require_signed: self.plugin_require_signed,
+                        verified_cache_dir: None,
                     },
-                )
-                .await;
+                );
             }
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
@@ -2892,9 +2892,9 @@ impl Tool for SpawnTool {
                             work_dir: Some(&working_dir),
                             synthesis_config: None,
                             require_signed: plugin_require_signed,
+                            verified_cache_dir: None,
                         },
-                    )
-                    .await;
+                    );
                 }
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());

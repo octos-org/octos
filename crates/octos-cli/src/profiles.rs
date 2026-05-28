@@ -129,6 +129,21 @@ pub struct ProfileConfig {
     /// unsigned plugins still load with a warning.
     #[serde(default)]
     pub plugins: crate::config::PluginsConfig,
+    /// RFC-3 (#1292) — per-topic model lane routing. When set, the
+    /// session-actor and the WS turn handler resolve the session's
+    /// `topic()` to a [`octos_llm::Lane`] using these overrides on
+    /// top of the built-in defaults, then scope the LLM chat call
+    /// inside [`octos_llm::with_lane_context`] so the
+    /// [`octos_llm::AdaptiveRouter`] narrows its candidate set to
+    /// the lane's `(provider, model)` list before scoring.
+    ///
+    /// Absent / `None` ⇒ pre-RFC-3 behavior: the router uses the
+    /// profile-default provider chain unchanged. The built-in lane
+    /// defaults still apply for topic prefixes (`slides`, `code`,
+    /// `research`, etc.) — the per-profile field only carries
+    /// **overrides**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
 }
 
 /// Profile-owned review workflow configuration.

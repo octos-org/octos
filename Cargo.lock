@@ -3731,6 +3731,7 @@ dependencies = [
  "futures",
  "gix",
  "glob",
+ "globset",
  "hound",
  "htmd",
  "ignore",
@@ -3839,6 +3840,7 @@ dependencies = [
  "octos-llm",
  "octos-memory",
  "octos-pipeline",
+ "octos-plugin",
  "octos-swarm",
  "open",
  "percent-encoding",
@@ -3877,7 +3879,9 @@ dependencies = [
  "eyre",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio-test",
+ "tracing",
  "uuid",
 ]
 

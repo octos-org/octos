@@ -136,6 +136,37 @@ pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persis
 /// the message — only the wire event the connected client observes flips.
 pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1";
 
+/// Feature flag for the explicit `file/attached` envelope (UPCR-2026-014
+/// M9-α-9).
+///
+/// Surfaces a dedicated, dedicated-shape notification per artefact path
+/// when a `spawn_only` background tool (`mofa_slides`, `podcast_generate`,
+/// `fm_tts`, `deep_search`) — or any code path that drains a
+/// `BackgroundResultPayload` with non-empty `media` / `envelope_media` —
+/// commits to the canonical session ledger. Mirrors the per-file media
+/// already carried on `message/persisted` and `turn/spawn_complete`, but
+/// as an isolated wire signal so SPA reducers (and admin / debug
+/// clients) can subscribe to file deliveries without parsing the
+/// content-bearing envelopes.
+///
+/// The fan-out is best-effort and additive: when no client has
+/// negotiated this capability the helper still appends the envelope to
+/// the ledger (subscribers + replay buffers continue to observe), but
+/// the dedicated per-connection wire filter drops the frame so legacy
+/// clients see no behaviour change. Clients that advertise this
+/// capability receive a `file/attached` per artefact in addition to the
+/// existing `message/persisted` / `turn/spawn_complete` envelopes.
+///
+/// Wired by the AppUI WS path's `BackgroundResultSender` closure (see
+/// `ui_protocol.rs::install_message_commit_observer` adjacent helpers)
+/// after each background result row commits. The notification's
+/// `(turn_id, path)` pair gives the SPA an authoritative placement
+/// signal even when `turn/spawn_complete`'s richer envelope is delayed
+/// or lost to a wire-level filter mismatch — the exact failure mode
+/// captured by the slides soak (2026-05-24, 5/8 successful generations
+/// produced PPTX bytes but 0/8 surfaced a clickable button on the SPA).
+pub const UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1: &str = "event.file_attached.v1";
+
 /// Feature flag for UPCR-2026-014 M9-γ canonical projection envelope.
 ///
 /// Capability-gated — servers advertise it only when they emit the
@@ -211,6 +242,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -944,6 +976,14 @@ pub mod methods {
     /// event mirroring the SSE `file:` frame from `files_to_send` tool
     /// surfaces.
     pub const FILE_ATTACHED: &str = "file/attached";
+    /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
+    /// envelope notification (spec § 14). γ-1 reserves the method name
+    /// in the notification methods list as part of capability negotiation
+    /// wire-up; γ-2 (follow-up) will gate emission on the
+    /// `projection.envelope.v1` feature and delete the legacy
+    /// `message/delta`, `message/persisted`, `tool/*`, and
+    /// `turn/completed` notifications it supersedes.
+    pub const PROJECTION_ENVELOPE: &str = "projection/envelope";
     /// UPCR-2026-014 (M9-α-9) `session/event` — wrapper envelope for
     /// legacy `/api/sessions/:id/events/stream` SSE frames bridged onto
     /// the unified v1 surface.
@@ -1108,6 +1148,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::MESSAGE_PERSISTED,
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
+    methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
     methods::ROUTER_STATUS,
     methods::ROUTER_FAILOVER,
@@ -3125,6 +3166,53 @@ pub struct Envelope {
     pub payload: Payload,
 }
 
+/// Ledger / wire wrapper around [`Envelope`] for the
+/// `projection/envelope` notification (UPCR-2026-014 M9-γ).
+///
+/// The wire JSON-RPC `params` field MUST match the spec § 14.1 wire
+/// shape exactly — `{ thread_id, seq, client_message_id?, payload }` —
+/// with **no `session_id`** key. But the in-memory ledger needs the
+/// `SessionKey` to route the event to the right per-session ring and
+/// broadcast channel, and it needs the optional `topic` so the
+/// topic-scope live filter (`ledger_event_matches_topic_scope`) keeps
+/// envelopes flowing to the right subscriber pane.
+///
+/// This wrapper carries those routing fields **outside** of the
+/// `envelope` body so the durable ledger can persist them and recovery
+/// can rebuild the routing context after restart.
+///
+/// **Serialization split (codex #1336 round-2 BLOCKER 4):** the global
+/// `Serialize` / `Deserialize` derive includes ALL fields (envelope +
+/// session_id + topic) so the DURABLE LEDGER round-trips routing
+/// state across daemon restart. The wire shape — bare `Envelope` per
+/// spec § 14.1 — is opted into only at the JSON-RPC boundary in
+/// [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`], where the bare
+/// envelope is extracted/re-wrapped. This is the "structurally honest"
+/// answer: a single global Serialize that strips routing fields means
+/// the ledger's disk records also strip them, and recovery walks the
+/// disk back into an `EnvelopeNotification` with empty `session_id` /
+/// `None` topic — topic-scoped envelope replay after restart silently
+/// loses routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeNotification {
+    /// Session this envelope belongs to. Used for ledger routing and
+    /// broadcast fan-out. Stripped from the wire (spec § 14.1) at the
+    /// `into_rpc_notification` boundary; preserved on disk so recovery
+    /// can rebuild routing.
+    pub session_id: SessionKey,
+    /// Optional topic for topic-scoped live forwarders (#1329 P0-A class
+    /// fix). Captured at the emit site BEFORE any `base_key()` strip so
+    /// the topic-scope filter routes correctly even when `session_id`
+    /// is the bare base key. Stripped from the wire at the
+    /// `into_rpc_notification` boundary; preserved on disk so recovery
+    /// can re-route topic-scoped envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// The canonical wire envelope — serializes verbatim per spec § 14.1.
+    pub envelope: Envelope,
+}
+
 /// Draft command payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -4077,6 +4165,14 @@ pub struct MessageDeltaEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStartedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key — populated from the originating
+    /// `SessionKey.topic()` BEFORE any `base_key()` strip. Carried on
+    /// the wire so a topic-scoped subscriber routes the event correctly
+    /// even when the emit-side `session_id` was reconstructed from
+    /// `base_key()`. Closes the P0-A class routing drop (#1329); see
+    /// `UiNotification::topic()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -4087,6 +4183,9 @@ pub struct ToolStartedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolProgressEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4098,6 +4197,9 @@ pub struct ToolProgressEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCompletedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -4294,6 +4396,9 @@ impl ApprovalRequestedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalAutoResolvedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub tool_name: String,
@@ -4312,6 +4417,9 @@ pub struct ApprovalAutoResolvedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecidedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub decision: ApprovalDecision,
@@ -4338,6 +4446,7 @@ impl ApprovalDecidedEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             decision,
@@ -4357,6 +4466,9 @@ impl ApprovalDecidedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalCancelledEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub reason: String,
@@ -4370,6 +4482,7 @@ impl ApprovalCancelledEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
@@ -4821,6 +4934,13 @@ pub struct ReplayLossyEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileAttachedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    /// Closes the P0-A regression that motivated the prior
+    /// `ledger_event_matches_topic_scope` exemption — now that the
+    /// field exists, the classifier consults the explicit topic and
+    /// the exemption is no longer needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     /// Filesystem path or URL the tool produced.
     pub path: String,
@@ -4977,6 +5097,14 @@ pub enum UiNotification {
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
+    /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
+    /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
+    /// per-connection live filter keeps legacy and envelope deliveries
+    /// mutually exclusive (legacy clients never see this variant,
+    /// negotiated clients see ONLY this variant for the events it
+    /// supersedes — `message/delta`, `message/persisted`, `tool/*`,
+    /// `turn/completed`, `file/attached`).
+    Envelope(EnvelopeNotification),
 }
 
 fn set_topic_if_absent(slot: &mut Option<String>, topic: &str) {
@@ -5027,6 +5155,7 @@ impl UiNotification {
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
+            Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
         }
     }
 
@@ -5066,6 +5195,7 @@ impl UiNotification {
             Self::LoopCompleted(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
+            Self::Envelope(event) => &event.session_id,
         }
     }
 
@@ -5075,7 +5205,23 @@ impl UiNotification {
             Self::MessageDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::ToolStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::ToolProgress(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ToolCompleted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::ApprovalRequested(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalAutoResolved(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalDecided(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
@@ -5092,9 +5238,13 @@ impl UiNotification {
             Self::TurnSpawnComplete(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::FileAttached(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::SessionEventBridged(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::Envelope(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             _ => self.session_id().topic(),
         }
     }
@@ -5106,14 +5256,22 @@ impl UiNotification {
         match self {
             Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::Envelope(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
         }
     }
@@ -5156,6 +5314,14 @@ impl UiNotification {
             Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
+            // UPCR-2026-014 (M9-γ): the wire shape per spec § 14.1 is the
+            // bare `Envelope` — `session_id` and `topic` are server-internal
+            // routing fields stripped here at the JSON-RPC boundary. The
+            // `EnvelopeNotification` struct itself uses a derive-based
+            // `Serialize` so the durable ledger persists routing fields
+            // on disk; recovery rebuilds them before rebroadcasting (codex
+            // #1336 round-2 BLOCKER 4).
+            Self::Envelope(params) => serde_json::to_value(&params.envelope),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -5230,6 +5396,26 @@ impl UiNotification {
             methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
                 decode_params(method, params)?,
             )),
+            // UPCR-2026-014 (M9-γ): decode the bare wire envelope into the
+            // wrapper; `session_id` and `topic` default to empty/None and
+            // are reconstituted from the ambient ledger context by the
+            // server-side decode path (the ledger never round-trips a
+            // wire-only envelope back into routing).
+            //
+            // Codex #1336 round-2 BLOCKER 4: the JSON-RPC params carry
+            // ONLY the bare `Envelope` (the wire shape per spec § 14.1) —
+            // decode it into `Envelope` directly and wrap with empty
+            // routing fields. The full-struct `EnvelopeNotification`
+            // serialization is used by the ledger ONLY on disk, never
+            // on the wire.
+            methods::PROJECTION_ENVELOPE => {
+                let envelope: Envelope = decode_params(method, params)?;
+                Ok(Self::Envelope(EnvelopeNotification {
+                    session_id: SessionKey(String::new()),
+                    topic: None,
+                    envelope,
+                }))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -5743,6 +5929,7 @@ mod tests {
                 "message/persisted",
                 "turn/spawn_complete",
                 "file/attached",
+                "projection/envelope",
                 "session/event",
                 "router/status",
                 "router/failover",
@@ -5905,6 +6092,7 @@ mod tests {
                     "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
+                    "projection/envelope",
                     "session/event",
                     "router/status",
                     "router/failover",
@@ -5930,6 +6118,7 @@ mod tests {
                     "state.turn_state_get.v1",
                     "event.message_persisted.v1",
                     "event.spawn_complete.v1",
+                    "event.file_attached.v1",
                     "projection.envelope.v1",
                     "auxiliary.rest_to_ws.v1",
                     "coding.autonomy.v1",
@@ -8113,6 +8302,7 @@ mod tests {
             .with_timezone(&Utc);
         let event = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
             session_id: session_id.clone(),
+            topic: None,
             approval_id: approval_id.clone(),
             turn_id: turn_id.clone(),
             decision: ApprovalDecision::Approve,
@@ -9807,6 +9997,187 @@ mod tests {
         );
     }
 
+    #[test]
+    fn envelope_notification_method_is_projection_envelope() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            envelope: Envelope {
+                thread_id: "thread-1".into(),
+                seq: 1,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "hi".into() },
+            },
+        });
+        assert_eq!(notif.method(), "projection/envelope");
+        assert_eq!(notif.session_id(), &SessionKey("local:demo".into()));
+    }
+
+    #[test]
+    fn envelope_notification_round_trips_through_rpc_envelope_with_bare_wire_shape() {
+        // The wire shape MUST be the bare `Envelope` per spec § 14.1 —
+        // `session_id` and `topic` are server-internal routing fields
+        // and MUST NOT leak onto the JSON-RPC `params`.
+        let envelope = Envelope {
+            thread_id: "thread-7".into(),
+            seq: 42,
+            client_message_id: Some("cmid-x".into()),
+            payload: Payload::UserMessage {
+                text: "hi".into(),
+                files: vec![FileRef {
+                    path: "/tmp/a.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 12,
+                }],
+            },
+        };
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo".into()),
+            topic: Some("planning".into()),
+            envelope: envelope.clone(),
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        assert_eq!(rpc.method, "projection/envelope");
+        // Wire shape: bare Envelope JSON, no session_id/topic keys.
+        let params = &rpc.params;
+        assert!(
+            params.get("session_id").is_none(),
+            "session_id must not leak onto the wire"
+        );
+        assert!(
+            params.get("topic").is_none(),
+            "topic must not leak onto the wire"
+        );
+        assert_eq!(params.get("thread_id"), Some(&json!("thread-7")));
+        assert_eq!(params.get("seq"), Some(&json!(42)));
+        assert_eq!(params.get("client_message_id"), Some(&json!("cmid-x")));
+
+        // Round-trip decode: session_id defaults to empty (the AppUI
+        // decode path rebuilds it from ambient context); envelope must
+        // be byte-equal.
+        let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
+        match parsed {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(ev.envelope, envelope);
+                // Routing fields default on the decode path; consumer
+                // reconstructs them from ambient context.
+                assert_eq!(ev.session_id, SessionKey(String::new()));
+                assert_eq!(ev.topic, None);
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+    }
+
+    /// Codex #1336 round-2 BLOCKER 4: the durable ledger writes records
+    /// via `serde_json::to_string(&LedgerDiskRecord)`, which chains
+    /// through the global `Serialize` impl on `EnvelopeNotification`.
+    /// Before the fix, that global impl stripped `session_id` + `topic`
+    /// to mirror the wire shape — so disk records lost their routing
+    /// context and recovery deserialized them with empty/None routing.
+    /// Topic-scoped envelope replay after restart silently mis-routed.
+    ///
+    /// Post-fix: the global Serialize/Deserialize is derive-based and
+    /// preserves ALL fields. The wire shape is opted into only at the
+    /// JSON-RPC boundary inside `into_rpc_notification`.
+    #[test]
+    fn envelope_notification_serde_preserves_routing_fields_for_disk_persistence() {
+        // Persistent shape: routing fields survive a JSON round-trip.
+        // This is the path the durable ledger uses for its on-disk
+        // records, NOT the wire path.
+        let original = EnvelopeNotification {
+            session_id: SessionKey("local:disk-routing".into()),
+            topic: Some("planning".into()),
+            envelope: Envelope {
+                thread_id: "thread-disk".into(),
+                seq: 7,
+                client_message_id: None,
+                payload: Payload::AssistantDelta {
+                    text: "persisted delta".into(),
+                },
+            },
+        };
+
+        // Serialize the EnvelopeNotification directly (NOT via
+        // into_rpc_notification) — this mirrors how the ledger writes
+        // it inside a LedgerDiskRecord. The output MUST contain the
+        // routing fields.
+        let serialized =
+            serde_json::to_value(&original).expect("EnvelopeNotification serializes for disk");
+        assert_eq!(
+            serialized.get("session_id"),
+            Some(&json!("local:disk-routing")),
+            "session_id must persist on disk so recovery can rebuild routing",
+        );
+        assert_eq!(
+            serialized.get("topic"),
+            Some(&json!("planning")),
+            "topic must persist on disk so topic-scoped recovery routes correctly",
+        );
+        assert!(
+            serialized.get("envelope").is_some(),
+            "envelope body must be present on disk",
+        );
+
+        // Deserialize back — routing fields must round-trip byte-equal.
+        let parsed: EnvelopeNotification = serde_json::from_value(serialized)
+            .expect("EnvelopeNotification deserializes from disk");
+        assert_eq!(
+            parsed, original,
+            "disk round-trip must preserve all fields including routing",
+        );
+
+        // Defensive: a `topic: None` envelope omits the field on disk
+        // (no behavioural change — just keeps the disk shape compact
+        // when topic isn't set).
+        let no_topic = EnvelopeNotification {
+            session_id: SessionKey("local:disk-no-topic".into()),
+            topic: None,
+            envelope: original.envelope.clone(),
+        };
+        let serialized = serde_json::to_value(&no_topic).expect("serialize");
+        assert!(
+            serialized.get("topic").is_none(),
+            "absent topic is omitted on disk; deserialize defaults back to None",
+        );
+        let parsed: EnvelopeNotification = serde_json::from_value(serialized).expect("deserialize");
+        assert_eq!(parsed, no_topic);
+    }
+
+    /// Codex #1336 round-2 BLOCKER 4 — wire shape regression guard.
+    /// `into_rpc_notification` is the ONLY place the wire shape is
+    /// produced; routing fields are stripped here and ONLY here. The
+    /// disk-persistence test above pins that the routing fields DO
+    /// survive when the envelope is serialized directly (not through
+    /// into_rpc_notification).
+    #[test]
+    fn envelope_notification_into_rpc_notification_strips_routing_fields() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:wire-strip".into()),
+            topic: Some("planning".into()),
+            envelope: Envelope {
+                thread_id: "thread-wire".into(),
+                seq: 5,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "x".into() },
+            },
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
+        let params = &rpc.params;
+        assert!(
+            params.get("session_id").is_none(),
+            "wire MUST strip session_id (spec § 14.1)",
+        );
+        assert!(
+            params.get("topic").is_none(),
+            "wire MUST strip topic (spec § 14.1)",
+        );
+        // Bare envelope on the wire — `thread_id`, `seq`, `payload`
+        // are top-level keys (no `envelope` nesting).
+        assert_eq!(params.get("thread_id"), Some(&json!("thread-wire")));
+        assert_eq!(params.get("seq"), Some(&json!(5)));
+    }
+
     // ------------------------------------------------------------------
     // Wave4-A: router/status, router/failover, queue/state, router/set_mode,
     // router/get_metrics round-trip + wire-shape tests.
@@ -10034,6 +10405,393 @@ mod tests {
         assert!(
             caps.supports_method(methods::ROUTER_GET_METRICS),
             "router/get_metrics must be a supported command method"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #1329 — topic-scope routing class fix
+    //
+    // The 6 events listed below (ToolStarted/Progress/Completed,
+    // ApprovalAutoResolved/Decided/Cancelled), plus FileAttached
+    // (already covered by the P0-A regression), gained an explicit
+    // `topic: Option<String>` field. `UiNotification::topic()` now
+    // consults that field FIRST and only falls back to
+    // `SessionKey.topic()`. Each test:
+    //   1. Builds the event with an explicit `topic` field — `topic()`
+    //      returns the field's value, even when `session_id` was
+    //      stripped to `base_key()` (the P0-A failure mode).
+    //   2. Builds the same event with a topic-suffixed session_id but
+    //      NO explicit topic — `topic()` falls back to the suffix
+    //      (backward compat; `stamp_topic_from_session` then promotes
+    //      it to the explicit field at append time).
+    //   3. Builds the event with neither — `topic()` returns `None`.
+    // -----------------------------------------------------------------
+
+    fn topic_session() -> SessionKey {
+        SessionKey("local:slides-soak#slides".into())
+    }
+
+    fn bare_session() -> SessionKey {
+        SessionKey("local:slides-soak".into())
+    }
+
+    #[test]
+    fn tool_started_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(
+            with_field.topic(),
+            Some("slides"),
+            "explicit topic field wins over base_key() session_id"
+        );
+
+        let fallback = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(
+            fallback.topic(),
+            Some("slides"),
+            "missing explicit topic falls back to session_id suffix"
+        );
+
+        let neither = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-3".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(neither.topic(), None, "no topic anywhere → None");
+    }
+
+    #[test]
+    fn tool_progress_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            message: Some("step 1".into()),
+            progress_pct: Some(25.0),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            message: None,
+            progress_pct: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn tool_completed_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: Some(10),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_auto_resolved_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_decided_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_cancelled_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    /// #1329 sibling test: FileAttached gained the same `topic` field
+    /// as the 6 ApprovalDecided-class events; verify the same access
+    /// rule (explicit first, suffix fallback). This was the bug the
+    /// P0-A exemption patched; with explicit field, the exemption is
+    /// no longer needed.
+    #[test]
+    fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: Some("tc-slides".into()),
+            mime: None,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: None,
+            mime: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    /// `stamp_topic_from_session` MUST populate the new explicit
+    /// `topic` field for the 6 vulnerable variants (and FileAttached)
+    /// from the SessionKey suffix when the field is absent. This is
+    /// the safety net that runs in `into_rpc_notification`: even if a
+    /// caller forgets to stamp, the wire-emit path stamps it for them
+    /// so a topic-scoped subscriber always routes the event correctly.
+    #[test]
+    fn stamp_topic_from_session_populates_new_topic_class_events() {
+        // ToolStarted
+        let mut event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        event.stamp_topic_from_session();
+        assert_eq!(event.topic(), Some("slides"));
+        if let UiNotification::ToolStarted(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        } else {
+            panic!("event variant changed unexpectedly");
+        }
+
+        // ToolProgress
+        let mut event = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            message: None,
+            progress_pct: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ToolProgress(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ToolCompleted
+        let mut event = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ToolCompleted(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalAutoResolved
+        let mut event = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalAutoResolved(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalDecided
+        let mut event = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalDecided(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalCancelled
+        let mut event = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalCancelled(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // FileAttached (sibling)
+        let mut event = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: None,
+            mime: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::FileAttached(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+    }
+
+    /// #1329 wire-shape guarantee: the new `topic` field must
+    /// serialize when present and stay omitted when absent (so v0
+    /// clients never see a surprise field). Verified for one
+    /// representative variant (the same `skip_serializing_if` is
+    /// applied uniformly across all 7).
+    #[test]
+    fn tool_started_topic_field_round_trips_on_the_wire() {
+        let event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId(Uuid::from_u128(0x1329)),
+            tool_call_id: "tc-1329".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        let wire = serde_json::to_value(event.clone().into_rpc_notification().expect("serialize"))
+            .expect("to_value");
+        assert_eq!(wire["params"]["topic"], json!("slides"));
+
+        let decoded: RpcNotification<Value> =
+            serde_json::from_value(wire).expect("deserialize wire");
+        let decoded_event = UiNotification::from_rpc_notification(decoded).expect("decode");
+        assert_eq!(decoded_event.topic(), Some("slides"));
+
+        // Absent topic stays omitted.
+        let bare_event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-bare".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        let wire =
+            serde_json::to_value(bare_event.into_rpc_notification().expect("serialize bare"))
+                .expect("to_value");
+        assert!(
+            wire["params"].get("topic").is_none(),
+            "absent topic field must stay omitted on the wire (no v0 breakage)"
         );
     }
 }

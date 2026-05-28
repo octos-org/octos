@@ -1,5 +1,15 @@
-//! Verifies that PluginLoader::load_into_with_options re-registers HTTP-discovered
+//! Verifies that the async HTTP discovery pass re-registers HTTP-discovered
 //! tools on every startup — fixes Critical #1 from the PR #1260 code review.
+//!
+//! Architecture (Path 2 from the PR #1346 → #1347 merge):
+//!
+//! Static (binary-protocol) skills register through the sync
+//! `PluginLoader::load_into_with_options`. HTTP-discovery skills get their
+//! catalog walked by an explicit async pass —
+//! `register_http_skills_on_startup` — that the agent boot path (chat /
+//! gateway / serve) invokes after the sync loader returns. The two passes
+//! together produce the same registry state the old in-loader HTTP path
+//! produced; splitting them just lets the cache pipeline stay sync.
 
 use std::net::{SocketAddr, TcpListener};
 
@@ -9,12 +19,12 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use octos_agent::permissions::SafetyTier;
-use octos_agent::plugins::{PluginLoader, activate_skill};
+use octos_agent::plugins::{PluginLoader, activate_skill, register_http_skills_on_startup};
 use octos_agent::tools::ToolRegistry;
 use octos_agent::tools::robot_groups;
 
 #[tokio::test]
-async fn load_into_registers_http_tools_from_catalog() {
+async fn startup_pass_registers_http_tools_from_catalog() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tools"))
@@ -40,14 +50,12 @@ async fn load_into_registers_http_tools_from_catalog() {
     .unwrap();
 
     let mut registry = ToolRegistry::new();
-    PluginLoader::load_into_with_options(
-        &mut registry,
-        &[dir.path().to_path_buf()],
-        &[],
-        Default::default(),
-    )
-    .await
-    .expect("load_into should succeed");
+    let plugin_dirs = vec![dir.path().to_path_buf()];
+    PluginLoader::load_into_with_options(&mut registry, &plugin_dirs, &[], Default::default())
+        .expect("static load_into should succeed");
+    register_http_skills_on_startup(&mut registry, &plugin_dirs)
+        .await
+        .expect("HTTP startup pass should succeed");
 
     // Names are sanitized for LLM provider tool-name pattern compatibility:
     // dots become underscores. The original SPEC-V1 verb is preserved in
@@ -64,7 +72,7 @@ async fn load_into_registers_http_tools_from_catalog() {
 }
 
 #[tokio::test]
-async fn load_into_falls_back_to_manifest_required_safety_tier_when_catalog_omits() {
+async fn startup_pass_falls_back_to_manifest_required_safety_tier_when_catalog_omits() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tools"))
@@ -90,14 +98,12 @@ async fn load_into_falls_back_to_manifest_required_safety_tier_when_catalog_omit
     .unwrap();
 
     let mut registry = ToolRegistry::new();
-    PluginLoader::load_into_with_options(
-        &mut registry,
-        &[dir.path().to_path_buf()],
-        &[],
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let plugin_dirs = vec![dir.path().to_path_buf()];
+    PluginLoader::load_into_with_options(&mut registry, &plugin_dirs, &[], Default::default())
+        .unwrap();
+    register_http_skills_on_startup(&mut registry, &plugin_dirs)
+        .await
+        .unwrap();
 
     // Sanitized: dots in the catalog name become underscores at registration.
     assert!(registry.get_tool("vendor_x_y_motion_go").is_some());
@@ -109,7 +115,7 @@ async fn load_into_falls_back_to_manifest_required_safety_tier_when_catalog_omit
 }
 
 #[tokio::test]
-async fn load_into_uses_tool_overrides_when_present() {
+async fn startup_pass_uses_tool_overrides_when_present() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tools"))
@@ -136,14 +142,12 @@ async fn load_into_uses_tool_overrides_when_present() {
     .unwrap();
 
     let mut registry = ToolRegistry::new();
-    PluginLoader::load_into_with_options(
-        &mut registry,
-        &[dir.path().to_path_buf()],
-        &[],
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let plugin_dirs = vec![dir.path().to_path_buf()];
+    PluginLoader::load_into_with_options(&mut registry, &plugin_dirs, &[], Default::default())
+        .unwrap();
+    register_http_skills_on_startup(&mut registry, &plugin_dirs)
+        .await
+        .unwrap();
 
     // Sanitized: tool_overrides key in the manifest uses the dotted SPEC-V1
     // verb; the resolver matches it before sanitization, then the resulting
@@ -157,7 +161,7 @@ async fn load_into_uses_tool_overrides_when_present() {
 }
 
 /// Important #1 fix from PR #1260 review: `activate_skill` (install-time)
-/// must use the same helper as `load_into_with_options` so a freshly
+/// must use the same helper as the runtime startup pass so a freshly
 /// installed skill is policy-gated immediately — registers as
 /// `DoraToolBridge` AND enrols in `robot_groups`, identically to the
 /// runtime-startup path.
@@ -213,10 +217,10 @@ async fn activate_skill_registers_http_tools_and_robot_groups() {
 /// PR #1260 review (Finding 2): startup-time HTTP discovery failure must
 /// not register zero tools and return success — that leaves an installed
 /// HTTP-backed skill silently unavailable until manual restart. The
-/// loader must hard-fail so the operator notices and CI catches the
-/// regression.
+/// startup pass must hard-fail so the operator notices and CI catches
+/// the regression.
 #[tokio::test]
-async fn load_into_hard_fails_when_http_bridge_unreachable() {
+async fn startup_pass_hard_fails_when_http_bridge_unreachable() {
     // Grab a real loopback port, then immediately drop the listener so
     // connections to it get "connection refused" — emulates a bridge that
     // crashed before the agent restarted.
@@ -241,14 +245,15 @@ async fn load_into_hard_fails_when_http_bridge_unreachable() {
     .unwrap();
 
     let mut registry = ToolRegistry::new();
-    let err = PluginLoader::load_into_with_options(
-        &mut registry,
-        &[dir.path().to_path_buf()],
-        &[],
-        Default::default(),
-    )
-    .await
-    .expect_err("load_into must fail when an HTTP-discovery skill cannot reach its bridge");
+    let plugin_dirs = vec![dir.path().to_path_buf()];
+    // Static load_into is a no-op here (the manifest has no static tools)
+    // but it must still succeed — the HTTP path is the gate, not this one.
+    PluginLoader::load_into_with_options(&mut registry, &plugin_dirs, &[], Default::default())
+        .expect("sync load_into should still succeed for HTTP-only manifests");
+
+    let err = register_http_skills_on_startup(&mut registry, &plugin_dirs)
+        .await
+        .expect_err("HTTP startup pass must fail when the bridge is unreachable");
 
     let msg = err.to_string();
     assert!(
@@ -262,7 +267,7 @@ async fn load_into_hard_fails_when_http_bridge_unreachable() {
 /// Companion to the above: a catalog endpoint that returns malformed JSON
 /// must also fail-fast, not silently register zero tools.
 #[tokio::test]
-async fn load_into_hard_fails_when_catalog_returns_garbage() {
+async fn startup_pass_hard_fails_when_catalog_returns_garbage() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tools"))
@@ -286,14 +291,13 @@ async fn load_into_hard_fails_when_catalog_returns_garbage() {
     .unwrap();
 
     let mut registry = ToolRegistry::new();
-    let err = PluginLoader::load_into_with_options(
-        &mut registry,
-        &[dir.path().to_path_buf()],
-        &[],
-        Default::default(),
-    )
-    .await
-    .expect_err("load_into must fail when catalog response cannot be parsed");
+    let plugin_dirs = vec![dir.path().to_path_buf()];
+    PluginLoader::load_into_with_options(&mut registry, &plugin_dirs, &[], Default::default())
+        .expect("sync load_into should still succeed for HTTP-only manifests");
+
+    let err = register_http_skills_on_startup(&mut registry, &plugin_dirs)
+        .await
+        .expect_err("HTTP startup pass must fail when catalog response cannot be parsed");
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("http") || msg.contains("bridge") || msg.contains("discovery"),

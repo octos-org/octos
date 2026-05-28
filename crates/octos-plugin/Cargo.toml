@@ -21,3 +21,8 @@ metrics = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 regex = { workspace = true }
+
+# RFC-2 CI entrypoint — used by scripts/validate-skill-manifests.sh.
+[[bin]]
+name = "validate_manifests"
+path = "src/bin/validate_manifests.rs"

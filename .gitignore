@@ -114,6 +114,10 @@ test_a2.md
 # api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md.
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md
+# Architecture Decision Records — landed under docs/adr/ to keep the
+# top-level docs/ flat for one-off design notes. Allowlist the whole
+# directory so future ADRs don't need per-file edits.
+!docs/adr/*.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
@@ -127,6 +131,11 @@ test_a2.md
 !crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md
+# Companion docs/ markdown for in-tree skill manifest discovery hints
+# (split out of SKILL.md when the body exceeds the ≤80-line discovery cap).
+!crates/octos-agent/skills/**/docs/*.md
+!crates/app-skills/**/docs/*.md
+!crates/platform-skills/**/docs/*.md
 # Crate-level developer documentation (SDK contracts, protocol specs)
 !crates/octos-plugin/docs/*.md
 # Crate test fixtures (sample reports, fake API payloads)

@@ -1338,7 +1338,51 @@ impl Agent {
                                     );
                                 } else {
                                     self.emit_cost_update(turn.total_usage(), &response);
-                                    let background_tools = response
+                                    // Post-spawn failure feedback loop
+                                    // (feat/spawn-only-failure-feedback-loop):
+                                    // record that the synth-ack went out for
+                                    // every spawn_only tool_call_id in this
+                                    // turn. The supervisor's `notify_failure`
+                                    // gates `SpawnOnlyFailureSignal` emission
+                                    // on this set so an eventual post-spawn
+                                    // failure (Gemini API error, plugin
+                                    // crash, late validator rejection) can
+                                    // reach the session actor and drive a
+                                    // recovery turn. Sibling-error
+                                    // suppression (the `if` branch above)
+                                    // intentionally skips this — the LLM
+                                    // already saw the sibling's error
+                                    // tool_result.
+                                    //
+                                    // Codex round-4 MAJOR (PR #1324 follow-up):
+                                    // iterate `sanitized_response.tool_calls`
+                                    // — not `response.tool_calls` — so the
+                                    // recorded id matches the one the
+                                    // dispatcher used to register the
+                                    // background task in
+                                    // `execution.rs::register_task_with_input_and_cmid`.
+                                    // `handle_tool_use` rewrites every
+                                    // tool_call_id via `sanitize_tool_call_id`
+                                    // (colon → underscore, empty/duplicate
+                                    // repair), and the supervisor stores the
+                                    // sanitized id on the `BackgroundTask`.
+                                    // Recording the ORIGINAL `tc.id` here
+                                    // (e.g. `call:1`) would key the
+                                    // synth-ack set on a value that
+                                    // `notify_failure` never looks up
+                                    // (it checks the sanitized `call_1`),
+                                    // permanently dropping the recovery
+                                    // signal. The `background_tools` chip
+                                    // collection uses the sanitized response
+                                    // for the same reason — it stays in
+                                    // lock-step with what the LLM observed.
+                                    let supervisor = self.tools.supervisor();
+                                    for tc in &sanitized_response.tool_calls {
+                                        if self.tools.is_spawn_only(&tc.name) {
+                                            supervisor.mark_synth_ack_emitted(&tc.id);
+                                        }
+                                    }
+                                    let background_tools = sanitized_response
                                         .tool_calls
                                         .iter()
                                         .filter(|tc| self.tools.is_spawn_only(&tc.name))

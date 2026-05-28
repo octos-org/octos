@@ -629,10 +629,9 @@ impl ProfileActorFactoryBuilder {
                         // (backward compatible — unsigned plugins still
                         // load with a warning).
                         require_signed: profile_config.plugins.require_signed,
+                        verified_cache_dir: None,
                     },
-                )
-                .await
-                {
+                ) {
                     Ok(result) => {
                         child_plugin_prompt_fragments = result.prompt_fragments;
                         child_plugin_hooks = result.hooks;
@@ -919,7 +918,17 @@ impl ProfileActorFactoryBuilder {
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
             adaptive_router,
+            // RFC-3 (#1292): thread per-profile topic→lane overrides
+            // through to the ActorFactory so the SessionActor's
+            // agent_task spawn can build the lane context off
+            // `profile.config.lane_routing`. None = built-in defaults.
+            lane_routing: effective_profile.config.lane_routing.clone(),
             memory_store: Some(self.memory_store.clone()),
+            // Codex round-2 MAJOR 3 (PR #1327 review): expose the
+            // profile_id so `ActorFactory::spawn` can build a per-
+            // session SessionScope (multi-tenant) and attach the
+            // canonicalised skill_read_zones to gateway-spawned actors.
+            profile_id: Some(profile_id.to_string()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
             // Section B (codex review P1.1): propagate the profile's

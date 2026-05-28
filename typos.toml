@@ -42,6 +42,11 @@ ratatui = "ratatui"
 mis = "mis"
 # Constant-time equality test fixture (intentionally 1-byte diff from "abc")
 abd = "abd"
+# Intentional typo fixture in manifest_validator.rs: tests that the validator
+# rejects "strng" as an invalid type-string value (it's a deliberate typo for
+# "string"). Allowlist the misspelling so the typos lint doesn't flag the
+# negative-test JSON literal.
+strng = "strng"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]

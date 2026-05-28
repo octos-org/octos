@@ -780,3 +780,240 @@ async fn agent_mcp_slides_writes_project_ledger() {
         });
     assert_eq!(pass.kind, "magic_bytes");
 }
+
+/// Slides soak round-13 (2026-05-25) regression — the spawn_only handler
+/// MUST propagate the skill's `files_to_send` onto the
+/// `BackgroundResultPayload` so downstream `file/attached` emit sites
+/// see the deck path. Round-13 validators ran against the four fleet
+/// hosts and recorded:
+///
+/// > "deck on disk + persisted message contains path + `file/attached`
+/// > count = 0 on all 4 hosts"
+///
+/// If the spawn-only `Satisfied` branch in `execution.rs` ever drops
+/// `output_files` from the payload (or wires it onto a field the
+/// `file/attached` emit site does not read), the `mofa_slides` chat
+/// bubble renders but the dedicated wire signal stays empty and the
+/// SPA never gets a clickable download button — exactly the round-13
+/// failure surface.
+///
+/// Locks down: a `FakeMofaSlides` tool emitting `files_to_send=[pptx]`
+/// must end up on exactly one captured `BackgroundResultPayload` whose
+/// `media` OR `envelope_media` carries the deck path. The
+/// `media`-vs-`envelope_media` split is documented on
+/// `BackgroundResultPayload::envelope_media`; both shapes are valid
+/// here because the helper in `ui_protocol_alpha9_bridge.rs` already
+/// coalesces both into a single `file/attached` stream — the contract
+/// this test pins is that AT LEAST ONE carrier is populated.
+#[tokio::test]
+async fn spawn_only_mofa_slides_propagates_files_to_send_onto_background_payload() {
+    use async_trait::async_trait;
+    use octos_agent::tools::spawn::{BackgroundResultPayload, BackgroundResultSender};
+    use octos_agent::{
+        Agent, AgentConfig, Tool, ToolRegistry, ToolResult, WorkspacePolicy, write_workspace_policy,
+    };
+    use octos_core::{AgentId, Message, ToolCall};
+    use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
+    use octos_memory::EpisodeStore;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    struct ScriptedLlm(StdMutex<Vec<ChatResponse>>);
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let mut r = self.0.lock().unwrap();
+            if r.is_empty() {
+                eyre::bail!("ScriptedLlm: out of responses");
+            }
+            Ok(r.remove(0))
+        }
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+        fn model_id(&self) -> &str {
+            "spawn-only-slides-payload-test"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct FakeMofaSlides {
+        pptx_abs_path: PathBuf,
+    }
+    #[async_trait]
+    impl Tool for FakeMofaSlides {
+        fn name(&self) -> &str {
+            "mofa_slides"
+        }
+        fn description(&self) -> &str {
+            "fake mofa_slides — emits pptx via files_to_send for round-13 payload test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "Generated PPTX: ok\n".into(),
+                files_to_send: vec![self.pptx_abs_path.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    // ── Workspace setup mirrors `spawn_only_mofa_slides_writes_project_ledger`.
+    let dir = TempDir::new().unwrap();
+    let session_root = dir.path();
+    let output_dir = session_root.join("output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    write_workspace_policy(session_root, &WorkspacePolicy::for_session()).unwrap();
+    let pptx_path = output_dir.join("deck.pptx");
+    let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
+    pptx_bytes.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&pptx_path, &pptx_bytes).unwrap();
+
+    // ── Capture every BackgroundResultPayload the spawn_only handler emits.
+    let captured: Arc<StdMutex<Vec<BackgroundResultPayload>>> = Arc::new(StdMutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured);
+    let sender: BackgroundResultSender = Arc::new(move |payload| {
+        let captured_clone = Arc::clone(&captured_clone);
+        Box::pin(async move {
+            captured_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(payload);
+            true
+        })
+    });
+
+    let mut tools = ToolRegistry::with_builtins(session_root);
+    tools.register(FakeMofaSlides {
+        pptx_abs_path: pptx_path.clone(),
+    });
+    tools.mark_spawn_only("mofa_slides", None);
+    tools.set_background_result_sender(sender);
+    let supervisor = tools.supervisor();
+
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join(".octos-mem"))
+            .await
+            .unwrap(),
+    );
+    let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm(StdMutex::new(vec![
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-slides-payload".into(),
+                name: "mofa_slides".into(),
+                arguments: serde_json::json!({"task": "make a deck"}),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider_index: None,
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            provider_index: None,
+        },
+    ])));
+    let agent = Agent::new(AgentId::new("slides-payload-test"), llm, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            // The spawn_only intercept handles file delivery via the
+            // background sender (workspace contract Satisfied path);
+            // suppress the foreground auto-send so we don't double-route.
+            suppress_auto_send_files: true,
+            ..Default::default()
+        },
+    );
+
+    agent
+        .process_message("make slides", &[], vec![])
+        .await
+        .expect("agent loop must succeed");
+
+    // ── Wait for the background spawn_only task to reach terminal status.
+    let mut completed = false;
+    for _ in 0..100 {
+        for task in supervisor.get_all_tasks() {
+            if task.tool_name == "mofa_slides"
+                && matches!(
+                    task.status,
+                    octos_agent::TaskStatus::Completed | octos_agent::TaskStatus::Failed
+                )
+            {
+                completed = true;
+                break;
+            }
+        }
+        if completed {
+            // Drain one more tick so any post-mark_completed sender call
+            // (the "✓ completed" Notification) lands in `captured`.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        completed,
+        "background spawn_only mofa_slides must reach terminal status"
+    );
+
+    // ── Load-bearing assertion (round-13 regression):
+    //
+    //   The spawn-only handler MUST emit at least one
+    //   `BackgroundResultPayload` whose `media` OR `envelope_media`
+    //   carries the deck path the fake tool reported. If both arrays are
+    //   empty across every captured payload, the
+    //   `emit_files_attached_from_background` site downstream sees
+    //   nothing and the SPA's `file/attached` count stays at 0 — exactly
+    //   the round-13 failure surface.
+    let captured = captured.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        !captured.is_empty(),
+        "spawn_only completion must emit at least one BackgroundResultPayload \
+         — got zero, which would silently drop the deck delivery from the wire"
+    );
+    let pptx_path_str = pptx_path.to_string_lossy().to_string();
+    let carries_deck = captured.iter().any(|payload| {
+        payload.media.iter().any(|p| p == &pptx_path_str)
+            || payload.envelope_media.iter().any(|p| p == &pptx_path_str)
+    });
+    assert!(
+        carries_deck,
+        "no captured BackgroundResultPayload carries the deck path on `media` \
+         or `envelope_media` — `files_to_send` propagation is broken; \
+         got payloads = {:#?}",
+        captured
+            .iter()
+            .map(|p| (
+                p.task_label.clone(),
+                p.media.clone(),
+                p.envelope_media.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+}
