@@ -1945,6 +1945,7 @@ mod tests {
   "tools": [{
     "name": "mofa_publish",
     "description": "deploy",
+    "input_schema": {"type": "object", "properties": {}},
     "spawn_only": true,
     "auto_summarize": true
   }]
@@ -2514,6 +2515,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            spawn_only_auto_summarize: vec![],
         };
         result.merge_extras(e1);
 
@@ -2527,6 +2529,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            spawn_only_auto_summarize: vec![],
         };
         result.merge_extras(e2);
 
@@ -2540,6 +2543,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            spawn_only_auto_summarize: vec![],
         };
         result.merge_extras(e3);
 

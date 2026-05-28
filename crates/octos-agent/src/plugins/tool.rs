@@ -5851,6 +5851,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("mofa-podcast".into(), def, executable);
@@ -5872,6 +5873,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let mofa_executable = skill_dir.path().join("mofa-slides");
@@ -6097,6 +6099,7 @@ mod tests {
             env: vec![],
             risk: None,
             spawn_only_message: None,
+            auto_summarize: false,
             concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));

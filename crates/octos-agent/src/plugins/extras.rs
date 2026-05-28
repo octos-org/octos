@@ -440,6 +440,7 @@ mod tests {
                     env: vec![],
                     risk: None,
                     spawn_only_message: None,
+                    auto_summarize: false,
                     concurrency_class: None,
                 })
                 .collect(),
