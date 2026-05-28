@@ -89,3 +89,4 @@ echo "smoke OK"
 echo
 echo "cleanup: octos skills --cwd $INSTALL_CWD remove $SKILL_NAME"
 "$OCTOS_BIN" skills --cwd "$INSTALL_CWD" remove "$SKILL_NAME" || true
+# CI re-trigger: 2026-05-28T00:08:54Z
