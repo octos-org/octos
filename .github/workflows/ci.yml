@@ -247,24 +247,15 @@ jobs:
 
       - name: Test octos-agent (integration)
         if: matrix.test-mode == 'integration'
-        # validator_runner.rs::should_kill_child_process_on_validator_timeout
-        # spawns `sh -c "... sleep 30"` and exercises the timeout-kill path.
-        # ValidatorRunner kills the `sh` PID, but the `sleep 30` is reparented
-        # to init and survives. Across three consecutive CI runs on this PR,
-        # the ubuntu-latest runner received an unrecoverable shutdown signal
-        # ~300ms after this test was scheduled — deterministic, identical
-        # timing offset whether tests ran in parallel or with --test-threads=1.
-        # Either GitHub's runner watchdog kills the runner on the orphan-sleep
-        # pattern, or there's a tokio/process-handle interaction specific to
-        # the current runner-pool image. The test passed on prior SHAs of this
-        # branch (d708c371, 65e40f89) without modification.
-        #
-        # Skip just this one test on CI; the rest of the integration suite
-        # (1000+ tests across ~40 binaries) still runs. Local cargo test
-        # still exercises the timeout-kill path on developer machines.
-        run: |
-          cargo test -p octos-agent --tests -- \
-            --skip should_kill_child_process_on_validator_timeout
+        # --test-threads=1: validator_runner.rs::should_kill_child_process_on_validator_timeout
+        # spawns a `sh -c "... sleep 30"` child to test the kill path. Under the
+        # default thread-per-core parallelism, multiple validator-timeout tests
+        # pile up concurrent sleep children and the ubuntu-latest runner gets
+        # terminated by GitHub for resource use (deterministic shutdown ~296ms
+        # after the preceding test passes). Serialising the integration tests
+        # eliminates the pileup. The full integration suite still finishes
+        # comfortably within the runner's 6h budget.
+        run: cargo test -p octos-agent --tests -- --test-threads=1
 
       # Co-located in the integration job so it reuses the warm octos-agent
       # integration test build cache (activate_tools_regression is itself an
