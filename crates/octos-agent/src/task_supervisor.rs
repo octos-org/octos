@@ -3981,6 +3981,7 @@ mod tests {
     ///   1. notify_failure observes ack=false.
     ///   2. mark_synth_ack_emitted records ack + drains empty pending.
     ///   3. notify_failure inserts pending — nothing will drain it.
+    ///
     /// Post-fix the combined mutex makes step 2 atomic with the
     /// check-and-insert pair in step 1+3, so the pending entry is
     /// either drained in step 2 OR observed in step 1 and dispatched

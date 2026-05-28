@@ -8,7 +8,10 @@ use serde::{Deserialize, Deserializer};
 /// A plugin manifest (manifest.json).
 #[derive(Debug, Deserialize)]
 pub struct PluginManifest {
-    /// Plugin name.
+    /// Plugin name. Accepts `id` as an alias so manifests written against
+    /// upstream's renamed field (which uses `id` with `#[serde(alias = "name")]`)
+    /// still parse cleanly through the agent-side deserializer.
+    #[serde(alias = "id")]
     pub name: String,
     /// Plugin version.
     pub version: String,

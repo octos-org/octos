@@ -109,18 +109,34 @@ pub async fn activate_skill(
             // scanned every sibling skill folder as a side-effect, leaking
             // their tools into the registry on install.
             //
-            // Note: `extras` (MCP servers, hooks, prompts) are intentionally
+            // `extras` (MCP servers, hooks, prompts) are intentionally
             // NOT resolved here — `activate_skill`'s contract is tool
             // registration only; extras flow through
             // `PluginLoader::load_into_with_options` at runtime startup.
-            let (tools, extras) = PluginLoader::load_plugin(skill_dir, extra_env)?;
-            for tool in tools {
-                let name = tool.name().to_string();
-                registry.mark_as_plugin(&name);
-                tool_names.push(name);
-                registry.register(tool);
+            //
+            // `load_plugin` failure (e.g. manifest declares tools but ships
+            // no executable) is soft: agent boot's `load_into_with_options`
+            // is the authoritative tool-registration path, and the install
+            // CLI flow discards this registry anyway. Hard-failing here
+            // would block legitimate "docs-only" or "tools-deferred" skills
+            // that pass upstream's manifest validator but have no binary.
+            match PluginLoader::load_plugin(skill_dir, extra_env) {
+                Ok((tools, _extras)) => {
+                    for tool in tools {
+                        let name = tool.name().to_string();
+                        registry.mark_as_plugin(&name);
+                        tool_names.push(name);
+                        registry.register(tool);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        skill = %skill_name,
+                        error = %e,
+                        "load_plugin during activate_skill failed; tool registration deferred to agent boot"
+                    );
+                }
             }
-            let _ = extras;
         }
         ToolDiscovery::Http { base_url } => {
             // Finding 2 (PR #1260 review): hard-fail on HTTP discovery
