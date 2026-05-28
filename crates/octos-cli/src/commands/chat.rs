@@ -279,6 +279,18 @@ impl ChatCommand {
                 Ok(result) => plugin_result = result,
                 Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
             }
+            // SPEC-VENDOR-NODE-V1 HTTP tool discovery — sync `load_into_with_options`
+            // only handles static binary-protocol skills; this async pass walks the
+            // same dirs for `tool_discovery: Http { base_url }` manifests and
+            // registers their catalog-derived tools. Warn-and-continue on failure
+            // matches the sync loader's pattern: a single unreachable bridge must
+            // not block boot of unrelated skills.
+            if let Err(e) =
+                octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                    .await
+            {
+                eprintln!("Warning: HTTP tool discovery failed: {e}");
+            }
         }
 
         // Start MCP servers declared in skill manifests

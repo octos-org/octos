@@ -647,6 +647,13 @@ impl ProfileActorFactoryBuilder {
                     }
                     Err(e) => warn!(profile_id, "child bot plugin loading failed: {e}"),
                 }
+                // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see chat.rs).
+                if let Err(e) =
+                    octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                        .await
+                {
+                    warn!(profile_id, "child bot HTTP tool discovery failed: {e}");
+                }
             }
             actor_plugin_dirs = plugin_dirs.clone();
             actor_plugin_env = plugin_env;

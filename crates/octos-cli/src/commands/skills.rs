@@ -2140,6 +2140,67 @@ fi
         );
     }
 
+    /// PR #1347 review (Critical #2): `remove_skill` builds its own
+    /// current-thread tokio runtime via `block_on` to drive the
+    /// `hardware_lifecycle.shutdown` phase. If a caller invokes
+    /// `remove_skill` directly from inside an existing tokio runtime
+    /// (the four `octos serve` API handlers all did, before the
+    /// `spawn_blocking` wrap landed), tokio panics with
+    /// "Cannot start a runtime from within a runtime".
+    ///
+    /// This regression test invokes `remove_skill` for a
+    /// shutdown-bearing skill from inside `tokio::spawn` (mirrors the
+    /// axum handler context) WITH the `spawn_blocking` wrap. It
+    /// asserts no panic and that the shutdown phase still ran. A
+    /// future refactor that drops the `spawn_blocking` wrap will
+    /// fail this test instead of silently breaking production.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_skill_from_async_context_does_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        let skill_dir = skills_dir.join("async-shutdown-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let sentinel = tmp.path().join("async_shutdown_ran.txt");
+        let sentinel_str = sentinel.to_string_lossy().to_string();
+
+        std::fs::write(skill_dir.join("SKILL.md"), "# async-shutdown-skill\n").unwrap();
+        let manifest = format!(
+            r#"{{
+                "name": "async-shutdown-skill",
+                "version": "0.1.0",
+                "tools": [],
+                "hardware_lifecycle": {{
+                    "shutdown": [
+                        {{"label": "write-sentinel", "command": "touch \"{sentinel_str}\""}}
+                    ]
+                }}
+            }}"#
+        );
+        std::fs::write(skill_dir.join("manifest.json"), manifest).unwrap();
+
+        // Mirrors the axum handler pattern (auth_handlers.rs:1013,
+        // admin.rs:1923 + :2063, gateway/skills_handler.rs:98 after this
+        // PR's fix): we are inside a tokio runtime; remove_skill MUST
+        // be deferred to `spawn_blocking` so its internal
+        // current-thread runtime constructs on a separate OS thread.
+        let skills_dir_clone = skills_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            remove_skill(&skills_dir_clone, "async-shutdown-skill")
+        })
+        .await
+        .expect("spawn_blocking join must not panic");
+
+        assert!(result.is_ok(), "remove_skill failed: {:?}", result.err());
+        assert!(!skill_dir.exists(), "skill dir should have been removed");
+        assert!(
+            sentinel.exists(),
+            "shutdown phase must run even from an async caller (was looking at {})",
+            sentinel.display()
+        );
+    }
+
     /// RFC-2 (issue #1291): a skill that ships the mofa-slides v0.5.0
     /// `anyOf`-without-`type` shape must be rejected at install time
     /// with a descriptive error, BEFORE we copy the skill onto disk.

@@ -2465,6 +2465,12 @@ impl Tool for SpawnTool {
                         verified_cache_dir: None,
                     },
                 );
+                // SPEC-VENDOR-NODE-V1 HTTP tool discovery — subagents need the
+                // same bridge tools the parent agent has, otherwise spawn-based
+                // robotics workflows lose visibility of vendor verbs.
+                let _ =
+                    crate::plugins::register_http_skills_on_startup(&mut tools, &self.plugin_dirs)
+                        .await;
             }
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
@@ -2895,6 +2901,10 @@ impl Tool for SpawnTool {
                             verified_cache_dir: None,
                         },
                     );
+                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see sync mode above).
+                    let _ =
+                        crate::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                            .await;
                 }
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());

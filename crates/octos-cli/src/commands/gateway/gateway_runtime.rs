@@ -729,6 +729,15 @@ impl GatewayRuntime {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),
                     }
+                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see chat.rs).
+                    if let Err(e) = octos_agent::plugins::register_http_skills_on_startup(
+                        &mut tools,
+                        &plugin_dirs,
+                    )
+                    .await
+                    {
+                        warn!("HTTP tool discovery failed: {e}");
+                    }
                 }
 
                 if !plugin_result.mcp_servers.is_empty() {
