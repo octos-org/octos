@@ -43,7 +43,9 @@ pub use lifecycle::{
     NoSandbox, PhaseResult, SafePolicyDenial, Sandbox, StepKillReason, StepOutcome, StepResult,
     is_safe_shell_command,
 };
-pub use manifest::{InstallSpec, PluginManifest, PluginType, Requirements, ToolDefinition};
+pub use manifest::{
+    InstallSpec, PluginManifest, PluginType, Requirements, ToolDefinition, ToolDiscovery,
+};
 pub use manifest_validator::{
     ManifestSchemaError, SchemaKind, ValidationProfile, validate_manifest_schemas,
     validate_manifest_schemas_with, validate_schema,

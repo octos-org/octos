@@ -31,6 +31,7 @@ regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 htmd = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
@@ -67,3 +68,4 @@ workspace = true
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }

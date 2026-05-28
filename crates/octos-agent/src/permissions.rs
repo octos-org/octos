@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 /// Safety tiers ordered from least to most dangerous.
 ///
 /// `Observe < SafeMotion < FullActuation < EmergencyOverride`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SafetyTier {
     /// Read-only: cameras, sensors, status queries. No actuation.
+    #[default]
     Observe,
     /// Low-risk motion: slow moves within verified workspace bounds.
     SafeMotion,
@@ -143,6 +146,11 @@ mod tests {
 
         assert!("".parse::<SafetyTier>().is_err());
         assert!("safe-motion".parse::<SafetyTier>().is_err());
+    }
+
+    #[test]
+    fn should_default_to_observe() {
+        assert_eq!(SafetyTier::default(), SafetyTier::Observe);
     }
 
     #[test]

@@ -1920,8 +1920,16 @@ pub async fn remove_profile_skill(
     let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    crate::commands::skills::remove_skill(&skills_dir, &name)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    // Defer to spawn_blocking so remove_skill's internal current-thread
+    // tokio runtime doesn't try to construct inside the axum runtime
+    // (mirrors install_skill).
+    let name_for_remove = name.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::skills::remove_skill(&skills_dir, &name_for_remove)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(ActionResponse {
         ok: true,
@@ -2060,8 +2068,16 @@ pub async fn remove_platform_skill(
     ))?;
     let skills_dir = store.octos_home_dir().join("skills");
 
-    crate::commands::skills::remove_skill(&skills_dir, &name)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    // Defer to spawn_blocking so remove_skill's internal current-thread
+    // tokio runtime doesn't try to construct inside the axum runtime
+    // (mirrors install_skill).
+    let name_for_remove = name.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::skills::remove_skill(&skills_dir, &name_for_remove)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(ActionResponse {
         ok: true,

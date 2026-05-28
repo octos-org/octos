@@ -945,6 +945,7 @@ mod tests {
             install: vec![],
             requires_network: None,
             hardware_lifecycle: None,
+            tool_discovery: crate::manifest::ToolDiscovery::Static,
         };
         assert!(
             validate_manifest_schemas_with(&manifest, ValidationProfile::Off).is_ok(),

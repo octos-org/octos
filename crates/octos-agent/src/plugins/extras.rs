@@ -372,6 +372,10 @@ mod tests {
             mcp_servers: vec![],
             hooks: vec![],
             prompts: None,
+            hardware_lifecycle: None,
+            tool_discovery: octos_plugin::ToolDiscovery::Static,
+            required_safety_tier: crate::permissions::SafetyTier::default(),
+            tool_overrides: HashMap::new(),
             discovery: None,
         };
         let extras = resolve_extras(&manifest, Path::new("/skills/test"));
@@ -401,6 +405,10 @@ mod tests {
             prompts: Some(SkillPrompts {
                 include: vec!["prompts/*.md".into()],
             }),
+            hardware_lifecycle: None,
+            tool_discovery: octos_plugin::ToolDiscovery::Static,
+            required_safety_tier: crate::permissions::SafetyTier::default(),
+            tool_overrides: HashMap::new(),
             discovery: None,
         };
         let extras = resolve_extras(&manifest, dir.path());
@@ -448,6 +456,10 @@ mod tests {
             mcp_servers: vec![],
             hooks: vec![],
             prompts: None,
+            hardware_lifecycle: None,
+            tool_discovery: octos_plugin::ToolDiscovery::Static,
+            required_safety_tier: crate::permissions::SafetyTier::default(),
+            tool_overrides: HashMap::new(),
             discovery,
         }
     }

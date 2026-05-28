@@ -47,6 +47,14 @@ crates/octos-cli/static/swarm/
 # Deploy script (contains credentials)
 scripts/deploy.sh
 
+# Internal working docs and per-developer notes — never commit to PR history.
+# These directories frequently contain local absolute paths (e.g. /Users/...)
+# and other operator-specific context. Anything tracked here in upstream is
+# fine; this just prevents accidental new commits via `git add -f`.
+docs/superpowers/
+.project_notes/
+test_a2.md
+
 # Agent research output
 *.md
 !README.md

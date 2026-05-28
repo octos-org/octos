@@ -394,7 +394,8 @@ pub enum ToolProgress {
 ///   serially in call order. A single error from an exclusive call cancels
 ///   the remaining peers so the LLM sees the cascade instead of continuing
 ///   to mutate state on a doomed path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {
     /// Read-only / side-effect-free. Can run in parallel with any other
     /// `Safe` tool call without observable interference.
@@ -645,9 +646,11 @@ pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
+pub mod dora_bridge;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
+pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
@@ -696,6 +699,7 @@ pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
+pub use http::HttpTool;
 pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
 pub use mcp_agent::{

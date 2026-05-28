@@ -1010,8 +1010,17 @@ pub async fn remove_my_profile_skill(
     let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    crate::commands::skills::remove_skill(&skills_dir, &name)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    // remove_skill builds its own current-thread tokio runtime via block_on
+    // to drive the optional shutdown lifecycle phase — that panics if invoked
+    // from inside the axum runtime. Defer to spawn_blocking so the new
+    // runtime constructs on a separate OS thread (mirrors install_skill).
+    let name_for_remove = name.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::skills::remove_skill(&skills_dir, &name_for_remove)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(super::admin::ActionResponse {
         ok: true,

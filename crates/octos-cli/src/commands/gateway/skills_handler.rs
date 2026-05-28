@@ -95,9 +95,20 @@ pub async fn handle_skills_command(
             if name.is_empty() {
                 return "Usage: /skills remove <name>".to_string();
             }
-            match crate::commands::skills::remove_skill(&skills_dir, name) {
-                Ok(()) => format!("Removed skill: {name}"),
-                Err(e) => format!("Error: {e}"),
+            // Defer to spawn_blocking — remove_skill builds its own
+            // current-thread tokio runtime to drive shutdown lifecycle,
+            // which would panic if invoked directly inside this gateway
+            // runtime (mirrors install_skill's wrapping at line ~60).
+            let name_owned = name.to_string();
+            let skills_dir_owned = skills_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::commands::skills::remove_skill(&skills_dir_owned, &name_owned)
+            })
+            .await
+            {
+                Ok(Ok(())) => format!("Removed skill: {name}"),
+                Ok(Err(e)) => format!("Error: {e}"),
+                Err(e) => format!("Remove task failed: {e}"),
             }
         }
 

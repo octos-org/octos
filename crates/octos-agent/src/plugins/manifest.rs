@@ -2,12 +2,16 @@
 
 use std::collections::HashMap;
 
+use octos_plugin::{HardwareLifecycle, ToolDiscovery};
 use serde::{Deserialize, Deserializer};
 
 /// A plugin manifest (manifest.json).
 #[derive(Debug, Deserialize)]
 pub struct PluginManifest {
-    /// Plugin name.
+    /// Plugin name. Accepts `id` as an alias so manifests written against
+    /// upstream's renamed field (which uses `id` with `#[serde(alias = "name")]`)
+    /// still parse cleanly through the agent-side deserializer.
+    #[serde(alias = "id")]
     pub name: String,
     /// Plugin version.
     pub version: String,
@@ -43,6 +47,29 @@ pub struct PluginManifest {
     /// Prompt fragments to inject into the system prompt.
     #[serde(default)]
     pub prompts: Option<SkillPrompts>,
+    /// Optional hardware lifecycle (preflight / init / ready_check /
+    /// shutdown / emergency_shutdown). Executed by the skill installer
+    /// when present. Skills without hardware (most app skills) omit this.
+    #[serde(default)]
+    pub hardware_lifecycle: Option<HardwareLifecycle>,
+    /// How this skill's tools are discovered. Defaults to `Static`
+    /// (enumerated in `tools`); `Http` triggers dynamic discovery from
+    /// a localhost bridge.
+    #[serde(default)]
+    pub tool_discovery: ToolDiscovery,
+    /// Skill-level safety tier. Applies to all of this skill's tools UNLESS
+    /// overridden by an entry in `tool_overrides` or the catalog's per-tool
+    /// `safety_tier`. Defaults to `Observe` (read-only). Robots should set
+    /// this to `safe_motion` at minimum.
+    #[serde(default)]
+    pub required_safety_tier: crate::permissions::SafetyTier,
+
+    /// Per-verb safety tier overrides. Keyed by tool name. Lower priority
+    /// than catalog tiers (the catalog is authoritative when present), higher
+    /// priority than `required_safety_tier`.
+    #[serde(default)]
+    pub tool_overrides: HashMap<String, crate::permissions::SafetyTier>,
+
     /// Optional LLM-facing discovery summary.
     ///
     /// When present, `resolve_extras` renders a short 5-line "skill card"
@@ -887,6 +914,116 @@ mod tests {
             def_with_concurrency(Some("   ")).classify_concurrency_class(),
             ConcurrencyClassClassification::Unset
         );
+    }
+
+    #[test]
+    fn hardware_lifecycle_optional_absent_means_none() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0"
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.hardware_lifecycle.is_none());
+    }
+
+    #[test]
+    fn hardware_lifecycle_parses_when_present() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0",
+            "hardware_lifecycle": {
+                "init": [
+                    {"label": "start dataflow", "command": "echo start", "timeout_secs": 10}
+                ],
+                "shutdown": [
+                    {"label": "stop dataflow", "command": "echo stop", "timeout_secs": 5}
+                ]
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        let lc = manifest
+            .hardware_lifecycle
+            .expect("lifecycle should be present");
+        assert_eq!(lc.init.len(), 1);
+        assert_eq!(lc.init[0].label, "start dataflow");
+        assert_eq!(lc.shutdown.len(), 1);
+    }
+
+    #[test]
+    fn tool_discovery_defaults_to_static() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0"
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(matches!(manifest.tool_discovery, ToolDiscovery::Static));
+    }
+
+    #[test]
+    fn tool_discovery_http_parses() {
+        let json = r#"{
+            "name": "test-skill",
+            "version": "0.1.0",
+            "tool_discovery": {"type": "http", "base_url": "http://localhost:8765"}
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        match manifest.tool_discovery {
+            ToolDiscovery::Http { base_url } => {
+                assert_eq!(base_url, "http://localhost:8765");
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_safety_tier_defaults_to_observe() {
+        let json = r#"{ "name": "s", "version": "0.1.0" }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            manifest.required_safety_tier,
+            crate::permissions::SafetyTier::Observe
+        ));
+    }
+
+    #[test]
+    fn required_safety_tier_parses_explicit_value() {
+        let json = r#"{
+            "name": "s", "version": "0.1.0",
+            "required_safety_tier": "safe_motion"
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            manifest.required_safety_tier,
+            crate::permissions::SafetyTier::SafeMotion
+        ));
+    }
+
+    #[test]
+    fn tool_overrides_parses() {
+        let json = r#"{
+            "name": "s", "version": "0.1.0",
+            "tool_overrides": {
+                "robot.estop": "emergency_override",
+                "vendor.x.y.motion.set_action": "safe_motion"
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.tool_overrides.len(), 2);
+        assert!(matches!(
+            manifest.tool_overrides["robot.estop"],
+            crate::permissions::SafetyTier::EmergencyOverride
+        ));
+        assert!(matches!(
+            manifest.tool_overrides["vendor.x.y.motion.set_action"],
+            crate::permissions::SafetyTier::SafeMotion
+        ));
+    }
+
+    #[test]
+    fn tool_overrides_absent_means_empty() {
+        let json = r#"{ "name": "s", "version": "0.1.0" }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.tool_overrides.is_empty());
     }
 
     // ------------------------------------------------------------------
