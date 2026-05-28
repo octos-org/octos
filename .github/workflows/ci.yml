@@ -247,7 +247,15 @@ jobs:
 
       - name: Test octos-agent (integration)
         if: matrix.test-mode == 'integration'
-        run: cargo test -p octos-agent --tests
+        # --test-threads=1: validator_runner.rs::should_kill_child_process_on_validator_timeout
+        # spawns a `sh -c "... sleep 30"` child to test the kill path. Under the
+        # default thread-per-core parallelism, multiple validator-timeout tests
+        # pile up concurrent sleep children and the ubuntu-latest runner gets
+        # terminated by GitHub for resource use (deterministic shutdown ~296ms
+        # after the preceding test passes). Serialising the integration tests
+        # eliminates the pileup. The full integration suite still finishes
+        # comfortably within the runner's 6h budget.
+        run: cargo test -p octos-agent --tests -- --test-threads=1
 
       # Co-located in the integration job so it reuses the warm octos-agent
       # integration test build cache (activate_tools_regression is itself an
