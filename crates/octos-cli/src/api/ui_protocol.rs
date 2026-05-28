@@ -14494,7 +14494,7 @@ fn m15_live_subagent_specs() -> [M15LiveSubagentSpec; 3] {
 
 async fn run_m15_live_subagent_fixture_turn(
     ws: &WsConnection,
-    ledger: &UiProtocolLedger,
+    ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
     turn_id: &TurnId,
     interrupt_rx: &mut mpsc::Receiver<()>,
@@ -14664,6 +14664,7 @@ async fn run_m15_live_subagent_fixture_turn(
         );
 
         let ws_for_agent = ws.clone();
+        let ledger_for_agent = Arc::clone(ledger);
         let session_id_for_agent = session_id.clone();
         let profile_id_for_agent = profile_id.clone();
         let workdir_for_agent = workdir.clone();
@@ -14671,6 +14672,7 @@ async fn run_m15_live_subagent_fixture_turn(
         joins.spawn(async move {
             run_m15_live_subagent_process(
                 ws_for_agent,
+                ledger_for_agent,
                 session_id_for_agent,
                 profile_id_for_agent,
                 workdir_for_agent,
@@ -14845,8 +14847,10 @@ async fn run_m15_live_subagent_fixture_turn(
     M9FixtureOutcome::Completed
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_m15_live_subagent_process(
     ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
     session_id: SessionKey,
     profile_id: String,
     workdir: PathBuf,
@@ -14918,20 +14922,33 @@ print(f"{agent_id}: {finding}")
         .heartbeat_interval(std::time::Duration::from_millis(150)),
     )
     .await?;
-    let _ = send_raw_notification_ephemeral(
-        &ws,
-        octos_core::ui_protocol::methods::MESSAGE_DELTA,
-        json!({
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "text": format!(
-                "Subagent done: {} ({}) completed; artifact `{}` is ready.\n",
-                spec.title,
-                spec.agent_id,
-                spec.artifact_id
-            ),
-        }),
-    );
+    // Codex #1336 round-3 BLOCKER 1: route the M15 live-subagent
+    // fixture's "subagent done" delta through the SAME path as every
+    // other AppUI MessageDelta — dual-emit envelope + filtered
+    // ephemeral. The legacy raw helper bypassed
+    // `direct_send_passes_capability_filter`, so a
+    // `projection.envelope.v1` client received the legacy
+    // `message/delta` frame in addition to the (missing) envelope.
+    //
+    // After this change:
+    //   • `projection.envelope.v1` connections receive ONLY the
+    //     canonical `projection/envelope` (carrying `AssistantDelta`)
+    //     via the broadcast forwarder; the ephemeral legacy send is
+    //     filtered out by `send_notification_ephemeral`'s gate.
+    //   • Legacy connections receive the legacy `message/delta`
+    //     ephemeral and observe NO envelope (the legacy method-name
+    //     filter on the live forwarder drops `projection/envelope`).
+    let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_id.clone(),
+        text: format!(
+            "Subagent done: {} ({}) completed; artifact `{}` is ready.\n",
+            spec.title, spec.agent_id, spec.artifact_id
+        ),
+    });
+    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+    let _ = send_notification_ephemeral(&ws, &ledger, delta);
     append_appui_evidence_jsonl(
         "agent-ledger.jsonl",
         json!({
@@ -18303,11 +18320,56 @@ fn append_appui_server_log(message: impl AsRef<str>) {
         });
 }
 
+/// CONTRACT: this helper bypasses the typed `UiNotification` ledger
+/// path and the envelope dual-emit. It exists ONLY for AppUI
+/// supervisor-event methods that are NOT in the M9-γ envelope-superseded
+/// set (e.g. `agent/updated`, `agent/output_delta`,
+/// `agent/artifact_updated`, and the other `WsSupervisorEventSink`
+/// surfaces).
+///
+/// Codex #1336 round-3 BLOCKER 1 (defense in depth): the helper now
+/// REFUSES to dispatch a `method` that is envelope-superseded under the
+/// M9-γ cutover gate — even on legacy connections — to make the
+/// envelope-only contract enforceable by construction. Future callers
+/// who reach for a legacy `message/delta` / `tool/started` / `…` send
+/// via the raw helper fail closed with a debug log instead of leaking
+/// a frame past `direct_send_passes_capability_filter`. Use
+/// [`send_notification_ephemeral`] (typed `UiNotification`) +
+/// [`emit_envelope_for_legacy_notification`] for those methods.
 fn send_raw_notification_ephemeral(
     ws: &WsConnection,
     method: &'static str,
     params: Value,
 ) -> Result<(), SendError> {
+    use octos_core::ui_protocol::methods as ui_methods;
+    // Envelope-superseded legacy methods are off-limits to the raw
+    // helper — they MUST flow through the typed `UiNotification` path
+    // so `send_notification_ephemeral` / `send_notification_durable` /
+    // `send_notification_lifecycle` can apply the per-connection
+    // capability filter AND `emit_envelope_for_legacy_notification`
+    // can publish the canonical envelope dual-emit.
+    if matches!(
+        method,
+        ui_methods::MESSAGE_DELTA
+            | ui_methods::MESSAGE_PERSISTED
+            | ui_methods::TOOL_STARTED
+            | ui_methods::TOOL_PROGRESS
+            | ui_methods::TOOL_COMPLETED
+            | ui_methods::FILE_ATTACHED
+            | ui_methods::TURN_COMPLETED
+    ) {
+        tracing::error!(
+            target: "octos::ui_protocol::ws",
+            method = %method,
+            "send_raw_notification_ephemeral refused: envelope-superseded method must use \
+             send_notification_ephemeral + emit_envelope_for_legacy_notification"
+        );
+        debug_assert!(
+            false,
+            "send_raw_notification_ephemeral called with envelope-superseded method {method}"
+        );
+        return Err(SendError::BackpressureDrop);
+    }
     let notification = octos_core::ui_protocol::RpcNotification::new(method, params);
     let frame = frame_for(&notification).ok_or(SendError::BackpressureDrop)?;
     ws.send_ephemeral(frame, method)
@@ -25318,6 +25380,203 @@ ignore = []
         } else {
             panic!("expected text frame");
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Codex #1336 round-3 BLOCKER 1: M15 live-subagent fixture path
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // Round-2 fix landed the per-connection capability filter on the
+    // direct-send helpers (`send_notification_ephemeral` /
+    // `send_notification_durable` / `send_notification_lifecycle`).
+    // Codex round-2 then flagged that the M15 fixture
+    // (`run_m15_live_subagent_process`) still emitted a raw
+    // `message/delta` via `send_raw_notification_ephemeral`, which
+    // jumps straight to `ws.send_ephemeral` and bypasses the gate.
+    // The fix routes the delta through
+    // `emit_envelope_for_legacy_notification` (canonical envelope
+    // dual-emit) + `send_notification_ephemeral` (filtered legacy
+    // ephemeral). The next three tests pin that contract.
+
+    /// `projection.envelope.v1` connection: the M15 fixture's
+    /// "Subagent done" delta MUST NOT deliver a legacy
+    /// `message/delta` to this connection's writer channel. The
+    /// envelope dual-emit publishes the canonical envelope via
+    /// `ledger.emit_envelope` (observable on the broadcast forwarder),
+    /// but the filtered ephemeral send is dropped on the originating
+    /// connection because `projection.envelope.v1` supersedes
+    /// `message/delta`.
+    #[tokio::test]
+    async fn m15_fixture_delta_filtered_for_projection_envelope_connection() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures {
+            projection_envelope: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        });
+
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:m15-delta-env".into());
+        let turn_id = TurnId::new();
+        // Mirror the exact shape `run_m15_live_subagent_process` builds.
+        let delta = UiNotification::MessageDelta(octos_core::ui_protocol::MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            text: "Subagent done: reviewer-api (Ada) completed; artifact `notes` is ready.\n"
+                .into(),
+        });
+
+        // 1) Canonical envelope dual-emit — observable through the ledger.
+        emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+        // 2) Filtered ephemeral legacy send — must be dropped on this connection.
+        let result = send_notification_ephemeral(&ws, &ledger, delta);
+        assert!(
+            result.is_ok(),
+            "filter-drop returns Ok so the spawn loop does not treat it as a fatal error"
+        );
+
+        // Wire: no legacy `message/delta` frame reaches the writer.
+        match rx.try_recv() {
+            Err(_) => {}
+            Ok(frame) => {
+                if let WsMessage::Text(text) = &frame {
+                    let value: serde_json::Value =
+                        serde_json::from_str(text.as_str()).expect("JSON");
+                    panic!(
+                        "projection.envelope.v1 connection must NOT receive legacy frame; got {}",
+                        value["method"]
+                    );
+                }
+                panic!("unexpected wire frame: {frame:?}");
+            }
+        }
+
+        // Ledger: a canonical envelope WAS appended for the session.
+        let (snapshot, _head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot succeeds for a session that just emitted an envelope");
+        let envelope_count = snapshot
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_))
+                )
+            })
+            .count();
+        assert_eq!(
+            envelope_count, 1,
+            "exactly one canonical envelope must be appended for the M15 fixture delta"
+        );
+        let envelope = snapshot
+            .iter()
+            .find_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope)) => {
+                    Some(envelope)
+                }
+                _ => None,
+            })
+            .expect("envelope notification present");
+        assert_eq!(envelope.envelope.thread_id, turn_id.0.to_string());
+        assert!(matches!(
+            envelope.envelope.payload,
+            octos_core::ui_protocol::Payload::AssistantDelta { .. }
+        ));
+    }
+
+    /// Legacy (non-projection.envelope) connection: the M15 fixture
+    /// delta MUST deliver the legacy `message/delta` frame, and the
+    /// envelope ledger entry is also produced (which the live
+    /// forwarder filters out on this connection's wire — covered by
+    /// `live_event_passes_capability_filter` tests elsewhere; here
+    /// we focus on the direct-send half).
+    #[tokio::test]
+    async fn m15_fixture_delta_delivered_to_legacy_connection() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures::default());
+
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:m15-delta-legacy".into());
+        let turn_id = TurnId::new();
+        let delta = UiNotification::MessageDelta(octos_core::ui_protocol::MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            text: "Subagent done: reviewer-tests (Hypatia) completed; artifact `notes` is ready.\n"
+                .into(),
+        });
+
+        emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+        let _ = send_notification_ephemeral(&ws, &ledger, delta);
+
+        let frame = rx
+            .try_recv()
+            .expect("legacy client must receive the M15 fixture's MessageDelta directly");
+        if let WsMessage::Text(text) = frame {
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
+            assert_eq!(value["method"], "message/delta");
+            assert!(
+                value["params"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("Subagent done:"),
+                "delta text must carry the fixture's subagent-done body"
+            );
+        } else {
+            panic!("expected text frame");
+        }
+        // Ledger still carries the envelope alongside; legacy connections
+        // just never see it on the wire (live forwarder filter).
+        let (snapshot, _head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot succeeds for a session that just emitted an envelope");
+        assert!(
+            snapshot.iter().any(|event| matches!(
+                event.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_))
+            )),
+            "envelope dual-emit must still append to the ledger for replay correctness"
+        );
+    }
+
+    /// Defense-in-depth: even if a future caller reaches for
+    /// `send_raw_notification_ephemeral` with an envelope-superseded
+    /// method, the helper itself refuses the dispatch — fail-closed
+    /// with `BackpressureDrop` and no wire frame emitted. Round-2's
+    /// per-connection filter is the primary gate; this is the second
+    /// belt so a `message/delta` raw send can never leak past it.
+    #[tokio::test]
+    async fn raw_ephemeral_helper_refuses_envelope_superseded_method() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures::default());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send_raw_notification_ephemeral(
+                &ws,
+                octos_core::ui_protocol::methods::MESSAGE_DELTA,
+                json!({"text": "should be refused"}),
+            )
+        }));
+        // In debug builds the helper hits a `debug_assert!`; in release
+        // builds it returns `Err(BackpressureDrop)`. Either way the wire
+        // MUST be empty.
+        match outcome {
+            Ok(result) => assert!(
+                matches!(result, Err(SendError::BackpressureDrop)),
+                "raw helper must refuse envelope-superseded methods in release builds"
+            ),
+            Err(_) => {
+                // debug_assert tripped — expected in debug.
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no wire frame may be emitted for an envelope-superseded raw send"
+        );
     }
 
     #[test]
