@@ -2774,6 +2774,33 @@ impl ActorFactory {
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         let supervisor = tools.supervisor();
+        // Wire supervisor on_failure_signal callback (M8.9) BEFORE
+        // `enable_persistence`. The orphan-task sweep at
+        // `task_supervisor.rs:1164-1166` can `mark_failed` resurrected
+        // tasks during `enable_persistence`, which fires the failure
+        // callback synchronously via `notify_failure`. Wiring this
+        // AFTER `enable_persistence` (pre-#1324-followup ordering) made
+        // those orphan-sweep failures silently dropped — `on_failure`
+        // was still `None` and `invoke_failure_callback` no-op'd. The
+        // PR #1324 follow-up reorders both this gateway path and the
+        // WS `run_standalone_turn` path to wire the callback first so
+        // every failure path — orphan-sweep, live `mark_failed`,
+        // cascade-fail — reaches the recovery inbox.
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+                // Issue #738 fix: forward the originating user turn's
+                // cmid into the recovery hint so the synthetic
+                // InboundMessage stamps `client_message_id` into its
+                // metadata and `process_inbound` reuses it instead of
+                // minting an orphan UUIDv7.
+                originating_client_message_id: signal.originating_client_message_id.clone(),
+            });
+        });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(
                 session = %session_key,
@@ -3000,26 +3027,11 @@ impl ActorFactory {
             forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
         });
 
-        // Wire supervisor on_failure_signal callback (M8.9): when a
-        // spawn_only task transitions to Failed, enqueue a synthetic
-        // recovery turn so the LLM can offer alternatives or take a
-        // recovery action instead of leaving the user with only a
-        // terminal failure notification.
-        let recovery_tx = tx.clone();
-        supervisor.set_on_failure_signal(move |signal| {
-            let prompt = build_recovery_prompt(signal);
-            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
-                task_id: signal.task_id.clone(),
-                tool_name: signal.tool_name.clone(),
-                prompt,
-                // Issue #738 fix: forward the originating user turn's
-                // cmid into the recovery hint so the synthetic
-                // InboundMessage stamps `client_message_id` into its
-                // metadata and `process_inbound` reuses it instead of
-                // minting an orphan UUIDv7.
-                originating_client_message_id: signal.originating_client_message_id.clone(),
-            });
-        });
+        // (PR #1324 follow-up moved the `set_on_failure_signal` wiring
+        // to immediately after `let supervisor = tools.supervisor();`
+        // above so the orphan-task sweep that runs during
+        // `enable_persistence` reaches the recovery inbox instead of
+        // hitting an `on_failure: None` callback slot.)
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(

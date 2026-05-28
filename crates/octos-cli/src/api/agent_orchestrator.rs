@@ -22,7 +22,7 @@ use super::supervisor_store::{
 };
 use chrono::Utc;
 use octos_agent::tools::mcp_agent::DispatchContextContract;
-use octos_agent::{Agent, AgentConfig, RoleTemplate, ToolRegistry};
+use octos_agent::{Agent, AgentConfig, RoleTemplate, SpawnOnlyFailureSignal, ToolRegistry};
 use octos_core::ui_protocol::{
     OutputCursor, RpcError, autonomy_error_kinds as kinds, methods, rpc_error_codes,
 };
@@ -79,6 +79,25 @@ const GOAL_COMPLETE_SENTINELS: &[&str] = &[
 const NATIVE_SPECIALIST_BACKEND_KIND: &str = "native";
 const NATIVE_SPECIALIST_SUMMARY_ARTIFACT_ID: &str = "summary";
 const NATIVE_SPECIALIST_ARTIFACT_CONTENT_MAX_BYTES: usize = 256 * 1024;
+
+/// #1324 follow-up — kind label for the `External(_)` master continuation
+/// reason used to re-inject a `SpawnOnlyFailureSignal` as a synthetic
+/// recovery turn on the WS / standalone-turn path. The gateway path drives
+/// recovery through `ActorMessage::RecoveryHint` directly into the actor
+/// inbox; on the WS path the closest equivalent is the global master
+/// continuation queue (drained on the connection's tick).
+pub(crate) const SPAWN_ONLY_FAILURE_EXTERNAL_KIND: &str = "spawn_only_failure";
+const SPAWN_ONLY_FAILURE_META_TASK_ID: &str = "task_id";
+const SPAWN_ONLY_FAILURE_META_TOOL_NAME: &str = "tool_name";
+const SPAWN_ONLY_FAILURE_META_ERROR_MESSAGE: &str = "error_message";
+const SPAWN_ONLY_FAILURE_META_TOOL_INPUT: &str = "tool_input";
+const SPAWN_ONLY_FAILURE_META_ALTERNATIVES: &str = "suggested_alternatives";
+const SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID: &str = "originating_client_message_id";
+/// Synthetic "group" id stamped onto spawn_only failure continuations so
+/// the `External` enqueue path passes the scheduler's required field.
+/// Distinct from `coding-autonomy` (loops/goals) so operators can filter
+/// the persisted queue by group when triaging recovery turns.
+const SPAWN_ONLY_FAILURE_GROUP: &str = "spawn-only-failure-recovery";
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentListRequest {
@@ -1468,6 +1487,80 @@ impl InProcessAgentOrchestrator {
         enqueue_goal_continuation_with_idle(&mut state, session_id, profile_id, &goal, idle_state)
             .map(|outcome| matches!(outcome, MasterContinuationEnqueueOutcome::Queued(_)))
             .unwrap_or(false)
+    }
+
+    /// PR #1324 follow-up — enqueue a synthetic recovery continuation for a
+    /// failed `spawn_only` task.
+    ///
+    /// The gateway path drives recovery through
+    /// [`ActorMessage::RecoveryHint`] directly into the session actor's
+    /// inbox (see `session_actor.rs::SessionActor::spawn` for the wiring).
+    /// The WS / `run_standalone_turn` path has no equivalent inbox: the
+    /// per-turn registry's `TaskSupervisor` outlives the turn (background
+    /// tokio::spawn tasks may fail AFTER the turn terminates), and the
+    /// WS connection itself may have closed before the failure surfaces.
+    /// The closest survivor is the in-process master continuation queue
+    /// (drained on every `appui_continuation_tick`), so we enqueue an
+    /// `External("spawn_only_failure")` request carrying the recovery
+    /// fields in metadata. `master_continuation_prompt` recognises the
+    /// kind and renders the same `[system-internal] Your previous ...`
+    /// body that `build_recovery_prompt` produces on the gateway path.
+    ///
+    /// The dedupe key is keyed on `task_id` so repeated `mark_failed`
+    /// calls (live + cascade-fail, idempotent re-marks) collapse onto a
+    /// single queued continuation.
+    pub(crate) fn enqueue_spawn_only_failure_continuation(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        signal: &SpawnOnlyFailureSignal,
+    ) -> MasterContinuationEnqueueOutcome {
+        let mut request = MasterContinuationRequest::new(
+            SPAWN_ONLY_FAILURE_GROUP,
+            session_id.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(SPAWN_ONLY_FAILURE_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(SPAWN_ONLY_FAILURE_META_TASK_ID, signal.task_id.clone())
+        .with_metadata(SPAWN_ONLY_FAILURE_META_TOOL_NAME, signal.tool_name.clone())
+        .with_metadata(
+            SPAWN_ONLY_FAILURE_META_ERROR_MESSAGE,
+            signal.error_message.clone(),
+        )
+        .with_dedupe_key(format!(
+            "external/{kind}/{session}/{task}",
+            kind = SPAWN_ONLY_FAILURE_EXTERNAL_KIND,
+            session = session_id,
+            task = signal.task_id,
+        ));
+        if !signal.tool_input.is_null() {
+            request = request.with_metadata(
+                SPAWN_ONLY_FAILURE_META_TOOL_INPUT,
+                serde_json::to_string(&signal.tool_input).unwrap_or_else(|_| "{}".to_owned()),
+            );
+        }
+        if !signal.suggested_alternatives.is_empty() {
+            // Comma-separated list; the renderer in `master_continuation_prompt`
+            // parses it back into a bullet block. We deliberately use a
+            // separator (`,`) that the existing `parse_alternatives`
+            // splitter does NOT recognise so an alternative containing
+            // `, ` isn't mis-split — alternatives are joined as supplied
+            // and rendered verbatim in the prompt.
+            request = request.with_metadata(
+                SPAWN_ONLY_FAILURE_META_ALTERNATIVES,
+                signal.suggested_alternatives.join("\u{001f}"),
+            );
+        }
+        if let Some(cmid) = signal
+            .originating_client_message_id
+            .as_ref()
+            .filter(|cmid| !cmid.is_empty())
+        {
+            request = request.with_metadata(SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID, cmid.clone());
+        }
+        let mut state = self.state();
+        enqueue_and_persist_continuation(&mut state, request)
     }
 
     /// #979 / M15-C2 — flip the goal to `complete` when the model
@@ -4292,11 +4385,64 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
             )
         }
+        MasterContinuationReason::External(kind) if kind == SPAWN_ONLY_FAILURE_EXTERNAL_KIND => {
+            render_spawn_only_failure_recovery_prompt(continuation)
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
         ),
     }
+}
+
+/// PR #1324 follow-up — render the spawn_only post-spawn failure recovery
+/// prompt from a queued continuation's metadata. Mirrors the
+/// `build_recovery_prompt` helper in `session_actor.rs` that the gateway
+/// path uses on the `ActorMessage::RecoveryHint` inbox, so the LLM sees
+/// the same `[system-internal] Your previous ...` body regardless of
+/// which path delivered the recovery turn.
+fn render_spawn_only_failure_recovery_prompt(continuation: &QueuedMasterContinuation) -> String {
+    let tool_name = continuation
+        .metadata
+        .get(SPAWN_ONLY_FAILURE_META_TOOL_NAME)
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    let error_message = continuation
+        .metadata
+        .get(SPAWN_ONLY_FAILURE_META_ERROR_MESSAGE)
+        .map(String::as_str)
+        .unwrap_or("");
+    let input_block = continuation
+        .metadata
+        .get(SPAWN_ONLY_FAILURE_META_TOOL_INPUT)
+        .map(|input| format!("\nOriginal input: {input}"))
+        .unwrap_or_default();
+    let alternatives_block = continuation
+        .metadata
+        .get(SPAWN_ONLY_FAILURE_META_ALTERNATIVES)
+        .map(|joined| {
+            let list = joined
+                .split('\u{001f}')
+                .filter(|alt| !alt.is_empty())
+                .map(|alt| format!("- {alt}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if list.is_empty() {
+                String::new()
+            } else {
+                format!("\nDetected alternatives:\n{list}\n")
+            }
+        })
+        .unwrap_or_default();
+    format!(
+        "[system-internal] Your previous `{tool}` call failed.\n\
+         Error: {err}{input}{alts}\n\
+         Respond to the user with a path forward — offer the alternatives, or try the safest one yourself if appropriate. Do not just report failure.",
+        tool = tool_name,
+        err = error_message,
+        input = input_block,
+        alts = alternatives_block,
+    )
 }
 
 fn master_continuation_reason_wire_name(reason: &MasterContinuationReason) -> String {

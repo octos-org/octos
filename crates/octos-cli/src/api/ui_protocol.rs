@@ -15490,6 +15490,55 @@ async fn run_standalone_turn(
         let bg_turn_id = turn_id.clone();
         let task_state_path = ui_protocol_task_output::task_state_path(&bg_data_dir, &session_id);
         let task_supervisor = tool_registry.supervisor();
+        // PR #1324 follow-up (L3 WS coverage gap): wire the spawn_only
+        // post-spawn failure signal BEFORE `enable_persistence` so the
+        // orphan-task sweep at `task_supervisor.rs:1164-1166` —
+        // which can `mark_failed` resurrected tasks — does NOT
+        // silently drop the recovery turn. The gateway path drives
+        // recovery through `ActorMessage::RecoveryHint` directly into
+        // the session actor's inbox; the WS turn handler has no
+        // actor, so we re-inject the failure into the global master
+        // continuation queue (drained on every
+        // `appui_continuation_tick`). `default_agent_orchestrator()`
+        // is a process-wide singleton, so the callback survives both
+        // the per-turn `tool_registry` drop AND a closed WS
+        // connection — on next subscribe, the queued
+        // `External("spawn_only_failure")` continuation fires and
+        // `master_continuation_prompt` renders the recovery body.
+        //
+        // The per-connection drain filter
+        // (`maybe_spawn_appui_master_continuation_runner`) takes
+        // exactly one continuation per session per tick, so the
+        // dedupe key on the request collapses repeated `mark_failed`
+        // calls onto one recovery turn even if `notify_failure`
+        // re-fires through a sibling path.
+        let failure_session_id = session_id.clone();
+        let failure_profile_id = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        task_supervisor.set_on_failure_signal(move |signal| {
+            let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+                &failure_session_id,
+                &failure_profile_id,
+                signal,
+            );
+            if outcome.is_duplicate() {
+                debug!(
+                    session = %failure_session_id,
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                );
+            } else {
+                info!(
+                    session = %failure_session_id,
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    "spawn_only failure recovery continuation queued (WS path)"
+                );
+            }
+        });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
             warn!(
                 session_id = %session_id.0,
@@ -22512,6 +22561,238 @@ ignore = []
         assert_eq!(tasks[0]["id"], task_id);
         assert_eq!(tasks[0]["tool_name"], "podcast_generate");
         assert_eq!(tasks[0]["status"], "running");
+    }
+
+    /// PR #1324 follow-up — pin that wiring `set_on_failure_signal` on a
+    /// per-turn `TaskSupervisor` (the way `run_standalone_turn` does
+    /// after this fix) routes a `SpawnOnlyFailureSignal` through to the
+    /// global master continuation queue. Pre-fix, the WS path created a
+    /// fresh `Arc::new(TaskSupervisor::new())` via
+    /// `snapshot_excluding(&[])` whose `on_failure` slot was `None` —
+    /// `invoke_failure_callback` silently no-op'd and the LLM never saw
+    /// the post-spawn failure → never retried.
+    ///
+    /// The test drives the canonical post-ack failure path:
+    ///   1. `register_with_input_and_cmid` + `mark_synth_ack_emitted`
+    ///      mirrors what `execution.rs::spawn_only` does when the LLM
+    ///      sees the synthetic ack tool result.
+    ///   2. `mark_failed` fires `notify_failure`. With a non-empty
+    ///      `tool_call_id` AND ack already recorded, the
+    ///      `notify_failure` path calls `invoke_failure_callback`
+    ///      synchronously inside `mark_failed`.
+    ///   3. The callback wired here mirrors the production wiring at
+    ///      `run_standalone_turn`: it enqueues a
+    ///      `MasterContinuationReason::External("spawn_only_failure")`
+    ///      continuation against the `default_agent_orchestrator()`.
+    ///   4. The pending continuation count + prompt body are asserted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_turn_supervisor_routes_spawn_only_failure_to_master_continuation_queue() {
+        // Use a profile_id distinct from MAIN_PROFILE_ID so this test
+        // does not contaminate sibling tests that drive the
+        // `default_agent_orchestrator()` static under the main profile
+        // (e.g. `appui_due_fixed_loop_tick_drains_internal_continuation_turn`).
+        // The drain path filters by profile, so queueing under a
+        // unique profile keeps the queue local to this test.
+        //
+        // We do NOT call `clear_default_agent_orchestrator_for_test()`
+        // at start either — it wipes the entire process-wide
+        // orchestrator, including state created by sibling tests
+        // running in parallel under their own profiles. The
+        // session-scoped assertions below filter by our unique
+        // session_id + profile_id, so prior state on other keys is
+        // invisible.
+        let session_id = SessionKey("web:tester#l3-recovery".to_owned());
+        let profile_id = "test-l3-recovery-isolate".to_owned();
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Mirror the WS path: per-turn registry built from snapshot.
+        let parent = octos_agent::ToolRegistry::with_builtins(temp.path());
+        let mut tool_registry = parent.snapshot_excluding(&[]);
+        tool_registry.set_session_key(session_id.to_string());
+        let task_supervisor = tool_registry.supervisor();
+
+        // Wire `set_on_failure_signal` exactly the way
+        // `run_standalone_turn` does after the PR #1324 follow-up. The
+        // callback is invoked inline from `mark_failed` /
+        // `notify_failure`, so a synchronous enqueue against the
+        // process-wide orchestrator singleton is observable on the next
+        // `pending_continuation_count_for_test()` read.
+        let cb_session = session_id.clone();
+        let cb_profile = profile_id.clone();
+        task_supervisor.set_on_failure_signal(move |signal| {
+            let _ = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+                &cb_session,
+                &cb_profile,
+                signal,
+            );
+        });
+
+        // Background spawn_only task: register + mark synth-ack + run +
+        // fail. This is the canonical production sequence in
+        // `execution.rs::spawn_only` for a task that succeeds at
+        // dispatch but fails AFTER the LLM has already moved on
+        // (e.g. mofa_slides plugin process crashes mid-render).
+        let task_id = task_supervisor.register_with_input_and_cmid(
+            "mofa_slides",
+            "call-l3-recovery",
+            Some(&session_id.0),
+            Some(serde_json::json!({"topic": "rust"})),
+            Some("user-cmid-42".to_owned()),
+        );
+        task_supervisor.mark_synth_ack_emitted("call-l3-recovery");
+        task_supervisor.mark_running(&task_id);
+        task_supervisor.mark_failed(
+            &task_id,
+            "puer-woodblock-style: plugin exited 137 (sigkill)".to_string(),
+        );
+
+        // The callback should have enqueued exactly one external
+        // spawn_only_failure continuation against the global
+        // orchestrator.
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, &profile_id,),
+            1,
+            "WS-path failure signal must reach the master continuation queue",
+        );
+
+        // The prompt body MUST surface the tool name + error message so
+        // the LLM has actionable context. We assert the structural
+        // pieces (the exact wording is owned by
+        // `render_spawn_only_failure_recovery_prompt` and tested
+        // separately at unit scope).
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            &profile_id,
+            crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "exactly one continuation must drain");
+        let prompt = master_continuation_prompt(&drained[0]);
+        assert!(
+            prompt.contains("[system-internal]") && prompt.contains("mofa_slides"),
+            "recovery prompt must mark itself system-internal and surface \
+             the failing tool name; got: {prompt}",
+        );
+        assert!(
+            prompt.contains("puer-woodblock-style"),
+            "recovery prompt must surface the underlying error so the \
+             LLM can pick an alternative; got: {prompt}",
+        );
+
+        // The per-turn registry's supervisor holds an `Arc` clone the
+        // failure callback captures; drop the registry to release the
+        // callback before the test function returns. We deliberately
+        // do NOT call `clear_default_agent_orchestrator_for_test()`
+        // at end — that would wipe queue entries created by sibling
+        // tests running in parallel under the shared static.
+        drop(tool_registry);
+    }
+
+    /// Regression: a `mark_failed` driven by the orphan-task sweep
+    /// during `enable_persistence` (`task_supervisor.rs:1164-1166`)
+    /// MUST reach the recovery callback. This pins the wiring order
+    /// the PR #1324 follow-up established: `set_on_failure_signal`
+    /// runs BEFORE `enable_persistence`, otherwise the orphan sweep's
+    /// `mark_failed` hits an `on_failure: None` slot and the recovery
+    /// turn for the resurrected task is silently dropped.
+    ///
+    /// Reproducer: a single supervisor with an in-memory non-terminal
+    /// task plus a recorded synth-ack. Calling `enable_persistence`
+    /// AFTER both states are established sweeps the task into the
+    /// `Failed` runtime state and — because the ack IS recorded —
+    /// `notify_failure` lands on the "ack already recorded" arm,
+    /// which fires `invoke_failure_callback` synchronously inside
+    /// `mark_failed`. With the corrected wiring order (callback
+    /// before persistence), the recovery callback fires and the
+    /// orchestrator's queue gains exactly one continuation. With
+    /// the pre-fix order (callback after persistence), the callback
+    /// is `None` at the moment `mark_failed` runs and the failure
+    /// is silently dropped — `pending_continuation_count` stays at 0.
+    ///
+    /// The test deliberately exercises only the live in-memory
+    /// orphan-sweep path. The persisted-ledger path (Phase 1 / Phase 2
+    /// across a supervisor drop) sweeps the task into the same
+    /// `Failed` state but lands on the stash arm of `notify_failure`
+    /// — the ack-set is not persisted, so a fresh supervisor sees no
+    /// ack on the replayed task. That stash-arm path is covered by
+    /// the unit tests in `task_supervisor::tests`; what this test
+    /// pins is the WIRING ORDER on a single supervisor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_turn_supervisor_orphan_sweep_failures_reach_recovery_callback() {
+        // Use a profile_id distinct from MAIN_PROFILE_ID so this test
+        // does not contaminate sibling tests that drain the
+        // `default_agent_orchestrator()` static under the main profile.
+        // (See the companion routes test for the rationale on why we
+        // do not call `clear_default_agent_orchestrator_for_test()`.)
+        let session_id = SessionKey("web:tester#l3-orphan".to_owned());
+        let profile_id = "test-l3-orphan-isolate".to_owned();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger_path = temp.path().join("task_ledger.jsonl");
+
+        // Build a per-turn registry exactly like the WS path.
+        let parent = octos_agent::ToolRegistry::with_builtins(temp.path());
+        let mut tool_registry = parent.snapshot_excluding(&[]);
+        tool_registry.set_session_key(session_id.to_string());
+        let task_supervisor = tool_registry.supervisor();
+
+        // Pre-populate a non-terminal task + record its synth-ack. The
+        // ack-set is in-memory only (not persisted), so this scenario
+        // requires building both states on the same supervisor: a
+        // fresh supervisor reloading from disk would not see the ack.
+        let task_id = task_supervisor.register_with_input_and_cmid(
+            "mofa_slides",
+            "call-orphan-1",
+            Some(&session_id.0),
+            Some(serde_json::json!({"topic": "rust"})),
+            Some("user-cmid-orphan".to_owned()),
+        );
+        task_supervisor.mark_synth_ack_emitted("call-orphan-1");
+        task_supervisor.mark_running(&task_id);
+
+        // Wire the failure callback BEFORE enable_persistence — the
+        // PR #1324 follow-up wiring order. The callback enqueues
+        // against the global orchestrator, same as production at
+        // `run_standalone_turn`.
+        let cb_session = session_id.clone();
+        let cb_profile = profile_id.clone();
+        task_supervisor.set_on_failure_signal(move |signal| {
+            let _ = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+                &cb_session,
+                &cb_profile,
+                signal,
+            );
+        });
+
+        // enable_persistence runs the orphan sweep over the in-memory
+        // map. The `mark_running` task is non-terminal, so the sweep
+        // `mark_failed`'s it. `notify_failure` finds the ack already
+        // recorded (from the `mark_synth_ack_emitted` call above) and
+        // takes the "ack already recorded" arm — which invokes
+        // `invoke_failure_callback` synchronously inside
+        // `mark_failed`. Pre-fix wiring (callback AFTER
+        // enable_persistence) would observe `on_failure: None` here
+        // and silently drop the recovery; the corrected order surfaces
+        // it on the orchestrator queue.
+        task_supervisor
+            .enable_persistence(&ledger_path)
+            .expect("enable_persistence on per-turn supervisor");
+
+        let reaped = task_supervisor
+            .get_task(&task_id)
+            .expect("orphaned task must still be tracked after sweep");
+        assert_eq!(reaped.status, octos_agent::TaskStatus::Failed);
+
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, &profile_id,),
+            1,
+            "orphan-sweep failure (ack-recorded arm) must reach the \
+             recovery callback when `set_on_failure_signal` is wired \
+             BEFORE `enable_persistence` (PR #1324 follow-up ordering)",
+        );
+
+        drop(tool_registry);
     }
 
     #[test]
