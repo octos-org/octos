@@ -53,6 +53,49 @@ use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 
+enum GatewayLoopEvent {
+    Wake,
+    Shutdown,
+    InboundClosed,
+    SessionDeleted(String),
+    Inbound(octos_core::InboundMessage),
+}
+
+async fn next_gateway_loop_event(
+    agent_handle: &mut octos_bus::AgentHandle,
+    session_delete_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    shutdown: &AtomicBool,
+    shutdown_notify: &Notify,
+) -> GatewayLoopEvent {
+    if shutdown.load(Ordering::Acquire) {
+        return GatewayLoopEvent::Shutdown;
+    }
+
+    tokio::select! {
+        biased;
+        _ = shutdown_notify.notified() => {
+            if shutdown.load(Ordering::Acquire) {
+                GatewayLoopEvent::Shutdown
+            } else {
+                GatewayLoopEvent::Wake
+            }
+        }
+        session_id = session_delete_rx.recv() => {
+            if let Some(id) = session_id {
+                GatewayLoopEvent::SessionDeleted(id)
+            } else {
+                GatewayLoopEvent::Wake
+            }
+        }
+        inbound = agent_handle.recv_inbound() => {
+            match inbound {
+                Some(inbound) => GatewayLoopEvent::Inbound(inbound),
+                None => GatewayLoopEvent::InboundClosed,
+            }
+        }
+    }
+}
+
 // `discover_ominix_url` and `push_runtime_plugin_env` live in
 // `crate::skills_scope` so the `serve` plugin loader can reuse them.
 use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
@@ -1636,33 +1679,22 @@ impl GatewayRuntime {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let shutdown_notified = shutdown_notify.notified();
-            tokio::pin!(shutdown_notified);
-            if self.shutdown.load(Ordering::Acquire) {
-                break;
-            }
-
-            let mut inbound = tokio::select! {
-                biased;
-                _ = &mut shutdown_notified => {
-                    if self.shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
+            let mut inbound = match next_gateway_loop_event(
+                &mut self.agent_handle,
+                &mut self.session_delete_rx,
+                &self.shutdown,
+                &shutdown_notify,
+            )
+            .await
+            {
+                GatewayLoopEvent::Wake => continue,
+                GatewayLoopEvent::Shutdown | GatewayLoopEvent::InboundClosed => break,
+                GatewayLoopEvent::SessionDeleted(id) => {
+                    tracing::debug!(session = %id, "stopping actor for deleted session");
+                    self.actor_registry.remove_session(&id);
                     continue;
                 }
-                session_id = self.session_delete_rx.recv() => {
-                    if let Some(id) = session_id {
-                        tracing::debug!(session = %id, "stopping actor for deleted session");
-                        self.actor_registry.remove_session(&id);
-                    }
-                    continue;
-                }
-                inbound = self.agent_handle.recv_inbound() => {
-                    match inbound {
-                        Some(inbound) => inbound,
-                        None => break,
-                    }
-                }
+                GatewayLoopEvent::Inbound(inbound) => inbound,
             };
 
             if self.shutdown.load(Ordering::Acquire) {
@@ -2080,5 +2112,60 @@ impl GatewayRuntime {
         ch_result?;
         println!("{}", "Gateway stopped.".dimmed());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tokio::sync::mpsc;
+
+    fn make_inbound(content: &str) -> octos_core::InboundMessage {
+        octos_core::InboundMessage {
+            channel: "email".into(),
+            sender_id: "sender@example.com".into(),
+            chat_id: "sender@example.com".into(),
+            content: content.into(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_wake_does_not_starve_next_inbound_message() {
+        let (mut agent_handle, publisher) = octos_bus::create_bus();
+        let inbound_tx = publisher.inbound_sender();
+        let (_delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let shutdown = AtomicBool::new(false);
+        let shutdown_notify = Notify::new();
+
+        shutdown_notify.notify_one();
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Wake => {}
+            _ => panic!("expected a non-shutdown wake"),
+        }
+
+        inbound_tx.send(make_inbound("hello")).await.unwrap();
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Inbound(inbound) => assert_eq!(inbound.content, "hello"),
+            _ => panic!("expected inbound message after wake"),
+        }
     }
 }

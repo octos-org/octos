@@ -76,6 +76,11 @@ impl Channel for EmailChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("Re: Message");
 
+        info!(
+            recipient = %msg.chat_id,
+            subject = %subject,
+            "smtp_send outbound email"
+        );
         smtp_send(&self.config, &msg.chat_id, subject, &msg.content).await
     }
 
@@ -183,14 +188,25 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
     }
     // Stream dropped — session is free again.
 
-    // Mark all fetched as seen
-    session.store(&seq_set, "+FLAGS (\\Seen)").await.ok();
+    // Mark all fetched as seen.
+    if let Err(e) = session.store(&seq_set, "+FLAGS (\\Seen)").await {
+        warn!(error = %e, "IMAP STORE failed while marking messages seen");
+    }
     session.logout().await.ok();
 
     // Send parsed emails as inbound messages
     let mut count = 0;
     for (from, subject, text_body) in parsed_emails {
         let sender_email = extract_email_address(&from);
+
+        if should_skip_self_reply(&sender_email, &subject, config) {
+            info!(
+                sender = %sender_email,
+                subject = %subject,
+                "skipping self-sent email reply"
+            );
+            continue;
+        }
 
         let content = if subject.is_empty() {
             text_body
@@ -286,15 +302,54 @@ fn extract_text_body(mail: &mailparse::ParsedMail) -> Option<String> {
 fn extract_email_address(from: &str) -> String {
     if let Some(start) = from.rfind('<') {
         if let Some(end) = from[start..].find('>') {
-            return from[start + 1..start + end].to_string();
+            return from[start + 1..start + end].trim().to_string();
         }
     }
     from.trim().to_string()
 }
 
+fn canonical_email_address(value: &str) -> String {
+    extract_email_address(value).to_ascii_lowercase()
+}
+
+fn subject_is_reply(subject: &str) -> bool {
+    subject.trim_start().to_ascii_lowercase().starts_with("re:")
+}
+
+fn should_skip_self_reply(sender_email: &str, subject: &str, config: &EmailConfig) -> bool {
+    if !subject_is_reply(subject) {
+        return false;
+    }
+
+    let sender = canonical_email_address(sender_email);
+    if sender.is_empty() {
+        return false;
+    }
+
+    [config.from_address.as_str(), config.username.as_str()]
+        .into_iter()
+        .filter(|addr| !addr.trim().is_empty())
+        .any(|addr| canonical_email_address(addr) == sender)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(from_address: &str, username: &str) -> EmailConfig {
+        EmailConfig {
+            imap_host: "imap.example.com".into(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 465,
+            username: username.into(),
+            password: "secret".into(),
+            from_address: from_address.into(),
+            poll_interval_secs: 30,
+            allowed_senders: vec![],
+            max_body_chars: 10_000,
+        }
+    }
 
     #[test]
     fn test_extract_email_address() {
@@ -310,5 +365,46 @@ mod tests {
             extract_email_address("<bob@example.com>"),
             "bob@example.com"
         );
+        assert_eq!(
+            extract_email_address("Bot < bot@example.com >"),
+            "bot@example.com"
+        );
+    }
+
+    #[test]
+    fn self_sent_reply_is_skipped_to_prevent_mail_loop() {
+        let config = test_config("Bot <bot@example.com>", "bot-login@example.com");
+
+        assert!(should_skip_self_reply(
+            "bot@example.com",
+            "Re: incoming question",
+            &config
+        ));
+        assert!(should_skip_self_reply(
+            "BOT@example.com",
+            "  re: incoming question",
+            &config
+        ));
+        assert!(should_skip_self_reply(
+            "bot-login@example.com",
+            "Re: via login address",
+            &config
+        ));
+    }
+
+    #[test]
+    fn non_self_or_non_reply_email_is_not_skipped() {
+        let config = test_config("bot@example.com", "bot-login@example.com");
+
+        assert!(!should_skip_self_reply(
+            "user@example.com",
+            "Re: incoming question",
+            &config
+        ));
+        assert!(!should_skip_self_reply(
+            "bot@example.com",
+            "New incoming question",
+            &config
+        ));
     }
 }
