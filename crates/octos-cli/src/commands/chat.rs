@@ -282,15 +282,13 @@ impl ChatCommand {
             // SPEC-VENDOR-NODE-V1 HTTP tool discovery — sync `load_into_with_options`
             // only handles static binary-protocol skills; this async pass walks the
             // same dirs for `tool_discovery: Http { base_url }` manifests and
-            // registers their catalog-derived tools. Warn-and-continue on failure
-            // matches the sync loader's pattern: a single unreachable bridge must
-            // not block boot of unrelated skills.
-            if let Err(e) =
-                octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
-                    .await
-            {
-                eprintln!("Warning: HTTP tool discovery failed: {e}");
-            }
+            // registers their catalog-derived tools. Per @ymote's Finding 2 contract
+            // (preserved in the post-merge review), an unreachable bridge or
+            // unparseable catalog must hard-fail the boot rather than silently
+            // register zero tools and let the operator find out at first LLM call.
+            octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                .await
+                .wrap_err("HTTP tool discovery failed at agent boot")?;
         }
 
         // Start MCP servers declared in skill manifests

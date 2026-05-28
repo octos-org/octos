@@ -114,12 +114,14 @@ pub async fn activate_skill(
             // registration only; extras flow through
             // `PluginLoader::load_into_with_options` at runtime startup.
             //
-            // `load_plugin` failure (e.g. manifest declares tools but ships
-            // no executable) is soft: agent boot's `load_into_with_options`
-            // is the authoritative tool-registration path, and the install
-            // CLI flow discards this registry anyway. Hard-failing here
-            // would block legitimate "docs-only" or "tools-deferred" skills
-            // that pass upstream's manifest validator but have no binary.
+            // Error handling: hard-fail on every `load_plugin` error EXCEPT
+            // "no executable found", which is a legitimate "tools declared
+            // in the manifest but binary deferred" case (matches upstream's
+            // RFC-2 valid-manifest install flow: copy files now, register
+            // tools later at agent boot). Integrity errors (sha256 mismatch,
+            // oversized binary, `require_signed` rejection) MUST propagate
+            // so install rolls back instead of silently parking a broken
+            // skill on disk. Reviewer post-merge feedback (Critical A).
             match PluginLoader::load_plugin(skill_dir, extra_env) {
                 Ok((tools, _extras)) => {
                     for tool in tools {
@@ -130,11 +132,24 @@ pub async fn activate_skill(
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        skill = %skill_name,
-                        error = %e,
-                        "load_plugin during activate_skill failed; tool registration deferred to agent boot"
-                    );
+                    let msg = e.to_string();
+                    if msg.contains("no executable found") {
+                        // Manifest declares `tools: [...]` but ships no
+                        // binary — typical for RFC-2 docs-first skills.
+                        // Tool registration will happen at agent boot if
+                        // a binary appears later; otherwise the skill
+                        // legitimately has no static tools.
+                        info!(
+                            skill = %skill_name,
+                            "skill has no executable; static tool registration deferred to agent boot"
+                        );
+                    } else {
+                        return Err(e).wrap_err_with(|| {
+                            format!(
+                                "skill {skill_name} static load_plugin failed; install must roll back"
+                            )
+                        });
+                    }
                 }
             }
         }

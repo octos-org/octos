@@ -2465,12 +2465,13 @@ impl Tool for SpawnTool {
                         verified_cache_dir: None,
                     },
                 );
-                // SPEC-VENDOR-NODE-V1 HTTP tool discovery — subagents need the
-                // same bridge tools the parent agent has, otherwise spawn-based
-                // robotics workflows lose visibility of vendor verbs.
-                let _ =
-                    crate::plugins::register_http_skills_on_startup(&mut tools, &self.plugin_dirs)
-                        .await;
+                // SPEC-VENDOR-NODE-V1 HTTP tool discovery — hard-fail per
+                // @ymote's Finding 2 contract. Subagents need the bridge tools
+                // the parent has; if discovery fails the spawn must error out
+                // rather than silently spawn a tool-blind subagent.
+                crate::plugins::register_http_skills_on_startup(&mut tools, &self.plugin_dirs)
+                    .await
+                    .map_err(|e| eyre::eyre!("subagent HTTP tool discovery failed: {e}"))?;
             }
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
@@ -2901,10 +2902,24 @@ impl Tool for SpawnTool {
                             verified_cache_dir: None,
                         },
                     );
-                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see sync mode above).
-                    let _ =
+                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery — this is the
+                    // ASYNC spawn-background path (`tokio::spawn(async move
+                    // { ... })`); the enclosing block returns `()` so there is
+                    // no Err-propagation channel. The contract therefore
+                    // diverges from the sync subagent and boot paths: a
+                    // failed catalog fetch in a background subagent is logged
+                    // and the subagent runs with whatever static tools loaded.
+                    // Documented divergence from @ymote's Finding 2 contract;
+                    // the sync subagent path (line ~2470) still hard-fails.
+                    if let Err(e) =
                         crate::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
-                            .await;
+                            .await
+                    {
+                        warn!(
+                            error = %e,
+                            "subagent (background) HTTP tool discovery failed; continuing with static tools only"
+                        );
+                    }
                 }
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());

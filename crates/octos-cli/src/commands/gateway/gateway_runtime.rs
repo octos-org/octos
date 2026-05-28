@@ -729,15 +729,11 @@ impl GatewayRuntime {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),
                     }
-                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see chat.rs).
-                    if let Err(e) = octos_agent::plugins::register_http_skills_on_startup(
-                        &mut tools,
-                        &plugin_dirs,
-                    )
-                    .await
-                    {
-                        warn!("HTTP tool discovery failed: {e}");
-                    }
+                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery — hard-fail per
+                    // @ymote's Finding 2 contract (see chat.rs).
+                    octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                        .await
+                        .wrap_err("HTTP tool discovery failed at gateway boot")?;
                 }
 
                 if !plugin_result.mcp_servers.is_empty() {

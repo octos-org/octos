@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{ActiveSessionStore, CronService, SessionManager};
 use octos_core::OutboundMessage;
@@ -647,13 +647,13 @@ impl ProfileActorFactoryBuilder {
                     }
                     Err(e) => warn!(profile_id, "child bot plugin loading failed: {e}"),
                 }
-                // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see chat.rs).
-                if let Err(e) =
-                    octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
-                        .await
-                {
-                    warn!(profile_id, "child bot HTTP tool discovery failed: {e}");
-                }
+                // SPEC-VENDOR-NODE-V1 HTTP tool discovery — hard-fail per
+                // @ymote's Finding 2 contract (see chat.rs).
+                octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                    .await
+                    .wrap_err_with(|| {
+                        format!("HTTP tool discovery failed for child bot profile {profile_id}")
+                    })?;
             }
             actor_plugin_dirs = plugin_dirs.clone();
             actor_plugin_env = plugin_env;

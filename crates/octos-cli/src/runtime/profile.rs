@@ -612,13 +612,16 @@ impl ProfileRuntime {
                 Ok(result) => plugin_result = result,
                 Err(e) => warn!(profile_id = %profile.id, error = %e, "plugin loading failed"),
             }
-            // SPEC-VENDOR-NODE-V1 HTTP tool discovery (see chat.rs for rationale).
-            if let Err(e) =
-                octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
-                    .await
-            {
-                warn!(profile_id = %profile.id, error = %e, "HTTP tool discovery failed");
-            }
+            // SPEC-VENDOR-NODE-V1 HTTP tool discovery — hard-fail per @ymote's
+            // Finding 2 contract (see chat.rs for rationale).
+            octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "HTTP tool discovery failed during profile {} bootstrap",
+                        profile.id
+                    )
+                })?;
         }
 
         // Step 14: skill-declared MCP servers.
