@@ -2474,26 +2474,32 @@ async fn kill_child_process(pid: u32) {
 
     #[cfg(unix)]
     {
-        use std::process::Command as StdCommand;
-        let _ = StdCommand::new("kill")
-            .args(["-15", &format!("-{pid}")])
-            .status();
-        let _ = StdCommand::new("kill")
-            .args(["-15", &pid.to_string()])
-            .status();
+        let has_own_process_group = process_group_id(pid).is_some_and(|pgid| pgid == pid);
+        let mut descendants = collect_descendant_pids(pid);
+
+        if has_own_process_group {
+            signal_process_group(pid, "-15");
+        }
+        signal_pids(&descendants, "-15");
+        signal_process(pid, "-15");
+
         tokio::time::sleep(KILL_GRACE_PERIOD).await;
 
-        let still_alive = StdCommand::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|status| status.success());
+        descendants.extend(collect_descendant_pids(pid));
+        descendants.sort_unstable();
+        descendants.dedup();
+
+        let still_alive = process_exists(pid)
+            || descendants
+                .iter()
+                .any(|descendant_pid| process_exists(*descendant_pid))
+            || (has_own_process_group && process_group_exists(pid));
         if still_alive {
-            let _ = StdCommand::new("kill")
-                .args(["-9", &format!("-{pid}")])
-                .status();
-            let _ = StdCommand::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+            if has_own_process_group {
+                signal_process_group(pid, "-9");
+            }
+            signal_pids(&descendants, "-9");
+            signal_process(pid, "-9");
         }
     }
 
@@ -2503,6 +2509,101 @@ async fn kill_child_process(pid: u32) {
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .status();
     }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: &str) -> bool {
+    use std::process::Command as StdCommand;
+
+    let group = format!("-{pid}");
+    StdCommand::new("kill")
+        .args([signal, "--", &group])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: &str) -> bool {
+    use std::process::Command as StdCommand;
+
+    StdCommand::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn signal_pids(pids: &[u32], signal: &str) {
+    for pid in pids {
+        signal_process(*pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    signal_process_group(pid, "-0")
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    signal_process(pid, "-0")
+}
+
+#[cfg(unix)]
+fn process_group_id(pid: u32) -> Option<u32> {
+    use std::process::Command as StdCommand;
+
+    let output = StdCommand::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .and_then(|pgid| pgid.parse().ok())
+}
+
+#[cfg(unix)]
+fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    use std::process::Command as StdCommand;
+
+    let output = match StdCommand::new("ps").args(["-eo", "pid=,ppid="]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let mut children_by_parent: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        children_by_parent.entry(ppid).or_default().push(pid);
+    }
+
+    let mut descendants = Vec::new();
+    let mut stack = children_by_parent
+        .get(&root_pid)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(pid) = stack.pop() {
+        descendants.push(pid);
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children);
+        }
+    }
+    descendants
 }
 
 /// Convenience: run validators for a workspace contract inspection pass.
