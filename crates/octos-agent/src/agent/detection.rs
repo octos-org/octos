@@ -99,7 +99,17 @@ impl Agent {
     }
 
     /// Check if an error looks like a transient server issue worth retrying.
+    ///
+    /// Codex round (PR #1355): typed `StreamError`s now flow through this
+    /// path. Downcast first so the variant's own retryability policy
+    /// drives the decision — string-matching the rendered message would
+    /// either over- or under-trigger (e.g. `MalformedArgs` carries a
+    /// "stream error" substring under some rendering but is explicitly
+    /// non-retryable so the model can self-correct on its next turn).
     pub(super) fn is_retryable_stream_error(err: &eyre::Report) -> bool {
+        if let Some(stream_err) = err.downcast_ref::<octos_llm::StreamError>() {
+            return stream_err.is_retryable();
+        }
         let msg = err.to_string().to_lowercase();
         msg.contains("overloaded")
             || msg.contains("temporarily")
@@ -375,5 +385,57 @@ mod tests {
     fn is_retryable_stream_error_non_retryable() {
         let err = eyre::eyre!("invalid json");
         assert!(!Agent::is_retryable_stream_error(&err));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Codex round (PR #1355): typed StreamError downcast — these tests
+    // pin the boundary contract. Without the downcast path, MalformedArgs
+    // would match the string "stream" fallback and get retried forever,
+    // hiding the diagnostic from the model.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_retryable_stream_error_idle_timeout_is_typed_retryable() {
+        let typed = octos_llm::StreamError::IdleTimeout { idle_secs: 180 };
+        let err = eyre::Report::new(typed);
+        assert!(
+            Agent::is_retryable_stream_error(&err),
+            "IdleTimeout must be retryable through the typed downcast"
+        );
+    }
+
+    #[test]
+    fn is_retryable_stream_error_malformed_args_is_typed_not_retryable() {
+        let typed = octos_llm::StreamError::MalformedArgs {
+            tool_id: "call_0".to_string(),
+            tool_name: "mofa_slides".to_string(),
+            error: "EOF while parsing a string at column 4123".to_string(),
+        };
+        let err = eyre::Report::new(typed);
+        // The rendered string contains "stream" / similar substrings under
+        // some formatters; the downcast path must short-circuit BEFORE the
+        // string match falls through.
+        assert!(
+            !Agent::is_retryable_stream_error(&err),
+            "MalformedArgs must be NOT retryable so the model sees the diagnostic"
+        );
+    }
+
+    #[test]
+    fn is_retryable_stream_error_incomplete_is_typed_retryable() {
+        let typed = octos_llm::StreamError::Incomplete {
+            detail: "stream ended without Done".to_string(),
+        };
+        let err = eyre::Report::new(typed);
+        assert!(Agent::is_retryable_stream_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_stream_error_transport_is_typed_retryable() {
+        let typed = octos_llm::StreamError::Transport {
+            detail: "broken pipe".to_string(),
+        };
+        let err = eyre::Report::new(typed);
+        assert!(Agent::is_retryable_stream_error(&err));
     }
 }

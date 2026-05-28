@@ -62,7 +62,7 @@ pub use credential_pool::{
     default_credential_pool_path, rotation_reason,
 };
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
-pub use error::{LlmError, LlmErrorKind};
+pub use error::{LlmError, LlmErrorKind, StreamError};
 pub use failover::ProviderChain;
 pub use fallback::FallbackProvider;
 pub use high_level::LlmClient;

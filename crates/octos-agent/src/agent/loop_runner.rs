@@ -1363,9 +1363,14 @@ impl Agent {
                                     // `execution.rs::register_task_with_input_and_cmid`.
                                     // `handle_tool_use` rewrites every
                                     // tool_call_id via `sanitize_tool_call_id`
-                                    // (colon → underscore, empty/duplicate
-                                    // repair), and the supervisor stores the
-                                    // sanitized id on the `BackgroundTask`.
+                                    // (colon → underscore character
+                                    // sanitisation), and the supervisor
+                                    // stores the sanitized id on the
+                                    // `BackgroundTask`. Codex round
+                                    // (PR #1355) removed the
+                                    // empty/duplicate id repair from this
+                                    // path; ids should arrive correct from
+                                    // the provider.
                                     // Recording the ORIGINAL `tc.id` here
                                     // (e.g. `call:1`) would key the
                                     // synth-ack set on a value that
@@ -1875,10 +1880,16 @@ impl Agent {
     /// Execute tool calls from an LLM response and accumulate results.
     ///
     /// On success returns the SANITIZED response — IDs after
-    /// `sanitize_tool_call_id` + empty/duplicate repair + name+args dedup.
+    /// `sanitize_tool_call_id` (character normalisation) + name+args dedup.
     /// Callers that subsequently key into `tool_success_by_id` MUST use the
     /// sanitized response so the lookup matches; the original response's
     /// tool_call_ids are stale once sanitization rewrites them.
+    ///
+    /// Codex round (PR #1355): the prior "empty/duplicate tool_call_id"
+    /// repair step that lived alongside `sanitize_tool_call_id` was removed.
+    /// Tool call ids should arrive correct from the provider; if they don't,
+    /// that's an upstream provider-impl bug to fix at the source, not by
+    /// salvaging downstream.
     ///
     /// Codex round-3 MAJOR (PR #1187 follow-up): the prior signature returned
     /// `Result<()>`, leaving the synth-ack gate at the call site to feed the
@@ -1913,32 +1924,20 @@ impl Agent {
         // needed there).
         turn_output_log: Option<&mut Vec<Message>>,
     ) -> Result<ChatResponse> {
-        // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
-        // duplicate or empty IDs which downstream providers reject with 400.
-        // Also sanitize characters: some providers (e.g. Moonshot/kimi) generate IDs
-        // with colons like "admin_view_sessions:11" which OpenAI rejects.
-        // We fix IDs on the response clone so both the assistant message and tool result
-        // messages use the same corrected IDs.
+        // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
+        // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
+        // letters, numbers, underscores, dashes accepted). This is a documented
+        // cross-provider portability concern, not a streaming-layer salvage.
+        //
+        // Codex round (PR #1355): the "fixing empty/duplicate tool_call_id"
+        // salvager that previously lived here (mint a synthetic id when the
+        // provider returned an empty / duplicate one) was deleted. Tool call
+        // IDs should arrive correct from the provider; if they don't, that's
+        // an upstream provider-impl bug to fix at the source, not by salvaging
+        // downstream. See `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md`.
         let mut response = response.clone();
-        {
-            let mut seen_ids = std::collections::HashSet::new();
-            for (i, tc) in response.tool_calls.iter_mut().enumerate() {
-                // Sanitize characters: keep only alphanumeric, underscore, hyphen
-                tc.id = sanitize_tool_call_id(&tc.id);
-
-                if tc.id.is_empty() || !seen_ids.insert(tc.id.clone()) {
-                    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let new_id = format!("call_{}_{}", i, seq);
-                    tracing::warn!(
-                        old_id = %tc.id,
-                        new_id = %new_id,
-                        tool = %tc.name,
-                        "fixing empty/duplicate tool_call_id"
-                    );
-                    tc.id = new_id;
-                }
-            }
+        for tc in response.tool_calls.iter_mut() {
+            tc.id = sanitize_tool_call_id(&tc.id);
         }
 
         // Deduplicate tool calls with identical name + arguments (some models

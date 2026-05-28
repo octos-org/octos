@@ -289,6 +289,126 @@ impl std::error::Error for LlmError {
     }
 }
 
+/// Typed errors produced by the LLM streaming layer.
+///
+/// Codex round (#1355): the streaming layer used to silently break its read
+/// loop on inter-chunk timeout with a half-assembled `tool_call.arguments`
+/// buffer, then ship a sentinel `Value::String("MALFORMED_JSON:...")`
+/// downstream as if it were a valid `ChatResponse`. The plugin executor
+/// dispatched the sentinel string and errored with "missing 'out'". See
+/// `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md` (PR #1355) for the full
+/// architectural argument.
+///
+/// `StreamError` is the typed boundary the agent-loop side of the streaming
+/// layer surfaces instead of silently propagating partial state. The variants
+/// implement the contract:
+///
+/// * `IdleTimeout` and `Transport` are retryable — the existing
+///   `RetryProvider` / `ProviderChain` machinery handles them as it does any
+///   other transient stream failure.
+/// * `Incomplete` (stream closed without `finish_reason`) is treated as
+///   retryable so the lane router can pick a different slot if the
+///   wire-shape mismatch repeats.
+/// * `MalformedArgs` is **not** retryable. The model produced syntactically
+///   bad JSON for a tool_call after a clean `finish_reason` — silently
+///   retrying would hide the bug from the model so it can't self-correct.
+///   The error reaches the loop, gets surfaced as a tool-failure, and the
+///   model sees the diagnostic on its next turn.
+#[derive(Debug)]
+pub enum StreamError {
+    /// Inter-chunk idle timeout fired during streaming — provider stalled.
+    /// Half-assembled buffers are discarded; the caller should retry from
+    /// scratch via the existing retry machinery.
+    IdleTimeout {
+        /// Idle window that elapsed without a chunk arriving.
+        idle_secs: u64,
+    },
+    /// Stream closed without a terminal signal (`finish_reason`).
+    Incomplete {
+        /// Operator-visible context (e.g. "stream ended before Done event").
+        detail: String,
+    },
+    /// Tool call arrived with un-parseable JSON arguments AFTER a clean
+    /// terminal signal. This is a model-side bug; surfacing it as
+    /// non-retryable lets the agent loop give the model a chance to
+    /// self-correct on its next turn.
+    MalformedArgs {
+        /// Tool call id (provider-assigned).
+        tool_id: String,
+        /// Tool name as declared in the stream.
+        tool_name: String,
+        /// Parse error rendered with truncated raw input for log brevity.
+        error: String,
+    },
+    /// Underlying transport failure (connection reset, broken pipe, etc.).
+    Transport { detail: String },
+}
+
+impl StreamError {
+    /// Whether the existing retry machinery should treat this error as
+    /// transient and retry the stream. See the variant docs for policy.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            StreamError::IdleTimeout { .. }
+            | StreamError::Incomplete { .. }
+            | StreamError::Transport { .. } => true,
+            StreamError::MalformedArgs { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamError::IdleTimeout { idle_secs } => {
+                write!(
+                    f,
+                    "stream idle timeout after {idle_secs}s — provider stalled"
+                )
+            }
+            StreamError::Incomplete { detail } => {
+                write!(f, "stream closed without terminal signal: {detail}")
+            }
+            StreamError::MalformedArgs {
+                tool_id,
+                tool_name,
+                error,
+            } => {
+                write!(
+                    f,
+                    "malformed tool_call arguments (tool={tool_name}, id={tool_id}): {error}"
+                )
+            }
+            StreamError::Transport { detail } => write!(f, "stream transport error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+impl From<StreamError> for LlmError {
+    /// Bridge `StreamError` into the existing `LlmError` taxonomy so the
+    /// failover/retry plumbing handles it uniformly. The mapping mirrors
+    /// the retryability policy on `StreamError::is_retryable()`:
+    ///
+    /// * `IdleTimeout` → `Timeout` (retryable in `LlmError::is_retryable`)
+    /// * `Incomplete` → `StreamError` (retryable)
+    /// * `MalformedArgs` → `InvalidRequest` (NOT retryable — model needs to see)
+    /// * `Transport` → `Network` (retryable)
+    fn from(err: StreamError) -> Self {
+        let message = err.to_string();
+        let kind = match &err {
+            StreamError::IdleTimeout { .. } => LlmErrorKind::Timeout,
+            StreamError::Incomplete { .. } => LlmErrorKind::StreamError,
+            StreamError::MalformedArgs { .. } => LlmErrorKind::InvalidRequest {
+                detail: message.chars().take(200).collect(),
+            },
+            StreamError::Transport { .. } => LlmErrorKind::Network,
+        };
+        LlmError::new(kind, message).with_source(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +610,117 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout");
         let err = LlmError::timeout("request timed out").with_source(io_err);
         assert!(err.source().is_some());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // StreamError — typed boundary for the streaming layer. See ADR
+    // docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_retryable_idle_timeout_true() {
+        let err = StreamError::IdleTimeout { idle_secs: 180 };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_transport_true() {
+        let err = StreamError::Transport {
+            detail: "connection reset".to_string(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_incomplete_true() {
+        let err = StreamError::Incomplete {
+            detail: "stream ended before Done event".to_string(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_malformed_args_false() {
+        // MalformedArgs MUST NOT be retried — the model needs to see the
+        // error on its next turn so it can self-correct.
+        let err = StreamError::MalformedArgs {
+            tool_id: "call_0".to_string(),
+            tool_name: "write_file".to_string(),
+            error: "EOF while parsing a string".to_string(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_idle_timeout_display_mentions_seconds() {
+        let err = StreamError::IdleTimeout { idle_secs: 180 };
+        let rendered = err.to_string();
+        assert!(rendered.contains("180s"), "got: {rendered}");
+        assert!(rendered.contains("stalled"), "got: {rendered}");
+    }
+
+    #[test]
+    fn stream_error_malformed_args_display_names_tool() {
+        let err = StreamError::MalformedArgs {
+            tool_id: "call_0".to_string(),
+            tool_name: "mofa_slides".to_string(),
+            error: "EOF while parsing a string at column 4123".to_string(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("mofa_slides"), "got: {rendered}");
+        assert!(rendered.contains("call_0"), "got: {rendered}");
+    }
+
+    #[test]
+    fn stream_error_idle_timeout_into_llm_error_retryable() {
+        // Bridge: StreamError::IdleTimeout → LlmError::Timeout (retryable in
+        // the RetryProvider taxonomy).
+        let err = StreamError::IdleTimeout { idle_secs: 60 };
+        let llm: LlmError = err.into();
+        assert!(matches!(llm.kind, LlmErrorKind::Timeout));
+        assert!(llm.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_incomplete_into_llm_error_retryable() {
+        let err = StreamError::Incomplete {
+            detail: "no Done event".to_string(),
+        };
+        let llm: LlmError = err.into();
+        assert!(matches!(llm.kind, LlmErrorKind::StreamError));
+        assert!(llm.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_malformed_args_into_llm_error_not_retryable() {
+        // MalformedArgs maps to InvalidRequest, which is NOT retryable.
+        let err = StreamError::MalformedArgs {
+            tool_id: "call_0".to_string(),
+            tool_name: "write_file".to_string(),
+            error: "EOF".to_string(),
+        };
+        let llm: LlmError = err.into();
+        assert!(matches!(llm.kind, LlmErrorKind::InvalidRequest { .. }));
+        assert!(!llm.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_transport_into_llm_error_retryable() {
+        let err = StreamError::Transport {
+            detail: "broken pipe".to_string(),
+        };
+        let llm: LlmError = err.into();
+        assert!(matches!(llm.kind, LlmErrorKind::Network));
+        assert!(llm.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_preserves_source_chain_through_bridge() {
+        use std::error::Error;
+        let stream_err = StreamError::IdleTimeout { idle_secs: 60 };
+        let llm: LlmError = stream_err.into();
+        // After bridging, the source should still resolve to the original
+        // StreamError so downstream logs preserve the typed context.
+        assert!(llm.source().is_some());
     }
 }

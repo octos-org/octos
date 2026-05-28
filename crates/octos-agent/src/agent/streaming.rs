@@ -5,24 +5,41 @@ use std::sync::atomic::Ordering;
 use eyre::Result;
 use futures::StreamExt;
 use octos_core::{Message, MessageRole, TokenUsage};
-use octos_llm::{ChatResponse, ChatStream, StopReason, StreamEvent};
+use octos_llm::{ChatResponse, ChatStream, StopReason, StreamError, StreamEvent};
 use tracing::warn;
 
 use super::Agent;
 use crate::progress::ProgressEvent;
 
+/// Default inter-chunk idle timeout for SSE streams.
+///
+/// Codex round (PR #1355) bumped this from 30s → 180s based on production
+/// evidence (mini3 2026-05-28 mofa_slides failure batch): kimi-k2.5/autodl,
+/// claude-opus thinking blocks, and other reasoning-heavy models legitimately
+/// pause for minutes between chunks. The 30s default produced false-positive
+/// stalls under normal load. codex's reference value is 5 minutes; 180s is a
+/// middle-ground that keeps a genuinely-stuck call from blocking forever.
+///
+/// See `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md`.
+pub(super) const STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180;
+
 impl Agent {
     /// Wait until the shutdown flag is set. Used with `tokio::select!`
     /// to cancel long-running operations on Ctrl+C.
-    /// Returns after the flag is set OR after 30 seconds (safety guard).
+    ///
+    /// Codex round (PR #1355): the previous implementation returned after
+    /// 30 seconds even when no shutdown signal arrived ("30s safety
+    /// guard"). That deadline raced the inter-chunk stream timeout: with
+    /// the 180s timeout for reasoning models, the safety guard fired
+    /// first and broke the SSE loop with a false "shutdown received"
+    /// signal — exactly the silent-state-shipping symptom this PR is
+    /// trying to eliminate. The safety guard had no production user
+    /// (Ctrl+C sets the atomic; no other consumer relied on the 30s
+    /// return) so the deadline is removed; the function now polls the
+    /// atomic until the flag flips.
     pub(super) async fn wait_for_shutdown(&self) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if self.shutdown.load(Ordering::Acquire) {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!("wait_for_shutdown: 30s deadline reached without shutdown signal");
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -35,8 +52,35 @@ impl Agent {
         iteration: u32,
         input_tokens_estimate: u32,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate)
-            .await
+        self.consume_stream_inner(
+            stream,
+            iteration,
+            input_tokens_estimate,
+            STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS,
+        )
+        .await
+    }
+
+    /// Test-only entry point: lets fixtures dial the inter-chunk idle
+    /// timeout down to milliseconds so virtual-time orchestration
+    /// (`#[tokio::test(start_paused)]`) can race the 30s `wait_for_shutdown`
+    /// safety guard cleanly. Production callers always use the
+    /// 180s constant via `consume_stream_with_input_estimate`.
+    #[cfg(test)]
+    pub(super) async fn consume_stream_for_test(
+        &self,
+        stream: ChatStream,
+        iteration: u32,
+        input_tokens_estimate: u32,
+        inter_chunk_idle_secs: u64,
+    ) -> Result<(ChatResponse, bool)> {
+        self.consume_stream_inner(
+            stream,
+            iteration,
+            input_tokens_estimate,
+            inter_chunk_idle_secs,
+        )
+        .await
     }
 
     async fn consume_stream_inner(
@@ -44,6 +88,13 @@ impl Agent {
         mut stream: ChatStream,
         iteration: u32,
         input_tokens_estimate: u32,
+        // Codex round (PR #1355): the inter-chunk idle timeout is passed in
+        // explicitly so test fixtures can dial it down to milliseconds
+        // (the production default is 180s, see
+        // `STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS`). Production callers go
+        // through `consume_stream_with_input_estimate` which always uses
+        // the constant.
+        inter_chunk_idle_secs: u64,
     ) -> Result<(ChatResponse, bool)> {
         // Clear any pending status line (e.g., "Thinking...")
         self.reporter().report(ProgressEvent::Response {
@@ -63,14 +114,25 @@ impl Agent {
         // - TTFT (first token): generous — models need time to process large
         //   inputs before generating. Scales with input: base 30s + 1s per 1K
         //   input tokens, capped at 180s.
-        // - Inter-chunk: once streaming starts, chunks arrive every <1s.
-        //   If no chunk for 30s after first token, the stream is stalled.
+        // - Inter-chunk: once streaming starts, codex round PR #1355 bumped
+        //   from 30s → STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS (180s) to give
+        //   reasoning models legitimate room to pause. The 30s value was
+        //   producing false-positive stalls on kimi-k2.5/autodl mofa_slides
+        //   calls; production evidence in
+        //   `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md`.
         let ttft_secs = (30 + input_tokens_estimate as u64 / 1000).min(180);
         let mut got_first_chunk = false;
+        // Codex round (PR #1355): track whether we observed an explicit
+        // `Done` event. Combined with the tool_calls list this lets us
+        // distinguish a real completion from a stream that dropped its
+        // terminal signal before delivering all the tool_call args bytes —
+        // the latter used to be silently fixed up via "fixing stop_reason"
+        // and shipped downstream; now it returns `StreamError::Incomplete`.
+        let mut saw_done = false;
 
         loop {
             let timeout = if got_first_chunk {
-                std::time::Duration::from_secs(30)
+                std::time::Duration::from_secs(inter_chunk_idle_secs)
             } else {
                 std::time::Duration::from_secs(ttft_secs)
             };
@@ -82,12 +144,33 @@ impl Agent {
                     break;
                 }
                 _ = tokio::time::sleep(timeout) => {
-                    if got_first_chunk {
-                        warn!("stream inter-chunk timeout after 30s — provider stalled");
+                    // Codex round (PR #1355): inter-chunk timeout used to
+                    // silently `break` with a half-assembled
+                    // `tool_call.arguments` buffer; that buffer was then
+                    // wrapped as a `MALFORMED_JSON:` sentinel and shipped
+                    // downstream as if it were a valid ChatResponse. The
+                    // plugin executor dispatched the sentinel string and
+                    // errored with "missing 'out'". The structural fix:
+                    // return a typed `StreamError::IdleTimeout`. The
+                    // existing `RetryProvider` / `ProviderChain` machinery
+                    // upstream surfaces this via `is_retryable_stream_error`
+                    // (matches "stream idle timeout") and retries. No
+                    // partial state ever leaves this function.
+                    let idle_secs = if got_first_chunk {
+                        inter_chunk_idle_secs
                     } else {
-                        warn!("stream TTFT timeout after {ttft_secs}s (input_estimate={input_tokens_estimate})");
+                        ttft_secs
+                    };
+                    if got_first_chunk {
+                        warn!(
+                            "stream inter-chunk timeout after {idle_secs}s — provider stalled"
+                        );
+                    } else {
+                        warn!(
+                            "stream TTFT timeout after {ttft_secs}s (input_estimate={input_tokens_estimate})"
+                        );
                     }
-                    break;
+                    return Err(eyre::Report::new(StreamError::IdleTimeout { idle_secs }));
                 }
             };
 
@@ -119,6 +202,16 @@ impl Agent {
                     name,
                     arguments_delta,
                 } => {
+                    // Codex round (PR #1355): tool_call deltas count as
+                    // "first chunk" for the TTFT → inter-chunk timeout
+                    // transition. Without this a tool_call-only response
+                    // (no text) would stay on the 30s TTFT timeout
+                    // forever — the second poll uses TTFT instead of the
+                    // inter-chunk budget, so a model that legitimately
+                    // streams tool args slowly gets falsely flagged as a
+                    // TTFT stall. Both `ReasoningDelta` and `TextDelta`
+                    // already toggle this; `ToolCallDelta` should too.
+                    got_first_chunk = true;
                     while tool_calls.len() <= index {
                         tool_calls.push((String::new(), String::new(), String::new(), None));
                     }
@@ -141,9 +234,15 @@ impl Agent {
                 }
                 StreamEvent::Done(reason) => {
                     stop_reason = reason;
+                    saw_done = true;
                 }
                 StreamEvent::Error(err) => {
-                    eyre::bail!("Stream error: {}", err);
+                    // Codex round (PR #1355): surface as typed Transport
+                    // error so `is_retryable_stream_error` / `LlmError`
+                    // bridge can route it through the existing retry
+                    // ladder. The previous `eyre::bail!` carried the same
+                    // semantics but without a typed downcast path.
+                    return Err(eyre::Report::new(StreamError::Transport { detail: err }));
                 }
             }
         }
@@ -165,38 +264,52 @@ impl Agent {
         }
 
         let content = if text.is_empty() { None } else { Some(text) };
-        let tool_calls: Vec<octos_core::ToolCall> = tool_calls
-            .into_iter()
-            .filter(|(_, name, _, _)| !name.is_empty())
-            .map(|(id, name, args, metadata)| {
-                let arguments = serde_json::from_str(&args).unwrap_or_else(|e| {
-                    // For write_file with truncated content, recover what we can.
-                    // The raw string looks like: {"path":"./report.md","content":"# Report...
-                    // Extract path and content even from broken JSON.
-                    if name == "write_file" {
-                        if let Some(recovered) = recover_write_file_args(&args) {
-                            tracing::info!(
-                                tool = %name,
-                                "recovered truncated write_file content ({} chars)",
-                                recovered.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0)
-                            );
-                            return recovered;
-                        }
-                    }
-                    tracing::warn!(tool = %name, error = %e, "malformed tool call JSON");
-                    serde_json::Value::String(format!(
-                        "MALFORMED_JSON: {e}. Raw input: {}",
-                        octos_core::truncated_utf8(&args, 200, "...")
-                    ))
-                });
-                octos_core::ToolCall {
+        // Codex round (PR #1355): parse tool_call arguments strictly. The
+        // previous code fell back to a `Value::String("MALFORMED_JSON:...")`
+        // sentinel when JSON parsing failed, which then shipped downstream
+        // as if it were a valid ChatResponse — the plugin executor
+        // dispatched the sentinel string and errored "missing 'out'". The
+        // new contract: a clean stream (saw_done == true) with garbage in
+        // args is a model-side bug → `StreamError::MalformedArgs`
+        // (non-retryable; the model needs to see the diagnostic). An
+        // incomplete stream's parse failure cannot reach this branch
+        // because the `IdleTimeout` / `Transport` paths above already
+        // short-circuited.
+        //
+        // The `write_file`-specific `recover_write_file_args` salvager and
+        // its `extract_json_string_field` helper are deleted in the same
+        // PR — with the boundary in place they were treating symptoms of
+        // the missing invariant, not addressing it.
+        let mut parsed_tool_calls: Vec<octos_core::ToolCall> = Vec::with_capacity(tool_calls.len());
+        for (id, name, args, metadata) in tool_calls {
+            if name.is_empty() {
+                continue;
+            }
+            match serde_json::from_str(&args) {
+                Ok(arguments) => parsed_tool_calls.push(octos_core::ToolCall {
                     id,
                     name,
                     arguments,
                     metadata,
+                }),
+                Err(e) => {
+                    let truncated_raw = octos_core::truncated_utf8(&args, 200, "...");
+                    tracing::warn!(
+                        tool = %name,
+                        tool_id = %id,
+                        error = %e,
+                        raw = %truncated_raw,
+                        "malformed tool call JSON — surfacing as StreamError::MalformedArgs"
+                    );
+                    return Err(eyre::Report::new(StreamError::MalformedArgs {
+                        tool_id: id,
+                        tool_name: name,
+                        error: format!("{e} (raw: {truncated_raw})"),
+                    }));
                 }
-            })
-            .collect();
+            }
+        }
+        let tool_calls = parsed_tool_calls;
 
         let reasoning_content = if reasoning.is_empty() {
             None
@@ -204,14 +317,25 @@ impl Agent {
             Some(reasoning)
         };
 
-        // Fix stop_reason mismatch: some models report "stop" / EndTurn even
-        // when they produced tool_calls (documented for OpenAI, Gemini).
+        // Codex round (PR #1355): the old code silently coerced
+        // `EndTurn + tool_calls` → `ToolUse` and emitted a "fixing
+        // stop_reason" warning. That was masking provider weirdness AND
+        // streaming-layer incompleteness (a stream that dropped its
+        // terminal `Done` event before delivering all tool_call args
+        // would default to `StopReason::EndTurn` and get fixed up). The
+        // new contract: this combination is `StreamError::Incomplete` —
+        // a typed retryable error the existing retry/failover ladder can
+        // route. The `saw_done` flag is part of the boundary: when a
+        // provider does emit `Done(ToolUse)` properly the parsing path
+        // above sets `stop_reason` correctly and we never enter this
+        // branch.
         if !tool_calls.is_empty() && stop_reason == StopReason::EndTurn {
-            tracing::warn!(
-                tool_count = tool_calls.len(),
-                "fixing stop_reason: EndTurn with tool_calls present -> ToolUse"
-            );
-            stop_reason = StopReason::ToolUse;
+            return Err(eyre::Report::new(StreamError::Incomplete {
+                detail: format!(
+                    "stream produced {} tool_call(s) but stop_reason is EndTurn (saw_done={saw_done})",
+                    tool_calls.len()
+                ),
+            }));
         }
 
         // Detect repetitive/looping output -- model got stuck repeating itself.
@@ -297,79 +421,344 @@ impl Agent {
     }
 }
 
-/// Recover write_file arguments from a truncated JSON string.
-///
-/// When the LLM's streaming output is cut off, the JSON for write_file looks like:
-/// `{"path":"./report.md","content":"# Report...<truncated>`
-///
-/// We extract `path` and `content` fields even from broken JSON, allowing the
-/// file to be written with the content we received (truncated but better than lost).
-fn recover_write_file_args(raw: &str) -> Option<serde_json::Value> {
-    // Try to find "path" field
-    let path = extract_json_string_field(raw, "path")
-        .or_else(|| extract_json_string_field(raw, "file_path"))?;
+// Codex round (PR #1355): `recover_write_file_args` and its helper
+// `extract_json_string_field` previously lived here. They were
+// tool-specific salvagers that compensated for the missing streaming
+// transactional boundary — when SSE timeouts produced half-assembled
+// `write_file` args buffers, the salvager scraped what it could and
+// shipped a "truncated but better than lost" file write downstream.
+// With the boundary in place (typed `StreamError::IdleTimeout` /
+// `Incomplete` / `MalformedArgs`), the retry machinery handles these
+// transparently and a `write_file` call with bad args becomes a typed
+// model-facing error rather than a silent partial write. The salvagers
+// were deleted in the same PR.
+//
+// See `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md` for the full
+// rationale.
 
-    // Try to find "content" field — it may be truncated
-    let content = extract_json_string_field(raw, "content").unwrap_or_default();
+#[cfg(test)]
+mod tests {
+    //! Streaming transactional-boundary tests (PR #1355).
+    //!
+    //! Each test feeds a synthetic `ChatStream` into `consume_stream_inner`
+    //! and asserts the typed `StreamError` contract:
+    //!
+    //! * Idle timeout → `Err(IdleTimeout)`; no partial buffer surfaces.
+    //! * Done(EndTurn) + tool_calls → `Err(Incomplete)`; the legacy
+    //!   silent fix-up to ToolUse is gone.
+    //! * Done(ToolUse) + malformed args → `Err(MalformedArgs)`; the
+    //!   `MALFORMED_JSON:` sentinel is gone.
+    //! * Done(EndTurn) with text only → `Ok` happy path (regression).
+    //! * Done(ToolUse) with valid args → `Ok` happy path (regression).
+    //!
+    //! These tests run with `tokio::time::pause` so the 180s inter-chunk
+    //! timeout fires instantly under virtual time.
 
-    if path.is_empty() {
-        return None;
-    }
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    // Add a truncation notice if the JSON was clearly cut off
-    let content = if !raw.ends_with('}') && !content.is_empty() {
-        format!(
-            "{content}\n\n---\n*[Note: This report was truncated due to output length limits. The content above is partial.]*"
-        )
-    } else {
-        content
+    use async_trait::async_trait;
+    use eyre::Result;
+    use futures::StreamExt;
+    use futures::stream;
+    use octos_core::{AgentId, Message};
+    use octos_llm::{
+        ChatConfig, ChatResponse, ChatStream, LlmProvider, StopReason, StreamError, StreamEvent,
+        TokenUsage as LlmTokenUsage, ToolSpec,
     };
+    use octos_memory::EpisodeStore;
+    use serde_json::json;
+    use tempfile::TempDir;
 
-    Some(serde_json::json!({
-        "path": path,
-        "content": content,
-    }))
-}
+    use super::super::Agent;
+    use crate::tools::ToolRegistry;
 
-/// Extract a string value for a given key from potentially malformed JSON.
-/// Handles JSON escaping within the string value.
-fn extract_json_string_field(raw: &str, key: &str) -> Option<String> {
-    // Look for "key": " or "key":"
-    let patterns = [format!("\"{key}\": \""), format!("\"{key}\":\"")];
+    struct NoopProvider;
 
-    for pattern in &patterns {
-        if let Some(start) = raw.find(pattern.as_str()) {
-            let value_start = start + pattern.len();
-            let bytes = raw.as_bytes();
-            let mut end = value_start;
-            let mut escaped = false;
+    #[async_trait]
+    impl LlmProvider for NoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            eyre::bail!("chat() unused in streaming tests")
+        }
 
-            // Walk through the string, handling JSON escapes
-            while end < bytes.len() {
-                if escaped {
-                    escaped = false;
-                    end += 1;
-                    continue;
-                }
-                match bytes[end] {
-                    b'\\' => {
-                        escaped = true;
-                        end += 1;
-                    }
-                    b'"' => break,
-                    _ => end += 1,
-                }
-            }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
 
-            let raw_value = &raw[value_start..end];
-            // Unescape JSON string escapes
-            let unescaped = raw_value
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\");
-            return Some(unescaped);
+        fn provider_name(&self) -> &str {
+            "mock"
         }
     }
-    None
+
+    /// Build a bare `Agent` whose backing provider is unused — the streaming
+    /// tests drive `consume_stream_inner` with hand-built streams.
+    async fn build_test_agent() -> (Agent, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+        let tools = ToolRegistry::new();
+        let agent = Agent::new(AgentId::new("stream-test"), provider, tools, memory);
+        (agent, dir)
+    }
+
+    fn into_chat_stream(events: Vec<StreamEvent>) -> ChatStream {
+        Box::pin(stream::iter(events))
+    }
+
+    /// A stream that yields one event then stalls forever — used to assert
+    /// the inter-chunk idle timeout fires and returns
+    /// `StreamError::IdleTimeout` rather than shipping the partial buffer.
+    fn stalling_stream(prelude: Vec<StreamEvent>) -> ChatStream {
+        let stalled = stream::iter(prelude).chain(stream::pending::<StreamEvent>());
+        Box::pin(stalled)
+    }
+
+    /// Downcast an `eyre::Report` to `StreamError`, returning `None` when
+    /// the error is not the typed variant.
+    fn as_stream_error(err: &eyre::Report) -> Option<&StreamError> {
+        err.downcast_ref::<StreamError>()
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_returns_err_not_partial_buffer() {
+        // PR #1355: the previous code would silently `break` here and ship
+        // the half-assembled `tool_call.arguments` buffer downstream as a
+        // sentinel. The new contract: typed `StreamError::IdleTimeout`,
+        // no `Ok` ever produced with partial state.
+        //
+        // The test uses real time with a 1s idle timeout (vs production's
+        // 180s) so the timeout fires before the 30s `wait_for_shutdown`
+        // safety-guard deadline. Virtual-time orchestration is avoided
+        // because it would auto-advance past the safety guard and break
+        // the loop on the shutdown branch instead of the timeout branch.
+        let (agent, _dir) = build_test_agent().await;
+
+        // Half-emit a tool_call: open the JSON object but never close it.
+        // Then stall — the inter-chunk timeout must fire before the SSE
+        // loop ever sees a Done event.
+        let stream = stalling_stream(vec![StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_0".to_string()),
+            name: Some("mofa_slides".to_string()),
+            arguments_delta: "{\"style\": \"sun\", \"slides\": [\"intro".to_string(),
+        }]);
+
+        let start = std::time::Instant::now();
+        // input_tokens_estimate = 0 forces ttft to its minimum (30s in the
+        // formula `30 + estimate/1000`). For the test we want the stream
+        // arm to win the first iteration's `select!` so we transition to
+        // `got_first_chunk = true` immediately and the second iteration
+        // uses our 1s `inter_chunk_idle_secs`. Real time + 1s vs 30s ttft
+        // is fine — the stream::iter event resolves in micros.
+        let result = agent.consume_stream_for_test(stream, 1, 0, 1).await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("idle timeout must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(
+            matches!(typed, StreamError::IdleTimeout { .. }),
+            "expected IdleTimeout, got {typed:?} (elapsed={elapsed:?})"
+        );
+        assert!(
+            typed.is_retryable(),
+            "idle timeout must be retryable so RetryProvider drives recovery"
+        );
+        // The 1s idle timeout MUST fire before the 30s `wait_for_shutdown`
+        // safety guard. If the test takes >= 25s the safety guard fired
+        // first and the test result is by coincidence — fix the
+        // production code so `wait_for_shutdown` cannot break the stream
+        // loop with a false shutdown signal.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "idle timeout took {elapsed:?} — wait_for_shutdown safety guard likely fired \
+             before the 1s timeout, which means the test passes by accident"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_malformed_args_returns_err() {
+        // PR #1355: when a stream produces tool_calls + Done(ToolUse) but
+        // the assembled args buffer fails to parse as JSON, the contract
+        // is `StreamError::MalformedArgs` — NOT the legacy
+        // `Value::String("MALFORMED_JSON:...")` sentinel that used to ship
+        // downstream as if it were a valid argument.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_0".to_string()),
+                name: Some("mofa_slides".to_string()),
+                arguments_delta: "this is not json at all".to_string(),
+            },
+            StreamEvent::Usage(LlmTokenUsage::default()),
+            StreamEvent::Done(StopReason::ToolUse),
+        ]);
+
+        let result = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await;
+
+        let err = result.expect_err("malformed args must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        match typed {
+            StreamError::MalformedArgs {
+                tool_id, tool_name, ..
+            } => {
+                assert_eq!(tool_id, "call_0");
+                assert_eq!(tool_name, "mofa_slides");
+            }
+            other => panic!("expected MalformedArgs, got {other:?}"),
+        }
+        assert!(
+            !typed.is_retryable(),
+            "MalformedArgs must NOT be retryable — the model needs to see the diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_endturn_with_toolcalls_returns_incomplete() {
+        // PR #1355: the old code coerced `EndTurn + tool_calls` → `ToolUse`
+        // with a "fixing stop_reason" warning. That was masking
+        // streaming-layer incompleteness (a stream that dropped its
+        // terminal Done event would default to EndTurn). The new
+        // contract: typed `StreamError::Incomplete`.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_0".to_string()),
+                name: Some("shell".to_string()),
+                arguments_delta: "{\"cmd\": \"ls\"}".to_string(),
+            },
+            // Stream ends without a Done event — `stop_reason` stays at
+            // its EndTurn default. Pre-PR-1355 this was silently fixed
+            // up to `ToolUse`; now it's `StreamError::Incomplete`.
+        ]);
+
+        let result = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await;
+
+        let err = result.expect_err("EndTurn + tool_calls must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(matches!(typed, StreamError::Incomplete { .. }));
+        assert!(
+            typed.is_retryable(),
+            "Incomplete must be retryable so the lane router can pick a different slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_complete_with_tool_use_returns_chat_response() {
+        // Happy path regression: a clean stream with valid tool_call args
+        // and a Done(ToolUse) signal returns Ok(ChatResponse) with the
+        // arguments parsed as a Value::Object.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_0".to_string()),
+                name: Some("shell".to_string()),
+                arguments_delta: "{\"cmd\":\"ls\"}".to_string(),
+            },
+            StreamEvent::Usage(LlmTokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            StreamEvent::Done(StopReason::ToolUse),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("clean stream must return Ok");
+        assert!(!streamed, "stream had no text deltas");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "shell");
+        assert_eq!(response.tool_calls[0].arguments, json!({"cmd": "ls"}));
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+    }
+
+    #[tokio::test]
+    async fn stream_complete_with_text_returns_chat_response() {
+        // Happy path regression #2: text-only assistant response with
+        // Done(EndTurn) — no tool_calls — must still return Ok.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta("Hello".to_string()),
+            StreamEvent::TextDelta(", world!".to_string()),
+            StreamEvent::Usage(LlmTokenUsage::default()),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("text-only stream must return Ok");
+        assert!(streamed, "got text deltas → streamed=true");
+        assert_eq!(response.content.as_deref(), Some("Hello, world!"));
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn stream_transport_error_returns_typed_err() {
+        // Provider emits an explicit error event. We surface it as
+        // `StreamError::Transport` so the typed retry policy can decide.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta("partial ".to_string()),
+            StreamEvent::Error("connection reset by peer".to_string()),
+        ]);
+
+        let result = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await;
+        let err = result.expect_err("stream error must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(matches!(typed, StreamError::Transport { .. }));
+        assert!(
+            typed.is_retryable(),
+            "transport errors should be retryable through the normal failover ladder"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_constant_is_180s() {
+        // Pin the constant value so a future tweak that brings it back
+        // down to 30s (the production-broken value) trips this test.
+        assert_eq!(
+            super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS,
+            180,
+            "30s was producing false-positive stalls on reasoning models; \
+             see docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md"
+        );
+        // Sanity: must be larger than legacy 30s value.
+        assert!(super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS > 30);
+    }
+
+    // Use Duration in a sanity check to make sure the constant is usable.
+    #[test]
+    fn idle_timeout_constant_builds_valid_duration() {
+        let d = Duration::from_secs(super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS);
+        assert_eq!(d.as_secs(), 180);
+    }
+
+    // Silence unused-import warnings in cfg(test) when one helper isn't used.
+    #[test]
+    fn _stream_helpers_compile() {
+        let _ = into_chat_stream(vec![]);
+        let _ = stalling_stream(vec![]);
+    }
 }
