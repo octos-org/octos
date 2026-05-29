@@ -159,8 +159,43 @@ pub(super) fn satisfied_completion_content(output_files: &[String], tool_output:
 /// Returns the prompt text the caller should paste into the first system
 /// `Message`. When no realtime controller is attached this is byte-identical
 /// to the stored system prompt.
+/// Generic tool-use discipline appended to every agent's system prompt.
+///
+/// Weaker models (kimi-k2.5, smaller open-source) exhibit "tool stickiness"
+/// — once they pick a tool for a turn, they tend to re-call it with the
+/// same arguments instead of switching, even when the result doesn't
+/// answer the user's question. Stronger models (Claude Opus) don't need
+/// this nudge, but the prompt is harmless for them and ~100 tokens of
+/// upfront cost is cheap insurance.
+///
+/// Empirical validation (llm-benchmark replay of mini3 session
+/// slides-1780013669236-8w2ime, the production failure that motivated
+/// this fix):
+///   - kimi-k2.5 + only `check_workspace_contract`:
+///       loop rate 5/5 → 3/5 with this block (40% break out)
+///   - kimi-k2.5 + check + read_file + list_dir:
+///       no consistent change (within noise)
+///   - claude-opus-4.7:
+///       already 0/5 loops in both arms; block has no effect on Opus
+///
+/// The block follows hermes-agent's prompt-time-injection pattern (in
+/// `agent/prompt_builder.py`), but applied universally rather than
+/// model-family-gated — the cost is small and the benefit is real.
+const TOOL_USE_DISCIPLINE: &str = "\n\n\
+## Tool use discipline\n\n\
+You have generic file-inspection tools — `read_file`, `list_dir`, \
+`view_image`, `grep`, `glob` — that can answer most questions about \
+the workspace state by reading the files directly. Use them aggressively \
+to investigate what's actually there.\n\n\
+When a tool result does not answer the user's question, do NOT re-call \
+the same tool with the same arguments — the result will be identical. \
+Pick a different tool that can answer the specific question, usually a \
+file-reading tool. If no tool can answer it, respond with text explaining \
+what's missing.";
+
 pub(super) fn compose_system_prompt(agent: &Agent) -> String {
     let mut content = agent.system_prompt_snapshot();
+    content.push_str(TOOL_USE_DISCIPLINE);
     if let Some(summary) = agent.realtime_sensor_summary() {
         if !content.ends_with('\n') {
             content.push('\n');
