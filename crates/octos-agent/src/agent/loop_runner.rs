@@ -1183,6 +1183,7 @@ impl Agent {
                                     Some(&mut tool_structured_metadata),
                                     Some(&mut iter_tool_success),
                                     Some(&mut turn_output_log),
+                                    &mut loop_detector,
                                 )
                                 .await
                             {
@@ -1520,6 +1521,10 @@ impl Agent {
             // the same session (the guard's `Drop` impl writes back).
             let mut retry_state =
                 PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
+            // PR #1363: task-loop gets its own detector so handle_tool_use
+            // can run the no-progress soft check on tool results here too.
+            // Matches the conversation-loop's window of 12.
+            let mut loop_detector = LoopDetector::new(12);
             let config = self.chat_config();
 
             loop {
@@ -1770,6 +1775,7 @@ impl Agent {
                                 None,
                                 None,
                                 None,
+                                &mut loop_detector,
                             )
                             .await
                         {
@@ -1923,6 +1929,15 @@ impl Agent {
         // `TaskResult`, not `ConversationResponse`, so no log is
         // needed there).
         turn_output_log: Option<&mut Vec<Message>>,
+        // PR #1363 (this PR): the outer-scope LoopDetector. Hard cycle
+        // detection runs in the caller BEFORE this is invoked (so the
+        // turn can be terminated cleanly); the soft "no progress" hint
+        // — which augments the just-produced tool result — runs INSIDE
+        // this function because we need the actual result content. The
+        // soft check is non-terminating: if it fires, the hint is
+        // appended to the matching Tool message's content and the
+        // conversation continues.
+        loop_detector: &mut LoopDetector,
     ) -> Result<ChatResponse> {
         // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
         // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
@@ -2011,12 +2026,45 @@ impl Agent {
             sink.extend(tool_success);
         }
 
-        let merged = merge_tool_messages_in_order(
+        let mut merged = merge_tool_messages_in_order(
             &response,
             &limited_response,
             tool_messages,
             blocked_messages,
         );
+
+        // PR #1363: OpenClaw-style no-progress check. For each Tool
+        // message we just produced, record `(tool_name, args, result)`
+        // in the result-aware ring. If the last 3 records match, append
+        // a soft NO_PROGRESS hint to that tool message's content so the
+        // LLM sees it on its next iteration. Distinguishes a stuck loop
+        // (identical (args, result) repeated) from a legitimate poll
+        // (same args, evolving result). Non-terminating — the hard
+        // cycle detector at the caller's pre-call site is the backstop.
+        {
+            use std::collections::HashMap;
+            let id_to_call: HashMap<&str, (&str, &serde_json::Value)> = response
+                .tool_calls
+                .iter()
+                .map(|tc| (tc.id.as_str(), (tc.name.as_str(), &tc.arguments)))
+                .collect();
+            for message in merged.iter_mut() {
+                if message.role != MessageRole::Tool {
+                    continue;
+                }
+                let Some(id) = message.tool_call_id.as_deref() else {
+                    continue;
+                };
+                let Some(&(name, args)) = id_to_call.get(id) else {
+                    continue;
+                };
+                if let Some(hint) =
+                    loop_detector.record_result(name, args, &message.content)
+                {
+                    message.content.push_str(&hint);
+                }
+            }
+        }
 
         // M6.2: record a productive-tool-call signal per merged Tool message
         // so the `LoopRetryState` grace-call path sees the loop making progress.
