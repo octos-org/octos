@@ -712,7 +712,7 @@ Profile containers need selective network access:
 Run a domain-allowlist HTTP proxy on the host. Profile containers route all traffic through it.
 
 ```
-octos serve (host, port 3000)
+octos serve (host, port 50080)
 ├── allowlist proxy (host, port 8888)
 │   ├── sales profile: allow api.moonshot.ai, api.telegram.org
 │   ├── support profile: allow api.deepseek.com, api.telegram.org

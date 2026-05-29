@@ -65,4 +65,4 @@ If you built with the `api` feature, start the web dashboard:
 octos serve
 ```
 
-Then open `http://localhost:8080` in your browser.
+Then open `http://localhost:50080` in your browser.

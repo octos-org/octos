@@ -1126,7 +1126,7 @@ JSON 持久化位于 `.octos/cron.json`。
 | `clean` | 删除 .redb 文件，支持 dry-run |
 | `completions` | Shell 补全生成（bash/zsh/fish） |
 | `docs` | 生成工具 + 提供商文档 |
-| `serve` | REST API 服务器（feature：api）— axum 监听 127.0.0.1:8080（`--host` 覆盖） |
+| `serve` | REST API 服务器（feature：api）— axum 监听 127.0.0.1:50080（`--host` 覆盖） |
 
 ### 配置
 

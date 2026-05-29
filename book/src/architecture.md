@@ -1126,7 +1126,7 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 | `clean` | Remove .redb files with dry-run support |
 | `completions` | Shell completion generation (bash/zsh/fish) |
 | `docs` | Generate tool + provider documentation |
-| `serve` | REST API server (feature: api) — axum on 127.0.0.1:8080 (`--host` to override) |
+| `serve` | REST API server (feature: api) — axum on 127.0.0.1:50080 (`--host` to override) |
 
 ### Configuration
 

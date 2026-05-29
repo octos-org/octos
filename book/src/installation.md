@@ -216,7 +216,7 @@ wsl --install -d Ubuntu
 # 2. Open Ubuntu terminal, then follow Linux (Ubuntu) steps above
 ```
 
-When running `octos serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080` (WSL2 auto-forwards ports).
+When running `octos serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:50080` (WSL2 auto-forwards ports).
 
 ## Docker
 
@@ -318,7 +318,7 @@ sudo systemctl restart octos-serve
 | `octos: command not found` | Add `~/.cargo/bin` to PATH: `export PATH="$HOME/.cargo/bin:$PATH"` |
 | Build fails on Linux | Install `build-essential pkg-config libssl-dev` |
 | macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/octos` |
-| Dashboard not accessible | Check port: `octos serve --port 8080`, open `http://localhost:8080` |
+| Dashboard not accessible | Check port: `octos serve --port 50080`, open `http://localhost:50080` |
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
 | Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u octos-serve` |
 | API key not found | Ensure env var is set in the service environment, not just your shell |
