@@ -196,6 +196,10 @@ npm --prefix e2e run ux:scenario:list -- --tier local
 # Write e2e/test-results-ux/summaries/<run>/ux-summary.{json,md}.
 npm --prefix e2e run ux:gate:local
 
+# Validate one artifact directory produced by ux:tmux:run.
+npm --prefix e2e run ux:tmux:validate -- \
+  e2e/test-results-ux/<run-id>/<scenario-id>
+
 # Summarize one or more real tmux artifact directories.
 npm --prefix e2e run ux:gate:report -- \
   --tier release \
@@ -216,7 +220,8 @@ Recommended lanes:
 - Nightly: run `ux:gate:release` against the latest available UX artifact root
   and publish the summary even when scenarios are skipped or blocked.
 - Soak: run selected `ux:tmux:run` scenarios into one
-  `e2e/test-results-ux/<run-id>/` tree, then run `ux:gate:report --tier release
+  `e2e/test-results-ux/<run-id>/` tree, run `ux:tmux:validate` against each
+  scenario artifact directory, then run `ux:gate:report --tier release
   --artifact-root e2e/test-results-ux/<run-id>`.
 - Release: run the same release report with `--strict` only when every required
   lane is expected to pass; the command exits nonzero on any non-passed row.
