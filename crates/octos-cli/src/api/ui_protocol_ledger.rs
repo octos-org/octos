@@ -123,10 +123,14 @@ impl LedgerConfig {
 
 /// Anything that can sit in the ledger ring.
 ///
-/// Serialized with an outer `envelope` tag distinct from `UiNotification`'s
-/// own `kind` tag so the two enums round-trip cleanly when nested.
+/// Serialized with an outer `record_kind` tag. The earlier name `"envelope"`
+/// collided with `EnvelopeNotification.envelope` once internally-tagged
+/// `UiNotification` flattened its variant data alongside the outer tag —
+/// serde produced two `"envelope"` keys in the same object and rejected
+/// the record on replay (`duplicate field 'envelope'`). `record_kind` is
+/// disjoint from every flattened inner field name on both branches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "envelope", rename_all = "snake_case")]
+#[serde(tag = "record_kind", rename_all = "snake_case")]
 pub(crate) enum UiProtocolLedgerEvent {
     Notification(UiNotification),
     Progress(UiProgressEvent),
@@ -3420,5 +3424,40 @@ mod tests {
             "completed=true MUST survive restart so post-completion \
              envelopes stay barriered even without an in-memory ring"
         );
+    }
+
+    #[test]
+    fn envelope_notification_round_trips_through_ledger_wrapper() {
+        // On mini3 we saw 5 ledger records dropped on replay with
+        //   error=Error("duplicate field `envelope`", ...)
+        // because the outer `tag = "envelope"` discriminator flattened
+        // alongside `EnvelopeNotification.envelope` and produced two
+        // identical keys in the same JSON object. The wider standalone
+        // round-trip test for `EnvelopeNotification` in octos-core missed
+        // this — only the ledger wrapper exhibits the collision.
+        let session = SessionKey("local:envelope-round-trip".into());
+        let event = UiProtocolLedgerEvent::Notification(UiNotification::Envelope(
+            EnvelopeNotification {
+                session_id: session.clone(),
+                topic: Some("planning".into()),
+                envelope: Envelope {
+                    thread_id: "round-trip-thread".into(),
+                    seq: 7,
+                    client_message_id: None,
+                    payload: Payload::AssistantDelta {
+                        text: "round-trip me".into(),
+                    },
+                },
+            },
+        ));
+
+        let serialized = serde_json::to_string(&event).expect("ledger event serializes");
+        assert!(
+            !serialized.contains("\"envelope\":\"notification\""),
+            "outer ledger discriminator must NOT be named `envelope` — got {serialized}"
+        );
+        let parsed: UiProtocolLedgerEvent = serde_json::from_str(&serialized)
+            .unwrap_or_else(|e| panic!("ledger replay MUST succeed: {e}; payload={serialized}"));
+        assert_eq!(parsed, event, "round-trip must be field-equal");
     }
 }
