@@ -55,7 +55,7 @@ impl Tool for CheckWorkspaceContractTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect workspace contract state for the current workspace. Use this to answer whether a slides/site deliverable is actually ready, which required checks failed, which artifacts exist, and what revision is currently present. Task state tells you what happened in execution; workspace state tells you what is true about the deliverable. The output includes a top-level `all_ready: bool` — when true, the deliverable is COMPLETE and you should finish the turn rather than re-poll."
+        "Inspect workspace contract state for the current workspace. Use this to answer whether a slides/site deliverable is actually ready, which required checks failed, which artifacts exist, and what revision is currently present. Task state tells you what happened in execution; workspace state tells you what is true about the deliverable. The output includes a top-level `all_ready: bool` — when true, the deliverable is COMPLETE and you should finish the turn rather than re-poll.\n\nDOES NOT answer: whether file CONTENT is correct (manifest layout, script.js logic, image quality, text rendering). This tool only verifies artifact PRESENCE and validator pass/fail — it does not read or interpret file contents. If the user asks about file content (`manifest`, `script`, what's INSIDE a file, why an image looks wrong, etc.), use `read_file` / `list_dir` / `view_image` instead. Re-calling this tool will return the same answer."
     }
 
     fn tags(&self) -> &[&str] {
