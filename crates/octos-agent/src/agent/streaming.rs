@@ -281,10 +281,25 @@ impl Agent {
         // PR — with the boundary in place they were treating symptoms of
         // the missing invariant, not addressing it.
         let mut parsed_tool_calls: Vec<octos_core::ToolCall> = Vec::with_capacity(tool_calls.len());
-        for (id, name, args, metadata) in tool_calls {
+        for (index, (id, name, args, metadata)) in tool_calls.into_iter().enumerate() {
             if name.is_empty() {
                 continue;
             }
+            // Some OpenAI-compatible providers (kimi / MiniMax via wisemodel)
+            // stream tool calls with no `id`. An empty tool_call_id is not
+            // cosmetic: it silently disables spawn_only failure-recovery
+            // downstream — `TaskSupervisor::notify_failure` returns early on
+            // an empty id (it can't key the synth-ack lookup), so a failed
+            // background skill never routes a recovery turn back to the LLM
+            // and the model can't fix its own bad input. Mint a stable,
+            // per-response-unique positional id (matching the Gemini
+            // provider's `call_{n}` convention) so a non-empty id always
+            // reaches the agent loop.
+            let id = if id.is_empty() {
+                format!("call_{index}")
+            } else {
+                id
+            };
             match serde_json::from_str(&args) {
                 Ok(arguments) => parsed_tool_calls.push(octos_core::ToolCall {
                     id,
@@ -577,6 +592,53 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "idle timeout took {elapsed:?} — wait_for_shutdown safety guard likely fired \
              before the 1s timeout, which means the test passes by accident"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_synthesizes_tool_call_id_when_provider_omits_it() {
+        // Regression (mofa_slides slides-1780072199773-2htqt1, mini3,
+        // 2026-05-29): kimi / MiniMax via wisemodel stream tool calls with
+        // NO `id` field. An empty tool_call_id silently disables spawn_only
+        // failure-recovery downstream — `TaskSupervisor::notify_failure`
+        // returns early on an empty id (it can't key the synth-ack lookup),
+        // so a failed background skill never routes a recovery turn back to
+        // the LLM and the model can't fix its own bad input. The streaming
+        // assembler must mint a stable, unique positional id (matching the
+        // Gemini provider's `call_{n}` convention) so a non-empty id always
+        // reaches the agent loop.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: Some("mofa_slides".to_string()),
+                arguments_delta: r#"{"deck":"x"}"#.to_string(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                id: None,
+                name: Some("glob".to_string()),
+                arguments_delta: r#"{"pattern":"*.toml"}"#.to_string(),
+            },
+            StreamEvent::Usage(LlmTokenUsage::default()),
+            StreamEvent::Done(StopReason::ToolUse),
+        ]);
+
+        let (resp, _streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("clean tool-use stream must assemble into a ChatResponse");
+
+        assert_eq!(resp.tool_calls.len(), 2);
+        assert!(
+            !resp.tool_calls[0].id.is_empty() && !resp.tool_calls[1].id.is_empty(),
+            "empty provider tool_call ids must be synthesized, not passed through"
+        );
+        assert_ne!(
+            resp.tool_calls[0].id, resp.tool_calls[1].id,
+            "synthesized ids must be unique per tool call"
         );
     }
 
