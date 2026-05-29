@@ -55,7 +55,7 @@ impl Tool for CheckWorkspaceContractTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect workspace contract state for the current workspace. Use this to answer whether a slides/site deliverable is actually ready, which required checks failed, which artifacts exist, and what revision is currently present. Task state tells you what happened in execution; workspace state tells you what is true about the deliverable."
+        "Inspect workspace contract state for the current workspace. Use this to answer whether a slides/site deliverable is actually ready, which required checks failed, which artifacts exist, and what revision is currently present. Task state tells you what happened in execution; workspace state tells you what is true about the deliverable. The output includes a top-level `all_ready: bool` — when true, the deliverable is COMPLETE and you should finish the turn rather than re-poll."
     }
 
     fn tags(&self) -> &[&str] {
@@ -106,11 +106,36 @@ impl Tool for CheckWorkspaceContractTool {
             contracts.retain(|status| !status.ready);
         }
 
+        let repo_count = contracts.len();
+        let ready_count = contracts.iter().filter(|status| status.ready).count();
+        // `all_ready` is the explicit termination signal for the LLM. When this
+        // is `true`, the deliverable is satisfied and there is no reason to
+        // re-poll — every artifact under the contract is present and every
+        // required validator passed. Without this flag the LLM had to derive
+        // the answer from a 4 KB nested artifact tree, which on degraded
+        // models (kimi @ 44 tools, ~110 KB prompt) collapsed into a tight
+        // re-call loop the runtime had to break with LOOP DETECTED.
+        let all_ready = repo_count > 0 && ready_count == repo_count;
+        let summary = if repo_count == 0 {
+            "No workspace contracts match the selector.".to_string()
+        } else if all_ready {
+            format!(
+                "All {repo_count} contract(s) satisfied — every required artifact is present and every validator passed. The deliverable is COMPLETE; do not re-poll, finish the turn."
+            )
+        } else {
+            let not_ready = repo_count - ready_count;
+            format!(
+                "{ready_count}/{repo_count} contract(s) satisfied; {not_ready} not yet ready — inspect `contracts[].ready_state` for what's missing."
+            )
+        };
+
         let output = json!({
             "workspace_root": self.base_dir,
             "requested_project": input.project,
-            "repo_count": contracts.len(),
-            "ready_count": contracts.iter().filter(|status| status.ready).count(),
+            "all_ready": all_ready,
+            "summary": summary,
+            "repo_count": repo_count,
+            "ready_count": ready_count,
             "contracts": contracts,
         });
 
@@ -207,6 +232,15 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(payload["repo_count"], 1);
         assert_eq!(payload["ready_count"], 1);
+        assert_eq!(payload["all_ready"], true);
+        assert!(
+            payload["summary"]
+                .as_str()
+                .map(|s| s.contains("COMPLETE") && s.contains("do not re-poll"))
+                .unwrap_or(false),
+            "summary must give the LLM an explicit termination signal: {}",
+            payload["summary"]
+        );
         assert_eq!(payload["contracts"][0]["repo_label"], "slides/demo");
         assert_eq!(payload["contracts"][0]["ready"], true);
         assert_eq!(payload["contracts"][0]["artifacts"][0]["name"], "deck");
