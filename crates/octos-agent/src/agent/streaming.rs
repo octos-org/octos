@@ -1,6 +1,6 @@
 //! Stream consumption, shutdown handling, and cost reporting.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eyre::Result;
 use futures::StreamExt;
@@ -10,6 +10,14 @@ use tracing::warn;
 
 use super::Agent;
 use crate::progress::ProgressEvent;
+
+/// Process-global monotonic counter for synthesizing tool-call ids when a
+/// provider streams a tool call with no `id`. MUST be globally unique (not a
+/// per-response positional index): `TaskSupervisor`'s
+/// `synth_ack_emitted_tool_call_ids` set is long-lived per session, so a
+/// positional id reused across responses could match a stale ack and fire an
+/// unwarranted recovery turn (codex P2).
+static SYNTH_TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Default inter-chunk idle timeout for SSE streams.
 ///
@@ -281,7 +289,7 @@ impl Agent {
         // PR — with the boundary in place they were treating symptoms of
         // the missing invariant, not addressing it.
         let mut parsed_tool_calls: Vec<octos_core::ToolCall> = Vec::with_capacity(tool_calls.len());
-        for (index, (id, name, args, metadata)) in tool_calls.into_iter().enumerate() {
+        for (id, name, args, metadata) in tool_calls.into_iter() {
             if name.is_empty() {
                 continue;
             }
@@ -291,12 +299,16 @@ impl Agent {
             // downstream — `TaskSupervisor::notify_failure` returns early on
             // an empty id (it can't key the synth-ack lookup), so a failed
             // background skill never routes a recovery turn back to the LLM
-            // and the model can't fix its own bad input. Mint a stable,
-            // per-response-unique positional id (matching the Gemini
-            // provider's `call_{n}` convention) so a non-empty id always
-            // reaches the agent loop.
+            // and the model can't fix its own bad input. Mint a PROCESS-UNIQUE
+            // id (monotonic counter, NOT a positional `call_{index}`): the
+            // supervisor's synth-ack set is long-lived per session, so a
+            // positional id reused across responses could match a stale ack
+            // and fire an unwarranted recovery turn (codex P2).
             let id = if id.is_empty() {
-                format!("call_{index}")
+                format!(
+                    "call_synth_{}",
+                    SYNTH_TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+                )
             } else {
                 id
             };
@@ -633,12 +645,44 @@ mod tests {
 
         assert_eq!(resp.tool_calls.len(), 2);
         assert!(
-            !resp.tool_calls[0].id.is_empty() && !resp.tool_calls[1].id.is_empty(),
-            "empty provider tool_call ids must be synthesized, not passed through"
+            resp.tool_calls
+                .iter()
+                .all(|tc| tc.id.starts_with("call_synth_")),
+            "empty provider tool_call ids must be synthesized, not passed through: {:?}",
+            resp.tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>()
         );
         assert_ne!(
             resp.tool_calls[0].id, resp.tool_calls[1].id,
             "synthesized ids must be unique per tool call"
+        );
+
+        // codex P2: ids must be unique ACROSS responses too — the supervisor's
+        // synth-ack set is long-lived per session, so a positional `call_0`
+        // reused on a later turn could match a stale ack. A second assembly
+        // must produce a disjoint id set.
+        let first_ids: std::collections::HashSet<String> =
+            resp.tool_calls.iter().map(|tc| tc.id.clone()).collect();
+        let stream2 = into_chat_stream(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: Some("mofa_slides".to_string()),
+                arguments_delta: r#"{"deck":"y"}"#.to_string(),
+            },
+            StreamEvent::Usage(LlmTokenUsage::default()),
+            StreamEvent::Done(StopReason::ToolUse),
+        ]);
+        let (resp2, _) = agent
+            .consume_stream_with_input_estimate(stream2, 2, 100)
+            .await
+            .expect("second stream must assemble");
+        assert!(
+            resp2
+                .tool_calls
+                .iter()
+                .all(|tc| !first_ids.contains(&tc.id)),
+            "synthesized ids must not collide across responses (codex P2): first={first_ids:?} second={:?}",
+            resp2.tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>()
         );
     }
 
