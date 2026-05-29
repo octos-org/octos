@@ -7,8 +7,13 @@ const LIVE_E2E_PATTERNS = [
   '**/*mini*.spec.ts',
   '**/fleet-*.spec.ts',
   '**/*fleet*.spec.ts',
+  '**/background-task-header-switching.spec.ts',
+  '**/coding-hardcases.spec.ts',
+  '**/kimi-loop-replay.spec.ts',
   '**/refactor-capabilities.spec.ts',
   '**/runtime-regression.spec.ts',
+  '**/session-recovery.spec.ts',
+  '**/skill-compat-gate.spec.ts',
 ];
 
 function hasExplicitTestSelection(argv: string[]): boolean {
