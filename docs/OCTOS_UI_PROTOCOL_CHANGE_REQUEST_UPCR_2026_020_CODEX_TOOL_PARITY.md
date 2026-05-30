@@ -1,6 +1,6 @@
 # UPCR-2026-020: AppUI Coding Tool Contract Inspection
 
-Status: proposed
+Status: proposed (implemented; pending formal acceptance)
 Date: 2026-05-15
 
 ## Summary

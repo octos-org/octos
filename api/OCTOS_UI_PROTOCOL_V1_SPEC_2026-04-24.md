@@ -340,46 +340,130 @@ Client commands are JSON-RPC requests.
 
 Server notifications are JSON-RPC notifications.
 
-The logical command/event names are:
+The logical command/event names are listed below. The machine-readable
+source of truth for this catalog is `UI_PROTOCOL_COMMAND_METHODS` and
+`UI_PROTOCOL_NOTIFICATION_METHODS` in
+[crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1075)
+(plus the server-handled `APPUI_EXTRA_METHODS` slice in
+[crates/octos-cli/src/api/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-cli/src/api/ui_protocol.rs:1)).
+Per `SRV-036`/M18-E, this list MUST stay in sync with those constants — a
+method that is dispatched and advertised in `supported_methods` but not
+named here is a spec defect.
 
 Commands:
+
+Session, turn, and approval core:
+
+- `session/open`
+- `session/hydrate` (gate `state.session_hydrate.v1`, accepted `UPCR-2026-009`)
+- `turn/start`
+- `turn/interrupt`
+- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
+- `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
+- `approval/respond`
+- `approval/scopes/list` (approval-scope discovery; first-server slice)
+- `permission/profile/list`, `permission/profile/set`
+  (accepted `UPCR-2026-018`)
+- `diff/preview/get`
+
+Task and harness control:
+
+- `task/output/read`
+- `task/list` (capability-gated `harness.task_control.v1`, accepted `UPCR-2026-005`)
+- `task/cancel` (capability-gated `harness.task_control.v1`, accepted `UPCR-2026-005`)
+- `task/restart_from_node` (capability-gated `harness.task_control.v1`, accepted `UPCR-2026-005`)
+- `task/artifact/list`, `task/artifact/read`
+  (capability-gated, canonical aliases of `agent/artifact/*`; #965 / accepted `UPCR-2026-019`)
+
+Supervised review and M15 agent/goal/loop autonomy (capability-gated, accepted
+`UPCR-2026-019` / `UPCR-2026-021`):
+
+- `review/start`
+- `agent/list`, `agent/status/read`, `agent/output/read`,
+  `agent/artifact/list`, `agent/artifact/read`, `agent/interrupt`, `agent/close`
+- `session/goal/get`, `session/goal/set`, `session/goal/clear`
+- `loop/create`, `loop/list`, `loop/delete`, `loop/pause`, `loop/resume`,
+  `loop/fire_now`
+
+Router (Wave4-A):
+
+- `router/set_mode`, `router/get_metrics`
+
+M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
+
+- `session/list`, `session/snapshot`, `session/messages_page`,
+  `session/status.get`, `session/files.list`, `session/tasks.list`,
+  `session/workspace.get`, `session/title.set`, `session/delete`
+- `system/status.get`
+- `content/list`, `content/delete`, `content/bulk_delete`
+
+Runtime, auth, profile, and onboarding inspection (server-handled
+`APPUI_EXTRA_METHODS`):
 
 - `config/capabilities/list` (accepted `UPCR-2026-017`)
 - `client_hello` (accepted `UPCR-2026-016`)
 - `profile/local/create` (accepted `UPCR-2026-018`)
-- `session/open`
 - `session/status/read` (accepted `UPCR-2026-017`)
-- `turn/start`
-- `review/start` (capability-gated, accepted `UPCR-2026-019`)
-- `turn/interrupt`
-- `approval/respond`
-- `permission/profile/list`, `permission/profile/set`
-  (accepted `UPCR-2026-018`)
-- `diff/preview/get`
-- `task/output/read`
-- `task/list` (capability-gated, accepted `UPCR-2026-005`)
-- `task/cancel` (capability-gated, accepted `UPCR-2026-005`)
-- `task/restart_from_node` (capability-gated, accepted `UPCR-2026-005`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
-  (accepted `UPCR-2026-017`)
+  (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
+  stdio capability set and return typed `auth_unavailable` per § stdio policy)
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/skills/list`, `profile/skills/registry/search`,
+  `profile/skills/install`, `profile/skills/remove` (server-handled skills
+  management)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
+- `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
+  local-solo only; #1057)
 
 Notifications:
 
-- `turn/started`
-- `turn/completed`
-- `turn/error`
+Session (server-pushed open-state echo for reconnect/replay):
+
+- `session/open` (same method name as the §7 command; emitted as
+  `UiNotification::SessionOpened` and replayed from the durable ledger)
+
+Turn, message, and tool lifecycle:
+
+- `turn/started`, `turn/completed`, `turn/error`
 - `message/delta`
-- `tool/started`
-- `tool/progress`
-- `tool/completed`
-- `approval/requested`
+- `message/persisted` (accepted `UPCR-2026-012`)
+- `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
+- `tool/started`, `tool/progress`, `tool/completed`
+
+Approval lifecycle:
+
+- `approval/requested`, `approval/auto_resolved`, `approval/decided`,
+  `approval/cancelled`
+
+Task and progress:
+
 - `task/updated`
 - `task/output/delta`
+- `progress/updated`
 - `warning`
+- `protocol/replay_lossy`
+
+Projection and session bridging (accepted `UPCR-2026-014`):
+
+- `projection/envelope`
+- `file/attached`
+- `session/event`
+
+Router and queue (Wave4-A):
+
+- `router/status`, `router/failover`, `queue/state`
+
+M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
+
+- `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
+- `session/goal/updated`, `session/goal/cleared`
+- `loop/updated`, `loop/fired`, `loop/completed`
+
+M16 context lifecycle (gate `context.lifecycle.v1`):
+
+- `context/compaction_completed`, `context/normalization_reported`
 
 ## 7. Command Semantics
 
@@ -1735,24 +1819,46 @@ Rules:
 
 ## 11. Relationship to REST
 
-During migration:
+The original migration-era split below has been **superseded by M12 Phase D**
+(`docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`, Accepted). The AppUI **data
+plane** is now the WS UI Protocol v1 (`/api/ui-protocol/ws`); the 13 auxiliary
+endpoints (`GET /api/sessions`, `/api/sessions/{id}/*`, `/api/status`,
+`/api/my/content*`) were migrated to the `auxiliary.rest_to_ws.v1` methods
+(§6 / §7) and retired from the REST router.
 
-- REST remains valid for snapshot hydrate
-- the protocol becomes the interactive source of truth
+After M12, REST survives only for four planes the WS protocol cannot or should
+not serve:
 
-Suggested split:
+- **AUTH / bootstrap** — `/api/auth/*`, `/api/register`, `/api/my/profile`.
+  The bearer token and `selected_profile` must be established over HTTP
+  *before* a WS handshake can authenticate (the WS bridge reads its credential
+  from the same store these calls populate). Keeping auth on a tiny, well-known
+  prefix is also what lets the 401-reaper scope to `/api/auth/*` only.
+- **BLOB / binary I/O** — `/api/upload`, `/api/site-files/upload`,
+  `/api/files`, `/api/files/{path}`, `/api/files/list`,
+  `/api/my/content/{id}/thumbnail`, `/api/my/content/{id}/body`,
+  `/api/site-preview/*`, `/api/preview/{profile}/{session}/{slug}/*`,
+  `/api/my/preview/sign`. Bodies exceed `MAX_TEXT_FRAME_BYTES` (1 MiB) and want
+  HTTP range/streaming/`<img src>`/browser-native caching.
+- **INFRA / OPS** — `/health`, `/metrics`, `/api/version`,
+  `/api/internal/frps-auth`, `/api/events/harness`. Non-AppUI consumers (load
+  balancers, Prometheus, the reverse proxy) require plain HTTP.
+- **ADMIN control plane** — `/api/admin/*` and the operator/config endpoints
+  consumed by the **admin dashboard** SPA (`dashboard/src/api.ts`), e.g.
+  `/api/my/test-provider`, `/api/my/provider-models`, `/api/my/test-search`,
+  `/api/my/model-limits`, `/api/my/soul`. These functionally overlap
+  `profile/llm/*` but serve the REST-based admin SPA, which is intentionally
+  outside the AppUI migration scope.
 
-- REST:
-  - session lists
-  - artifact/file lists
-  - compatibility hydrate
-- protocol:
-  - turn lifecycle
-  - approvals
-  - diff preview
-  - task output
-  - live progress
-  - resumable event flow
+Note: `POST /api/tasks/{task_id}/cancel` is **not** an AppUI duplicate of the
+WS `task/cancel` method — it backs the `octos-bus` API channel
+(`crates/octos-bus/src/api_channel.rs`) and is the channel/CLI task-cancel path.
+
+Original migration-era split (historical):
+
+- REST: session lists, artifact/file lists, compatibility hydrate
+- protocol: turn lifecycle, approvals, diff preview, task output, live
+  progress, resumable event flow
 
 ## 12. M8 Gate
 

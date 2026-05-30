@@ -316,7 +316,7 @@ method.
 
 Proposed by: 5-day structural plan, Day 1.
 
-Decision notes: Pending review. Lifts the existing in-memory thread
+Decision notes: Accepted (implemented; matches the header status). Lifts the existing in-memory thread
 partition produced by `Session::threads()` onto the wire so clients no
 longer reconstruct grouping from message-ordering heuristics. Would have
 made `#742`'s mis-binding observable in test fixtures rather than only

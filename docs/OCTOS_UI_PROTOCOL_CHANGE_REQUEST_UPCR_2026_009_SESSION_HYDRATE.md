@@ -329,7 +329,7 @@ method.
 
 Proposed by: 5-day structural plan, Day 1.
 
-Decision notes: Pending review. Closes the persistence-side reload
+Decision notes: Accepted (implemented; matches the header status). Closes the persistence-side reload
 misbinding gap exposed by `#738` / `#740` / `#742` by giving clients a
 single typed RPC for authoritative chat state on reload. The new
 capability flag `state.session_hydrate.v1` lets clients depend on the
