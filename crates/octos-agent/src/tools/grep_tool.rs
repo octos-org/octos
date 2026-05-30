@@ -164,15 +164,6 @@ impl Tool for GrepTool {
             },
         };
 
-        // Whether the search root itself resolved under the upload tmpdir,
-        // i.e. the `path` input was an explicit `up/...` upload handle (the
-        // ONLY way `resolve_for_scope` yields an upload-tmpdir path — a plain
-        // workspace path that symlinks into uploads is refused at resolution as
-        // OutOfScope). This gates the per-entry upload exemption below so it
-        // CANNOT be reached during a normal workspace/skill walk.
-        let rooted_in_upload = ctx.session_scope.is_some()
-            && octos_bus::file_handle::is_within_upload_root(&search_root);
-
         let scope = ctx.session_scope.clone();
         let pattern_str = input.pattern.clone();
         let file_pattern = input.file_pattern.clone();
@@ -185,7 +176,6 @@ impl Tool for GrepTool {
             run_grep(
                 scope,
                 search_root,
-                rooted_in_upload,
                 pattern_str,
                 file_pattern,
                 limit,
@@ -227,7 +217,6 @@ impl Tool for GrepTool {
 fn run_grep(
     scope: Option<Arc<SessionScope>>,
     search_root: PathBuf,
-    rooted_in_upload: bool,
     pattern_str: String,
     file_pattern: Option<String>,
     limit: usize,
@@ -253,6 +242,14 @@ fn run_grep(
         .hidden(false)
         .git_ignore(true)
         .build();
+    // Whether the search root itself resolved under the upload tmpdir, i.e. the
+    // `path` input was an explicit `up/...` upload handle (the ONLY way
+    // `resolve_for_scope` yields an upload-tmpdir path - a plain workspace path
+    // that symlinks into uploads is refused at resolution as OutOfScope). This
+    // gates the per-entry upload exemption below so it CANNOT be reached during
+    // a normal workspace/skill walk.
+    let rooted_in_upload =
+        scope.is_some() && octos_bus::file_handle::is_within_upload_root(&search_root);
 
     for entry in walker {
         if match_count >= limit {
