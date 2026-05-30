@@ -72,6 +72,18 @@ pub fn temp_upload_root() -> PathBuf {
     std::env::temp_dir().join("octos-uploads")
 }
 
+/// True when `path`'s canonical form lies inside the authenticated upload
+/// tmpdir (`octos-uploads`). Uploaded attachments live outside any
+/// [`crate::session`]/`SessionScope`, so walk-style tools (`grep`) that drop
+/// out-of-scope entries need this to recognise a resolved upload handle as a
+/// permitted read target. Canonicalising both sides keeps the macOS firmlink
+/// equivalence (`/var` vs `/private/var`) AND the symlink-escape guard intact:
+/// a symlink whose target is outside the upload root won't canonicalise back
+/// under it.
+pub fn is_within_upload_root(path: &Path) -> bool {
+    canonicalize_lossy(path).starts_with(canonical_root(&temp_upload_root()))
+}
+
 pub fn encode_profile_file_handle(base_dir: &Path, path: &Path) -> Option<String> {
     let relative = path
         .strip_prefix(base_dir)
