@@ -223,6 +223,10 @@ fn run_grep(
     context: usize,
     ignore_case: bool,
 ) -> Result<(Vec<String>, usize)> {
+    // Canonical form of the resolved search root. Used by the per-entry scope
+    // guard to exempt the legitimately-rooted upload file (see below).
+    let canonical_search_root = octos_core::canonicalize_lossy(&search_root);
+
     // Compile regex.
     let regex_pattern = if ignore_case {
         format!("(?i){}", pattern_str)
@@ -265,11 +269,34 @@ fn run_grep(
         // closes the symlink-loop escape: a symlink inside the
         // skill_dir pointing at `/etc` would otherwise let the walker
         // read passwd; canonicalize-then-classify rejects it.
+        //
+        // EXCEPT the file the search was explicitly rooted at: when `path` was
+        // an upload handle (`up/...`), `search_root` is the resolved
+        // upload-tmpdir file, which classifies OutOfScope because uploads live
+        // outside any SessionScope (see `resolve_for_scope`). Without an
+        // exemption grep would resolve the handle then silently report "No
+        // matches". We exempt ONLY entries whose canonical path is contained in
+        // the canonical search root — i.e. the upload file the caller actually
+        // asked to search.
+        //
+        // SECURITY: keying the exemption on containment in `search_root` (not
+        // on "is under the global upload tmpdir") is what makes it leak-proof.
+        // A symlink whose target is a SIBLING upload, `/etc/passwd`, or any
+        // other tenant's file canonicalises OUTSIDE `search_root`, so it is not
+        // exempt and stays dropped — even when the workspace itself is nested
+        // under the upload tmpdir. For a normal workspace walk `search_root` is
+        // the in-scope workspace, so its files never classify OutOfScope and
+        // this exemption is inert.
+        // `&&` short-circuits, so the second `canonicalize_lossy` runs ONLY for
+        // the rare OutOfScope entry (almost never during a normal workspace
+        // walk) — `classify_canonical_path` already canonicalised once, so we
+        // don't pay a second stat per in-scope file.
         if let Some(scope) = scope.as_ref() {
             if matches!(
                 scope.classify_canonical_path(path),
                 PathClassification::OutOfScope
-            ) {
+            ) && !octos_core::canonicalize_lossy(path).starts_with(&canonical_search_root)
+            {
                 continue;
             }
         }
@@ -570,6 +597,103 @@ mod tests {
         assert!(
             result.output.contains("outside session scope"),
             "expected scope rejection, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_searches_resolved_upload_handle_contents() {
+        // codex #1367 P2: an uploaded file lives in the upload tmpdir, which
+        // is OUTSIDE the SessionScope. Once `resolve_for_scope` decodes the
+        // `up/...` handle to the real upload path, grep's per-entry OutOfScope
+        // filter must NOT drop it — otherwise grep resolves the handle then
+        // silently returns "No matches" for a file the user uploaded.
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("g-{}-insight.md", std::process::id()));
+        std::fs::write(
+            &uploaded,
+            "# strategy insight\nNEEDLE marks the spot in the uploaded report\n",
+        )
+        .unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("insight.md"))
+                .expect("encode upload handle");
+
+        // Workspace is unrelated to the upload tmpdir.
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        let tool = GrepTool::new(workspace.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "pattern": "NEEDLE",
+                    "path": handle,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&uploaded);
+
+        // Assert on REAL match output, not the echoed pattern: the no-match
+        // message is `No matches found for pattern: NEEDLE` (which contains the
+        // pattern), so checking for "NEEDLE" alone would pass even when the
+        // file was dropped. The match line carries the surrounding text, which
+        // the no-match message never does.
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(
+            result.output.starts_with("Found ")
+                && result
+                    .output
+                    .contains("marks the spot in the uploaded report"),
+            "grep must surface the uploaded file's matched line, got: {}",
+            result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_does_not_follow_workspace_symlink_into_upload_root() {
+        // codex #1367 round-2 P1: the upload-root exemption must apply ONLY
+        // when the search is explicitly rooted at an upload handle. A workspace
+        // symlink whose target sits under the GLOBAL upload tmpdir must still be
+        // dropped — otherwise a scoped session could read arbitrary uploads
+        // (other tenants' files) by planting a symlink in its own workspace.
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let secret = upload_root.join(format!("s-{}-secret.md", std::process::id()));
+        std::fs::write(
+            &secret,
+            "TENANT_SECRET must never leak via a workspace symlink\n",
+        )
+        .unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.path().join("leak.md")).unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let tool = GrepTool::new(workspace.path());
+        let ctx = ctx_with_scope(scope);
+
+        // Search the WORKSPACE (not the upload handle): rooted_in_upload=false,
+        // so the exemption must not fire and the symlink target stays dropped.
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({ "pattern": "TENANT_SECRET" }))
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&secret);
+
+        assert!(
+            !result
+                .output
+                .contains("must never leak via a workspace symlink"),
+            "scoped grep must NOT follow a workspace symlink into the upload tmpdir, got: {}",
             result.output
         );
     }
