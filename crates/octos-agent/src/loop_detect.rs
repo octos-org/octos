@@ -247,7 +247,10 @@ mod tests {
         assert!(d.record_result("check", &args, result).is_none());
         assert!(d.record_result("check", &args, result).is_none());
         let hint = d.record_result("check", &args, result);
-        assert!(hint.is_some(), "expected NO PROGRESS hint after 3 identical");
+        assert!(
+            hint.is_some(),
+            "expected NO PROGRESS hint after 3 identical"
+        );
         assert!(hint.unwrap().contains("NO PROGRESS"));
     }
 

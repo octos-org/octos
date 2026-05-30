@@ -172,11 +172,11 @@ pub(super) fn satisfied_completion_content(output_files: &[String], tool_output:
 /// slides-1780013669236-8w2ime, the production failure that motivated
 /// this fix):
 ///   - kimi-k2.5 + only `check_workspace_contract`:
-///       loop rate 5/5 → 3/5 with this block (40% break out)
+///     loop rate 5/5 → 3/5 with this block (40% break out)
 ///   - kimi-k2.5 + check + read_file + list_dir:
-///       no consistent change (within noise)
+///     no consistent change (within noise)
 ///   - claude-opus-4.7:
-///       already 0/5 loops in both arms; block has no effect on Opus
+///     already 0/5 loops in both arms; block has no effect on Opus
 ///
 /// The block follows hermes-agent's prompt-time-injection pattern (in
 /// `agent/prompt_builder.py`), but applied universally rather than

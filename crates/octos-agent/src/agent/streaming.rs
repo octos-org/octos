@@ -851,7 +851,8 @@ mod tests {
              see docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md"
         );
         // Sanity: must be larger than legacy 30s value.
-        assert!(super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS > 30);
+        let timeout_secs = super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS;
+        assert!(timeout_secs > 30);
     }
 
     // Use Duration in a sanity check to make sure the constant is usable.
