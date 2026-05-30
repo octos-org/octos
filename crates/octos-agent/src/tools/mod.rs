@@ -869,6 +869,59 @@ fn resolve_for_scope(
     user_path: &str,
     for_write: bool,
 ) -> Result<PathBuf, &'static str> {
+    // Upload handles (`up/<base64>/<name>`) are opaque references to a file in
+    // the authenticated upload tmpdir — NOT workspace-relative paths. Without
+    // this short-circuit the join+classify logic below treats them as
+    // `<workspace>/up/<base64>/<name>` (lexically InWorkspace) and the file is
+    // never found, so every scoped (SPA web-/slides-/site-) session is unable
+    // to read ANY uploaded file. Decode via the unified resolver (which
+    // canonicalizes under the upload root, firmlink-safe), matching the legacy
+    // `resolve_path`.
+    //
+    // SECURITY: only trust this short-circuit when the resolver actually
+    // landed in the upload tmpdir (`ToolPathScope::UploadTmpdir`). A path that
+    // merely *starts with* `up/` but is not a valid handle (e.g.
+    // `up/link/secret.txt`) decode-fails and `resolve_tool_path` falls back to
+    // `ToolPathScope::Workspace`, returning the LEXICAL `<workspace>/up/...`
+    // form. Returning that here would skip the canonical ancestor-symlink guard
+    // in `classify_canonical_path` below — and `read_no_follow` only protects
+    // the leaf component, so a symlinked `workspace/up` would reopen a scoped
+    // read escape. Such paths therefore fall through to the normal resolver.
+    // Uploads are read sources, so writes to a resolved upload handle are
+    // refused. The `pf/` profile handle needs a profile root that
+    // `SessionScope` does not currently expose; tracked as a follow-up
+    // (issue #1367).
+    if user_path.starts_with("up/") {
+        match octos_bus::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
+            Ok(resolved)
+                if resolved.scope == octos_bus::file_handle::ToolPathScope::UploadTmpdir =>
+            {
+                return if for_write {
+                    Err("Writes to uploaded files are not permitted")
+                } else {
+                    Ok(resolved.absolute)
+                };
+            }
+            _ => {
+                // If the value DECODES as an upload handle it is unambiguously an
+                // upload reference: never fall through to the workspace resolver
+                // (which would let `write_file` create `<workspace>/up/<payload>/
+                // <name>`, or a read silently hit an unrelated workspace file with
+                // the same literal path). The temp file may have been deleted or
+                // no longer canonicalises under the upload root — report it as a
+                // missing upload rather than masking it as a workspace path.
+                if matches!(
+                    octos_bus::file_handle::decode_file_handle(user_path),
+                    Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+                ) {
+                    return Err("Uploaded file not found");
+                }
+                // A value that merely starts with `up/` but does NOT decode as a
+                // handle (e.g. a real workspace path) falls through to the scoped
+                // resolver, where the canonical containment guard still applies.
+            }
+        }
+    }
     let candidate = PathBuf::from(user_path);
     let absolute = if candidate.is_absolute() {
         candidate
@@ -1433,6 +1486,112 @@ mod path_tests {
         // The lexical absolute form passes through unchanged
         // (canonicalisation is only used for classification).
         assert_eq!(resolved, skill_file);
+    }
+
+    /// Regression (issue #1367): a SCOPED session must resolve an
+    /// `up/<base64>/<name>` upload handle to the real file under the upload
+    /// tmpdir — NOT treat it as a workspace-relative `<workspace>/up/...`
+    /// path. Every SPA (web-/slides-/site-) session is scoped, so before this
+    /// fix uploaded attachments were unreadable ("File not found: up/...").
+    /// The pre-existing scope tests never exercised a handle — that gap is
+    /// what let the bug ship.
+    #[test]
+    fn scoped_session_resolves_upload_handle_to_tmpdir_not_workspace() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
+        let uploaded = upload_root.join(format!("u-{}-report.md", std::process::id()));
+        std::fs::write(&uploaded, b"# strategy insight report\n").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("report.md"))
+            .expect("encode upload handle");
+        assert!(
+            handle.starts_with("up/"),
+            "expected an up/ handle, got {handle}"
+        );
+
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        // READ resolves to the real upload file (under the canonical upload
+        // root), NOT under the workspace.
+        let resolved = resolve_path_for_session_scope_read(&scope, &handle)
+            .expect("scoped session must resolve an up/ upload handle");
+        let canon_root = std::fs::canonicalize(&upload_root).unwrap_or(upload_root.clone());
+        assert!(
+            resolved.starts_with(&canon_root),
+            "resolved {} must be under the upload root {}, not joined onto the workspace",
+            resolved.display(),
+            canon_root.display()
+        );
+        assert!(
+            !resolved.starts_with(workspace.path()),
+            "must NOT resolve the upload handle under the workspace"
+        );
+
+        // Uploads are read sources — writes via the handle are refused.
+        assert!(
+            resolve_path_for_session_scope_write(&scope, &handle).is_err(),
+            "writes to an upload handle must be refused"
+        );
+
+        let _ = std::fs::remove_file(&uploaded);
+    }
+
+    /// SECURITY (codex #1367 P1): a path that merely *starts with* `up/` but
+    /// is NOT a valid upload handle must NOT bypass the canonical
+    /// ancestor-symlink guard. `up/secret.txt` ("secret.txt" isn't valid
+    /// base64 → decode fails → `resolve_tool_path` falls back to
+    /// `ToolPathScope::Workspace`, returning the LEXICAL `<workspace>/up/...`).
+    /// The short-circuit must reject the Workspace fallback and let the path
+    /// fall through to `classify_canonical_path`, which canonicalises through
+    /// the `up` symlink and refuses the escape — instead of leaking a lexical
+    /// path whose only protection (`O_NOFOLLOW`) guards the leaf, not the `up`
+    /// ancestor.
+    #[test]
+    #[cfg(unix)]
+    fn scoped_session_does_not_trust_non_handle_up_prefix_via_symlink() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let outside = tempfile::tempdir().expect("out-of-scope tmpdir");
+        std::fs::write(outside.path().join("secret.txt"), b"top secret\n").unwrap();
+        // workspace/up -> <outside>: an ancestor symlink escaping the scope.
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("up")).unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        let resolved = resolve_path_for_session_scope_read(&scope, "up/secret.txt");
+        assert!(
+            resolved.is_err(),
+            "a non-handle up/ path through an ancestor symlink must be refused, got {resolved:?}"
+        );
+    }
+
+    /// codex #1367 round-4 P2: a value that DECODES as an upload handle but
+    /// whose temp file is gone (deleted / no longer canonicalises under the
+    /// upload root) must report a missing upload — NOT fall through to the
+    /// workspace resolver, which would let `write_file` create
+    /// `<workspace>/up/<payload>/<name>` or a read silently hit an unrelated
+    /// same-named workspace file.
+    #[test]
+    fn scoped_session_rejects_decoded_but_missing_upload_handle() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("m-{}-gone.md", std::process::id()));
+        std::fs::write(&uploaded, b"temp\n").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("gone.md"))
+            .expect("encode upload handle");
+        // Delete the upload so the handle still DECODES but no longer resolves.
+        std::fs::remove_file(&uploaded).unwrap();
+
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        assert!(
+            resolve_path_for_session_scope_read(&scope, &handle).is_err(),
+            "a decoded-but-missing upload handle must error, not resolve to a workspace path"
+        );
+        assert!(
+            resolve_path_for_session_scope_write(&scope, &handle).is_err(),
+            "write to a missing upload handle must error"
+        );
     }
 
     /// PR-A core invariant: write attempts inside a registered
