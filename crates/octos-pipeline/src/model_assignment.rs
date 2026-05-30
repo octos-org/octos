@@ -40,6 +40,7 @@
 //! PID + nanos seeded round-robin start indices keep concurrent
 //! pipelines from herd-routing to the same model on every call.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -146,6 +147,24 @@ pub fn assign_from_catalog_dir(graph: &mut PipelineGraph, data_dir: &Path) {
     };
 
     assign_to_graph(graph, &pools);
+}
+
+/// Return every model key advertised by the profile/system pipeline catalog.
+///
+/// The validator uses this as its pure, data-driven source of truth after
+/// DOT parsing and model assignment. Missing or malformed catalogs return an
+/// empty set so callers can skip catalog-backed model validation rather than
+/// rejecting legacy/offline runs.
+pub fn known_model_keys_from_catalog_dir(data_dir: &Path) -> HashSet<String> {
+    load_catalog(data_dir)
+        .map(|catalog| {
+            catalog
+                .models
+                .into_iter()
+                .map(|entry| entry.model_key().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Test-friendly entry point that takes pre-built pools directly so we

@@ -112,6 +112,24 @@ async fn pre_flight_accepts_well_formed_dot() {
 }
 
 #[tokio::test]
+async fn pre_flight_accepts_declared_runtime_variables() {
+    let (tool, _working, _data) = make_tool().await;
+    let args = serde_json::json!({
+        "pipeline": "digraph ok {\n\
+            start [handler=Codergen, prompt=\"Use {topic}\"];\n\
+        }",
+        "input": "anything",
+        "variables": { "topic": "pipeline validation" },
+    });
+    let result = tool.pre_flight_validate(&args).await;
+    assert!(
+        result.is_ok(),
+        "declared variables must satisfy pre-flight template binding; got Err: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
 async fn pre_flight_rejects_malformed_json_args() {
     let (tool, _working, _data) = make_tool().await;
     let args = serde_json::json!({ "pipeline": "digraph x { a; }" }); // missing required `input`

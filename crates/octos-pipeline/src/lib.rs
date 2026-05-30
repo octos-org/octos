@@ -59,4 +59,7 @@ pub use server::{
 pub use stylesheet::{ModelStylesheet, ResolvedStyle, StyleRule};
 pub use thread::{Thread, ThreadRegistry};
 pub use tool::RunPipelineTool;
-pub use validate::{LintDiagnostic, Severity, validate};
+pub use validate::{
+    GraphLocation, LintDiagnostic, PipelineDiagnostic, RuleId, Severity, ValidationContext,
+    validate, validate_result, validate_with_context,
+};

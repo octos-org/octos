@@ -1267,6 +1267,8 @@ mod tests {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: vec![],
+            human_gate: false,
+            human_resolver: None,
         };
 
         let outcome = GateHandler
@@ -1336,6 +1338,8 @@ mod tests {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: vec![],
+            human_gate: false,
+            human_resolver: None,
         };
 
         let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
@@ -1389,6 +1393,8 @@ mod tests {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: vec![],
+            human_gate: false,
+            human_resolver: None,
         };
 
         let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
@@ -1452,6 +1458,8 @@ mod tests {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: vec![],
+            human_gate: false,
+            human_resolver: None,
         };
 
         let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
@@ -1515,6 +1523,8 @@ mod tests {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: vec![],
+            human_gate: false,
+            human_resolver: None,
         };
 
         let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
@@ -1576,6 +1586,8 @@ mod tests {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: vec![],
+            human_gate: false,
+            human_resolver: None,
         };
 
         let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();

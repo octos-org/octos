@@ -509,7 +509,9 @@ impl Tool for RunPipelineTool {
             .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
         let graph = crate::parser::parse_dot(&dot_content)
             .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
-        let diags = crate::validate::validate(&graph);
+        let validation_context = crate::validate::ValidationContext::default()
+            .with_runtime_channels(input.variables.keys().cloned());
+        let diags = crate::validate::validate_with_context(&graph, &validation_context);
         if crate::validate::has_errors(&diags) {
             let errors: Vec<_> = diags
                 .iter()

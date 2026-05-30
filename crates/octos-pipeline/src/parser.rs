@@ -554,6 +554,10 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         .get("deadline_action")
         .and_then(|s| parse_deadline_action(s));
     let checkpoints = parse_checkpoints(attrs);
+    let human_gate = attrs
+        .get("human_gate")
+        .and_then(|s| parse_bool(s))
+        .unwrap_or(false);
 
     PipelineNode {
         id: id.to_string(),
@@ -587,6 +591,11 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
             .and_then(|s| parse_bool(s))
             .unwrap_or(false),
         checkpoints,
+        human_gate,
+        human_resolver: attrs
+            .get("human_resolver")
+            .or_else(|| attrs.get("resolver"))
+            .cloned(),
     }
 }
 
@@ -843,6 +852,20 @@ mod tests {
 
         let graph = parse_dot(dot).unwrap();
         assert!(graph.nodes["review"].goal_gate);
+    }
+
+    #[test]
+    fn test_parse_human_gate_resolver() {
+        let dot = r#"
+            digraph test {
+                approve [handler="gate", human_gate="true", resolver="operator"]
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        let node = &graph.nodes["approve"];
+        assert!(node.human_gate);
+        assert_eq!(node.human_resolver.as_deref(), Some("operator"));
     }
 
     #[test]

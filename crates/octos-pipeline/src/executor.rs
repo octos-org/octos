@@ -994,6 +994,15 @@ impl PipelineExecutor {
             .as_deref()
             .unwrap_or(&self.config.working_dir);
         crate::model_assignment::assign_from_catalog_dir(&mut graph, catalog_dir);
+        let known_models = crate::model_assignment::known_model_keys_from_catalog_dir(catalog_dir);
+        let mut validation_context = if known_models.is_empty() {
+            validate::ValidationContext::default()
+        } else {
+            validate::ValidationContext::default().with_known_models(known_models)
+        };
+        validation_context
+            .runtime_channels
+            .extend(variables.keys().cloned());
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph
@@ -1021,7 +1030,7 @@ impl PipelineExecutor {
             edge_summary.join("\n")
         );
 
-        let diags = validate::validate(&graph);
+        let diags = validate::validate_with_context(&graph, &validation_context);
 
         for diag in &diags {
             match diag.severity {
@@ -3183,6 +3192,97 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    struct CountingHandler {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::handler::Handler for CountingHandler {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(NodeOutcome {
+                node_id: node.id.clone(),
+                status: OutcomeStatus::Pass,
+                content: "called".to_string(),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_errors_stop_before_handler_dispatch() {
+        let executor = PipelineExecutor::new(make_capped_config(8).await);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Codergen,
+            Arc::new(CountingHandler {
+                calls: calls.clone(),
+            }),
+        );
+
+        let result = executor
+            .run_with_handlers(
+                r#"
+                digraph invalid {
+                    start [handler="codergen", prompt="Use {missing_binding}"]
+                }
+                "#,
+                "input",
+                &serde_json::Map::new(),
+                handlers,
+            )
+            .await;
+
+        let err = result.expect_err("invalid template binding must fail before execution");
+        assert!(
+            err.to_string().contains("rule 16"),
+            "error should include the template-binding validation rule: {err}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "handler must not dispatch after validation errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_accepts_runtime_variable_bindings() {
+        let executor = PipelineExecutor::new(make_capped_config(8).await);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Codergen,
+            Arc::new(CountingHandler {
+                calls: calls.clone(),
+            }),
+        );
+        let variables = serde_json::json!({ "topic": "pipeline validation" });
+        let variables = variables.as_object().unwrap();
+
+        let result = executor
+            .run_with_handlers(
+                r#"
+                digraph valid {
+                    start [handler="codergen", prompt="Use {topic}"]
+                }
+                "#,
+                "input",
+                variables,
+                handlers,
+            )
+            .await;
+
+        result.expect("runtime variables should satisfy template binding");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "handler should dispatch after runtime variable binding validates"
+        );
     }
 
     #[test]

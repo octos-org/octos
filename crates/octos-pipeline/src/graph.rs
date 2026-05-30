@@ -158,6 +158,12 @@ pub struct PipelineNode {
     /// An empty list means no checkpoint is written for this node.
     #[serde(default)]
     pub checkpoints: Vec<MissionCheckpoint>,
+    /// Marks this gate as requiring external human/operator resolution.
+    #[serde(default)]
+    pub human_gate: bool,
+    /// Resolver/channel name used when `human_gate` is true.
+    #[serde(default)]
+    pub human_resolver: Option<String>,
 }
 
 impl Default for PipelineNode {
@@ -183,6 +189,8 @@ impl Default for PipelineNode {
             deadline_action: None,
             continue_on_error: false,
             checkpoints: Vec::new(),
+            human_gate: false,
+            human_resolver: None,
         }
     }
 }
