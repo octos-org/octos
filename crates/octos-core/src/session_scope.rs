@@ -546,6 +546,17 @@ impl SessionScope {
         &self.mode
     }
 
+    /// The tenant (profile) id this scope belongs to — `Some` for a
+    /// multi-tenant session, `None` for a solo session. Used to bind
+    /// uploaded files to a tenant and to refuse cross-tenant `up/`
+    /// handle resolution (#1377).
+    pub fn tenant_id(&self) -> Option<&str> {
+        match &self.mode {
+            ScopeMode::MultiTenant { tenant_id, .. } => Some(tenant_id.as_str()),
+            ScopeMode::Solo { .. } => None,
+        }
+    }
+
     /// Return the read-only plugin skill directories the agent may
     /// reach. See the `skill_read_zones` field doc on [`SessionScope`].
     pub fn skill_read_zones(&self) -> &[PathBuf] {
@@ -856,6 +867,15 @@ mod tests {
             session.into(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn tenant_id_some_for_multi_tenant_none_for_solo() {
+        let data = abs("/octos/profiles/dspfac/data");
+        let mt = mt_default(&data, "web-x");
+        assert_eq!(mt.tenant_id(), Some("dspfac"));
+        let solo = SessionScope::solo(abs("/ws"), vec![]).unwrap();
+        assert_eq!(solo.tenant_id(), None);
     }
 
     #[test]

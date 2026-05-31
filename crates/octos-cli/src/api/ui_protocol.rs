@@ -8717,7 +8717,10 @@ pub(crate) async fn resolve_sessions_for_lookup(
     state.sessions.clone()
 }
 
-fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -> Option<PathBuf> {
+pub(crate) fn session_workspace_root_for_state(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> Option<PathBuf> {
     // M11-F: read-through view on `session_workspaces()` only. The
     // legacy `state.agent.tool_registry().workspace_root()` fallback
     // was deleted alongside `state.agent`; the cached
@@ -16560,11 +16563,29 @@ async fn run_standalone_turn(
     // the WS transport. The legacy `rewrite_for` field is logged at
     // debug level for now; durable in-place rewrites land in a
     // follow-up that touches the per-session ledger replace path.
-    let turn_media_paths: Vec<String> = params
+    // #1377: materialize non-image uploads into `<workspace>/uploads/` so the
+    // agent reads them as ordinary workspace files (read_file/grep/list_dir/glob
+    // all work) and global `up/` resolution can be refused for tenant isolation.
+    // Images pass through unchanged (vision reads them directly). The persisted
+    // user-row media (set from this list inside the agent loop) therefore stores
+    // `uploads/<name>` so the `up/` handle never resurfaces in later turns; the
+    // client-facing `UserMessage` envelope keeps the original handle for display.
+    let raw_media: Vec<String> = params
         .media
         .iter()
         .map(|file_ref| file_ref.path.clone())
         .collect();
+    let turn_media_paths: Vec<String> = octos_bus::file_handle::materialize_turn_uploads(
+        &session_runtime.workspace_root,
+        // #1377: bind to the session's OWNING TENANT so the materializer only
+        // copies uploads owned by this tenant (cross-tenant handles dropped).
+        // Use the runtime's profile id — NOT `scope.tenant_id()` — because
+        // profile-qualified AppUI sessions (`:`-keyed) run under a profile but
+        // may have no attached `SessionScope`; deriving the tenant only from the
+        // scope would skip the ownership check for them (codex round-5 P1).
+        Some(session_runtime.profile.profile_id.as_str()),
+        &raw_media,
+    );
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
