@@ -3436,8 +3436,8 @@ mod tests {
         // round-trip test for `EnvelopeNotification` in octos-core missed
         // this — only the ledger wrapper exhibits the collision.
         let session = SessionKey("local:envelope-round-trip".into());
-        let event = UiProtocolLedgerEvent::Notification(UiNotification::Envelope(
-            EnvelopeNotification {
+        let event =
+            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(EnvelopeNotification {
                 session_id: session.clone(),
                 topic: Some("planning".into()),
                 envelope: Envelope {
@@ -3448,8 +3448,7 @@ mod tests {
                         text: "round-trip me".into(),
                     },
                 },
-            },
-        ));
+            }));
 
         let serialized = serde_json::to_string(&event).expect("ledger event serializes");
         assert!(
