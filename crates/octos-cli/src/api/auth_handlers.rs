@@ -227,7 +227,7 @@ fn resolve_root_login_target(state: &AppState, email: &str) -> Option<RootLoginT
     }
 }
 
-fn is_login_ready_email(email: &str) -> bool {
+pub(crate) fn is_login_ready_email(email: &str) -> bool {
     let normalized = email.trim().to_lowercase();
     !normalized.is_empty() && normalized != ADMIN_PLACEHOLDER_EMAIL
 }
@@ -366,6 +366,14 @@ pub struct AuthStatusResponse {
     pub email_login_enabled: bool,
     pub admin_token_login_enabled: bool,
     pub allow_self_registration: bool,
+    /// True when this host advertises the no-password solo login path
+    /// (`POST /api/auth/solo` / `/api/auth/solo/create`): a Local-mode
+    /// deployment with profile + user stores. The SPA reads this to show
+    /// the "continue without a password" affordance. Mirrors the TUI's
+    /// `profile/local/create` capability gate (`supports_local_solo_profile_create`).
+    /// The flag does NOT mean auth is bypassed — the endpoints still
+    /// enforce a loopback peer at request time.
+    pub local_solo_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoped_profile: Option<ScopedAuthTarget>,
 }
@@ -573,6 +581,11 @@ pub async fn auth_status(
             .as_ref()
             .map(|m| m.allow_self_registration())
             .unwrap_or(false),
+        // Advertise solo only when supported — which now requires the
+        // explicit opt-in (a hosted Local-mode fleet daemon behind Caddy never
+        // sets it), so the SPA never offers the no-password path there. See
+        // `supports_local_solo_profile_create` / `crate::api::solo_auth`.
+        local_solo_enabled: crate::api::ui_protocol::supports_local_solo_profile_create(&state),
         scoped_profile,
     }))
 }
@@ -2386,6 +2399,7 @@ mod tests {
         ));
         let state = AppState {
             auth_token: Some("bootstrap-token".into()),
+            solo_login_enabled: true,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
@@ -2396,6 +2410,34 @@ mod tests {
             ..AppState::empty_for_tests()
         };
         (dir, state, user_store, profile_store)
+    }
+
+    #[tokio::test]
+    async fn auth_status_advertises_local_solo_enabled_in_local_mode() {
+        // Local deployment + profile/user stores ⇒ the no-password solo
+        // login path is available, so /api/auth/status must advertise it.
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        assert_eq!(state.deployment_mode, crate::config::DeploymentMode::Local);
+        let Json(status) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(status.local_solo_enabled);
+    }
+
+    #[tokio::test]
+    async fn auth_status_hides_local_solo_in_tenant_mode() {
+        // Tenant/cloud hosts are multi-tenant; the solo path must never be
+        // advertised there (defense-in-depth alongside the request-time
+        // loopback gate enforced by the handlers themselves).
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let state = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            ..state
+        };
+        let Json(status) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(!status.local_solo_enabled);
     }
 
     fn scoped_host_headers(host: &str) -> HeaderMap {

@@ -18,6 +18,7 @@ import { ApiError } from '../api'
 
 const mockGetTokenStatus = vi.fn()
 const mockGetSetupState = vi.fn()
+const mockAuthStatus = vi.fn()
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
@@ -27,6 +28,7 @@ vi.mock('../api', async () => {
       getTokenStatus: () => mockGetTokenStatus(),
       getSetupState: () => mockGetSetupState(),
     },
+    authApi: { ...actual.authApi, status: () => mockAuthStatus() },
   }
 })
 
@@ -62,6 +64,9 @@ beforeEach(() => {
   isAdminMock = true
   mockGetTokenStatus.mockReset()
   mockGetSetupState.mockReset()
+  mockAuthStatus.mockReset()
+  // Default: a non-solo host, so existing rotate-wizard behaviour is unchanged.
+  mockAuthStatus.mockResolvedValue({ local_solo_enabled: false })
 })
 
 afterEach(() => {
@@ -129,6 +134,39 @@ describe('BootstrapGate', () => {
   it('treats 500 / network errors as "not rotated" (conservative)', async () => {
     mockGetTokenStatus.mockRejectedValue(new ApiError(500, 'server error'))
     mockGetSetupState.mockRejectedValue(new ApiError(500, 'server error'))
+    renderAt('/')
+    await waitFor(() => expect(screen.getByTestId('welcome')).toBeInTheDocument())
+  })
+
+  it('renders children on a solo host even when the token is not rotated', async () => {
+    // No-password solo hosts have nothing to rotate; the gate must not push
+    // the freshly solo-logged-in admin into the rotate-token wizard.
+    mockGetTokenStatus.mockResolvedValue({ rotated: false })
+    mockGetSetupState.mockResolvedValue({
+      wizard_completed_at: null,
+      wizard_skipped: false,
+      wizard_last_step_reached: 0,
+    })
+    mockAuthStatus.mockResolvedValue({ local_solo_enabled: true })
+    renderAt('/')
+    await waitFor(() => expect(screen.getByTestId('children')).toBeInTheDocument())
+    expect(screen.queryByTestId('welcome')).not.toBeInTheDocument()
+  })
+
+  it('still forces rotation on a solo-capable host that also exposes admin-token login', async () => {
+    // local_solo_enabled is true for any Local host with stores, but if an
+    // admin token is also configured (admin_token_login_enabled) there is a
+    // live bootstrap token to rotate — the gate must NOT be bypassed.
+    mockGetTokenStatus.mockResolvedValue({ rotated: false })
+    mockGetSetupState.mockResolvedValue({
+      wizard_completed_at: null,
+      wizard_skipped: false,
+      wizard_last_step_reached: 0,
+    })
+    mockAuthStatus.mockResolvedValue({
+      local_solo_enabled: true,
+      admin_token_login_enabled: true,
+    })
     renderAt('/')
     await waitFor(() => expect(screen.getByTestId('welcome')).toBeInTheDocument())
   })

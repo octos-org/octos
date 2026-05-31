@@ -1,11 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { authApi, ApiError } from '../api'
+import SoloProfileForm from '../components/SoloProfileForm'
 
 export default function LoginPage() {
-  const { user, sendOtp, verifyOtp, loginWithToken } = useAuth()
+  const { user, sendOtp, verifyOtp, loginWithToken, soloLogin } = useAuth()
   const navigate = useNavigate()
-  const [step, setStep] = useState<'email' | 'code' | 'token'>('email')
+  const [step, setStep] = useState<'email' | 'code' | 'token' | 'solo'>('email')
+  const [soloEnabled, setSoloEnabled] = useState(false)
   const [email, setEmail] = useState('')
   const [code, setCode] = useState(['', '', '', '', '', ''])
   const [adminToken, setAdminToken] = useState('')
@@ -18,6 +21,34 @@ export default function LoginPage() {
   useEffect(() => {
     if (user) navigate('/', { replace: true })
   }, [user, navigate])
+
+  // Probe public login config to decide whether to offer the no-password
+  // solo path. Failure leaves solo hidden — the OTP / token forms still work.
+  useEffect(() => {
+    authApi
+      .status()
+      .then((s) => setSoloEnabled(s.local_solo_enabled))
+      .catch(() => {})
+  }, [])
+
+  const handleSoloContinue = async () => {
+    setError('')
+    setLoading(true)
+    try {
+      // Re-login the existing local owner. First run (no profile yet) comes
+      // back as 404 → drop into the create form.
+      await soloLogin()
+      navigate('/', { replace: true })
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        setStep('solo')
+      } else {
+        setError(e instanceof Error ? e.message : 'Solo login failed')
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const handleSendCode = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -125,7 +156,21 @@ export default function LoginPage() {
         </div>
 
         <div className="bg-surface rounded-xl border border-gray-700/50 p-6">
-          {step === 'token' ? (
+          {step === 'solo' ? (
+            <div>
+              <SoloProfileForm onDone={() => navigate('/', { replace: true })} />
+              <button
+                type="button"
+                onClick={() => {
+                  setStep('email')
+                  setError('')
+                }}
+                className="mt-3 w-full text-sm text-gray-500 hover:text-gray-300 transition"
+              >
+                Back
+              </button>
+            </div>
+          ) : step === 'token' ? (
             <form onSubmit={handleTokenLogin}>
               <label
                 htmlFor="admin-token"
@@ -165,7 +210,29 @@ export default function LoginPage() {
               </button>
             </form>
           ) : step === 'email' ? (
-            <form onSubmit={handleSendCode}>
+            <>
+              {soloEnabled && (
+                <div className="mb-6">
+                  <button
+                    type="button"
+                    data-testid="solo-continue"
+                    onClick={handleSoloContinue}
+                    disabled={loading}
+                    className="w-full px-4 py-2.5 text-sm font-medium rounded-lg bg-accent text-white hover:bg-accent-light transition disabled:opacity-50"
+                  >
+                    {loading ? 'Continuing…' : 'Continue without a password'}
+                  </button>
+                  <p className="mt-2 text-center text-xs text-gray-600">
+                    Solo mode — local, single-user, stays on this machine.
+                  </p>
+                  <div className="my-4 flex items-center gap-3 text-xs text-gray-600">
+                    <span className="h-px flex-1 bg-gray-700/50" />
+                    or sign in with email
+                    <span className="h-px flex-1 bg-gray-700/50" />
+                  </div>
+                </div>
+              )}
+              <form onSubmit={handleSendCode}>
               <label
                 htmlFor="login-email"
                 className="block text-sm font-medium text-gray-300 mb-2"
@@ -193,7 +260,8 @@ export default function LoginPage() {
               >
                 {loading ? 'Sending...' : 'Send verification code'}
               </button>
-            </form>
+              </form>
+            </>
           ) : (
             <div>
               <p className="text-sm text-gray-400 mb-1">
@@ -251,7 +319,7 @@ export default function LoginPage() {
         </div>
 
         {/* Toggle between email and token login */}
-        {step !== 'code' && step !== 'token' && (
+        {step !== 'code' && step !== 'token' && step !== 'solo' && (
           <div className="text-center mt-4">
             <button
               type="button"

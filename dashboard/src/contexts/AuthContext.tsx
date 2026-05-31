@@ -17,6 +17,12 @@ interface AuthContextValue {
   sendOtp: (email: string) => Promise<{ ok: boolean; message?: string }>
   verifyOtp: (email: string, code: string) => Promise<boolean>
   loginWithToken: (token: string) => Promise<boolean>
+  /** No-password solo re-login for the existing local owner. Rejects with
+   *  an `ApiError(404)` when no solo profile exists yet — the caller then
+   *  shows the create form. */
+  soloLogin: () => Promise<void>
+  /** Onboard a local profile AND log in (no password). */
+  soloCreate: (body: { name: string; username: string; email: string }) => Promise<void>
   swapToken: (newToken: string) => void
   logout: () => Promise<void>
 }
@@ -94,6 +100,51 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // No-password solo login. The server only honours these on a Local-mode
+  // host reached over loopback (see `crate::api::solo_auth`); off-loopback
+  // they 403, so the SPA can never land a session it shouldn't.
+  const soloLogin = useCallback(async () => {
+    const res = await authApi.soloLogin()
+    localStorage.setItem('octos_session_token', res.token)
+    setToken(res.token)
+    setUser(res.user)
+    try {
+      const me = await authApi.me()
+      setScopedProfile(me.scoped_profile ?? null)
+    } catch {
+      // best-effort scope refresh
+    }
+  }, [])
+
+  const soloCreate = useCallback(
+    async (body: { name: string; username: string; email: string }) => {
+      const res = await authApi.soloCreate(body)
+      localStorage.setItem('octos_session_token', res.token)
+      setToken(res.token)
+      // Establish the principal directly from the create result so AuthGuard
+      // always has a user — even if the follow-up /me refresh fails (which
+      // would otherwise bounce the operator back to /login with no error).
+      // The local solo owner is created with the admin role server-side.
+      setUser({
+        id: res.user_id,
+        email: res.email,
+        name: res.name,
+        role: 'admin',
+        created_at: new Date().toISOString(),
+        last_login_at: null,
+      })
+      // Refine with the canonical principal + tenant scope when reachable.
+      try {
+        const me = await authApi.me()
+        setUser(me.user)
+        setScopedProfile(me.scoped_profile ?? null)
+      } catch {
+        // best-effort refine — the create-derived user already unblocks the guard
+      }
+    },
+    [],
+  )
+
   const swapToken = useCallback((newToken: string) => {
     localStorage.setItem('octos_auth_token', newToken)
     setToken(newToken)
@@ -114,7 +165,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, isAdmin, scopedProfile, loading, sendOtp, verifyOtp, loginWithToken, swapToken, logout }}
+      value={{ user, token, isAdmin, scopedProfile, loading, sendOtp, verifyOtp, loginWithToken, soloLogin, soloCreate, swapToken, logout }}
     >
       {children}
     </AuthContext.Provider>

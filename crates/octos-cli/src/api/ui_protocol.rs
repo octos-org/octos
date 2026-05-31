@@ -4988,8 +4988,19 @@ fn raw_profile_id(params: &RawProfileParams, connection_profile_id: Option<&str>
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn supports_local_solo_profile_create(state: &AppState) -> bool {
-    state.deployment_mode == crate::config::DeploymentMode::Local
+/// Whether the no-password local-solo profile primitive is available — both
+/// the `profile/local/create` WS method (TUI onboarding) and the
+/// `/api/auth/solo*` REST endpoints (dashboard).
+///
+/// SECURITY: this requires the explicit `solo_login_enabled` opt-in, NOT just
+/// Local mode. The hosted fleet runs Local mode behind a Caddy reverse proxy,
+/// so a proxied client reaches the daemon over loopback; without this gate it
+/// could create a top-level Admin user over EITHER transport. Fleet configs
+/// never set the opt-in, so solo stays off there; a genuine solo install runs
+/// `octos serve --solo` / `OCTOS_SOLO_LOGIN=1`.
+pub(crate) fn supports_local_solo_profile_create(state: &AppState) -> bool {
+    state.solo_login_enabled
+        && state.deployment_mode == crate::config::DeploymentMode::Local
         && state.profile_store.is_some()
         && state.user_store.is_some()
 }
@@ -5231,7 +5242,7 @@ fn ensure_existing_local_profile_matches(
     Ok(())
 }
 
-fn create_or_get_local_solo_profile(
+pub(crate) fn create_or_get_local_solo_profile(
     state: &AppState,
     params: octos_core::ui_protocol::ProfileLocalCreateParams,
 ) -> Result<octos_core::ui_protocol::ProfileLocalCreateResult, RpcError> {
@@ -19227,6 +19238,9 @@ mod tests {
             profile_store: Some(Arc::new(crate::profiles::ProfileStore::open(dir).unwrap())),
             user_store: Some(Arc::new(crate::user_store::UserStore::open(dir).unwrap())),
             deployment_mode: crate::config::DeploymentMode::Local,
+            // Solo profile creation is opt-in; the TUI/WS tests exercise the
+            // supported path, so enable it here.
+            solo_login_enabled: true,
             ..AppState::empty_for_tests()
         }
     }

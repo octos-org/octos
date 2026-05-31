@@ -19,6 +19,10 @@ auth_token="${OCTOS_M12_SOAK_AUTH_TOKEN:-octos-m12-solo-soak-token}"
 profile_id="${OCTOS_M12_SOAK_PROFILE:-m12solo}"
 session_id="${OCTOS_M12_SOAK_SESSION:-$profile_id:local:m12-solo#$run_id}"
 serve_args="${OCTOS_M12_SOAK_SERVE_ARGS:-}"
+# The no-password local-solo gate is opt-in (OFF by default; see
+# `api::solo_auth`). This soak intentionally exercises solo onboarding, so opt
+# in for both the WS and stdio serve launches below.
+export OCTOS_SOLO_LOGIN=1
 strict="${OCTOS_M12_SOAK_STRICT:-0}"
 tenant_negative="${OCTOS_M12_SOAK_TENANT_NEGATIVE:-0}"
 api_key_env="${OCTOS_M12_SOAK_API_KEY_ENV:-OPENAI_API_KEY}"

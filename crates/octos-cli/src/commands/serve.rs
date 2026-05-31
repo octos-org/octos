@@ -246,6 +246,15 @@ pub struct ServeCommand {
     #[arg(long)]
     pub auth_token: Option<String>,
 
+    /// Enable the no-password "solo" login (`POST /api/auth/solo*`) for a
+    /// local single-user install. OFF by default. Only honoured for direct
+    /// loopback requests on a Local-mode host with profile/user stores, and
+    /// never when the request carries reverse-proxy headers. Also settable
+    /// via `OCTOS_SOLO_LOGIN=1`. Do NOT set on a host fronted by a reverse
+    /// proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
+    #[arg(long)]
+    pub solo: bool,
+
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
@@ -634,6 +643,10 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            solo_login_enabled: self.solo
+                || std::env::var("OCTOS_SOLO_LOGIN")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),

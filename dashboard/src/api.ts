@@ -8,6 +8,9 @@ import type {
   OtpSendResponse,
   OtpVerifyResponse,
   MeResponse,
+  AuthStatusResponse,
+  SoloLoginResult,
+  SoloCreateResult,
   User,
   AllowlistEntry,
   SharedMetrics,
@@ -388,6 +391,21 @@ export const authApi = {
     }),
 
   me: () => authedRequest<MeResponse>('/auth/me'),
+
+  // Public login configuration — which login modes to render.
+  status: () => publicRequest<AuthStatusResponse>('/auth/status'),
+
+  // No-password solo login (Local-mode host, loopback peer). `soloLogin`
+  // re-logs the existing owner (404 when none exists yet); `soloCreate`
+  // onboards a local profile and logs in atomically.
+  soloLogin: () =>
+    publicRequest<SoloLoginResult>('/auth/solo', { method: 'POST' }),
+
+  soloCreate: (body: { name: string; username: string; email: string }) =>
+    publicRequest<SoloCreateResult>('/auth/solo/create', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   logout: () =>
     authedRequest<ActionResponse>('/auth/logout', { method: 'POST' }),

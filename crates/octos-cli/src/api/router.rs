@@ -19,6 +19,7 @@ use super::frps_plugin;
 use super::handlers;
 use super::metrics;
 use super::purge;
+use super::solo_auth;
 use super::static_files;
 use super::swarm as swarm_api;
 use super::ui_protocol;
@@ -86,10 +87,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     };
 
     // Public auth endpoints (no auth required)
+    //
+    // `/api/auth/solo*` are the no-password solo login routes. They are
+    // public by design — no credential exists yet on a fresh local install
+    // — and fail closed inside the handlers (`solo_auth::solo_login_allowed`)
+    // unless the host is Local-solo AND the peer is loopback.
     let auth_api = Router::new()
         .route("/api/auth/status", get(auth_handlers::auth_status))
         .route("/api/auth/send-code", post(auth_handlers::send_code))
         .route("/api/auth/verify", post(auth_handlers::verify))
+        .route("/api/auth/solo", post(solo_auth::solo_login))
+        .route("/api/auth/solo/create", post(solo_auth::solo_create))
         .route("/api/auth/logout", post(auth_handlers::logout));
 
     // Chat + status API (existing)
