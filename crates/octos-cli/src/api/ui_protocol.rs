@@ -10133,6 +10133,40 @@ async fn handle_task_cancel(
         return;
     }
 
+    let task_id = params.task_id.clone();
+
+    // octos#1380: gateway-mode — the `octos serve` API server owns no task
+    // supervisor (`task_query_store == None`); the supervisor lives in the
+    // gateway process. Proxy the cancel to that process (mirroring the REST
+    // `/api/tasks/{id}/cancel` handler) instead of failing `runtime_unavailable`.
+    if state.task_query_store.is_none() {
+        if let Some(port) = gateway_task_api_port(state, connection_profile_id).await {
+            let path = format!("/tasks/{}/cancel", task_id);
+            let response = super::webhook_proxy::api_post_proxy_json(
+                state,
+                port,
+                &path,
+                serde_json::json!({}),
+            )
+            .await;
+            match proxied_task_cancel_outcome(&task_id, response) {
+                Ok(()) => send_serialized_rpc_result(
+                    ws,
+                    id,
+                    octos_core::ui_protocol::methods::TASK_CANCEL,
+                    TaskCancelResult {
+                        task_id,
+                        status: UiTaskRuntimeState::Cancelled,
+                    },
+                ),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return;
+        }
+    }
+
     let store = match task_query_store_or_error(state) {
         Ok(store) => store,
         Err(error) => {
@@ -10140,7 +10174,6 @@ async fn handle_task_cancel(
             return;
         }
     };
-    let task_id = params.task_id.clone();
     match ensure_task_in_session(state, session_id, &task_id).and_then(|()| {
         store
             .cancel_task(&task_id.to_string())
@@ -10161,6 +10194,38 @@ async fn handle_task_cancel(
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
         }
+    }
+}
+
+/// octos#1380: resolve the gateway-process api port that owns the task
+/// supervisor for `profile_id`. Used when the API server has no local
+/// `task_query_store` (`octos serve` runs supervisors in gateway processes).
+async fn gateway_task_api_port(state: &AppState, profile_id: Option<&str>) -> Option<u16> {
+    let pm = state.process_manager.as_ref()?;
+    pm.api_port(profile_id?).await
+}
+
+/// Map a proxied REST `/tasks/{id}/cancel` gateway response onto the WS
+/// `task/cancel` outcome: 200 -> cancelled, 404 -> unknown task, 409 -> already
+/// terminal, anything else -> typed `runtime_unavailable`.
+fn proxied_task_cancel_outcome(
+    task_id: &TaskId,
+    response: axum::response::Response,
+) -> Result<(), RpcError> {
+    match response.status() {
+        axum::http::StatusCode::OK => Ok(()),
+        axum::http::StatusCode::NOT_FOUND => Err(task_cancel_rpc_error(
+            task_id,
+            octos_agent::TaskCancelError::NotFound,
+        )),
+        axum::http::StatusCode::CONFLICT => Err(task_cancel_rpc_error(
+            task_id,
+            octos_agent::TaskCancelError::AlreadyTerminal,
+        )),
+        status => Err(RpcError::runtime_not_ready(format!(
+            "gateway task/cancel proxy returned {status}"
+        ))
+        .with_data(serde_json::json!({ "kind": "runtime_unavailable" }))),
     }
 }
 
@@ -20857,6 +20922,24 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+    }
+
+    #[test]
+    fn proxied_task_cancel_outcome_maps_gateway_status() {
+        // octos#1380: the WS task/cancel gateway-proxy fallback maps the REST
+        // gateway response onto the JSON-RPC outcome.
+        use axum::http::StatusCode;
+        let task_id = TaskId::new();
+        let response = |status: StatusCode| {
+            axum::response::Response::builder()
+                .status(status)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::OK)).is_ok());
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::NOT_FOUND)).is_err());
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::CONFLICT)).is_err());
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::BAD_GATEWAY)).is_err());
     }
 
     #[test]
