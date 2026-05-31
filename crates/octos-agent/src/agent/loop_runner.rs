@@ -2058,9 +2058,7 @@ impl Agent {
                 let Some(&(name, args)) = id_to_call.get(id) else {
                     continue;
                 };
-                if let Some(hint) =
-                    loop_detector.record_result(name, args, &message.content)
-                {
+                if let Some(hint) = loop_detector.record_result(name, args, &message.content) {
                     message.content.push_str(&hint);
                 }
             }

@@ -1254,6 +1254,7 @@ impl ConnectionUiFeatures {
     }
 
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
+        let task_runtime_available = supports_appui_task_runtime(state);
         let mut capabilities = self.negotiated_capabilities();
         for method in APPUI_EXTRA_METHODS {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
@@ -1341,10 +1342,12 @@ impl ConnectionUiFeatures {
                 &mut capabilities.supported_features,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
             );
-            push_capability_feature(
-                &mut capabilities.supported_features,
-                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
-            );
+            if task_runtime_available {
+                push_capability_feature(
+                    &mut capabilities.supported_features,
+                    octos_core::ui_protocol::UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+                );
+            }
         }
         if supports_local_solo_profile_create(state) {
             push_capability_feature(
@@ -1359,11 +1362,45 @@ impl ConnectionUiFeatures {
                 APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1,
             );
         }
+        if !task_runtime_available {
+            prune_appui_task_runtime_capabilities(&mut capabilities);
+        }
         if self.stdio_transport {
             apply_stdio_auth_bound_capability_policy(&mut capabilities);
         }
         capabilities
     }
+}
+
+fn supports_appui_task_runtime(state: &AppState) -> bool {
+    state.task_query_store.is_some()
+}
+
+fn prune_appui_task_runtime_capabilities(capabilities: &mut UiProtocolCapabilities) {
+    capabilities
+        .supported_methods
+        .retain(|method| !is_appui_task_runtime_method(method));
+    capabilities
+        .supported_features
+        .retain(|feature| !is_appui_task_runtime_feature(feature));
+}
+
+fn is_appui_task_runtime_method(method: &str) -> bool {
+    matches!(
+        method,
+        octos_core::ui_protocol::methods::TASK_LIST
+            | octos_core::ui_protocol::methods::TASK_CANCEL
+            | octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE
+            | octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST
+            | octos_core::ui_protocol::methods::TASK_ARTIFACT_READ
+    )
+}
+
+fn is_appui_task_runtime_feature(feature: &str) -> bool {
+    matches!(
+        feature,
+        UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1 | UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1
+    )
 }
 
 fn apply_stdio_auth_bound_capability_policy(capabilities: &mut UiProtocolCapabilities) {
@@ -19042,6 +19079,54 @@ mod tests {
             .collect()
     }
 
+    fn assert_task_runtime_surface_hidden(capabilities: &UiProtocolCapabilities) {
+        for feature in [
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+        ] {
+            assert!(
+                !capabilities.supports_feature(feature),
+                "{feature} must not be advertised without task runtime wiring"
+            );
+        }
+        for method in [
+            methods::TASK_LIST,
+            methods::TASK_CANCEL,
+            methods::TASK_RESTART_FROM_NODE,
+            methods::TASK_ARTIFACT_LIST,
+            methods::TASK_ARTIFACT_READ,
+        ] {
+            assert!(
+                !capabilities.supports_method(method),
+                "{method} must not be advertised without task runtime wiring"
+            );
+        }
+    }
+
+    fn assert_task_runtime_surface_advertised(capabilities: &UiProtocolCapabilities) {
+        for feature in [
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+        ] {
+            assert!(
+                capabilities.supports_feature(feature),
+                "{feature} must be advertised when task runtime wiring is present"
+            );
+        }
+        for method in [
+            methods::TASK_LIST,
+            methods::TASK_CANCEL,
+            methods::TASK_RESTART_FROM_NODE,
+            methods::TASK_ARTIFACT_LIST,
+            methods::TASK_ARTIFACT_READ,
+        ] {
+            assert!(
+                capabilities.supports_method(method),
+                "{method} must be advertised when task runtime wiring is present"
+            );
+        }
+    }
+
     fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         let session_id = SessionKey("local:dispatch-parity".into());
         let turn_id = TurnId::new();
@@ -25167,7 +25252,9 @@ ignore = []
     async fn session_open_result_advertises_full_protocol_when_no_header() {
         // Client sent no `X-Octos-Ui-Features` request — server returns
         // the `first_server_slice` baseline so a discovery-aware client
-        // can learn the surface in-band per UPCR-2026-007.
+        // can learn the surface in-band per UPCR-2026-007, with
+        // runtime-backed task capabilities pruned when no task supervisor
+        // store is wired for the AppUI connection.
         let temp = tempfile::tempdir().expect("tempdir");
         let state = state_with_sessions(temp.path());
         let ledger = UiProtocolLedger::new(16);
@@ -25196,10 +25283,10 @@ ignore = []
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
-        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
         assert!(capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
         assert!(capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
+        assert_task_runtime_surface_hidden(capabilities);
         let context_state = outcome
             .result
             .opened
@@ -25219,6 +25306,56 @@ ignore = []
             !context_state.transcript_hash.is_empty(),
             "context state must include a stable transcript hash"
         );
+    }
+
+    #[test]
+    fn advertised_capabilities_hide_task_runtime_surface_without_store() {
+        let state = AppState::empty_for_tests();
+        let requested_task_features = ConnectionUiFeatures::from_requested_feature_tokens(
+            [
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            ],
+            false,
+        );
+        let requested_agent_control = ConnectionUiFeatures::from_requested_feature_tokens(
+            [
+                UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+                UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+            ],
+            false,
+        );
+
+        for features in [
+            ConnectionUiFeatures::default(),
+            requested_task_features,
+            requested_agent_control,
+        ] {
+            let capabilities = features.advertised_capabilities(&state);
+            assert_task_runtime_surface_hidden(&capabilities);
+        }
+    }
+
+    #[test]
+    fn advertised_capabilities_include_task_runtime_surface_when_store_wired() {
+        let session_id = SessionKey("local:task-runtime-caps".into());
+        let (state, _supervisor, _task_id) = appui_task_state_with_running_task(&session_id);
+        let requested_task_features = ConnectionUiFeatures::from_requested_feature_tokens(
+            [
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            ],
+            false,
+        );
+
+        for features in [
+            ConnectionUiFeatures::default(),
+            requested_task_features,
+            ConnectionUiFeatures::stdio_defaults(),
+        ] {
+            let capabilities = features.advertised_capabilities(&state);
+            assert_task_runtime_surface_advertised(&capabilities);
+        }
     }
 
     #[tokio::test]
