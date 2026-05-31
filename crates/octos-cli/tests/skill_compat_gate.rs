@@ -52,6 +52,11 @@ fn fixture_skill_dir() -> PathBuf {
 fn run_octos_skills(cwd: &Path, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(octos_binary());
     cmd.arg("skills").arg("--cwd").arg(cwd).args(args);
+    // Keep install-time plugin cache writes hermetic. The child `octos`
+    // binary is not built with `cfg(test)`, so its default verified-hash
+    // cache would otherwise use the developer/CI HOME.
+    cmd.env("HOME", cwd.join(".home"));
+    cmd.env("XDG_CACHE_HOME", cwd.join(".cache"));
     cmd.output().expect("failed to run octos skills")
 }
 
