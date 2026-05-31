@@ -242,6 +242,16 @@ pub struct AppState {
     pub frps_port: Option<u16>,
     /// Deployment mode (local, tenant, or cloud).
     pub deployment_mode: crate::config::DeploymentMode,
+    /// Opt-in for the no-password "solo" REST login (`/api/auth/solo*`).
+    /// OFF by default; set by `octos serve --solo` / `OCTOS_SOLO_LOGIN=1`.
+    ///
+    /// SECURITY: `deployment_mode == Local` is NOT sufficient to enable solo
+    /// login. A hosted fleet daemon runs Local mode behind a Caddy reverse
+    /// proxy, so every request reaches the daemon over loopback and would
+    /// otherwise pass the loopback guard. This explicit opt-in (which fleet
+    /// configs never set) is the primary defence; the handlers additionally
+    /// reject any request carrying proxy-forwarding headers.
+    pub solo_login_enabled: bool,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
@@ -352,6 +362,7 @@ impl AppState {
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
+            solo_login_enabled: false,
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,

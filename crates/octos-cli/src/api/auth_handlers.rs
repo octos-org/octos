@@ -581,6 +581,10 @@ pub async fn auth_status(
             .as_ref()
             .map(|m| m.allow_self_registration())
             .unwrap_or(false),
+        // Advertise solo only when supported — which now requires the
+        // explicit opt-in (a hosted Local-mode fleet daemon behind Caddy never
+        // sets it), so the SPA never offers the no-password path there. See
+        // `supports_local_solo_profile_create` / `crate::api::solo_auth`.
         local_solo_enabled: crate::api::ui_protocol::supports_local_solo_profile_create(&state),
         scoped_profile,
     }))
@@ -2395,6 +2399,7 @@ mod tests {
         ));
         let state = AppState {
             auth_token: Some("bootstrap-token".into()),
+            solo_login_enabled: true,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
