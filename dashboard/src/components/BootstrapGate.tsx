@@ -51,11 +51,14 @@ export default function BootstrapGate({ children }: { children: React.ReactNode 
       }
 
       // Solo hosts have no password to rotate — the no-password solo login
-      // IS the setup. Never force the rotate-token wizard there (it stays
-      // reachable from the sidebar for anyone who wants it).
+      // IS the setup, so don't force the rotate-token wizard there (it stays
+      // reachable from the sidebar). But a Local host that ALSO exposes
+      // admin-token login still has a live bootstrap token that must be
+      // rotated, so only bypass when admin-token login is absent.
       if (
         authStatusRes.status === 'fulfilled' &&
-        authStatusRes.value.local_solo_enabled
+        authStatusRes.value.local_solo_enabled &&
+        !authStatusRes.value.admin_token_login_enabled
       ) {
         setDecision({ redirectTo: null, path: location.pathname })
         return

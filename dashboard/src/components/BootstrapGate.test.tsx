@@ -153,6 +153,24 @@ describe('BootstrapGate', () => {
     expect(screen.queryByTestId('welcome')).not.toBeInTheDocument()
   })
 
+  it('still forces rotation on a solo-capable host that also exposes admin-token login', async () => {
+    // local_solo_enabled is true for any Local host with stores, but if an
+    // admin token is also configured (admin_token_login_enabled) there is a
+    // live bootstrap token to rotate — the gate must NOT be bypassed.
+    mockGetTokenStatus.mockResolvedValue({ rotated: false })
+    mockGetSetupState.mockResolvedValue({
+      wizard_completed_at: null,
+      wizard_skipped: false,
+      wizard_last_step_reached: 0,
+    })
+    mockAuthStatus.mockResolvedValue({
+      local_solo_enabled: true,
+      admin_token_login_enabled: true,
+    })
+    renderAt('/')
+    await waitFor(() => expect(screen.getByTestId('welcome')).toBeInTheDocument())
+  })
+
   it('bypasses the gate for non-admin users', async () => {
     isAdminMock = false
     renderAt('/')

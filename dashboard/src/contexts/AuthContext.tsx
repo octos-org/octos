@@ -121,14 +121,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await authApi.soloCreate(body)
       localStorage.setItem('octos_session_token', res.token)
       setToken(res.token)
-      // soloCreate returns the profile fields + token but not a full User;
-      // fetch the canonical principal via /me now that the token is live.
+      // Establish the principal directly from the create result so AuthGuard
+      // always has a user — even if the follow-up /me refresh fails (which
+      // would otherwise bounce the operator back to /login with no error).
+      // The local solo owner is created with the admin role server-side.
+      setUser({
+        id: res.user_id,
+        email: res.email,
+        name: res.name,
+        role: 'admin',
+        created_at: new Date().toISOString(),
+        last_login_at: null,
+      })
+      // Refine with the canonical principal + tenant scope when reachable.
       try {
         const me = await authApi.me()
         setUser(me.user)
         setScopedProfile(me.scoped_profile ?? null)
       } catch {
-        // best-effort
+        // best-effort refine — the create-derived user already unblocks the guard
       }
     },
     [],
