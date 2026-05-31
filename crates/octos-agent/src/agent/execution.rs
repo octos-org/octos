@@ -23,10 +23,11 @@
 //! tools still serializes the whole batch. An optimised "run Safe in parallel,
 //! then Exclusive in order" pipeline is explicitly deferred (see the M8.8 spec).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::Result;
-use octos_core::{Message, MessageRole, TokenUsage};
+use octos_core::{Message, MessageRole, SessionScope, TokenUsage};
 use octos_llm::ChatResponse;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -67,6 +68,16 @@ fn should_auto_send_tool_files(
     tool_name: &str,
 ) -> bool {
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
+}
+
+pub(super) fn session_scope_for_messages(
+    scope: &Option<Arc<SessionScope>>,
+    messages: &[Message],
+) -> Option<Arc<SessionScope>> {
+    scope.as_ref().map(|scope| {
+        let handles = messages.iter().flat_map(|message| message.media.iter());
+        Arc::new(scope.as_ref().clone().with_attached_upload_handles(handles))
+    })
 }
 
 /// Issue #896 — spawn_only filename propagation (Layer 1).
@@ -171,12 +182,12 @@ pub(super) fn satisfied_completion_content(output_files: &[String], tool_output:
 /// Empirical validation (llm-benchmark replay of mini3 session
 /// slides-1780013669236-8w2ime, the production failure that motivated
 /// this fix):
-///   - kimi-k2.5 + only `check_workspace_contract`:
-///       loop rate 5/5 → 3/5 with this block (40% break out)
-///   - kimi-k2.5 + check + read_file + list_dir:
-///       no consistent change (within noise)
-///   - claude-opus-4.7:
-///       already 0/5 loops in both arms; block has no effect on Opus
+/// - kimi-k2.5 + only `check_workspace_contract`:
+///   loop rate 5/5 → 3/5 with this block (40% break out)
+/// - kimi-k2.5 + check + read_file + list_dir:
+///   no consistent change (within noise)
+/// - claude-opus-4.7:
+///   already 0/5 loops in both arms; block has no effect on Opus
 ///
 /// The block follows hermes-agent's prompt-time-injection pattern (in
 /// `agent/prompt_builder.py`), but applied universally rather than
@@ -229,6 +240,7 @@ impl Agent {
         tool_call: &octos_core::ToolCall,
         explicit_send_file_requested: bool,
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
+        session_scope: Option<Arc<SessionScope>>,
     ) -> JoinHandle<ToolCallResult> {
         // Clone Arc-wrapped fields so the spawned task is 'static
         let tools = self.tools.clone();
@@ -274,12 +286,11 @@ impl Agent {
         // `ctx.spawn_depth` and refuses further nesting at the cap.
         let spawn_depth = self.spawn_depth;
         // Phase 1 of the SessionScope migration (PR #1198 follow-up):
-        // snapshot the agent's `session_scope` so the foreground and
-        // spawn_only `ToolContext` builders below thread it onto every
-        // tool call. `None` keeps pre-Phase-1 behaviour; downstream
-        // consumers (pipeline workers, file tools, plugins) come online
-        // in Phase 2.
-        let session_scope = self.session_scope.clone();
+        // snapshot the effective per-turn `session_scope` so the
+        // foreground and spawn_only `ToolContext` builders below thread it
+        // onto every tool call. The caller layers current/history upload
+        // media onto the scope before dispatch so multi-tenant upload
+        // handles remain session-bound.
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -1655,6 +1666,7 @@ impl Agent {
     pub(super) async fn execute_tools(
         &self,
         response: &ChatResponse,
+        session_scope: Option<Arc<SessionScope>>,
     ) -> Result<(
         Vec<Message>,
         Vec<std::path::PathBuf>,
@@ -1727,6 +1739,7 @@ impl Agent {
                 response,
                 explicit_send_file_requested,
                 &turn_attachment_ctx,
+                session_scope,
                 tool_timeout,
                 tool_timeout_secs,
             )
@@ -1742,6 +1755,7 @@ impl Agent {
                         tool_call,
                         explicit_send_file_requested,
                         &turn_attachment_ctx,
+                        session_scope.clone(),
                     )
                 })
                 .collect();
@@ -1879,6 +1893,7 @@ impl Agent {
         response: &ChatResponse,
         explicit_send_file_requested: bool,
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
+        session_scope: Option<Arc<SessionScope>>,
         tool_timeout: Duration,
         tool_timeout_secs: u64,
     ) -> Vec<ToolCallResult> {
@@ -1898,8 +1913,12 @@ impl Agent {
                 continue;
             }
 
-            let handle =
-                self.spawn_tool_task(tool_call, explicit_send_file_requested, turn_attachment_ctx);
+            let handle = self.spawn_tool_task(
+                tool_call,
+                explicit_send_file_requested,
+                turn_attachment_ctx,
+                session_scope.clone(),
+            );
 
             let outcome = match tokio::time::timeout(tool_timeout, handle).await {
                 Ok(Ok(r)) => r,
@@ -2009,8 +2028,24 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 mod tests {
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
-        satisfied_completion_content, should_auto_send_tool_files,
+        satisfied_completion_content, session_scope_for_messages, should_auto_send_tool_files,
     };
+    use octos_core::{Message, MessageRole, SessionScope};
+    use std::sync::Arc;
+
+    fn message_with_media(media: Vec<&str>) -> Message {
+        Message {
+            role: MessageRole::User,
+            content: String::new(),
+            media: media.into_iter().map(str::to_string).collect(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
 
     #[test]
     fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
@@ -2021,6 +2056,29 @@ mod tests {
     #[test]
     fn auto_send_respects_global_suppression_flag() {
         assert!(!should_auto_send_tool_files(true, false, "mofa_slides"));
+    }
+
+    #[test]
+    fn session_scope_for_messages_collects_upload_handles_from_media_history() {
+        let tenant = tempfile::tempdir().unwrap();
+        let scope = Some(Arc::new(
+            SessionScope::multi_tenant_with_default_zones(
+                tenant.path().to_path_buf(),
+                "dspfac".into(),
+                "web-1".into(),
+            )
+            .unwrap(),
+        ));
+        let messages = vec![
+            message_with_media(vec!["up/current-payload/current.md", "workspace/file.md"]),
+            message_with_media(vec!["up/history-payload/history.md"]),
+        ];
+
+        let scoped = session_scope_for_messages(&scope, &messages).unwrap();
+
+        assert!(scoped.allows_upload_handle("up/current-payload"));
+        assert!(scoped.allows_upload_handle("up/history-payload/renamed.md"));
+        assert!(!scoped.allows_upload_handle("up/foreign-payload/foreign.md"));
     }
 
     #[test]

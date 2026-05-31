@@ -403,6 +403,12 @@ pub struct SessionScope {
     /// higher-priority classifications even when a skill_dir happens
     /// to live inside them.
     skill_read_zones: Vec<PathBuf>,
+    /// Upload handles that were explicitly attached to this session
+    /// through current or historical message media. This is deliberately
+    /// not serialized into diagnostics: handles are bearer references to
+    /// process-global upload tmpdir entries.
+    #[serde(skip_serializing)]
+    attached_upload_handles: Vec<String>,
 }
 
 /// Canonical names of shared zones under `<root>` for the dspfac /
@@ -480,6 +486,7 @@ impl SessionScope {
                 shared_zones,
             },
             skill_read_zones: Vec::new(),
+            attached_upload_handles: Vec::new(),
         })
     }
 
@@ -520,6 +527,7 @@ impl SessionScope {
             root: cwd,
             mode: ScopeMode::Solo { granted_dirs },
             skill_read_zones: Vec::new(),
+            attached_upload_handles: Vec::new(),
         })
     }
 
@@ -550,6 +558,55 @@ impl SessionScope {
     /// reach. See the `skill_read_zones` field doc on [`SessionScope`].
     pub fn skill_read_zones(&self) -> &[PathBuf] {
         &self.skill_read_zones
+    }
+
+    /// Return upload handles that were explicitly attached to this
+    /// session's current or historical user-visible media.
+    pub fn attached_upload_handles(&self) -> &[String] {
+        &self.attached_upload_handles
+    }
+
+    /// Return a new `SessionScope` with the attached-upload allowlist
+    /// replaced by `handles`.
+    ///
+    /// Handles are normalized to the opaque identity portion
+    /// (`up/<payload>`) so callers may pass either the full
+    /// `up/<payload>/<display-name>` form or the shorter form that LLMs
+    /// often retain. Non-upload values are ignored.
+    pub fn with_attached_upload_handles<I, S>(mut self, handles: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized = Vec::new();
+        for handle in handles {
+            let Some(key) = upload_handle_key(handle.as_ref()) else {
+                continue;
+            };
+            if !normalized.iter().any(|existing| existing == &key) {
+                normalized.push(key);
+            }
+        }
+        self.attached_upload_handles = normalized;
+        self
+    }
+
+    /// Whether this scope may resolve the given upload handle.
+    ///
+    /// Multi-tenant sessions must have explicitly attached the handle in
+    /// the current turn or conversation history. Solo mode keeps the
+    /// historical developer-CWD behavior: upload handles are not a tenant
+    /// boundary there, so no allowlist is required.
+    pub fn allows_upload_handle(&self, handle: &str) -> bool {
+        let Some(key) = upload_handle_key(handle) else {
+            return false;
+        };
+        if !matches!(self.mode, ScopeMode::MultiTenant { .. }) {
+            return true;
+        }
+        self.attached_upload_handles
+            .iter()
+            .any(|allowed| allowed == &key)
     }
 
     /// Return a new `SessionScope` with `skill_read_zones` replacing
@@ -729,6 +786,14 @@ impl SessionScope {
     }
 }
 
+fn upload_handle_key(handle: &str) -> Option<String> {
+    let mut parts = handle.split('/');
+    match (parts.next(), parts.next()) {
+        (Some("up"), Some(payload)) if !payload.is_empty() => Some(format!("up/{payload}")),
+        _ => None,
+    }
+}
+
 /// Canonicalise a path, walking ancestors when the leaf doesn't exist
 /// yet (writes targeting new files inside an existing directory).
 /// Mirrors `octos_agent::tools::canonicalize_lossy` (and
@@ -881,6 +946,26 @@ mod tests {
         assert_eq!(scope.root(), cwd);
         assert_eq!(scope.workspace(), cwd);
         assert!(scope.shared_zones().is_empty());
+    }
+
+    #[test]
+    fn multi_tenant_upload_handles_require_explicit_attachment() {
+        let data = abs("/octos/profiles/dspfac/data");
+        let scope = mt_default(&data, "web-1")
+            .with_attached_upload_handles(["up/abc123/report.md", "not-an-upload"]);
+
+        assert_eq!(scope.attached_upload_handles(), &["up/abc123".to_string()]);
+        assert!(scope.allows_upload_handle("up/abc123"));
+        assert!(scope.allows_upload_handle("up/abc123/renamed.md"));
+        assert!(!scope.allows_upload_handle("up/other/report.md"));
+    }
+
+    #[test]
+    fn solo_upload_handles_do_not_require_attachment_allowlist() {
+        let cwd = abs("/home/yc/my-project");
+        let scope = SessionScope::solo(cwd, vec![]).unwrap();
+
+        assert!(scope.allows_upload_handle("up/other/report.md"));
     }
 
     #[test]

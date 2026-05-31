@@ -651,6 +651,72 @@ mod tests {
         assert!(result.output.contains("shared notes"));
     }
 
+    #[tokio::test]
+    async fn read_file_refuses_multi_tenant_upload_handle_not_attached_to_session() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("read-{}-foreign.txt", std::process::id()));
+        std::fs::write(&uploaded, "foreign upload\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("foreign.txt"))
+                .unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data_dir.path().to_path_buf(),
+            "dspfac".into(),
+            "web-b".into(),
+        )
+        .unwrap();
+        let tool = ReadFileTool::new(scope.workspace());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": handle}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result.output.contains("not attached to this session"),
+            "expected upload attachment rejection, got: {}",
+            result.output
+        );
+
+        let _ = std::fs::remove_file(&uploaded);
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_multi_tenant_upload_handle_attached_to_session() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("read-{}-own.txt", std::process::id()));
+        std::fs::write(&uploaded, "own upload\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("own.txt")).unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data_dir.path().to_path_buf(),
+            "dspfac".into(),
+            "web-a".into(),
+        )
+        .unwrap()
+        .with_attached_upload_handles([handle.as_str()]);
+        let tool = ReadFileTool::new(scope.workspace());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": handle}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(result.output.contains("own upload"));
+
+        let _ = std::fs::remove_file(&uploaded);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn read_file_refuses_ancestor_symlink_escape() {

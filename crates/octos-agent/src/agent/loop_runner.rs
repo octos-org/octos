@@ -2000,6 +2000,8 @@ impl Agent {
         // from content prefixes (which missed shell timeouts, sandbox
         // path rejections, browser nav failures, etc.).
         let mut tool_success: Vec<(String, bool)> = Vec::new();
+        let session_scope =
+            super::execution::session_scope_for_messages(&self.session_scope, messages);
         for batch in tool_batches {
             let mut batch_response = limited_response.clone();
             batch_response.tool_calls = batch.to_vec();
@@ -2010,7 +2012,9 @@ impl Agent {
                 batch_tokens,
                 batch_metadata,
                 batch_success,
-            ) = self.execute_tools(&batch_response).await?;
+            ) = self
+                .execute_tools(&batch_response, session_scope.clone())
+                .await?;
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
@@ -2058,9 +2062,7 @@ impl Agent {
                 let Some(&(name, args)) = id_to_call.get(id) else {
                     continue;
                 };
-                if let Some(hint) =
-                    loop_detector.record_result(name, args, &message.content)
-                {
+                if let Some(hint) = loop_detector.record_result(name, args, &message.content) {
                     message.content.push_str(&hint);
                 }
             }

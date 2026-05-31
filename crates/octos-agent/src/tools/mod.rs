@@ -892,6 +892,13 @@ fn resolve_for_scope(
     // `SessionScope` does not currently expose; tracked as a follow-up
     // (issue #1367).
     if user_path.starts_with("up/") {
+        let decoded_upload_handle = matches!(
+            octos_bus::file_handle::decode_file_handle(user_path),
+            Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+        );
+        if decoded_upload_handle && !scope.allows_upload_handle(user_path) {
+            return Err("Uploaded file is not attached to this session");
+        }
         match octos_bus::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
             Ok(resolved)
                 if resolved.scope == octos_bus::file_handle::ToolPathScope::UploadTmpdir =>
@@ -910,10 +917,7 @@ fn resolve_for_scope(
                 // the same literal path). The temp file may have been deleted or
                 // no longer canonicalises under the upload root — report it as a
                 // missing upload rather than masking it as a workspace path.
-                if matches!(
-                    octos_bus::file_handle::decode_file_handle(user_path),
-                    Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
-                ) {
+                if decoded_upload_handle {
                     return Err("Uploaded file not found");
                 }
                 // A value that merely starts with `up/` but does NOT decode as a
@@ -1532,6 +1536,56 @@ mod path_tests {
             resolve_path_for_session_scope_write(&scope, &handle).is_err(),
             "writes to an upload handle must be refused"
         );
+
+        let _ = std::fs::remove_file(&uploaded);
+    }
+
+    #[test]
+    fn multi_tenant_session_rejects_unattached_upload_handle() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
+        let uploaded = upload_root.join(format!("mt-{}-foreign.md", std::process::id()));
+        std::fs::write(&uploaded, b"foreign session upload\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("foreign.md"))
+                .expect("encode upload handle");
+
+        let tenant = tempfile::tempdir().expect("tenant data dir");
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            tenant.path().to_path_buf(),
+            "dspfac".into(),
+            "web-b".into(),
+        )
+        .unwrap();
+
+        let err = resolve_path_for_session_scope_read(&scope, &handle)
+            .expect_err("foreign upload handle must be rejected");
+        assert_eq!(err, "Uploaded file is not attached to this session");
+
+        let _ = std::fs::remove_file(&uploaded);
+    }
+
+    #[test]
+    fn multi_tenant_session_resolves_attached_upload_handle() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
+        let uploaded = upload_root.join(format!("mt-{}-own.md", std::process::id()));
+        std::fs::write(&uploaded, b"own session upload\n").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("own.md"))
+            .expect("encode upload handle");
+
+        let tenant = tempfile::tempdir().expect("tenant data dir");
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            tenant.path().to_path_buf(),
+            "dspfac".into(),
+            "web-a".into(),
+        )
+        .unwrap()
+        .with_attached_upload_handles([handle.as_str()]);
+
+        let resolved = resolve_path_for_session_scope_read(&scope, &handle)
+            .expect("attached upload handle must resolve");
+        assert_eq!(resolved, std::fs::canonicalize(&uploaded).unwrap());
 
         let _ = std::fs::remove_file(&uploaded);
     }
