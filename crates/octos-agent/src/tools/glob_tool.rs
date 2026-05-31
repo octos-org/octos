@@ -126,6 +126,26 @@ impl Tool for GlobTool {
             });
         }
 
+        // Interim mitigation (#1378, superseded by #1377): redirect upload-handle
+        // / `up/` namespace patterns to read_file BEFORE globbing, so a decoded
+        // handle is never returned as a workspace match (consistent with
+        // read_file/list_dir which treat decoded `up/...` as uploads). A
+        // non-handle `up/...` beside a real `up/` dir returns None and globs
+        // normally; one with no real `up/` dir is redirected here rather than
+        // surfacing the misleading empty "No files found".
+        let ws_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|s| s.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
+        if let Some(guidance) = super::upload_namespace_redirect(&pattern, &ws_root) {
+            return Ok(ToolResult {
+                output: guidance.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let scope = ctx.session_scope.clone();
         let base_dir = self.base_dir.clone();
         let pattern_clone = pattern.clone();
@@ -411,6 +431,140 @@ fn run_glob_legacy(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn glob_on_upload_handle_namespace_returns_guidance() {
+        // #1378: glob('up/**') can never match (uploads live outside the
+        // workspace), so redirect to read_file instead of an empty "no
+        // matches" that reads as "the upload is gone".
+        let dir = tempfile::tempdir().unwrap();
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "up/**"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("opaque upload handle") && result.output.contains("read_file"),
+            "expected upload guidance, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn glob_does_not_hijack_a_real_workspace_up_directory() {
+        // codex #1378 P2: a repo with a genuine `up/` dir must glob normally —
+        // matches return files; a no-match returns "No files found", NOT upload
+        // guidance.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("up")).unwrap();
+        std::fs::write(dir.path().join("up/a.rs"), "").unwrap();
+        let tool = GlobTool::new(dir.path());
+
+        let hit = tool
+            .execute(&serde_json::json!({"pattern": "up/*.rs"}))
+            .await
+            .unwrap();
+        assert!(
+            hit.success && hit.output.contains("a.rs"),
+            "got: {}",
+            hit.output
+        );
+        assert!(!hit.output.contains("opaque upload handle"));
+
+        let miss = tool
+            .execute(&serde_json::json!({"pattern": "up/*.toml"}))
+            .await
+            .unwrap();
+        assert!(
+            miss.output.contains("No files found"),
+            "real up/ dir with no match must say No files found, got: {}",
+            miss.output
+        );
+        assert!(!miss.output.contains("opaque upload handle"));
+    }
+
+    #[tokio::test]
+    async fn glob_guides_when_up_is_a_regular_file_not_a_dir() {
+        // codex round-2 P3: `up` is a regular FILE (not a dir), so glob('up/**')
+        // can't enumerate it — guidance should still fire (is_dir, not exists).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("up"), "i am a file").unwrap();
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "up/**"}))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("opaque upload handle"),
+            "expected guidance when up is a file, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn glob_guides_for_a_decoded_handle_even_with_a_real_up_dir() {
+        // codex round-3 P2: a syntactically valid upload handle must redirect to
+        // read_file even when the workspace also has a real `up/` directory —
+        // glob must not fall back to "No files found".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("up")).unwrap();
+        std::fs::write(dir.path().join("up/decoy.rs"), "").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
+            &octos_bus::file_handle::temp_upload_root().join("u-x-report.md"),
+            Some("report.md"),
+        )
+        .expect("encode upload handle");
+
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": handle }))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("opaque upload handle"),
+            "expected guidance for a decoded handle despite a real up/ dir, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn glob_redirects_decoded_handle_even_when_it_matches_a_real_path() {
+        // codex round-5 P2: a decoded handle whose literal path ALSO exists in
+        // the workspace must still redirect to read_file (upload-handle
+        // precedence, consistent with read_file/list_dir), NOT be returned as a
+        // glob match. The redirect runs BEFORE the glob walk.
+        let dir = tempfile::tempdir().unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
+            &octos_bus::file_handle::temp_upload_root().join("u-collide-report.md"),
+            Some("report.md"),
+        )
+        .expect("encode handle");
+        // Plant a real workspace file at the handle's literal path so a naive
+        // glob would match it.
+        let lit = dir.path().join(&handle);
+        std::fs::create_dir_all(lit.parent().unwrap()).unwrap();
+        std::fs::write(&lit, "decoy").unwrap();
+
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": handle }))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("opaque upload handle"),
+            "decoded handle must redirect even when its literal path exists, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Found "),
+            "must NOT return the colliding workspace match, got: {}",
+            result.output
+        );
+    }
 
     #[tokio::test]
     async fn test_glob_finds_files() {

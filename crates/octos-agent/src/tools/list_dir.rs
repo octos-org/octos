@@ -76,12 +76,42 @@ impl Tool for ListDirTool {
     ) -> Result<ToolResult> {
         let input: Input = serde_json::from_value(args.clone())?;
 
+        // Interim mitigation (#1378, superseded by #1377): `up/<base64>/<name>`
+        // is an opaque upload handle, not a browsable directory. When the input
+        // targets that namespace and doesn't resolve to a real listable entry,
+        // return guidance pointing the model at `read_file` instead of a
+        // misleading "Directory not found" (observed to make models — incl.
+        // gemini-2.5-pro on replay — give up on a file they can read). The gate
+        // (shared with `glob`) redirects only for a genuine upload handle OR
+        // when there's no real `up/` directory, so a repo that uses `up/` as a
+        // normal folder keeps its normal behaviour.
+        //
+        // CRITICAL (codex round-6 P3): this substitution is applied ONLY on the
+        // not-found / not-a-dir exits — NEVER on a resolver error. A traversal /
+        // out-of-scope violation (`up/../secret`) must surface as the real
+        // "Path outside session scope" error, not be masked as upload confusion.
+        let ws_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|s| s.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
+        let up_guidance = super::upload_namespace_redirect(&input.path, &ws_root);
+        let fail = |orig: String| -> ToolResult {
+            ToolResult {
+                output: up_guidance.map(str::to_string).unwrap_or(orig),
+                success: false,
+                ..Default::default()
+            }
+        };
+
         // PR-B: when the host has threaded a `SessionScope` through
         // `ToolContext`, validate the directory against it (same
         // classification semantics as `read_file` — InWorkspace,
         // InGrantedDir, InSharedZone, and InSkillDir all permit reads).
         // No scope wired => keep the legacy `base_dir + FilesystemScope`
         // path for backward compatibility with `octos chat`.
+        // Resolver errors are returned VERBATIM (no upload guidance) so policy
+        // violations are reported as such.
         let target = match ctx.session_scope.as_ref() {
             Some(scope) => match super::resolve_path_for_session_scope_read(scope, &input.path) {
                 Ok(p) => p,
@@ -114,19 +144,11 @@ impl Tool for ListDirTool {
         }
 
         if !target.exists() {
-            return Ok(ToolResult {
-                output: format!("Error: Directory not found: {}", input.path),
-                success: false,
-                ..Default::default()
-            });
+            return Ok(fail(format!("Error: Directory not found: {}", input.path)));
         }
 
         if !target.is_dir() {
-            return Ok(ToolResult {
-                output: format!("Error: Not a directory: {}", input.path),
-                success: false,
-                ..Default::default()
-            });
+            return Ok(fail(format!("Error: Not a directory: {}", input.path)));
         }
 
         let mut entries = match tokio::fs::read_dir(&target).await {
@@ -278,6 +300,107 @@ mod tests {
             "expected both .toml entries, got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn list_dir_on_upload_handle_namespace_returns_guidance() {
+        // #1378: list_dir('up') / list_dir('up/<handle>') must not return the
+        // misleading "Directory not found"; it returns guidance pointing the
+        // model at read_file so it stops looping into "please re-upload".
+        let workspace = TempDir::new().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let tool = ListDirTool::new(workspace.path());
+        let ctx = ctx_with_scope(scope);
+
+        for p in ["up", "up/MDE5_handle/report.md"] {
+            let result = tool
+                .execute_with_context(&ctx, &serde_json::json!({ "path": p }))
+                .await
+                .unwrap();
+            assert!(!result.success, "expected non-success for {p:?}");
+            assert!(
+                result.output.contains("opaque upload handle")
+                    && result.output.contains("read_file"),
+                "expected upload guidance for {p:?}, got: {}",
+                result.output
+            );
+            assert!(
+                !result.output.contains("Directory not found"),
+                "must NOT return the misleading not-found for {p:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_up_traversal_keeps_scope_error_not_upload_guidance() {
+        // codex round-6 P3: a traversal/out-of-scope violation under the up/
+        // namespace must surface as the real scope error, NOT be masked as
+        // upload-handle confusion (the substitution is failure-exit-only and
+        // never replaces a resolver error).
+        let workspace = TempDir::new().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let tool = ListDirTool::new(workspace.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({ "path": "up/../secret" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("outside session scope"),
+            "traversal under up/ must report the scope error, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("opaque upload handle"),
+            "a policy violation must NOT be masked as upload guidance"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_lists_a_real_workspace_up_directory() {
+        // codex #1378 P2: the guard is a FALLBACK — a repo that genuinely has
+        // an `up/` directory must list normally, NOT get hijacked by upload
+        // guidance.
+        let workspace = TempDir::new().unwrap();
+        std::fs::create_dir(workspace.path().join("up")).unwrap();
+        std::fs::write(workspace.path().join("up/keep.txt"), "x").unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let tool = ListDirTool::new(workspace.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({ "path": "up" }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "a real up/ dir must list, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("keep.txt"),
+            "expected up/ contents, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("opaque upload handle"),
+            "must NOT show upload guidance for a real up/ dir"
+        );
+
+        // codex round-2 P2: a normal file UNDER a real up/ dir keeps its normal
+        // error, not upload guidance.
+        let not_dir = tool
+            .execute_with_context(&ctx, &serde_json::json!({ "path": "up/keep.txt" }))
+            .await
+            .unwrap();
+        assert!(
+            not_dir.output.contains("Not a directory"),
+            "up/keep.txt under a real up/ dir must say Not a directory, got: {}",
+            not_dir.output
+        );
+        assert!(!not_dir.output.contains("opaque upload handle"));
     }
 
     #[tokio::test]
