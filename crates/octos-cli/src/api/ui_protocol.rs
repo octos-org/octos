@@ -16459,69 +16459,39 @@ async fn run_standalone_turn(
         if scope.workspace() == session_runtime.workspace_root.as_path() {
             request_agent = request_agent.with_session_scope(scope.clone());
         } else {
-            // Phase 3-A codex round-4 (rolling back rounds 2/3): for
-            // hint sessions (the workspace mismatch case), do NOT
-            // propagate any SessionScope onto the per-turn agent —
-            // keep them on the pre-Phase-3-A `session_scope: None`
-            // path. Rationale + history:
+            // #1377 Phase-3-B: this branch is now a DEFENSIVE FALLBACK
+            // that should be unreachable. `SessionRuntime::bootstrap`
+            // now roots the scope at the session's REAL `workspace_root`
+            // for every shape — channel-prefixed (`:`) ids via the
+            // encoded-path workspace, and coding-agent `workspace_hint`
+            // sessions via a repo-rooted scope (root == workspace) — so
+            // `scope.workspace() == session_runtime.workspace_root`
+            // holds by construction and the `if` branch above fires.
             //
-            // - Round-2 synthesized a workspace-rooted solo scope so
-            //   the Phase-2 consumers' boundary check would kick in,
-            //   addressing codex round-1's plugin path-escape concern.
-            //   But that introduced an upload-handle regression
-            //   (codex round-2 P2): the new scope-aware resolver
-            //   classified `up/...` and absolute upload-tmpdir paths
-            //   as OutOfScope, breaking attachment resolution.
-            // - Round-3 added `temp_upload_root()` as a granted_dir to
-            //   close the absolute-path arm, but codex round-3 P2
-            //   showed two remaining gaps the scoped resolver still
-            //   can't handle: (a) `up/...` handles are not decoded by
-            //   `resolve_path_for_session_scope_*` (they're treated as
-            //   workspace-relative `<workspace>/up/...`); (b) on macOS
-            //   the canonical upload root is `/private/var/folders/...`
-            //   while `temp_upload_root()` returns `/var/folders/...`
-            //   — the plugin tool's LEXICAL classifier doesn't follow
-            //   firmlinks, so canonical paths and decoded handles
-            //   remain OutOfScope.
+            // The earlier rounds deliberately skipped propagation for
+            // the workspace-mismatch (hint) case because the scoped
+            // resolver misclassified `up/...` handles and absolute
+            // upload-tmpdir paths as OutOfScope. That blocker is gone:
+            // uploads are now materialized into `<workspace>/uploads/`
+            // at turn start and read by their workspace-relative path,
+            // so there are no raw `up/` handles left for the scoped
+            // resolver to misclassify (a pasted foreign `up/` handle is
+            // instead REFUSED by the tenant-ownership gate — the goal).
             //
-            // Both of those gaps are properly addressed in `octos-bus`
-            // (handle decoding) and `octos-agent` plugins (canonical
-            // classification) — i.e. Phase-2 consumer changes that the
-            // user explicitly bounded out of this PR ("stay in
-            // plumbing — additive scope propagation only"). Until a
-            // follow-up Phase 3-B PR closes those, the safer landing
-            // for THIS PR is to leave hint sessions on their
-            // pre-existing legacy (None) behaviour: handle resolution
-            // works through `resolve_tool_path` as before; the
-            // pre-existing plugin path-escape risk codex round-1
-            // surfaced is NEITHER introduced NOR closed by this PR
-            // (it's pre-existing — Phase-2 PRs are the right place to
-            // close it via either a bootstrap-side scope rebuild for
-            // hint sessions or scope-aware handle decoding).
-            //
-            // Default-layout sessions (the common mini5 NEW-06 path)
-            // still get full propagation through the `if` branch
-            // above. This gate ONLY skips for hint sessions whose
-            // cached scope was built under the canonical
-            // `<data>/users/<id>/workspace` layout while
-            // workspace_root tracks a caller-supplied repo path.
-            //
-            // TODO(phase3b): reconcile `SessionRuntime::bootstrap`'s
-            // SessionScope construction with `workspace_hint` (build
-            // `SessionScope::solo` from workspace_root for hint
-            // sessions, with `temp_upload_root` granted and canonical
-            // upload root pre-resolved) so this skip branch becomes
-            // unreachable and hint sessions also benefit from the
-            // Phase-2 consumer boundary checks.
-            tracing::debug!(
+            // If we ever DO land here (a scope whose workspace does not
+            // match the turn's workspace_root), propagating it would
+            // misresolve relative paths against the wrong directory, so
+            // the safe action is still to skip and fall back to the
+            // legacy resolver. Log at warn so the unexpected mismatch is
+            // visible rather than silent.
+            tracing::warn!(
                 session = %session_id.0,
                 turn = %turn_id.0,
                 scope_workspace = %scope.workspace().display(),
                 runtime_workspace = %session_runtime.workspace_root.display(),
-                "skipping SessionScope propagation onto per-turn agent: \
-                 scope workspace does not match SessionRuntime.workspace_root \
-                 (likely a coding-agent hint session); falling back to \
-                 legacy unread-scope behaviour pending phase3b resolver work"
+                "SessionScope workspace does not match SessionRuntime.workspace_root; \
+                 NOT propagating (bootstrap should root every scope at workspace_root — \
+                 this branch is expected to be unreachable post-#1377 Phase-3-B)"
             );
         }
     }
