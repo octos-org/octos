@@ -1977,13 +1977,17 @@ async fn dispatch_background_result_to_actor(
             false
         }
         Err(_) => {
+            // The actor accepted the queued BackgroundResult. A slow ack only
+            // means persistence is still pending behind current actor work; it
+            // does not prove the verified artifact failed to persist.
             record_retry("background_result_ack_timeout");
-            warn!(
+            debug!(
                 task_label,
                 timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
-                "timed out waiting for background result actor acknowledgment"
+                "timed out waiting for background result actor acknowledgment; \
+                 treating accepted actor enqueue as pending persistence"
             );
-            false
+            true
         }
     }
 }
@@ -13615,6 +13619,47 @@ mod tests {
         assert!(
             persisted,
             "producer should return the acked persistence flag"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn background_result_ack_timeout_still_counts_as_actor_accepted_for_octos_889() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dispatch = tokio::spawn(dispatch_background_result_to_actor(
+            tx,
+            BackgroundResultPayload {
+                task_label: "fm_tts".to_string(),
+                content: String::new(),
+                kind: BackgroundResultKind::Notification,
+                media: vec!["skill-output/yangmi_1778515952.mp3".to_string()],
+                envelope_media: vec![],
+                originating_thread_id: Some("cmid-yangmi-turn".to_string()),
+                task_id: Some("task-fm-tts".to_string()),
+                tool_call_id: Some("call-fm-tts".to_string()),
+                originating_client_message_id: Some("cmid-yangmi-turn".to_string()),
+                terminal_status: None,
+            },
+        ));
+
+        let message = rx.recv().await.expect("background result enqueued");
+        let ActorMessage::BackgroundResult {
+            task_label,
+            media,
+            ack,
+            ..
+        } = message
+        else {
+            panic!("expected BackgroundResult actor message");
+        };
+        assert_eq!(task_label, "fm_tts");
+        assert_eq!(media, vec!["skill-output/yangmi_1778515952.mp3"]);
+        let _held_ack_sender = ack.expect("dispatch should request durable ack");
+
+        tokio::time::advance(BACKGROUND_RESULT_ACK_TIMEOUT + Duration::from_millis(1)).await;
+        assert!(
+            dispatch.await.expect("dispatch task should join"),
+            "a successfully enqueued background result must not be reported as \
+             persistence failure solely because the actor ack was slow"
         );
     }
 
