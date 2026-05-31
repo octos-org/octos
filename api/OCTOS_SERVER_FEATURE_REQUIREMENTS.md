@@ -39,7 +39,7 @@ logs, prompt text, or private implementation details.
 | ID | Requirement | Priority | Acceptance Criteria | Verification |
 |---|---|---:|---|---|
 | SRV-001 | AppUI protocol source of truth | P0 | All client-visible methods, notifications, params, results, error codes, and feature flags are defined in `octos-core`; no server/client private wire extensions. | core golden tests and API grep gate |
-| SRV-002 | Capability advertisement | P0 | Server advertises only supported AppUI methods/features, including mode-specific limitations or typed `runtime_not_ready` behavior. | protocol e2e capability test |
+| SRV-002 | Capability advertisement | P0 | Server advertises only supported AppUI methods/features, including mode-specific limitations or typed `runtime_unavailable` behavior (the §10 taxonomy code; `runtime_not_ready` is reserved for the REST-503 bridge of auxiliary methods). | protocol e2e capability test |
 | SRV-003 | Session open and replay | P0 | `session/open` creates or rehydrates a session, returns active profile, workspace root, cursor, pane snapshots when supported, and typed errors on invalid cursor/session/cwd. | `m9-protocol-session-open` e2e |
 | SRV-004 | Workspace cwd enforcement | P0 | Requested cwd is canonicalized and accepted only under approved readable/writable roots. Tools execute relative to session cwd, not server launch cwd. | unit tests plus live cwd fixture |
 | SRV-005 | Turn lifecycle | P0 | `turn/start`, `turn/started`, streamed `message/delta`, `turn/completed`, and `turn/error` form a deterministic lifecycle with one active turn per session unless explicitly supported otherwise. | protocol e2e and race tests |
@@ -58,7 +58,7 @@ logs, prompt text, or private implementation details.
 | SRV-018 | Task updates | P0 | Task updates are emitted as AppUI notifications with task id, session id, title, state, runtime detail, and terminal states. Terminal updates survive backpressure. | backpressure tests |
 | SRV-019 | Task output read | P0 | `task/output/read` returns a bounded snapshot projection with cursor, output text, output files, source, and limitations. It must not pretend to be full live-tail unless live-tail is implemented. | task output protocol tests |
 | SRV-020 | Task output live-tail | P1 | Active task output deltas are streamed through `task/output/delta` with cursor monotonicity and duplicate prevention. | live-tail e2e |
-| SRV-021 | Task control API | P1 | AppUI supports task list, cancel, and restart-from-node when advertised. Requests are session/profile scoped and reject missing/invalid scope with typed errors. | task-control protocol e2e |
+| SRV-021 | Task control API | P1 | AppUI supports task list, cancel, and restart-from-node when the `harness.task_control.v1` feature is advertised. Requests are session/profile scoped and reject missing/invalid scope with typed errors. | task-control protocol e2e |
 | SRV-022 | Restart-from-node semantics | P1 | Restart creates a successor task only when runtime can either execute it or explicitly marks it as accepted/pending-runtime. Clients must not mistake placeholder registration for completed restart. | supervisor and protocol tests |
 | SRV-023 | Swarm task lifecycle | P0 | Swarm/subagent tasks expose creation, task id, pending/running/completed/failed/cancelled states, cancellation, progress, structured output, and registry visibility. | swarm/task supervisor tests |
 | SRV-024 | Swarm observability | P1 | Server exposes enough task and progress data for clients to implement `/ps`, status rows, expandable task cards, and agent labels without scraping logs. | AppUI contract tests |
@@ -229,8 +229,11 @@ Known gaps to track against this document:
   and `octos-app` client handling.
 - `task/output/read` is currently a snapshot projection; true disk-routed
   stdout/stderr live-tail is a separate feature.
-- Task-control capability advertisement must define whether support is binary
-  level or runtime-mode level.
+- Task-control capability advertisement is resolved at the feature-flag level:
+  the server gates `task/list`, `task/cancel`, and `task/restart_from_node`
+  behind `harness.task_control.v1`, negotiated per-session and reflected in
+  `SessionOpened.capabilities.supported_methods` so the advertised method set
+  always agrees with the callable surface.
 - Restart-from-node semantics must distinguish accepted placeholder from actual
   re-execution when no relaunch callback is wired.
 - Some client UX needs, such as `/ps`, `/stop`, expandable task cards, and

@@ -965,6 +965,54 @@ fn resolve_for_scope(
     }
 }
 
+/// Interim mitigation (#1378, superseded by #1377): `up/<base64>/<name>` is an
+/// opaque UPLOAD HANDLE, not a browsable directory — and uploaded files live in
+/// a tmpdir *outside* the session workspace, so `list_dir`/`glob` can never
+/// enumerate the `up/` namespace. They returned a bare "Directory not found",
+/// which was observed to make models (deepseek-chat in prod, and gemini-2.5-pro
+/// on replay) wrongly conclude the upload is missing and ask the user to
+/// re-upload — even after a successful `read_file` of the same handle.
+///
+/// Returns guidance to redirect the model when a directory-listing tool is
+/// pointed at the upload-handle namespace (`up` or `up/...`). Matches the EXACT
+/// spelling `read_file`/`resolve_for_scope` accept as a handle (`up/` prefix);
+/// it deliberately does NOT normalise `./up/...` or trim whitespace, because the
+/// read path doesn't either — guiding the model to `read_file("./up/...")` would
+/// just fail there too (codex #1378 round 6). This is a band-aid; the real fix
+/// (#1377) materialises uploads into `<workspace>/uploads/`.
+pub(crate) fn upload_handle_namespace_guidance(path: &str) -> Option<&'static str> {
+    if path == "up" || path.starts_with("up/") {
+        Some(
+            "`up/…` is an opaque upload handle, not a directory — uploaded files \
+             are NOT browsable via list_dir or glob. Read the file directly with \
+             read_file using the exact `up/…` handle from the attachment (you may \
+             already have its contents from a prior read).",
+        )
+    } else {
+        None
+    }
+}
+
+/// Whether a `list_dir`/`glob` failure for `path` should be replaced with
+/// upload guidance, given the session's `workspace_root`. Centralises the gate
+/// so the two tools cannot diverge (codex #1378): redirect iff `path` targets
+/// the `up/` namespace AND it either decodes as a real upload handle OR there is
+/// no real browsable `up/` directory in the workspace. Uses the path verbatim
+/// (no `./`/whitespace normalisation) so the redirect decision matches exactly
+/// what `read_file` would accept as a handle.
+pub(crate) fn upload_namespace_redirect(path: &str, workspace_root: &Path) -> Option<&'static str> {
+    let guidance = upload_handle_namespace_guidance(path)?;
+    let decodes_as_upload = matches!(
+        octos_bus::file_handle::decode_file_handle(path),
+        Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+    );
+    if decodes_as_upload || !workspace_root.join("up").is_dir() {
+        Some(guidance)
+    } else {
+        None
+    }
+}
+
 /// Lexical normalise (collapse `.`, refuse `..`). Mirrors the helper
 /// inside `octos_core::session_scope` so the canonicalize walk above
 /// can't absorb a traversal escape.
@@ -1592,6 +1640,87 @@ mod path_tests {
             resolve_path_for_session_scope_write(&scope, &handle).is_err(),
             "write to a missing upload handle must error"
         );
+    }
+
+    /// Interim guard (#1378): the upload-handle namespace is detected for
+    /// directory-listing tools, and ONLY that namespace — a normal path or a
+    /// directory whose name merely starts with "up" must not be hijacked.
+    #[test]
+    fn upload_handle_namespace_guidance_matches_only_the_up_namespace() {
+        for p in ["up", "up/", "up/abc123/file.md"] {
+            assert!(
+                super::upload_handle_namespace_guidance(p).is_some(),
+                "expected guidance for upload-namespace path {p:?}"
+            );
+        }
+        // Verbatim match (codex round-6): `./up/...` and whitespace variants are
+        // NOT hijacked, because the read path doesn't accept those spellings as
+        // handles either — staying consistent avoids guiding to a failing read.
+        for p in [
+            "uploads/x",
+            "up2/x",
+            "upstream/x",
+            "report.md",
+            "slides/untitled/script.js",
+            "",
+            "/etc/passwd",
+            "./up/abc/file.md",
+            "  up/x  ",
+        ] {
+            assert!(
+                super::upload_handle_namespace_guidance(p).is_none(),
+                "must NOT hijack non-upload-namespace path {p:?}"
+            );
+        }
+        assert!(
+            super::upload_handle_namespace_guidance("up/x")
+                .unwrap()
+                .contains("read_file"),
+            "guidance should point the model at read_file"
+        );
+    }
+
+    /// The centralised gate (#1378): a bare valid handle redirects even beside a
+    /// real `up/` dir (decode precedence); a non-handle `up/...` beside a real
+    /// `up/` dir does NOT (normal workspace path); and `./`-prefixed spellings
+    /// are NOT redirected — the read path doesn't accept them either, so the
+    /// guard stays consistent rather than guiding to a failing read (round-6).
+    #[test]
+    fn upload_namespace_redirect_matches_readfile_acceptance() {
+        let ws = tempfile::tempdir().expect("ws");
+        std::fs::create_dir(ws.path().join("up")).unwrap(); // a REAL up/ dir
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
+            &octos_bus::file_handle::temp_upload_root().join("u-x-report.md"),
+            Some("report.md"),
+        )
+        .expect("encode handle");
+
+        // A bare valid handle decodes → redirect even though a real `up/` dir
+        // exists (decode precedence, consistent with read_file).
+        assert!(
+            super::upload_namespace_redirect(&handle, ws.path()).is_some(),
+            "the bare valid handle must redirect even beside a real up/ dir"
+        );
+        // `./`-prefixed: read_file would NOT treat this as a handle, so neither
+        // do we (no guiding the model to a read that fails).
+        assert!(
+            super::upload_namespace_redirect(&format!("./{handle}"), ws.path()).is_none(),
+            "a ./-prefixed handle must NOT redirect (matches read_file acceptance)"
+        );
+        // Non-handle `up/...` beside a real up/ dir → normal workspace path.
+        assert!(
+            super::upload_namespace_redirect("up/keep.txt", ws.path()).is_none(),
+            "non-handle up/ path beside a real up/ dir must NOT redirect"
+        );
+        assert!(
+            super::upload_namespace_redirect("up", ws.path()).is_none(),
+            "listing the real up/ dir itself must NOT redirect"
+        );
+        // No real up/ dir → any up-namespace path redirects.
+        let empty = tempfile::tempdir().expect("empty ws");
+        assert!(super::upload_namespace_redirect("up", empty.path()).is_some());
+        assert!(super::upload_namespace_redirect("up/x", empty.path()).is_some());
+        assert!(super::upload_namespace_redirect("uploads/x", empty.path()).is_none());
     }
 
     /// PR-A core invariant: write attempts inside a registered

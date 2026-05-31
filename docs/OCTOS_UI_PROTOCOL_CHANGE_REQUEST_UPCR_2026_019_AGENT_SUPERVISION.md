@@ -1,6 +1,6 @@
 # UPCR-2026-019: AppUI Backend-Owned Supervised Task Inspection
 
-Status: proposed
+Status: accepted (implemented)
 Date: 2026-05-15
 
 ## Summary
