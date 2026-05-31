@@ -394,7 +394,11 @@ impl SessionRuntime {
             profile.memory.clone(),
         )
         .with_config(AgentConfig {
-            max_iterations: 20,
+            // Honor the configured `max_iterations` instead of a hardcoded cap.
+            // The previous fixed `20` ignored config AND propagated to spawned
+            // sub-agents (which inherit this config), starving multi-step
+            // background tasks that need more iterations.
+            max_iterations: resolve_session_max_iterations(profile.max_iterations),
             save_episodes: true,
             ..Default::default()
         })
@@ -492,6 +496,15 @@ fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
         .wrap_err("failed to bootstrap session workspace policy")
 }
 
+/// Resolve the per-session agent iteration budget from the profile's
+/// configured `gateway.max_iterations`, falling back to the `AgentConfig`
+/// default when unset. Spawned sub-agents inherit the resulting config, so
+/// this is also the cap for background workers — `None` must not collapse to a
+/// small hardcoded value the way the previous fixed `20` did.
+fn resolve_session_max_iterations(configured: Option<u32>) -> u32 {
+    configured.unwrap_or_else(|| AgentConfig::default().max_iterations)
+}
+
 /// Resolve a per-session workspace root.
 ///
 /// Honors a caller-supplied `workspace_hint` (coding-agent flow) when
@@ -578,6 +591,24 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    #[test]
+    fn resolve_session_max_iterations_honors_config_else_default() {
+        // A configured gateway.max_iterations must be respected (the bug was a
+        // hardcoded 20 that ignored it and starved spawned sub-agents).
+        assert_eq!(resolve_session_max_iterations(Some(120)), 120);
+        assert_eq!(resolve_session_max_iterations(Some(5)), 5);
+        // Unset falls back to the AgentConfig default (50), not the old 20.
+        assert_eq!(
+            resolve_session_max_iterations(None),
+            AgentConfig::default().max_iterations
+        );
+        assert_ne!(
+            resolve_session_max_iterations(None),
+            20,
+            "unset must not collapse to the old hardcoded cap"
+        );
+    }
+
     use octos_agent::sandbox::create_sandbox;
     use octos_agent::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
     use octos_agent::workspace_policy::{
@@ -642,6 +673,7 @@ mod tests {
             plugin_env_template: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
+            max_iterations: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -1122,6 +1154,7 @@ mod tests {
             plugin_env_template: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
+            max_iterations: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -1174,6 +1207,7 @@ mod tests {
             plugin_env_template: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
+            max_iterations: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -1254,6 +1288,7 @@ mod tests {
             plugin_env_template: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
+            max_iterations: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),

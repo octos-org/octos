@@ -33170,6 +33170,7 @@ ignore = []
             plugin_env_template: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
+            max_iterations: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
