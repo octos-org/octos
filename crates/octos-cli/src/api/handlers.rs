@@ -380,7 +380,7 @@ fn standalone_api_session_key_candidates_with_topic(
     Ok(candidates)
 }
 
-fn encode_api_session_path_id(id: &str) -> String {
+pub(crate) fn encode_api_session_path_id(id: &str) -> String {
     octos_bus::session::encode_path_component(id)
 }
 

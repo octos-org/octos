@@ -10141,6 +10141,12 @@ async fn handle_task_cancel(
     // `/api/tasks/{id}/cancel` handler) instead of failing `runtime_unavailable`.
     if state.task_query_store.is_none() {
         if let Some(port) = gateway_task_api_port(state, connection_profile_id).await {
+            if let Err(error) =
+                ensure_task_in_gateway_session(state, port, session_id, &task_id).await
+            {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
             let path = format!("/tasks/{}/cancel", task_id);
             let response = super::webhook_proxy::api_post_proxy_json(
                 state,
@@ -10202,7 +10208,68 @@ async fn handle_task_cancel(
 /// `task_query_store` (`octos serve` runs supervisors in gateway processes).
 async fn gateway_task_api_port(state: &AppState, profile_id: Option<&str>) -> Option<u16> {
     let pm = state.process_manager.as_ref()?;
-    pm.api_port(profile_id?).await
+    // Mirror `resolve_api_port`: prefer the connection's profile, else fall back
+    // to the gateway's first available port (covers no-auth/first-gateway and
+    // admin/routed connections that carry no `connection_profile_id`).
+    if let Some(profile) = profile_id {
+        if let Some(port) = pm.api_port(profile).await {
+            return Some(port);
+        }
+    }
+    pm.first_api_port().await.map(|(_, port)| port)
+}
+
+/// octos#1380: gateway-mode equivalent of [`ensure_task_in_session`] — confirm
+/// `task_id` belongs to `session_id` by proxying the gateway's session task
+/// list, so task-control stays session-scoped (not just profile-scoped) and a
+/// task id from another session in the same profile yields `unknown_task_id`.
+async fn ensure_task_in_gateway_session(
+    state: &AppState,
+    port: u16,
+    session_id: &SessionKey,
+    task_id: &TaskId,
+) -> Result<(), RpcError> {
+    let path = format!(
+        "/sessions/{}/tasks",
+        super::handlers::encode_api_session_path_id(&session_id.to_string())
+    );
+    let response = super::webhook_proxy::api_get_proxy(state, port, &path).await;
+    if !response.status().is_success() {
+        return Err(RpcError::unknown_task_id(task_id));
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| {
+            RpcError::internal_error(format!(
+                "gateway session tasks proxy body read failed: {error}"
+            ))
+        })?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        RpcError::internal_error(format!(
+            "gateway session tasks proxy returned invalid JSON: {error}"
+        ))
+    })?;
+    if json_task_list_contains(&body, &task_id.to_string()) {
+        Ok(())
+    } else {
+        Err(RpcError::unknown_task_id(task_id))
+    }
+}
+
+/// Whether a proxied gateway task-list JSON payload contains `task_id`. Accepts
+/// a bare array or a `{ "tasks": [...] }` wrapper, matching either an `id` or
+/// `task_id` field — defensive against the gateway's untyped task_query shape.
+fn json_task_list_contains(body: &serde_json::Value, task_id: &str) -> bool {
+    let items = body
+        .as_array()
+        .or_else(|| body.get("tasks").and_then(|tasks| tasks.as_array()));
+    match items {
+        Some(items) => items.iter().any(|item| {
+            item.get("id").and_then(|field| field.as_str()) == Some(task_id)
+                || item.get("task_id").and_then(|field| field.as_str()) == Some(task_id)
+        }),
+        None => false,
+    }
 }
 
 /// Map a proxied REST `/tasks/{id}/cancel` gateway response onto the WS
@@ -10312,6 +10379,12 @@ async fn handle_task_restart_from_node(
     // store is wired, mirroring the REST `/api/tasks/{id}/restart-from-node`.
     if state.task_query_store.is_none() {
         if let Some(port) = gateway_task_api_port(state, connection_profile_id).await {
+            if let Err(error) =
+                ensure_task_in_gateway_session(state, port, session_id, &task_id).await
+            {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
             let path = format!("/tasks/{}/restart-from-node", task_id);
             let response = super::webhook_proxy::api_post_proxy_json(
                 state,
@@ -21063,6 +21136,26 @@ ignore = []
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn json_task_list_contains_matches_array_and_wrapped_shapes() {
+        // octos#1380: gateway session-membership check accepts a bare array or a
+        // `{ "tasks": [...] }` wrapper, matching `id` or `task_id`.
+        let id = "01950000-0000-7000-8000-0000000000a1";
+        assert!(json_task_list_contains(
+            &serde_json::json!([{ "id": id }, { "id": "other" }]),
+            id
+        ));
+        assert!(json_task_list_contains(
+            &serde_json::json!({ "tasks": [{ "task_id": id }] }),
+            id
+        ));
+        assert!(!json_task_list_contains(
+            &serde_json::json!([{ "id": "other" }]),
+            id
+        ));
+        assert!(!json_task_list_contains(&serde_json::json!({}), id));
     }
 
     #[test]
