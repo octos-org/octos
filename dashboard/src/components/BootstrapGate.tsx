@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Navigate, useLocation } from 'react-router-dom'
-import { ApiError, api } from '../api'
+import { ApiError, api, authApi } from '../api'
 import { useAuth } from '../contexts/AuthContext'
 
 // Result of the bootstrap check.
@@ -28,40 +28,54 @@ export default function BootstrapGate({ children }: { children: React.ReactNode 
     }
     let cancelled = false
 
-    // Probe both endpoints in parallel. If either auth check fails (401/403)
-    // we bow out — AuthGuard upstream will redirect to /login. Other errors
-    // (5xx, network) fall through to the conservative "not rotated" branch
-    // so a misconfigured server still surfaces the wizard.
-    Promise.allSettled([api.getTokenStatus(), api.getSetupState()]).then(
-      ([statusRes, stateRes]) => {
-        if (cancelled) return
+    // Probe in parallel. If either admin auth check fails (401/403) we bow
+    // out — AuthGuard upstream will redirect to /login. Other errors (5xx,
+    // network) fall through to the conservative "not rotated" branch so a
+    // misconfigured server still surfaces the wizard. `authApi.status()` is
+    // public and tells us whether this is a no-password solo host.
+    Promise.allSettled([
+      api.getTokenStatus(),
+      api.getSetupState(),
+      authApi.status(),
+    ]).then(([statusRes, stateRes, authStatusRes]) => {
+      if (cancelled) return
 
-        const authFailed =
-          (statusRes.status === 'rejected' && ApiError.isAuthError(statusRes.reason)) ||
-          (stateRes.status === 'rejected' && ApiError.isAuthError(stateRes.reason))
-        if (authFailed) {
-          // Let AuthGuard handle the redirect. Render children so the
-          // unauthenticated path is invisible (no setup chrome flashes).
-          setDecision({ redirectTo: null, path: location.pathname })
-          return
-        }
+      const authFailed =
+        (statusRes.status === 'rejected' && ApiError.isAuthError(statusRes.reason)) ||
+        (stateRes.status === 'rejected' && ApiError.isAuthError(stateRes.reason))
+      if (authFailed) {
+        // Let AuthGuard handle the redirect. Render children so the
+        // unauthenticated path is invisible (no setup chrome flashes).
+        setDecision({ redirectTo: null, path: location.pathname })
+        return
+      }
 
-        const rotated =
-          statusRes.status === 'fulfilled' ? statusRes.value.rotated : false
-        const wizardCompleted =
-          stateRes.status === 'fulfilled' && stateRes.value.wizard_completed_at != null
+      // Solo hosts have no password to rotate — the no-password solo login
+      // IS the setup. Never force the rotate-token wizard there (it stays
+      // reachable from the sidebar for anyone who wants it).
+      if (
+        authStatusRes.status === 'fulfilled' &&
+        authStatusRes.value.local_solo_enabled
+      ) {
+        setDecision({ redirectTo: null, path: location.pathname })
+        return
+      }
 
-        if (rotated) {
-          setDecision({ redirectTo: null, path: location.pathname })
-          return
-        }
+      const rotated =
+        statusRes.status === 'fulfilled' ? statusRes.value.rotated : false
+      const wizardCompleted =
+        stateRes.status === 'fulfilled' && stateRes.value.wizard_completed_at != null
 
-        // Token not rotated. Skip the welcome step when the operator has
-        // already completed the wizard once (re-rotation case).
-        const target = wizardCompleted ? '/setup/rotate-token' : '/setup/welcome'
-        setDecision({ redirectTo: target, path: location.pathname })
-      },
-    )
+      if (rotated) {
+        setDecision({ redirectTo: null, path: location.pathname })
+        return
+      }
+
+      // Token not rotated. Skip the welcome step when the operator has
+      // already completed the wizard once (re-rotation case).
+      const target = wizardCompleted ? '/setup/rotate-token' : '/setup/welcome'
+      setDecision({ redirectTo: target, path: location.pathname })
+    })
 
     return () => {
       cancelled = true

@@ -269,6 +269,39 @@ export interface MeResponse {
   scoped_profile?: ScopedAuthTarget | null
 }
 
+/// Public login configuration from `GET /api/auth/status`. Drives which
+/// login affordances the page renders. `local_solo_enabled` is the
+/// no-password solo path (Local-mode host with stores); see
+/// `crate::api::solo_auth`.
+export interface AuthStatusResponse {
+  bootstrap_mode: boolean
+  email_login_enabled: boolean
+  admin_token_login_enabled: boolean
+  allow_self_registration: boolean
+  local_solo_enabled: boolean
+  scoped_profile?: ScopedAuthTarget | null
+}
+
+/// `POST /api/auth/solo` — re-login for the existing local solo owner.
+export interface SoloLoginResult {
+  token: string
+  user: User
+}
+
+/// `POST /api/auth/solo/create` — create the local profile AND log in.
+/// Mirrors the server `ProfileLocalCreateResult` shape plus a session
+/// `token`.
+export interface SoloCreateResult {
+  profile_id: string
+  user_id: string
+  name: string
+  username: string
+  email: string
+  created: boolean
+  runtime_mode: string
+  token: string
+}
+
 export interface BridgeQrInfo {
   qr: string | null
   status: 'waiting' | 'connected' | 'disconnected' | 'logged_out'
