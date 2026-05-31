@@ -547,6 +547,37 @@ impl AuthManager {
         Ok(Some(token))
     }
 
+    /// Mint a session token for a known user WITHOUT an OTP challenge.
+    ///
+    /// This backs the loopback-only solo (no-password) login path. It performs
+    /// NO authorization of its own — the caller is responsible for gating
+    /// (`deployment_mode == Local` AND a loopback peer). Treat a call to this
+    /// as "the caller has already proven this is a local solo box."
+    ///
+    /// `user_id`/`role` are recorded on the session as-is; `validate_session`
+    /// later re-reads the live role from the user store, so a stale role here
+    /// cannot escalate privileges.
+    pub async fn create_session_for_user(&self, user_id: &str, role: UserRole) -> Result<String> {
+        let now = Utc::now();
+        let token = generate_session_token();
+        let session = ActiveSession {
+            user_id: user_id.to_owned(),
+            role,
+            created_at: now,
+            expires_at: now + Duration::hours(self.session_expiry_hours as i64),
+        };
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(token.clone(), session);
+            if let Some(ref path) = self.sessions_path {
+                Self::persist_sessions_blocking(&sessions, path);
+            }
+        }
+
+        Ok(token)
+    }
+
     /// Validate a session token. Returns (user_id, role) if valid.
     /// Re-reads user role from disk to reflect role changes / deletions.
     pub async fn validate_session(&self, token: &str) -> Option<(String, UserRole)> {
@@ -931,6 +962,35 @@ mod tests {
         // Revoke
         mgr.revoke_session(&token).await;
         assert!(mgr.validate_session(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_session_for_user_mints_validatable_session() {
+        // The solo (no-password) login path mints a session directly, with
+        // no OTP exchange. The minted token must validate exactly like an
+        // OTP-issued one so the rest of the auth pipeline is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        user_store
+            .save(&crate::user_store::User {
+                id: "ada".into(),
+                email: "ada@example.com".into(),
+                name: "Ada".into(),
+                role: UserRole::Admin,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let mgr = AuthManager::new(None, user_store);
+        let token = mgr
+            .create_session_for_user("ada", UserRole::Admin)
+            .await
+            .unwrap();
+
+        let (user_id, role) = mgr.validate_session(&token).await.unwrap();
+        assert_eq!(user_id, "ada");
+        assert_eq!(role, UserRole::Admin);
     }
 
     #[tokio::test]
