@@ -559,6 +559,12 @@ impl AuthManager {
     /// cannot escalate privileges.
     pub async fn create_session_for_user(&self, user_id: &str, role: UserRole) -> Result<String> {
         let now = Utc::now();
+        // Record the login on the user, matching the OTP paths, so admin /
+        // user audit views show an accurate last_login_at after a solo login.
+        if let Some(mut user) = self.user_store.get(user_id)? {
+            user.last_login_at = Some(now);
+            self.user_store.save(&user)?;
+        }
         let token = generate_session_token();
         let session = ActiveSession {
             user_id: user_id.to_owned(),

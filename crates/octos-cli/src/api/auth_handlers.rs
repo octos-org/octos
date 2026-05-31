@@ -227,7 +227,7 @@ fn resolve_root_login_target(state: &AppState, email: &str) -> Option<RootLoginT
     }
 }
 
-fn is_login_ready_email(email: &str) -> bool {
+pub(crate) fn is_login_ready_email(email: &str) -> bool {
     let normalized = email.trim().to_lowercase();
     !normalized.is_empty() && normalized != ADMIN_PLACEHOLDER_EMAIL
 }

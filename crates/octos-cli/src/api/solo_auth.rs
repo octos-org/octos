@@ -32,7 +32,7 @@ use octos_core::ui_protocol::{
 };
 
 use super::AppState;
-use super::auth_handlers::is_top_level_profile_id;
+use super::auth_handlers::{is_login_ready_email, is_top_level_profile_id};
 use super::ui_protocol::{create_or_get_local_solo_profile, supports_local_solo_profile_create};
 use crate::user_store::{User, UserRole};
 
@@ -81,11 +81,18 @@ fn rpc_error_to_status(err: &RpcError) -> StatusCode {
 /// Resolve the local solo owner. In solo mode there is normally exactly one
 /// top-level user; if several exist (e.g. repeated `solo/create` with
 /// different usernames) the most recently created wins so a fresh onboard
-/// takes effect. Sub-accounts are excluded.
+/// takes effect.
+///
+/// Sub-accounts and the bootstrap `admin` placeholder are excluded. The
+/// placeholder (email `admin@localhost`) is created by `ensure_admin_user`
+/// on a bare admin-token `/me` call; it is NOT a solo owner, so matching it
+/// here would mint an admin session instead of the documented first-run 404.
+/// `is_login_ready_email` rejects it (and any empty/placeholder email),
+/// leaving only genuine solo profiles created via `profile/local/create`.
 fn resolve_solo_user(state: &AppState) -> Option<User> {
     let store = state.user_store.as_ref()?;
     let mut users: Vec<User> = store.list().ok()?;
-    users.retain(|u| is_top_level_profile_id(state, &u.id));
+    users.retain(|u| is_top_level_profile_id(state, &u.id) && is_login_ready_email(&u.email));
     users.into_iter().max_by_key(|u| u.created_at)
 }
 
@@ -236,6 +243,34 @@ mod tests {
         let err = solo_login(State(state), loopback())
             .await
             .expect_err("no solo profile yet → 404 so the SPA shows the create form");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn solo_login_404_ignores_admin_placeholder() {
+        // A bare admin-token `/me` call can create the disabled `admin`
+        // placeholder (email admin@localhost) as a top-level user. That is
+        // NOT a solo owner — solo_login must still 404 so the SPA shows the
+        // create form rather than minting an admin session.
+        let dir = tempfile::tempdir().unwrap();
+        let state = solo_state(dir.path());
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&User {
+                id: "admin".into(),
+                email: "admin@localhost".into(),
+                name: "Admin".into(),
+                role: UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = solo_login(State(state), loopback())
+            .await
+            .expect_err("the admin placeholder is not a solo owner");
         assert_eq!(err, StatusCode::NOT_FOUND);
     }
 
