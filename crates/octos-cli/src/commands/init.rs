@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use colored::Colorize;
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 use serde_json::json;
 
 use super::Executable;
@@ -147,6 +147,10 @@ pub struct InitCommand {
     /// Skip interactive prompts and use defaults.
     #[arg(long)]
     pub defaults: bool,
+
+    /// Overwrite an existing config without prompting.
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl Executable for InitCommand {
@@ -167,7 +171,13 @@ impl Executable for InitCommand {
                 "Config already exists:".yellow(),
                 config_path.display()
             );
-            if !self.defaults {
+            if self.defaults && !self.force {
+                return Err(eyre!(
+                    "Config already exists at {}. Re-run with --force to overwrite it.",
+                    config_path.display()
+                ));
+            }
+            if !self.defaults && !self.force {
                 print!("Overwrite? [y/N] ");
                 io::stdout().flush()?;
 
@@ -177,6 +187,12 @@ impl Executable for InitCommand {
                     println!("Aborted.");
                     return Ok(());
                 }
+            }
+            if self.force {
+                println!(
+                    "{}",
+                    "Overwriting existing config because --force was set.".yellow()
+                );
             }
         }
 
