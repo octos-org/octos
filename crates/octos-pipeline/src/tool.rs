@@ -509,12 +509,28 @@ impl Tool for RunPipelineTool {
             .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
         let graph = crate::parser::parse_dot(&dot_content)
             .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
-        let diags = crate::validate::validate(&graph);
+        let validation_context = crate::validate::ValidationContext::default()
+            .with_runtime_variables(input.variables.keys().cloned())
+            .with_known_models(crate::model_assignment::known_model_keys_from_catalog_dir(
+                &self.working_dir,
+            ))
+            .with_known_tools(
+                octos_agent::ToolRegistry::with_builtins(&self.working_dir).tool_names(),
+            );
+        let diags = crate::validate::diagnostics_with_context(&graph, &validation_context);
         if crate::validate::has_errors(&diags) {
             let errors: Vec<_> = diags
                 .iter()
                 .filter(|d| d.severity == crate::validate::Severity::Error)
-                .map(|d| format!("rule {}: {}", d.rule, d.message))
+                .map(|d| {
+                    format!(
+                        "{} (rule {}, {:?}): {}",
+                        d.rule_id.code(),
+                        d.rule,
+                        d.location,
+                        d.message
+                    )
+                })
                 .collect();
             return Err(format!(
                 "pipeline validation failed:\n{}",

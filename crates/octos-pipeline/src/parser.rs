@@ -534,6 +534,14 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+fn parse_csv_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
     // Resolution: explicit handler > shape-based > default (codergen)
     let handler = attrs
@@ -544,8 +552,7 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
 
     let tools = attrs
         .get("tools")
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-        .unwrap_or_default();
+        .map_or_else(Vec::new, |s| parse_csv_list(s));
 
     let deadline_secs = attrs
         .get("deadline_secs")
@@ -580,6 +587,23 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         worker_prompt: attrs.get("worker_prompt").cloned(),
         planner_model: attrs.get("planner_model").cloned(),
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
+        human_gate: attrs
+            .get("human_gate")
+            .or_else(|| attrs.get("requires_human"))
+            .and_then(|s| parse_bool(s))
+            .unwrap_or_else(|| attrs.contains_key("input_type")),
+        resolver: attrs
+            .get("resolver")
+            .or_else(|| attrs.get("gate_resolver"))
+            .cloned(),
+        artifact_refs: attrs
+            .get("artifact_refs")
+            .or_else(|| attrs.get("requires_artifact"))
+            .map_or_else(Vec::new, |s| parse_csv_list(s)),
+        checkpoint_refs: attrs
+            .get("checkpoint_refs")
+            .or_else(|| attrs.get("requires_checkpoint"))
+            .map_or_else(Vec::new, |s| parse_csv_list(s)),
         deadline_secs,
         deadline_action,
         continue_on_error: attrs
@@ -1212,5 +1236,28 @@ mod tests {
         );
         assert_eq!(parse_deadline_action("retry:0"), None);
         assert_eq!(parse_deadline_action("bogus"), None);
+    }
+
+    #[test]
+    fn should_parse_human_gate_resolver_and_refs() {
+        let graph = parse_dot(
+            r#"
+            digraph test {
+                gate [
+                    handler="gate",
+                    human_gate="true",
+                    resolver="operator",
+                    requires_artifact="draft, report",
+                    requires_checkpoint="post_draft"
+                ]
+            }
+            "#,
+        )
+        .unwrap();
+        let gate = &graph.nodes["gate"];
+        assert!(gate.human_gate);
+        assert_eq!(gate.resolver.as_deref(), Some("operator"));
+        assert_eq!(gate.artifact_refs, vec!["draft", "report"]);
+        assert_eq!(gate.checkpoint_refs, vec!["post_draft"]);
     }
 }
