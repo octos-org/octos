@@ -21,23 +21,136 @@ import type {
 
 const BASE = '/api/admin'
 
-/// Error thrown by the dashboard's request helpers when the server returns a
-/// non-2xx response. Carries the HTTP status code so callers can distinguish
-/// auth failures (401/403) from infrastructure errors (5xx) without
-/// re-parsing the message string. Use `ApiError.isAuthError(err)` for the
-/// common "auth failed, hand back to the login flow" branch.
-export class ApiError extends Error {
-  public readonly status: number
+export const API_ERROR_CODES = {
+  unauthorized: 'unauthorized',
+  forbidden: 'forbidden',
+  notFound: 'not_found',
+  conflict: 'conflict',
+  validation: 'validation_error',
+  rateLimited: 'rate_limited',
+  server: 'server_error',
+  http: 'http_error',
+} as const
 
-  constructor(status: number, message: string) {
-    super(message || `HTTP ${status}`)
+export type KnownApiErrorCode =
+  (typeof API_ERROR_CODES)[keyof typeof API_ERROR_CODES]
+
+export type ApiErrorCode = KnownApiErrorCode | (string & {})
+
+export interface ApiErrorPayload<C extends ApiErrorCode = ApiErrorCode> {
+  code: C
+  message: string
+  details?: unknown
+}
+
+interface ApiErrorOptions<C extends ApiErrorCode = ApiErrorCode> {
+  code?: C
+  details?: unknown
+  payload?: ApiErrorPayload<C>
+}
+
+/// Error thrown by the dashboard's request helpers when the server returns a
+/// non-2xx response. Carries both HTTP status and structured server error code
+/// so callers can branch on `err.code` instead of parsing message text.
+export class ApiError<C extends ApiErrorCode = ApiErrorCode> extends Error {
+  public readonly status: number
+  public readonly code: C
+  public readonly details?: unknown
+  public readonly payload: ApiErrorPayload<C>
+
+  constructor(
+    status: number,
+    message: string,
+    codeOrOptions?: C | ApiErrorOptions<C>,
+    details?: unknown,
+  ) {
+    const options: ApiErrorOptions<C> =
+      typeof codeOrOptions === 'object' && codeOrOptions !== null
+        ? codeOrOptions
+        : { code: codeOrOptions, details }
+    const code = options.code ?? (apiErrorCodeForStatus(status) as C)
+    const resolvedMessage = message || `HTTP ${status}`
+    super(resolvedMessage)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
+    this.details = options.details
+    this.payload = options.payload ?? {
+      code,
+      message: resolvedMessage,
+      ...(options.details === undefined ? {} : { details: options.details }),
+    }
   }
 
   static isAuthError(err: unknown): boolean {
-    return err instanceof ApiError && (err.status === 401 || err.status === 403)
+    return (
+      err instanceof ApiError &&
+      (err.code === API_ERROR_CODES.unauthorized ||
+        err.code === API_ERROR_CODES.forbidden ||
+        err.status === 401 ||
+        err.status === 403)
+    )
   }
+}
+
+function apiErrorCodeForStatus(status: number): KnownApiErrorCode {
+  if (status === 401) return API_ERROR_CODES.unauthorized
+  if (status === 403) return API_ERROR_CODES.forbidden
+  if (status === 404) return API_ERROR_CODES.notFound
+  if (status === 409) return API_ERROR_CODES.conflict
+  if (status === 422 || status === 400) return API_ERROR_CODES.validation
+  if (status === 429) return API_ERROR_CODES.rateLimited
+  if (status >= 500) return API_ERROR_CODES.server
+  return API_ERROR_CODES.http
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function normalizeApiErrorPayload(status: number, raw: string): ApiErrorPayload {
+  const fallbackCode = apiErrorCodeForStatus(status)
+  const fallbackMessage = raw.trim() || `HTTP ${status}`
+
+  if (!raw.trim()) {
+    return { code: fallbackCode, message: fallbackMessage }
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!isRecord(parsed)) {
+      return { code: fallbackCode, message: fallbackMessage }
+    }
+    const code =
+      typeof parsed.code === 'string' && parsed.code.trim()
+        ? parsed.code
+        : fallbackCode
+    const message =
+      typeof parsed.message === 'string' && parsed.message.trim()
+        ? parsed.message
+        : typeof parsed.error === 'string' && parsed.error.trim()
+          ? parsed.error
+          : fallbackMessage
+    return {
+      code,
+      message,
+      ...(Object.prototype.hasOwnProperty.call(parsed, 'details')
+        ? { details: parsed.details }
+        : {}),
+    }
+  } catch {
+    return { code: fallbackCode, message: fallbackMessage }
+  }
+}
+
+async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  const raw = await res.text()
+  const payload = normalizeApiErrorPayload(res.status, raw)
+  return new ApiError(res.status, payload.message, {
+    code: payload.code,
+    details: payload.details,
+    payload,
+  })
 }
 
 export interface SkillRegistryPackage {
@@ -69,8 +182,7 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
@@ -81,8 +193,7 @@ async function requestNoContent(path: string, opts?: RequestInit): Promise<void>
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
 }
 
@@ -92,8 +203,7 @@ async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
@@ -104,8 +214,7 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }

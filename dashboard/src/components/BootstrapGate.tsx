@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Navigate, useLocation } from 'react-router-dom'
-import { ApiError, api, authApi } from '../api'
+import { API_ERROR_CODES, ApiError, api, authApi } from '../api'
 import { useAuth } from '../contexts/AuthContext'
 
 // Result of the bootstrap check.
@@ -14,6 +14,17 @@ import { useAuth } from '../contexts/AuthContext'
 type GateDecision = { redirectTo: string | null; path: string }
 
 const SETUP_PATHS = new Set(['/setup/welcome', '/setup/rotate-token'])
+
+function isAuthApiError(reason: unknown): boolean {
+  if (!(reason instanceof ApiError)) return false
+  switch (reason.code) {
+    case API_ERROR_CODES.unauthorized:
+    case API_ERROR_CODES.forbidden:
+      return true
+    default:
+      return ApiError.isAuthError(reason)
+  }
+}
 
 export default function BootstrapGate({ children }: { children: React.ReactNode }) {
   const { isAdmin } = useAuth()
@@ -41,8 +52,8 @@ export default function BootstrapGate({ children }: { children: React.ReactNode 
       if (cancelled) return
 
       const authFailed =
-        (statusRes.status === 'rejected' && ApiError.isAuthError(statusRes.reason)) ||
-        (stateRes.status === 'rejected' && ApiError.isAuthError(stateRes.reason))
+        (statusRes.status === 'rejected' && isAuthApiError(statusRes.reason)) ||
+        (stateRes.status === 'rejected' && isAuthApiError(stateRes.reason))
       if (authFailed) {
         // Let AuthGuard handle the redirect. Render children so the
         // unauthenticated path is invisible (no setup chrome flashes).
