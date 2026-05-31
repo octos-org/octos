@@ -11,7 +11,9 @@ import { test, expect } from '@playwright/test';
  *     rotate-token wizard).
  *
  * Prereqs (started out-of-band by the runner):
- *   - `octos serve --port 8080` with a FRESH data dir (Local mode → solo).
+ *   - `octos serve --solo --port 8080` with a FRESH data dir. The `--solo`
+ *     opt-in is REQUIRED — solo login is OFF by default and must never be
+ *     enabled on a proxy-fronted host (see `api::solo_auth`).
  *   - `vite dev` on :5173 serving the dashboard at /admin/, proxying /api
  *     to :8080. Set OCTOS_TEST_URL=http://localhost:5173.
  */

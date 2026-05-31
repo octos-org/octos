@@ -548,7 +548,11 @@ export class StdioClient {
     this.nextSeq = 0;
     this.child = spawn(
       octosBin,
-      ['serve', '--stdio', '--data-dir', dataDir, '--cwd', workspace],
+      // `--solo` opts into the no-password local-solo gate so the matrix's
+      // `profile/local/create` onboarding scenarios are advertised/executed.
+      // Solo is OFF by default (see `api::solo_auth`); harmless for non-solo
+      // scenarios.
+      ['serve', '--stdio', '--solo', '--data-dir', dataDir, '--cwd', workspace],
       {
         cwd: repoRoot,
         env: {
