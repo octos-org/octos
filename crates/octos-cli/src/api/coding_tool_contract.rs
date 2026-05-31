@@ -781,12 +781,6 @@ fn required_tool_status_entry(
     entry.insert("capability".into(), json!(spec.capability));
     entry.insert("policy".into(), json!(spec.policy));
 
-    if available_model_tools.contains(spec.name) {
-        entry.insert("status".into(), json!(TOOL_STATUS_AVAILABLE));
-        entry.insert("backend_tool".into(), json!(spec.name));
-        return Value::Object(entry);
-    }
-
     // #970: a tool registered but currently in the deferred set is
     // recoverable through `activate_tools`. Surface it as `deferred` so
     // clients can render "available, currently inactive" UX; it counts
@@ -808,6 +802,12 @@ fn required_tool_status_entry(
         entry.insert("status".into(), json!(TOOL_STATUS_DISABLED_BY_POLICY));
         entry.insert("backend_tool".into(), json!(spec.name));
         entry.insert("detail".into(), json!("disabled by effective tool policy"));
+        return Value::Object(entry);
+    }
+
+    if available_model_tools.contains(spec.name) {
+        entry.insert("status".into(), json!(TOOL_STATUS_AVAILABLE));
+        entry.insert("backend_tool".into(), json!(spec.name));
         return Value::Object(entry);
     }
 
