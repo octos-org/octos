@@ -517,31 +517,55 @@ enum MaterializeOutcome {
 }
 
 /// Copy one upload reference into `uploads_dir`. See [`MaterializeOutcome`].
+/// Whether a RESOLVED upload-tmpdir path is owned by `tenant_id`.
+///
+/// Uploads are stored as `octos-uploads/<tenant>/<uuid>_<name>`, so the FIRST
+/// path component of the resolved file (relative to the canonical upload root)
+/// is the owning tenant. This is the single tenant-ownership predicate shared by
+/// every upload-into-workspace path so the isolation rule cannot drift between
+/// them (the serve `materialize_one` and the gateway/actor
+/// `copy_media_to_workspace`):
+///
+/// - `tenant_id == Some(t)` → owned only if the resolved file's first component
+///   under the upload root equals `t`. A file owned by ANOTHER tenant — by `up/`
+///   handle, a raw absolute/relative tmpdir path, OR an image path — is NOT
+///   owned. A flat legacy file (no tenant component) is NOT owned either.
+/// - `tenant_id == None` (solo / CLI `octos chat`, single-tenant) → always owned.
+///
+/// Callers pass a path that is ALREADY resolved (e.g. via
+/// [`resolve_upload_reference`]); a path outside the upload root yields `false`
+/// for a multi-tenant caller, so non-upload paths must be screened separately.
+pub fn upload_owned_by_tenant(resolved: &Path, tenant_id: Option<&str>) -> bool {
+    let Some(tenant) = tenant_id else {
+        return true; // single-tenant: ownership check does not apply
+    };
+    let Ok(rel) = resolved.strip_prefix(canonical_root(&temp_upload_root())) else {
+        return false; // outside the upload root entirely
+    };
+    let mut comps = rel.components();
+    let first_is_tenant =
+        matches!(comps.next(), Some(Component::Normal(s)) if s.to_str() == Some(tenant));
+    // Require at least one MORE component after the tenant directory. A flat
+    // file resolved at `octos-uploads/<tenant>` (the legacy flat `/upload`
+    // path can create a file named exactly like the tenant) has the tenant as
+    // its ONLY component — that is NOT a `<tenant>/<file>` layout and must not
+    // be treated as owned (codex P2). `<tenant>/<file>` → owned.
+    first_is_tenant && comps.next().is_some()
+}
+
 fn materialize_one(uploads_dir: &Path, tenant_id: Option<&str>, entry: &str) -> MaterializeOutcome {
     let Some(src) = resolve_upload_reference(entry) else {
         return MaterializeOutcome::Passthrough; // not a staged upload (workspace path / external / unknown)
     };
 
-    // #1377 tenant isolation: uploads are stored under
-    // `octos-uploads/<tenant>/<uuid>_<name>`, so the FIRST path component of the
-    // resolved file (relative to the upload root) is the owning tenant. In a
-    // multi-tenant session only keep a file owned by THIS tenant; a file owned by
-    // another tenant — whether referenced by `up/` handle, a raw absolute/relative
-    // tmpdir path, OR an image path (which would otherwise reach the vision
-    // encoder via std::fs::read) — is DROPPED. Checking the RESOLVED path covers
-    // ALL of these (codex round-6 P1.3 + round-7 image P1). A flat legacy file
-    // (no tenant component) is also dropped. Solo sessions (`tenant_id == None`,
-    // CLI `octos chat`) skip the check (single-tenant).
-    if let Some(tenant) = tenant_id {
-        let owned = src
-            .strip_prefix(canonical_root(&temp_upload_root()))
-            .ok()
-            .and_then(|rel| rel.components().next())
-            .map(|c| matches!(c, Component::Normal(s) if s.to_str() == Some(tenant)))
-            .unwrap_or(false);
-        if !owned {
-            return MaterializeOutcome::DropForeign;
-        }
+    // #1377 tenant isolation: in a multi-tenant session only keep a file owned by
+    // THIS tenant; a file owned by another tenant — whether referenced by `up/`
+    // handle, a raw absolute/relative tmpdir path, OR an image path (which would
+    // otherwise reach the vision encoder via std::fs::read) — is DROPPED. Checking
+    // the RESOLVED path covers ALL of these (codex round-6 P1.3 + round-7 image
+    // P1). Solo sessions (`tenant_id == None`, CLI `octos chat`) skip the check.
+    if !upload_owned_by_tenant(&src, tenant_id) {
+        return MaterializeOutcome::DropForeign;
     }
 
     // Owned image: keep it on the vision path (the encoder reads it directly via
@@ -681,6 +705,38 @@ mod tests {
             out_b[0]
         );
         assert!(ws_b.path().join(&out_b[0]).is_file());
+    }
+
+    #[test]
+    fn upload_owned_by_tenant_keys_off_first_component_under_root() {
+        // The shared predicate used by BOTH the serve materializer and the
+        // gateway/actor `copy_media_to_workspace`. Ownership = the resolved
+        // file's first path component (under the canonical upload root)
+        // equals the tenant.
+        let root = canonical_root(&temp_upload_root());
+        let owned = root.join("dspfac").join("uuid_doc.md");
+        let foreign = root.join("acme").join("uuid_doc.md");
+        let flat = root.join("legacy_no_tenant.md");
+        // Flat file named EXACTLY like the tenant (legacy flat `/upload`): the
+        // tenant is its only component, so it must NOT be owned (codex P2).
+        let flat_named_as_tenant = root.join("dspfac");
+        let outside = PathBuf::from("/etc/passwd");
+
+        // Multi-tenant: only `<tenant>/<file>` is owned.
+        assert!(upload_owned_by_tenant(&owned, Some("dspfac")));
+        assert!(!upload_owned_by_tenant(&foreign, Some("dspfac")));
+        // Flat files (no tenant subdir) and paths outside the upload root are
+        // NOT owned — all dropped by the materializer / copy path.
+        assert!(!upload_owned_by_tenant(&flat, Some("dspfac")));
+        assert!(!upload_owned_by_tenant(
+            &flat_named_as_tenant,
+            Some("dspfac")
+        ));
+        assert!(!upload_owned_by_tenant(&outside, Some("dspfac")));
+
+        // Solo (tenant_id == None, CLI `octos chat`): ownership check skipped.
+        assert!(upload_owned_by_tenant(&foreign, None));
+        assert!(upload_owned_by_tenant(&outside, None));
     }
 
     #[test]

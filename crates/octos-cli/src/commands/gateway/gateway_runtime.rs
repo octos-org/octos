@@ -1643,25 +1643,12 @@ impl GatewayRuntime {
                 }
             }
 
-            // Transcribe audio, separate images, and tag voice metadata.
-            let media_result = message_preprocessing::process_media(
-                &mut inbound,
-                self.asr_binary.as_deref(),
-                self.asr_language.as_deref(),
-                &self.channel_mgr,
-            )
-            .await;
-            let image_media = media_result.image_media;
-            let attachment_media = media_result.attachment_media;
-            let attachment_prompt = media_result.attachment_prompt;
-
-            // Route cron-triggered messages to their target channel
-            let (reply_channel, reply_chat_id) = message_preprocessing::resolve_reply_target(
-                &inbound,
-                &self.default_cron_channel,
-                &self.default_cron_chat_id,
-            );
-
+            // #1377 codex round-6 P1: resolve routing (incl. profile-factory
+            // build, which resets `dispatch_profile_id` to None on failure)
+            // BEFORE media preprocessing, so the isolation tenant reflects the
+            // FINAL dispatch decision. Otherwise a `target`-stamped upload
+            // could be transcribed as the target tenant yet then routed to a
+            // different (fallback) actor — a cross-session mismatch.
             let target_profile = inbound
                 .metadata
                 .get("target_profile_id")
@@ -1693,9 +1680,68 @@ impl GatewayRuntime {
                     }
                 }
             }
-
             // Update dispatcher's profile ID for this message.
             self.session_dispatcher.dispatch_profile_id = dispatch_profile_id.clone();
+
+            // ISOLATION tenant = the FINAL dispatch profile (after any
+            // fallback-to-None above), or the gateway's own profile, or
+            // `_main` as a last resort. A gateway is a multi-tenant context,
+            // so the tenant is NEVER None — otherwise the upload gates treat
+            // `None` as solo and skip ownership checks, letting the main/admin
+            // gateway accept any tenant's `up/` handles (codex round-7 P1).
+            // `_main` matches the serve handler's resolved main tenant.
+            let isolation_tenant: Option<String> = dispatch_profile_id
+                .clone()
+                .or_else(|| self.profile_id.clone())
+                .or_else(|| Some(octos_core::MAIN_PROFILE_ID.to_string()));
+
+            // Drop cross-tenant uploads from `inbound.media` BEFORE
+            // `process_media` resolves images or transcribes audio — a foreign
+            // `up/.../voice.ogg` would otherwise be transcribed into the
+            // message content before any later filter, which dropping the path
+            // cannot undo (codex round-3 P1).
+            if let Some(tenant) = isolation_tenant.as_deref() {
+                inbound.media.retain(|entry| {
+                    match octos_bus::file_handle::resolve_upload_reference(entry) {
+                        Some(resolved) => {
+                            let owned = octos_bus::file_handle::upload_owned_by_tenant(
+                                &resolved,
+                                Some(tenant),
+                            );
+                            if !owned {
+                                tracing::warn!(
+                                    tenant = %tenant,
+                                    "dropping cross-tenant upload from inbound media before preprocessing",
+                                );
+                            }
+                            owned
+                        }
+                        None => true, // not a staged upload — keep (workspace / external)
+                    }
+                });
+            }
+
+            // Transcribe audio, separate images, and tag voice metadata.
+            let media_result = message_preprocessing::process_media(
+                &mut inbound,
+                self.asr_binary.as_deref(),
+                self.asr_language.as_deref(),
+                &self.channel_mgr,
+            )
+            .await;
+            let image_media = media_result.image_media;
+            let attachment_media = media_result.attachment_media;
+            let attachment_prompt = media_result.attachment_prompt;
+
+            // Route cron-triggered messages to their target channel
+            let (reply_channel, reply_chat_id) = message_preprocessing::resolve_reply_target(
+                &inbound,
+                &self.default_cron_channel,
+                &self.default_cron_chat_id,
+            );
+
+            // (routing + `dispatch_profile_id` + isolation_tenant were resolved
+            // BEFORE media preprocessing above — codex round-6 P1.)
 
             // Resolve session key with the current profile-scoped base key only.
             let base_session_key = build_profiled_session_key(
@@ -1945,6 +1991,9 @@ impl GatewayRuntime {
                     reply_chat_id: &reply_chat_id,
                     status_indicator,
                     profile_id: dispatch_profile_id.as_deref(),
+                    // #1377 P1.2: ISOLATION tenant (never None on a profiled
+                    // gateway), decoupled from the routing `profile_id`.
+                    tenant_id: isolation_tenant.as_deref(),
                     system_prompt_override: prompt_override,
                     sender_user_id: dispatch_sender_uid,
                 })

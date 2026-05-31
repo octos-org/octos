@@ -560,7 +560,7 @@ fn resolve_session_max_iterations(configured: Option<u32>) -> u32 {
 /// `-` is lossless for the field's only purpose (diagnostics/logging)
 /// while guaranteeing the constructor's `is_safe_session_id` check
 /// passes.
-fn sanitize_scope_session_id(raw: &str) -> String {
+pub(crate) fn sanitize_scope_session_id(raw: &str) -> String {
     let mut out: String = raw
         .chars()
         .map(|c| {

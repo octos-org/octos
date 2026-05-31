@@ -2488,9 +2488,68 @@ async fn handle_file_download(
     }
 }
 
+/// Query params for `POST /upload`. `target_profile_id` lets a cross-profile
+/// routing client stamp the upload with the same tenant it will route the
+/// subsequent `/chat` to (#1377 codex round-5 P2); absent for the common
+/// single-profile case.
+#[derive(Debug, Default, serde::Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    target_profile_id: Option<String>,
+}
+
 /// POST /upload — upload files for use in chat media field.
-async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
-    let upload_dir = std::env::temp_dir().join("octos-uploads");
+///
+/// #1377: stores uploads under `octos-uploads/<tenant>/<name>` where the
+/// tenant is the gateway's resolved profile (the same layout the `octos serve`
+/// handler uses), so the resolved `up/` handle carries the owning tenant and
+/// the cross-tenant ownership gate (`upload_owned_by_tenant`) can enforce
+/// isolation. A gateway with no profile (single-tenant / main) stores flat,
+/// preserving the previous behaviour.
+async fn handle_upload(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    let upload_root = std::env::temp_dir().join("octos-uploads");
+    // #1377: stamp the upload with the OWNING tenant so the resolved handle
+    // matches what the subsequent `/chat` filters against. When the client
+    // routes cross-profile it passes `?target_profile_id=<p>` (the same value
+    // it sends on `/chat`); otherwise fall back to the gateway's own profile,
+    // then to `_main` (codex round-7 P1: a gateway is a multi-tenant context,
+    // so uploads are ALWAYS tenant-stamped — never flat — otherwise the
+    // main/admin route would accept any tenant's handles). The target is
+    // charset-guarded (lowercase alnum + `-`, the profile-id alphabet) so it
+    // cannot inject a path component or `..`; an invalid/empty value falls
+    // back to the gateway profile / `_main`.
+    let tenant = query
+        .target_profile_id
+        .as_deref()
+        .filter(|t| {
+            !t.is_empty()
+                && t.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .map(str::to_string)
+        .or_else(|| state.profile_id.clone())
+        .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_string());
+    let upload_dir = upload_root.join(&tenant);
+    // codex round-7 P2: a LEGACY flat upload named exactly like a profile id
+    // (`octos-uploads/<tenant>`) would block `create_dir_all` and 500 every
+    // upload for that tenant. Such a flat file is a pre-migration artifact in
+    // the ephemeral temp dir that the new layout treats as un-owned (dropped
+    // by the filter) anyway, so clear it to make room for the tenant dir.
+    if tokio::fs::metadata(&upload_dir)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        warn!(
+            tenant = %tenant,
+            "removing legacy flat upload colliding with tenant directory"
+        );
+        let _ = tokio::fs::remove_file(&upload_dir).await;
+    }
     if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

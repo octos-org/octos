@@ -37,7 +37,7 @@ use octos_bus::{
 use octos_core::AgentId;
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
-    OutboundMessage, SessionKey, SessionScope, is_safe_session_id,
+    OutboundMessage, SessionKey, SessionScope,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, FailoverEvent, LlmProvider, ProviderRouter,
@@ -74,6 +74,11 @@ pub struct DispatchParams<'a> {
     pub reply_chat_id: &'a str,
     pub status_indicator: Option<Arc<StatusComposer>>,
     pub profile_id: Option<&'a str>,
+    /// Owning tenant for upload isolation (#1377 P1.2). Decoupled from
+    /// `profile_id` (routing): on a profiled gateway this falls back to the
+    /// gateway's own profile, so it is never `None` even when `profile_id`
+    /// is (unknown `target_profile_id`), preventing an unscoped bypass.
+    pub tenant_id: Option<&'a str>,
     pub system_prompt_override: Option<String>,
     pub sender_user_id: Option<String>,
 }
@@ -87,6 +92,12 @@ struct SpawnParams<'a> {
     status_indicator: Option<Arc<StatusComposer>>,
     system_prompt_override: Option<String>,
     sender_user_id: Option<String>,
+    /// Resolved DISPATCH profile = the authoritative owning tenant for this
+    /// actor (#1377 codex P1.2). NOT the top-level factory's `profile_id`,
+    /// which is `None` for the current-profile gateway — `resolve_dispatch_
+    /// profile_id` falls back to the current gateway profile, so this is
+    /// `Some(profile)` on a single-profile deploy (e.g. the dspfac fleet).
+    tenant_id: Option<String>,
 }
 
 /// Parameters for the outbound message forwarder task.
@@ -2102,6 +2113,7 @@ impl ActorRegistry {
             reply_chat_id,
             status_indicator,
             profile_id,
+            tenant_id,
             system_prompt_override,
             sender_user_id,
         } = params;
@@ -2125,6 +2137,10 @@ impl ActorRegistry {
                 status_indicator: status_indicator.clone(),
                 system_prompt_override: system_prompt_override.clone(),
                 sender_user_id: sender_user_id.clone(),
+                // #1377 P1.2: the ISOLATION tenant (falls back to the gateway
+                // profile; never None on a profiled gateway), not the routing
+                // profile_id which is None for the current-profile gateway.
+                tenant_id: tenant_id.map(|s| s.to_string()),
             });
             self.actors.insert(
                 key_str.clone(),
@@ -2191,6 +2207,8 @@ impl ActorRegistry {
                     status_indicator,
                     system_prompt_override: prompt_override.clone(),
                     sender_user_id: uid_override.clone(),
+                    // #1377 P1.2: isolation tenant (gateway-profile fallback).
+                    tenant_id: tenant_id.map(|s| s.to_string()),
                 });
                 let _ = tx.send(actor_msg).await;
                 self.actors.insert(
@@ -2453,17 +2471,19 @@ impl ToolRegistryFactory for SnapshotToolRegistryFactory {
 /// `ActorFactory::spawn` so the wiring can be unit-tested without
 /// having to drive an entire actor through a tokio mpsc channel.
 ///
-/// Returns `Some(scope)` when:
-/// - `profile_id` is `Some` (per-profile actors created by
-///   `ProfileFactory::build` always supply it; the admin / test
-///   ActorFactory leaves it `None`), AND
-/// - `session_key.base_key()` satisfies [`is_safe_session_id`] (SPA
-///   `web-/slides-/site-` shapes pass; channel-prefixed `api:...`
-///   shapes do not — those route through the legacy resolver).
+/// Returns `Some(scope)` when `profile_id` is `Some` (per-profile actors
+/// created by `ProfileFactory::build` always supply it; the admin / test
+/// ActorFactory leaves it `None`). The scope is rooted at the session's
+/// REAL on-disk workspace (`<data>/users/<encoded base_key>/workspace`),
+/// so BOTH SPA `web-/slides-/site-` shapes AND channel-prefixed `api:...`
+/// shapes get a tenant-bound scope (#1377 Phase-3-B — the gateway/actor
+/// sibling of the serve `SessionRuntime` fix). Channel-prefixed ids used
+/// to skip scope construction and fall onto the unscoped legacy resolver
+/// (which decodes process-global `up/` upload handles with no tenant
+/// check); rooting at the encoded workspace closes that gap.
 ///
-/// Returns `None` (= legacy resolver) for the admin path, the
-/// channel-prefixed shapes, or when the scope builder rejects the
-/// inputs entirely.
+/// Returns `None` (= legacy resolver) only for the admin path (no
+/// `profile_id`) or when the scope builder rejects the inputs entirely.
 ///
 /// Fail-closed canonicalisation per round-2 BLOCKER 2: any
 /// `plugin_dir` that fails canonicalize is dropped (logged at `warn`).
@@ -2482,20 +2502,36 @@ pub(crate) fn build_gateway_session_scope(
         );
         return None;
     };
-    if !is_safe_session_id(&session_id_raw) {
-        tracing::debug!(
-            profile_id = %profile_id,
-            session = %session_key,
-            "ActorFactory::spawn skipping SessionScope: session id outside is_safe_session_id alphabet \
-             (legacy channel-prefixed shape)",
-        );
-        return None;
-    }
-    match SessionScope::multi_tenant_with_default_zones(
-        data_dir.to_path_buf(),
-        profile_id.to_string(),
-        session_id_raw.clone(),
-    ) {
+
+    // #1377 Phase-3-B (gateway/actor sibling of the serve `SessionRuntime`
+    // fix): bind the scope to the session's REAL on-disk workspace —
+    // `<data>/users/<encoded base_key>/workspace`, the SAME path the actor
+    // computes for `user_workspace` — rather than re-deriving it from the
+    // raw id. This closes the channel-prefixed (`:`) gap: those ids fail
+    // `is_safe_session_id`, so the old `multi_tenant_with_default_zones`
+    // (which uses the raw id and percent-encoding-mismatched path) skipped
+    // them, leaving actor file tools on the unscoped legacy resolver that
+    // decodes process-global `up/` handles with no tenant check. The
+    // workspace path is the encoded form, so it matches the actor and the
+    // tenant-ownership gate in `resolve_for_scope` now applies. Safe-id
+    // sessions get a byte-identical scope (encode == raw, sanitize == raw).
+    let encoded_base = octos_bus::session::encode_path_component(&session_id_raw);
+    let workspace = data_dir.join("users").join(&encoded_base).join("workspace");
+    let scope_session_id = crate::runtime::session::sanitize_scope_session_id(&session_id_raw);
+    let shared_zones: Vec<std::path::PathBuf> = octos_core::DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
+        .iter()
+        .map(|name| data_dir.join(name))
+        .collect();
+    let build = || {
+        SessionScope::multi_tenant_at_workspace(
+            data_dir.to_path_buf(),
+            workspace.clone(),
+            profile_id.to_string(),
+            scope_session_id.clone(),
+            shared_zones.clone(),
+        )
+    };
+    match build() {
         Ok(scope) => {
             // Round-2 BLOCKER 2: fail-closed canonicalisation. Drop
             // any plugin dir that can't be canonicalised so a later
@@ -2511,13 +2547,7 @@ pub(crate) fn build_gateway_session_scope(
                         "ActorFactory::spawn with_skill_read_zones rejected one or more plugin_dirs; \
                          attaching scope without skill_read_zones",
                     );
-                    SessionScope::multi_tenant_with_default_zones(
-                        data_dir.to_path_buf(),
-                        profile_id.to_string(),
-                        session_id_raw,
-                    )
-                    .map(Arc::new)
-                    .ok()
+                    build().map(Arc::new).ok()
                 }
             }
         }
@@ -2545,6 +2575,7 @@ impl ActorFactory {
             status_indicator,
             system_prompt_override,
             sender_user_id,
+            tenant_id,
         } = params;
         let (tx, rx) = mpsc::channel(ACTOR_INBOX_SIZE);
 
@@ -3235,7 +3266,9 @@ impl ActorFactory {
         // and could not reach the per-profile skill_dirs the
         // SKILL.md auto-inject teaches the agent to use.
         let session_scope_arc = build_gateway_session_scope(
-            self.profile_id.as_deref(),
+            // #1377 P1.2: use the DISPATCH tenant (the top-level factory's
+            // `profile_id` is None for the current-profile gateway).
+            tenant_id.as_deref(),
             &self.data_dir,
             &session_key,
             &self.plugin_dirs,
@@ -3310,6 +3343,7 @@ impl ActorFactory {
             session_key: session_key.clone(),
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
+            tenant_id,
             inbox: rx,
             agent: Arc::new(agent),
             hooks: self.hooks.clone(),
@@ -3771,6 +3805,12 @@ struct SessionActor {
     session_key: SessionKey,
     channel: String,
     chat_id: String,
+
+    /// Owning tenant (the spawning factory's `profile_id`), or `None` for the
+    /// admin/test/single-tenant path. #1377: used to drop cross-tenant uploads
+    /// in `copy_media_to_workspace` — the authoritative tenant, matching the id
+    /// `build_gateway_session_scope` binds onto the agent's `SessionScope`.
+    tenant_id: Option<String>,
 
     inbox: mpsc::Receiver<ActorMessage>,
 
@@ -4450,6 +4490,18 @@ impl SessionActor {
                                     attachment_prompt,
                                 )
                                 .await;
+
+                            // #1377 codex P1.1: drop cross-tenant uploads from the
+                            // fully-merged media set (this turn + any drained queued
+                            // turns) BEFORE vision encoding / ASR / workspace copy —
+                            // `drain_queue` only concatenates media strings, so this
+                            // is the single point where ALL inbound media is present
+                            // yet still unread. A foreign image handle would otherwise
+                            // reach the vision encoder, and foreign audio the ASR, via
+                            // `process_inbound*` below.
+                            let final_media = self.drop_foreign_uploads(final_media);
+                            let final_attachment_media =
+                                self.drop_foreign_uploads(final_attachment_media);
 
                             // Copy non-image attachments into the agent workspace so
                             // tools can resolve them by filename without path hints.
@@ -5598,19 +5650,75 @@ impl SessionActor {
     /// Copy media files from their original location (e.g. profile media_dir)
     /// into the agent's sandboxed `user_workspace` so that `read_file` and
     /// other cwd-bound tools can access them.  Returns the updated paths.
+    /// Drop any staged upload in `media` NOT owned by this actor's tenant.
+    ///
+    /// #1377 codex P1.1: this runs on the RAW merged media set (image +
+    /// attachment) the moment a turn is assembled — BEFORE vision encoding,
+    /// ASR transcription, or the workspace copy — because a foreign image
+    /// handle is read directly by the vision encoder and audio is transcribed
+    /// before `copy_media_to_workspace`. Non-upload entries (workspace /
+    /// external paths, which `resolve_upload_reference` returns `None` for)
+    /// are kept unchanged. Solo sessions (`tenant_id == None`) keep everything.
+    fn drop_foreign_uploads(&self, media: Vec<String>) -> Vec<String> {
+        media
+            .into_iter()
+            .filter(|entry| {
+                match octos_bus::file_handle::resolve_upload_reference(entry) {
+                    Some(resolved) => {
+                        let owned = octos_bus::file_handle::upload_owned_by_tenant(
+                            &resolved,
+                            self.tenant_id.as_deref(),
+                        );
+                        if !owned {
+                            warn!(
+                                session = %self.session_key,
+                                "dropping cross-tenant upload from inbound media \
+                                 (staged file not owned by this tenant)",
+                            );
+                        }
+                        owned
+                    }
+                    None => true, // not a staged upload — keep (workspace / external)
+                }
+            })
+            .collect()
+    }
+
     fn copy_media_to_workspace(&self, media: Vec<String>) -> Vec<String> {
         media
             .into_iter()
-            .map(|path| {
-                let resolved = octos_bus::file_handle::resolve_upload_reference(&path)
-                    .map(|candidate| candidate.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone());
+            .filter_map(|path| {
+                // #1377 tenant isolation (gateway/actor analog of the serve
+                // `materialize_turn_uploads` ownership check): a media entry may
+                // reference a STAGED upload (`up/` handle or upload-tmpdir path).
+                // Resolve it and, in a multi-tenant session, DROP any upload
+                // owned by ANOTHER tenant before copying it into this session's
+                // workspace — otherwise a pasted foreign handle would copy
+                // another tenant's file in. Non-upload entries (workspace /
+                // external paths) resolve to `None` and are kept unchanged.
+                let resolved = match octos_bus::file_handle::resolve_upload_reference(&path) {
+                    Some(candidate) => {
+                        if !octos_bus::file_handle::upload_owned_by_tenant(
+                            &candidate,
+                            self.tenant_id.as_deref(),
+                        ) {
+                            warn!(
+                                session = %self.session_key,
+                                "dropping cross-tenant upload from media set \
+                                 (staged file not owned by this tenant)",
+                            );
+                            return None;
+                        }
+                        candidate.to_string_lossy().into_owned()
+                    }
+                    None => path.clone(),
+                };
                 let src = std::path::Path::new(&resolved);
                 if !src.exists() {
-                    return resolved;
+                    return Some(resolved);
                 }
                 let Some(filename) = src.file_name() else {
-                    return resolved;
+                    return Some(resolved);
                 };
                 let dest = self.user_workspace.join(filename);
                 match std::fs::copy(src, &dest) {
@@ -5621,7 +5729,7 @@ impl SessionActor {
                             dest = %dest.display(),
                             "copied media file to workspace"
                         );
-                        dest.to_string_lossy().into_owned()
+                        Some(dest.to_string_lossy().into_owned())
                     }
                     Err(e) => {
                         warn!(
@@ -5630,7 +5738,7 @@ impl SessionActor {
                             error = %e,
                             "failed to copy media to workspace, using original path"
                         );
-                        resolved
+                        Some(resolved)
                     }
                 }
             })
@@ -9889,6 +9997,7 @@ mod tests {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: None,
@@ -9960,6 +10069,7 @@ mod tests {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: None,
@@ -10109,6 +10219,7 @@ mod tests {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: Some(hooks),
@@ -10233,6 +10344,7 @@ mod tests {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: Some(hooks),
@@ -10356,6 +10468,7 @@ mod tests {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: None,
@@ -10448,6 +10561,7 @@ mod tests {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: None,
@@ -10542,6 +10656,7 @@ mod tests {
             session_key: session_key.clone(),
             channel: reply_channel.to_string(),
             chat_id: "test-api-chat".to_string(),
+            tenant_id: None,
             inbox: inbox_rx,
             agent: Arc::new(agent),
             hooks: None,
@@ -13003,6 +13118,7 @@ mod tests {
                 reply_chat_id: "!room:localhost",
                 status_indicator: None,
                 profile_id: Some("weather"),
+                tenant_id: Some("weather"),
                 system_prompt_override: Some("You are a weather bot".to_string()),
                 sender_user_id: Some("@octos_weather:localhost".to_string()),
             })
@@ -13045,6 +13161,7 @@ mod tests {
                 reply_chat_id: "!room:localhost",
                 status_indicator: None,
                 profile_id: None,
+                tenant_id: None,
                 system_prompt_override: None,
                 sender_user_id: None,
             })
@@ -13087,6 +13204,7 @@ mod tests {
                 reply_chat_id: "!room:localhost",
                 status_indicator: None,
                 profile_id: Some("weather"),
+                tenant_id: Some("weather"),
                 system_prompt_override: None,
                 sender_user_id: None,
             })
@@ -13113,6 +13231,7 @@ mod tests {
                 reply_chat_id: "!room:localhost",
                 status_indicator: None,
                 profile_id: None,
+                tenant_id: None,
                 system_prompt_override: None,
                 sender_user_id: None,
             })
@@ -13162,6 +13281,7 @@ mod tests {
                 reply_chat_id: "!room:localhost",
                 status_indicator: None,
                 profile_id: Some("weather"),
+                tenant_id: Some("weather"),
                 system_prompt_override: None,
                 sender_user_id: Some("@octos_weather:localhost".to_string()),
             })
@@ -15270,26 +15390,32 @@ mod tests {
     }
 
     #[test]
-    fn build_gateway_session_scope_returns_none_for_unsafe_session_id() {
-        // Channel-prefixed legacy shapes (`api:web-1234`,
-        // `telegram:12345`, etc.) produce a `base_key()` containing
-        // `:`, which fails `is_safe_session_id`. We MUST route those
-        // through the legacy resolver (= None) rather than building a
-        // scope against the unsafe id.
+    fn build_gateway_session_scope_binds_tenant_for_unsafe_session_id() {
+        // #1377 Phase-3-B: channel-prefixed legacy shapes (`api:web-1234`,
+        // `telegram:12345`, etc.) produce a `base_key()` containing `:`,
+        // which fails `is_safe_session_id`. These USED to skip scope
+        // construction (None), dropping actor file tools onto the unscoped
+        // legacy resolver that decodes process-global `up/` handles with no
+        // tenant check. They now get a tenant-bound scope rooted at the
+        // session's real (percent-encoded) workspace, so the upload gate
+        // applies — the gateway/actor sibling of the serve fix.
         let tmp = tempfile::TempDir::new().unwrap();
         let session_key = SessionKey::new("telegram", "12345");
-        // Sanity: pin the regression — channel-prefixed shape really
-        // fails the safe-id check.
+        // Sanity: pin that this really is a channel-prefixed (unsafe) shape.
         assert!(
             !octos_core::is_safe_session_id(session_key.base_key()),
             "this test relies on channel-prefixed keys failing is_safe_session_id; \
              update the test if SessionKey's representation changes",
         );
 
-        let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[]);
-        assert!(
-            scope.is_none(),
-            "unsafe session id must skip scope (legacy resolver path)",
+        let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[])
+            .expect("channel-prefixed id now yields a tenant-bound scope");
+        assert_eq!(scope.tenant_id(), Some("dspfac"));
+        // Workspace is the real encoded on-disk path under the data dir.
+        let encoded = octos_bus::session::encode_path_component(session_key.base_key());
+        assert_eq!(
+            scope.workspace(),
+            tmp.path().join("users").join(&encoded).join("workspace"),
         );
     }
 
