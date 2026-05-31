@@ -78,6 +78,10 @@ pub use agent::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
+    verifier::{
+        AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
+        VerifierVerdict,
+    },
 };
 pub use compaction_tiered::{
     ApiMicroCompactionConfig, DEFAULT_TIER1_MAX_AGE_TURNS, DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,

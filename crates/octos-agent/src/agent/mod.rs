@@ -14,6 +14,7 @@ mod message_repair;
 pub mod realtime;
 mod streaming;
 mod turn_state;
+pub mod verifier;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -29,6 +30,7 @@ use crate::progress::{ProgressReporter, SilentReporter};
 use crate::prompt_context::PromptContextManager;
 use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
+use verifier::AgentVerifierConfig;
 
 pub use realtime::RealtimeController;
 
@@ -286,6 +288,10 @@ pub struct Agent {
     /// pipeline workers, plugins, and shell to derive their CWD and
     /// path validation from this scope.
     pub(super) session_scope: Option<Arc<SessionScope>>,
+    /// Optional inference-time verifier plus structured TurnLedger. Absent
+    /// by default so legacy agent loops do not spend verifier calls or write
+    /// verifier sidecars unless a caller opts in explicitly.
+    pub(super) verifier_config: Option<AgentVerifierConfig>,
 }
 
 impl Agent {
@@ -330,6 +336,7 @@ impl Agent {
             sandbox_config: None,
             prompt_context_manager: None,
             session_scope: None,
+            verifier_config: None,
         }
     }
 
@@ -375,6 +382,7 @@ impl Agent {
             sandbox_config: None,
             prompt_context_manager: None,
             session_scope: None,
+            verifier_config: None,
         }
     }
 

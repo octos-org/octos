@@ -17,6 +17,7 @@ use super::loop_compaction::{prepare_conversation_messages, prepare_task_message
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState};
+use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
@@ -788,6 +789,7 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                let mut turn_ledger = self.new_turn_ledger();
 
                 loop {
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
@@ -980,9 +982,23 @@ impl Agent {
 
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
+                            let content = response.content.clone().unwrap_or_default();
+                            if !self
+                                .verifier_allows_termination(
+                                    &mut messages,
+                                    turn_ledger.as_mut(),
+                                    &content,
+                                    iteration,
+                                    &mut turn,
+                                    tracker,
+                                )
+                                .await?
+                            {
+                                continue;
+                            }
                             self.emit_cost_update(turn.total_usage(), &response);
                             return Ok(ConversationResponse {
-                                content: response.content.unwrap_or_default(),
+                                content,
                                 reasoning_content: response.reasoning_content.clone(),
                                 provider_metadata: Some(
                                     self.llm.provider_metadata_for_index(response.provider_index),
@@ -1184,6 +1200,7 @@ impl Agent {
                                     Some(&mut iter_tool_success),
                                     Some(&mut turn_output_log),
                                     &mut loop_detector,
+                                    turn_ledger.as_mut(),
                                 )
                                 .await
                             {
@@ -1200,6 +1217,27 @@ impl Agent {
                                     }
                                 }
                             };
+
+                            if let Err(e) = self
+                                .maybe_run_verifier_after_tool_batch(
+                                    &mut messages,
+                                    turn_ledger.as_mut(),
+                                    iteration,
+                                    &mut turn,
+                                    tracker,
+                                )
+                                .await
+                            {
+                                match self.handle_loop_error_with_dispatch(
+                                    &e,
+                                    &mut retry_state,
+                                    iteration,
+                                    &mut messages,
+                                ) {
+                                    LoopErrorAction::Retry => continue,
+                                    LoopErrorAction::Bail => return Err(e),
+                                }
+                            }
 
                             let spiral_iteration = turn.iteration();
                             if let Some(outcome) = self.dispatch_shell_retry_recovery(
@@ -1338,6 +1376,23 @@ impl Agent {
                                         "tool invocation errored in spawn_only turn — suppressing synthesized 'Background work started' ack and letting the LLM react to the error"
                                     );
                                 } else {
+                                    let should_gate_spawn_ack = turn_ledger
+                                        .as_ref()
+                                        .is_some_and(TurnLedger::ready_gate_active);
+                                    if should_gate_spawn_ack
+                                        && !self
+                                            .verifier_allows_termination(
+                                                &mut messages,
+                                                turn_ledger.as_mut(),
+                                                "Background work started.",
+                                                iteration,
+                                                &mut turn,
+                                                tracker,
+                                            )
+                                            .await?
+                                    {
+                                        continue;
+                                    }
                                     self.emit_cost_update(turn.total_usage(), &response);
                                     // Post-spawn failure feedback loop
                                     // (feat/spawn-only-failure-feedback-loop):
@@ -1525,6 +1580,7 @@ impl Agent {
             // can run the no-progress soft check on tool results here too.
             // Matches the conversation-loop's window of 12.
             let mut loop_detector = LoopDetector::new(12);
+            let mut turn_ledger = self.new_turn_ledger();
             let config = self.chat_config();
 
             loop {
@@ -1634,6 +1690,20 @@ impl Agent {
                     StopReason::EndTurn | StopReason::StopSequence => {
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
+                        let proposed = final_response.content.clone().unwrap_or_default();
+                        if !self
+                            .verifier_allows_termination(
+                                &mut messages,
+                                turn_ledger.as_mut(),
+                                &proposed,
+                                iteration,
+                                &mut turn,
+                                None,
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
                         if self.config.save_episodes {
                             let summary = final_response.content.clone().unwrap_or_default();
                             let summary_truncated =
@@ -1776,6 +1846,27 @@ impl Agent {
                                 None,
                                 None,
                                 &mut loop_detector,
+                                turn_ledger.as_mut(),
+                            )
+                            .await
+                        {
+                            match self.handle_loop_error_with_dispatch(
+                                &e,
+                                &mut retry_state,
+                                iteration,
+                                &mut messages,
+                            ) {
+                                LoopErrorAction::Retry => continue,
+                                LoopErrorAction::Bail => return Err(e),
+                            }
+                        }
+                        if let Err(e) = self
+                            .maybe_run_verifier_after_tool_batch(
+                                &mut messages,
+                                turn_ledger.as_mut(),
+                                iteration,
+                                &mut turn,
+                                None,
                             )
                             .await
                         {
@@ -1938,6 +2029,7 @@ impl Agent {
         // appended to the matching Tool message's content and the
         // conversation continues.
         loop_detector: &mut LoopDetector,
+        turn_ledger: Option<&mut TurnLedger>,
     ) -> Result<ChatResponse> {
         // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
         // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
@@ -2022,6 +2114,7 @@ impl Agent {
         if let Some(sink) = tool_structured_metadata {
             sink.extend(tool_metadata);
         }
+        let tool_success_for_ledger = tool_success.clone();
         if let Some(sink) = tool_success_by_id {
             sink.extend(tool_success);
         }
@@ -2048,6 +2141,12 @@ impl Agent {
                 .iter()
                 .map(|tc| (tc.id.as_str(), (tc.name.as_str(), &tc.arguments)))
                 .collect();
+            let success_by_id: HashMap<&str, bool> = tool_success_for_ledger
+                .iter()
+                .map(|(id, success)| (id.as_str(), *success))
+                .collect();
+            let stated_intent = response.content.as_deref();
+            let mut turn_ledger = turn_ledger;
             for message in merged.iter_mut() {
                 if message.role != MessageRole::Tool {
                     continue;
@@ -2058,8 +2157,25 @@ impl Agent {
                 let Some(&(name, args)) = id_to_call.get(id) else {
                     continue;
                 };
-                if let Some(hint) = loop_detector.record_result(name, args, &message.content) {
+                let result_before_hint = message.content.clone();
+                let repeating = if let Some(hint) =
+                    loop_detector.record_result(name, args, &result_before_hint)
+                {
                     message.content.push_str(&hint);
+                    true
+                } else {
+                    false
+                };
+                if let Some(ledger) = turn_ledger.as_deref_mut() {
+                    ledger.push_entry(ledger_entry_from_tool_result(
+                        turn.iteration(),
+                        stated_intent,
+                        name,
+                        args,
+                        success_by_id.get(id).copied(),
+                        &result_before_hint,
+                        repeating,
+                    ));
                 }
             }
         }
@@ -2736,16 +2852,370 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
     use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
     use octos_llm::{
         ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
+        ToolChoice,
     };
     use octos_memory::EpisodeStore;
 
     use crate::plugins::PluginTool;
+    use crate::{AgentConfig, AgentVerifierConfig};
+
+    fn tool_use(tool_calls: Vec<ToolCall>, input_tokens: u32, output_tokens: u32) -> ChatResponse {
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            provider_index: None,
+        }
+    }
+
+    fn end_turn(content: &str, input_tokens: u32, output_tokens: u32) -> ChatResponse {
+        ChatResponse {
+            content: Some(content.to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            usage: LlmTokenUsage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            provider_index: None,
+        }
+    }
+
+    struct ScriptedProvider {
+        responses: StdMutex<Vec<ChatResponse>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: StdMutex::new(responses.into_iter().rev().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.responses
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop()
+                .ok_or_else(|| eyre::eyre!("scripted provider exhausted"))
+        }
+
+        fn model_id(&self) -> &str {
+            "planner-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct StaticResultTool {
+        name: &'static str,
+        output: &'static str,
+        success: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StaticResultTool {
+        fn new(
+            name: &'static str,
+            output: &'static str,
+            success: bool,
+            calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name,
+                output,
+                success,
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for StaticResultTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test tool for verifier loop tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ToolResult {
+                output: self.output.to_string(),
+                success: self.success,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct NoCallVerifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for NoCallVerifier {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            eyre::bail!("verifier should have been skipped for quiet progress")
+        }
+
+        fn model_id(&self) -> &str {
+            "haiku-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-verifier"
+        }
+    }
+
+    struct RepeatAwarePlanner {
+        calls: AtomicUsize,
+        saw_repeating_note: AtomicBool,
+    }
+
+    impl RepeatAwarePlanner {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                saw_repeating_note: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RepeatAwarePlanner {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            let saw_repeating = messages.iter().any(|message| {
+                message.content.contains("[verifier]")
+                    && message.content.contains("verdict: Repeating")
+            });
+            if saw_repeating {
+                self.saw_repeating_note.store(true, AtomicOrdering::SeqCst);
+            }
+            let fix_ran = messages.iter().any(|message| {
+                message.role == MessageRole::Tool && message.content.contains("fixed style")
+            });
+            if fix_ran {
+                return Ok(end_turn("fixed answer", 12, 6));
+            }
+            if saw_repeating {
+                return Ok(tool_use(
+                    vec![ToolCall {
+                        id: "fix_call".into(),
+                        name: "fix_tool".into(),
+                        arguments: serde_json::json!({"path": "style.toml", "repair": true}),
+                        metadata: None,
+                    }],
+                    10,
+                    5,
+                ));
+            }
+            Ok(tool_use(
+                vec![ToolCall {
+                    id: format!("fail_call_{call}"),
+                    name: "fail_tool".into(),
+                    arguments: serde_json::json!({"path": "style.toml"}),
+                    metadata: None,
+                }],
+                10,
+                5,
+            ))
+        }
+
+        fn model_id(&self) -> &str {
+            "planner-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct LedgerDrivenVerifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for LedgerDrivenVerifier {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            assert!(
+                matches!(config.tool_choice, ToolChoice::None),
+                "verifier call must not expose tools"
+            );
+            assert_eq!(
+                octos_llm::current_lane_context().lane,
+                Some(octos_llm::Lane::FastChat),
+                "verifier call should use the cheap fast-chat lane"
+            );
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let verdict = if prompt.contains("tool=fix_tool") {
+                r#"{"verdict":"ReadyToAnswer"}"#
+            } else if prompt.contains("repeating=true") {
+                r#"{"verdict":"Repeating","error_class":"ContractFail"}"#
+            } else {
+                r#"{"verdict":"Insufficient","reason":"need a different action"}"#
+            };
+            Ok(ChatResponse {
+                content: Some(verdict.to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "haiku-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-verifier"
+        }
+    }
+
+    struct PrematureEndPlanner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PrematureEndPlanner {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                return Ok(tool_use(
+                    vec![ToolCall {
+                        id: "fail_once".into(),
+                        name: "fail_tool".into(),
+                        arguments: serde_json::json!({"path": "style.toml"}),
+                        metadata: None,
+                    }],
+                    8,
+                    4,
+                ));
+            }
+            if call == 1 {
+                return Ok(end_turn("premature answer", 8, 4));
+            }
+            Ok(end_turn("ready answer", 8, 4))
+        }
+
+        fn model_id(&self) -> &str {
+            "planner-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct GateVerifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for GateVerifier {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let verdict = if prompt.contains("Proposed answer:\nready answer") {
+                r#"{"verdict":"ReadyToAnswer"}"#
+            } else if call == 0 {
+                r#"{"verdict":"Blocked","reason":"tool failed"}"#
+            } else {
+                r#"{"verdict":"Insufficient","reason":"not ready yet"}"#
+            };
+            Ok(ChatResponse {
+                content: Some(verdict.to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "haiku-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-verifier"
+        }
+    }
     use crate::plugins::manifest::PluginToolDef;
     use crate::prompt_context::{
         PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
@@ -4860,6 +5330,168 @@ printf '{"output":"voice saved","success":true}\n'
             });
         }
         out
+    }
+
+    #[tokio::test]
+    async fn verifier_skips_quiet_successful_tool_batch_and_persists_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("turn_ledger.jsonl");
+        let planner: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "quiet_call".into(),
+                    name: "quiet_tool".into(),
+                    arguments: serde_json::json!({"path": "ok.txt"}),
+                    metadata: None,
+                }],
+                10,
+                5,
+            ),
+            end_turn("done", 10, 5),
+        ]));
+        let verifier = Arc::new(NoCallVerifier {
+            calls: AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "quiet_tool",
+            "healthy progress\n\nExit code: 0",
+            true,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("verifier-skip"), planner, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            })
+            .with_verifier_config(
+                AgentVerifierConfig::with_provider(verifier.clone(), "haiku-test")
+                    .with_ledger_path(&ledger_path),
+            );
+
+        let response = agent
+            .process_message("do one safe thing", &[], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "done");
+        assert_eq!(verifier.calls.load(AtomicOrdering::SeqCst), 0);
+        let persisted = std::fs::read_to_string(&ledger_path).expect("turn ledger persisted");
+        assert!(
+            persisted.contains("\"tool\":\"quiet_tool\""),
+            "quiet successful tool call should still be ledgered: {persisted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier_repeating_note_changes_next_planner_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("turn_ledger.jsonl");
+        let planner = Arc::new(RepeatAwarePlanner::new());
+        let verifier = Arc::new(LedgerDrivenVerifier {
+            calls: AtomicUsize::new(0),
+        });
+        let fail_calls = Arc::new(AtomicUsize::new(0));
+        let fix_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "fail_tool",
+            "[VALIDATION FAILED] style TOML is malformed",
+            false,
+            fail_calls.clone(),
+        ));
+        tools.register(StaticResultTool::new(
+            "fix_tool",
+            "fixed style\n\nExit code: 0",
+            true,
+            fix_calls.clone(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("verifier-repeat"),
+            planner.clone(),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            max_iterations: 12,
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_verifier_config(
+            AgentVerifierConfig::with_provider(verifier.clone(), "haiku-test")
+                .with_ledger_path(&ledger_path),
+        );
+
+        let response = agent
+            .process_message("repair the generated style", &[], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "fixed answer");
+        assert!(
+            planner.saw_repeating_note.load(AtomicOrdering::SeqCst),
+            "planner must observe the injected Repeating verifier note"
+        );
+        assert_eq!(fail_calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(fix_calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            verifier.calls.load(AtomicOrdering::SeqCst) >= 4,
+            "verifier should classify failures and the ready gate"
+        );
+        let persisted = std::fs::read_to_string(&ledger_path).expect("turn ledger persisted");
+        assert!(persisted.contains("\"tool\":\"fail_tool\""));
+        assert!(persisted.contains("\"tool\":\"fix_tool\""));
+    }
+
+    #[tokio::test]
+    async fn verifier_ready_to_answer_gates_endturn_after_problem_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let planner = Arc::new(PrematureEndPlanner {
+            calls: AtomicUsize::new(0),
+        });
+        let verifier = Arc::new(GateVerifier {
+            calls: AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "fail_tool",
+            "[VALIDATION FAILED] artifact missing",
+            false,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("verifier-gate"),
+            planner.clone(),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            max_iterations: 8,
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_verifier_config(AgentVerifierConfig::with_provider(
+            verifier.clone(),
+            "haiku-test",
+        ));
+
+        let response = agent
+            .process_message("try then answer too early", &[], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "ready answer");
+        assert!(
+            planner.calls.load(AtomicOrdering::SeqCst) >= 3,
+            "premature EndTurn must be rejected until ReadyToAnswer"
+        );
+        assert!(
+            verifier.calls.load(AtomicOrdering::SeqCst) >= 3,
+            "failure classification plus two termination checks expected"
+        );
     }
 
     // ── is_productive_tool_message (M6.2) ───────────────────────────────
