@@ -10133,6 +10133,46 @@ async fn handle_task_cancel(
         return;
     }
 
+    let task_id = params.task_id.clone();
+
+    // octos#1380: gateway-mode — the `octos serve` API server owns no task
+    // supervisor (`task_query_store == None`); the supervisor lives in the
+    // gateway process. Proxy the cancel to that process (mirroring the REST
+    // `/api/tasks/{id}/cancel` handler) instead of failing `runtime_unavailable`.
+    if state.task_query_store.is_none() {
+        if let Some(port) = gateway_task_api_port(state, connection_profile_id).await {
+            if let Err(error) =
+                ensure_task_in_gateway_session(state, port, session_id, &task_id).await
+            {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+            let path = format!("/tasks/{}/cancel", task_id);
+            let response = super::webhook_proxy::api_post_proxy_json(
+                state,
+                port,
+                &path,
+                serde_json::json!({}),
+            )
+            .await;
+            match proxied_task_cancel_outcome(&task_id, response) {
+                Ok(()) => send_serialized_rpc_result(
+                    ws,
+                    id,
+                    octos_core::ui_protocol::methods::TASK_CANCEL,
+                    TaskCancelResult {
+                        task_id,
+                        status: UiTaskRuntimeState::Cancelled,
+                    },
+                ),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return;
+        }
+    }
+
     let store = match task_query_store_or_error(state) {
         Ok(store) => store,
         Err(error) => {
@@ -10140,7 +10180,6 @@ async fn handle_task_cancel(
             return;
         }
     };
-    let task_id = params.task_id.clone();
     match ensure_task_in_session(state, session_id, &task_id).and_then(|()| {
         store
             .cancel_task(&task_id.to_string())
@@ -10161,6 +10200,148 @@ async fn handle_task_cancel(
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
         }
+    }
+}
+
+/// octos#1380: resolve the gateway-process api port that owns the task
+/// supervisor for `profile_id`. Used when the API server has no local
+/// `task_query_store` (`octos serve` runs supervisors in gateway processes).
+async fn gateway_task_api_port(state: &AppState, profile_id: Option<&str>) -> Option<u16> {
+    let pm = state.process_manager.as_ref()?;
+    // Mirror `resolve_api_port`: prefer the connection's profile, else fall back
+    // to the gateway's first available port (covers no-auth/first-gateway and
+    // admin/routed connections that carry no `connection_profile_id`).
+    if let Some(profile) = profile_id {
+        if let Some(port) = pm.api_port(profile).await {
+            return Some(port);
+        }
+    }
+    pm.first_api_port().await.map(|(_, port)| port)
+}
+
+/// octos#1380: gateway-mode equivalent of [`ensure_task_in_session`] — confirm
+/// `task_id` belongs to `session_id` by proxying the gateway's session task
+/// list, so task-control stays session-scoped (not just profile-scoped) and a
+/// task id from another session in the same profile yields `unknown_task_id`.
+async fn ensure_task_in_gateway_session(
+    state: &AppState,
+    port: u16,
+    session_id: &SessionKey,
+    task_id: &TaskId,
+) -> Result<(), RpcError> {
+    let path = format!(
+        "/sessions/{}/tasks",
+        super::handlers::encode_api_session_path_id(&session_id.to_string())
+    );
+    let response = super::webhook_proxy::api_get_proxy(state, port, &path).await;
+    if !response.status().is_success() {
+        return Err(RpcError::unknown_task_id(task_id));
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| {
+            RpcError::internal_error(format!(
+                "gateway session tasks proxy body read failed: {error}"
+            ))
+        })?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        RpcError::internal_error(format!(
+            "gateway session tasks proxy returned invalid JSON: {error}"
+        ))
+    })?;
+    if json_task_list_contains(&body, &task_id.to_string()) {
+        Ok(())
+    } else {
+        Err(RpcError::unknown_task_id(task_id))
+    }
+}
+
+/// Whether a proxied gateway task-list JSON payload contains `task_id`. Accepts
+/// a bare array or a `{ "tasks": [...] }` wrapper, matching either an `id` or
+/// `task_id` field — defensive against the gateway's untyped task_query shape.
+fn json_task_list_contains(body: &serde_json::Value, task_id: &str) -> bool {
+    let items = body
+        .as_array()
+        .or_else(|| body.get("tasks").and_then(|tasks| tasks.as_array()));
+    match items {
+        Some(items) => items.iter().any(|item| {
+            item.get("id").and_then(|field| field.as_str()) == Some(task_id)
+                || item.get("task_id").and_then(|field| field.as_str()) == Some(task_id)
+        }),
+        None => false,
+    }
+}
+
+/// Map a proxied REST `/tasks/{id}/cancel` gateway response onto the WS
+/// `task/cancel` outcome: 200 -> cancelled, 404 -> unknown task, 409 -> already
+/// terminal, anything else -> typed `runtime_unavailable`.
+fn proxied_task_cancel_outcome(
+    task_id: &TaskId,
+    response: axum::response::Response,
+) -> Result<(), RpcError> {
+    match response.status() {
+        axum::http::StatusCode::OK => Ok(()),
+        axum::http::StatusCode::NOT_FOUND => Err(task_cancel_rpc_error(
+            task_id,
+            octos_agent::TaskCancelError::NotFound,
+        )),
+        axum::http::StatusCode::CONFLICT => Err(task_cancel_rpc_error(
+            task_id,
+            octos_agent::TaskCancelError::AlreadyTerminal,
+        )),
+        status => Err(RpcError::runtime_not_ready(format!(
+            "gateway task/cancel proxy returned {status}"
+        ))
+        .with_data(serde_json::json!({ "kind": "runtime_unavailable" }))),
+    }
+}
+
+/// Map a proxied REST `/tasks/{id}/restart-from-node` gateway response onto the
+/// WS `task/restart_from_node` outcome. On 200 the relaunched task id is read
+/// from the gateway body; 404/409 map to the typed relaunch errors; anything
+/// else to `runtime_unavailable`.
+async fn proxied_task_restart_outcome(
+    task_id: &TaskId,
+    response: axum::response::Response,
+) -> Result<TaskId, RpcError> {
+    match response.status() {
+        axum::http::StatusCode::OK => {
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "gateway restart proxy body read failed: {error}"
+                    ))
+                })?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                RpcError::internal_error(format!(
+                    "gateway restart proxy returned invalid JSON: {error}"
+                ))
+            })?;
+            let new_task_id = value
+                .get("new_task_id")
+                .and_then(|field| field.as_str())
+                .ok_or_else(|| {
+                    RpcError::internal_error("gateway restart proxy response missing new_task_id")
+                })?;
+            new_task_id.parse::<TaskId>().map_err(|error| {
+                RpcError::internal_error(format!(
+                    "gateway restart proxy returned an invalid relaunched task id: {error}"
+                ))
+            })
+        }
+        axum::http::StatusCode::NOT_FOUND => Err(task_relaunch_rpc_error(
+            task_id,
+            octos_agent::TaskRelaunchError::NotFound,
+        )),
+        axum::http::StatusCode::CONFLICT => Err(task_relaunch_rpc_error(
+            task_id,
+            octos_agent::TaskRelaunchError::StillActive,
+        )),
+        status => Err(RpcError::runtime_not_ready(format!(
+            "gateway task/restart_from_node proxy returned {status}"
+        ))
+        .with_data(serde_json::json!({ "kind": "runtime_unavailable" }))),
     }
 }
 
@@ -10190,6 +10371,47 @@ async fn handle_task_restart_from_node(
         return;
     }
 
+    let task_id = params.task_id.clone();
+    let from_node = params.node_id.clone();
+
+    // octos#1380: gateway-mode proxy (see handle_task_cancel) — forward the
+    // relaunch to the gateway process that owns the supervisor when no local
+    // store is wired, mirroring the REST `/api/tasks/{id}/restart-from-node`.
+    if state.task_query_store.is_none() {
+        if let Some(port) = gateway_task_api_port(state, connection_profile_id).await {
+            if let Err(error) =
+                ensure_task_in_gateway_session(state, port, session_id, &task_id).await
+            {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+            let path = format!("/tasks/{}/restart-from-node", task_id);
+            let response = super::webhook_proxy::api_post_proxy_json(
+                state,
+                port,
+                &path,
+                serde_json::json!({ "node_id": from_node }),
+            )
+            .await;
+            match proxied_task_restart_outcome(&task_id, response).await {
+                Ok(new_task_id) => send_serialized_rpc_result(
+                    ws,
+                    id,
+                    octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE,
+                    TaskRestartFromNodeResult {
+                        original_task_id: task_id,
+                        new_task_id,
+                        from_node,
+                    },
+                ),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return;
+        }
+    }
+
     let store = match task_query_store_or_error(state) {
         Ok(store) => store,
         Err(error) => {
@@ -10197,8 +10419,6 @@ async fn handle_task_restart_from_node(
             return;
         }
     };
-    let task_id = params.task_id.clone();
-    let from_node = params.node_id.clone();
     let opts = octos_agent::RelaunchOpts {
         from_node: from_node.clone(),
     };
@@ -20857,6 +21077,85 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+    }
+
+    #[test]
+    fn proxied_task_cancel_outcome_maps_gateway_status() {
+        // octos#1380: the WS task/cancel gateway-proxy fallback maps the REST
+        // gateway response onto the JSON-RPC outcome.
+        use axum::http::StatusCode;
+        let task_id = TaskId::new();
+        let response = |status: StatusCode| {
+            axum::response::Response::builder()
+                .status(status)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::OK)).is_ok());
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::NOT_FOUND)).is_err());
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::CONFLICT)).is_err());
+        assert!(proxied_task_cancel_outcome(&task_id, response(StatusCode::BAD_GATEWAY)).is_err());
+    }
+
+    #[tokio::test]
+    async fn proxied_task_restart_outcome_maps_gateway_status() {
+        // octos#1380: the WS task/restart_from_node gateway-proxy fallback reads
+        // the relaunched task id from the gateway body and maps statuses.
+        use axum::http::StatusCode;
+        let task_id = TaskId::new();
+        let new_id = TaskId::new();
+        let ok_body = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from(
+                serde_json::json!({ "new_task_id": new_id.to_string() }).to_string(),
+            ))
+            .unwrap();
+        let parsed = proxied_task_restart_outcome(&task_id, ok_body)
+            .await
+            .expect("200 maps to the relaunched task id");
+        assert_eq!(parsed, new_id);
+
+        let empty = |status: StatusCode| {
+            axum::response::Response::builder()
+                .status(status)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert!(
+            proxied_task_restart_outcome(&task_id, empty(StatusCode::NOT_FOUND))
+                .await
+                .is_err()
+        );
+        assert!(
+            proxied_task_restart_outcome(&task_id, empty(StatusCode::CONFLICT))
+                .await
+                .is_err()
+        );
+        assert!(
+            proxied_task_restart_outcome(&task_id, empty(StatusCode::BAD_GATEWAY))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn json_task_list_contains_matches_array_and_wrapped_shapes() {
+        // octos#1380: gateway session-membership check accepts a bare array or a
+        // `{ "tasks": [...] }` wrapper, matching `id` or `task_id`.
+        let id = "01950000-0000-7000-8000-0000000000a1";
+        assert!(json_task_list_contains(
+            &serde_json::json!([{ "id": id }, { "id": "other" }]),
+            id
+        ));
+        assert!(json_task_list_contains(
+            &serde_json::json!({ "tasks": [{ "task_id": id }] }),
+            id
+        ));
+        assert!(!json_task_list_contains(
+            &serde_json::json!([{ "id": "other" }]),
+            id
+        ));
+        assert!(!json_task_list_contains(&serde_json::json!({}), id));
     }
 
     #[test]
