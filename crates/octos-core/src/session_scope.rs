@@ -499,6 +499,119 @@ impl SessionScope {
         Self::multi_tenant(profile_data_dir, tenant_id, session_id, shared_zones)
     }
 
+    /// Construct a multi-tenant scope bound to an EXPLICIT `workspace`
+    /// directory rather than the canonical
+    /// `<root>/users/<session_id>/workspace` layout that
+    /// [`Self::multi_tenant`] derives.
+    ///
+    /// Use this when the session's real on-disk workspace does not match
+    /// the canonical derivation:
+    ///
+    /// - **coding-agent `workspace_hint` sessions** rooted at a
+    ///   caller-supplied repo. The repo lives OUTSIDE the profile data
+    ///   dir, so pass `profile_data_dir == workspace` (root the scope at
+    ///   the repo itself) and `shared_zones == []` — there is no valid
+    ///   `<root>/research` zone to grant.
+    /// - **channel-prefixed session ids** (`api:web-1234`, …) whose `:`
+    ///   the on-disk path percent-encodes. Pass the profile data dir as
+    ///   `profile_data_dir` and the encoded
+    ///   `<data>/users/<encoded>/workspace` as `workspace` (it IS under
+    ///   the data dir), with the usual shared zones.
+    ///
+    /// `session_id` is recorded for diagnostics only — classification
+    /// keys off `workspace` + `shared_zones`, never `session_id` — but it
+    /// must still satisfy [`is_safe_session_id`] (callers sanitize the
+    /// `:` first). The tenant binding applies regardless, so the agent
+    /// resolver's upload-ownership gate fires for `up/` handles in these
+    /// sessions (#1377): an unscoped session would decode a global `up/`
+    /// handle with no tenant check, but a tenant-bound scope routes
+    /// through the gated resolver.
+    ///
+    /// Validates that `profile_data_dir` and `workspace` are absolute,
+    /// that `workspace` does not escape `profile_data_dir` (equal is
+    /// allowed — the coding-agent root-at-repo case), that the tenant id
+    /// is non-empty, that `session_id` is safe, and that every shared
+    /// zone is a strict subdir of root that does not overlap the
+    /// per-session `users/` subtree (codex round-2 P2 isolation guard).
+    pub fn multi_tenant_at_workspace(
+        profile_data_dir: PathBuf,
+        workspace: PathBuf,
+        tenant_id: String,
+        session_id: String,
+        shared_zones: Vec<PathBuf>,
+    ) -> Result<Self, SessionScopeError> {
+        if !profile_data_dir.is_absolute() {
+            return Err(SessionScopeError::RootNotAbsolute(profile_data_dir));
+        }
+        if !workspace.is_absolute() {
+            // An absolute workspace is required for the same reason as an
+            // absolute root: so the scope cannot be reinterpreted against
+            // a different CWD. Reuse `RootNotAbsolute` — there is no
+            // separate workspace-absoluteness variant and the message is
+            // accurate (workspace is the scope's effective root here).
+            return Err(SessionScopeError::RootNotAbsolute(workspace));
+        }
+        // Reject `..` components BEFORE the lexical containment check
+        // below. `Path::starts_with` is purely lexical, so a workspace
+        // like `<root>/../escapes` lexically "starts with" <root> yet
+        // canonicalizes OUTSIDE it — and the scoped resolver canonicalizes
+        // `scope.workspace()`, which would then classify the escaped
+        // directory as `InWorkspace`, defeating the WorkspaceEscapesRoot
+        // guarantee (codex round-11 P2). Canonical/derived workspaces
+        // never contain `..`, so rejecting is a safe degrade (the bootstrap
+        // caller falls back to an unscoped session). Check `root` too —
+        // a `..` in the root would make the containment compare meaningless.
+        if workspace
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+            || profile_data_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(SessionScopeError::WorkspaceEscapesRoot {
+                root: profile_data_dir,
+                workspace,
+            });
+        }
+        if !workspace.starts_with(&profile_data_dir) {
+            return Err(SessionScopeError::WorkspaceEscapesRoot {
+                root: profile_data_dir,
+                workspace,
+            });
+        }
+        if tenant_id.is_empty() {
+            return Err(SessionScopeError::EmptyTenantId);
+        }
+        if !is_safe_session_id(&session_id) {
+            return Err(SessionScopeError::UnsafeSessionId(session_id));
+        }
+        let users_subtree = profile_data_dir.join(MULTI_TENANT_USERS_DIR_NAME);
+        for zone in &shared_zones {
+            if zone == &profile_data_dir || !zone.starts_with(&profile_data_dir) {
+                return Err(SessionScopeError::SharedZoneNotStrictSubdir {
+                    root: profile_data_dir.clone(),
+                    zone: zone.clone(),
+                });
+            }
+            if zone == &users_subtree || zone.starts_with(&users_subtree) {
+                return Err(SessionScopeError::SharedZoneOverlapsUsersSubtree {
+                    users_subtree: users_subtree.clone(),
+                    zone: zone.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            workspace,
+            root: profile_data_dir,
+            mode: ScopeMode::MultiTenant {
+                tenant_id,
+                session_id,
+                shared_zones,
+            },
+            skill_read_zones: Vec::new(),
+        })
+    }
+
     /// Construct a solo scope from the user's CWD. Workspace == root
     /// (one CWD per process); no shared zones (cross-session
     /// continuity is the user's project files in their CWD, not a
@@ -544,6 +657,17 @@ impl SessionScope {
 
     pub fn mode(&self) -> &ScopeMode {
         &self.mode
+    }
+
+    /// The tenant (profile) id this scope belongs to — `Some` for a
+    /// multi-tenant session, `None` for a solo session. Used to bind
+    /// uploaded files to a tenant and to refuse cross-tenant `up/`
+    /// handle resolution (#1377).
+    pub fn tenant_id(&self) -> Option<&str> {
+        match &self.mode {
+            ScopeMode::MultiTenant { tenant_id, .. } => Some(tenant_id.as_str()),
+            ScopeMode::Solo { .. } => None,
+        }
     }
 
     /// Return the read-only plugin skill directories the agent may
@@ -856,6 +980,116 @@ mod tests {
             session.into(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn tenant_id_some_for_multi_tenant_none_for_solo() {
+        let data = abs("/octos/profiles/dspfac/data");
+        let mt = mt_default(&data, "web-x");
+        assert_eq!(mt.tenant_id(), Some("dspfac"));
+        let solo = SessionScope::solo(abs("/ws"), vec![]).unwrap();
+        assert_eq!(solo.tenant_id(), None);
+    }
+
+    #[test]
+    fn multi_tenant_at_workspace_accepts_encoded_under_data_layout() {
+        // Channel-prefixed `:` session: the on-disk workspace lives under
+        // the profile data dir (percent-encoded path), so root stays at
+        // the data dir and the standard shared zones apply.
+        let data = abs("/octos/profiles/dspfac/data");
+        let workspace = data.join("users/api%3Aweb-1234/workspace");
+        let scope = SessionScope::multi_tenant_at_workspace(
+            data.clone(),
+            workspace.clone(),
+            "dspfac".into(),
+            "api-web-1234".into(),
+            vec![data.join("research"), data.join("skills")],
+        )
+        .expect("encoded workspace under data dir is valid");
+        assert_eq!(scope.root(), data);
+        assert_eq!(scope.workspace(), workspace.as_path());
+        // Tenant binding present -> the agent resolver's upload gate fires.
+        assert_eq!(scope.tenant_id(), Some("dspfac"));
+        // A workspace-relative path classifies InWorkspace; arbitrary
+        // absolute paths outside the scope stay OutOfScope.
+        assert!(matches!(
+            scope.classify_canonical_path(&workspace.join("uploads/a.md")),
+            PathClassification::InWorkspace
+        ));
+    }
+
+    #[test]
+    fn multi_tenant_at_workspace_roots_at_repo_for_coding_hint() {
+        // Coding-agent hint session: the repo lives OUTSIDE the profile
+        // data dir, so the caller roots the scope at the repo itself
+        // (workspace == root) with no shared zones. workspace.starts_with
+        // (root) holds via equality, so the WorkspaceEscapesRoot guard
+        // does not trip.
+        // Use a path under `/octos` (guaranteed not to exist and not a
+        // macOS automount like `/home`) so `canonicalize_lossy` treats
+        // candidate + workspace identically.
+        let repo = abs("/octos/repos/some-repo");
+        let scope = SessionScope::multi_tenant_at_workspace(
+            repo.clone(),
+            repo.clone(),
+            "dspfac".into(),
+            "appui-1234".into(),
+            vec![],
+        )
+        .expect("repo-rooted hint scope is valid");
+        assert_eq!(scope.root(), repo);
+        assert_eq!(scope.workspace(), repo);
+        assert_eq!(scope.tenant_id(), Some("dspfac"));
+        assert!(matches!(
+            scope.classify_canonical_path(&repo.join("src/main.rs")),
+            PathClassification::InWorkspace
+        ));
+    }
+
+    #[test]
+    fn multi_tenant_at_workspace_rejects_workspace_escaping_root() {
+        // A workspace that is neither under nor equal to root is a
+        // contract violation (the caller must root at the repo for the
+        // out-of-tree case, not leave root at the data dir).
+        let data = abs("/octos/profiles/dspfac/data");
+        let escaped = abs("/home/yc/outside");
+        let err = SessionScope::multi_tenant_at_workspace(
+            data,
+            escaped,
+            "dspfac".into(),
+            "x".into(),
+            vec![],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::WorkspaceEscapesRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn multi_tenant_at_workspace_rejects_parent_dir_escape() {
+        // codex round-11 P2: a workspace that lexically `starts_with` root
+        // but contains `..` canonicalizes OUTSIDE root. `Path::starts_with`
+        // would accept it, so the `..` guard must reject it first.
+        let data = abs("/octos/profiles/dspfac/data");
+        let escaping = data.join("../escapes"); // lexically starts_with data
+        assert!(
+            escaping.starts_with(&data),
+            "test premise: the escaping path lexically starts_with root",
+        );
+        let err = SessionScope::multi_tenant_at_workspace(
+            data,
+            escaping,
+            "dspfac".into(),
+            "x".into(),
+            vec![],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::WorkspaceEscapesRoot { .. }
+        ));
     }
 
     #[test]

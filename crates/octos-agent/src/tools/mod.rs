@@ -892,6 +892,23 @@ fn resolve_for_scope(
     // `SessionScope` does not currently expose; tracked as a follow-up
     // (issue #1367).
     if user_path.starts_with("up/") {
+        // #1377 tenant isolation: in a multi-tenant (scoped) session, uploads
+        // are materialized into `<workspace>/uploads/` at turn start and read
+        // by that workspace path. Refuse global `up/` handle resolution here so
+        // a scoped session cannot reach the process-global upload tmpdir (and
+        // thus another tenant's uploads) by handle. Solo sessions (CLI
+        // `octos chat`) keep resolving handles for back-compat.
+        if scope.tenant_id().is_some()
+            && matches!(
+                octos_bus::file_handle::decode_file_handle(user_path),
+                Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+            )
+        {
+            return Err(
+                "Uploaded file not found; uploaded files are under uploads/ — \
+                 read with read_file(\"uploads/<name>\")",
+            );
+        }
         match octos_bus::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
             Ok(resolved)
                 if resolved.scope == octos_bus::file_handle::ToolPathScope::UploadTmpdir =>
@@ -1640,6 +1657,43 @@ mod path_tests {
             resolve_path_for_session_scope_write(&scope, &handle).is_err(),
             "write to a missing upload handle must error"
         );
+    }
+
+    /// #1377 tenant isolation: a multi-tenant (scoped) session must NOT resolve
+    /// a global `up/` upload handle — uploads are materialized into `uploads/`
+    /// and read by that workspace path. (Solo sessions keep resolving handles;
+    /// covered by `scoped_session_resolves_upload_handle_to_tmpdir_not_workspace`.)
+    #[test]
+    fn multi_tenant_session_refuses_global_up_handle_but_reads_uploads_dir() {
+        let data = tempfile::tempdir().expect("profile data dir");
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.path().to_path_buf(),
+            "tenant-a".into(),
+            "web-x".into(),
+        )
+        .unwrap();
+        // Create the workspace so canonicalize is firmlink-consistent on macOS.
+        std::fs::create_dir_all(scope.workspace()).unwrap();
+
+        // A valid up/ handle (which a solo session WOULD resolve under the
+        // global tmpdir) is refused for a multi-tenant session.
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("mt-{}-secret.md", std::process::id()));
+        std::fs::write(&uploaded, b"tenant secret\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("secret.md")).unwrap();
+        let resolved = resolve_path_for_session_scope_read(&scope, &handle);
+        let _ = std::fs::remove_file(&uploaded);
+        assert!(
+            resolved.is_err(),
+            "a multi-tenant session must refuse a global up/ handle, got {resolved:?}"
+        );
+
+        // ...but the materialized workspace path resolves InWorkspace.
+        let ok = resolve_path_for_session_scope_read(&scope, "uploads/secret.md")
+            .expect("uploads/<name> must resolve in the workspace");
+        assert!(ok.starts_with(scope.workspace().join("uploads")));
     }
 
     /// Interim guard (#1378): the upload-handle namespace is detected for

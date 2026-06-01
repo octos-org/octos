@@ -61,9 +61,160 @@ pub(crate) fn response_path_for_profile_file(
 fn resolve_scoped_download_path(
     base_dir: &std::path::Path,
     request_path: &str,
+    auth_profile: Option<&str>,
+    session_workspace: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
-    resolve_scoped_file_handle(base_dir, request_path)
+    if let Some(resolved) = resolve_scoped_file_handle(base_dir, request_path)
         .or_else(|| resolve_legacy_file_request(base_dir, request_path))
+    {
+        // SECURITY (#1377 round-6 P1.2): `up/` handles + raw tmpdir refs resolve
+        // against the PROCESS-GLOBAL upload root regardless of `base_dir`, so a
+        // requester who obtains another tenant's handle could otherwise download
+        // it. Now that uploads are stored under `octos-uploads/<profile>/…`,
+        // refuse an upload-tmpdir result whose owning tenant != the authenticated
+        // requester. Non-upload results (profile files already scoped to
+        // `base_dir`) are unaffected.
+        if let Some(owner) = upload_tmpdir_tenant(&resolved) {
+            if auth_profile != Some(owner.as_str()) {
+                return None;
+            }
+        }
+        return Some(resolved);
+    }
+    // #1377: uploaded files are materialized into the per-session workspace
+    // (`<workspace>/uploads/<name>`) and the user-message `FileRef` carries that
+    // workspace-relative path. Serve it from the resolved session workspace (the
+    // caller passes the SAME root the turn materialized into).
+    resolve_within_workspace(session_workspace?, request_path)
+}
+
+/// If `p` is contained under the process-global upload tmpdir, return its owning
+/// tenant (the first path component, since uploads live at
+/// `octos-uploads/<tenant>/<uuid>_<name>`). `None` for any path NOT under the
+/// upload root (e.g. a profile file already scoped to its tenant `base_dir`).
+fn upload_tmpdir_tenant(p: &std::path::Path) -> Option<String> {
+    let root = std::fs::canonicalize(octos_bus::file_handle::temp_upload_root()).ok()?;
+    let canon = std::fs::canonicalize(p).ok()?;
+    match canon.strip_prefix(&root).ok()?.components().next()? {
+        std::path::Component::Normal(s) => s.to_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Resolve a workspace-relative download path (e.g. `uploads/<name>`) under
+/// `workspace_root`. Canonical containment + traversal guards keep it inside
+/// that workspace.
+fn resolve_within_workspace(
+    workspace_root: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    let rel = std::path::Path::new(request_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let candidate = std::fs::canonicalize(workspace_root.join(rel)).ok()?;
+    let canon_ws = std::fs::canonicalize(workspace_root).ok()?;
+    (candidate.is_file() && candidate.starts_with(&canon_ws)).then_some(candidate)
+}
+
+/// Resolve the workspace root for a download request's owning session, matching
+/// EXACTLY where the turn materialized uploads (#1377). `data_dir` is the
+/// authenticated caller's profile/tenant root, so this only reaches that
+/// tenant's own sessions.
+///
+/// Primary: the in-memory open-session map (`session_workspace_root_for_state`),
+/// which holds the exact `workspace_root` the turn used — correct for every
+/// session shape, including `base_key()`-encoded and cwd-hinted workspaces.
+/// Fallback (evicted session): the canonical multi-tenant layout
+/// `<data>/users/<encode_path_component(base_key)>/workspace` (mirrors the
+/// workspace construction in `ui_protocol.rs`).
+///
+/// SECURITY: the open-session map is process-GLOBAL across tenants, so a map
+/// hit is trusted ONLY when its workspace is contained under the authenticated
+/// `data_dir` (this tenant's root). A foreign session id therefore can't
+/// surface another tenant's workspace; it falls through to the tenant-scoped
+/// reconstruction, which (for a foreign session) won't exist under this
+/// `data_dir` and resolves to a 404 — never a cross-tenant read (codex #1377
+/// round-3/8 P1).
+///
+/// KNOWN LIMITATION: a session opened with an approved `cwd` OUTSIDE the data
+/// dir (desktop/AppUI custom workspaces — NOT the hosted `<data>/users/...`
+/// fleet layout) materialises uploads into that external repo, which this
+/// containment rule won't serve via `/api/files`. Soundly serving those needs a
+/// session→owning-profile binding the workspace map does not carry; a generic
+/// cwd-safety re-check is NOT an ownership proof (it would reopen the
+/// cross-tenant read — codex round-8 P1). Tracked as a follow-up.
+fn resolve_session_workspace_root(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let key = octos_core::SessionKey(session_id.to_string());
+    if let Some(ws) = crate::api::ui_protocol::session_workspace_root_for_state(state, &key) {
+        if map_workspace_belongs_to_tenant(&ws, data_dir) {
+            return Some(ws);
+        }
+        // Outside this tenant's data dir → not provably owned by the requester.
+        // Ignore the global map entry and fall through to the tenant-scoped
+        // reconstruction below.
+    }
+    let base = session_id.split('#').next().unwrap_or(session_id);
+    if base.is_empty() || base.contains('/') || base.contains('\\') || base.contains("..") {
+        return None;
+    }
+    let encoded = octos_bus::session::encode_path_component(base);
+    Some(data_dir.join("users").join(encoded).join("workspace"))
+}
+
+/// True when `ws` (a global-map workspace root) is contained under the
+/// authenticated tenant's `data_dir`. Canonicalizes both sides; fails closed if
+/// either can't be canonicalized.
+fn map_workspace_belongs_to_tenant(ws: &std::path::Path, data_dir: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(ws), std::fs::canonicalize(data_dir)) {
+        (Ok(w), Ok(d)) => w.starts_with(&d),
+        _ => false,
+    }
+}
+
+/// The authenticated requester's owning profile id, derived the SAME way the WS
+/// session derives its tenant (routed header OR authenticated identity), so a
+/// download's tenant check matches the upload's stamp. Admin-without-routing →
+/// `MAIN_PROFILE_ID` (admin runs default sessions as `_main`). `None` when it
+/// can't be resolved — download callers then fail closed. Used by `/api/files`.
+fn request_owner_profile(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Option<String> {
+    let header_profile_id = routed_profile_id_from_headers(state, headers);
+    let identity_profile_id = match identity {
+        Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
+        Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
+        None => None,
+    };
+    let pid = if identity.is_none() && header_profile_id.is_none() {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        decide_resolved_profile_id(
+            state,
+            identity,
+            header_profile_id.as_deref(),
+            identity_profile_id,
+        )
+        .ok()?
+    };
+    Some(if pid == ADMIN_PROFILE_ID {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        pid
+    })
 }
 
 fn request_host(headers: &HeaderMap) -> Option<String> {
@@ -1435,11 +1586,51 @@ pub async fn delete_session(
 /// Accepts multipart/form-data with one or more `file` fields.
 /// Returns JSON array of server-side upload handles.
 pub async fn upload(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    // Determine upload directory
-    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    // #1377 tenant isolation: stamp the upload with the OWNING profile so the
+    // turn-start materializer can verify ownership (`octos-uploads/<profile>/…`).
+    // The id MUST equal the session's `tenant_id` (both `profile.id`), so it is
+    // resolved IDENTITY-AWARE exactly like the session's profile — NOT from the
+    // routing header alone: an OTP/bearer user on the bare host has no routed
+    // header but their session is scoped to their own profile, so a header-only
+    // `_main` fallback would mis-stamp the upload and make it unreadable (codex
+    // round-5 P1). Cross-tenant `X-Profile-Id` → 403; truly unauthenticated
+    // (no identity, no header) → `MAIN_PROFILE_ID` (the default profile's tenant).
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let header_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let identity_profile_id = match identity_ref {
+        Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
+        Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
+        None => None,
+    };
+    let resolved_profile_id = if identity_ref.is_none() && header_profile_id.is_none() {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        decide_resolved_profile_id(
+            &state,
+            identity_ref,
+            header_profile_id.as_deref(),
+            identity_profile_id,
+        )
+        .map_err(|_| (StatusCode::FORBIDDEN, "forbidden".to_string()))?
+    };
+    // An admin token with NO tenant routing runs its WS session under the
+    // default profile (`MAIN_PROFILE_ID`), not under `admin`. Stamp the upload
+    // the same way so the materializer doesn't treat the admin's own upload as
+    // foreign (codex round-6 P2). Admin acting AS a tenant carries a header,
+    // which resolves to that tenant above (not `admin`).
+    let profile_id = if resolved_profile_id == ADMIN_PROFILE_ID {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        resolved_profile_id
+    };
+
+    // Determine upload directory (per-tenant subdir).
+    let upload_dir = std::env::temp_dir().join("octos-uploads").join(&profile_id);
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1703,7 +1894,19 @@ pub async fn serve_file_by_query(
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
-    serve_file_impl(&data_dir, filename).await
+    // #1377: the authenticated requester's profile gates upload-tmpdir downloads
+    // (no cross-tenant) and authorizes a session-relative `uploads/<name>` path.
+    let auth_profile = request_owner_profile(&state, &headers, identity);
+    let session_ws = params
+        .get("session")
+        .and_then(|s| resolve_session_workspace_root(&state, &data_dir, s));
+    serve_file_impl(
+        &data_dir,
+        filename,
+        auth_profile.as_deref(),
+        session_ws.as_deref(),
+    )
+    .await
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
@@ -1712,17 +1915,35 @@ pub async fn serve_file(
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(filename): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
     let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
-    serve_file_impl(&data_dir, &filename).await
+    let auth_profile = request_owner_profile(&state, &headers, identity);
+    let session_ws = params
+        .get("session")
+        .and_then(|s| resolve_session_workspace_root(&state, &data_dir, s));
+    serve_file_impl(
+        &data_dir,
+        &filename,
+        auth_profile.as_deref(),
+        session_ws.as_deref(),
+    )
+    .await
 }
 
-async fn serve_file_impl(data_dir: &std::path::Path, filename: &str) -> Response {
-    let Some(path) = resolve_scoped_download_path(data_dir, filename) else {
+async fn serve_file_impl(
+    data_dir: &std::path::Path,
+    filename: &str,
+    auth_profile: Option<&str>,
+    session_workspace: Option<&std::path::Path>,
+) -> Response {
+    let Some(path) =
+        resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace)
+    else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
@@ -4268,8 +4489,104 @@ mod tests {
         std::fs::write(&other_file, b"secret").unwrap();
 
         assert!(
-            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none()
+            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy(), None, None)
+                .is_none()
         );
+    }
+
+    #[test]
+    fn resolve_scoped_download_path_serves_session_workspace_upload() {
+        // #1377: `uploads/<name>` resolves under the resolved session workspace.
+        let data = tempfile::tempdir().unwrap();
+        let ws = data.path().join("users/web-abc/workspace");
+        std::fs::create_dir_all(ws.join("uploads")).unwrap();
+        std::fs::write(ws.join("uploads/report.md"), b"hi").unwrap();
+
+        // With the owning session workspace → resolves to the workspace file.
+        // (auth_profile is irrelevant for a workspace-relative path — only
+        // upload-tmpdir results are tenant-gated.)
+        let ok = resolve_scoped_download_path(
+            data.path(),
+            "uploads/report.md",
+            None,
+            Some(ws.as_path()),
+        );
+        assert_eq!(
+            ok,
+            Some(std::fs::canonicalize(ws.join("uploads/report.md")).unwrap())
+        );
+
+        // Without a session workspace → not resolvable (no session context).
+        assert!(
+            resolve_scoped_download_path(data.path(), "uploads/report.md", None, None).is_none()
+        );
+        // Traversal is refused even with a workspace.
+        assert!(
+            resolve_scoped_download_path(data.path(), "../../etc/passwd", None, Some(ws.as_path()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_download_path_gates_cross_tenant_upload_handle() {
+        // codex round-6 P1.2: a download for an upload-tmpdir file owned by
+        // another tenant is refused; the owner gets it.
+        let data = tempfile::tempdir().unwrap();
+        let upload_root = octos_bus::file_handle::temp_upload_root().join("tenant-b");
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let f = upload_root.join(format!("u-{}-secret.md", std::process::id()));
+        std::fs::write(&f, b"theirs").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&f, Some("secret.md")).unwrap();
+
+        // Requester is tenant-a → refused.
+        assert!(
+            resolve_scoped_download_path(data.path(), &handle, Some("tenant-a"), None).is_none(),
+            "cross-tenant upload download must be refused"
+        );
+        // Owner tenant-b → served.
+        assert!(
+            resolve_scoped_download_path(data.path(), &handle, Some("tenant-b"), None).is_some(),
+            "the owning tenant must be able to download its upload"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn resolve_session_workspace_root_falls_back_to_base_key_layout() {
+        // #1377: an evicted (not-in-map) session resolves to the canonical
+        // `<data>/users/<encode(base_key)>/workspace`, with the topic stripped.
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        // Topic-suffixed key → workspace dir uses base_key (topic stripped).
+        let ws = resolve_session_workspace_root(&state, data.path(), "slides-xyz#deck-1").unwrap();
+        let expected_base = octos_bus::session::encode_path_component("slides-xyz");
+        assert_eq!(
+            ws,
+            data.path()
+                .join("users")
+                .join(expected_base)
+                .join("workspace")
+        );
+        // Empty session id → None.
+        assert!(resolve_session_workspace_root(&state, data.path(), "").is_none());
+    }
+
+    #[test]
+    fn map_workspace_must_be_under_authenticated_tenant() {
+        // codex #1377 round-3 P1: a global-map workspace from ANOTHER tenant must
+        // not be trusted by the session-aware download path.
+        let tenant_a = tempfile::tempdir().unwrap();
+        let tenant_b = tempfile::tempdir().unwrap();
+        let a_ws = tenant_a.path().join("users/web-a/workspace");
+        std::fs::create_dir_all(&a_ws).unwrap();
+        let b_ws = tenant_b.path().join("users/web-b/workspace");
+        std::fs::create_dir_all(&b_ws).unwrap();
+
+        // A's workspace is under A's data dir → trusted.
+        assert!(map_workspace_belongs_to_tenant(&a_ws, tenant_a.path()));
+        // B's workspace is NOT under A's data dir → rejected (no cross-tenant).
+        assert!(!map_workspace_belongs_to_tenant(&b_ws, tenant_a.path()));
     }
 
     #[test]
