@@ -696,7 +696,8 @@ mod tests {
         let (abs_src, _handle) = stage_tenant_upload("tenant-b", "secret.md", b"theirs");
         let raw_abs = abs_src.to_string_lossy().into_owned();
 
-        let out = materialize_turn_uploads(ws.path(), Some("tenant-a"), &[raw_abs.clone()]);
+        let out =
+            materialize_turn_uploads(ws.path(), Some("tenant-a"), std::slice::from_ref(&raw_abs));
         assert!(
             out.is_empty(),
             "raw cross-tenant tmpdir path must be DROPPED, got: {out:?}"
