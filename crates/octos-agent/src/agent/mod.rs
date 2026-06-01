@@ -61,6 +61,17 @@ pub struct AgentConfig {
     pub worker_prompt: Option<String>,
     /// Maximum seconds for all parallel tool calls to complete. Default: 300.
     pub tool_timeout_secs: u64,
+    /// Default timeout (seconds) for a batch of ordinary interactive/fast
+    /// tools (`glob`, `list_dir`, `read_file`, `grep`, ...) when the LLM does
+    /// NOT request a per-call `timeout_secs`. Genuinely long-running tools
+    /// (`shell`, `spawn`, `run_pipeline`, `browser`, deep research/crawl)
+    /// keep `tool_timeout_secs` / `MAX_TOOL_TIMEOUT_SECS` instead.
+    ///
+    /// Default 120s; env override `OCTOS_INTERACTIVE_TOOL_TIMEOUT_SECS`
+    /// (clamped [1, 1800]). mini5 soak motivation: a read-only `glob`/
+    /// `list_dir` over an unscoped home dir must not inherit the 1800s
+    /// ceiling and hang the whole turn.
+    pub default_interactive_tool_timeout_secs: u64,
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
@@ -104,6 +115,17 @@ fn env_secs_or(var: &str, default_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Like [`env_secs_or`] but returns a raw `u64` seconds value clamped to
+/// `[1, MAX_TOOL_TIMEOUT_SECS]`. Used for the interactive-tool-timeout knob,
+/// which is stored as a `u64` on [`AgentConfig`] (not a `Duration`).
+fn env_secs_u64_or(var: &str, default_secs: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|v| v.clamp(1, MAX_TOOL_TIMEOUT_SECS))
+        .unwrap_or(default_secs)
+}
+
 /// Default tool execution timeout in seconds.
 /// Matches `MAX_TOOL_TIMEOUT_SECS` so long-running tools like `run_pipeline`
 /// (default 1800s) are not silently capped when the LLM omits `timeout_secs`
@@ -111,6 +133,11 @@ fn env_secs_or(var: &str, default_secs: u64) -> std::time::Duration {
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1800;
 /// Maximum tool timeout the LLM can request (30 minutes).
 pub const MAX_TOOL_TIMEOUT_SECS: u64 = 1800;
+/// Default timeout (seconds) for a batch of ordinary interactive/fast tools
+/// (`glob`, `list_dir`, `read_file`, `grep`, ...) when the LLM omits a
+/// per-call `timeout_secs`. Genuinely long-running tools keep the 1800s
+/// default. See [`AgentConfig::default_interactive_tool_timeout_secs`].
+pub const DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS: u64 = 120;
 /// Default session processing timeout in seconds.
 pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
 
@@ -123,6 +150,10 @@ impl Default for AgentConfig {
             save_episodes: true,
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
+            default_interactive_tool_timeout_secs: env_secs_u64_or(
+                "OCTOS_INTERACTIVE_TOOL_TIMEOUT_SECS",
+                DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS,
+            ),
             chat_max_tokens: None,
             suppress_auto_send_files: false,
             llm_first_token_grace: env_secs_or(
