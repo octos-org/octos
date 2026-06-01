@@ -1774,6 +1774,55 @@ pub(crate) fn build_recovery_prompt(signal: &octos_agent::SpawnOnlyFailureSignal
     )
 }
 
+/// Prototype gate (env `OCTOS_AUTO_REVIEW_BACKGROUND`): when truthy, a
+/// delivered background-task result triggers ONE agent turn so the model
+/// reviews/summarizes it instead of waiting for the user to type "check".
+/// Off by default — this is the event-driven completion-acknowledgment
+/// prototype; graduate it to a profile config field before GA.
+fn auto_review_background_completions_enabled() -> bool {
+    std::env::var("OCTOS_AUTO_REVIEW_BACKGROUND")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Build the synthetic `[system-internal]` prompt enqueued when a background
+/// task's result is delivered, so the LLM reviews it and summarizes for the
+/// user. Success-path sibling of [`build_recovery_prompt`]. A bounded preview
+/// of the result is inlined so the model has the gist without the actor
+/// re-reading the (possibly large) output.
+pub(crate) fn build_completion_review_prompt(
+    task_label: &str,
+    content: &str,
+    files: &[String],
+) -> String {
+    const PREVIEW_CHARS: usize = 500;
+    let preview: String = content.chars().take(PREVIEW_CHARS).collect();
+    let elided = if content.chars().count() > PREVIEW_CHARS {
+        " …(truncated)"
+    } else {
+        ""
+    };
+    // The artifact files this completion produced are copied into the workspace
+    // before the review turn, so the model can `read_file` them by name to
+    // inspect what was delivered (codex P2 — don't review blind).
+    let files_block = if files.is_empty() {
+        String::new()
+    } else {
+        let list = files
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\nFiles produced (in your workspace — read them to inspect):\n{list}")
+    };
+    format!(
+        "[system-internal] A background task `{task_label}` just finished and its \
+         result was delivered to this conversation:\n\n{preview}{elided}{files_block}\n\n\
+         Briefly review the result and tell the user what was produced and any \
+         clear next step. Be concise. Do NOT re-run the task.",
+    )
+}
+
 fn git_turn_summary(content: &str) -> String {
     let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
@@ -4137,6 +4186,39 @@ impl SessionActor {
         }
     }
 
+    /// Synthetic `InboundMessage` for the completion-review turn — the
+    /// success-path sibling of [`Self::synthetic_recovery_inbound`]. Stamped
+    /// `_completion_review` so `process_inbound` does NOT reset the
+    /// consecutive-auto-turn cap (the review is server-driven, not user
+    /// re-engagement); the optional originating id threads the review under
+    /// the bubble that started the work.
+    fn synthetic_completion_review_inbound(
+        &self,
+        prompt: String,
+        originating_client_message_id: Option<String>,
+    ) -> InboundMessage {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("_completion_review".to_string(), serde_json::json!(true));
+        if let Some(cmid) = originating_client_message_id {
+            if !cmid.is_empty() {
+                metadata.insert(
+                    "client_message_id".to_string(),
+                    serde_json::Value::String(cmid),
+                );
+            }
+        }
+        InboundMessage {
+            channel: self.channel.clone(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: self.chat_id.clone(),
+            content: prompt,
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::Value::Object(metadata),
+            message_id: None,
+        }
+    }
+
     #[cfg(feature = "api")]
     fn synthetic_master_continuation_inbound(
         &self,
@@ -4494,6 +4576,10 @@ impl SessionActor {
                             idle_sleep
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + self.idle_timeout);
+                            let review_origin = originating_thread_id.clone();
+                            // Keep the artifact paths so a (success) review turn can
+                            // actually inspect what was produced (codex P2).
+                            let review_media = media.clone();
                             let persisted = self
                                 .handle_background_result(
                                     &task_label,
@@ -4505,6 +4591,61 @@ impl SessionActor {
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
+                            }
+                            // Event-driven completion review (prototype, gated by
+                            // OCTOS_AUTO_REVIEW_BACKGROUND): the actor is idle and a
+                            // background task's result just landed — exactly the case
+                            // where the user otherwise has to type "check". Dispatch
+                            // ONE agent turn so the model reviews/summarizes the
+                            // result. Bounded by the shared consecutive-auto-turn cap
+                            // (MAX_CONSECUTIVE_RECOVERY_TURNS), which resets on the
+                            // next user turn, so a review that spawns more work cannot
+                            // run away; silently skipped (no banner) when the cap is
+                            // hit, since a missed review is harmless.
+                            //
+                            // SUCCESS ONLY (codex P2): a FAILED spawn_only task already
+                            // drives the dedicated RecoveryHint path AND emits a failure
+                            // BackgroundResult — reviewing that would (a) summarize a
+                            // failure the recovery turn is already handling and (b) burn
+                            // a shared recovery-cap slot a real recovery needs. `kind`
+                            // does NOT distinguish: execution.rs emits `Notification`
+                            // for failures too (mark_failed). The reliable signal is the
+                            // runtime's failure prefix: every failure delivery is
+                            // formatted "✗ … failed/error" by execution.rs/spawn.rs (a
+                            // runtime convention, not tool-controlled), so a body that
+                            // does NOT start with "✗" is a successful completion.
+                            //
+                            // Soak-grade gate. GA-robust form: carry an explicit
+                            // terminal-status bool on the BackgroundResult message
+                            // (the mailbox-aligned fix) across spawn.rs/execution.rs's
+                            // ~13 emit sites, plus per-task_id dedup for the second
+                            // "produced files" notification.
+                            let is_success_completion = !content.trim_start().starts_with('✗');
+                            if persisted
+                                && is_success_completion
+                                && auto_review_background_completions_enabled()
+                                && self.try_begin_recovery_turn()
+                            {
+                                debug!(
+                                    session = %self.session_key,
+                                    task_label,
+                                    "dispatching synthetic completion-review turn"
+                                );
+                                // Reference the delivered artifacts by path (they
+                                // already exist where the task produced them). Do NOT
+                                // re-copy into the workspace: copy_media_to_workspace
+                                // targets user_workspace/<basename>, so an artifact
+                                // already there would be truncated by std::fs::copy
+                                // onto itself (codex P1).
+                                let prompt = build_completion_review_prompt(
+                                    &task_label,
+                                    &content,
+                                    &review_media,
+                                );
+                                let synthetic = self
+                                    .synthetic_completion_review_inbound(prompt, review_origin);
+                                self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
+                                    .await;
                             }
                             let _ = self.drain_master_continuations().await;
                         }
@@ -5684,6 +5825,19 @@ impl SessionActor {
             return None;
         }
         if self.channel == "system" {
+            return None;
+        }
+        // A completion-review turn is a system-internal prompt that EMBEDS the
+        // finished task's label (e.g. "Deep research"). Running forced-workflow
+        // detection on it would match that label and spawn a DUPLICATE workflow
+        // instead of reviewing the result — re-triggering on every completion up
+        // to the auto-turn cap. Never force a workflow from a review prompt.
+        if inbound
+            .metadata
+            .get("_completion_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return None;
         }
         WorkflowKind::detect_forced_background(&inbound.content).map(WorkflowKind::build)
@@ -7536,8 +7690,17 @@ impl SessionActor {
             .get("_recovery_turn")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // A completion-review turn (event-driven background acknowledgment) is
+        // server-driven too — it must NOT reset the consecutive-auto-turn cap,
+        // otherwise a review that spawns more background work could review its
+        // own follow-ups without bound.
+        let is_completion_review = inbound
+            .metadata
+            .get("_completion_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let is_master_continuation_inbound = inbound_is_master_continuation(&inbound);
-        if !is_recovery_turn && !is_master_continuation_inbound {
+        if !is_recovery_turn && !is_completion_review && !is_master_continuation_inbound {
             self.reset_consecutive_recovery_turns();
         }
 
@@ -13773,6 +13936,85 @@ mod tests {
         assert!(
             recovery_user_msgs[0].content.contains("vivian"),
             "recovery prompt should include parsed alternatives"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[test]
+    fn completion_review_prompt_frames_result_for_the_model() {
+        let prompt = build_completion_review_prompt(
+            "deep research",
+            "Found 3 sources on X.",
+            &["report.md".to_string(), "data.csv".to_string()],
+        );
+        assert!(prompt.starts_with("[system-internal]"));
+        assert!(prompt.contains("deep research"));
+        assert!(prompt.contains("Found 3 sources on X."));
+        assert!(prompt.contains("Do NOT re-run"));
+        // Artifact files are surfaced so the review turn can inspect them.
+        assert!(prompt.contains("report.md"));
+        assert!(prompt.contains("data.csv"));
+        // Long results are previewed, not dumped whole.
+        let long = "z".repeat(2000);
+        let truncated = build_completion_review_prompt("t", &long, &[]);
+        assert!(truncated.contains("truncated"));
+        assert!(
+            truncated.len() < long.len(),
+            "prompt should preview, not inline the whole result"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_result_does_not_auto_review_when_gate_disabled() {
+        // Default (OCTOS_AUTO_REVIEW_BACKGROUND unset): a delivered background
+        // result is persisted + broadcast but must NOT spend an extra LLM turn,
+        // preserving the pre-prototype behavior. (The enabled path is validated
+        // live; edition-2024 makes `set_var` unsafe under deny(unsafe_code), so
+        // the env gate can't be flipped in-process here.)
+        //
+        // codex P3: if the suite is run in an environment that already enables
+        // the prototype gate, the review path is taken and this negative
+        // assertion is meaningless — skip rather than spuriously fail.
+        if auto_review_background_completions_enabled() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("AUTO-REVIEWED"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "deep research".into(),
+            content: "Found 3 sources.".into(),
+            kind: BackgroundResultKind::Notification,
+            media: vec![],
+            originating_thread_id: None,
+            ack: None,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+        }
+        // The result was delivered to the conversation...
+        assert!(
+            responses.iter().any(|c| c.contains("Found 3 sources")),
+            "background result should be delivered: {responses:?}"
+        );
+        // ...but the model was NOT invoked to review it (gate off by default).
+        assert!(
+            !responses.iter().any(|c| c.contains("AUTO-REVIEWED")),
+            "no review turn should run when the gate is disabled: {responses:?}"
         );
 
         drop(tx);
