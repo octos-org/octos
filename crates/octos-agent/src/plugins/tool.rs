@@ -1456,6 +1456,71 @@ fn rescue_workspace_input_existence(
     }
 }
 
+/// Lexically test whether `candidate` stays within `root` after
+/// collapsing `.`/`..` components, WITHOUT touching the filesystem.
+///
+/// Used by the plugin input-path subdir rescue to refuse a
+/// workspace-relative candidate that would climb out of the workspace
+/// root (defence in depth — the caller already rejected raw `..` input,
+/// but the `skill-output/`-stripped form is re-derived and re-checked
+/// here). A `..` that pops above `root` makes the running depth go
+/// negative → not within.
+fn lexically_within(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    let Ok(rel) = candidate.strip_prefix(root) else {
+        return false; // not even lexically prefixed by root
+    };
+    let mut depth: i32 = 0;
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            // CurDir / RootDir / Prefix: ignore (RootDir/Prefix can't
+            // appear in a relative strip result; CurDir is a no-op).
+            _ => {}
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod subdir_rescue_tests {
+    use super::lexically_within;
+    use std::path::Path;
+
+    #[test]
+    fn lexically_within_accepts_subdir_paths() {
+        let root = Path::new("/ws");
+        assert!(lexically_within(
+            root,
+            Path::new("/ws/slides/deck/script.js")
+        ));
+        assert!(lexically_within(root, Path::new("/ws/file.txt")));
+        assert!(lexically_within(root, Path::new("/ws"))); // root itself
+    }
+
+    #[test]
+    fn lexically_within_rejects_escapes_and_foreign_roots() {
+        let root = Path::new("/ws");
+        // climbs above root
+        assert!(!lexically_within(root, Path::new("/ws/../etc/passwd")));
+        assert!(!lexically_within(root, Path::new("/ws/a/../../etc")));
+        // not under root at all
+        assert!(!lexically_within(root, Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn lexically_within_allows_interior_parent_that_stays_within() {
+        let root = Path::new("/ws");
+        // dips into a subdir then back up — net still inside
+        assert!(lexically_within(root, Path::new("/ws/a/b/../c")));
+    }
+}
+
 /// Resolve a plugin tool's input path (`audio_path` / `file_path` /
 /// `input` / `script_path` / `video_path` / `text_path` / per-slide
 /// `source_image`) to an absolute on-disk string.
@@ -1591,6 +1656,72 @@ fn resolve_plugin_input_path(
     // doesn't fix the adversarial race.
     if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
         if let Some(parent) = work_dir.parent() {
+            // #1377 slides fix: BEFORE the basename-only rescue, try the
+            // FULL workspace-relative path under the workspace root. The
+            // basename rescue below only finds a file at `<workspace>/
+            // <basename>`, so a SUBDIR-prefixed input like
+            // `slides/<deck>/script.js` (the documented mofa-slides
+            // `input:` form, written by `write_file` against the workspace
+            // ROOT) never resolves — the work_dir is chrooted to
+            // `<workspace>/skill-output/`, so `work_dir.join(raw_path)`
+            // probes `<workspace>/skill-output/slides/...` and misses.
+            // Without this the agent's safe `input:` mode fails with
+            // `os error 2` and it falls back to partial inline `slides`
+            // arrays that overwrite earlier slides (position-based
+            // filenames). Probe `raw_path` and its `skill-output/`-
+            // stripped form against the workspace root, guarded by the
+            // same symlink/regular-file check as the basename rescue PLUS
+            // a lexical-containment check (raw `..` already returned Err
+            // at this fn's entry; this rejects any candidate that still
+            // escapes the workspace root after normalisation).
+            let workspace_root = parent;
+            for rel in [Some(raw_path), stripped.as_deref()].into_iter().flatten() {
+                let candidate = workspace_root.join(rel);
+                // Lexical containment: the normalised candidate must stay
+                // under the workspace root. `lexically_within` collapses
+                // `.`/`..` without touching disk; a candidate that climbs
+                // out (despite the entry `..` guard, e.g. via the stripped
+                // form) is refused.
+                if !lexically_within(workspace_root, &candidate) {
+                    continue;
+                }
+                // Guard 1 (final component): reject if the candidate's LEAF
+                // is a symlink or non-regular file. `symlink_metadata` does
+                // NOT follow the final component, so a `script.js -> …`
+                // symlink at the candidate path is refused regardless of its
+                // target — matching the basename rescue's target-agnostic,
+                // TOCTOU-resistant posture.
+                let leaf_is_regular_file = std::fs::symlink_metadata(&candidate)
+                    .map(|m| m.file_type().is_file())
+                    .unwrap_or(false);
+                if !leaf_is_regular_file {
+                    continue;
+                }
+                // Guard 2 (ancestors — codex round-1 P1): unlike the basename
+                // rescue (single component), this candidate carries SUBDIR
+                // components, so a symlinked ANCESTOR (`<workspace>/slides ->
+                // /etc`) could let `slides/passwd` escape — `symlink_metadata`
+                // above only checks the LEAF, and it traverses symlinked
+                // parents. Canonicalize the full candidate (resolves every
+                // ancestor symlink) and require it to stay under the canonical
+                // workspace root.
+                let (Ok(canon), Ok(canon_root)) = (
+                    std::fs::canonicalize(&candidate),
+                    std::fs::canonicalize(workspace_root),
+                ) else {
+                    continue;
+                };
+                if !canon.starts_with(&canon_root) {
+                    continue; // a symlinked ancestor escaped the workspace
+                }
+                // Both guards passed: return the LEXICAL candidate (not
+                // `canon`). Containment is proven, so the lexical path names
+                // the same in-workspace file, and the legacy resolver
+                // contract is to return the workspace-relative lexical form
+                // (callers/tests rely on it; canonicalize would also rewrite
+                // macOS `/var`->`/private/var`).
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
             if let Some(basename) = std::path::Path::new(raw_path).file_name() {
                 let candidate = parent.join(basename);
                 // Reject symlinks AND non-regular files (directories,
@@ -3310,6 +3441,60 @@ mod tests {
         );
         // Defense in depth.
         let _ = bait;
+    }
+
+    #[test]
+    fn subdir_rescue_resolves_workspace_relative_script() {
+        // #1377 slides fix: a SUBDIR-prefixed input (`slides/<deck>/script.js`)
+        // written at the workspace ROOT must resolve when work_dir is
+        // chrooted to `<workspace>/skill-output/`. Before the fix only the
+        // basename was probed at the root, so this missed and the agent fell
+        // back to the overwrite-prone inline-array mode.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let deck_dir = workspace.path().join("slides").join("deck");
+        std::fs::create_dir_all(&deck_dir).unwrap();
+        let script = deck_dir.join("script.js");
+        std::fs::write(&script, "module.exports = []").unwrap();
+
+        let resolved = resolve_plugin_input_path("slides/deck/script.js", &skill_output)
+            .expect("subdir-prefixed workspace-relative input must resolve");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&script).unwrap(),
+            "must resolve to the real workspace-root script",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subdir_rescue_rejects_symlinked_ancestor_escape() {
+        // Codex round-1 P1: the full-path rescue carries SUBDIR components,
+        // so a symlinked ANCESTOR (`<workspace>/slides -> /etc`) could let
+        // `slides/passwd` escape — `symlink_metadata` only checks the final
+        // component. The canonical-containment guard must reject it.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // `<workspace>/slides` is a symlink to /etc (an ancestor of the input).
+        let bait_dir = workspace.path().join("slides");
+        std::os::unix::fs::symlink("/etc", &bait_dir).unwrap();
+
+        let resolved = resolve_plugin_input_path("slides/passwd", &skill_output)
+            .expect("resolver still returns a (contained) fallback path, not the escape");
+        let resolved_path = std::path::Path::new(&resolved);
+        assert!(
+            !resolved_path.starts_with("/etc"),
+            "rescue must not resolve through a symlinked ancestor into /etc: {resolved}",
+        );
+        // Falls through to a contained path (skill-output basename join, or
+        // the lexical fallback) — never the escaped /etc/passwd.
+        assert!(
+            resolved_path.starts_with(workspace.path()),
+            "resolved path must stay within the workspace: {resolved}",
+        );
+        let _ = bait_dir;
     }
 
     #[cfg(unix)]
