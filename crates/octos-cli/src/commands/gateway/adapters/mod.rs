@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use octos_bus::{ChannelManager, SessionManager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::config::ChannelEntry;
 
@@ -76,6 +76,7 @@ pub type TaskRelaunchCb =
 #[allow(dead_code)]
 pub struct ChannelRegistrationCtx<'a> {
     pub shutdown: &'a Arc<AtomicBool>,
+    pub shutdown_notify: &'a Arc<Notify>,
     pub media_dir: &'a Path,
     pub data_dir: &'a Path,
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
@@ -107,7 +108,7 @@ pub fn register_all(
 ) -> eyre::Result<()> {
     for entry in entries {
         match entry.channel_type.as_str() {
-            "cli" => cli::register(channel_mgr, entry, ctx.shutdown)?,
+            "cli" => cli::register(channel_mgr, entry, ctx.shutdown, ctx.shutdown_notify)?,
             #[cfg(feature = "telegram")]
             "telegram" => telegram::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "discord")]
