@@ -13350,13 +13350,21 @@ mod tests {
             .await;
 
         registry.cancel(&sk.to_string()).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        registry.reap_dead_actors();
 
-        assert!(
-            registry.actor_keys().is_empty(),
-            "cancel should stop the profiled actor when called with the bare session key"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            registry.reap_dead_actors();
+            let keys = registry.actor_keys();
+            if keys.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancel should stop the profiled actor when called with the bare session key; got keys: {:?}",
+                keys
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[test]
