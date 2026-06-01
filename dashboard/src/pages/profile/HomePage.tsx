@@ -441,7 +441,12 @@ export default function HomePage() {
                     key={sub.id}
                     className="flex items-center gap-3 py-2.5 px-3 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors"
                   >
-                    <StatusBadge running={sub.status.running} className="shrink-0" />
+                    <StatusBadge
+                      running={sub.status.running}
+                      status={sub.status.status}
+                      error={sub.status.error}
+                      className="shrink-0"
+                    />
 
                     <Link
                       to={`/profile/${sub.id}`}

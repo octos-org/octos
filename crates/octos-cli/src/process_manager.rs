@@ -47,6 +47,8 @@ pub struct ProcessManager {
     admin_token: Option<String>,
     /// Weak self-reference for auto-restart from spawned tasks.
     self_ref: std::sync::Mutex<Option<std::sync::Weak<ProcessManager>>>,
+    /// Non-retryable startup failures keyed by profile id.
+    configuration_errors: Arc<RwLock<HashMap<String, ProcessConfigurationError>>>,
     /// Section B (codex review round-5 P1.2): host-level
     /// `plugins.require_signed` policy that spawned gateway processes
     /// must inherit. When `true`, every gateway gets
@@ -66,6 +68,12 @@ struct GatewayProcess {
     api_port: Option<u16>,
     /// Ring buffer of recent log lines so new subscribers can see history.
     log_history: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessConfigurationError {
+    message: String,
+    since: DateTime<Utc>,
 }
 
 /// Max number of log lines to retain per gateway process.
@@ -99,13 +107,113 @@ pub enum BridgeStatus {
     LoggedOut,
 }
 
+/// High-level state of a gateway process.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessState {
+    Running,
+    Stopped,
+    ConfigurationError,
+}
+
 /// Status of a gateway process.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessStatus {
+    pub status: ProcessState,
     pub running: bool,
     pub pid: Option<u32>,
     pub started_at: Option<String>,
     pub uptime_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_since: Option<String>,
+}
+
+impl ProcessStatus {
+    fn running(pid: u32, started_at: DateTime<Utc>) -> Self {
+        let uptime = Utc::now() - started_at;
+        Self {
+            status: ProcessState::Running,
+            running: true,
+            pid: Some(pid),
+            started_at: Some(started_at.to_rfc3339()),
+            uptime_secs: Some(uptime.num_seconds()),
+            error: None,
+            error_since: None,
+        }
+    }
+
+    pub fn stopped() -> Self {
+        Self {
+            status: ProcessState::Stopped,
+            running: false,
+            pid: None,
+            started_at: None,
+            uptime_secs: None,
+            error: None,
+            error_since: None,
+        }
+    }
+
+    fn configuration_error(error: ProcessConfigurationError) -> Self {
+        Self {
+            status: ProcessState::ConfigurationError,
+            running: false,
+            pid: None,
+            started_at: None,
+            uptime_secs: None,
+            error: Some(error.message),
+            error_since: Some(error.since.to_rfc3339()),
+        }
+    }
+}
+
+fn classify_startup_configuration_error(detail: &str) -> Option<String> {
+    let lower = detail.to_ascii_lowercase();
+    let is_env_failure = lower.contains("environment variable not found")
+        || lower.contains("environment variable not set")
+        || lower.contains(" not set. run `octos auth login");
+
+    if !is_env_failure {
+        return None;
+    }
+
+    let var_name = missing_env_var_from_detail(detail);
+    Some(match var_name {
+        Some(var_name) => format!("missing environment variable {var_name}"),
+        None => "missing required environment variable".to_string(),
+    })
+}
+
+fn missing_env_var_from_detail(detail: &str) -> Option<String> {
+    for line in detail.lines() {
+        let trimmed = line.trim();
+        if let Some((candidate, _)) = trimmed.split_once(" not set") {
+            if let Some(name) = candidate.split_whitespace().last() {
+                if looks_like_env_var(name) {
+                    return Some(name.trim_matches(['`', '\'', '"']).to_string());
+                }
+            }
+        }
+        if let Some((candidate, _)) = trimmed.split_once(" environment variable not set") {
+            if let Some(name) = candidate.split_whitespace().last() {
+                if looks_like_env_var(name) {
+                    return Some(name.trim_matches(['`', '\'', '"']).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_env_var(candidate: &str) -> bool {
+    let candidate = candidate.trim_matches(['`', '\'', '"']);
+    !candidate.is_empty()
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && candidate.contains('_')
 }
 
 /// WhatsApp bridge QR + status info returned to the dashboard.
@@ -134,6 +242,7 @@ impl ProcessManager {
             serve_port: None,
             admin_token: None,
             self_ref: std::sync::Mutex::new(None),
+            configuration_errors: Arc::new(RwLock::new(HashMap::new())),
             host_plugins_require_signed: false,
         }
     }
@@ -181,6 +290,8 @@ impl ProcessManager {
     /// Start the gateway for a profile. Returns an error if already running.
     /// If the profile has a managed WhatsApp channel, the bridge is started first.
     pub async fn start(&self, profile: &UserProfile) -> Result<()> {
+        self.clear_configuration_error(&profile.id).await;
+
         // Hold the write lock for the entire operation to prevent TOCTOU races.
         tracing::debug!(profile = %profile.id, "start: acquiring processes write lock");
         let mut procs = self.processes.write().await;
@@ -545,6 +656,13 @@ impl ProcessManager {
                                             );
                                             return;
                                         }
+                                        if pm.has_configuration_error(&pid2).await {
+                                            tracing::warn!(
+                                                profile = %pid2,
+                                                "skipping auto-restart: profile has configuration error"
+                                            );
+                                            return;
+                                        }
                                         tracing::info!(profile = %pid2, "auto-restarting crashed gateway");
                                         if let Err(e) = pm.start(&profile).await {
                                             tracing::error!(profile = %pid2, error = %e, "auto-restart failed");
@@ -586,6 +704,9 @@ impl ProcessManager {
                 } else {
                     lines.join("\n")
                 };
+                if let Some(message) = classify_startup_configuration_error(&detail) {
+                    self.record_configuration_error(&profile.id, message).await;
+                }
                 tracing::error!(profile = %profile.id, "gateway failed to start:\n{detail}");
                 bail!("gateway failed to start:\n{detail}");
             }
@@ -625,22 +746,49 @@ impl ProcessManager {
     /// Get the status of a gateway process.
     pub async fn status(&self, profile_id: &str) -> ProcessStatus {
         let procs = self.processes.read().await;
-        match procs.get(profile_id) {
-            Some(proc) => {
-                let uptime = Utc::now() - proc.started_at;
-                ProcessStatus {
-                    running: true,
-                    pid: Some(proc.pid),
-                    started_at: Some(proc.started_at.to_rfc3339()),
-                    uptime_secs: Some(uptime.num_seconds()),
-                }
-            }
-            None => ProcessStatus {
-                running: false,
-                pid: None,
-                started_at: None,
-                uptime_secs: None,
+        if let Some(proc) = procs.get(profile_id) {
+            return ProcessStatus::running(proc.pid, proc.started_at);
+        }
+        drop(procs);
+
+        self.configuration_errors
+            .read()
+            .await
+            .get(profile_id)
+            .cloned()
+            .map(ProcessStatus::configuration_error)
+            .unwrap_or_else(ProcessStatus::stopped)
+    }
+
+    pub async fn has_configuration_error(&self, profile_id: &str) -> bool {
+        self.configuration_errors
+            .read()
+            .await
+            .contains_key(profile_id)
+    }
+
+    async fn clear_configuration_error(&self, profile_id: &str) {
+        self.configuration_errors.write().await.remove(profile_id);
+    }
+
+    async fn record_configuration_error(&self, profile_id: &str, message: String) {
+        let mut errors = self.configuration_errors.write().await;
+        let should_log = errors
+            .get(profile_id)
+            .is_none_or(|existing| existing.message != message);
+        errors.insert(
+            profile_id.to_string(),
+            ProcessConfigurationError {
+                message: message.clone(),
+                since: Utc::now(),
             },
+        );
+        if should_log {
+            tracing::error!(
+                profile = %profile_id,
+                error = %message,
+                "gateway disabled until reload: configuration error"
+            );
         }
     }
 
@@ -661,19 +809,20 @@ impl ProcessManager {
 
     /// Get the status of all profiles.
     pub async fn all_statuses(&self) -> HashMap<String, ProcessStatus> {
-        let procs = self.processes.read().await;
         let mut statuses = HashMap::new();
-        for (id, proc) in procs.iter() {
-            let uptime = Utc::now() - proc.started_at;
-            statuses.insert(
-                id.clone(),
-                ProcessStatus {
-                    running: true,
-                    pid: Some(proc.pid),
-                    started_at: Some(proc.started_at.to_rfc3339()),
-                    uptime_secs: Some(uptime.num_seconds()),
-                },
-            );
+        {
+            let procs = self.processes.read().await;
+            for (id, proc) in procs.iter() {
+                statuses.insert(
+                    id.clone(),
+                    ProcessStatus::running(proc.pid, proc.started_at),
+                );
+            }
+        }
+        for (id, error) in self.configuration_errors.read().await.iter() {
+            statuses
+                .entry(id.clone())
+                .or_insert_with(|| ProcessStatus::configuration_error(error.clone()));
         }
         statuses
     }
@@ -1570,15 +1719,74 @@ mod tests {
 
     #[test]
     fn should_serialize_process_status_not_running() {
-        let status = ProcessStatus {
-            running: false,
-            pid: None,
-            started_at: None,
-            uptime_secs: None,
-        };
+        let status = ProcessStatus::stopped();
         let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status"], "stopped");
         assert_eq!(json["running"], false);
         assert!(json["pid"].is_null());
+    }
+
+    #[test]
+    fn should_classify_missing_env_startup_output_as_configuration_error() {
+        let detail = "WISEMODEL_API_KEY not set. Run `octos auth login -p minimax` or set the env var\nenvironment variable not found";
+
+        let message = classify_startup_configuration_error(detail).unwrap();
+
+        assert_eq!(message, "missing environment variable WISEMODEL_API_KEY");
+    }
+
+    #[test]
+    fn should_ignore_retryable_startup_output_for_configuration_error() {
+        assert!(classify_startup_configuration_error("port already in use").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_surface_configuration_error_status_until_cleared() {
+        let (_dir, pm) = make_pm();
+
+        pm.record_configuration_error(
+            "admin",
+            "missing environment variable WISEMODEL_API_KEY".to_string(),
+        )
+        .await;
+        let status = pm.status("admin").await;
+
+        assert_eq!(status.status, ProcessState::ConfigurationError);
+        assert!(!status.running);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("missing environment variable WISEMODEL_API_KEY")
+        );
+        assert!(status.error_since.is_some());
+        assert!(pm.has_configuration_error("admin").await);
+
+        pm.clear_configuration_error("admin").await;
+        let status = pm.status("admin").await;
+
+        assert_eq!(status.status, ProcessState::Stopped);
+        assert!(!status.running);
+        assert!(status.error.is_none());
+        assert!(!pm.has_configuration_error("admin").await);
+    }
+
+    #[tokio::test]
+    async fn should_include_configuration_error_in_all_statuses() {
+        let (_dir, pm) = make_pm();
+
+        pm.record_configuration_error(
+            "admin",
+            "missing environment variable WISEMODEL_API_KEY".to_string(),
+        )
+        .await;
+        let statuses = pm.all_statuses().await;
+
+        let status = statuses.get("admin").unwrap();
+        assert_eq!(status.status, ProcessState::ConfigurationError);
+        assert!(!status.running);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("missing environment variable WISEMODEL_API_KEY")
+        );
     }
 
     #[test]
