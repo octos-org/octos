@@ -10108,6 +10108,42 @@ async fn handle_task_list(
         return;
     }
 
+    // octos#1380: gateway-mode mirrors task/cancel and
+    // task/restart_from_node. In `octos serve`, the AppUI server has no local
+    // task_query_store because supervisors live in per-profile gateway API
+    // channels; proxy task/list to the owning gateway instead of advertising a
+    // method that can only return runtime_unavailable.
+    if state.task_query_store.is_none() {
+        if let Some(port) = gateway_task_api_port(state, connection_profile_id).await {
+            match gateway_task_list_snapshot(
+                state,
+                port,
+                &params.session_id,
+                params.topic.as_deref(),
+            )
+            .await
+            {
+                Ok(tasks) => {
+                    let result = TaskListResult {
+                        session_id: params.session_id,
+                        topic: params.topic,
+                        tasks,
+                    };
+                    send_serialized_rpc_result(
+                        ws,
+                        id,
+                        octos_core::ui_protocol::methods::TASK_LIST,
+                        result,
+                    );
+                }
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return;
+        }
+    }
+
     match task_list_snapshot(state, &query_session_id) {
         Ok(tasks) => {
             let result = TaskListResult {
@@ -10243,10 +10279,7 @@ async fn ensure_task_in_gateway_session(
     session_id: &SessionKey,
     task_id: &TaskId,
 ) -> Result<(), RpcError> {
-    let path = format!(
-        "/sessions/{}/tasks",
-        super::handlers::encode_api_session_path_id(&session_id.to_string())
-    );
+    let path = gateway_session_tasks_path(session_id, None);
     let response = super::webhook_proxy::api_get_proxy(state, port, &path).await;
     if !response.status().is_success() {
         return Err(RpcError::unknown_task_id(task_id));
@@ -10267,6 +10300,67 @@ async fn ensure_task_in_gateway_session(
         Ok(())
     } else {
         Err(RpcError::unknown_task_id(task_id))
+    }
+}
+
+async fn gateway_task_list_snapshot(
+    state: &AppState,
+    port: u16,
+    session_id: &SessionKey,
+    topic: Option<&str>,
+) -> Result<Vec<TaskListEntry>, RpcError> {
+    let path = gateway_session_tasks_path(session_id, topic);
+    let response = super::webhook_proxy::api_get_proxy(state, port, &path).await;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(RpcError::runtime_not_ready(format!(
+            "gateway task/list proxy returned {status}"
+        ))
+        .with_data(json!({ "kind": "runtime_unavailable" })));
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| {
+            RpcError::internal_error(format!("gateway task/list proxy body read failed: {error}"))
+        })?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        RpcError::internal_error(format!(
+            "gateway task/list proxy returned invalid JSON: {error}"
+        ))
+    })?;
+    task_list_entries_from_gateway_value(body)
+}
+
+fn gateway_session_tasks_path(session_id: &SessionKey, topic: Option<&str>) -> String {
+    let mut path = format!(
+        "/sessions/{}/tasks",
+        super::handlers::encode_api_session_path_id(&session_id.to_string())
+    );
+    if let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) {
+        path.push_str("?topic=");
+        path.push_str(&octos_bus::session::encode_path_component(topic));
+    }
+    path
+}
+
+fn task_list_entries_from_gateway_value(value: Value) -> Result<Vec<TaskListEntry>, RpcError> {
+    match value {
+        Value::Array(tasks) => tasks
+            .into_iter()
+            .map(task_list_entry_from_value)
+            .collect::<Result<Vec<_>, _>>(),
+        Value::Object(mut object) => match object.remove("tasks") {
+            Some(Value::Array(tasks)) => tasks
+                .into_iter()
+                .map(task_list_entry_from_value)
+                .collect::<Result<Vec<_>, _>>(),
+            _ => Err(RpcError::internal_error(
+                "gateway task/list proxy returned a non-array task snapshot",
+            )),
+        },
+        _ => Err(RpcError::internal_error(
+            "gateway task/list proxy returned a non-array task snapshot",
+        )),
     }
 }
 
@@ -21140,6 +21234,60 @@ ignore = []
             proxied_task_restart_outcome(&task_id, empty(StatusCode::BAD_GATEWAY))
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn gateway_session_tasks_path_encodes_topic_query() {
+        // octos#1380: task/list gateway-mode proxy must address the API
+        // channel's `/sessions/{id}/tasks` endpoint and preserve topic
+        // scoping, matching `session/tasks.list`.
+        let session_id = SessionKey("slides-123".into());
+        assert_eq!(
+            gateway_session_tasks_path(&session_id, Some("slides untitled-deck")),
+            "/sessions/slides-123/tasks?topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn gateway_task_list_proxy_decodes_array_and_wrapped_shapes() {
+        // octos#1380: the API channel returns the same task projection used by
+        // session/tasks.list. The task/list gateway fallback accepts the bare
+        // array shape and a defensive `{ tasks: [...] }` wrapper.
+        let now = Utc::now();
+        let task_id = TaskId::new();
+        let raw = json!({
+            "id": task_id,
+            "tool_name": "spawn_agent",
+            "tool_call_id": "call-task-list",
+            "status": "running",
+            "lifecycle_state": "running",
+            "runtime_state": "executing_tool",
+            "started_at": now,
+            "updated_at": now,
+            "role": "reviewer",
+        });
+
+        let array_entries = task_list_entries_from_gateway_value(json!([raw.clone()]))
+            .expect("bare gateway task array decodes");
+        assert_eq!(array_entries.len(), 1);
+        assert_eq!(array_entries[0].id, task_id);
+        assert_eq!(array_entries[0].role.as_deref(), Some("reviewer"));
+        assert_eq!(array_entries[0].state, UiTaskRuntimeState::Running);
+
+        let wrapped_entries = task_list_entries_from_gateway_value(json!({ "tasks": [raw] }))
+            .expect("wrapped gateway task array decodes");
+        assert_eq!(wrapped_entries.len(), 1);
+        assert_eq!(wrapped_entries[0].id, task_id);
+    }
+
+    #[test]
+    fn gateway_task_list_proxy_rejects_non_array_snapshot() {
+        let error = task_list_entries_from_gateway_value(json!({ "unexpected": true }))
+            .expect_err("non-array gateway task response should fail closed");
+        assert_eq!(
+            error.code,
+            octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
         );
     }
 
