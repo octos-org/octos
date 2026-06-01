@@ -105,29 +105,137 @@ const NULL_DEVICE_PATH: &str = "NUL";
 const NULL_DEVICE_PATH: &str = "/dev/null";
 
 fn contains_git_invocation(command: &str) -> bool {
-    command
-        .split(['\n', ';'])
-        .flat_map(|segment| segment.split("&&"))
-        .flat_map(|segment| segment.split("||"))
-        .any(segment_invokes_git)
+    shell_command_segments(command)
+        .iter()
+        .any(|segment| segment_invokes_git(segment))
 }
 
-fn segment_invokes_git(segment: &str) -> bool {
-    let mut remaining = segment.trim_start();
-    loop {
-        if remaining == "git" || remaining.starts_with("git ") {
+fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut segment = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                quote = None;
+            } else if quote_ch == '"' && ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        token.push(chars.next().expect("peeked char exists"));
+                    } else {
+                        token.push(ch);
+                    }
+                } else {
+                    token.push(ch);
+                }
+            } else {
+                token.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    if is_shell_token_separator(next) || matches!(next, '\'' | '"' | '\\') {
+                        token.push(chars.next().expect("peeked char exists"));
+                    } else {
+                        token.push(ch);
+                    }
+                } else {
+                    token.push(ch);
+                }
+            }
+            '\n' | ';' | '&' | '|' | '(' | ')' => {
+                push_shell_token(&mut segment, &mut token);
+                push_shell_segment(&mut segments, &mut segment);
+            }
+            ch if ch.is_whitespace() => push_shell_token(&mut segment, &mut token),
+            _ => token.push(ch),
+        }
+    }
+
+    push_shell_token(&mut segment, &mut token);
+    push_shell_segment(&mut segments, &mut segment);
+    segments
+}
+
+fn is_shell_token_separator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')')
+}
+
+fn push_shell_token(segment: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        segment.push(std::mem::take(token));
+    }
+}
+
+fn push_shell_segment(segments: &mut Vec<Vec<String>>, segment: &mut Vec<String>) {
+    if !segment.is_empty() {
+        segments.push(std::mem::take(segment));
+    }
+}
+
+fn segment_invokes_git(segment: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(token) = segment.get(index) {
+        if token_invokes_git(token) {
             return true;
         }
-        let Some(token_end) = remaining.find(char::is_whitespace) else {
-            return false;
-        };
-        let token = &remaining[..token_end];
-        if token == "env" || looks_like_env_assignment(token) {
-            remaining = remaining[token_end..].trim_start();
+        if looks_like_env_assignment(token) {
+            index += 1;
+            continue;
+        }
+        if is_git_invocation_wrapper(token) {
+            index += 1;
+            while segment.get(index).is_some_and(|wrapped| {
+                wrapped.starts_with('-') || looks_like_env_assignment(wrapped)
+            }) {
+                index += 1;
+            }
             continue;
         }
         return false;
     }
+    false
+}
+
+fn token_invokes_git(token: &str) -> bool {
+    if looks_like_env_assignment(token) {
+        return false;
+    }
+    let basename = command_basename(token);
+    basename.eq_ignore_ascii_case("git") || basename.eq_ignore_ascii_case("git.exe")
+}
+
+fn is_git_invocation_wrapper(token: &str) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "env",
+        "env.exe",
+        "time",
+        "time.exe",
+        "sudo",
+        "sudo.exe",
+        "npx",
+        "npx.exe",
+        "command",
+        "command.exe",
+        "exec",
+        "exec.exe",
+    ];
+
+    let basename = command_basename(token);
+    WRAPPERS
+        .iter()
+        .any(|wrapper| basename.eq_ignore_ascii_case(wrapper))
+}
+
+fn command_basename(token: &str) -> &str {
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
 fn looks_like_env_assignment(token: &str) -> bool {
@@ -592,7 +700,40 @@ mod tests {
         ));
         assert!(contains_git_invocation("GIT_DIR=.git git status --short"));
         assert!(contains_git_invocation("env GIT_DIR=.git git status"));
+        assert!(contains_git_invocation("/usr/bin/git log --oneline"));
+        assert!(contains_git_invocation(r#""/usr/bin/git" log --oneline"#));
+        assert!(contains_git_invocation("time git status --short"));
+        assert!(contains_git_invocation("sudo -E git push"));
+        assert!(contains_git_invocation("npx git log --oneline"));
+        assert!(contains_git_invocation(
+            "printf ref | git hash-object --stdin"
+        ));
+        assert!(contains_git_invocation(
+            r#""C:\Program Files\Git\cmd\git.exe" status"#
+        ));
         assert!(!contains_git_invocation("printf 'git diff -- notes.txt'"));
+        assert!(!contains_git_invocation("grep git README.md"));
+        assert!(!contains_git_invocation("FOO=/usr/bin/git echo ok"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn applies_git_protection_to_wrapped_git_invocation() {
+        let tool = ShellTool::new(std::env::temp_dir());
+        let result = tool
+            .execute(&serde_json::json!({
+                "command": "time git --version >/dev/null 2>&1; printf 'global=%s\\nsystem=%s\\n' \"$GIT_CONFIG_GLOBAL\" \"$GIT_CONFIG_NOSYSTEM\""
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "shell command failed: {}", result.output);
+        assert!(
+            result.output.contains("global=/dev/null"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("system=1"), "{}", result.output);
     }
 
     // -----------------------------------------------------------------------
