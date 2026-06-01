@@ -90,6 +90,14 @@ pub struct AppUiTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_detail: Option<String>,
     pub output_tail: String,
+    /// C1 step 4: the turn that originated this task. Lets the client
+    /// attribute the task (and its terminal transition) to a specific turn
+    /// so the "N running" task count can be reconciled per-turn instead of
+    /// staying stuck when a sub-agent fails/recovers/is-orphaned. Optional
+    /// so legacy daemons and synthetic emitters that cannot resolve the
+    /// originating turn still parse; omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
 }
 
 /// In-flight assistant response rendered by app UIs before it is committed.
@@ -395,6 +403,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: Some("seeded".into()),
                     output_tail: "bootstrap\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],

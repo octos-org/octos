@@ -13055,6 +13055,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            // C1 step 4: stamp the originating turn.
+                            turn_id: Some(turn_id.clone()),
                         }),
                     );
                     let _ = send_notification_durable(
@@ -13084,6 +13086,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            // C1 step 4: stamp the originating turn.
+                            turn_id: Some(turn_id.clone()),
                         }),
                     );
                     if m9_fixture_delay_or_interrupt(
@@ -14058,6 +14062,8 @@ async fn run_native_code_review_turn(
             summary: Some("Launching native code review specialists".to_owned()),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     let _ = send_notification_durable(
@@ -14212,6 +14218,8 @@ async fn run_native_code_review_turn(
                         summary: Some("Code review interrupted".to_owned()),
                         artifact_count: Some(0),
                         runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+                        // C1 step 4: stamp the originating turn.
+                        turn_id: Some(turn_id.clone()),
                     }),
                 );
                 try_emit_terminal(
@@ -14330,6 +14338,8 @@ async fn run_native_code_review_turn(
             )),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     try_emit_terminal(
@@ -14820,6 +14830,8 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     let _ = send_notification_durable(
@@ -14958,6 +14970,8 @@ async fn run_m15_live_subagent_fixture_turn(
                         summary: None,
                         artifact_count: None,
                         runtime_policy_stamp: None,
+                        // C1 step 4: stamp the originating turn.
+                        turn_id: Some(turn_id.clone()),
                     }),
                 );
                 return M9FixtureOutcome::Interrupted;
@@ -15055,6 +15069,8 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     append_appui_evidence_jsonl(
@@ -15688,6 +15704,21 @@ async fn run_standalone_turn(
     // Falls back to the server-wide data dir for local sessions / dev.
     let plugin_root_dir = session_runtime.profile.data_dir.clone();
 
+    // C1 fix: create the progress channel + drop counter UP HERE — BEFORE
+    // the `enable_persistence` block below — so the supervisor `on_change`
+    // callback (which captures clones of these) can be installed BEFORE
+    // `enable_persistence`. The orphan-task sweep that runs inside
+    // `enable_persistence` fires terminal `mark_failed("orphaned across
+    // restart")` transitions; if `on_change` is installed AFTER persistence
+    // (the pre-C1 ordering) the sweep's `notify_change` hits
+    // `on_change == None` and the `task_updated` event is silently dropped,
+    // leaving the TUI task count stuck at "N running". The channel itself is
+    // consumed (`progress_rx` drained) much later in the function — only its
+    // sender clone needs to exist this early.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
+    let progress_dropped = Arc::new(AtomicU64::new(0));
+
     // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
     // completions and explicit `send_file` calls persist as assistant
     // messages on the session and reach connected WS clients via the
@@ -15772,6 +15803,23 @@ async fn run_standalone_turn(
                     "spawn_only failure recovery continuation queued (WS path)"
                 );
             }
+        });
+        // C1 fix: wire the supervisor `on_change` callback BEFORE
+        // `enable_persistence` — same ordering rule as `set_on_failure_signal`
+        // above. The orphan-task sweep that runs inside `enable_persistence`
+        // fires terminal `mark_failed("orphaned across restart")`
+        // transitions; if `on_change` is installed AFTER persistence (the
+        // pre-C1 ordering, where it lived next to the per-turn agent build)
+        // the sweep's `notify_change` hits `on_change == None` and the
+        // `task_updated` WS event is silently dropped, leaving the TUI task
+        // count stuck at "N running" / chip "Orchestrating".
+        // M9-06: terminal updates (completed/failed/cancelled) must not be
+        // dropped under WebSocket backpressure either — see
+        // `forward_task_progress_to_channel`.
+        let progress_tx_for_tasks = progress_tx.clone();
+        let task_progress_dropped = progress_dropped.clone();
+        task_supervisor.set_on_change(move |task| {
+            forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
             warn!(
@@ -16332,9 +16380,10 @@ async fn run_standalone_turn(
     // `done`/`error`.
     let tool_registry = Arc::new(tool_registry);
 
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
-    let progress_dropped = Arc::new(AtomicU64::new(0));
+    // C1 fix: `progress_tx` / `progress_dropped` are now created earlier
+    // (before the `enable_persistence` block) so the supervisor `on_change`
+    // callback can be wired before the orphan sweep runs. See the note at
+    // their construction site.
     // PR F (M8.10 thread-binding chain `#649 → #740`): bind the originating
     // `TurnId` into the reporter so every progress event the agent emits
     // carries `thread_id`. Closes the wire-side leak where standalone-turn
@@ -16375,15 +16424,10 @@ async fn run_standalone_turn(
     };
 
     let progress_tx_for_result = progress_tx.clone();
-    let progress_tx_for_tasks = progress_tx.clone();
-    let task_progress_dropped = progress_dropped.clone();
-    tool_registry.supervisor().set_on_change(move |task| {
-        // M9-06: terminal updates (completed/failed/cancelled) must not be
-        // dropped under WebSocket backpressure — dropping one would leave the
-        // UI stuck on `running` indefinitely. See
-        // `forward_task_progress_to_channel`.
-        forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
-    });
+    // C1 fix: the supervisor `on_change` callback is now wired earlier
+    // (before `enable_persistence`, inside the background-result block) so
+    // the orphan sweep's terminal `task_updated` events are not dropped. See
+    // the note at that wiring site.
     drop(progress_tx);
     // M11-E: the agent is built per-turn (so per-turn callbacks layer in
     // without mutating shared session state), but its LLM, memory,

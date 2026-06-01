@@ -870,6 +870,7 @@ mod tests {
             task_id: Some("test-task".into()),
             originating_client_message_id: Some("test-cmid".into()),
             tool_call_id: Some(tool_call_id.to_string()),
+            terminal_status: None,
         }
     }
 

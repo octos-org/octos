@@ -175,6 +175,8 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
                     .get("runtime_policy_stamp")
                     .cloned()
                     .filter(|v| !v.is_null()),
+                // C1 step 4: stamp the originating turn id (see map_task_updated).
+                turn_id: turn_id_field(event).or_else(|| Some(context.turn_id.clone())),
             },
         )]);
     }
@@ -255,6 +257,15 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
             .get("runtime_policy_stamp")
             .cloned()
             .filter(|v| !v.is_null()),
+        // C1 step 4: stamp the originating turn id so the client can
+        // reconcile its per-turn "N running" task count when a sub-agent
+        // reaches a terminal state. The source is the in-flight standalone
+        // turn's `TurnId` carried on `ProgressMappingContext` — the task
+        // snapshot itself records only a `client_message_id` (cmid), not a
+        // TurnId, so the context turn is the authoritative turn identity for
+        // events emitted during this turn. The producer JSON may override it
+        // with an explicit `turn_id` field when present.
+        turn_id: turn_id_field(event).or_else(|| Some(context.turn_id.clone())),
     })])
 }
 
@@ -530,6 +541,15 @@ fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
 
 fn task_id_field(value: &Value, keys: &[&str]) -> Option<TaskId> {
     string_field(value, keys).and_then(|task_id| task_id.parse().ok())
+}
+
+/// C1 step 4: extract an explicit `turn_id` from the producer progress JSON
+/// when present (a UUID string). Callers fall back to the in-flight turn on
+/// the `ProgressMappingContext` when this returns `None`.
+fn turn_id_field(value: &Value) -> Option<TurnId> {
+    string_field(value, &["turn_id"])
+        .and_then(|raw| uuid::Uuid::parse_str(&raw).ok())
+        .map(TurnId)
 }
 
 fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
@@ -951,6 +971,56 @@ mod tests {
         assert_eq!(updated.title, "search");
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
+        // C1 step 4: when the producer JSON omits an explicit turn_id, the
+        // emitter falls back to the in-flight turn on the context.
+        assert_eq!(
+            updated.turn_id,
+            Some(TurnId(Uuid::from_u128(7))),
+            "task_updated must stamp the originating turn from the context",
+        );
+    }
+
+    /// C1 step 4: an explicit `turn_id` on the producer JSON overrides the
+    /// context turn, and a `task_updated` notification carrying `turn_id`
+    /// round-trips through serde while omitting it when absent.
+    #[test]
+    fn ui_protocol_progress_task_updated_turn_id_override_and_serde_roundtrip() {
+        let explicit = Uuid::from_u128(0xABCD);
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-000000000003",
+                "title": "search",
+                "state": "running",
+                "turn_id": explicit.to_string(),
+            }),
+        );
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.turn_id,
+            Some(TurnId(explicit)),
+            "explicit turn_id on the producer JSON must override the context turn",
+        );
+
+        // Serde round-trip with turn_id set: it appears on the wire and
+        // decodes back unchanged.
+        let value = serde_json::to_value(updated).expect("serialize");
+        assert_eq!(value.get("turn_id"), Some(&json!(explicit.to_string())));
+        let parsed: octos_core::ui_protocol::TaskUpdatedEvent =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.turn_id, Some(TurnId(explicit)));
+
+        // serde omits turn_id when None.
+        let mut bare = updated.clone();
+        bare.turn_id = None;
+        let bare_value = serde_json::to_value(&bare).expect("serialize bare");
+        assert!(
+            bare_value.get("turn_id").is_none(),
+            "turn_id must be omitted from the wire when None",
+        );
     }
 
     /// Codex P2 rev2 follow-up on #1156: a `null` runtime_policy_stamp

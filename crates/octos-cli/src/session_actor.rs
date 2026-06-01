@@ -1702,6 +1702,12 @@ async fn dispatch_background_result_to_actor(
             kind: payload.kind,
             media: payload.media,
             originating_thread_id: payload.originating_thread_id,
+            // C1 step 3: thread the task_id / tool_call_id / terminal_status
+            // from the payload onto the actor message so consumers can read
+            // an explicit terminal status instead of the content heuristic.
+            task_id: payload.task_id,
+            tool_call_id: payload.tool_call_id,
+            terminal_status: payload.terminal_status,
             ack: Some(ack_tx),
         }),
     )
@@ -1989,6 +1995,21 @@ pub enum ActorMessage {
         /// turns have rotated the per-chat sticky thread_id. `None` for
         /// legacy callers and tests that pre-date #649.
         originating_thread_id: Option<String>,
+        /// C1 step 3: the spawn_only task id that produced this completion,
+        /// carried through from `BackgroundResultPayload::task_id`. Lets the
+        /// actor attribute the terminal result to a specific background task.
+        /// `None` for legacy callers and tests that do not track it.
+        task_id: Option<String>,
+        /// C1 step 3: the originating tool_call_id, carried through from
+        /// `BackgroundResultPayload::tool_call_id`. `None` for legacy callers.
+        tool_call_id: Option<String>,
+        /// C1 step 3: the explicit terminal supervisor status
+        /// (`Completed`/`Failed`/`Cancelled`) for the producing task, carried
+        /// through from `BackgroundResultPayload::terminal_status`. The
+        /// completion-review success gate can read this instead of inferring
+        /// success from the rendered `"✗"` content heuristic. `None` for
+        /// legacy callers and tests that do not track it.
+        terminal_status: Option<octos_agent::TaskStatus>,
         /// Completion acknowledgment for durable persistence.
         ack: Option<oneshot::Sender<bool>>,
     },
@@ -2805,18 +2826,23 @@ impl ActorFactory {
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         let supervisor = tools.supervisor();
-        // Wire supervisor on_failure_signal callback (M8.9) BEFORE
-        // `enable_persistence`. The orphan-task sweep at
-        // `task_supervisor.rs:1164-1166` can `mark_failed` resurrected
-        // tasks during `enable_persistence`, which fires the failure
-        // callback synchronously via `notify_failure`. Wiring this
-        // AFTER `enable_persistence` (pre-#1324-followup ordering) made
-        // those orphan-sweep failures silently dropped — `on_failure`
-        // was still `None` and `invoke_failure_callback` no-op'd. The
-        // PR #1324 follow-up reorders both this gateway path and the
-        // WS `run_standalone_turn` path to wire the callback first so
-        // every failure path — orphan-sweep, live `mark_failed`,
-        // cascade-fail — reaches the recovery inbox.
+        // Wire BOTH supervisor callbacks (on_failure_signal AND on_change)
+        // BEFORE `enable_persistence`. The orphan-task sweep at
+        // `task_supervisor.rs` (the `mark_failed("orphaned across restart")`
+        // sweep) can `mark_failed` resurrected tasks during
+        // `enable_persistence`, which fires BOTH callbacks synchronously
+        // via `notify_failure` AND `notify_change`. Wiring either callback
+        // AFTER `enable_persistence` (pre-#1324-followup ordering for
+        // `on_failure`; the dominant C1 bug for `on_change`) made the
+        // orphan-sweep transitions silently dropped — the callback slot was
+        // still `None` and the notify no-op'd. For `on_change` that left the
+        // TUI task count stuck at "N running" forever (chip stuck
+        // "Orchestrating") because the `task_updated` WS event the sweep
+        // should have produced never fired. The PR #1324 follow-up + C1 fix
+        // reorder both this gateway path and the WS `run_standalone_turn`
+        // path to wire the callbacks first so every terminal path —
+        // orphan-sweep, live `mark_failed`/`mark_completed`, cascade-fail —
+        // reaches the recovery inbox and the SSE/WS task-status consumers.
         let recovery_tx = tx.clone();
         supervisor.set_on_failure_signal(move |signal| {
             let prompt = build_recovery_prompt(signal);
@@ -2831,6 +2857,17 @@ impl ActorFactory {
                 // minting an orphan UUIDv7.
                 originating_client_message_id: signal.originating_client_message_id.clone(),
             });
+        });
+        // Wire supervisor on_change callback to push task status via SSE,
+        // ALSO before `enable_persistence` (see the combined ordering note
+        // above). M9-06: terminal lifecycle states (Completed/Failed/
+        // Cancelled) MUST NOT be silently dropped under inbox backpressure
+        // (32 slots), or the UI / SSE consumers stay stuck on `running`.
+        // See [`forward_task_status_to_actor_inbox`].
+        let status_tx = tx.clone();
+        let task_data_dir = self.data_dir.clone();
+        supervisor.set_on_change(move |task| {
+            forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(
@@ -3047,22 +3084,12 @@ impl ActorFactory {
             Box::pin(async move { dispatch_background_result_to_actor(tx, payload).await })
         }));
 
-        // Wire supervisor on_change callback to push task status via SSE.
-        // M9-06: terminal lifecycle states (Completed/Failed/Cancelled) MUST
-        // NOT be silently dropped under inbox backpressure (32 slots), or the
-        // UI / SSE consumers stay stuck on `running`. See
-        // [`forward_task_status_to_actor_inbox`].
-        let status_tx = tx.clone();
-        let task_data_dir = self.data_dir.clone();
-        supervisor.set_on_change(move |task| {
-            forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
-        });
-
-        // (PR #1324 follow-up moved the `set_on_failure_signal` wiring
-        // to immediately after `let supervisor = tools.supervisor();`
-        // above so the orphan-task sweep that runs during
-        // `enable_persistence` reaches the recovery inbox instead of
-        // hitting an `on_failure: None` callback slot.)
+        // (PR #1324 follow-up + C1 fix moved BOTH the `set_on_failure_signal`
+        // AND `set_on_change` wiring to immediately after
+        // `let supervisor = tools.supervisor();` above so the orphan-task
+        // sweep that runs during `enable_persistence` reaches the recovery
+        // inbox AND the SSE task-status consumers, instead of hitting
+        // `on_failure: None` / `on_change: None` callback slots.)
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
@@ -4541,6 +4568,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             idle_sleep
@@ -5355,6 +5389,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             let persisted = self
@@ -5439,6 +5480,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             let persisted = self
@@ -6412,6 +6460,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             let persisted = self
@@ -11884,6 +11939,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: None,
         })
         .await
@@ -11962,6 +12020,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: None,
         })
         .await
@@ -12035,6 +12096,9 @@ mod tests {
             kind: BackgroundResultKind::Notification,
             media: vec![media_path.to_string_lossy().to_string()],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12102,6 +12166,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: Some(originating_cmid.to_string()),
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12226,6 +12293,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: Some(originating_cmid.to_string()),
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12309,6 +12379,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12347,6 +12420,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12373,6 +12449,64 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// C1 step 3: `dispatch_background_result_to_actor` must thread the
+    /// payload's `task_id` and `terminal_status` (and `tool_call_id`) onto
+    /// the produced `ActorMessage::BackgroundResult`, so the consumer can
+    /// read an explicit terminal status instead of the "✗" content heuristic.
+    #[tokio::test]
+    async fn dispatch_background_result_carries_task_id_and_terminal_status() {
+        let (tx, mut rx) = mpsc::channel::<ActorMessage>(4);
+
+        let payload = BackgroundResultPayload {
+            task_label: "mofa_slides".to_string(),
+            content: "✗ mofa_slides failed: contract rejected".to_string(),
+            kind: BackgroundResultKind::Notification,
+            media: vec![],
+            envelope_media: vec![],
+            originating_thread_id: None,
+            task_id: Some("task-abc".to_string()),
+            originating_client_message_id: None,
+            tool_call_id: Some("tc-xyz".to_string()),
+            terminal_status: Some(octos_agent::TaskStatus::Failed),
+        };
+
+        // Producer waits for an ack; receive the message and ack it.
+        let dispatch =
+            tokio::spawn(async move { dispatch_background_result_to_actor(tx, payload).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("message");
+
+        let ActorMessage::BackgroundResult {
+            task_id,
+            tool_call_id,
+            terminal_status,
+            ack,
+            ..
+        } = msg
+        else {
+            panic!("expected BackgroundResult variant");
+        };
+        assert_eq!(task_id.as_deref(), Some("task-abc"));
+        assert_eq!(tool_call_id.as_deref(), Some("tc-xyz"));
+        assert_eq!(terminal_status, Some(octos_agent::TaskStatus::Failed));
+
+        // Ack so the producer returns rather than timing out.
+        if let Some(ack) = ack {
+            let _ = ack.send(true);
+        }
+        let persisted = tokio::time::timeout(Duration::from_secs(2), dispatch)
+            .await
+            .expect("dispatch timeout")
+            .expect("join");
+        assert!(
+            persisted,
+            "producer should return the acked persistence flag"
+        );
     }
 
     #[tokio::test]

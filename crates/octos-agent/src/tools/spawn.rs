@@ -26,7 +26,7 @@ use crate::prompt_context::PromptContextManager;
 use crate::role_template::RoleTemplate;
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
-use crate::task_supervisor::TaskSupervisor;
+use crate::task_supervisor::{TaskSupervisor, TaskTerminalGuard};
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
@@ -157,6 +157,15 @@ pub struct BackgroundResultPayload {
     /// identity round-trips correctly in both shapes. `None` for legacy
     /// callers and tests that do not track origination.
     pub originating_client_message_id: Option<String>,
+    /// C1 step 3: the terminal supervisor status (`Completed` / `Failed` /
+    /// `Cancelled`) for the spawn_only task that produced this completion.
+    /// Set at the same call sites that invoke `mark_completed` /
+    /// `mark_failed`, so the session actor can read an explicit status
+    /// instead of inferring success from the rendered `"✗"` / `"✅"` content
+    /// heuristic. Carried alongside `task_id` so the actor can attribute the
+    /// terminal state to a specific background task. `None` for legacy
+    /// callers and tests that do not track the terminal status.
+    pub terminal_status: Option<crate::task_supervisor::TaskStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2803,10 +2812,18 @@ impl Tool for SpawnTool {
             let child_session_scope = ctx.session_scope.clone();
 
             tokio::spawn(async move {
+                // C1 step 2: arm a RAII terminal guard right after
+                // mark_running so an aborted/panicked child body does not
+                // leave the task stuck Running (TUI count never decrements).
+                // Idempotent on the normal terminal arms below; Drop no-ops
+                // once the body marked the task terminal itself.
+                let mut _terminal_guard: Option<TaskTerminalGuard> = None;
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
                     supervisor.mark_running(task_id);
+                    _terminal_guard =
+                        Some(TaskTerminalGuard::new(supervisor.clone(), task_id.clone()));
                     if let Some(workflow) = workflow_metadata.as_ref() {
                         // Seed `runtime_detail.progress` with a small non-null
                         // value at workflow start. Without this, dashboards
@@ -3426,6 +3443,17 @@ impl Tool for SpawnTool {
                     }
                 }
 
+                // C1 step 3: derive the terminal supervisor status from the
+                // SAME (&result, contract_failure) match the mark_* arms above
+                // used, so the BackgroundResultPayload carries an explicit
+                // outcome the session actor can read instead of inferring
+                // success from the rendered content string.
+                let terminal_status = match (&result, contract_failure.as_ref()) {
+                    (Ok(task_result), None) if task_result.success => {
+                        crate::task_supervisor::TaskStatus::Completed
+                    }
+                    _ => crate::task_supervisor::TaskStatus::Failed,
+                };
                 let content = match (&result, contract_failure.as_ref()) {
                     (Ok(_), Some(error)) => format!("Status: FAILED\nError: {error}"),
                     (Ok(r), None) => format!(
@@ -3506,6 +3534,7 @@ impl Tool for SpawnTool {
                         // its parent prompt row carries.
                         originating_client_message_id: originating_thread_id.clone(),
                         tool_call_id: originating_tool_call_id.clone(),
+                        terminal_status: Some(terminal_status),
                     },
                 )
                 .await
@@ -4609,6 +4638,7 @@ PY
             task_id: None,
             originating_client_message_id: None,
             tool_call_id: None,
+            terminal_status: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);

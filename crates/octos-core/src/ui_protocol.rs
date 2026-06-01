@@ -4558,6 +4558,14 @@ pub struct TaskUpdatedEvent {
     /// `BackgroundTask::runtime_policy_stamp`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
+    /// C1 step 4: the turn that originated this task. Lets the client
+    /// reconcile its per-turn "N running" task count when a sub-agent
+    /// fails/recovers/errors/is-orphaned — without it the count stayed
+    /// stuck and the chip stuck "Orchestrating". Optional so legacy daemons
+    /// and synthetic / fallback emission paths that cannot resolve the
+    /// originating turn still parse; omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6334,6 +6342,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         })
         .into_rpc_notification()
         .expect("serialize task/updated cancelled");
@@ -8377,6 +8386,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         });
         let rpc = event
             .clone()
@@ -8410,6 +8420,8 @@ mod tests {
             summary: Some("found 1 issue".into()),
             artifact_count: Some(2),
             runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+            // C1 step 4: turn_id round-trips alongside the projection fields.
+            turn_id: Some(TurnId(Uuid::from_u128(0xCAFE))),
         };
         let value = serde_json::to_value(&event).expect("serialize task/updated");
         assert_eq!(value.get("source"), Some(&json!("model")));
@@ -8419,6 +8431,11 @@ mod tests {
         assert_eq!(
             value.get("runtime_policy_stamp"),
             Some(&json!({ "approval_policy": "on-request" })),
+        );
+        assert_eq!(
+            value.get("turn_id"),
+            Some(&json!(Uuid::from_u128(0xCAFE).to_string())),
+            "turn_id must appear on the wire when set",
         );
         let parsed: TaskUpdatedEvent =
             serde_json::from_value(value).expect("deserialize task/updated");
@@ -8440,6 +8457,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         };
         let bare_value = serde_json::to_value(&bare).expect("serialize bare task/updated");
         assert!(bare_value.get("source").is_none(), "absent source omits");
@@ -8452,6 +8470,10 @@ mod tests {
         assert!(
             bare_value.get("runtime_policy_stamp").is_none(),
             "absent runtime_policy_stamp omits",
+        );
+        assert!(
+            bare_value.get("turn_id").is_none(),
+            "absent turn_id omits (C1 step 4)",
         );
         let legacy_json = json!({
             "session_id": "local:demo",
@@ -8466,6 +8488,7 @@ mod tests {
         assert_eq!(parsed_legacy.summary, None);
         assert_eq!(parsed_legacy.artifact_count, None);
         assert_eq!(parsed_legacy.runtime_policy_stamp, None);
+        assert_eq!(parsed_legacy.turn_id, None);
     }
 
     // ===== UPCR-2026-009 / -010 / -011 / -012 golden tests (PR G) =====
@@ -8866,6 +8889,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         };
         let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
         assert_eq!(
@@ -8892,6 +8916,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         };
         let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");
         assert!(
