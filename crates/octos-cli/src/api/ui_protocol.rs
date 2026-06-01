@@ -103,6 +103,7 @@ use super::ui_protocol_ledger::{
 };
 use super::ui_protocol_progress::{
     ProgressMappingContext, UiProgressMapping, background_task_to_progress_json, map_progress_json,
+    replay_task_updated_notification,
 };
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
@@ -7723,6 +7724,30 @@ async fn handle_session_open(
         }
         _ => session_id_for_subscribe,
     };
+
+    // C8 / GAP A: replay the supervisor's CURRENT task snapshot to this
+    // freshly-opened / reconnecting connection as `task/updated` events. A
+    // TUI starts with an empty `session.tasks` and only applies incremental
+    // updates, so without this it cannot see tasks that were already running
+    // when it connected (it would have to wait for the next live transition,
+    // and a stable long-running task may never produce one). Each task is
+    // routed through the SAME mapping live updates use
+    // (`background_task_to_progress_json` -> `map_progress_json`), so the wire
+    // shape is identical to a live `task/updated`.
+    //
+    // These are sent EPHEMERAL (direct to this connection, NOT appended to the
+    // ledger): the snapshot is catch-up state for one client, not a new event
+    // in session history. Any historical durable `task/updated` events were
+    // already shipped by the replay loop above; the client merges by `task_id`
+    // (last-write-wins), so a duplicate is harmless and the latest state wins.
+    if let Some(store) = state.task_query_store.as_ref() {
+        for (task, _data_dir) in store.raw_tasks_for_session(&session_id.0) {
+            if let Some(notification) = replay_task_updated_notification(&session_id, &task) {
+                let _ = send_notification_ephemeral(ws, ledger, notification);
+            }
+        }
+    }
+
     let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
 

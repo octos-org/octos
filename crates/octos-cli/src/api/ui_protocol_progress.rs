@@ -610,6 +610,44 @@ pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTas
     payload
 }
 
+/// C8 / GAP A: build the `task/updated` notification used to REPLAY an
+/// already-known supervisor task to a freshly-opened / reconnecting client.
+///
+/// A reconnecting TUI starts with an empty `session.tasks` and only applies
+/// incremental `task/updated` deltas, so without replaying the current task
+/// list on `session/open` the existing tasks are invisible until their next
+/// live transition. This routes the raw [`octos_agent::BackgroundTask`]
+/// through the SAME mapping live updates use
+/// ([`background_task_to_progress_json`] -> [`map_progress_json`]), so the
+/// replayed wire shape is byte-identical to a live `task/updated`.
+///
+/// Unlike a live update, a replay is NOT tied to an in-flight turn, so the
+/// originating `turn_id` is cleared (`None`) — the client only needs the task
+/// to populate its list; the per-turn "N running" reconciliation that
+/// `turn_id` drives applies to live transitions during a turn, not to a
+/// snapshot replay. Returns `None` if the task JSON cannot be mapped (the
+/// only failure mode is an unmappable task_id / lifecycle state, which
+/// [`map_progress_json`] turns into a `warning` rather than a notification).
+pub(crate) fn replay_task_updated_notification(
+    session_id: &SessionKey,
+    task: &octos_agent::BackgroundTask,
+) -> Option<UiNotification> {
+    let event = background_task_to_progress_json(task);
+    // The context turn is never surfaced: map_task_updated's fallback stamps
+    // it, but we clear it below. A throwaway TurnId keeps the mapper happy.
+    let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+    let mapping = map_progress_json(&context, &event);
+    mapping.notifications.into_iter().find_map(|notification| {
+        if let UiNotification::TaskUpdated(mut updated) = notification {
+            // Replay snapshot — not attributable to a live turn.
+            updated.turn_id = None;
+            Some(UiNotification::TaskUpdated(updated))
+        } else {
+            None
+        }
+    })
+}
+
 fn stable_task_runtime_detail(task: &octos_agent::BackgroundTask) -> Option<String> {
     if let Some(error) = task.error.as_deref() {
         return Some(error.to_string());
@@ -1218,6 +1256,65 @@ mod tests {
         assert_eq!(event["title"], "search");
         assert_eq!(event["state"], "verifying");
         assert_eq!(event["runtime_detail"], "Writing report");
+    }
+
+    /// C8 / GAP A: a session-open task replay must reproduce the live
+    /// `task/updated` wire shape (same task_id / title / state / projection
+    /// fields routed through `background_task_to_progress_json` ->
+    /// `map_progress_json`) but with `turn_id` cleared — a snapshot replay is
+    /// not attributable to any in-flight turn.
+    #[test]
+    fn replay_task_updated_notification_clears_turn_id_and_preserves_shape() {
+        let session_id = SessionKey("local:demo".into());
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000099".into(),
+            tool_name: "run_pipeline".into(),
+            tool_call_id: "call-replay".into(),
+            parent_session_key: Some("local:demo".into()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::ExecutingTool,
+            runtime_detail: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:demo".into()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        let notification = replay_task_updated_notification(&session_id, &task)
+            .expect("running task should map to a task/updated notification");
+        let UiNotification::TaskUpdated(updated) = notification else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.task_id.to_string(),
+            "01900000-0000-7000-8000-000000000099"
+        );
+        assert_eq!(updated.title, "run_pipeline");
+        assert_eq!(updated.tool_call_id.as_deref(), Some("call-replay"));
+        assert_eq!(updated.state, UiTaskRuntimeState::Running);
+        assert_eq!(updated.session_id, session_id);
+        // The whole point of GAP A's clearing: a replayed snapshot is NOT
+        // tied to a live turn, unlike the live mapping which stamps the
+        // in-flight context turn.
+        assert_eq!(
+            updated.turn_id, None,
+            "a session-open replay snapshot must not carry an originating turn_id",
+        );
     }
 
     /// #1113 codex P2 follow-up: when `set_m13b_projection` populates
