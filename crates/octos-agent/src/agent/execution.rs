@@ -758,6 +758,11 @@ impl Agent {
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
                                             tool_call_id: Some(bg_tc_id.clone()),
+                                            // C1 step 3: contract-Satisfied success path
+                                            // (mark_completed below).
+                                            terminal_status: Some(
+                                                crate::task_supervisor::TaskStatus::Completed,
+                                            ),
                                         })
                                         .await
                                     } else {
@@ -820,6 +825,11 @@ impl Agent {
                                                                 bg_originating_client_message_id
                                                                     .clone(),
                                                             tool_call_id: Some(bg_tc_id.clone()),
+                                                            // C1 step 3: produced-files
+                                                            // follow-up after mark_completed.
+                                                            terminal_status: Some(
+                                                                crate::task_supervisor::TaskStatus::Completed,
+                                                            ),
                                                         })
                                                         .await;
                                                 }
@@ -865,6 +875,11 @@ impl Agent {
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
                                             tool_call_id: Some(bg_tc_id.clone()),
+                                            // C1 step 3: contract-rejected failure
+                                            // (mark_failed above).
+                                            terminal_status: Some(
+                                                crate::task_supervisor::TaskStatus::Failed,
+                                            ),
                                         })
                                         .await;
                                     }
@@ -894,6 +909,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: required-but-unconfigured
+                                                // contract failure (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -952,6 +972,11 @@ impl Agent {
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
                                                     tool_call_id: Some(bg_tc_id.clone()),
+                                                    // C1 step 3: text-only success
+                                                    // (mark_completed above).
+                                                    terminal_status: Some(
+                                                        crate::task_supervisor::TaskStatus::Completed,
+                                                    ),
                                                 })
                                                 .await;
                                             }
@@ -989,6 +1014,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: no-files-no-text failure
+                                                // (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -1124,6 +1154,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: file-delivery failure
+                                                // (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -1234,6 +1269,11 @@ impl Agent {
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
                                                     tool_call_id: Some(bg_tc_id.clone()),
+                                                    // C1 step 3: file-delivery success
+                                                    // (mark_completed above).
+                                                    terminal_status: Some(
+                                                        crate::task_supervisor::TaskStatus::Completed,
+                                                    ),
                                                 })
                                                 .await;
 
@@ -1308,6 +1348,11 @@ impl Agent {
                                                                 bg_originating_client_message_id
                                                                     .clone(),
                                                             tool_call_id: Some(bg_tc_id.clone()),
+                                                            // C1 step 3: produced-files
+                                                            // follow-up after mark_completed.
+                                                            terminal_status: Some(
+                                                                crate::task_supervisor::TaskStatus::Completed,
+                                                            ),
                                                         })
                                                         .await;
                                                     }
@@ -1338,6 +1383,11 @@ impl Agent {
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
                                     tool_call_id: Some(bg_tc_id.clone()),
+                                    // C1 step 3: tool returned non-success
+                                    // (mark_failed above).
+                                    terminal_status: Some(
+                                        crate::task_supervisor::TaskStatus::Failed,
+                                    ),
                                 })
                                 .await;
                             }
@@ -1361,6 +1411,11 @@ impl Agent {
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
                                     tool_call_id: Some(bg_tc_id.clone()),
+                                    // C1 step 3: tool execution errored
+                                    // (mark_failed above).
+                                    terminal_status: Some(
+                                        crate::task_supervisor::TaskStatus::Failed,
+                                    ),
                                 })
                                 .await;
                             }
