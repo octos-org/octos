@@ -340,16 +340,39 @@ impl SessionRuntime {
         // must satisfy `is_safe_session_id`; collapse the `:` of
         // channel-prefixed shapes (and any other out-of-alphabet byte).
         let scope_session_id = sanitize_scope_session_id(&session_id_raw);
-        let workspace_under_data = workspace_root.starts_with(&profile.data_dir);
+        // #1377 (codex pre-merge P2): decide in-profile membership by comparing
+        // CANONICAL forms (firmlink-safe: macOS `/var` vs `/private/var`), but
+        // pick the `scope_root` that is an actual PREFIX of `workspace_root`.
+        // `workspace_root` is canonical for hint sessions (the `..`/symlink fix
+        // above) but RAW for the common no-hint case (it is built but not yet
+        // created on disk when `resolve_workspace_root` runs, so it can't be
+        // canonicalized there). Comparing a canonical workspace to a raw
+        // data_dir (or vice-versa) would misclassify; comparing canonical
+        // forms is correct, and rooting at whichever data_dir form prefixes
+        // the actual `workspace_root` keeps `scope.classify_*` containment
+        // intact for both shapes. `canonicalize` falls back to the raw path
+        // when the dir is absent.
+        let raw_data_dir = profile.data_dir.clone();
+        let canon_data_dir =
+            std::fs::canonicalize(&raw_data_dir).unwrap_or_else(|_| raw_data_dir.clone());
+        let canon_ws =
+            std::fs::canonicalize(&workspace_root).unwrap_or_else(|_| workspace_root.clone());
+        let workspace_under_data = canon_ws.starts_with(&canon_data_dir);
+        // Use the data_dir form that actually prefixes workspace_root so the
+        // scope's root is a true ancestor (raw-vs-raw for no-hint, else canon).
         let scope_root = if workspace_under_data {
-            profile.data_dir.clone()
+            if workspace_root.starts_with(&raw_data_dir) {
+                raw_data_dir.clone()
+            } else {
+                canon_data_dir.clone()
+            }
         } else {
             workspace_root.clone()
         };
         let scope_zones: Vec<PathBuf> = if workspace_under_data {
             DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
                 .iter()
-                .map(|name| profile.data_dir.join(name))
+                .map(|name| scope_root.join(name))
                 .collect()
         } else {
             Vec::new()
@@ -589,7 +612,14 @@ fn resolve_workspace_root(
     workspace_hint: Option<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(hint) = workspace_hint {
-        return validate_workspace_hint(&hint).map(|_| hint);
+        // #1377 (codex pre-merge P1): return the CANONICAL hint, not the raw
+        // one. A raw hint carrying `..` (or symlinked ancestors) would flow
+        // into `workspace_root`, and `SessionScope::multi_tenant_at_workspace`
+        // rejects `..` — leaving the session UNSCOPED and back on the legacy
+        // resolver that decodes global `up/` handles with no tenant check.
+        // Canonicalizing collapses `..` and resolves symlinks so the scope is
+        // always built and the upload-ownership gate applies.
+        return validate_workspace_hint(&hint);
     }
 
     let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
@@ -614,7 +644,7 @@ fn resolve_workspace_root(
 /// `api/ui_protocol.rs::validate_session_workspace_allowed` and this
 /// function can call. Today the two paths must stay synchronized by
 /// inspection.
-fn validate_workspace_hint(hint: &Path) -> Result<()> {
+fn validate_workspace_hint(hint: &Path) -> Result<PathBuf> {
     // The hint must canonicalize (so we reject symlink traps and
     // nonexistent paths early). Callers that want to *create* a
     // workspace should pre-create the directory before passing the
@@ -650,7 +680,9 @@ fn validate_workspace_hint(hint: &Path) -> Result<()> {
         }
     }
 
-    Ok(())
+    // Return the CANONICAL path (collapses `..`, resolves symlinks) so the
+    // caller roots the session scope at a normalized workspace_root.
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -802,14 +834,20 @@ mod tests {
 
         // Repo hint is a sibling of the data dir -> NOT under it.
         let repo = tmp.path().join("some-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // #1377 (codex pre-merge P1): the hint is now CANONICALIZED before it
+        // becomes workspace_root (so a `..`/symlinked hint can't slip through
+        // unscoped). Compare against the canonical form (`/tmp`->`/private/tmp`
+        // on macOS).
+        let repo_canon = std::fs::canonicalize(&repo).unwrap();
         let key = SessionKey::new("appui", "coding-1");
         let rt = SessionRuntime::bootstrap(&profile, key, Some(repo.clone()))
             .await
             .expect("bootstrap with workspace hint");
 
-        assert_eq!(rt.workspace_root, repo);
+        assert_eq!(rt.workspace_root, repo_canon);
         assert!(
-            !repo.starts_with(&data_dir),
+            !repo_canon.starts_with(&data_dir),
             "test setup: repo must be outside data dir"
         );
 
@@ -819,9 +857,9 @@ mod tests {
             .expect("hint session now carries a tenant scope")
             .clone();
         assert_eq!(scope.tenant_id(), Some(profile.profile_id.as_str()));
-        // root == workspace == repo; no shared zones (repo is out-of-tree).
-        assert_eq!(scope.workspace(), repo.as_path());
-        assert_eq!(scope.root(), repo.as_path());
+        // root == workspace == canonical repo; no shared zones (out-of-tree).
+        assert_eq!(scope.workspace(), repo_canon.as_path());
+        assert_eq!(scope.root(), repo_canon.as_path());
         assert!(scope.shared_zones().is_empty());
         // Critical for propagation: scope.workspace() == workspace_root.
         assert_eq!(scope.workspace(), rt.workspace_root.as_path());
@@ -919,9 +957,12 @@ mod tests {
             .clone();
         // Tenant binding present -> the resolver's `up/` ownership gate fires.
         assert_eq!(scope.tenant_id(), Some(profile.profile_id.as_str()));
+        // No-hint session: workspace_root is the raw `<data>/users/<enc>/
+        // workspace` path, so scope.root() stays the raw data_dir (the form
+        // that prefixes workspace_root).
         assert_eq!(scope.root(), data_dir.as_path());
-        // Workspace is the real on-disk (percent-encoded) path and matches
-        // the runtime's workspace_root, so per-turn propagation attaches it.
+        // Workspace matches the runtime's workspace_root, so per-turn
+        // propagation attaches it.
         assert_eq!(scope.workspace(), rt.workspace_root.as_path());
         assert!(rt.workspace_root.starts_with(&data_dir));
     }

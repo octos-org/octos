@@ -535,6 +535,15 @@ enum MaterializeOutcome {
 /// Callers pass a path that is ALREADY resolved (e.g. via
 /// [`resolve_upload_reference`]); a path outside the upload root yields `false`
 /// for a multi-tenant caller, so non-upload paths must be screened separately.
+/// Whether a RESOLVED path lives under the process-global upload tmpdir
+/// root (`octos-uploads`). Callers use this to decide whether the tenant
+/// ownership rule ([`upload_owned_by_tenant`]) even applies: a workspace or
+/// profile file is NOT under the upload root and must not be subjected to
+/// the upload-ownership check (it would be falsely denied).
+pub fn is_under_upload_root(resolved: &Path) -> bool {
+    resolved.starts_with(canonical_root(&temp_upload_root()))
+}
+
 pub fn upload_owned_by_tenant(resolved: &Path, tenant_id: Option<&str>) -> bool {
     let Some(tenant) = tenant_id else {
         return true; // single-tenant: ownership check does not apply
@@ -705,6 +714,21 @@ mod tests {
             out_b[0]
         );
         assert!(ws_b.path().join(&out_b[0]).is_file());
+    }
+
+    #[test]
+    fn is_under_upload_root_distinguishes_upload_from_other_paths() {
+        let root = canonical_root(&temp_upload_root());
+        // Upload-root paths (any tenant / flat) are "under" the root — the
+        // download gate then applies the ownership check to these.
+        assert!(is_under_upload_root(&root.join("dspfac/uuid_doc.md")));
+        assert!(is_under_upload_root(&root.join("flat.md")));
+        // Workspace / profile / external paths are NOT under the upload root,
+        // so the download gate leaves them alone (no false denial).
+        assert!(!is_under_upload_root(std::path::Path::new(
+            "/some/profile/data/users/web-1/workspace/out.pptx"
+        )));
+        assert!(!is_under_upload_root(std::path::Path::new("/etc/passwd")));
     }
 
     #[test]
