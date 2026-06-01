@@ -5648,4 +5648,92 @@ mod tests {
             failed_snapshots.len()
         );
     }
+
+    /// STEP 1 contract: the orphan sweep that runs INSIDE
+    /// `enable_persistence` fires terminal `mark_failed("orphaned across
+    /// restart")` transitions. For the TUI task-count chain to learn the
+    /// task failed, the `on_change` callback MUST be installed BEFORE
+    /// `enable_persistence` — otherwise the sweep's `notify_change` hits
+    /// `on_change == None` and the terminal transition is silently dropped.
+    /// This is the supervisor-level invariant the CLI wiring (session_actor
+    /// + ui_protocol `run_standalone_turn`) depends on.
+    #[test]
+    fn on_change_installed_before_enable_persistence_observes_orphan_sweep() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // First runtime: register + mark_running, persist a non-terminal
+        // task, then drop the supervisor (simulating a restart).
+        let first = TaskSupervisor::new();
+        first.enable_persistence(&ledger_path).unwrap();
+        let id =
+            first.register_with_lineage("mofa_slides", "call-orphan", Some("api:session"), None);
+        first.mark_running(&id);
+        assert_eq!(
+            first.get_task(&id).expect("task").status,
+            TaskStatus::Running
+        );
+        drop(first);
+
+        // Second runtime: install on_change FIRST, then enable_persistence.
+        // The orphan sweep should fire the callback with the now-Failed task.
+        let restored = TaskSupervisor::new();
+        let observed: Arc<Mutex<Vec<BackgroundTask>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        restored.set_on_change(move |task: &BackgroundTask| {
+            sink.lock().unwrap().push(task.clone());
+        });
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let snapshots = observed.lock().unwrap();
+        let orphan_failure = snapshots
+            .iter()
+            .find(|t| t.id == id && t.status == TaskStatus::Failed)
+            .expect("on_change MUST observe the orphaned task transition to Failed");
+        assert_eq!(
+            orphan_failure.error.as_deref(),
+            Some("orphaned across restart"),
+        );
+    }
+
+    /// Inverse of the above: installing `on_change` AFTER
+    /// `enable_persistence` (the pre-fix ordering) means the orphan sweep's
+    /// terminal transition is NEVER observed by the callback. Documents WHY
+    /// the wiring order matters — the supervisor's stored task is Failed
+    /// either way, but the live notification chain stays cold.
+    #[test]
+    fn on_change_installed_after_enable_persistence_misses_orphan_sweep() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let first = TaskSupervisor::new();
+        first.enable_persistence(&ledger_path).unwrap();
+        let id =
+            first.register_with_lineage("mofa_slides", "call-orphan2", Some("api:session"), None);
+        first.mark_running(&id);
+        drop(first);
+
+        let restored = TaskSupervisor::new();
+        // Sweep runs HERE, before any callback is installed.
+        restored.enable_persistence(&ledger_path).unwrap();
+        let observed: Arc<Mutex<Vec<BackgroundTask>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        restored.set_on_change(move |task: &BackgroundTask| {
+            sink.lock().unwrap().push(task.clone());
+        });
+
+        // Stored task is Failed (sweep ran), but the callback never saw it.
+        assert_eq!(
+            restored.get_task(&id).expect("task").status,
+            TaskStatus::Failed
+        );
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "on_change installed AFTER enable_persistence must NOT observe the sweep's transition",
+        );
+    }
 }
