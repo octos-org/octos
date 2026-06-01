@@ -4650,13 +4650,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
-                            // C1 step 3: new attribution fields are bound but
-                            // not yet consumed here — the explicit terminal
-                            // status is available for the completion-review
-                            // gate to read instead of the "✗" heuristic.
+                            // C1 step 3: the explicit terminal supervisor
+                            // status now drives the completion-review success
+                            // gate below (replacing the "✗" content heuristic).
+                            // `task_id` / `tool_call_id` are not consumed here.
                             task_id: _,
                             tool_call_id: _,
-                            terminal_status: _,
+                            terminal_status,
                             ack,
                         }) => {
                             idle_sleep
@@ -4693,20 +4693,20 @@ impl SessionActor {
                             // drives the dedicated RecoveryHint path AND emits a failure
                             // BackgroundResult — reviewing that would (a) summarize a
                             // failure the recovery turn is already handling and (b) burn
-                            // a shared recovery-cap slot a real recovery needs. `kind`
-                            // does NOT distinguish: execution.rs emits `Notification`
-                            // for failures too (mark_failed). The reliable signal is the
-                            // runtime's failure prefix: every failure delivery is
-                            // formatted "✗ … failed/error" by execution.rs/spawn.rs (a
-                            // runtime convention, not tool-controlled), so a body that
-                            // does NOT start with "✗" is a successful completion.
+                            // a shared recovery-cap slot a real recovery needs.
                             //
-                            // Soak-grade gate. GA-robust form: carry an explicit
-                            // terminal-status bool on the BackgroundResult message
-                            // (the mailbox-aligned fix) across spawn.rs/execution.rs's
-                            // ~13 emit sites, plus per-task_id dedup for the second
-                            // "produced files" notification.
-                            let is_success_completion = !content.trim_start().starts_with('✗');
+                            // This gate now reads the AUTHORITATIVE terminal status that
+                            // C1 (subagent-terminal-propagation) threads onto the
+                            // BackgroundResult message from the SAME mark_completed /
+                            // mark_failed match the producer used (spawn.rs /
+                            // execution.rs). A completion is a success iff the supervisor
+                            // marked the task `Completed`; `Failed` / `Cancelled` / a
+                            // legacy `None` (callers/tests that don't track status) all
+                            // suppress the review. This replaces the previous "✗ content
+                            // prefix" heuristic — the rendered body is not load-bearing
+                            // anymore, the explicit terminal status is.
+                            let is_success_completion =
+                                matches!(terminal_status, Some(octos_agent::TaskStatus::Completed));
                             if persisted
                                 && is_success_completion
                                 && auto_review_background_completions_enabled()
@@ -14248,6 +14248,9 @@ mod tests {
             kind: BackgroundResultKind::Notification,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: Some(octos_agent::TaskStatus::Completed),
             ack: None,
         })
         .await
