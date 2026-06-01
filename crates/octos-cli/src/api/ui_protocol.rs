@@ -53,13 +53,14 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
+    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
+    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
+    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
     UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
     progress_kinds, thread_status,
@@ -981,6 +982,7 @@ struct ConnectionUiFeatures {
     typed_approvals: bool,
     pane_snapshots: bool,
     session_workspace_cwd: bool,
+    session_sandbox: bool,
     harness_task_control: bool,
     harness_task_artifacts: bool,
     /// UPCR-2026-009 `state.session_hydrate.v1` negotiated.
@@ -1077,6 +1079,7 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             ),
+            session_sandbox: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1),
             harness_task_control: has_ui_feature(
                 headers,
                 query,
@@ -1144,6 +1147,7 @@ impl ConnectionUiFeatures {
             typed_approvals: true,
             pane_snapshots: true,
             session_workspace_cwd: true,
+            session_sandbox: true,
             harness_task_control: true,
             harness_task_artifacts: true,
             session_hydrate: true,
@@ -1195,6 +1199,7 @@ impl ConnectionUiFeatures {
             typed_approvals: has(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1),
             pane_snapshots: has(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1),
             session_workspace_cwd: has(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
+            session_sandbox: has(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1),
             harness_task_control: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1),
             harness_task_artifacts: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1),
             session_hydrate: has(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
@@ -1239,6 +1244,9 @@ impl ConnectionUiFeatures {
         }
         if self.session_workspace_cwd {
             requested.push(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1);
+        }
+        if self.session_sandbox {
+            requested.push(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1);
         }
         if self.harness_task_control {
             requested.push(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1);
@@ -8656,6 +8664,7 @@ async fn open_session_result(
     ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
     let requested_workspace =
         validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
+    validate_session_sandbox_feature_gate(features, &params)?;
     // M11-F deliverable D: re-introduce the
     // `appui.default_session_cwd` Tier-2 fallback that M11-E's
     // `clone_session_tools` deletion took out. Pre-resolution order:
@@ -8708,13 +8717,19 @@ async fn open_session_result(
     {
         let hint = effective_workspace_hint.clone();
         let permissions = effective_permissions_for_session(state, &params.session_id)?;
+        let sandbox_override = validate_requested_session_sandbox(
+            features,
+            &params,
+            &permissions.apply_to_sandbox(&profile_runtime.default_sandbox),
+        )?;
         match state
             .session_cache
-            .get_or_init_with_permissions(
+            .get_or_init_with_permissions_and_sandbox(
                 &profile_runtime,
                 params.session_id.clone(),
                 hint,
                 permissions,
+                sandbox_override,
             )
             .await
         {
@@ -8733,6 +8748,14 @@ async fn open_session_result(
                 )));
             }
         }
+    } else if params.sandbox.is_some() {
+        return Err(RpcError::invalid_params(
+            "session/open sandbox requires a configured profile runtime",
+        )
+        .with_data(json!({
+            "kind": "sandbox_runtime_unavailable",
+            "active_profile_id": active_profile_id,
+        })));
     } else if let Some(workspace_root) = effective_workspace_hint.as_ref() {
         // No profile registered (legacy single-agent serve). Stash the
         // effective hint in the read-through map so the legacy
@@ -8901,6 +8924,140 @@ fn validate_requested_session_cwd(
     let workspace_root = canonical_existing_dir(cwd)?;
     validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
     Ok(Some(workspace_root))
+}
+
+fn validate_session_sandbox_feature_gate(
+    features: ConnectionUiFeatures,
+    params: &SessionOpenParams,
+) -> Result<(), RpcError> {
+    if params.sandbox.is_some() && !features.session_sandbox {
+        return Err(RpcError::invalid_params(
+            "session/open sandbox requires feature session.sandbox.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+        })));
+    }
+    Ok(())
+}
+
+fn validate_requested_session_sandbox(
+    features: ConnectionUiFeatures,
+    params: &SessionOpenParams,
+    inherited: &octos_agent::SandboxConfig,
+) -> Result<Option<octos_agent::SandboxConfig>, RpcError> {
+    validate_session_sandbox_feature_gate(features, params)?;
+    let Some(requested) = params.sandbox.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut narrowed = inherited.clone();
+    if let Some(enabled) = requested.enabled {
+        if !enabled && inherited.enabled {
+            return Err(session_sandbox_widening_error(
+                "enabled",
+                json!(enabled),
+                json!(inherited.enabled),
+                "session sandbox cannot disable profile-level sandbox isolation",
+            ));
+        }
+        narrowed.enabled = enabled;
+    }
+
+    if let Some(network_access) = requested.network_access {
+        if network_access && !inherited.allow_network {
+            return Err(session_sandbox_widening_error(
+                "network_access",
+                json!(network_access),
+                json!(inherited.allow_network),
+                "session sandbox cannot enable network access denied by the profile",
+            ));
+        }
+        narrowed.allow_network = network_access;
+    }
+
+    if !requested.read_allow_paths.is_empty() {
+        let requested_paths =
+            canonical_session_sandbox_paths("read_allow_paths", &requested.read_allow_paths)?;
+        if !inherited.read_allow_paths.is_empty() {
+            let inherited_paths = canonical_session_sandbox_paths(
+                "inherited_read_allow_paths",
+                &inherited.read_allow_paths,
+            )?;
+            for requested_path in &requested_paths {
+                if !inherited_paths
+                    .iter()
+                    .any(|allowed| requested_path == allowed || requested_path.starts_with(allowed))
+                {
+                    return Err(session_sandbox_widening_error(
+                        "read_allow_paths",
+                        json!(requested_path.to_string_lossy()),
+                        json!(
+                            inherited_paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect::<Vec<_>>()
+                        ),
+                        "session sandbox read paths must stay within the profile allowlist",
+                    ));
+                }
+            }
+        }
+        narrowed.read_allow_paths = requested_paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+    }
+
+    Ok(Some(narrowed))
+}
+
+fn canonical_session_sandbox_paths(
+    field: &str,
+    paths: &[String],
+) -> Result<Vec<PathBuf>, RpcError> {
+    paths
+        .iter()
+        .map(|path| {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err(RpcError::invalid_params(format!(
+                    "session/open sandbox {field} path must not be empty"
+                ))
+                .with_data(json!({
+                    "kind": "session_sandbox_path_empty",
+                    "field": field,
+                })));
+            }
+            let expanded = expand_home_path(trimmed);
+            std::fs::canonicalize(&expanded).map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "session/open sandbox {field} path is not accessible: {path}"
+                ))
+                .with_data(json!({
+                    "kind": "session_sandbox_path_not_accessible",
+                    "field": field,
+                    "path": path,
+                    "error": error.to_string(),
+                }))
+            })
+        })
+        .collect()
+}
+
+fn session_sandbox_widening_error(
+    field: &'static str,
+    requested: Value,
+    inherited: Value,
+    message: &'static str,
+) -> RpcError {
+    RpcError::permission_denied(message).with_data(json!({
+        "kind": "session_sandbox_would_widen_profile",
+        "field": field,
+        "requested": requested,
+        "inherited": inherited,
+    }))
 }
 
 fn canonical_existing_dir(path: &str) -> Result<PathBuf, RpcError> {
@@ -22138,7 +22295,7 @@ mod tests {
         ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
         DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-        QuestionId, approval_scopes, methods, rpc_error_codes,
+        QuestionId, SessionSandboxParams, approval_scopes, methods, rpc_error_codes,
     };
 
     fn local_profile_state(dir: &Path) -> AppState {
@@ -22728,6 +22885,7 @@ mod tests {
             topic: None,
             profile_id: None,
             cwd: None,
+            sandbox: None,
             after: None,
         };
         assert_eq!(
@@ -22740,6 +22898,7 @@ mod tests {
             topic: None,
             profile_id: Some("explicit".into()),
             cwd: None,
+            sandbox: None,
             after: None,
         };
         assert_eq!(
@@ -22752,6 +22911,7 @@ mod tests {
             topic: None,
             profile_id: None,
             cwd: None,
+            sandbox: None,
             after: None,
         };
         assert_eq!(
@@ -24406,6 +24566,7 @@ ignore = []
             topic: None,
             profile_id: Some("missing".into()),
             cwd: None,
+            sandbox: None,
             after: None,
         };
         let candidate = stdio_session_open_candidate_profile(&missing_params, binding.as_deref());
@@ -24459,6 +24620,7 @@ ignore = []
             topic: None,
             profile_id: Some("grace".into()),
             cwd: None,
+            sandbox: None,
             after: None,
         };
         let candidate = stdio_session_open_candidate_profile(&grace_params, binding.as_deref());
@@ -24627,6 +24789,7 @@ ignore = []
                     topic: None,
                     profile_id: None,
                     cwd: None,
+                    sandbox: None,
                     after: None,
                 },
             )
@@ -25103,6 +25266,7 @@ ignore = []
             topic: None,
             profile_id: Some("ada".into()),
             cwd: Some(workspace.path().to_string_lossy().into_owned()),
+            sandbox: None,
             after: None,
         };
 
@@ -26457,6 +26621,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26519,6 +26684,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26626,6 +26792,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26688,6 +26855,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26743,6 +26911,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26841,6 +27010,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -28296,6 +28466,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(first.cursor),
             },
         )
@@ -28358,6 +28529,7 @@ ignore = []
                 topic: Some("alpha".into()),
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: alpha_session.0.clone(),
                     seq: 0,
@@ -28388,6 +28560,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: base_session.0.clone(),
                     seq: 0,
@@ -28427,6 +28600,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: "local:other".into(),
                     seq: 0,
@@ -28487,6 +28661,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 0,
@@ -28543,6 +28718,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -28935,6 +29111,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 1,
@@ -28979,6 +29156,7 @@ ignore = []
                 typed_approvals: false,
                 pane_snapshots: true,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -29004,6 +29182,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -29055,6 +29234,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: Some(temp.path().to_string_lossy().to_string()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -29093,6 +29273,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -29165,6 +29346,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -31631,6 +31813,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -31656,6 +31839,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 0,
@@ -33572,6 +33756,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(warmup.cursor.clone()),
             },
         )
@@ -37831,17 +38016,11 @@ ignore = []
         }
     }
 
-    async fn make_m11e_profile(
-        profile_id: &str,
-        data_dir: &std::path::Path,
-    ) -> Arc<crate::runtime::ProfileRuntime> {
-        make_m11e_profile_with_llm(profile_id, data_dir, Arc::new(M11EStubLlm)).await
-    }
-
-    async fn make_m11e_profile_with_llm(
+    async fn make_m11e_profile_with_llm_and_sandbox(
         profile_id: &str,
         data_dir: &std::path::Path,
         llm: Arc<dyn octos_llm::LlmProvider>,
+        sandbox: octos_agent::SandboxConfig,
     ) -> Arc<crate::runtime::ProfileRuntime> {
         std::fs::create_dir_all(data_dir).expect("profile data dir");
         let memory = Arc::new(
@@ -37859,7 +38038,6 @@ ignore = []
                 .await
                 .expect("tool config store"),
         );
-        let sandbox = octos_agent::SandboxConfig::default();
         let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
             data_dir,
             octos_agent::create_sandbox(&sandbox),
@@ -37915,6 +38093,21 @@ ignore = []
         profile_id: &str,
         llm: Arc<dyn octos_llm::LlmProvider>,
     ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+        state_with_profile_llm_and_sandbox(
+            data_dir,
+            profile_id,
+            llm,
+            octos_agent::SandboxConfig::default(),
+        )
+        .await
+    }
+
+    async fn state_with_profile_llm_and_sandbox(
+        data_dir: &std::path::Path,
+        profile_id: &str,
+        llm: Arc<dyn octos_llm::LlmProvider>,
+        sandbox: octos_agent::SandboxConfig,
+    ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
         std::fs::create_dir_all(data_dir).expect("data dir");
 
         let sessions = Arc::new(tokio::sync::Mutex::new(
@@ -37922,7 +38115,9 @@ ignore = []
         ));
 
         let profile_data_dir = data_dir.join("profiles").join(profile_id).join("data");
-        let profile_runtime = make_m11e_profile_with_llm(profile_id, &profile_data_dir, llm).await;
+        let profile_runtime =
+            make_m11e_profile_with_llm_and_sandbox(profile_id, &profile_data_dir, llm, sandbox)
+                .await;
 
         let mut profiles = HashMap::new();
         profiles.insert(profile_id.to_string(), profile_runtime.clone());
@@ -38175,6 +38370,7 @@ ignore = []
         let session_id = SessionKey::with_profile("m11e-custom-cwd", "api", "custom-cwd-session");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38192,6 +38388,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-custom-cwd".into()),
                 cwd: Some(supplied_cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38239,6 +38436,235 @@ ignore = []
         );
     }
 
+    #[test]
+    fn session_sandbox_requires_negotiated_feature() {
+        let params = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-feature-required"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: Some(false),
+                read_allow_paths: Vec::new(),
+            }),
+            after: None,
+        };
+
+        let err = validate_requested_session_sandbox(
+            ConnectionUiFeatures::default(),
+            &params,
+            &octos_agent::SandboxConfig::default(),
+        )
+        .expect_err("sandbox override must require feature negotiation");
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("feature_required"))
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("feature")),
+            Some(&json!(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1))
+        );
+    }
+
+    #[test]
+    fn session_sandbox_can_narrow_network_but_not_widen() {
+        let features = ConnectionUiFeatures {
+            session_sandbox: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        let params = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-network-narrow"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: Some(false),
+                read_allow_paths: Vec::new(),
+            }),
+            after: None,
+        };
+        let inherited = octos_agent::SandboxConfig {
+            allow_network: true,
+            ..octos_agent::SandboxConfig::default()
+        };
+
+        let narrowed = validate_requested_session_sandbox(features, &params, &inherited)
+            .expect("network:false narrows network-enabled profile")
+            .expect("override present");
+        assert!(!narrowed.allow_network);
+
+        let widening = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-network-widen"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: Some(true),
+                read_allow_paths: Vec::new(),
+            }),
+            after: None,
+        };
+        let err = validate_requested_session_sandbox(
+            features,
+            &widening,
+            &octos_agent::SandboxConfig::default(),
+        )
+        .expect_err("network:true widens a network-denied profile");
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("session_sandbox_would_widen_profile"))
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("field")),
+            Some(&json!("network_access"))
+        );
+    }
+
+    #[test]
+    fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let allowed = temp.path().join("allowed");
+        let nested = allowed.join("nested");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let features = ConnectionUiFeatures {
+            session_sandbox: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        let inherited = octos_agent::SandboxConfig {
+            read_allow_paths: vec![allowed.to_string_lossy().into_owned()],
+            ..octos_agent::SandboxConfig::default()
+        };
+
+        let narrowed = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-read-narrow"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: None,
+                read_allow_paths: vec![nested.to_string_lossy().into_owned()],
+            }),
+            after: None,
+        };
+        let sandbox = validate_requested_session_sandbox(features, &narrowed, &inherited)
+            .expect("nested read path narrows profile allowlist")
+            .expect("override present");
+        assert_eq!(sandbox.read_allow_paths.len(), 1);
+        assert!(Path::new(&sandbox.read_allow_paths[0]).ends_with("nested"));
+
+        let widening = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-read-widen"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: None,
+                read_allow_paths: vec![outside.to_string_lossy().into_owned()],
+            }),
+            after: None,
+        };
+        let err = validate_requested_session_sandbox(features, &widening, &inherited)
+            .expect_err("outside read path widens profile allowlist");
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("session_sandbox_would_widen_profile"))
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("field")),
+            Some(&json!("read_allow_paths"))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sandbox_open_override_materializes_distinct_session_policies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile_llm_and_sandbox(
+            temp.path(),
+            "m11-session-sandbox",
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig {
+                allow_network: true,
+                ..octos_agent::SandboxConfig::default()
+            },
+        )
+        .await;
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let features = ConnectionUiFeatures {
+            session_sandbox: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        let gamma = SessionKey::with_profile("m11-session-sandbox", "api", "gamma");
+        let delta = SessionKey::with_profile("m11-session-sandbox", "api", "delta");
+
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11-session-sandbox"),
+            features,
+            SessionOpenParams {
+                session_id: gamma.clone(),
+                topic: None,
+                profile_id: Some("m11-session-sandbox".into()),
+                cwd: None,
+                sandbox: Some(SessionSandboxParams {
+                    enabled: None,
+                    network_access: Some(false),
+                    read_allow_paths: Vec::new(),
+                }),
+                after: None,
+            },
+        )
+        .await
+        .expect("gamma session/open with network false sandbox override");
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11-session-sandbox"),
+            features,
+            SessionOpenParams {
+                session_id: delta.clone(),
+                topic: None,
+                profile_id: Some("m11-session-sandbox".into()),
+                cwd: None,
+                sandbox: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("delta session/open with default sandbox");
+
+        let gamma_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, gamma, None)
+            .await
+            .expect("gamma runtime");
+        let delta_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, delta, None)
+            .await
+            .expect("delta runtime");
+
+        assert!(profile_runtime.default_sandbox.allow_network);
+        assert!(!gamma_runtime.sandbox.allow_network);
+        assert!(delta_runtime.sandbox.allow_network);
+        assert_ne!(gamma_runtime.workspace_root, delta_runtime.workspace_root);
+    }
+
     /// M11-E acceptance §2: two AppUI sessions opened on the SAME profile
     /// with DIFFERENT cwds must not see each other's files. This is the
     /// multi-tenant scope invariant codex flagged on PR #868 — pre-M11
@@ -38265,6 +38691,7 @@ ignore = []
 
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38283,6 +38710,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-multi-cwd".into()),
                 cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38303,6 +38731,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-multi-cwd".into()),
                 cwd: Some(cwd_b.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38435,6 +38864,7 @@ ignore = []
         let session_id = SessionKey::with_profile("m11e-rebind-attempt", "api", "single-key");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38452,6 +38882,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-rebind-attempt".into()),
                 cwd: Some(first_cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38472,6 +38903,7 @@ ignore = []
                 profile_id: Some("m11e-rebind-attempt".into()),
                 // Different cwd — must NOT take effect; cache is sticky.
                 cwd: Some(second_cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38526,6 +38958,7 @@ ignore = []
         let session_id = SessionKey::with_profile("m11e-not-registered", "api", "x");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38545,6 +38978,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: Some(cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38595,6 +39029,7 @@ ignore = []
         let session_a = SessionKey::with_profile("m11e-symlink", "api", "session-a");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38612,6 +39047,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-symlink".into()),
                 cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38720,6 +39156,7 @@ ignore = []
         // that the M11-E deletion of `clone_session_tools` broke.
         let features = ConnectionUiFeatures {
             session_workspace_cwd: false,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38737,6 +39174,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11f-tier2-default".into()),
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )

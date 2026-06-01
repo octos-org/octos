@@ -204,6 +204,26 @@ impl SessionRuntime {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_with_permissions_and_sandbox(
+            profile,
+            session_key,
+            workspace_hint,
+            permissions,
+            None,
+        )
+        .await
+    }
+
+    /// Construct a [`SessionRuntime`] with explicit effective permissions and
+    /// an optional, already-validated sandbox override. The override must be
+    /// derived from and no wider than the profile-level sandbox policy.
+    pub async fn bootstrap_with_permissions_and_sandbox(
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        permissions: EffectivePermissions,
+        sandbox_override: Option<SandboxConfig>,
+    ) -> Result<Arc<Self>> {
         // Step 1: resolve workspace_root.
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
@@ -246,7 +266,8 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = permissions.apply_to_sandbox(&profile.default_sandbox);
+        let sandbox = sandbox_override
+            .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
             create_sandbox(&sandbox),
@@ -756,11 +777,19 @@ mod tests {
         data_dir: PathBuf,
         system_prompt: String,
     ) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt_and_sandbox(data_dir, system_prompt, SandboxConfig::default())
+            .await
+    }
+
+    async fn make_profile_with_prompt_and_sandbox(
+        data_dir: PathBuf,
+        system_prompt: String,
+        sandbox: SandboxConfig,
+    ) -> Arc<ProfileRuntime> {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
-        let sandbox = SandboxConfig::default();
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
         Arc::new(ProfileRuntime {
@@ -794,6 +823,14 @@ mod tests {
             lane_routing: None,
             voice: crate::config::VoiceConfig::default(),
         })
+    }
+
+    async fn make_profile_with_sandbox(
+        data_dir: PathBuf,
+        sandbox: SandboxConfig,
+    ) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt_and_sandbox(data_dir, "test-system-prompt".to_string(), sandbox)
+            .await
     }
 
     #[tokio::test]
@@ -867,6 +904,50 @@ mod tests {
         assert!(scope.shared_zones().is_empty());
         // Critical for propagation: scope.workspace() == workspace_root.
         assert_eq!(scope.workspace(), rt.workspace_root.as_path());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_explicit_sandbox_overrides_are_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile_with_sandbox(
+            data_dir,
+            SandboxConfig {
+                allow_network: true,
+                ..SandboxConfig::default()
+            },
+        )
+        .await;
+
+        let gamma_sandbox = SandboxConfig {
+            allow_network: false,
+            ..profile.default_sandbox.clone()
+        };
+
+        let gamma = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+            &profile,
+            SessionKey::new("api", "gamma"),
+            Some(tmp.path().join("gamma")),
+            EffectivePermissions::workspace_write(),
+            Some(gamma_sandbox),
+        )
+        .await
+        .expect("gamma bootstrap");
+        let delta = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+            &profile,
+            SessionKey::new("api", "delta"),
+            Some(tmp.path().join("delta")),
+            EffectivePermissions::workspace_write(),
+            None,
+        )
+        .await
+        .expect("delta bootstrap");
+
+        assert!(profile.default_sandbox.allow_network);
+        assert!(!gamma.sandbox.allow_network);
+        assert!(delta.sandbox.allow_network);
+        assert_ne!(gamma.workspace_root, delta.workspace_root);
+        assert!(!Arc::ptr_eq(&gamma.tools, &delta.tools));
     }
 
     #[tokio::test]

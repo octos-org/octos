@@ -106,6 +106,9 @@ pub const UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1: &str = "pane.snapshots.v1";
 /// Feature flag for UPCR-2026-003 per-session workspace cwd requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
 
+/// Feature flag for UPCR-2026-022 per-session sandbox narrowing requests.
+pub const UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1: &str = "session.sandbox.v1";
+
 /// Feature flag for harness task registry/control commands.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1: &str = "harness.task_control.v1";
 
@@ -246,6 +249,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
     UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
@@ -1345,6 +1349,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+            UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
@@ -1693,8 +1698,25 @@ pub struct SessionOpenParams {
     pub profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SessionSandboxParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<UiCursor>,
+}
+
+/// Optional session-scoped sandbox narrowing requested by `session/open`.
+///
+/// The server validates this object against the profile-derived sandbox before
+/// constructing the session runtime. Requests may keep or narrow the inherited
+/// policy; they must not widen network, filesystem, or sandbox isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSandboxParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_allow_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6113,6 +6135,7 @@ mod tests {
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(capabilities.supports_method(methods::TASK_LIST));
@@ -6150,6 +6173,7 @@ mod tests {
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
     }
@@ -6170,18 +6194,26 @@ mod tests {
     }
 
     #[test]
-    fn session_open_params_topic_and_cwd_are_additive_and_round_trip() {
+    fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
         let params = SessionOpenParams {
             session_id: SessionKey("local:demo".into()),
             topic: Some("research".into()),
             profile_id: Some("coding".into()),
             cwd: Some("/repo".into()),
+            sandbox: Some(SessionSandboxParams {
+                enabled: Some(true),
+                network_access: Some(false),
+                read_allow_paths: vec!["/repo/docs".into()],
+            }),
             after: None,
         };
 
         let wire = serde_json::to_value(&params).expect("serialize session/open params");
         assert_eq!(wire["topic"], json!("research"));
         assert_eq!(wire["cwd"], json!("/repo"));
+        assert_eq!(wire["sandbox"]["enabled"], json!(true));
+        assert_eq!(wire["sandbox"]["network_access"], json!(false));
+        assert_eq!(wire["sandbox"]["read_allow_paths"], json!(["/repo/docs"]));
 
         let decoded: SessionOpenParams =
             serde_json::from_value(wire).expect("deserialize session/open params");
@@ -6195,6 +6227,7 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy session/open params");
         assert!(decoded_legacy.topic.is_none());
         assert!(decoded_legacy.cwd.is_none());
+        assert!(decoded_legacy.sandbox.is_none());
     }
 
     #[test]
@@ -6778,6 +6811,7 @@ mod tests {
                     "approval.typed.v1",
                     "pane.snapshots.v1",
                     "session.workspace_cwd.v1",
+                    "session.sandbox.v1",
                     "harness.task_control.v1",
                     "state.session_hydrate.v1",
                     "state.thread_graph.v1",
