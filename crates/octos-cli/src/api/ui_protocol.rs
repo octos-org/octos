@@ -13055,6 +13055,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            // C1 step 4: stamp the originating turn.
+                            turn_id: Some(turn_id.clone()),
                         }),
                     );
                     let _ = send_notification_durable(
@@ -13084,6 +13086,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            // C1 step 4: stamp the originating turn.
+                            turn_id: Some(turn_id.clone()),
                         }),
                     );
                     if m9_fixture_delay_or_interrupt(
@@ -14058,6 +14062,8 @@ async fn run_native_code_review_turn(
             summary: Some("Launching native code review specialists".to_owned()),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     let _ = send_notification_durable(
@@ -14212,6 +14218,8 @@ async fn run_native_code_review_turn(
                         summary: Some("Code review interrupted".to_owned()),
                         artifact_count: Some(0),
                         runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+                        // C1 step 4: stamp the originating turn.
+                        turn_id: Some(turn_id.clone()),
                     }),
                 );
                 try_emit_terminal(
@@ -14330,6 +14338,8 @@ async fn run_native_code_review_turn(
             )),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     try_emit_terminal(
@@ -14820,6 +14830,8 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     let _ = send_notification_durable(
@@ -14958,6 +14970,8 @@ async fn run_m15_live_subagent_fixture_turn(
                         summary: None,
                         artifact_count: None,
                         runtime_policy_stamp: None,
+                        // C1 step 4: stamp the originating turn.
+                        turn_id: Some(turn_id.clone()),
                     }),
                 );
                 return M9FixtureOutcome::Interrupted;
@@ -15055,6 +15069,8 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     append_appui_evidence_jsonl(
