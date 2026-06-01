@@ -26,7 +26,7 @@ use crate::prompt_context::PromptContextManager;
 use crate::role_template::RoleTemplate;
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
-use crate::task_supervisor::TaskSupervisor;
+use crate::task_supervisor::{TaskSupervisor, TaskTerminalGuard};
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
@@ -2803,10 +2803,18 @@ impl Tool for SpawnTool {
             let child_session_scope = ctx.session_scope.clone();
 
             tokio::spawn(async move {
+                // C1 step 2: arm a RAII terminal guard right after
+                // mark_running so an aborted/panicked child body does not
+                // leave the task stuck Running (TUI count never decrements).
+                // Idempotent on the normal terminal arms below; Drop no-ops
+                // once the body marked the task terminal itself.
+                let mut _terminal_guard: Option<TaskTerminalGuard> = None;
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
                     supervisor.mark_running(task_id);
+                    _terminal_guard =
+                        Some(TaskTerminalGuard::new(supervisor.clone(), task_id.clone()));
                     if let Some(workflow) = workflow_metadata.as_ref() {
                         // Seed `runtime_detail.progress` with a small non-null
                         // value at workflow start. Without this, dashboards

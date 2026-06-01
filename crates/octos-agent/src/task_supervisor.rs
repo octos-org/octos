@@ -2749,6 +2749,59 @@ impl TaskSupervisor {
         tasks.values().filter(|t| t.status.is_active()).count()
     }
 }
+
+/// RAII guard that drives a background task to a terminal state if its
+/// owning worker body is dropped (panicked, aborted, or torn down with the
+/// runtime) before reaching its own terminal `mark_*` arm.
+///
+/// C1 step 2: a background `tokio::spawn` body that panics or is cancelled
+/// after `mark_running` but before its `mark_completed`/`mark_failed` arm
+/// would otherwise leave the task `Running` forever — the TUI task count
+/// never decrements and the chip stays "Orchestrating".
+///
+/// Construct the guard at the top of each background body right after
+/// `mark_running`. No explicit disarm is needed: on normal completion the
+/// body's own `mark_*` arm has already moved the task terminal, so by the
+/// time `Drop` runs the task is no longer `is_active()` and the guard's
+/// `mark_failed` is a no-op (the terminal guards inside `mark_failed` /
+/// `mark_completed` make this idempotent).
+pub struct TaskTerminalGuard {
+    supervisor: Arc<TaskSupervisor>,
+    task_id: String,
+}
+
+impl TaskTerminalGuard {
+    /// Arm a guard for `task_id` on `supervisor`.
+    pub fn new(supervisor: Arc<TaskSupervisor>, task_id: String) -> Self {
+        Self {
+            supervisor,
+            task_id,
+        }
+    }
+}
+
+impl Drop for TaskTerminalGuard {
+    fn drop(&mut self) {
+        // Only fire if the task is still active. For already-terminal tasks
+        // this lookup short-circuits and we leave the recorded outcome
+        // (Completed/Failed/Cancelled) untouched — and even if we raced and
+        // called `mark_failed` anyway, the supervisor's terminal guard would
+        // no-op it. The active-check keeps the common (success) path from
+        // touching the lock twice and avoids a spurious failure-signal fire.
+        let still_active = self
+            .supervisor
+            .get_task(&self.task_id)
+            .map(|task| task.status.is_active())
+            .unwrap_or(false);
+        if still_active {
+            self.supervisor.mark_failed(
+                &self.task_id,
+                "worker dropped before reaching terminal state".to_string(),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5734,6 +5787,88 @@ mod tests {
         assert!(
             observed.lock().unwrap().is_empty(),
             "on_change installed AFTER enable_persistence must NOT observe the sweep's transition",
+        );
+    }
+
+    /// STEP 2: a guard armed after `mark_running` and dropped WITHOUT a
+    /// terminal call drives the task to `Failed` with the dropped-worker
+    /// reason.
+    #[test]
+    fn terminal_guard_marks_failed_when_dropped_while_active() {
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("mofa_slides", "call-guard", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        {
+            let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+            // No terminal call inside the scope — simulate an aborted body.
+        }
+
+        let task = supervisor.get_task(&id).expect("task");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.error.as_deref(),
+            Some("worker dropped before reaching terminal state"),
+        );
+    }
+
+    /// STEP 2: a guard whose body reached `mark_completed` before drop must
+    /// leave the task `Completed` — the Drop is a no-op for terminal tasks.
+    #[test]
+    fn terminal_guard_noop_when_task_already_completed() {
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("mofa_slides", "call-guard2", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        {
+            let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+            supervisor.mark_completed(&id, vec!["deck.pdf".to_string()]);
+        }
+
+        let task = supervisor.get_task(&id).expect("task");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "guard Drop must not overwrite a completed task",
+        );
+        assert!(task.error.is_none());
+    }
+
+    /// STEP 2: a `tokio::spawn` body that `panic!`s after `mark_running`
+    /// (with the guard armed) leaves the supervisor in `Failed` once the
+    /// JoinHandle resolves with the panic. Mirrors the production spawn body
+    /// shape where the guard is the first thing constructed.
+    #[tokio::test]
+    async fn terminal_guard_marks_failed_when_body_panics() {
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("mofa_slides", "call-guard-panic", Some("api:session"));
+
+        let sup = Arc::clone(&supervisor);
+        let task_id = id.clone();
+        let handle = tokio::spawn(async move {
+            sup.mark_running(&task_id);
+            let _guard = TaskTerminalGuard::new(Arc::clone(&sup), task_id.clone());
+            panic!("simulated worker panic after mark_running");
+        });
+
+        let join = handle.await;
+        assert!(join.is_err(), "spawned body should have panicked");
+
+        let task = supervisor.get_task(&id).expect("task");
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "guard Drop on panic-unwind must drive the task to Failed",
+        );
+        assert_eq!(
+            task.error.as_deref(),
+            Some("worker dropped before reaching terminal state"),
         );
     }
 }

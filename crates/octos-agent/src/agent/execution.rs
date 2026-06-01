@@ -36,7 +36,7 @@ use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
-use crate::task_supervisor::TaskRuntimeState;
+use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 use crate::workspace_contract::{
@@ -527,6 +527,15 @@ impl Agent {
                 let task_id_for_handle = task_id.clone();
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
+                    // C1 step 2: arm a RAII terminal guard right after
+                    // mark_running. If this body panics or is aborted before
+                    // one of its mark_completed/mark_failed arms runs, the
+                    // guard's Drop drives the task to Failed so the TUI task
+                    // count decrements instead of hanging on "N running".
+                    // Idempotent on normal completion (the body's own
+                    // terminal mark wins; Drop then no-ops).
+                    let _terminal_guard =
+                        TaskTerminalGuard::new(bg_supervisor.clone(), task_id.clone());
                     // M8.7 (item 4): start a periodic-summary watcher for
                     // this background task. The watcher honours
                     // `min_runtime` so short tasks never trigger an LLM
