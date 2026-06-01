@@ -266,6 +266,7 @@ function taskSubagentFixtureEnv(scenario, workdir) {
 function backendFixtureEnv(scenario, workdir) {
   return {
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
+    OCTOS_SOLO_LOGIN: '1',
     DEEPSEEK_API_KEY: 'dummy-key-for-ux-tmux',
     ...taskSubagentFixtureEnv(scenario, workdir),
   };
@@ -273,6 +274,12 @@ function backendFixtureEnv(scenario, workdir) {
 
 function shellEnvAssignments(env) {
   return Object.entries(env).map(([name, value]) => `${name}=${shellQuote(value)}`);
+}
+
+function soloServeArgs(raw) {
+  const text = String(raw || '').trim();
+  if (/(^|\s)--solo($|\s)/.test(text)) return text;
+  return `${text} --solo`.trim();
 }
 
 function isExecutable(file) {
@@ -902,7 +909,9 @@ function runLowerRunner(ctx) {
       || (ctx.scenario.transport === 'websocket' ? '4' : '1'),
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
+    OCTOS_TUI_SOAK_SERVE_ARGS: soloServeArgs(process.env.OCTOS_TUI_SOAK_SERVE_ARGS),
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
+    OCTOS_SOLO_LOGIN: '1',
     ...ctx.fixtureEnv,
   };
 
