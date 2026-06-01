@@ -273,16 +273,34 @@ function taskSubagentFixtureEnv(scenario, workdir) {
   };
 }
 
+function scenarioRequiresSoloServe(scenario) {
+  return scenario.runner === 'onboarding-solo';
+}
+
 function backendFixtureEnv(scenario, workdir) {
   return {
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
     DEEPSEEK_API_KEY: 'dummy-key-for-ux-tmux',
+    ...(scenarioRequiresSoloServe(scenario) ? { OCTOS_SOLO_LOGIN: '1' } : {}),
     ...taskSubagentFixtureEnv(scenario, workdir),
   };
 }
 
 function shellEnvAssignments(env) {
   return Object.entries(env).map(([name, value]) => `${name}=${shellQuote(value)}`);
+}
+
+function ensureServeArg(rawArgs, requiredArg) {
+  const args = String(rawArgs || '').trim();
+  if (!args) return requiredArg;
+  if (args.split(/\s+/).includes(requiredArg)) return args;
+  return `${args} ${requiredArg}`;
+}
+
+function lowerRunnerServeArgs(scenario) {
+  const existing = process.env.OCTOS_TUI_SOAK_SERVE_ARGS || '';
+  if (!scenarioRequiresSoloServe(scenario)) return existing.trim();
+  return ensureServeArg(existing, '--solo');
 }
 
 function isExecutable(file) {
@@ -370,6 +388,7 @@ function resolveContext({ scenarioId, selfTest }) {
     process.env.OCTOS_UX_TMUX_SESSION || `octos-ux-${safeSlug(runId)}-${safeSlug(scenario.id)}`;
   const fixtureEnv = taskSubagentFixtureEnv(scenario, workdir);
   const backendEnv = backendFixtureEnv(scenario, workdir);
+  const backendServeArgs = scenarioRequiresSoloServe(scenario) ? ['--solo'] : [];
   const backendCommand =
     process.env.OCTOS_UX_TMUX_BACKEND_COMMAND
     || [
@@ -378,6 +397,7 @@ function resolveContext({ scenarioId, selfTest }) {
       shellQuote(octosBin),
       'serve',
       '--stdio',
+      ...backendServeArgs,
       '--data-dir',
       shellQuote(dataDir),
       '--cwd',
@@ -937,6 +957,7 @@ function runLowerRunner(ctx, options = {}) {
     OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
     OCTOS_TUI_SOAK_REQUIRE_PROFILE: '0',
     OCTOS_TUI_SOAK_SOLO_STRICT: process.env.OCTOS_TUI_SOAK_SOLO_STRICT || '0',
+    OCTOS_TUI_SOAK_SERVE_ARGS: lowerRunnerServeArgs(ctx.scenario),
     OCTOS_TUI_SOAK_SERVER_WAIT_SECS:
       process.env.OCTOS_TUI_SOAK_SERVER_WAIT_SECS
       || (ctx.scenario.transport === 'websocket' ? '4' : '1'),

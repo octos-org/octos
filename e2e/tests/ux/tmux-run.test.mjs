@@ -98,3 +98,12 @@ test('dry-run can skip automatic validation', () => {
   assert.equal(summary.validation_skipped, true);
   assert.equal(existsSync(join(outDir, 'validation.json')), false);
 });
+
+test('stdio onboarding launch opts into local solo mode', () => {
+  const { env, outDir } = makeEnv('ux-run-test-solo-opt-in');
+  run(['stdio-happy-path', '--dry-run', '--no-validate'], env);
+
+  const launchCommand = readFileSync(join(outDir, 'launch-command.txt'), 'utf8');
+  assert.match(launchCommand, /OCTOS_SOLO_LOGIN=/);
+  assert.match(launchCommand, /\bserve --stdio --solo\b/);
+});
