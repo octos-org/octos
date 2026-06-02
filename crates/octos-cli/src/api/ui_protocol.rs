@@ -16262,6 +16262,25 @@ async fn run_standalone_turn(
                 Some(change_profile_id.as_str()),
             );
         });
+        // Gap-1 unification: the single terminal sink. Routes BOTH success
+        // (ChildCompleted) AND failure (recovery) re-entry through ONE
+        // profile-resolving call into the master continuation queue. Runs
+        // alongside the legacy `set_on_change` (success) and
+        // `set_on_failure_signal` (failure) wiring during the strangler
+        // migration — shared dedupe keys collapse the double delivery to one
+        // continuation. The threaded `terminal_profile_id` (mirrors
+        // `change_profile_id` / `failure_profile_id`) kills the `_main`
+        // failure-stranding by construction.
+        let terminal_profile_id = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        task_supervisor.set_on_terminal(move |event| {
+            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+                event,
+                Some(terminal_profile_id.as_str()),
+            );
+        });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
             warn!(
                 session_id = %session_id.0,
@@ -30260,6 +30279,237 @@ ignore = []
         assert!(
             prompt.contains("[system-internal]"),
             "autonomous re-entry prompt must be framed system-internal; got: {prompt}",
+        );
+    }
+
+    // ====================================================================
+    // Gap-1 unification: parity contract over the SINGLE terminal sink
+    // (`route_terminal_event_to_continuation_queue`). The same consumer fn
+    // is wired via `set_on_terminal` in every runtime mode (WS, gateway,
+    // headless drain), so driving it directly proves the cross-mode parity:
+    // exactly one continuation, correct reason, enqueued under the resolved
+    // runtime profile (ZERO under `_main`), idempotent under repeated
+    // terminal marks, recovery prompt body unchanged for failure-with-ack.
+    // ====================================================================
+
+    /// Build a production-shaped spawn_only `BackgroundTask` for the matrix.
+    fn unified_terminal_test_task(
+        id: &str,
+        session: &SessionKey,
+        tool_call_id: &str,
+        status: octos_agent::TaskStatus,
+        error: Option<&str>,
+    ) -> octos_agent::BackgroundTask {
+        let now = chrono::Utc::now();
+        let runtime_state = match status {
+            octos_agent::TaskStatus::Completed => octos_agent::TaskRuntimeState::Completed,
+            octos_agent::TaskStatus::Failed => octos_agent::TaskRuntimeState::Failed,
+            octos_agent::TaskStatus::Cancelled => octos_agent::TaskRuntimeState::Cancelled,
+            _ => octos_agent::TaskRuntimeState::ExecutingTool,
+        };
+        octos_agent::BackgroundTask {
+            id: id.into(),
+            tool_name: "mofa_slides".into(),
+            tool_call_id: tool_call_id.into(),
+            parent_session_key: Some(session.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status,
+            runtime_state,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec![],
+            error: error.map(str::to_owned),
+            session_key: Some(session.to_string()),
+            tool_input: Some(serde_json::json!({"topic": "rust"})),
+            originating_client_message_id: Some("cmid-unified".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        }
+    }
+
+    /// failure-WITH-ack across the unified sink: exactly one recovery
+    /// continuation under the resolved profile (ZERO under `_main`), the
+    /// recovery prompt body unchanged, idempotent under repeated marks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() {
+        let session_id = SessionKey("web:tester#unified-fail-ack".to_owned());
+        let profile_id = "test-unified-fail-ack";
+
+        let task = unified_terminal_test_task(
+            "01900000-0000-7000-8000-0000000fa001",
+            &session_id,
+            "call-unified-ack",
+            octos_agent::TaskStatus::Failed,
+            Some("plugin exited 137 (sigkill). available: a, b, c"),
+        );
+        let event = octos_agent::TerminalEvent {
+            task: task.clone(),
+            synth_ack_emitted: true,
+            outcome: octos_agent::TerminalOutcome::Failed(octos_agent::SpawnOnlyFailureSignal {
+                task_id: task.id.clone(),
+                tool_name: task.tool_name.clone(),
+                tool_input: task.tool_input.clone().unwrap(),
+                error_message: task.error.clone().unwrap(),
+                suggested_alternatives: vec!["a".into(), "b".into(), "c".into()],
+                parent_session_key: task.parent_session_key.clone(),
+                originating_client_message_id: task.originating_client_message_id.clone(),
+            }),
+        };
+
+        // Drive the unified sink twice — idempotent collapse via dedupe key.
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+        );
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+        );
+
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, profile_id),
+            1,
+            "failure-with-ack must enqueue exactly one recovery continuation (idempotent)",
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "no recovery continuation may be stranded under '_main'",
+        );
+
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            profile_id,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "exactly one continuation drains");
+        assert!(matches!(
+            drained[0].reason,
+            MasterContinuationReason::External(ref kind)
+                if kind == crate::api::agent_orchestrator::SPAWN_ONLY_FAILURE_EXTERNAL_KIND
+        ));
+        let prompt = master_continuation_prompt(&drained[0]);
+        assert!(
+            prompt.contains("[system-internal]")
+                && prompt.contains("mofa_slides")
+                && prompt.contains("plugin exited 137"),
+            "recovery prompt body must be unchanged (system-internal + tool + error); got: {prompt}",
+        );
+    }
+
+    /// failure-WITHOUT-ack: the unified sink suppresses the recovery turn at
+    /// PROMPT SELECTION (matching the documented sibling-error / pre-flight
+    /// skip cases) — ZERO continuations anywhere.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_terminal_sink_failure_without_ack_suppresses_recovery() {
+        let session_id = SessionKey("web:tester#unified-fail-noack".to_owned());
+        let profile_id = "test-unified-fail-noack";
+
+        let task = unified_terminal_test_task(
+            "01900000-0000-7000-8000-0000000fa002",
+            &session_id,
+            "call-unified-noack",
+            octos_agent::TaskStatus::Failed,
+            Some("sibling tool already errored"),
+        );
+        let event = octos_agent::TerminalEvent {
+            task: task.clone(),
+            synth_ack_emitted: false,
+            outcome: octos_agent::TerminalOutcome::Failed(octos_agent::SpawnOnlyFailureSignal {
+                task_id: task.id.clone(),
+                tool_name: task.tool_name.clone(),
+                tool_input: task.tool_input.clone().unwrap(),
+                error_message: task.error.clone().unwrap(),
+                suggested_alternatives: vec![],
+                parent_session_key: task.parent_session_key.clone(),
+                originating_client_message_id: None,
+            }),
+        };
+
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+        );
+
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, profile_id),
+            0,
+            "failure-without-ack must be suppressed at prompt selection (no recovery turn)",
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "and nothing stranded under '_main' either",
+        );
+    }
+
+    /// success across the unified sink: exactly one autonomous
+    /// `ChildCompleted` re-entry under the resolved profile (ZERO under
+    /// `_main`), idempotent under repeated terminal marks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_terminal_sink_success_queues_child_completed_under_profile() {
+        let session_id = SessionKey("web:tester#unified-success".to_owned());
+        let profile_id = "test-unified-success";
+
+        let task = unified_terminal_test_task(
+            "01900000-0000-7000-8000-0000000fa003",
+            &session_id,
+            String::new().as_str(),
+            octos_agent::TaskStatus::Completed,
+            None,
+        );
+        let event = octos_agent::TerminalEvent {
+            task,
+            synth_ack_emitted: false,
+            outcome: octos_agent::TerminalOutcome::Completed,
+        };
+
+        // Idempotent: two terminal marks collapse to one continuation.
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+        );
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+        );
+
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            profile_id,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let child_completed = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .count();
+        assert_eq!(
+            child_completed,
+            1,
+            "success must enqueue exactly one ChildCompleted re-entry (idempotent); got drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "no ChildCompleted may be stranded under '_main'",
         );
     }
 

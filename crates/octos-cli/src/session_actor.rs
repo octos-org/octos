@@ -2960,6 +2960,21 @@ impl ActorFactory {
         supervisor.set_on_change(move |task| {
             forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
         });
+        // Gap-1 unification: the single terminal sink, also wired BEFORE
+        // `enable_persistence` (see the combined ordering note above). Routes
+        // BOTH success (ChildCompleted) AND failure (recovery) re-entry
+        // through ONE profile-resolving call into the master continuation
+        // queue. Runs alongside the legacy gateway wiring (the `on_change` →
+        // `upsert_background_task_agent` success path and the
+        // `set_on_failure_signal` → `RecoveryHint` failure path) during the
+        // strangler migration; shared dedupe keys collapse double delivery.
+        // Gateway session keys carry the profile (`profile:channel:chat`), so
+        // `None` lets the key-derived profile resolve inside the router —
+        // matching `forward_task_status_to_actor_inbox`'s `None` call.
+        #[cfg(feature = "api")]
+        supervisor.set_on_terminal(move |event| {
+            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(event, None);
+        });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(
                 session = %session_key,

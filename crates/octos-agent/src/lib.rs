@@ -148,7 +148,7 @@ pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
     TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
-    TaskSupervisor, parse_alternatives,
+    TaskSupervisor, TerminalEvent, TerminalOutcome, parse_alternatives,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
