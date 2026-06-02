@@ -3649,6 +3649,20 @@ fn enqueue_agent_terminal_continuations(
         SystemTime::now(),
     )
     .with_child_agent_id(agent.agent_id.clone())
+    // Gap-1 step 3: explicit success dedupe key, symmetric to the failure
+    // key `external/<kind>/<session>/<task_id>`. Keyed ONLY on stable
+    // identity (group + session + agent_id) so repeated terminal marks of
+    // the same agent (live + cascade + orphan-sweep, AND the strangler's
+    // legacy on_change + unified on_terminal double-delivery) collapse to
+    // one ChildCompleted continuation via `pending_by_key` — independent of
+    // metadata drift (status/summary/nickname/role), which the auto-derived
+    // `stable_dedupe_key` would otherwise fold into the key and split into
+    // distinct entries.
+    .with_dedupe_key(child_completed_dedupe_key(
+        &group_id,
+        &agent.session_id.0,
+        &agent.agent_id,
+    ))
     .with_metadata("status", agent.status.clone())
     .with_metadata("nickname", agent.nickname.clone())
     .with_metadata("role", agent.role.clone());
@@ -3674,6 +3688,13 @@ fn enqueue_agent_terminal_continuations(
     {
         return;
     }
+    // NOTE: the `ScatterJoinComplete` continuation deliberately keeps the
+    // auto-derived `stable_dedupe_key` (which folds in the
+    // `terminal_children` count). The join only enqueues on the
+    // all-siblings-terminal edge, and a re-expanded group that finishes
+    // again SHOULD be able to re-join — so an identity-only key would be a
+    // behavior change here. Only the per-child `ChildCompleted` gets the
+    // explicit Gap-1 step-3 key.
     let scatter = MasterContinuationRequest::new(
         group_id,
         agent.session_id.to_string(),
@@ -3690,6 +3711,15 @@ fn enqueue_agent_terminal_continuations(
     )
     .with_metadata("terminal_children", siblings.len().to_string());
     enqueue_and_persist_continuation(state, scatter);
+}
+
+/// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
+/// failure key `external/<kind>/<session>/<task_id>`. Keyed on stable
+/// identity only (group + session + agent_id) so metadata drift
+/// (status/summary/nickname/role) never splits the dedupe across the
+/// strangler double-delivery or repeated terminal marks.
+fn child_completed_dedupe_key(group_id: &str, session_id: &str, agent_id: &str) -> String {
+    format!("child/{group_id}/{session_id}/{agent_id}")
 }
 
 fn agent_continuation_group_id(agent: &AutonomyAgentRecord) -> String {
@@ -6488,6 +6518,68 @@ mod tests {
                 MasterContinuationReason::ChildCompleted,
                 MasterContinuationReason::ScatterJoinComplete
             ]
+        );
+    }
+
+    /// Gap-1 step 3: the explicit `child/<group>/<session>/<agent_id>`
+    /// dedupe key collapses repeated terminal enqueues of the SAME agent —
+    /// even when the terminal status (and thus the auto-derived key's
+    /// metadata) drifts between marks (e.g. a cascade re-mark flips
+    /// completed→failed). The auto key would split these into two distinct
+    /// `ChildCompleted` continuations; the explicit identity-only key
+    /// collapses them to one.
+    #[test]
+    fn child_completed_dedupe_key_collapses_terminal_status_drift() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-step3", "api", "dedupe-drift");
+        let agent_id = "task-step3-drift".to_owned();
+
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "step3".to_owned(),
+            backend_kind: "task_supervisor:run_pipeline".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-step3".to_owned(),
+        };
+
+        // First terminal transition (completed) enqueues ChildCompleted.
+        orchestrator.upsert_agent(upsert("completed"));
+        // A terminal-status CHANGE (completed → failed) would re-enqueue a
+        // ChildCompleted under the auto key (different `status`/`summary`
+        // metadata). The explicit identity key must collapse it.
+        orchestrator.upsert_agent(upsert("failed"));
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-step3",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let child_completed = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .count();
+        assert_eq!(
+            child_completed,
+            1,
+            "explicit dedupe key must collapse terminal-status drift to one ChildCompleted; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn child_completed_dedupe_key_is_identity_only() {
+        // Symmetric to the failure key `external/<kind>/<session>/<task>`.
+        assert_eq!(
+            child_completed_dedupe_key("agent-group:p:s:master", "p:api:s", "task-x"),
+            "child/agent-group:p:s:master/p:api:s/task-x",
         );
     }
 
