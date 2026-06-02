@@ -1131,6 +1131,24 @@ impl Config {
 
     /// Get the API key: auth store first, then environment variable.
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
+        // Resolve the env var name we expect to hold this provider's key, and
+        // mark it as a secret FIRST — before any early return — so the
+        // configured key var is stripped from the default subprocess
+        // environment regardless of which resolution path (auth store /
+        // env_vars / keychain / process env) actually wins below. This also
+        // covers a custom `api_key_env` whose NAME does not look secret to the
+        // heuristic, so it can't be `echo`'d from the shell tool. Registered
+        // names are still allowlistable: a tool that declares the var in its
+        // manifest `env` list may receive it (the sanctioned path for skills
+        // that call LLMs). See `octos_agent::subprocess_env`.
+        let env_var = self.api_key_env.clone().unwrap_or_else(|| {
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
+        });
+        octos_agent::register_secret_env_names([env_var.as_str()]);
+
         // Check auth store first.
         if let Ok(store) = crate::auth::AuthStore::load() {
             if let Some(cred) = store.get(provider) {
@@ -1139,14 +1157,6 @@ impl Config {
                 }
             }
         }
-
-        // Resolve the env var name we expect to hold this provider's key.
-        let env_var = self.api_key_env.clone().unwrap_or_else(|| {
-            octos_llm::registry::lookup(provider)
-                .and_then(|e| e.api_key_env)
-                .map(String::from)
-                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
-        });
 
         if let Some(value) = self.env_vars.get(&env_var).and_then(|value| {
             crate::auth::keychain::resolve_value(&env_var, value).filter(|value| !value.is_empty())
