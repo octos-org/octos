@@ -9854,15 +9854,19 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // `drain_appui_due_master_continuations`) so we can gate each
             // target on a known workspace.
             //
-            // codex P2 (re-review): pull a generous candidate WINDOW rather than
-            // the per-tick spawn limit, then cap how many we actually SPAWN.
-            // Deferred (workspace-unknown) targets must NOT consume the spawn
-            // budget — otherwise a batch of `DRAIN_SPAWN_CAP` workspace-unknown
-            // sessions at the head of the queue could be returned every tick and
-            // starve runnable continuations queued behind them.
-            const DRAIN_CANDIDATE_WINDOW: usize = 64;
+            // codex P2 (round 3): scan ALL due targets, not a fixed window.
+            // `due_loop_targets` applies its limit BEFORE we can apply the
+            // workspace gate, so any fixed window can be entirely filled by
+            // deferred (workspace-unknown) targets at the head of the queue
+            // (e.g. after a restart reloads many persisted continuations for
+            // not-yet-reopened sessions) — starving runnable continuations
+            // behind them forever. Requesting every due target means deferred
+            // entries can never hide a runnable one; the spawn CAP (not the
+            // scan) bounds per-tick work. The due set is bounded by real
+            // autonomy state (due loops/goals/pending continuations), so a
+            // full in-memory scan every few seconds is cheap.
             const DRAIN_SPAWN_CAP: usize = 8;
-            let due = default_agent_orchestrator().due_loop_targets(None, DRAIN_CANDIDATE_WINDOW);
+            let due = default_agent_orchestrator().due_loop_targets(None, usize::MAX);
             let mut advanced = 0usize;
             let mut deferred = 0usize;
             for (session_id, profile_id) in due {
