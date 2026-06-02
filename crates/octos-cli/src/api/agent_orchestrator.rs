@@ -1151,6 +1151,24 @@ impl InProcessAgentOrchestrator {
         profile_filter: Option<&str>,
         max_items: usize,
     ) -> Vec<(SessionKey, String)> {
+        self.due_loop_targets_with_filter(profile_filter, max_items, None)
+    }
+
+    /// Like [`Self::due_loop_targets`] but only counts a target toward
+    /// `max_items` when `runnable(session)` is true. The connection-independent
+    /// global drain passes a "workspace is known in-memory" predicate so it can
+    /// use a small `max_items` (bounded result + bounded allocation) yet never
+    /// let deferred (workspace-unknown) sessions at the head of the queue starve
+    /// runnable continuations behind them: the filter is applied BEFORE the
+    /// limit, so non-runnable candidates are skipped without consuming a slot.
+    /// (codex review of e1f611f4: filter-before-limit, replacing an unbounded
+    /// `usize::MAX` scan that materialized the whole due set every tick.)
+    pub(crate) fn due_loop_targets_with_filter(
+        &self,
+        profile_filter: Option<&str>,
+        max_items: usize,
+        runnable: Option<&dyn Fn(&SessionKey) -> bool>,
+    ) -> Vec<(SessionKey, String)> {
         if max_items == 0 {
             return Vec::new();
         }
@@ -1183,6 +1201,9 @@ impl InProcessAgentOrchestrator {
                 loop_record.session_id.clone(),
                 loop_record.profile_id.clone(),
             );
+            if runnable.is_some_and(|is_runnable| !is_runnable(&target.0)) {
+                continue;
+            }
             if !targets.contains(&target) {
                 targets.push(target);
                 if targets.len() >= max_items {
@@ -1222,6 +1243,9 @@ impl InProcessAgentOrchestrator {
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
                     continue;
                 }
+                if runnable.is_some_and(|is_runnable| !is_runnable(session_id)) {
+                    continue;
+                }
                 let target = (session_id.clone(), goal.profile_id.clone());
                 if !targets.contains(&target) {
                     targets.push(target);
@@ -1257,6 +1281,9 @@ impl InProcessAgentOrchestrator {
                     continue;
                 }
                 let session_key = SessionKey(item.session_id.as_str().to_owned());
+                if runnable.is_some_and(|is_runnable| !is_runnable(&session_key)) {
+                    continue;
+                }
                 if seen_sessions.insert(session_key.clone()) {
                     targets.push((session_key, item.profile_id.as_str().to_owned()));
                     if targets.len() >= max_items {
@@ -6473,6 +6500,45 @@ mod tests {
                 .iter()
                 .any(|(session, profile)| *session == session_id && profile == "coding"),
             "the connection-independent (None) sweep must surface the queued continuation, got {unscoped:?}"
+        );
+    }
+
+    /// codex e1f611f4 re-review (filter-before-limit): the global drain's
+    /// workspace gate is applied INSIDE `due_loop_targets_with_filter` BEFORE
+    /// the `max_items` limit, so a non-runnable (deferred / workspace-unknown)
+    /// session can never consume a result slot and starve a runnable one behind
+    /// it — even at `max_items == 1`. This replaces the unbounded `usize::MAX`
+    /// scan with a bounded result + no starvation.
+    #[test]
+    fn filtered_due_loop_targets_skips_non_runnable_before_the_limit() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let deferred = SessionKey("gap1-deferred-no-workspace".into());
+        let runnable = SessionKey("gap1-runnable-has-workspace".into());
+        for (session, agent_id) in [(&deferred, "child-d"), (&runnable, "child-r")] {
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.to_string(),
+                parent_agent_id: Some("master".into()),
+                session_id: session.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "worker".into(),
+                nickname: "w".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("done".into()),
+                cwd: None,
+                profile_id: "coding".into(),
+            });
+        }
+
+        // Only `runnable` passes the predicate; `deferred` must be skipped
+        // WITHOUT consuming the single slot.
+        let is_runnable = |session: &SessionKey| *session == runnable;
+        let targets = orchestrator.due_loop_targets_with_filter(None, 1, Some(&is_runnable));
+        assert_eq!(
+            targets,
+            vec![(runnable.clone(), "coding".to_owned())],
+            "the non-runnable session must be dropped before the limit so the runnable one is not starved, got {targets:?}"
         );
     }
 

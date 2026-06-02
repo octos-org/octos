@@ -9854,38 +9854,30 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // `drain_appui_due_master_continuations`) so we can gate each
             // target on a known workspace.
             //
-            // codex P2 (round 3): scan ALL due targets, not a fixed window.
-            // `due_loop_targets` applies its limit BEFORE we can apply the
-            // workspace gate, so any fixed window can be entirely filled by
-            // deferred (workspace-unknown) targets at the head of the queue
-            // (e.g. after a restart reloads many persisted continuations for
-            // not-yet-reopened sessions) — starving runnable continuations
-            // behind them forever. Requesting every due target means deferred
-            // entries can never hide a runnable one; the spawn CAP (not the
-            // scan) bounds per-tick work. The due set is bounded by real
-            // autonomy state (due loops/goals/pending continuations), so a
-            // full in-memory scan every few seconds is cheap.
+            // codex P1 + P2 (rounds 2-4): only run a headless turn for a session
+            // whose workspace is already established in-memory (opened this
+            // process run). A continuation rehydrated across a serve restart has
+            // no `session_workspaces()` entry yet; running it blind would
+            // bootstrap the profile-default workspace and could run tools in the
+            // wrong repo for a custom-cwd session — so such targets must be
+            // deferred to reconnect (session/open repopulates the workspace).
+            //
+            // The gate is pushed INTO `due_loop_targets_with_filter` so it is
+            // applied BEFORE the `max_items` limit: a bounded `DRAIN_SPAWN_CAP`
+            // window returns up to N *runnable* targets (bounded result +
+            // allocation), and deferred (workspace-unknown) sessions at the head
+            // of the queue can neither fill the window (starving runnable ones)
+            // nor force an unbounded per-tick scan/allocation under the
+            // orchestrator mutex.
             const DRAIN_SPAWN_CAP: usize = 8;
-            let due = default_agent_orchestrator().due_loop_targets(None, usize::MAX);
+            let runnable = |session: &SessionKey| session_workspaces().get(session).is_some();
+            let due = default_agent_orchestrator().due_loop_targets_with_filter(
+                None,
+                DRAIN_SPAWN_CAP,
+                Some(&runnable),
+            );
             let mut advanced = 0usize;
-            let mut deferred = 0usize;
             for (session_id, profile_id) in due {
-                if advanced >= DRAIN_SPAWN_CAP {
-                    break;
-                }
-                // codex P1: only run a headless turn for a session whose
-                // workspace is already established in-memory (opened this
-                // process run). A continuation rehydrated across a serve
-                // restart has no `session_workspaces()` entry yet; running it
-                // blind would bootstrap the profile-default workspace and could
-                // run tools in the wrong repo for a session originally opened
-                // with a custom cwd. Defer to reconnect — `session/open`
-                // repopulates the workspace and the per-connection tick then
-                // drains it safely.
-                if session_workspaces().get(&session_id).is_none() {
-                    deferred += 1;
-                    continue;
-                }
                 if maybe_spawn_appui_master_continuation_runner(
                     &ws,
                     &state,
@@ -9902,10 +9894,10 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     advanced += 1;
                 }
             }
-            if advanced > 0 || deferred > 0 {
+            if advanced > 0 {
                 info!(
                     advanced,
-                    deferred, "global master-continuation drain (connection-independent)"
+                    "global master-continuation drain (connection-independent)"
                 );
             }
         }
