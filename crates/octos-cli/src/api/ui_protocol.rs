@@ -3438,6 +3438,19 @@ async fn ui_protocol_connection(
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let connection_profile_id = connection_profile_id.as_deref();
     let routed_profile_id = routed_profile_id.as_deref();
+    // mini5 soak gap #2: the profile a `session/open` bound this connection to.
+    // The WS connection's authenticated `connection_profile_id` is frozen at
+    // upgrade time and an admin / unscoped connection (`connection_profile_id ==
+    // None`) carries no profile, so a later `turn/start` resolved to `<unset>`
+    // and the per-connection continuation drain filtered by `None`. Mirror the
+    // stdio handler (`stdio_session_open_candidate_profile` ->
+    // `connection_profile_id_owned`): remember the profile a successful
+    // `session/open` resolved to and use it as a fallback for both the turn
+    // profile and the drain filter. For an authenticated profile-scoped
+    // connection this is a no-op (validate_authenticated_session_scope already
+    // forces the session to that profile); it only fills the gap left by
+    // None-scoped (admin) connections, which are authorized for every profile.
+    let mut session_open_profile_id: Option<String> = None;
 
     // #924 BLOCK 1: wake the read loop the instant a lifecycle/RPC
     // send marks the connection failed. Without this, an idle socket
@@ -3476,7 +3489,9 @@ async fn ui_protocol_connection(
                 break;
             }
             _ = appui_continuation_tick.tick() => {
-                let profile_filter = connection_profile_id.or(routed_profile_id);
+                let profile_filter = connection_profile_id
+                    .or(routed_profile_id)
+                    .or(session_open_profile_id.as_deref());
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -3580,7 +3595,16 @@ async fn ui_protocol_connection(
                 }
             }
             UiCommand::SessionOpen(params) => {
-                handle_session_open(
+                // gap #2: remember the profile this open resolves to (params ->
+                // session-key -> current) and commit it only if the open
+                // succeeds, so a None-scoped (admin) connection's later
+                // turn/start + continuation drain can recover it. The auth gate
+                // stays in `handle_session_open` -> `validate_session_scope`.
+                let candidate = stdio_session_open_candidate_profile(
+                    &params,
+                    session_open_profile_id.as_deref(),
+                );
+                let opened = handle_session_open(
                     &ws,
                     &state,
                     &ledger,
@@ -3592,6 +3616,9 @@ async fn ui_protocol_connection(
                     params,
                 )
                 .await;
+                if opened {
+                    session_open_profile_id = candidate;
+                }
             }
             UiCommand::TurnStart(params) => {
                 handle_turn_start(
@@ -3602,7 +3629,9 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
-                    routed_profile_id,
+                    // gap #2: fall back to the session-open profile when the
+                    // connection supplied no routing profile (admin / unscoped).
+                    routed_profile_id.or(session_open_profile_id.as_deref()),
                     features,
                     id,
                     params,
@@ -9713,6 +9742,89 @@ async fn drain_appui_due_master_continuations(
         )
         .await;
     }
+}
+
+/// Cadence for the server-level (connection-independent) master-continuation
+/// drain. Deliberately slower than the per-connection `appui_continuation_tick`
+/// (2s) so a live ws/stdio client almost always wins the race and renders the
+/// re-entry turn on its own connection; this loop is the safety net that drains
+/// queued continuations when NO client is connected.
+const GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS: u64 = 5;
+
+/// Spawn a server-level background task that drains due master continuations
+/// regardless of whether any ws/stdio client is connected.
+///
+/// The AppUI re-entry path (`appui_continuation_tick` ->
+/// `drain_appui_due_master_continuations`) runs ONLY inside a live connection's
+/// handler loop. So when a sub-agent finishes while the user's TUI is
+/// disconnected — or after a serve restart re-loads the persisted queue — the
+/// `ChildCompleted` / `ScatterJoinComplete` / `GoalContinue` / `LoopFire`
+/// continuation sits in the scheduler with nothing to drain it until a client
+/// reconnects. This loop closes that gap (mini5 soak gap #1).
+///
+/// It reuses the exact same drain primitive as the per-connection tick and
+/// shares the process-global `active_turns_registry()`, so the scheduler's
+/// atomic pop + the per-session active-turn guard prevent any double-run when a
+/// client IS connected: whoever pops the continuation first wins, the other
+/// side finds it gone / the session occupied. Turn events persist to the
+/// durable ledger, so connected clients receive them live via their session's
+/// live forwarder and disconnected clients replay them on reconnect.
+///
+/// `profile_filter = None` so it sweeps every profile (each per-connection tick
+/// scopes to its own profile; the safety net must cover all of them).
+pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        // Detached connection: there is no live peer. Outbound frames are
+        // discarded by a drain task (the durable record is the ledger); keep
+        // the receiver alive so sends never backpressure-fail and mark the
+        // connection dead.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+        tokio::spawn(async move { while writer_rx.recv().await.is_some() {} });
+        let ws = WsConnection::new(writer_tx);
+        let active_turns = active_turns_registry();
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let contracts = contract_stores();
+        let ledger = event_ledger(&state).await;
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; skip it so we don't race the serve's
+        // own startup wiring before any session can exist.
+        tick.tick().await;
+        info!(
+            interval_secs = GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS,
+            "global master-continuation drain loop started (connection-independent)"
+        );
+        loop {
+            tick.tick().await;
+            // Read-only peek (no enqueue side effects) so the
+            // connection-independent drain is observable: when targets exist
+            // here it means continuations were queued for sessions whose own
+            // client may be disconnected, and this loop — not a per-connection
+            // tick — advances them.
+            let due = default_agent_orchestrator().due_loop_targets(None, 8);
+            if !due.is_empty() {
+                info!(
+                    targets = due.len(),
+                    "global master-continuation drain advancing continuations (connection-independent)"
+                );
+            }
+            drain_appui_due_master_continuations(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                None,
+                features,
+            )
+            .await;
+        }
+    });
 }
 
 async fn handle_turn_interrupt(

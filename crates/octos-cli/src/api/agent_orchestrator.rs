@@ -6429,6 +6429,53 @@ mod tests {
         );
     }
 
+    /// mini5 soak gap #1: the server-level drain
+    /// (`spawn_global_master_continuation_drain`) sweeps `due_loop_targets`
+    /// with `profile_filter = None` precisely so it surfaces continuations that
+    /// a connection scoped to a DIFFERENT profile would skip — i.e. it drains
+    /// for sessions that have no matching live connection. A per-connection
+    /// tick filtered to profile Q misses a continuation enqueued under profile
+    /// P; the connection-independent None sweep catches it.
+    #[test]
+    fn unscoped_due_loop_targets_surfaces_continuation_a_scoped_connection_skips() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey("gap1-unscoped-sweep".into());
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-x".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-x".into(),
+            role: "worker".into(),
+            nickname: "Xena".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("done".into()),
+            cwd: None,
+            profile_id: "coding".into(),
+        });
+
+        // A connection scoped to a DIFFERENT profile never surfaces it — this
+        // is the gap: with no coding-scoped connection open, nothing drains it.
+        let scoped_other = orchestrator.due_loop_targets(Some("ocean"), 8);
+        assert!(
+            !scoped_other
+                .iter()
+                .any(|(session, _)| *session == session_id),
+            "a connection scoped to a different profile must not surface the continuation, got {scoped_other:?}"
+        );
+
+        // The server-level None sweep surfaces it regardless of profile, so the
+        // global drain loop can run it even when no client is connected.
+        let unscoped = orchestrator.due_loop_targets(None, 8);
+        assert!(
+            unscoped
+                .iter()
+                .any(|(session, profile)| *session == session_id && profile == "coding"),
+            "the connection-independent (None) sweep must surface the queued continuation, got {unscoped:?}"
+        );
+    }
+
     #[test]
     fn repeated_terminal_agent_upsert_does_not_queue_duplicate_continuations() {
         let orchestrator = InProcessAgentOrchestrator::default();

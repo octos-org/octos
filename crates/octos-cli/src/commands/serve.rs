@@ -927,6 +927,16 @@ impl ServeCommand {
             }
         }
 
+        // mini5 soak gap #1: drain queued master continuations
+        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
+        // even when NO ws/stdio client is connected. The per-connection
+        // `appui_continuation_tick` only runs inside a live handler loop, so a
+        // sub-agent finishing while the TUI is disconnected (or a continuation
+        // re-loaded after a serve restart) would otherwise sit undrained until
+        // a client reconnects. Shares the process-global active-turns registry
+        // with the per-connection ticks, so there is no double-run.
+        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
+
         let app = build_router(state);
         let addr = format!("{}:{}", self.host, self.port);
 
