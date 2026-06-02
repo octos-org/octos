@@ -3595,15 +3595,22 @@ async fn ui_protocol_connection(
                 }
             }
             UiCommand::SessionOpen(params) => {
-                // gap #2: remember the profile this open resolves to (params ->
-                // session-key -> current) and commit it only if the open
-                // succeeds, so a None-scoped (admin) connection's later
-                // turn/start + continuation drain can recover it. The auth gate
-                // stays in `handle_session_open` -> `validate_session_scope`.
-                let candidate = stdio_session_open_candidate_profile(
-                    &params,
-                    session_open_profile_id.as_deref(),
-                );
+                // gap #2 (codex P2): record the profile this open RESOLVES to so
+                // a None-scoped (admin) connection's later turn/start +
+                // continuation drain can recover it, committed only on success.
+                // For a None connection `handle_session_open` ->
+                // `validate_session_scope` resolves
+                // `params.profile_id.or(session_id.profile_id())`, so mirror that
+                // exactly — do NOT carry the previous session's profile onto a
+                // profile-less open (that would mis-bind a session opened under
+                // the default/_main runtime to the prior profile). For an
+                // authenticated connection this value is unused downstream
+                // (connection_profile_id dominates the turn + drain filter); the
+                // auth gate stays in handle_session_open.
+                let resolved_open_profile = params
+                    .profile_id
+                    .clone()
+                    .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
                 let opened = handle_session_open(
                     &ws,
                     &state,
@@ -3617,7 +3624,7 @@ async fn ui_protocol_connection(
                 )
                 .await;
                 if opened {
-                    session_open_profile_id = candidate;
+                    session_open_profile_id = resolved_open_profile;
                 }
             }
             UiCommand::TurnStart(params) => {
@@ -9800,29 +9807,82 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
         );
         loop {
             tick.tick().await;
-            // Read-only peek (no enqueue side effects) so the
-            // connection-independent drain is observable: when targets exist
-            // here it means continuations were queued for sessions whose own
-            // client may be disconnected, and this loop — not a per-connection
-            // tick — advances them.
+
+            // codex P2 (reap): this loop never closes, so the per-connection
+            // cleanup path (`abort_connection_turns` on socket close) never runs
+            // for the turns we spawn. Without this, every disconnected session
+            // we drain would leave a Terminal active-turn entry behind forever.
+            // Drop our own entries once their turn has reached Terminal.
+            {
+                let mut conns = connection_turns.lock().await;
+                if !conns.is_empty() {
+                    let mut active = active_turns.lock().await;
+                    let mut finished: Vec<SessionKey> = Vec::new();
+                    for (session, turn_id) in conns.iter() {
+                        match active.get(session) {
+                            Some(existing) if existing.turn_id == *turn_id => {
+                                if matches!(&*existing.state.lock().await, TurnState::Terminal(_)) {
+                                    finished.push(session.clone());
+                                }
+                            }
+                            // Replaced by a newer turn (or already gone): our
+                            // mapping is stale, drop it.
+                            _ => finished.push(session.clone()),
+                        }
+                    }
+                    for session in finished {
+                        if let Some(existing) = active.get(&session) {
+                            if conns.get(&session) == Some(&existing.turn_id) {
+                                active.remove(&session);
+                            }
+                        }
+                        conns.remove(&session);
+                    }
+                }
+            }
+
+            // Drive the drain ourselves (rather than
+            // `drain_appui_due_master_continuations`) so we can gate each
+            // target on a known workspace.
             let due = default_agent_orchestrator().due_loop_targets(None, 8);
-            if !due.is_empty() {
+            let mut advanced = 0usize;
+            let mut deferred = 0usize;
+            for (session_id, profile_id) in due {
+                // codex P1: only run a headless turn for a session whose
+                // workspace is already established in-memory (opened this
+                // process run). A continuation rehydrated across a serve
+                // restart has no `session_workspaces()` entry yet; running it
+                // blind would bootstrap the profile-default workspace and could
+                // run tools in the wrong repo for a session originally opened
+                // with a custom cwd. Defer to reconnect — `session/open`
+                // repopulates the workspace and the per-connection tick then
+                // drains it safely.
+                if session_workspaces().get(&session_id).is_none() {
+                    deferred += 1;
+                    continue;
+                }
+                if maybe_spawn_appui_master_continuation_runner(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts,
+                    &active_turns,
+                    &connection_turns,
+                    session_id,
+                    profile_id,
+                    features,
+                )
+                .await
+                {
+                    advanced += 1;
+                }
+            }
+            if advanced > 0 || deferred > 0 {
                 info!(
-                    targets = due.len(),
-                    "global master-continuation drain advancing continuations (connection-independent)"
+                    advanced,
+                    deferred, "global master-continuation drain (connection-independent)"
                 );
             }
-            drain_appui_due_master_continuations(
-                &ws,
-                &state,
-                &ledger,
-                &contracts,
-                &active_turns,
-                &connection_turns,
-                None,
-                features,
-            )
-            .await;
         }
     });
 }
