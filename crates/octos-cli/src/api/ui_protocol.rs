@@ -3510,6 +3510,7 @@ async fn ui_protocol_connection(
                     &ws,
                     &ledger,
                     &active_turns,
+                    &live_forwarders,
                     &mut last_orchestration,
                 ).await;
                 continue;
@@ -4027,6 +4028,7 @@ where
                     &ws,
                     &ledger,
                     &active_turns,
+                    &live_forwarders,
                     &mut last_orchestration,
                 ).await;
                 continue;
@@ -9807,12 +9809,28 @@ async fn emit_session_orchestration_updates(
     ws: &WsConnection,
     ledger: &Arc<UiProtocolLedger>,
     active_turns: &SharedActiveTurns,
+    live_forwarders: &SharedLiveForwarders,
     last: &mut std::collections::HashMap<SessionKey, SessionOrchestrationEvent>,
 ) {
+    // Scope to THIS connection's open/subscribed sessions so we don't (a) emit
+    // another profile's session status to a connection that never opened it
+    // (cross-profile leak) or (b) have every connection re-emit for every active
+    // session (the redundant N× the per-connection design otherwise produces).
+    // A session enters `live_forwarders` only via a scope-validated
+    // `session/open`, so this is the connection's authorized session set.
+    let subscribed: std::collections::HashSet<SessionKey> =
+        live_forwarders.lock().await.keys().cloned().collect();
+    if subscribed.is_empty() {
+        // Still drain `last` to idle so a connection that closed its sessions
+        // doesn't leave a stale active indicator on its own dedup map.
+        last.clear();
+        return;
+    }
     let turn_sessions = active_turn_sessions(active_turns).await;
     let orchestrator = default_agent_orchestrator();
     let mut candidates = orchestrator.sessions_with_active_orchestration();
     candidates.extend(turn_sessions.iter().cloned());
+    candidates.retain(|session_id| subscribed.contains(session_id));
 
     let mut current: std::collections::HashMap<SessionKey, SessionOrchestrationEvent> =
         std::collections::HashMap::new();
