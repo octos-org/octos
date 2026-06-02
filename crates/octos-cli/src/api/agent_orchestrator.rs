@@ -394,10 +394,29 @@ pub(crate) struct NativeSpecialistRunResult {
 
 pub(crate) fn upsert_background_task_agent(
     task: &octos_agent::BackgroundTask,
+    runtime_profile_id: Option<&str>,
 ) -> Option<(SessionKey, Value)> {
     let session_id = background_task_session_id(task)?;
-    let profile_id = session_id
-        .profile_id()
+    // mini5 soak fix: AppUI/TUI sessions use BARE session keys ("q5",
+    // "test1") with no `profile:channel:chat` prefix, so
+    // `SessionKey::profile_id()` is `None` and the terminal-agent
+    // continuation used to fall back to `MAIN_PROFILE_ID` ("_main"). But
+    // the owning turn actually runs under a real profile (e.g. "coding"
+    // resolved from the connection / `session/open` `profile_id`), and
+    // only THAT profile has a registered `ProfileRuntime`. Enqueuing the
+    // `ChildCompleted` / `ScatterJoinComplete` continuation under "_main"
+    // breaks re-entry two ways: a profile-scoped connection skips it in
+    // `due_loop_targets` (profile mismatch) and an unscoped connection
+    // drains it into a `run_standalone_turn` that fails closed with
+    // `runtime_unavailable` (no runtime for "_main"). Either way the
+    // task-completion notice never fires. Prefer the runtime profile the
+    // caller threads in (mirrors `set_on_failure_signal`'s
+    // `active_profile_id.or(routed_profile_id)` resolution); fall back to
+    // the key-derived profile for channel sessions whose key DOES carry
+    // it.
+    let profile_id = runtime_profile_id
+        .filter(|profile| !profile.is_empty())
+        .or_else(|| session_id.profile_id())
         .unwrap_or(MAIN_PROFILE_ID)
         .to_owned();
     let agent_id = background_task_agent_id(task);
@@ -6282,7 +6301,7 @@ mod tests {
         };
 
         let (mirrored_session, agent) =
-            upsert_background_task_agent(&task).expect("task should mirror");
+            upsert_background_task_agent(&task, None).expect("task should mirror");
 
         assert_eq!(mirrored_session, session_id);
         assert_eq!(agent["status"], json!("completed"));
@@ -6306,6 +6325,107 @@ mod tests {
                 MasterContinuationReason::ChildCompleted,
                 MasterContinuationReason::ScatterJoinComplete
             ]
+        );
+    }
+
+    /// mini5 soak regression (task-completion notice never fired): AppUI /
+    /// TUI sessions use BARE session keys ("q5", "test1") with no
+    /// `profile:channel:chat` prefix, so `SessionKey::profile_id()` is
+    /// `None`. The terminal-agent continuation used to fall back to
+    /// `MAIN_PROFILE_ID` ("_main"), which has no registered `ProfileRuntime`
+    /// on the serve — so a profile-scoped connection skipped the
+    /// continuation in `due_loop_targets` (profile mismatch) and an
+    /// unscoped connection drained it into a `runtime_unavailable` turn.
+    /// The reconciliation now threads the turn's real runtime profile, so
+    /// the continuation is enqueued under THAT profile and re-entry fires.
+    #[test]
+    fn bare_key_background_task_continuation_inherits_runtime_profile_not_main_fallback() {
+        let session_id = SessionKey("soak-bareprofile-1".into());
+        assert_eq!(
+            session_id.profile_id(),
+            None,
+            "precondition: AppUI session key carries no profile prefix"
+        );
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-0000000000c1".into(),
+            tool_name: "spawn".into(),
+            tool_call_id: "call-bp1".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: Some(format!("{session_id}#child-abc")),
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some(session_id.to_string()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: Some("deep code review".into()),
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        // Reconcile under the profile the turn actually runs under ("coding"),
+        // exactly as `forward_task_progress_to_channel` now threads it.
+        let (mirrored_session, agent) = upsert_background_task_agent(&task, Some("coding"))
+            .expect("terminal background task should mirror to an agent record");
+        assert_eq!(mirrored_session, session_id);
+        assert_eq!(
+            agent["profile_id"],
+            json!("coding"),
+            "agent record must carry the runtime profile, not the _main fallback"
+        );
+
+        // The continuation must drain under the runtime profile — NOT "_main".
+        let under_runtime_profile = default_agent_orchestrator()
+            .drain_ready_continuations_for_session(
+                &session_id,
+                "coding",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+        assert!(
+            under_runtime_profile
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "ChildCompleted continuation must be drainable under the runtime profile 'coding'"
+        );
+        assert!(
+            under_runtime_profile
+                .iter()
+                .all(|item| item.profile_id.as_str() == "coding"),
+            "every drained continuation must be tagged with the runtime profile, got {:?}",
+            under_runtime_profile
+                .iter()
+                .map(|item| item.profile_id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        // And nothing must linger under the broken "_main" fallback profile.
+        let under_main = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            MAIN_PROFILE_ID,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            under_main.is_empty(),
+            "no continuation may be stranded under the '_main' fallback, got {:?}",
+            under_main
+                .iter()
+                .map(|item| item.reason.clone())
+                .collect::<Vec<_>>()
         );
     }
 

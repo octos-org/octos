@@ -2900,6 +2900,7 @@ fn forward_task_progress_to_channel(
     tx: &tokio::sync::mpsc::Sender<String>,
     progress_dropped: &Arc<AtomicU64>,
     task: &octos_agent::BackgroundTask,
+    runtime_profile_id: Option<&str>,
 ) {
     let event = background_task_to_progress_json(task);
     let Ok(json) = serde_json::to_string(&event) else {
@@ -2907,7 +2908,7 @@ fn forward_task_progress_to_channel(
     };
     forward_task_progress_json_to_channel(tx, progress_dropped, task, "task_progress", json);
 
-    if let Some((session_id, agent)) = upsert_background_task_agent(task) {
+    if let Some((session_id, agent)) = upsert_background_task_agent(task, runtime_profile_id) {
         let event = json!({
             "type": "agent_updated",
             "session_id": session_id,
@@ -15278,7 +15279,7 @@ async fn seed_m9_task_output_fixture(
         ))
         .map_err(|error| format!("failed to enable task persistence: {error}"))?;
     supervisor.set_on_change(move |task| {
-        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task) else {
+        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task, None) else {
             return;
         };
         let Ok(agent) = serde_json::from_value::<UiAgentRecord>(agent_value) else {
@@ -15843,8 +15844,23 @@ async fn run_standalone_turn(
         // `forward_task_progress_to_channel`.
         let progress_tx_for_tasks = progress_tx.clone();
         let task_progress_dropped = progress_dropped.clone();
+        // mini5 soak fix: thread the turn's resolved runtime profile into the
+        // agent-record mirror so the terminal-agent continuation inherits the
+        // profile the turn actually runs under (mirrors `failure_profile_id`
+        // above) instead of the bare-session-key "_main" fallback that left
+        // the task-completion re-entry stranded (`runtime_unavailable` /
+        // profile-scoped drain skip).
+        let change_profile_id = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         task_supervisor.set_on_change(move |task| {
-            forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
+            forward_task_progress_to_channel(
+                &progress_tx_for_tasks,
+                &task_progress_dropped,
+                task,
+                Some(change_profile_id.as_str()),
+            );
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
             warn!(
@@ -29529,7 +29545,7 @@ ignore = []
             octos_agent::TaskStatus::Completed,
             octos_agent::TaskRuntimeState::Completed,
         );
-        forward_task_progress_to_channel(&tx, &dropped, &task);
+        forward_task_progress_to_channel(&tx, &dropped, &task, None);
 
         // The synchronous try_send must have failed (channel was full),
         // bumping the drop counter that feeds the replay_lossy machinery.
@@ -29577,7 +29593,7 @@ ignore = []
             octos_agent::TaskStatus::Running,
             octos_agent::TaskRuntimeState::ExecutingTool,
         );
-        forward_task_progress_to_channel(&tx, &dropped, &task);
+        forward_task_progress_to_channel(&tx, &dropped, &task, None);
 
         // Drop counter must increment for both the task-progress frame and
         // the paired agent mirror frame.
@@ -29614,7 +29630,7 @@ ignore = []
             octos_agent::TaskStatus::Failed,
             octos_agent::TaskRuntimeState::Failed,
         );
-        forward_task_progress_to_channel(&tx, &dropped, &task);
+        forward_task_progress_to_channel(&tx, &dropped, &task, None);
 
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         let event = rx.try_recv().expect("event must be available immediately");

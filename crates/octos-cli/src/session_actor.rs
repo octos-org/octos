@@ -1488,8 +1488,13 @@ fn forward_task_status_to_actor_inbox(
     data_dir: &Path,
     task: &octos_agent::BackgroundTask,
 ) {
+    // Channel/gateway SessionActor keys carry the profile
+    // (`profile:channel:chat`), so the key-derived fallback inside
+    // `upsert_background_task_agent` resolves the right profile here; the
+    // AppUI/serve bare-key path threads its runtime profile explicitly
+    // (see `forward_task_progress_to_channel`).
     #[cfg(feature = "api")]
-    let _ = upsert_background_task_agent(task);
+    let _ = upsert_background_task_agent(task, None);
 
     let task_json = sanitize_task_for_response(data_dir, task);
     let Ok(json) = serde_json::to_string(&task_json) else {
