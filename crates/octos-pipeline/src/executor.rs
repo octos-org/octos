@@ -1021,15 +1021,30 @@ impl PipelineExecutor {
             edge_summary.join("\n")
         );
 
-        let diags = validate::validate(&graph);
+        let validation_context = self.validation_context(&graph, catalog_dir, variables);
+        let diags = validate::diagnostics_with_context(&graph, &validation_context);
 
         for diag in &diags {
             match diag.severity {
                 validate::Severity::Error => {
-                    tracing::error!(rule = diag.rule, "{}", diag.message);
+                    tracing::error!(
+                        rule = diag.rule_id.code(),
+                        rule_number = diag.rule,
+                        location = ?diag.location,
+                        fix_hint = ?diag.fix_hint,
+                        "{}",
+                        diag.message
+                    );
                 }
                 validate::Severity::Warning => {
-                    warn!(rule = diag.rule, "{}", diag.message);
+                    warn!(
+                        rule = diag.rule_id.code(),
+                        rule_number = diag.rule,
+                        location = ?diag.location,
+                        fix_hint = ?diag.fix_hint,
+                        "{}",
+                        diag.message
+                    );
                 }
             }
         }
@@ -1038,7 +1053,15 @@ impl PipelineExecutor {
             let errors: Vec<_> = diags
                 .iter()
                 .filter(|d| d.severity == validate::Severity::Error)
-                .map(|d| format!("rule {}: {}", d.rule, d.message))
+                .map(|d| {
+                    format!(
+                        "{} (rule {}, {:?}): {}",
+                        d.rule_id.code(),
+                        d.rule,
+                        d.location,
+                        d.message
+                    )
+                })
                 .collect();
             eyre::bail!("pipeline validation failed:\n{}", errors.join("\n"));
         }
@@ -1524,6 +1547,32 @@ impl PipelineExecutor {
         registry.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
 
         registry
+    }
+
+    fn validation_context(
+        &self,
+        graph: &PipelineGraph,
+        catalog_dir: &std::path::Path,
+        variables: &serde_json::Map<String, serde_json::Value>,
+    ) -> validate::ValidationContext {
+        // codex pre-merge P2: include plugin tool names (when `plugin_dirs` is
+        // set AND the graph references a non-built-in tool) so a graph
+        // allow-listing a legitimate plugin tool isn't rejected by Rule 19.
+        // Shared with `RunPipelineTool::pre_flight_validate` via
+        // `known_tool_names_with_plugins` so the two validation paths can't
+        // drift. Load failures are non-fatal (fall back to built-ins).
+        let tool_names = validate::known_tool_names_with_plugins(
+            &self.config.working_dir,
+            &self.config.plugin_dirs,
+            self.config.plugin_require_signed,
+            &validate::referenced_tool_entries(graph),
+        );
+        validate::ValidationContext::default()
+            .with_runtime_variables(variables.keys().cloned())
+            .with_known_models(crate::model_assignment::known_model_keys_from_catalog_dir(
+                catalog_dir,
+            ))
+            .with_known_tools(tool_names)
     }
 
     async fn execute_graph(
@@ -3177,6 +3226,73 @@ mod tests {
         fn provider_name(&self) -> &str {
             "mock"
         }
+    }
+
+    struct CountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(octos_llm::ChatResponse {
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[test]
+    fn validation_rejects_malformed_pipeline_before_llm_dispatch() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = make_test_config();
+        config.default_provider = Arc::new(CountingProvider {
+            calls: calls.clone(),
+        });
+        let executor = PipelineExecutor::new(config);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(executor.run(
+                r#"
+                digraph test {
+                    start [prompt="Use {missing_runtime_binding}"]
+                }
+                "#,
+                "input",
+                &serde_json::Map::new(),
+            ))
+            .expect_err("unbound template variable must reject the pipeline");
+        assert!(
+            err.to_string().contains("T-Agent"),
+            "unexpected validation error: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "validation must fail before any LLM call"
+        );
     }
 
     async fn create_test_store() -> EpisodeStore {

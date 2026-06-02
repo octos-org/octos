@@ -534,6 +534,14 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+fn parse_csv_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
     // Resolution: explicit handler > shape-based > default (codergen)
     let handler = attrs
@@ -542,10 +550,22 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         .or_else(|| attrs.get("shape").and_then(|s| HandlerKind::from_shape(s)))
         .unwrap_or(HandlerKind::Codergen);
 
-    let tools = attrs
-        .get("tools")
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-        .unwrap_or_default();
+    // `tools` is special vs other CSV lists: an EXPLICIT `tools=""` (present
+    // but empty) is a deny-all signal the handler distinguishes from an
+    // omitted attribute (`CodergenHandler` checks `!node.tools.is_empty()` and
+    // then `allowed.is_empty()` -> `deny: ["*"]`). `parse_csv_list` filters
+    // empty entries, which would collapse `tools=""` to `[]` and make it look
+    // omitted — so a text-only node would silently regain the default toolset
+    // (codex pre-merge P1). Preserve the legacy contract: when the attribute
+    // is PRESENT but has no non-empty tokens, keep a single `""` marker.
+    let tools = attrs.get("tools").map_or_else(Vec::new, |s| {
+        let parsed = parse_csv_list(s);
+        if parsed.is_empty() {
+            vec![String::new()] // explicit deny-all marker (tools="")
+        } else {
+            parsed
+        }
+    });
 
     let deadline_secs = attrs
         .get("deadline_secs")
@@ -580,6 +600,23 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         worker_prompt: attrs.get("worker_prompt").cloned(),
         planner_model: attrs.get("planner_model").cloned(),
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
+        human_gate: attrs
+            .get("human_gate")
+            .or_else(|| attrs.get("requires_human"))
+            .and_then(|s| parse_bool(s))
+            .unwrap_or_else(|| attrs.contains_key("input_type")),
+        resolver: attrs
+            .get("resolver")
+            .or_else(|| attrs.get("gate_resolver"))
+            .cloned(),
+        artifact_refs: attrs
+            .get("artifact_refs")
+            .or_else(|| attrs.get("requires_artifact"))
+            .map_or_else(Vec::new, |s| parse_csv_list(s)),
+        checkpoint_refs: attrs
+            .get("checkpoint_refs")
+            .or_else(|| attrs.get("requires_checkpoint"))
+            .map_or_else(Vec::new, |s| parse_csv_list(s)),
         deadline_secs,
         deadline_action,
         continue_on_error: attrs
@@ -795,6 +832,28 @@ mod tests {
         let graph = parse_dot(dot).unwrap();
         let node = &graph.nodes["search"];
         assert_eq!(node.tools, vec!["web_search", "web_fetch"]);
+    }
+
+    #[test]
+    fn explicit_empty_tools_is_deny_all_marker_not_omitted() {
+        // codex pre-merge P1: `tools=""` (explicit deny-all) must be
+        // distinguishable from an omitted `tools` attribute. The handler keys
+        // off `!node.tools.is_empty()` then `allowed.is_empty()` -> deny ["*"],
+        // so an explicit-empty must yield a single `""` marker, NOT `[]` (which
+        // would silently grant the default toolset).
+        let with_empty = parse_dot(r#"digraph t { n [prompt="text only", tools=""] }"#).unwrap();
+        assert_eq!(
+            with_empty.nodes["n"].tools,
+            vec![String::new()],
+            "tools=\"\" must keep a single empty marker (deny-all signal)"
+        );
+
+        // Omitted tools -> empty vec (default toolset path).
+        let omitted = parse_dot(r#"digraph t { n [prompt="hi"] }"#).unwrap();
+        assert!(
+            omitted.nodes["n"].tools.is_empty(),
+            "omitted tools must be an empty vec (distinct from deny-all)"
+        );
     }
 
     #[test]
@@ -1212,5 +1271,28 @@ mod tests {
         );
         assert_eq!(parse_deadline_action("retry:0"), None);
         assert_eq!(parse_deadline_action("bogus"), None);
+    }
+
+    #[test]
+    fn should_parse_human_gate_resolver_and_refs() {
+        let graph = parse_dot(
+            r#"
+            digraph test {
+                gate [
+                    handler="gate",
+                    human_gate="true",
+                    resolver="operator",
+                    requires_artifact="draft, report",
+                    requires_checkpoint="post_draft"
+                ]
+            }
+            "#,
+        )
+        .unwrap();
+        let gate = &graph.nodes["gate"];
+        assert!(gate.human_gate);
+        assert_eq!(gate.resolver.as_deref(), Some("operator"));
+        assert_eq!(gate.artifact_refs, vec!["draft", "report"]);
+        assert_eq!(gate.checkpoint_refs, vec!["post_draft"]);
     }
 }

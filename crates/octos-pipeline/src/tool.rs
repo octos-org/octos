@@ -509,12 +509,36 @@ impl Tool for RunPipelineTool {
             .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
         let graph = crate::parser::parse_dot(&dot_content)
             .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
-        let diags = crate::validate::validate(&graph);
+        let validation_context = crate::validate::ValidationContext::default()
+            .with_runtime_variables(input.variables.keys().cloned())
+            .with_known_models(crate::model_assignment::known_model_keys_from_catalog_dir(
+                &self.working_dir,
+            ))
+            // codex pre-merge P2: include plugin tool names so a graph that
+            // allow-lists a legitimate plugin tool isn't rejected by Rule 19 in
+            // preflight (runs BEFORE the plugin-aware executor). Shares logic
+            // with `PipelineExecutor::validation_context`; loads plugins only
+            // when the graph actually references a non-built-in tool.
+            .with_known_tools(crate::validate::known_tool_names_with_plugins(
+                &self.working_dir,
+                &self.plugin_dirs,
+                self.plugin_require_signed,
+                &crate::validate::referenced_tool_entries(&graph),
+            ));
+        let diags = crate::validate::diagnostics_with_context(&graph, &validation_context);
         if crate::validate::has_errors(&diags) {
             let errors: Vec<_> = diags
                 .iter()
                 .filter(|d| d.severity == crate::validate::Severity::Error)
-                .map(|d| format!("rule {}: {}", d.rule, d.message))
+                .map(|d| {
+                    format!(
+                        "{} (rule {}, {:?}): {}",
+                        d.rule_id.code(),
+                        d.rule,
+                        d.location,
+                        d.message
+                    )
+                })
                 .collect();
             return Err(format!(
                 "pipeline validation failed:\n{}",
