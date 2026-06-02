@@ -1063,6 +1063,8 @@ pub mod methods {
     pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
+    /// Session-level whole-job orchestration status notification.
+    pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -4138,6 +4140,29 @@ impl UiProgressEvent {
     }
 }
 
+/// Session-level "whole job" orchestration status (`session/orchestration`
+/// notification). Lets a client render a single job-status indicator that stays
+/// active across the gap between a sub-agent's "task completed" and the master's
+/// re-entry turn — a gap the client cannot infer on its own because the
+/// master-continuation queue is server-side.
+///
+/// `active` is true when the session has any of: an in-flight turn, a running
+/// sub-agent, or a queued/in-flight master continuation. `phase` is a coarse
+/// human label ("working" / "orchestrating" / "re-entering"); `running_agents`
+/// is the count of non-terminal sub-agents. When `active` is false the client
+/// hides the indicator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOrchestrationEvent {
+    pub session_id: SessionKey,
+    pub active: bool,
+    #[serde(default)]
+    pub running_agents: u32,
+    #[serde(default)]
+    pub pending_continuations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnStartedEvent {
     pub session_id: SessionKey,
@@ -5105,6 +5130,11 @@ pub enum UiNotification {
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
+    /// Session-level whole-job orchestration status. Emitted when the session's
+    /// orchestration state changes (turn active / sub-agents running / master
+    /// continuation pending), so a client can render a job indicator that stays
+    /// live across the sub-agent-complete → master-re-entry gap.
+    SessionOrchestration(SessionOrchestrationEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -5163,6 +5193,7 @@ impl UiNotification {
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
+            Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
         }
     }
@@ -5203,6 +5234,7 @@ impl UiNotification {
             Self::LoopCompleted(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
+            Self::SessionOrchestration(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
         }
     }
@@ -5322,6 +5354,7 @@ impl UiNotification {
             Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
+            Self::SessionOrchestration(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ): the wire shape per spec § 14.1 is the
             // bare `Envelope` — `session_id` and `topic` are server-internal
             // routing fields stripped here at the JSON-RPC boundary. The
@@ -5404,6 +5437,9 @@ impl UiNotification {
             methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
                 decode_params(method, params)?,
             )),
+            methods::SESSION_ORCHESTRATION => {
+                Ok(Self::SessionOrchestration(decode_params(method, params)?))
+            }
             // UPCR-2026-014 (M9-γ): decode the bare wire envelope into the
             // wrapper; `session_id` and `topic` default to empty/None and
             // are reconstituted from the ambient ledger context by the
