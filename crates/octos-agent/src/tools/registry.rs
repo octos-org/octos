@@ -1148,7 +1148,36 @@ impl ToolRegistry {
         // Track usage for LRU auto-eviction
         self.record_usage(name);
 
-        tool.execute_with_context(ctx, args).await
+        // Layer 2 (mini5 soak): isolate a tool panic at this single dispatch
+        // boundary. A panic inside a tool used to unwind through the session
+        // actor's task, killing the actor AND every in-process sub-agent it had
+        // spawned (which then got stamped "orphaned across restart"). Catching
+        // it here degrades the panic to a failed ToolResult: the caller sees a
+        // clean tool error and the actor — plus its sub-agents — keeps running.
+        // `catch_unwind` relies on unwind (the default profile). `AssertUnwindSafe`
+        // is sound because on panic we DISCARD the tool's future/state entirely
+        // and return a fresh error; nothing from the poisoned call is reused.
+        let invocation = tool.execute_with_context(ctx, args);
+        match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(invocation)).await {
+            Ok(result) => result,
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::error!(
+                    tool = name,
+                    panic = %detail,
+                    "tool execution panicked — isolated to a tool error; session actor preserved"
+                );
+                Ok(ToolResult {
+                    output: format!("tool '{name}' failed (internal error): {detail}"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+        }
     }
 }
 
@@ -2289,6 +2318,49 @@ mod context_threading_tests {
             seen.as_deref(),
             Some("call-m8.1"),
             "registry must forward the caller's ToolContext into execute_with_context",
+        );
+    }
+
+    struct PanickingTool;
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn name(&self) -> &str {
+            "panicker"
+        }
+        fn description(&self) -> &str {
+            "test-only: panics on execute"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            panic!("simulated tool panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_panic_is_isolated_to_a_failed_result_not_an_actor_crash() {
+        // mini5 soak (Layer 2): a panicking tool must NOT unwind through the
+        // registry — that would crash the session actor and orphan its
+        // in-process sub-agents. The dispatch boundary catches the panic and
+        // returns a failed ToolResult. This test COMPLETING (rather than
+        // panicking) is itself the core assertion.
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(PanickingTool));
+
+        let result = reg
+            .execute("panicker", &serde_json::json!({}))
+            .await
+            .expect("registry must return Ok(failed result), not propagate the panic");
+        assert!(
+            !result.success,
+            "a panicking tool must yield a failed result"
+        );
+        assert!(
+            result.output.contains("internal error"),
+            "result should flag the internal failure: {}",
+            result.output
         );
     }
 
