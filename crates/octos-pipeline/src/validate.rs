@@ -235,6 +235,84 @@ pub fn has_errors(diags: &[PipelineDiagnostic]) -> bool {
     diags.iter().any(|d| d.severity == Severity::Error)
 }
 
+/// Collect every tool/policy entry referenced by any node in the graph.
+/// Used to decide whether plugin loading is needed for Rule 19 validation.
+pub fn referenced_tool_entries(graph: &PipelineGraph) -> Vec<String> {
+    graph
+        .nodes
+        .values()
+        .flat_map(|n| n.tools.iter().cloned())
+        .collect()
+}
+
+/// Build the set of known tool names for Rule 19 validation: the built-in
+/// tools, plus — ONLY when the graph actually references a non-built-in tool —
+/// the names the real `PluginLoader` would register from `plugin_dirs`.
+///
+/// Shared by both validation entry paths (`RunPipelineTool::pre_flight_validate`
+/// and `PipelineExecutor::validation_context`) so they cannot drift.
+///
+/// Design (reconciling codex pre-merge rounds 4–6, which pulled in opposite
+/// directions — "don't load, it's slow" vs "a manifest-only scan diverges from
+/// what actually registers"):
+///
+/// - **Built-in-only graphs (the common case):** every referenced tool is
+///   already a built-in / `group:` / a wildcard a built-in matches, so we
+///   NEVER touch `plugin_dirs` — zero plugin I/O (round-4's perf concern).
+/// - **A graph references a tool the built-ins don't cover:** we run the REAL
+///   `PluginLoader` and use exactly the tools it registers. That is ground
+///   truth — it honours signing (`require_signed`), skips broken/no-exe
+///   installs, and matches the executor's plugin cache — so Rule 19 can never
+///   diverge from runtime registration in either direction (rounds 5 & 6).
+///   The cost is paid only when a plugin tool is genuinely in play.
+pub fn known_tool_names_with_plugins(
+    working_dir: &std::path::Path,
+    plugin_dirs: &[std::path::PathBuf],
+    plugin_require_signed: bool,
+    referenced_tools: &[String],
+) -> Vec<String> {
+    let builtins = octos_agent::ToolRegistry::with_builtins(working_dir).tool_names();
+    if plugin_dirs.is_empty() {
+        return builtins;
+    }
+    // Does the graph reference anything the built-ins (or group: policy
+    // entries) don't already cover? If not, plugin loading cannot change the
+    // validation outcome — skip it entirely.
+    let builtin_set: std::collections::HashSet<&str> =
+        builtins.iter().map(String::as_str).collect();
+    let needs_plugins = referenced_tools.iter().any(|t| {
+        let t = t.trim();
+        if t.is_empty() || t.starts_with("group:") {
+            return false;
+        }
+        // codex round-7 P2: a wildcard (`my_plugin_*`) needs plugin discovery
+        // UNLESS a built-in already matches the prefix — otherwise Rule 19
+        // would reject a legitimate plugin-prefix policy the executor loads.
+        if let Some(prefix) = t.strip_suffix('*') {
+            return !builtin_set.iter().any(|b| b.starts_with(prefix));
+        }
+        !builtin_set.contains(t)
+    });
+    if !needs_plugins {
+        return builtins;
+    }
+    // Real load = ground truth (signing-aware, skips broken installs), so
+    // Rule 19 matches what the executor's plugin cache will register.
+    let mut registry = octos_agent::ToolRegistry::with_builtins(working_dir);
+    let _ = octos_agent::PluginLoader::load_into_with_options(
+        &mut registry,
+        plugin_dirs,
+        &[],
+        octos_agent::PluginLoadOptions {
+            work_dir: None,
+            synthesis_config: None,
+            require_signed: plugin_require_signed,
+            verified_cache_dir: None,
+        },
+    );
+    registry.tool_names()
+}
+
 /// Find the start node: named "start", or the only node with no incoming edges.
 pub fn find_start_node(graph: &PipelineGraph) -> Option<String> {
     if graph.nodes.contains_key("start") {
@@ -725,6 +803,15 @@ fn rule_19_known_tools(
 ) {
     for node in graph.nodes.values() {
         for tool in &node.tools {
+            // codex pre-merge P2 (round-2): an empty entry is the explicit
+            // `tools=""` deny-all SENTINEL the parser preserves (so the handler
+            // can emit `deny: ["*"]`). It is not a tool name, so skip the
+            // known-tool check — otherwise Rule 19 errors on the very syntax
+            // the P1 fix restored and the text-only node fails validation
+            // before the handler ever interprets the sentinel.
+            if tool.trim().is_empty() {
+                continue;
+            }
             if tool_policy_entry_known(tool, context) {
                 continue;
             }
@@ -1086,12 +1173,17 @@ fn detect_cycles_ignoring_marked_back_edges(graph: &PipelineGraph) -> Result<(),
     Ok(())
 }
 
-fn edge_allows_back_edge(edge: &PipelineEdge, graph: &PipelineGraph) -> bool {
-    let source = graph.nodes.get(&edge.source);
-    let node_retry = source.is_some_and(|node| node.max_retries > 0);
+fn edge_allows_back_edge(edge: &PipelineEdge, _graph: &PipelineGraph) -> bool {
+    // A back edge must be marked on the EDGE itself (label or condition
+    // carrying a retry/back_edge/guard_back marker). codex pre-merge P2: a
+    // source node's `max_retries > 0` must NOT suppress cycle detection — it
+    // bounds HANDLER retries, not graph traversal, so inferring a back edge
+    // from it let real cycles (e.g. `start [max_retries=1] -> b; b -> start`)
+    // pass validation and the executor could loop indefinitely. Only the
+    // explicit edge marker designates an intentional loop-back.
     let label_marker = edge.label.as_deref().is_some_and(has_back_edge_marker);
     let condition_marker = edge.condition.as_deref().is_some_and(has_back_edge_marker);
-    node_retry || label_marker || condition_marker
+    label_marker || condition_marker
 }
 
 fn has_back_edge_marker(value: &str) -> bool {
@@ -1347,6 +1439,31 @@ mod tests {
     }
 
     #[test]
+    fn max_retries_does_not_hide_a_real_cycle() {
+        // codex pre-merge P2: `max_retries` bounds HANDLER retries, not graph
+        // traversal. A node with `max_retries > 0` must NOT make its outgoing
+        // edges count as back edges — otherwise a genuine cycle slips past
+        // validation and the executor can loop indefinitely. Only an explicit
+        // edge marker (label/condition) designates an intentional loop-back.
+        let graph = parse_dot(
+            r#"
+            digraph test {
+                start [prompt="A", max_retries="1"]
+                b [prompt="B"]
+                start -> b
+                b -> start
+            }
+            "#,
+        )
+        .unwrap();
+        let diags = diagnostics(&graph);
+        assert!(
+            diagnostic_for(&diags, RuleId::NoCycle),
+            "max_retries on the cycle source must not suppress NoCycle"
+        );
+    }
+
+    #[test]
     fn retry_marked_back_edge_is_allowed() {
         let graph = parse_dot(
             r#"
@@ -1410,6 +1527,52 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn explicit_empty_tools_deny_all_passes_validation() {
+        // codex pre-merge P2 (round-2): `tools=""` is the deny-all sentinel
+        // (parser keeps a single `""` entry). Rule 19 must NOT flag that empty
+        // marker as an unknown tool — otherwise the restored deny-all syntax
+        // fails validation before the handler interprets it.
+        let graph = parse_dot(
+            r#"
+            digraph test {
+                start [prompt="text only, no tools", tools=""]
+            }
+            "#,
+        )
+        .unwrap();
+        // Sanity: the parser kept the deny-all marker.
+        assert_eq!(graph.nodes["start"].tools, vec![String::new()]);
+        let diags = diagnostics(&graph);
+        assert!(
+            !diagnostic_for(&diags, RuleId::KnownToolPolicy),
+            "tools=\"\" deny-all must not trip Rule 19",
+        );
+    }
+
+    #[test]
+    fn known_tools_helper_skips_plugin_load_when_builtins_cover_refs() {
+        // No plugin_dirs -> just built-ins, regardless of references.
+        let wd = std::path::Path::new(".");
+        let names = known_tool_names_with_plugins(wd, &[], false, &["read_file".into()]);
+        assert!(names.iter().any(|n| n == "read_file"));
+
+        // A wildcard already covered by a built-in (`read_*` matches
+        // `read_file`) must NOT require plugin discovery — with a nonexistent
+        // plugin dir the load would no-op, so we just assert built-ins return
+        // and the call doesn't error. (codex round-7 P2: wildcards are only
+        // "covered" when a built-in matches the prefix.)
+        let missing = std::path::PathBuf::from("/nonexistent/plugins");
+        let names2 = known_tool_names_with_plugins(wd, &[missing], false, &["read_*".into()]);
+        assert!(names2.iter().any(|n| n == "read_file"));
+
+        // A plugin-prefix wildcard with no matching built-in flags
+        // needs_plugins (the load is attempted; nonexistent dir -> built-ins).
+        let missing2 = std::path::PathBuf::from("/nonexistent/plugins");
+        let names3 = known_tool_names_with_plugins(wd, &[missing2], false, &["my_plugin_*".into()]);
+        assert!(names3.iter().any(|n| n == "read_file"));
     }
 
     #[test]

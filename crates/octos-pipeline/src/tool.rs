@@ -514,9 +514,17 @@ impl Tool for RunPipelineTool {
             .with_known_models(crate::model_assignment::known_model_keys_from_catalog_dir(
                 &self.working_dir,
             ))
-            .with_known_tools(
-                octos_agent::ToolRegistry::with_builtins(&self.working_dir).tool_names(),
-            );
+            // codex pre-merge P2: include plugin tool names so a graph that
+            // allow-lists a legitimate plugin tool isn't rejected by Rule 19 in
+            // preflight (runs BEFORE the plugin-aware executor). Shares logic
+            // with `PipelineExecutor::validation_context`; loads plugins only
+            // when the graph actually references a non-built-in tool.
+            .with_known_tools(crate::validate::known_tool_names_with_plugins(
+                &self.working_dir,
+                &self.plugin_dirs,
+                self.plugin_require_signed,
+                &crate::validate::referenced_tool_entries(&graph),
+            ));
         let diags = crate::validate::diagnostics_with_context(&graph, &validation_context);
         if crate::validate::has_errors(&diags) {
             let errors: Vec<_> = diags

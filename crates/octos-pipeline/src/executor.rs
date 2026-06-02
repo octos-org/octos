@@ -1021,7 +1021,7 @@ impl PipelineExecutor {
             edge_summary.join("\n")
         );
 
-        let validation_context = self.validation_context(catalog_dir, variables);
+        let validation_context = self.validation_context(&graph, catalog_dir, variables);
         let diags = validate::diagnostics_with_context(&graph, &validation_context);
 
         for diag in &diags {
@@ -1551,11 +1551,22 @@ impl PipelineExecutor {
 
     fn validation_context(
         &self,
+        graph: &PipelineGraph,
         catalog_dir: &std::path::Path,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> validate::ValidationContext {
-        let tool_names =
-            octos_agent::ToolRegistry::with_builtins(&self.config.working_dir).tool_names();
+        // codex pre-merge P2: include plugin tool names (when `plugin_dirs` is
+        // set AND the graph references a non-built-in tool) so a graph
+        // allow-listing a legitimate plugin tool isn't rejected by Rule 19.
+        // Shared with `RunPipelineTool::pre_flight_validate` via
+        // `known_tool_names_with_plugins` so the two validation paths can't
+        // drift. Load failures are non-fatal (fall back to built-ins).
+        let tool_names = validate::known_tool_names_with_plugins(
+            &self.config.working_dir,
+            &self.config.plugin_dirs,
+            self.config.plugin_require_signed,
+            &validate::referenced_tool_entries(graph),
+        );
         validate::ValidationContext::default()
             .with_runtime_variables(variables.keys().cloned())
             .with_known_models(crate::model_assignment::known_model_keys_from_catalog_dir(

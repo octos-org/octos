@@ -550,9 +550,22 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         .or_else(|| attrs.get("shape").and_then(|s| HandlerKind::from_shape(s)))
         .unwrap_or(HandlerKind::Codergen);
 
-    let tools = attrs
-        .get("tools")
-        .map_or_else(Vec::new, |s| parse_csv_list(s));
+    // `tools` is special vs other CSV lists: an EXPLICIT `tools=""` (present
+    // but empty) is a deny-all signal the handler distinguishes from an
+    // omitted attribute (`CodergenHandler` checks `!node.tools.is_empty()` and
+    // then `allowed.is_empty()` -> `deny: ["*"]`). `parse_csv_list` filters
+    // empty entries, which would collapse `tools=""` to `[]` and make it look
+    // omitted — so a text-only node would silently regain the default toolset
+    // (codex pre-merge P1). Preserve the legacy contract: when the attribute
+    // is PRESENT but has no non-empty tokens, keep a single `""` marker.
+    let tools = attrs.get("tools").map_or_else(Vec::new, |s| {
+        let parsed = parse_csv_list(s);
+        if parsed.is_empty() {
+            vec![String::new()] // explicit deny-all marker (tools="")
+        } else {
+            parsed
+        }
+    });
 
     let deadline_secs = attrs
         .get("deadline_secs")
@@ -819,6 +832,28 @@ mod tests {
         let graph = parse_dot(dot).unwrap();
         let node = &graph.nodes["search"];
         assert_eq!(node.tools, vec!["web_search", "web_fetch"]);
+    }
+
+    #[test]
+    fn explicit_empty_tools_is_deny_all_marker_not_omitted() {
+        // codex pre-merge P1: `tools=""` (explicit deny-all) must be
+        // distinguishable from an omitted `tools` attribute. The handler keys
+        // off `!node.tools.is_empty()` then `allowed.is_empty()` -> deny ["*"],
+        // so an explicit-empty must yield a single `""` marker, NOT `[]` (which
+        // would silently grant the default toolset).
+        let with_empty = parse_dot(r#"digraph t { n [prompt="text only", tools=""] }"#).unwrap();
+        assert_eq!(
+            with_empty.nodes["n"].tools,
+            vec![String::new()],
+            "tools=\"\" must keep a single empty marker (deny-all signal)"
+        );
+
+        // Omitted tools -> empty vec (default toolset path).
+        let omitted = parse_dot(r#"digraph t { n [prompt="hi"] }"#).unwrap();
+        assert!(
+            omitted.nodes["n"].tools.is_empty(),
+            "omitted tools must be an empty vec (distinct from deny-all)"
+        );
     }
 
     #[test]

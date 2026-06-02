@@ -3946,6 +3946,7 @@ dependencies = [
  "octos-core",
  "octos-llm",
  "octos-memory",
+ "octos-plugin",
  "regex",
  "serde",
  "serde_json",
