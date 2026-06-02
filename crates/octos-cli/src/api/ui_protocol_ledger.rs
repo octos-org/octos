@@ -2075,6 +2075,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::LoopCompleted(event) => &event.session_id,
         UiNotification::ContextCompactionCompleted(event) => &event.session_id,
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
+        UiNotification::SessionOrchestration(event) => &event.session_id,
         UiNotification::Envelope(event) => &event.session_id,
     }
 }

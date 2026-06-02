@@ -1678,6 +1678,50 @@ impl InProcessAgentOrchestrator {
         self.state().continuations.len()
     }
 
+    /// Whole-job orchestration inputs for a session: (non-terminal sub-agents,
+    /// queued master continuations). Combined with the session's in-flight turn
+    /// (tracked in the AppUI `active_turns` registry) this drives the
+    /// `session/orchestration` status — `active` is true when any of the three
+    /// is non-zero, so the client's job indicator stays live across the
+    /// sub-agent-complete → master-re-entry gap.
+    pub(crate) fn session_orchestration_counts(&self, session_id: &SessionKey) -> (u32, u32) {
+        let state = self.state();
+        let running_agents = state
+            .agents
+            .values()
+            .filter(|agent| {
+                agent.session_id == *session_id && !is_agent_terminal_status(&agent.status)
+            })
+            .count() as u32;
+        let session_str = session_id.to_string();
+        let pending_continuations = state
+            .continuations
+            .pending_items()
+            .filter(|item| item.session_id.as_str() == session_str)
+            .count() as u32;
+        (running_agents, pending_continuations)
+    }
+
+    /// Sessions that currently have active orchestration from the
+    /// orchestrator's view: a non-terminal sub-agent OR a queued master
+    /// continuation. The AppUI tick unions this with its in-flight-turn set to
+    /// decide which sessions to emit `session/orchestration` for.
+    pub(crate) fn sessions_with_active_orchestration(
+        &self,
+    ) -> std::collections::HashSet<SessionKey> {
+        let state = self.state();
+        let mut sessions = std::collections::HashSet::new();
+        for agent in state.agents.values() {
+            if !is_agent_terminal_status(&agent.status) {
+                sessions.insert(agent.session_id.clone());
+            }
+        }
+        for item in state.continuations.pending_items() {
+            sessions.insert(SessionKey(item.session_id.as_str().to_owned()));
+        }
+        sessions
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_continuation_count_for_session_for_test(
         &self,

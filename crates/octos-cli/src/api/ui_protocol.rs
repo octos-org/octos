@@ -35,29 +35,30 @@ use octos_core::ui_protocol::{
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
-    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
-    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    SessionOpened, SessionOrchestrationEvent, SessionSnapshotParams, SessionStatusGetParams,
+    SessionTasksListParams, SessionTitleSetParams, SessionWorkspaceGetParams,
+    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
+    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
+    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
+    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
+    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
+    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
+    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
+    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
     approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
@@ -3451,6 +3452,9 @@ async fn ui_protocol_connection(
     // forces the session to that profile); it only fills the gap left by
     // None-scoped (admin) connections, which are authorized for every profile.
     let mut session_open_profile_id: Option<String> = None;
+    // Last-emitted whole-job orchestration status per session (dedup so only
+    // changes hit the wire). Drives the client's composer top-border indicator.
+    let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
 
     // #924 BLOCK 1: wake the read loop the instant a lifecycle/RPC
     // send marks the connection failed. Without this, an idle socket
@@ -3501,6 +3505,12 @@ async fn ui_protocol_connection(
                     &connection_turns,
                     profile_filter,
                     features,
+                ).await;
+                emit_session_orchestration_updates(
+                    &ws,
+                    &ledger,
+                    &active_turns,
+                    &mut last_orchestration,
                 ).await;
                 continue;
             }
@@ -3980,6 +3990,7 @@ where
     let mut features = ConnectionUiFeatures::stdio_defaults();
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
+    let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let failed_notify = ws.failed_notify();
@@ -4011,6 +4022,12 @@ where
                     &connection_turns,
                     connection_profile_id_owned.as_deref(),
                     features,
+                ).await;
+                emit_session_orchestration_updates(
+                    &ws,
+                    &ledger,
+                    &active_turns,
+                    &mut last_orchestration,
                 ).await;
                 continue;
             }
@@ -9758,6 +9775,104 @@ async fn drain_appui_due_master_continuations(
         )
         .await;
     }
+}
+
+/// Snapshot of sessions that currently have an in-flight (non-terminal) turn in
+/// the process-global active-turns registry. One lock acquisition; used to feed
+/// the whole-job orchestration status without re-locking per session.
+async fn active_turn_sessions(
+    active_turns: &SharedActiveTurns,
+) -> std::collections::HashSet<SessionKey> {
+    let mut sessions = std::collections::HashSet::new();
+    let active = active_turns.lock().await;
+    for (session_id, turn) in active.iter() {
+        if !matches!(&*turn.state.lock().await, TurnState::Terminal(_)) {
+            sessions.insert(session_id.clone());
+        }
+    }
+    sessions
+}
+
+/// Compute + emit `session/orchestration` updates for the whole-job indicator.
+///
+/// The "active orchestration" set is the union of: sessions with an in-flight
+/// turn, sessions with a non-terminal sub-agent, and sessions with a queued
+/// master continuation. For each such session we emit a status carrying
+/// `active:true` + counts + a coarse phase; a session that drops out of the set
+/// gets one final `active:false`. Emissions are deduped per connection via
+/// `last` (only changes go on the wire). The client keeps its job indicator
+/// live across the sub-agent-complete → master-re-entry gap because such a
+/// session stays in the set (pending continuation) even with no running turn.
+async fn emit_session_orchestration_updates(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    last: &mut std::collections::HashMap<SessionKey, SessionOrchestrationEvent>,
+) {
+    let turn_sessions = active_turn_sessions(active_turns).await;
+    let orchestrator = default_agent_orchestrator();
+    let mut candidates = orchestrator.sessions_with_active_orchestration();
+    candidates.extend(turn_sessions.iter().cloned());
+
+    let mut current: std::collections::HashMap<SessionKey, SessionOrchestrationEvent> =
+        std::collections::HashMap::new();
+    for session_id in &candidates {
+        let (running_agents, pending_continuations) =
+            orchestrator.session_orchestration_counts(session_id);
+        let turn_active = turn_sessions.contains(session_id);
+        // A candidate is here because at least one of these holds; if a stale
+        // continuation cleared between set-build and count, skip it.
+        if !turn_active && running_agents == 0 && pending_continuations == 0 {
+            continue;
+        }
+        let phase = if turn_active && running_agents > 0 {
+            "orchestrating"
+        } else if turn_active {
+            "working"
+        } else if pending_continuations > 0 {
+            "re-entering"
+        } else {
+            "orchestrating"
+        };
+        current.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents,
+                pending_continuations,
+                phase: Some(phase.to_owned()),
+            },
+        );
+    }
+
+    // Sessions that just went idle: emit one terminal active:false.
+    for (session_id, previous) in last.iter() {
+        if previous.active && !current.contains_key(session_id) {
+            let _ = send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::SessionOrchestration(SessionOrchestrationEvent {
+                    session_id: session_id.clone(),
+                    active: false,
+                    running_agents: 0,
+                    pending_continuations: 0,
+                    phase: None,
+                }),
+            );
+        }
+    }
+    // New / changed active sessions.
+    for (session_id, event) in &current {
+        if last.get(session_id) != Some(event) {
+            let _ = send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::SessionOrchestration(event.clone()),
+            );
+        }
+    }
+    *last = current;
 }
 
 /// Cadence for the server-level (connection-independent) master-continuation
@@ -19426,6 +19541,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // the surrounding LedgeredUiProtocolEvent.
             | UiNotification::ContextCompactionCompleted(_)
             | UiNotification::ContextNormalizationReported(_)
+            // Whole-job orchestration status is a stateless lifecycle push
+            // (no durable cursor of its own).
+            | UiNotification::SessionOrchestration(_)
             // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
             // `seq` allocated by `ThreadSeqAllocator`, not the per-session
             // `UiCursor` the legacy ledger replay uses. The durable
