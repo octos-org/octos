@@ -3624,7 +3624,16 @@ async fn ui_protocol_connection(
                 )
                 .await;
                 if opened {
-                    session_open_profile_id = resolved_open_profile;
+                    // codex P2 (re-review): a successful open always resolves to
+                    // a concrete runtime — a profile-less default open resolves
+                    // to MAIN_PROFILE_ID, not "no profile". Record that concrete
+                    // profile so the per-connection drain filter
+                    // (`connection.or(routed).or(session_open)`) scopes to this
+                    // session's profile instead of degrading to `None` (= ALL
+                    // profiles) for an unscoped/admin connection, which would let
+                    // it drain unrelated profiles' continuations.
+                    session_open_profile_id =
+                        Some(resolved_open_profile.unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()));
                 }
             }
             UiCommand::TurnStart(params) => {
@@ -9844,10 +9853,22 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // Drive the drain ourselves (rather than
             // `drain_appui_due_master_continuations`) so we can gate each
             // target on a known workspace.
-            let due = default_agent_orchestrator().due_loop_targets(None, 8);
+            //
+            // codex P2 (re-review): pull a generous candidate WINDOW rather than
+            // the per-tick spawn limit, then cap how many we actually SPAWN.
+            // Deferred (workspace-unknown) targets must NOT consume the spawn
+            // budget — otherwise a batch of `DRAIN_SPAWN_CAP` workspace-unknown
+            // sessions at the head of the queue could be returned every tick and
+            // starve runnable continuations queued behind them.
+            const DRAIN_CANDIDATE_WINDOW: usize = 64;
+            const DRAIN_SPAWN_CAP: usize = 8;
+            let due = default_agent_orchestrator().due_loop_targets(None, DRAIN_CANDIDATE_WINDOW);
             let mut advanced = 0usize;
             let mut deferred = 0usize;
             for (session_id, profile_id) in due {
+                if advanced >= DRAIN_SPAWN_CAP {
+                    break;
+                }
                 // codex P1: only run a headless turn for a session whose
                 // workspace is already established in-memory (opened this
                 // process run). A continuation rehydrated across a serve
