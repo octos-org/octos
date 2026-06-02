@@ -1666,7 +1666,17 @@ impl UiProtocolLedger {
         // Range validation echoes the existing replay_after error.
         if let Some(oldest_seq) = session.entries.front().map(|entry| entry.seq) {
             let min_after_seq = oldest_seq.saturating_sub(1);
-            if after.seq < min_after_seq || after.seq > head_seq {
+            // A from-beginning request (`after: None` -> seq 0) means "everything
+            // you still retain" and is always valid — even for a long/trimmed
+            // ledger whose oldest retained seq is > 1. Without this exemption a
+            // `session/hydrate { after: None }` against a large session
+            // (oldest_seq > 1, e.g. ledger head ~5.5k) was rejected with
+            // `cursor_out_of_range`, breaking reconnect-rehydration; the client
+            // can't supply a valid cursor for "from the beginning" of a trimmed
+            // ring. We still reject a genuine stale non-zero cursor and any
+            // future cursor.
+            let from_beginning = after.seq == 0;
+            if (!from_beginning && after.seq < min_after_seq) || after.seq > head_seq {
                 let head_cursor = UiCursor {
                     stream: session_id.0.clone(),
                     seq: head_seq,
@@ -2556,6 +2566,26 @@ mod tests {
                 .and_then(|data| data.get("oldest_retained_seq")),
             Some(&json!(6))
         );
+    }
+
+    #[test]
+    fn snapshot_from_beginning_succeeds_on_trimmed_ring() {
+        // Regression: `session/hydrate { after: None }` (from-beginning) against a
+        // large/trimmed session (oldest retained seq > 1) must NOT be rejected as
+        // cursor_out_of_range — "from the beginning" means "everything you still
+        // retain". This previously broke reconnect-rehydration on long sessions
+        // (mini5 soak: ledger head ~5.5k, hydrate errored + the transcript went
+        // empty). A genuine stale non-zero cursor is still rejected elsewhere.
+        let ledger = UiProtocolLedger::new(3);
+        let session_id = SessionKey("local:trimmed".into());
+        for i in 1..=6 {
+            ledger.append_notification(delta(&session_id, &format!("msg-{i}")));
+        }
+        // Ring retains only the last 3 (seq 4,5,6); oldest_seq = 4 > 1.
+        let (events, _head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("from-beginning hydrate must succeed on a trimmed ring");
+        assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
     }
 
     #[test]
