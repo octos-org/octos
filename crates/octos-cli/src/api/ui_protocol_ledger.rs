@@ -1630,7 +1630,18 @@ impl UiProtocolLedger {
                 .sessions
                 .entry(session_id.clone())
                 .or_insert_with(SessionLedger::new);
-            hydrate_session_from_snapshot(session, snapshot);
+            // codex P1: never hydrate a STALE disk snapshot over a newer live
+            // session. `hydrate_session_from_snapshot` overwrites `next_seq` and
+            // clears the in-memory ring, so if the live session is already newer
+            // than the snapshot's head — a concurrent append that landed between
+            // the pre-lock disk read and acquiring this lock — hydrating would
+            // roll `next_seq` back and drop/duplicate live events. A
+            // freshly-inserted session has `next_seq == 0`, so new/trimmed rings
+            // still hydrate normally. (Mirrors the stale-live guard on the
+            // append/disk-replay paths.)
+            if session.next_seq <= snapshot.head_seq {
+                hydrate_session_from_snapshot(session, snapshot);
+            }
         }
 
         let session = match inner.sessions.get(session_id) {
@@ -2586,6 +2597,55 @@ mod tests {
             .snapshot_with_cursor(&session_id, None)
             .expect("from-beginning hydrate must succeed on a trimmed ring");
         assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
+    }
+
+    #[test]
+    fn snapshot_with_cursor_does_not_hydrate_stale_disk_over_newer_live() {
+        // codex P1: `snapshot_with_cursor` must not let a STALE disk snapshot
+        // roll back a newer live session — `hydrate_session_from_snapshot` resets
+        // `next_seq` and clears the ring, which would drop/duplicate live events.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.retained_per_session = 1;
+        config.retained_log_files = 4;
+        config.rotate_bytes = 1024 * 1024;
+        let ledger = UiProtocolLedger::with_config(config);
+        let session_id = SessionKey("local:stale-live-snap".into());
+
+        ledger.append_notification(delta(&session_id, "one"));
+        ledger.append_notification(delta(&session_id, "two"));
+        ledger.append_notification(delta(&session_id, "three")); // live next_seq=4, ring=[seq3]
+
+        // Truncate the disk log to a STALE snapshot (only seq 1,2 → head_seq=2).
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        let mut log_files = list_log_files(&session_dir).expect("list logs");
+        log_files.sort();
+        let active_log = log_files.last().expect("active log");
+        let contents = std::fs::read_to_string(active_log).expect("read log");
+        let stale = contents
+            .lines()
+            .take(2)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(active_log, stale).expect("truncate to stale snapshot");
+
+        // From-beginning snapshot: with the guard it must keep the LIVE tail and
+        // the live head, not roll back to the stale disk.
+        let (events, head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("from-beginning must succeed without rolling back");
+        assert_eq!(
+            head.seq, 3,
+            "live head (3) must be preserved, not rolled back to the stale disk head (2)"
+        );
+        assert_eq!(
+            replay_texts(&events),
+            vec!["three"],
+            "the live tail survives; the stale disk must not replace it"
+        );
     }
 
     #[test]
