@@ -2927,6 +2927,53 @@ fn forward_task_progress_to_channel(
     }
 }
 
+/// Mirror a TERMINAL `BackgroundTask` snapshot onto the durable, per-session
+/// ledger as an `agent/updated` notification.
+///
+/// **Why this exists (stuck-chip root cause):** the per-turn progress channel
+/// (`forward_task_progress_to_channel` → `progress_tx`) is torn down when the
+/// spawning turn ends. A spawn_only background child that outlives its turn and
+/// only THEN goes terminal has no live receiver — the terminal `task_progress`
+/// AND `agent_updated` frames are both dropped ("terminal task update dropped:
+/// progress receiver gone"), so the client's chip never flips off
+/// "Orchestrating…".
+///
+/// [`send_notification_durable`] appends the event to the per-session ledger
+/// (in-memory ring + disk + `publish_live` broadcast) BEFORE it attempts live
+/// delivery to `ws`. That append is connection-independent, so the terminal
+/// flip survives the originating connection being gone: a reconnecting client
+/// replays it via cursor, and any sibling connection on the same session sees
+/// it on the live broadcast forwarder. The carried [`UiAgentRecord`] includes
+/// `task_id` + `status`, which the TUI uses to reconcile its chip.
+///
+/// Only TERMINAL snapshots (`completed` / `failed` / `cancelled`) are mirrored
+/// here — non-terminal updates already flow on the live per-turn channel and
+/// are coalesce-friendly, so appending each to the durable ledger would only
+/// bloat replay history with redundant in-flight states.
+fn forward_terminal_agent_update_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    task: &octos_agent::BackgroundTask,
+    runtime_profile_id: Option<&str>,
+) {
+    if !task.status.is_terminal() {
+        return;
+    }
+    let Some((session_id, agent_value)) = upsert_background_task_agent(task, runtime_profile_id)
+    else {
+        return;
+    };
+    let Ok(agent) = serde_json::from_value::<octos_core::ui_protocol::UiAgentRecord>(agent_value)
+    else {
+        return;
+    };
+    let _ = send_notification_durable(
+        ws,
+        ledger,
+        UiNotification::AgentUpdated(AgentUpdatedEvent { session_id, agent }),
+    );
+}
+
 fn forward_task_progress_json_to_channel(
     tx: &tokio::sync::mpsc::Sender<String>,
     progress_dropped: &Arc<AtomicU64>,
@@ -16189,10 +16236,28 @@ async fn run_standalone_turn(
             .clone()
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        // Stuck-chip fix: a spawn_only background task that goes TERMINAL after
+        // its spawning turn ended has no live `progress_tx_for_tasks` receiver
+        // (it was torn down at end-of-turn), so the terminal `task_progress` +
+        // `agent_updated` frames are silently dropped and the chip stays on
+        // "Orchestrating…". In addition to the best-effort per-turn channel
+        // forward below, mirror the TERMINAL agent record onto the DURABLE,
+        // connection-independent ledger (`send_notification_durable` →
+        // `ledger.append`) so a reconnecting / sibling client still observes the
+        // terminal flip via cursor replay + the live broadcast forwarder. See
+        // `forward_terminal_agent_update_durable` for the durability contract.
+        let change_ws = ws.clone();
+        let change_ledger = ledger.clone();
         task_supervisor.set_on_change(move |task| {
             forward_task_progress_to_channel(
                 &progress_tx_for_tasks,
                 &task_progress_dropped,
+                task,
+                Some(change_profile_id.as_str()),
+            );
+            forward_terminal_agent_update_durable(
+                &change_ws,
+                change_ledger.as_ref(),
                 task,
                 Some(change_profile_id.as_str()),
             );
@@ -29974,6 +30039,108 @@ ignore = []
         let event = rx.try_recv().expect("event must be available immediately");
         let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
         assert_eq!(parsed["state"], "failed");
+    }
+
+    /// Regression: a spawn_only background task that goes terminal AFTER its
+    /// spawning turn ended has no live per-turn `progress_tx` to deliver the
+    /// flip on (the receiver was torn down at end-of-turn). The per-turn
+    /// channel path drops it ("terminal task update dropped: progress receiver
+    /// gone") and the client's chip stays stuck on "Orchestrating…".
+    ///
+    /// The fix routes the TERMINAL agent-record mirror through the durable,
+    /// connection-independent ledger so a reconnecting / sibling client still
+    /// observes the terminal `agent/updated`. This pins that the ledger append
+    /// happens EVEN WHEN the per-turn progress receiver is already gone (the
+    /// `local:test` task's `progress_tx` has been dropped before the terminal
+    /// snapshot arrives).
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_agent_update_reaches_ledger_when_progress_channel_gone() {
+        // Simulate end-of-turn: the per-turn progress receiver is already gone.
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<String>(8);
+        drop(progress_rx);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(writer_tx);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey("local:test".into());
+
+        // A terminal (Failed) background task — the spawn_only child that
+        // outlived its turn and only NOW went terminal.
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000fc",
+            octos_agent::TaskStatus::Failed,
+            octos_agent::TaskRuntimeState::Failed,
+        );
+
+        // The per-turn path (best-effort, will silently drop since rx is gone)
+        // PLUS the new durable terminal path.
+        forward_task_progress_to_channel(&progress_tx, &dropped, &task, None);
+        forward_terminal_agent_update_durable(&ws, &ledger, &task, None);
+
+        // The durable ledger must carry the terminal agent/updated even though
+        // the per-turn progress receiver was gone. Replay from the start.
+        let events = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay must succeed");
+        let terminal_agent = events.iter().find_map(|event| match &event.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(agent_event))
+                if agent_event.agent.status == "failed" =>
+            {
+                Some(agent_event.clone())
+            }
+            _ => None,
+        });
+        let terminal_agent = terminal_agent.expect(
+            "durable ledger must carry the terminal agent/updated even when the per-turn progress receiver is gone",
+        );
+        assert_eq!(
+            terminal_agent.agent.task_id.as_deref(),
+            Some("01900000-0000-7000-8000-0000000000fc"),
+            "the durable agent record must carry the task_id so the TUI can reconcile its chip",
+        );
+    }
+
+    /// The durable terminal mirror must NOT fire for non-terminal snapshots —
+    /// those are coalesce-friendly and already flow on the live per-turn
+    /// channel; appending every running update to the durable ledger would
+    /// bloat replay history with redundant in-flight states.
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_terminal_mirror_skips_non_terminal_snapshots() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(writer_tx);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey("local:test".into());
+
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000bb",
+            octos_agent::TaskStatus::Running,
+            octos_agent::TaskRuntimeState::ExecutingTool,
+        );
+        forward_terminal_agent_update_durable(&ws, &ledger, &task, None);
+
+        let events = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay must succeed");
+        assert!(
+            !events.iter().any(|event| matches!(
+                &event.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(_))
+            )),
+            "non-terminal snapshots must not append an agent/updated to the durable ledger",
+        );
     }
 
     /// Re-entry parity regression (mini5 soak `12fcb8c0` + `e1f611f4`):
