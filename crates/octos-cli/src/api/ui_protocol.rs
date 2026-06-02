@@ -9869,15 +9869,28 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // of the queue can neither fill the window (starving runnable ones)
             // nor force an unbounded per-tick scan/allocation under the
             // orchestrator mutex.
+            // Request more RUNNABLE candidates than we will spawn so a
+            // candidate that can't advance this tick (already-active/occupied
+            // turn, or nothing drainable → `maybe_spawn` returns false) does not
+            // consume the per-tick spawn budget and skip runnable sessions
+            // behind it (codex round-5). Only SUCCESSFUL spawns count toward the
+            // cap. The window stays bounded (<= DRAIN_CANDIDATE_WINDOW); a
+            // session is "occupied" only while it holds an in-flight turn, so
+            // more than DRAIN_CANDIDATE_WINDOW simultaneously-occupied runnable
+            // sessions is not operationally reachable on a single serve.
             const DRAIN_SPAWN_CAP: usize = 8;
+            const DRAIN_CANDIDATE_WINDOW: usize = 64;
             let runnable = |session: &SessionKey| session_workspaces().get(session).is_some();
             let due = default_agent_orchestrator().due_loop_targets_with_filter(
                 None,
-                DRAIN_SPAWN_CAP,
+                DRAIN_CANDIDATE_WINDOW,
                 Some(&runnable),
             );
             let mut advanced = 0usize;
             for (session_id, profile_id) in due {
+                if advanced >= DRAIN_SPAWN_CAP {
+                    break;
+                }
                 if maybe_spawn_appui_master_continuation_runner(
                     &ws,
                     &state,
