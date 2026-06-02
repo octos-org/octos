@@ -213,7 +213,22 @@ impl TurnLedger {
         let Some(latest) = self.entries.back() else {
             return false;
         };
-        if latest.repeating || latest.outcome == TurnOutcome::Err {
+        // codex pre-merge P2: a single LLM response can execute MULTIPLE tools,
+        // appending several entries. Checking only `entries.back()` misses a
+        // failure/repeat in an EARLIER result of the batch when a later result
+        // succeeds — so with the default `max_quiet_turns == 0` the verifier
+        // never classifies the failure and a premature EndTurn bypasses it.
+        // Scan every UNVERIFIED entry (turn beyond `last_verified_turn`) for a
+        // problem signal.
+        let problem_in_unverified = self
+            .entries
+            .iter()
+            .filter(|e| match self.last_verified_turn {
+                Some(last) => e.turn > last,
+                None => true,
+            })
+            .any(|e| e.repeating || e.outcome == TurnOutcome::Err);
+        if problem_in_unverified {
             return true;
         }
         if max_quiet_turns == 0 {
@@ -726,6 +741,73 @@ mod tests {
         assert_eq!(first.outcome, TurnOutcome::Ok);
         assert_eq!(second.outcome, TurnOutcome::Ok);
         assert_ne!(first.result_digest, second.result_digest);
+    }
+
+    #[test]
+    fn should_verify_detects_failure_earlier_in_multi_tool_batch() {
+        // codex pre-merge P2: a multi-tool batch can have an EARLIER failure
+        // and a LATER success. With max_quiet_turns == 0, checking only the
+        // last entry would return false and skip verification. Scanning all
+        // unverified entries must catch the earlier failure.
+        let mut ledger = TurnLedger::new(None);
+        // turn 1: FAILED tool result
+        ledger.push_entry(ledger_entry_from_tool_result(
+            1,
+            Some("do thing"),
+            "check_workspace_contract",
+            &json!({"path": "."}),
+            Some(false),
+            "Error: contract failed",
+            false,
+        ));
+        // turn 1 (same batch): SUCCESSFUL tool result (the back() entry)
+        ledger.push_entry(ledger_entry_from_tool_result(
+            1,
+            Some("do other thing"),
+            "read_file",
+            &json!({"path": "ok.txt"}),
+            Some(true),
+            "file contents",
+            false,
+        ));
+        assert!(
+            matches!(
+                ledger.entries.back().map(|e| e.outcome),
+                Some(TurnOutcome::Ok)
+            ),
+            "test setup: the LAST entry must be a success (the trap)"
+        );
+        assert!(
+            ledger.should_verify_after_tool_batch(0),
+            "an earlier failure in the batch must trigger verification even though the last entry succeeded",
+        );
+    }
+
+    #[test]
+    fn should_verify_false_when_all_unverified_entries_succeed() {
+        let mut ledger = TurnLedger::new(None);
+        ledger.push_entry(ledger_entry_from_tool_result(
+            1,
+            Some("a"),
+            "read_file",
+            &json!({"path": "a"}),
+            Some(true),
+            "ok",
+            false,
+        ));
+        ledger.push_entry(ledger_entry_from_tool_result(
+            1,
+            Some("b"),
+            "read_file",
+            &json!({"path": "b"}),
+            Some(true),
+            "ok2",
+            false,
+        ));
+        assert!(
+            !ledger.should_verify_after_tool_batch(0),
+            "all-success batch with max_quiet_turns=0 must NOT trigger verification",
+        );
     }
 
     #[test]
