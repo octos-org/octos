@@ -2973,7 +2973,19 @@ impl ActorFactory {
         // matching `forward_task_status_to_actor_inbox`'s `None` call.
         #[cfg(feature = "api")]
         supervisor.set_on_terminal(move |event| {
-            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(event, None);
+            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+                event,
+                None,
+                // Gateway: failure recovery stays on the `RecoveryHint` inbox
+                // (which owns the consecutive-recovery cap + per-task claim +
+                // exhaustion banner). Routing failure through the queue too
+                // would double-deliver across two distinct channels. Only the
+                // SUCCESS outcome routes through the queue here (and it
+                // collapses against the legacy on_change ChildCompleted via
+                // the step-3 dedupe key). Step 4 retires RecoveryHint and
+                // flips this to `Queue`.
+                crate::api::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
+            );
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(

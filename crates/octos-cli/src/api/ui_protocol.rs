@@ -16279,6 +16279,10 @@ async fn run_standalone_turn(
             crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 Some(terminal_profile_id.as_str()),
+                // WS / standalone-turn path: the queue IS the only failure
+                // channel here (the legacy `set_on_failure_signal` enqueues
+                // the SAME dedupe key), so route both outcomes.
+                crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
             );
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
@@ -30370,10 +30374,12 @@ ignore = []
         crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
             &event,
             Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
         );
         crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
             &event,
             Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
         );
 
         assert_eq!(
@@ -30442,6 +30448,7 @@ ignore = []
         crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
             &event,
             Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
         );
 
         assert_eq!(
@@ -30483,10 +30490,12 @@ ignore = []
         crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
             &event,
             Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
         );
         crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
             &event,
             Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
         );
 
         let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
