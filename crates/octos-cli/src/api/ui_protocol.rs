@@ -29976,6 +29976,126 @@ ignore = []
         assert_eq!(parsed["state"], "failed");
     }
 
+    /// Re-entry parity regression (mini5 soak `12fcb8c0` + `e1f611f4`):
+    /// a SUCCESSFUL spawn_only background completion (e.g.
+    /// `run_pipeline pipeline=deep_research`) must AUTONOMOUSLY trigger the
+    /// master's re-entry without a user command. The production wiring is
+    /// the per-turn supervisor's `set_on_change` callback
+    /// (`run_standalone_turn`) → `forward_task_progress_to_channel(...,
+    /// Some(runtime_profile))` → `upsert_background_task_agent` → terminal
+    /// transition → `enqueue_agent_terminal_continuations` (`ChildCompleted`),
+    /// which the connection-independent `spawn_global_master_continuation_drain`
+    /// + AppUI tick drain via `due_loop_targets` / `drain_ready_continuations`.
+    ///
+    /// The prior coverage (`background_task_mirror_uses_agent_orchestrator_and_queues_continuations`)
+    /// calls `upsert_background_task_agent` DIRECTLY; this pins the same
+    /// behavior through the actual `set_on_change` forwarding helper, for a
+    /// `run_pipeline` spawn_only success, AND asserts the continuation is
+    /// enqueued under the THREADED runtime profile (not the `_main`
+    /// fallback that stranded re-entry before the mini5 fix) so a profile
+    /// regression here can't silently disable autonomous success re-entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentry() {
+        // Unique session + profile so the session-scoped assertions stay
+        // local under the process-wide orchestrator static (matches the
+        // isolation discipline of the spawn_only_failure WS test).
+        let session_id = SessionKey("web:reentry#spawn-only-success".to_owned());
+        let runtime_profile = "test-spawn-only-success-reentry";
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // Production-shaped run_pipeline spawn_only task: tracked under the
+        // turn's session_key, no child_session_key, terminal Completed with
+        // a delivered synthesis artifact.
+        let now = chrono::Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-00000000re01".into(),
+            tool_name: "run_pipeline".into(),
+            // Empty tool_call_id: ID-less providers (deepseek/kimi) stream
+            // none. Autonomous re-entry must not depend on a non-empty one.
+            tool_call_id: String::new(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec!["/Users/cloud/tmp/deep_research/synthesis.md".into()],
+            error: None,
+            session_key: Some(session_id.to_string()),
+            tool_input: Some(serde_json::json!({"pipeline": "deep_research"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        // The production `set_on_change` callback, threading the resolved
+        // runtime profile exactly as `run_standalone_turn` does.
+        forward_task_progress_to_channel(&tx, &dropped, &task, Some(runtime_profile));
+
+        // The terminal completion must have enqueued auto-drainable
+        // continuation(s) under the THREADED runtime profile. A
+        // single-agent terminal group enqueues BOTH `ChildCompleted` and
+        // the group's `ScatterJoinComplete` (all siblings terminal) — the
+        // important invariant is that at least one autonomous re-entry is
+        // queued and the `ChildCompleted` is present.
+        let pending = default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&session_id, runtime_profile);
+        assert!(
+            pending >= 1,
+            "successful spawn_only completion must enqueue an autonomous re-entry continuation under the runtime profile, got {pending}",
+        );
+
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            runtime_profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "spawn_only success re-entry must drain a ChildCompleted master continuation autonomously (no user command); got {:?}",
+            drained
+                .iter()
+                .map(|item| item.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        // Nothing may be stranded under the `_main` fallback profile (the
+        // pre-mini5 bug that left the completion notice never firing).
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "no continuation may be stranded under the '_main' fallback profile",
+        );
+
+        // The re-entry prompt must be system-internal so the LLM treats it
+        // as runtime guidance, not a user turn.
+        let child_completed = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .expect("ChildCompleted continuation present");
+        let prompt = master_continuation_prompt(child_completed);
+        assert!(
+            prompt.contains("[system-internal]"),
+            "autonomous re-entry prompt must be framed system-internal; got: {prompt}",
+        );
+    }
+
     // ====================================================================
     // PR G — UPCR-2026-009 / -010 / -011 / -012 handler tests
     // ====================================================================
