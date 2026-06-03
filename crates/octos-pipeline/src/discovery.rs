@@ -181,13 +181,26 @@ impl PipelineDiscovery {
         //    step 3 via `list_available`, where the ordered scan keeps them
         //    lowest precedence.
         for dir in &self.search_paths {
+            // Only treat the joined path as a LOCATED pipeline candidate when
+            // it is an actual pipeline FILE — a regular file with the `.dot`
+            // extension. `candidate.exists()` alone is over-inclusive: for a
+            // BARE name like `deep_research`, a coincidental non-`.dot` entry
+            // (e.g. a directory `<dir>/deep_research`, or a non-pipeline file)
+            // would otherwise be `read_located`'d, fail, and surface as `Read`
+            // — which BLOCKS the embedded bundled fallback even though no real
+            // `deep_research.dot` candidate exists anywhere (a true miss
+            // mis-tagged as `Read`). Narrowing to `is_dot_file` lets such a
+            // coincidence fall through to step 3 / `NotFound` so the bundled
+            // fallback can fire. A legitimate relative `.dot` path
+            // (`subdir/foo.dot`, input already carries `.dot`) is a regular
+            // `.dot` file and still resolves here.
             let candidate = dir.join(name_or_path);
-            if candidate.exists() {
+            if is_dot_file(&candidate) {
                 return read_located(&candidate).await;
             }
             // Try with .dot extension
             let with_ext = dir.join(format!("{name_or_path}.dot"));
-            if with_ext.exists() {
+            if is_dot_file(&with_ext) {
                 return read_located(&with_ext).await;
             }
         }
@@ -217,6 +230,18 @@ impl PipelineDiscovery {
             available: all.into_iter().map(|p| p.name).collect(),
         }))
     }
+}
+
+/// Whether `path` is an actual pipeline FILE — a regular file with the `.dot`
+/// extension. This is the criterion the step-2 relative-path short-circuit uses
+/// to decide whether the joined path is a LOCATED pipeline candidate.
+///
+/// `is_file()` (which follows symlinks and returns `false` for directories /
+/// missing paths) plus the `.dot` extension check together reject the
+/// over-inclusive cases — a coincidental directory or a non-`.dot` file sharing
+/// a bare pipeline name — so a true miss is not mis-tagged as a `Read` failure.
+fn is_dot_file(path: &Path) -> bool {
+    path.is_file() && path.extension().is_some_and(|e| e == "dot")
 }
 
 /// Read a LOCATED candidate file to its DOT string. A failure here is a
@@ -456,6 +481,137 @@ mod tests {
             ),
             "located-but-unreadable candidate must surface Read, NOT NotFound (which \
              would let the bundled fallback mask the broken install), got: {err:?}"
+        );
+    }
+
+    /// Gap 4.1 (codex review) — STEP 2 (the relative-path short-circuit) must
+    /// only treat `dir.join(name_or_path)` as a LOCATED pipeline candidate when
+    /// it is an actual pipeline FILE (a regular file with the `.dot`
+    /// extension). For a BARE name like `deep_research`, a coincidental
+    /// non-`.dot` entry — here a DIRECTORY `<search_dir>/deep_research` — must
+    /// NOT be treated as the located pipeline.
+    ///
+    /// RED on ffdfdb98: step 2 did `if candidate.exists() { read_located(..) }`,
+    /// so the coincidental directory matched, `read_to_string` on it failed,
+    /// and `resolve` returned `Read` — which BLOCKS the embedded bundled
+    /// fallback even though there is NO `deep_research.dot` candidate anywhere.
+    /// A true miss was mis-tagged as `Read`. GREEN after: step 2 skips the
+    /// non-`.dot` entry, resolution falls through to bare-name discovery (step
+    /// 3), and ultimately to `NotFound` so the bundled fallback can fire.
+    #[tokio::test]
+    async fn bare_name_with_coincidental_non_dot_path_is_a_true_miss_not_read() {
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+
+        // A coincidental DIRECTORY named exactly like the bare pipeline name,
+        // directly in a search path. NO `deep_research.dot` anywhere.
+        let pipelines_dir = data.path().join("pipelines");
+        std::fs::create_dir_all(pipelines_dir.join("deep_research")).unwrap();
+
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+        let err = discovery.resolve("deep_research").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineResolveError>(),
+                Some(PipelineResolveError::NotFound { .. })
+            ),
+            "a bare name whose only coincidental match is a non-`.dot` directory \
+             must surface NotFound (so the bundled fallback can fire), NOT Read \
+             (which blocks it), got: {err:?}"
+        );
+    }
+
+    /// Companion to the above: a coincidental non-`.dot` regular FILE (not a
+    /// directory) named exactly like the bare pipeline name must also be a true
+    /// miss — step 2's candidate criterion is `is_file() && ext == "dot"`, so a
+    /// `.dot`-less file is ignored too.
+    #[tokio::test]
+    async fn bare_name_with_coincidental_non_dot_file_is_a_true_miss_not_read() {
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+
+        // A coincidental plain FILE (no `.dot` extension) named like the bare
+        // pipeline name. NO `deep_research.dot` anywhere.
+        let pipelines_dir = data.path().join("pipelines");
+        std::fs::create_dir_all(&pipelines_dir).unwrap();
+        std::fs::write(pipelines_dir.join("deep_research"), "not a pipeline").unwrap();
+
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+        let err = discovery.resolve("deep_research").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineResolveError>(),
+                Some(PipelineResolveError::NotFound { .. })
+            ),
+            "a bare name whose only coincidental match is a non-`.dot` file must \
+             surface NotFound, NOT Read, got: {err:?}"
+        );
+    }
+
+    /// No-regression guard for step 2: a LEGITIMATE relative path whose input
+    /// already carries `.dot` (`subdir/foo.dot`) must STILL resolve via the
+    /// step-2 short-circuit. The fix narrows the candidate criterion to a
+    /// regular `.dot` file — it must not break the legitimate relative-`.dot`
+    /// path that step 2 exists to serve.
+    #[tokio::test]
+    async fn step2_legitimate_dot_relative_path_still_resolves() {
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+
+        // <data>/pipelines/subdir/foo.dot — reached by joining the relative
+        // input `subdir/foo.dot` onto the `<data>/pipelines` search path.
+        let subdir = data.path().join("pipelines").join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(
+            subdir.join("foo.dot"),
+            "digraph foo { a [prompt=\"RELATIVE_DOT\"] }",
+        )
+        .unwrap();
+
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+        let resolved = discovery.resolve("subdir/foo.dot").await.unwrap();
+        assert!(
+            resolved.contains("RELATIVE_DOT"),
+            "a legitimate relative `.dot` path must still resolve via step 2, got: {resolved}"
+        );
+    }
+
+    /// Close codex's noted step-1/step-2 test gap: an existing `.dot` REGULAR
+    /// FILE that fails to read (here made unreadable by removing all
+    /// permissions on Unix) must surface `Read` — the read error is propagated,
+    /// not masked or mis-tagged as a miss. This proves step 2 still hands real
+    /// `.dot` files to `read_located` (so genuine read failures reach the
+    /// tool layer's propagate-not-fallback path).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn step2_existing_dot_file_that_fails_to_read_surfaces_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+
+        // A real `.dot` file reachable by step 2 via the relative input
+        // `subdir/locked.dot`, then made unreadable.
+        let subdir = data.path().join("pipelines").join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let dot_path = subdir.join("locked.dot");
+        std::fs::write(&dot_path, "digraph locked { a [prompt=\"x\"] }").unwrap();
+        std::fs::set_permissions(&dot_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+        let result = discovery.resolve("subdir/locked.dot").await;
+
+        // Restore perms so the tempdir can be cleaned up regardless of outcome.
+        let _ = std::fs::set_permissions(&dot_path, std::fs::Permissions::from_mode(0o644));
+
+        let err = result.expect_err("an unreadable .dot file located by step 2 must Err");
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineResolveError>(),
+                Some(PipelineResolveError::Read { .. })
+            ),
+            "a located-but-unreadable `.dot` FILE must surface Read (propagated, \
+             not masked), got: {err:?}"
         );
     }
 

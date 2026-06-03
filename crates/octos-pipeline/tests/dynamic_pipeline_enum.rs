@@ -542,6 +542,58 @@ async fn corrupt_installed_pipeline_is_not_masked_by_bundled_fallback() {
     );
 }
 
+/// Gap 4.1 (codex review) — the mirror of the discovery-layer
+/// `bare_name_with_coincidental_non_dot_path_is_a_true_miss_not_read` test, but
+/// asserted at the TOOL boundary: a coincidental non-`.dot` entry that merely
+/// shares the bare pipeline name must NOT block the embedded bundled fallback.
+///
+/// Setup: a DIRECTORY `<octos_home>/pipelines/deep_research` (coincidental,
+/// non-`.dot`) exists in a search path, but there is NO `deep_research.dot`
+/// installed anywhere. The embedded bundled bytes ARE available.
+///
+/// RED on ffdfdb98: step 2 of `PipelineDiscovery::resolve` treated the
+/// coincidental directory as the located pipeline, `read_to_string` failed, and
+/// `resolve` returned `Read` — which `resolve_named_with_bundled_fallback` does
+/// NOT fall back on (it only falls back on a TRUE `NotFound` miss). So the
+/// bundled `deep_research` was unreachable and `resolve_named_for_test` errored.
+/// GREEN after: step 2 ignores the non-`.dot` directory, resolution falls
+/// through to `NotFound`, and the embedded bundled `deep_research` fires.
+#[tokio::test]
+async fn coincidental_non_dot_path_does_not_block_bundled_fallback() {
+    let working = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let octos_home = tempfile::tempdir().unwrap();
+
+    // A coincidental DIRECTORY named exactly like the bare pipeline name in a
+    // search path. There is NO `deep_research.dot` anywhere on disk.
+    let home_pipelines = octos_home.path().join("pipelines");
+    std::fs::create_dir_all(home_pipelines.join("deep_research")).unwrap();
+
+    let tool = make_tool_with_data(working.path(), data.path())
+        .await
+        .with_octos_home(PathBuf::from(octos_home.path()));
+
+    // The coincidental non-`.dot` path must NOT mis-classify as Read and block
+    // the embedded bundled fallback — `deep_research` must resolve to the
+    // bundled bytes.
+    let dot = tool.resolve_named_for_test("deep_research").await.expect(
+        "a coincidental non-`.dot` directory sharing the bare name must NOT block \
+             the embedded bundled fallback (it is a true miss, not a Read failure)",
+    );
+    assert!(
+        dot.contains("digraph deep_research"),
+        "the embedded bundled deep_research must resolve despite the coincidental \
+         non-`.dot` directory, got: {dot}"
+    );
+
+    // And the full tool path (resolve + parse + validate) must accept it.
+    let args = serde_json::json!({ "pipeline": "deep_research", "input": "x" });
+    tool.pre_flight_validate(&args).await.expect(
+        "bundled deep_research must pass pre_flight_validate even when a coincidental \
+         non-`.dot` directory shadows the bare name",
+    );
+}
+
 /// Cross-crate guard: every pipeline bundled by `octos_agent` must parse and
 /// validate clean against THIS crate's parser/validator — otherwise
 /// `pre_flight_validate` would reject the bundled fallback the moment the
