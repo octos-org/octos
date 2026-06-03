@@ -35,7 +35,14 @@ pub const OCTOS_HARNESS_TASK_ID_ENV: &str = "OCTOS_HARNESS_TASK_ID";
 pub const MAX_HARNESS_EVENT_LINE_BYTES: usize = 16 * 1024;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_TASK_ID_BYTES: usize = 128;
-const MAX_WORKFLOW_BYTES: usize = 128;
+/// Maximum byte length the validator accepts for the `workflow` (pipeline id)
+/// field on every event variant. A `workflow` over this bound makes
+/// [`HarnessEvent::validate`] (and therefore [`write_event_to_sink`]) reject
+/// the event — so producers that copy an UNBOUNDED id into `workflow` (the
+/// pipeline executor's DOT graph id) MUST truncate it to this cap at the emit
+/// site, or the event silently drops. Exposed so the producer references the
+/// canonical limit instead of a drifting magic number (Gap 4.2 / Blocker 3).
+pub const MAX_WORKFLOW_BYTES: usize = 128;
 const MAX_PHASE_BYTES: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_CREDENTIAL_ID_BYTES: usize = 256;
@@ -104,7 +111,7 @@ fn sink_write_lock(path: &Path) -> Arc<Mutex<()>> {
     let registry = SINK_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard
-        .entry(sink_key(path))
+        .entry(sink_lock_key(path))
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
 }
@@ -142,7 +149,53 @@ fn sink_key_from_raw(raw_sink: &str) -> String {
     sink_path_from_raw(raw_sink).display().to_string()
 }
 
+/// Key used for the sink-CONTEXT registry (session/task id lookup). This is
+/// matched against [`sink_key_from_raw`] (the lookup path), so it MUST stay the
+/// plain `display()` form — canonicalizing here would desync registration from
+/// lookup. Lock keying uses the separate [`sink_lock_key`] (Blocker 4).
 fn sink_key(path: &Path) -> String {
+    path.display().to_string()
+}
+
+/// Blocker 4 — derive the per-path write-LOCK key from the CANONICAL path so
+/// two lexically-different spellings of the same file (`./x` vs `/abs/x`, a
+/// symlink vs its target, `a/../b` vs `b`) map to ONE lock and therefore
+/// serialize against each other. Without canonicalization the lock is keyed by
+/// `display()` and the two spellings get DIFFERENT locks — still racy.
+///
+/// This is intentionally SEPARATE from [`sink_key`] (the context-registry key,
+/// which must stay `display()` to match the lookup path): the lock only needs a
+/// stable per-file identity; the context registry needs registration/lookup to
+/// agree on the SAME (verbatim) spelling.
+///
+/// `std::fs::canonicalize` requires the path to EXIST, but a sink file may not
+/// exist on the first write. We degrade deterministically so the SAME target
+/// always yields the SAME key regardless of which write happens first:
+///   1. canonicalize the full path if it already exists;
+///   2. else canonicalize the PARENT dir (usually exists) and re-join the file
+///      name — this collapses symlinked/relative parents the same way for the
+///      first and all subsequent writes;
+///   3. else CWD-join to absolutize a relative spelling (no FS access);
+///   4. else the raw `display()` string.
+fn sink_lock_key(path: &Path) -> String {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon.display().to_string();
+    }
+    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) {
+        // An empty parent ("x" with no dir component) canonicalizes to CWD; that
+        // is still consistent for every spelling that omits a parent, so use it.
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            return canon_parent.join(file_name).display().to_string();
+        }
+    }
+    // No FS access succeeded — CWD-join to absolutize without touching disk so a
+    // relative spelling still maps to the same key as its absolute form when the
+    // CWD is stable.
+    if path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(path).display().to_string();
+        }
+    }
     path.display().to_string()
 }
 
@@ -1977,6 +2030,164 @@ mod tests {
             WRITERS,
             "every writer's unique node id must appear exactly once"
         );
+    }
+
+    /// Blocker 4 — the per-path write lock must be keyed by the CANONICAL path
+    /// so two lexically-different spellings of the SAME file share ONE lock (and
+    /// therefore serialize). Before the fix the key was `display()`, so `a/../x`
+    /// and `x`, or `./x` and an absolute `x`, got DIFFERENT locks — still racy.
+    #[test]
+    fn canonical_path_lock_shared_across_path_spellings() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("sink.ndjson");
+        // Touch the file so `canonicalize` resolves the full path.
+        std::fs::write(&target, b"").expect("create sink");
+
+        // Spelling A: the plain absolute path.
+        let spelling_a = target.clone();
+        // Spelling B: a `dir/subdir/../sink.ndjson` detour that resolves to the
+        // same file. (`canonicalize` collapses the `..`.)
+        let detour = dir.path().join("subdir");
+        std::fs::create_dir_all(&detour).expect("subdir");
+        let spelling_b = detour.join("..").join("sink.ndjson");
+
+        assert_ne!(
+            spelling_a.display().to_string(),
+            spelling_b.display().to_string(),
+            "the two spellings must be lexically different (else the test proves nothing)"
+        );
+
+        // The canonical lock KEY must be identical for both spellings…
+        assert_eq!(
+            sink_lock_key(&spelling_a),
+            sink_lock_key(&spelling_b),
+            "canonical lock key must be identical for two spellings of the same file"
+        );
+        // …and they must therefore resolve to the SAME lock Arc (pointer-equal).
+        let lock_a = sink_write_lock(&spelling_a);
+        let lock_b = sink_write_lock(&spelling_b);
+        assert!(
+            Arc::ptr_eq(&lock_a, &lock_b),
+            "two spellings of the same file must share one write-lock Arc"
+        );
+    }
+
+    /// Blocker 4 — the lock key for a NOT-YET-EXISTENT sink (first write before
+    /// the file exists) must still be canonical and consistent: `canonicalize`
+    /// fails on a missing file, so the parent dir is canonicalized and the file
+    /// name re-joined. Two spellings whose parents differ only by a `..` detour
+    /// must still map to one lock even before the file is created.
+    #[test]
+    fn canonical_path_lock_consistent_before_file_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let detour = dir.path().join("subdir");
+        std::fs::create_dir_all(&detour).expect("subdir");
+
+        // Target does NOT exist yet (no `write`); both spellings reference it.
+        let spelling_a = dir.path().join("pending.ndjson");
+        let spelling_b = detour.join("..").join("pending.ndjson");
+        assert!(!spelling_a.exists(), "target must not exist for this test");
+
+        assert_eq!(
+            sink_lock_key(&spelling_a),
+            sink_lock_key(&spelling_b),
+            "canonical lock key must be consistent across spellings even before \
+             the sink file is created (parent-canonicalize fallback)"
+        );
+        assert!(
+            Arc::ptr_eq(&sink_write_lock(&spelling_a), &sink_write_lock(&spelling_b)),
+            "pre-creation spellings of the same file must share one lock"
+        );
+    }
+
+    /// Blocker 4 — delegation events (a custom `{schema, kind:"delegation", …}`
+    /// shape) and canonical harness events written CONCURRENTLY to the SAME sink
+    /// via the atomic helpers must produce only well-formed NDJSON: no line is
+    /// split or merged. This proves `delegate.rs`'s migration to
+    /// `write_event_line_to_sink` shares the per-path lock with `write_event_to
+    /// _sink` (the prior raw `writeln!` was UNLOCKED and could interleave).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_delegation_and_harness_writes_stay_well_formed_ndjson() {
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        register_sink_context(
+            sink_key_from_raw(&sink_uri),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-mixed-sink".to_string(),
+            },
+        );
+
+        const N: usize = 16;
+        let mut handles = Vec::new();
+        // Half write canonical harness events (write_event_to_sink); half write
+        // pre-serialized delegation-shaped lines (write_event_line_to_sink) — the
+        // exact two paths delegate.rs and the executor now share.
+        for i in 0..N {
+            let sink = sink_uri.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    let mut extra: HashMap<String, Value> = HashMap::new();
+                    extra.insert("node".to_string(), Value::String(format!("hev-{i}")));
+                    extra.insert("preview".to_string(), Value::String("h".repeat(6 * 1024)));
+                    let event = HarnessEvent::progress_with_extra(
+                        "api:session",
+                        "tc-mixed-sink",
+                        Some("research"),
+                        "node_completed",
+                        Some(format!("harness {i}")),
+                        Some(1.0),
+                        extra,
+                    );
+                    write_event_to_sink(&sink, &event).expect("write harness event");
+                } else {
+                    // A delegation-shaped line (NOT a HarnessEvent payload variant)
+                    // with a large body to widen the interleave window.
+                    let line = serde_json::json!({
+                        "schema": HARNESS_EVENT_SCHEMA_V1,
+                        "kind": "delegation",
+                        "depth": 1,
+                        "parent_task_id": format!("parent-{i}"),
+                        "child_task_id": format!("child-{i}"),
+                        "outcome": "ok",
+                        "pad": "d".repeat(6 * 1024),
+                    })
+                    .to_string();
+                    write_event_line_to_sink(&sink, &line).expect("write delegation line");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("writer task");
+        }
+
+        unregister_sink_context(&sink_key_from_raw(&sink_uri));
+
+        let contents = std::fs::read_to_string(sink_file.path()).expect("read sink");
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            N,
+            "expected exactly one whole line per writer (delegation + harness \
+             share the per-path lock); got {} lines",
+            lines.len()
+        );
+        // Every line must be complete, parseable JSON (a torn line would fail).
+        for line in &lines {
+            let v: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line must be whole JSON: {e}; line={line:?}"));
+            assert_eq!(v["schema"], HARNESS_EVENT_SCHEMA_V1, "line={line:?}");
+        }
+        let delegations = lines
+            .iter()
+            .filter(|l| l.contains("\"delegation\""))
+            .count();
+        let harness = lines
+            .iter()
+            .filter(|l| l.contains("node_completed"))
+            .count();
+        assert_eq!(delegations, N / 2, "all delegation lines present and whole");
+        assert_eq!(harness, N / 2, "all harness lines present and whole");
     }
 
     #[test]

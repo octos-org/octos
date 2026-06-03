@@ -530,6 +530,14 @@ const _: () = {
 /// `escaped(node_id) + escaped(preview) <= MAX_HARNESS_EVENT_LINE_BYTES -
 /// HARNESS_EVENT_ENVELOPE_RESERVE`. The reserve covers every other (already
 /// bounded) field plus the JSON scaffold, so the full line is under the cap.
+///
+/// One-shot "emit from the LIVE `TOOL_CTX`" path: resolves the sink + context
+/// from the task-local and delegates to [`emit_node_event_to_sink`]. The node
+/// execution paths now arm a [`NodeProgressGuard`] (which captures the sink at
+/// arm time for cancellation-safety) rather than calling this directly, so this
+/// remains as the documented direct-emit API and is exercised by the bounding
+/// tests; allow it to be dead outside `cfg(test)`.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_pipeline_node_event(
     pipeline_id: &str,
@@ -550,11 +558,59 @@ pub(crate) fn emit_pipeline_node_event(
     let Some(context) = octos_agent::harness_events::lookup_event_sink_context(&sink) else {
         return;
     };
+    emit_node_event_to_sink(
+        &sink,
+        &context,
+        pipeline_id,
+        phase,
+        message,
+        node_id,
+        node_index,
+        node_total,
+        success,
+        preview,
+    );
+}
+
+/// Lower-level node-event emit that takes the sink + context EXPLICITLY rather
+/// than reading them from the `TOOL_CTX` task-local. This is the path the RAII
+/// [`NodeProgressGuard`] uses: it captures the sink/context at ARM time (while
+/// `TOOL_CTX` is live) and replays them from `Drop`, where the task-local may be
+/// gone (cancellation drops the run future from a different context, and during
+/// a panic unwind the task-local frame may already be torn down). All field
+/// bounding (Blocker 1) and the workflow truncation (Blocker 3) live here so
+/// both the live-context [`emit_pipeline_node_event`] path and the guard-Drop
+/// path are bounded identically and the assembled line is PROVABLY emittable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_node_event_to_sink(
+    sink: &str,
+    context: &octos_agent::harness_events::HarnessEventSinkContext,
+    pipeline_id: &str,
+    phase: &str,
+    message: &str,
+    node_id: &str,
+    node_index: usize,
+    node_total: usize,
+    success: Option<bool>,
+    preview: Option<&str>,
+) {
     let progress = if node_total > 0 {
         Some((node_index as f64 / node_total as f64).clamp(0.0, 1.0))
     } else {
         None
     };
+
+    // Blocker 3 — bound the workflow (pipeline/graph) id at the emit site. The
+    // DOT parser accepts an UNBOUNDED graph id and the harness validator REJECTS
+    // a `workflow` over `MAX_WORKFLOW_BYTES`, so a long graph id would make
+    // `write_event_to_sink` reject the WHOLE event — and the preview-shrink loop
+    // can't fix it (the id is not elastic), so it would silently DROP (back to
+    // opaque). Bounding by JSON-ESCAPED length to the validator cap guarantees
+    // BOTH the raw bound (escaped ≥ raw ⇒ raw ≤ cap, so the validator passes)
+    // AND a bounded line contribution. A parsed graph id is never empty (the
+    // parser defaults to "pipeline"), so the non-empty validator rule holds.
+    let bounded_workflow =
+        bound_str_to_escaped_budget(pipeline_id, octos_agent::harness_events::MAX_WORKFLOW_BYTES);
 
     // Bound node_id to a small cap (UTF-8 safe; Gap-3.4 truncation appends a
     // marker when it shortens). This is the free-form key the call sites can't
@@ -616,7 +672,7 @@ pub(crate) fn emit_pipeline_node_event(
     let mut event = octos_agent::harness_events::HarnessEvent::progress_with_extra(
         context.session_id.clone(),
         context.task_id.clone(),
-        Some(pipeline_id),
+        Some(bounded_workflow.clone()),
         phase,
         Some(bounded_message.clone()),
         progress,
@@ -635,7 +691,7 @@ pub(crate) fn emit_pipeline_node_event(
                 event = octos_agent::harness_events::HarnessEvent::progress_with_extra(
                     context.session_id.clone(),
                     context.task_id.clone(),
-                    Some(pipeline_id),
+                    Some(bounded_workflow.clone()),
                     phase,
                     Some(bounded_message.clone()),
                     progress,
@@ -646,7 +702,7 @@ pub(crate) fn emit_pipeline_node_event(
         }
     }
     // `write_event_to_sink` re-validates + writes the single line atomically.
-    let _ = octos_agent::harness_events::write_event_to_sink(&sink, &event);
+    let _ = octos_agent::harness_events::write_event_to_sink(sink, &event);
 }
 
 /// Bound `s` so its JSON-escaped length is `<= budget`, snapping the kept
@@ -681,6 +737,140 @@ fn bound_str_to_escaped_budget(s: &str, budget: usize) -> String {
         }
     }
     s[..lo].to_string()
+}
+
+/// Gap 4.2 / Blocker 1+2 — RAII guard that pairs every `node_started` with a
+/// `node_completed` on EVERY exit path (normal completion, an early `?`-return,
+/// a panic unwind, or a cancellation that drops the run future mid-node).
+///
+/// Mirrors the [`ProcessGroupKillGuard`](octos_agent) "limits degrade, never
+/// leak" pattern: the guard emits `node_started` at construction (ARM), and its
+/// `Drop` emits a terminal `node_completed { success: false }` UNLESS the node
+/// completed normally — in which case [`NodeProgressGuard::complete`] emitted
+/// the real `node_completed` and DISARMED the guard. The result is exactly one
+/// `node_started` + exactly one `node_completed` per node that actually starts;
+/// a node whose future is never polled (a never-armed guard) emits nothing.
+///
+/// Cancellation-safety: the sink path AND the session/task context are CAPTURED
+/// at arm time (while `TOOL_CTX` is live). The `Drop` emit replays them via
+/// [`emit_node_event_to_sink`] WITHOUT reading the task-local — so it works even
+/// when the run future is dropped from a different async context (cancellation)
+/// or while the task-local frame is being torn down during a panic unwind. When
+/// no sink is attached at arm time (out-of-band callers / unit tests), the guard
+/// is inert: it emits nothing and its `Drop` is a no-op.
+///
+/// Drop is best-effort and PANIC-SAFE: it holds no locks across the emit, takes
+/// no `unwrap`, and ignores all IO errors (`emit_node_event_to_sink` already
+/// swallows write errors). A panic in `Drop` during an unwind would be a
+/// double-panic = abort, so the emit path is kept allocation-light and
+/// infallible from the guard's perspective.
+struct NodeProgressGuard {
+    /// `Some` only when a sink was attached at arm time; `None` ⇒ inert guard.
+    sink: Option<String>,
+    context: Option<octos_agent::harness_events::HarnessEventSinkContext>,
+    pipeline_id: String,
+    node_id: String,
+    label: String,
+    node_index: usize,
+    node_total: usize,
+    /// `true` until `complete()` runs; a still-armed guard emits the terminal
+    /// `node_completed { success: false }` from `Drop`.
+    armed: bool,
+}
+
+impl NodeProgressGuard {
+    /// Arm the guard: capture the sink/context from `TOOL_CTX` (synchronously,
+    /// so it survives a later cancellation/unwind) and emit `node_started`.
+    fn arm(
+        pipeline_id: &str,
+        node_id: &str,
+        label: &str,
+        node_index: usize,
+        node_total: usize,
+    ) -> Self {
+        // Capture the sink + context NOW, while the task-local is live. `None`
+        // when no sink is attached ⇒ inert guard (no emit, no-op Drop).
+        let sink = TOOL_CTX
+            .try_with(|c| c.harness_event_sink.clone())
+            .ok()
+            .flatten();
+        let context = sink
+            .as_deref()
+            .and_then(octos_agent::harness_events::lookup_event_sink_context);
+
+        let mut guard = Self {
+            sink,
+            context,
+            pipeline_id: pipeline_id.to_string(),
+            node_id: node_id.to_string(),
+            label: label.to_string(),
+            node_index,
+            node_total,
+            // Stay disarmed until the started emit lands below; a guard with no
+            // sink/context stays inert (no emit, no-op Drop).
+            armed: false,
+        };
+        guard.emit("node_started", None, None);
+        // Arm AFTER the started emit, and only when there is somewhere to write,
+        // so the Drop terminal-event path can fire on every early exit.
+        guard.armed = guard.sink.is_some() && guard.context.is_some();
+        guard
+    }
+
+    /// Emit a node event through the captured (not task-local) sink. No-op when
+    /// the guard is inert (no sink/context captured at arm time).
+    fn emit(&self, phase: &str, success: Option<bool>, preview: Option<&str>) {
+        let (Some(sink), Some(context)) = (self.sink.as_deref(), self.context.as_ref()) else {
+            return;
+        };
+        let suffix = match success {
+            Some(true) => " — done",
+            Some(false) => " — failed",
+            None => "",
+        };
+        let message = format!(
+            "{} ({} of {}){suffix}",
+            self.label, self.node_index, self.node_total
+        );
+        emit_node_event_to_sink(
+            sink,
+            context,
+            &self.pipeline_id,
+            phase,
+            &message,
+            &self.node_id,
+            self.node_index,
+            self.node_total,
+            success,
+            preview,
+        );
+    }
+
+    /// Normal-completion path: emit the real `node_completed` (with the node's
+    /// success + bounded preview) and DISARM so `Drop` does not double-emit.
+    fn complete(mut self, success: bool, preview: &str) {
+        self.emit("node_completed", Some(success), Some(preview));
+        self.armed = false;
+    }
+}
+
+impl Drop for NodeProgressGuard {
+    fn drop(&mut self) {
+        // Best-effort, panic-safe: if the node completed normally `complete()`
+        // already disarmed us. A still-armed guard means an early `?`-return,
+        // a panic unwind, or a cancellation drop happened between `node_started`
+        // and the normal completion — emit a terminal `node_completed{false}` so
+        // the chip flips off "running" instead of dangling forever.
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.emit(
+            "node_completed",
+            Some(false),
+            Some("interrupted: node did not complete (error, cancellation, or panic)"),
+        );
+    }
 }
 
 /// Shared status snapshot updated by the pipeline executor and read by the
@@ -2175,34 +2365,30 @@ impl PipelineExecutor {
                     let par_node_label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
                     // Gap 4.2 / Blocker 2 — N/M is the sub-node's 1-based
-                    // position within the fan-out. The `node_started` emit is
-                    // moved INSIDE the future (below) so a sub-node whose future
-                    // is never polled (a LATER target's prep — lookup/handler/
-                    // budget reservation — aborts the whole fan-out via `?`
-                    // before `join_all`) NEVER emits `node_started`, and so can
-                    // never dangle without a matching `node_completed`.
+                    // position within the fan-out. The RAII NodeProgressGuard is
+                    // armed INSIDE the future (after the permit is acquired) so a
+                    // sub-node whose future is never polled (a LATER target's
+                    // prep — lookup/handler/budget reservation — aborts the whole
+                    // fan-out via `?` before `join_all`) NEVER emits
+                    // `node_started`. Once armed, the guard's Drop pairs the
+                    // started with a `node_completed{false}` even if the worker
+                    // PANICS (the future unwinds; `join_all` surfaces the panic).
                     let par_node_index = target_idx + 1;
 
                     let sem = semaphore.clone();
                     let pipeline_id = graph.id.clone();
-                    let started_pipeline_id = graph.id.clone();
-                    let started_label = par_label.clone();
-                    let started_tid = tid.clone();
-                    let completed_label = par_label.clone();
-                    let completed_tid = tid.clone();
+                    let guard_label = par_label.clone();
+                    let guard_tid = tid.clone();
                     futures.push(async move {
                         let _permit = sem.acquire().await.expect("semaphore closed");
-                        // Emit `node_started` HERE — only once the future is
-                        // actually polled, guaranteeing a started/completed pair.
-                        emit_pipeline_node_event(
-                            &started_pipeline_id,
-                            "node_started",
-                            &format!("{started_label} ({par_node_index} of {total_targets})"),
-                            &started_tid,
+                        // Arm the guard HERE — only once the future is actually
+                        // polled, guaranteeing a started/completed pair.
+                        let guard = NodeProgressGuard::arm(
+                            &pipeline_id,
+                            &guard_tid,
+                            &guard_label,
                             par_node_index,
                             total_targets,
-                            None,
-                            None,
                         );
                         let start = Instant::now();
                         let result = execute_with_retries_static(
@@ -2217,13 +2403,13 @@ impl PipelineExecutor {
                         report_progress(&format!(
                             "{par_node_label}: '{par_label}' done ({n}/{total_targets}, {secs}s)"
                         ));
-                        // Gap 4.2 / Blocker 2 — structured `node_completed` for
-                        // THIS sub-node with success + a bounded preview. The
-                        // futures are `join_all`-polled on THIS task (not
-                        // `tokio::spawn`ed), so the `TOOL_CTX` task-local the
-                        // emit helper reads is preserved; concurrent emits go
-                        // through the shared append-only sink (one whole line
-                        // per `writeln!`), so interleaving can't corrupt a line.
+                        // Gap 4.2 / Blocker 2 — normal-completion path: emit the
+                        // real `node_completed` (success + bounded preview) and
+                        // disarm. The futures are `join_all`-polled on THIS task
+                        // (not `tokio::spawn`ed), so the guard's captured sink is
+                        // the same one; concurrent emits go through the shared
+                        // append-only sink (one atomic whole line each), so
+                        // interleaving can't corrupt a line.
                         let (success, preview) = match &result {
                             Ok(o) => (
                                 o.status == OutcomeStatus::Pass,
@@ -2231,19 +2417,7 @@ impl PipelineExecutor {
                             ),
                             Err(e) => (false, node_output_preview(&format!("Error: {e}"))),
                         };
-                        emit_pipeline_node_event(
-                            &pipeline_id,
-                            "node_completed",
-                            &format!(
-                                "{completed_label} ({par_node_index} of {total_targets}) — {}",
-                                if success { "done" } else { "failed" }
-                            ),
-                            &completed_tid,
-                            par_node_index,
-                            total_targets,
-                            Some(success),
-                            Some(&preview),
-                        );
+                        guard.complete(success, &preview);
                         (tid, target_with_prompt, start.elapsed(), result)
                     });
                     // Guard B: count the worker as dispatched (the
@@ -2615,32 +2789,27 @@ impl PipelineExecutor {
 
                     // Gap 4.2 / Blocker 2 — `deep_research` IS dynamic_parallel.
                     // N/M is the worker's 1-based position within the
-                    // dynamically-expanded total. The `node_started` emit is
-                    // moved INSIDE the future (below) so a worker whose future is
-                    // never polled (a LATER worker's budget reservation aborts the
+                    // dynamically-expanded total. The RAII NodeProgressGuard is
+                    // armed INSIDE the future so a worker whose future is never
+                    // polled (a LATER worker's budget reservation aborts the
                     // whole fan-out via `?` before `join_all`) NEVER emits
-                    // `node_started`, and so can never dangle without a matching
-                    // `node_completed`.
+                    // `node_started`. Once armed, the guard's Drop pairs the
+                    // started with a `node_completed{false}` even if the worker
+                    // PANICS (the future unwinds; `join_all` surfaces the panic).
                     let dp_node_index = worker_idx + 1;
 
                     let pipeline_id = graph.id.clone();
-                    let started_pipeline_id = graph.id.clone();
-                    let started_label = worker_label.clone();
-                    let started_tid = task_id.clone();
-                    let completed_label = worker_label.clone();
-                    let completed_tid = task_id.clone();
+                    let guard_label = worker_label.clone();
+                    let guard_tid = task_id.clone();
                     futures.push(async move {
-                        // Emit `node_started` HERE — only once the future is
-                        // actually polled, guaranteeing a started/completed pair.
-                        emit_pipeline_node_event(
-                            &started_pipeline_id,
-                            "node_started",
-                            &format!("{started_label} ({dp_node_index} of {total_workers})"),
-                            &started_tid,
+                        // Arm the guard HERE — only once the future is actually
+                        // polled, guaranteeing a started/completed pair.
+                        let guard = NodeProgressGuard::arm(
+                            &pipeline_id,
+                            &guard_tid,
+                            &guard_label,
                             dp_node_index,
                             total_workers,
-                            None,
-                            None,
                         );
                         let start = Instant::now();
                         let result =
@@ -2651,11 +2820,12 @@ impl PipelineExecutor {
                         report_progress(&format!(
                             "{dp_label}: '{worker_label}' done ({n}/{total_workers}, {secs}s)"
                         ));
-                        // Gap 4.2 / Blocker 2 — structured `node_completed` per
-                        // worker. Polled on THIS task via `join_all` (not
-                        // `tokio::spawn`), so the `TOOL_CTX` task-local survives;
-                        // the shared append-only sink serializes whole lines so
-                        // concurrent emits can't interleave-corrupt.
+                        // Gap 4.2 / Blocker 2 — normal-completion path: emit the
+                        // real `node_completed` (success + bounded preview) and
+                        // disarm. Polled on THIS task via `join_all` (not
+                        // `tokio::spawn`), so the guard's captured sink is the
+                        // same one; the shared append-only sink serializes whole
+                        // lines so concurrent emits can't interleave-corrupt.
                         let (success, preview) = match &result {
                             Ok(o) => (
                                 o.status == OutcomeStatus::Pass,
@@ -2663,19 +2833,7 @@ impl PipelineExecutor {
                             ),
                             Err(e) => (false, node_output_preview(&format!("Error: {e}"))),
                         };
-                        emit_pipeline_node_event(
-                            &pipeline_id,
-                            "node_completed",
-                            &format!(
-                                "{completed_label} ({dp_node_index} of {total_workers}) — {}",
-                                if success { "done" } else { "failed" }
-                            ),
-                            &completed_tid,
-                            dp_node_index,
-                            total_workers,
-                            Some(success),
-                            Some(&preview),
-                        );
+                        guard.complete(success, &preview);
                         (task_id, synth_node, start.elapsed(), result)
                     });
                     // Guard B: count this worker as dispatched (the
@@ -2826,25 +2984,22 @@ impl PipelineExecutor {
 
             let input_bytes = input_text.len();
 
-            let seq_label = node.label.as_deref().unwrap_or(&node.id);
+            let seq_label = node.label.as_deref().unwrap_or(&node.id).to_string();
             report_progress(&format!("{seq_label}: running..."));
 
-            // Gap 4.2 — structured NodeStarted into the harness.event.v1
-            // contract: node name + "N of M" so the client renders real
-            // per-node progress instead of a blind heartbeat. The 1-based
-            // index is `completed.len() + 1` (nodes finished so far + this).
+            // Gap 4.2 / Blocker 1 — RAII NodeProgressGuard pairs the
+            // `node_started` emit with a `node_completed` on EVERY exit path of
+            // this loop body: the normal-completion `guard.complete(...)` below,
+            // plus the guard's Drop for any early `?`-return (reserve_node_budget,
+            // dispatch, select_next_edge), early `return` (skipped/goal/error/
+            // budget/no-edge), a panic in the handler, or a cancellation that
+            // drops this run future mid-node. The guard captures the sink at arm
+            // time so its Drop emit survives an unwound TOOL_CTX task-local. The
+            // 1-based index is `completed.len() + 1` (nodes finished so far + this).
             let node_total = graph.nodes.len();
             let node_index = completed.len() + 1;
-            emit_pipeline_node_event(
-                &graph.id,
-                "node_started",
-                &format!("{seq_label} ({node_index} of {node_total})"),
-                &node.id,
-                node_index,
-                node_total,
-                None,
-                None,
-            );
+            let node_progress_guard =
+                NodeProgressGuard::arm(&graph.id, &node.id, &seq_label, node_index, node_total);
 
             info!(
                 node = %node.id,
@@ -3145,26 +3300,14 @@ impl PipelineExecutor {
 
             completed.insert(current_node_id.clone(), outcome.clone());
 
-            // Gap 4.2 — structured NodeCompleted into the harness.event.v1
-            // contract: node name, success, and a BOUNDED partial-output
-            // preview (Gap-3.4 truncation) so the client shows what each node
-            // produced as it lands. The preview cap keeps the frequent event
-            // small (well under the 16 KiB harness-event line cap).
+            // Gap 4.2 / Blocker 1 — normal-completion path: emit the real
+            // `node_completed` (node name, success, BOUNDED partial-output
+            // preview via Gap-3.4 truncation) AND disarm the guard so its Drop
+            // does not double-emit a terminal `node_completed{false}`. Every
+            // early-exit path above this line instead lets the guard's Drop fire.
             let node_success = outcome.status == OutcomeStatus::Pass;
             let preview = node_output_preview(&outcome.content);
-            emit_pipeline_node_event(
-                &graph.id,
-                "node_completed",
-                &format!(
-                    "{seq_label} ({node_index} of {node_total}) — {}",
-                    if node_success { "done" } else { "failed" }
-                ),
-                &node.id,
-                node_index,
-                node_total,
-                Some(node_success),
-                Some(&preview),
-            );
+            node_progress_guard.complete(node_success, &preview);
 
             // Persist mission checkpoints declared on this node (if any) and
             // the store is configured. Best-effort — a failed persist logs a
@@ -4926,5 +5069,514 @@ mod tests {
         // a plain `*`. Must clamp to u64::MAX, not wrap.
         let eta = linear_eta_secs(u64::MAX, 1, 1_000_000);
         assert_eq!(eta, Some(u64::MAX), "ETA must saturate, not overflow");
+    }
+
+    // ── Gap 4.2 / Blocker 3: an unbounded graph/workflow id must not silently
+    // DROP the whole node event (workflow > 128 B fails the validator) ───────
+
+    /// Blocker 3 (RED on cab744a4) — `emit_pipeline_node_event` copies the
+    /// graph id verbatim into the event `workflow`, but the DOT parser accepts
+    /// an UNBOUNDED graph id and the harness validator REJECTS `workflow >128 B`.
+    /// A pathological >128-byte graph id therefore makes `write_event_to_sink`
+    /// reject the event — and the preview-shrink loop can't fix it (the id is
+    /// not elastic) — so the event silently DROPS (back to opaque). After the
+    /// fix the workflow id is truncated at the emit site to the validator limit,
+    /// so the line is provably emittable with preview shrunk all the way to 0.
+    #[tokio::test]
+    async fn oversized_graph_id_node_event_still_emits() {
+        use octos_agent::harness_events::{
+            HarnessEvent, HarnessEventSinkContext, MAX_HARNESS_EVENT_LINE_BYTES,
+            attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-blocker3".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-blocker3".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // A 512-byte graph id (well over the 128-byte MAX_WORKFLOW_BYTES) plus a
+        // big preview. The id is NOT elastic, so without an emit-site bound the
+        // validator rejects the event and nothing is written.
+        let huge_graph_id = "g".repeat(512);
+        let preview = node_output_preview(&"z".repeat(50_000));
+
+        let sink_for_assert = sink_uri.clone();
+        let huge_for_assert = huge_graph_id.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                emit_pipeline_node_event(
+                    &huge_graph_id,
+                    "node_started",
+                    "analyze (1 of 2)",
+                    "analyze",
+                    1,
+                    2,
+                    None,
+                    Some(&preview),
+                );
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        let lines = std::fs::read_to_string(&sink_for_assert).expect("read sink");
+        let event_lines: Vec<&str> = lines.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            event_lines.len(),
+            1,
+            "an oversized graph id must NOT drop the event; expected exactly one \
+             node event line, got {event_lines:?}"
+        );
+        let line = event_lines[0];
+        assert!(
+            line.len() < MAX_HARNESS_EVENT_LINE_BYTES,
+            "node event line must stay under the {MAX_HARNESS_EVENT_LINE_BYTES}-byte cap; \
+             got {} bytes",
+            line.len()
+        );
+        let event =
+            HarnessEvent::from_json_line(line).expect("event must round-trip (not dropped)");
+        let detail = event.runtime_detail_value(None, None);
+        assert_eq!(detail["phase"], "node_started");
+        // The workflow id was truncated to the validator bound — prefix preserved.
+        let workflow = detail["workflow_kind"].as_str().expect("workflow present");
+        assert!(
+            workflow.len() <= 128,
+            "workflow id must be truncated to the validator bound; got {} bytes",
+            workflow.len()
+        );
+        assert!(
+            huge_for_assert.starts_with(workflow) || workflow.starts_with("gg"),
+            "truncated workflow must be a prefix of the original id; got {workflow:?}"
+        );
+    }
+
+    // ── Gap 4.2 / Blocker 1+2: NodeProgressGuard — every node_started gets a
+    // matching node_completed on EVERY exit path (error, panic, cancellation) ─
+
+    /// A test handler whose `execute` returns `Err` on the first call — drives
+    /// the SEQUENTIAL dispatch `?`-early-return path between the `node_started`
+    /// and the (skipped) `node_completed` emit.
+    struct ErroringHandler;
+    #[async_trait::async_trait]
+    impl crate::handler::Handler for ErroringHandler {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+            eyre::bail!("handler '{}' hard-errored on purpose", node.id)
+        }
+    }
+
+    /// A test handler whose `execute` PANICS — exercises the guard's Drop on
+    /// unwind (a panic between node_started and node_completed must still flip
+    /// the chip off "running").
+    struct PanickingHandler;
+    #[async_trait::async_trait]
+    impl crate::handler::Handler for PanickingHandler {
+        async fn execute(
+            &self,
+            _node: &PipelineNode,
+            _ctx: &HandlerContext,
+        ) -> Result<NodeOutcome> {
+            panic!("handler panicked on purpose");
+        }
+    }
+
+    /// A test handler that NEVER returns (parks forever) so the run future can
+    /// be polled once into the node, then dropped (cancellation) mid-node.
+    struct HangingHandler;
+    #[async_trait::async_trait]
+    impl crate::handler::Handler for HangingHandler {
+        async fn execute(
+            &self,
+            _node: &PipelineNode,
+            _ctx: &HandlerContext,
+        ) -> Result<NodeOutcome> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    fn install_handler(
+        kind: HandlerKind,
+        handler: Arc<dyn crate::handler::Handler>,
+    ) -> HandlerRegistry {
+        let mut registry = HandlerRegistry::new();
+        registry.register(kind, handler);
+        // DynamicParallel needs a (noop) registry entry even when unused.
+        registry.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        registry.register(HandlerKind::Noop, Arc::new(NoopHandler));
+        registry
+    }
+
+    /// Blocker 1 (RED on cab744a4) — a SEQUENTIAL node whose dispatch errors
+    /// (`?`-returns out of the loop between the node_started emit and the
+    /// node_completed emit) must STILL get a matching `node_completed{success:
+    /// false}` via the RAII guard's Drop — otherwise the chip is stuck "running".
+    #[tokio::test]
+    async fn sequential_dispatch_error_emits_node_completed_via_guard() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-seq-error".to_string(),
+            },
+        );
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-seq-error".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // Single codergen node whose handler hard-errors → dispatch `?`-returns.
+        let dot = r#"
+            digraph t {
+                solo [handler="codergen", prompt="go"]
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let result = TOOL_CTX
+            .scope(ctx, async move {
+                let config = make_capped_config(8).await;
+                let executor = PipelineExecutor::new(config);
+                let handlers = install_handler(HandlerKind::Codergen, Arc::new(ErroringHandler));
+                executor
+                    .run_with_handlers(dot, "seq error", &serde_json::Map::new(), handlers)
+                    .await
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+        assert!(
+            result.is_err(),
+            "erroring dispatch must surface as Err: {result:?}"
+        );
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert_eq!(
+            (started, completed),
+            (1, 1),
+            "a sequential node that errors must emit exactly one node_started AND \
+             one node_completed (no dangling); got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(n, p, s)| n == "solo" && p == "node_completed" && *s == Some(false)),
+            "the guard-Drop completion must mark the interrupted node failed; got {events:?}"
+        );
+    }
+
+    /// Blocker 1 (RED on cab744a4) — a node whose handler PANICS must still emit
+    /// `node_completed` via the guard's Drop during unwind. We catch the panic
+    /// at the run boundary so the test observes the emitted events.
+    #[tokio::test]
+    async fn sequential_panic_emits_node_completed_via_guard_drop() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-seq-panic".to_string(),
+            },
+        );
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-seq-panic".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let dot = r#"
+            digraph t {
+                solo [handler="codergen", prompt="go"]
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        // Run on a separate tokio task so the panic is contained and joined,
+        // letting the guard's Drop (synchronous emit) run during unwind.
+        let join = tokio::spawn(async move {
+            TOOL_CTX
+                .scope(ctx, async move {
+                    let config = make_capped_config(8).await;
+                    let executor = PipelineExecutor::new(config);
+                    let handlers =
+                        install_handler(HandlerKind::Codergen, Arc::new(PanickingHandler));
+                    executor
+                        .run_with_handlers(dot, "seq panic", &serde_json::Map::new(), handlers)
+                        .await
+                })
+                .await
+        })
+        .await;
+
+        detach_event_sink_context(&sink_uri);
+        assert!(
+            join.is_err(),
+            "the handler panic must propagate as a join error"
+        );
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert_eq!(
+            (started, completed),
+            (1, 1),
+            "a panicking node must still emit node_completed via guard Drop; got {events:?}"
+        );
+    }
+
+    /// Blocker 1 (RED on cab744a4) — a CANCELLED run (the run future is dropped
+    /// mid-node) must flip every started node off "running" via the guard's
+    /// Drop. The guard captures the sink at arm time, so Drop works even though
+    /// the TOOL_CTX task-local is gone when the future is dropped.
+    #[tokio::test]
+    async fn cancelled_run_emits_node_completed_via_guard_drop() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-cancel".to_string(),
+            },
+        );
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-cancel".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let dot = r#"
+            digraph t {
+                solo [handler="codergen", prompt="go"]
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                let config = make_capped_config(8).await;
+                let executor = PipelineExecutor::new(config);
+                let handlers = install_handler(HandlerKind::Codergen, Arc::new(HangingHandler));
+                let vars = serde_json::Map::new();
+                let run = executor.run_with_handlers(dot, "cancel", &vars, handlers);
+                // Drive the run far enough to enter the node (emit node_started +
+                // park on the hanging handler), then DROP it (cancellation).
+                let timed = tokio::time::timeout(Duration::from_millis(150), run).await;
+                assert!(timed.is_err(), "the hanging handler must not complete");
+                // `timed` (and the inner run future) is dropped here → guard Drop.
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert_eq!(
+            started, completed,
+            "a cancelled run must complete every started node via guard Drop; \
+             started={started} completed={completed} ({events:?})"
+        );
+        assert!(
+            started >= 1,
+            "the run must have entered the node; got {events:?}"
+        );
+    }
+
+    /// Guard happy-path regression — a SEQUENTIAL node that completes normally
+    /// must emit EXACTLY one `node_started` and EXACTLY one `node_completed`
+    /// (success): `complete()` disarms the guard so its Drop does NOT fire a
+    /// second terminal event. Locks the "exactly one started + one completed per
+    /// node that runs; no double-emit" invariant for the sequential path.
+    #[tokio::test]
+    async fn sequential_happy_path_emits_exactly_one_pair() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-seq-happy".to_string(),
+            },
+        );
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-seq-happy".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // Single noop node — completes normally; the guard must disarm.
+        let dot = r#"
+            digraph t {
+                solo [handler="noop"]
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let result = TOOL_CTX
+            .scope(ctx, async move {
+                let config = make_capped_config(8).await;
+                let executor = PipelineExecutor::new(config);
+                executor
+                    .run(dot, "seq happy", &serde_json::Map::new())
+                    .await
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+        assert!(
+            result.is_ok(),
+            "happy-path sequential run must succeed: {result:?}"
+        );
+
+        let events = drain_node_events(&sink_for_run);
+        let started: Vec<_> = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .collect();
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .collect();
+        assert_eq!(
+            (started.len(), completed.len()),
+            (1, 1),
+            "a sequential node that completes normally must emit EXACTLY one \
+             started + one completed (guard disarmed, no double-emit); got {events:?}"
+        );
+        assert_eq!(
+            completed[0].2,
+            Some(true),
+            "the normal completion must report success=true, not the guard's \
+             interrupted fallback; got {events:?}"
+        );
+    }
+
+    /// Blocker 2 (RED on cab744a4) — a PANIC inside a Parallel sub-node future
+    /// must still emit `node_completed` for that sub-node via the guard's Drop
+    /// (the future unwinds; `join_all` surfaces the panic). Without the guard,
+    /// the panicking worker's node_started dangles.
+    #[tokio::test]
+    async fn parallel_subnode_panic_emits_node_completed_via_guard_drop() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-par-panic".to_string(),
+            },
+        );
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-par-panic".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // Parallel fan-out where each sub-node is a codergen target whose
+        // handler panics. `join_all` polls the worker futures on THIS task.
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="codergen", prompt="a"]
+                merge [handler="noop"]
+                fan -> a
+                a -> merge
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let join = tokio::spawn(async move {
+            TOOL_CTX
+                .scope(ctx, async move {
+                    let config = make_capped_config(8).await;
+                    let executor = PipelineExecutor::new(config);
+                    let handlers =
+                        install_handler(HandlerKind::Codergen, Arc::new(PanickingHandler));
+                    executor
+                        .run_with_handlers(dot, "par panic", &serde_json::Map::new(), handlers)
+                        .await
+                })
+                .await
+        })
+        .await;
+
+        detach_event_sink_context(&sink_uri);
+        // The worker panic propagates through join_all → the run task panics.
+        assert!(join.is_err(), "a panicking parallel worker must propagate");
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert_eq!(
+            started, completed,
+            "every parallel sub-node that starts must emit node_completed even on \
+             panic; started={started} completed={completed} ({events:?})"
+        );
+        assert!(
+            started >= 1,
+            "the parallel worker must have started; got {events:?}"
+        );
     }
 }
