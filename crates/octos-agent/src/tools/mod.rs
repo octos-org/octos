@@ -537,6 +537,33 @@ pub trait Tool: Send + Sync {
     fn concurrency_class(&self) -> ConcurrencyClass {
         ConcurrencyClass::Safe
     }
+
+    /// Per-tool execution timeout (seconds) enforced at the registry dispatch
+    /// boundary (Gap 3.3). `None` (the default) means "use the registry's
+    /// global backstop" (`ToolRegistry::set_tool_timeout_secs`, default
+    /// 1800s). A tool that returns `Some(n)` caps its own foreground
+    /// execution at `n` seconds regardless of the registry default.
+    ///
+    /// This is the LAST line of defence against a hung foreground tool
+    /// wedging the session-actor turn forever: even direct registry callers
+    /// (e.g. the serve/API tool path, workspace-contract auto-send) that do
+    /// not run inside the agent loop's per-batch timeout get bounded here.
+    /// It composes with — and is independent of — the agent loop's
+    /// fast/long batch timeout in `agent::execution`, which fires first on
+    /// that path; this guard catches the unprotected direct-caller paths.
+    ///
+    /// `spawn_only` tools are intercepted and backgrounded BEFORE the
+    /// foreground dispatch path, so they never hit this timeout. Genuinely
+    /// long-running foreground tools (`web_fetch`, `web_search`, `browser`,
+    /// deep research/crawl) inherit the generous 1800s backstop by leaving
+    /// this `None`; the `shell` tool already clamps its own internal timeout
+    /// to [1, 600]s, well under the backstop, so it is not double-killed.
+    ///
+    /// Default: `None` (inherit the registry backstop). Keep any override
+    /// generous — this is a safety net, not a tuning knob for normal work.
+    fn execution_timeout_secs(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// LRU-based tool lifecycle manager.
