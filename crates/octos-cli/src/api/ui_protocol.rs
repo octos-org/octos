@@ -19010,7 +19010,7 @@ async fn abort_connection_turns(
 /// when a payload contains non-serializable data; treat as lifecycle).
 fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
     match app_ui_codec::to_compact_json(value) {
-        Ok(text) => Some(WsMessage::text(text)),
+        Ok(text) => Some(WsMessage::text(preview_oversized_frame(text))),
         Err(error) => {
             metrics::counter!("ws.send.error.lifecycle").increment(1);
             tracing::warn!(
@@ -19021,6 +19021,340 @@ fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
             None
         }
     }
+}
+
+/// Oversized outbound frame -> head+tail preview (truncate-in-place, NO disk).
+///
+/// Today an outbound UI-protocol frame whose serialized length exceeds
+/// [`MAX_TEXT_FRAME_BYTES`] (1 MiB) is undeliverable: the transport's
+/// `validate_text_frame_boundary` rejects it with `frame_too_large` and the
+/// content is lost ("Message too large"). This is the codex pattern for
+/// user-facing output: when a frame would exceed the cap, truncate its
+/// largest string field(s) IN PLACE to a head + tail preview (keep the
+/// beginning AND the end, drop the middle) with a byte-count marker, so the
+/// frame becomes deliverable (< 1 MiB) and the user still sees the start and
+/// the end of the dominant payload. NO disk write, NO FileRef, NO file store,
+/// NO session/owner scoping (that whole class of complexity is intentionally
+/// avoided — it is the entire point of this approach).
+///
+/// Because EVERY outbound frame flows through [`frame_for`], this covers
+/// every oversized frame type: `assistant_persisted` / `message_delta`
+/// notifications, `tool_end` errors, the legacy `MessagePersisted` /
+/// `ToolCompleted` notifications, and `session/hydrate` RPC results.
+///
+/// Algorithm (serialized frame `> MAX_TEXT_FRAME_BYTES`):
+///   1. Parse the frame JSON. Parse failure -> return the original unchanged
+///      so the transport's `frame_too_large` guard rejects it (no regression).
+///   2. Find the LARGEST string field (the dominant payload) by JSON-escaped
+///      length, descending recursively into objects/arrays.
+///   3. Rewrite that field to a head+tail preview: keep the first H and last T
+///      bytes (UTF-8 char-boundary safe — never split a codepoint), drop the
+///      middle, insert `\n…… [<N> bytes truncated] ……\n` between head and
+///      tail (N = dropped byte count of the ORIGINAL field). The field's
+///      budget is computed by ESCAPED length so the rewritten frame is
+///      provably under the target.
+///   4. Re-serialize; if still over (multiple dominant fields), truncate the
+///      next-largest field too; repeat until under cap.
+///   5. If no string field can be truncated to get under cap (a
+///      structurally-huge frame, e.g. an array of thousands of tiny items
+///      with no single dominant string) -> return the ORIGINAL unchanged so
+///      the existing `frame_too_large` behavior applies (rare; documented).
+///      Never panic, never emit an over-cap frame as if it succeeded.
+fn preview_oversized_frame(text: String) -> String {
+    // Fast path: under the cap -> byte-identical pass-through.
+    if text.len() <= MAX_TEXT_FRAME_BYTES {
+        return text;
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+        // Not parseable as JSON -> fall through to frame_too_large unchanged.
+        return text;
+    };
+
+    // Iterate: truncate the largest string field, re-measure, repeat. The
+    // bound is the number of string fields in the frame (each iteration marks
+    // one as previewed and it stops being a truncation candidate), so this
+    // terminates.
+    loop {
+        let serialized_len = match serde_json::to_string(&value) {
+            Ok(s) => s.len(),
+            // Re-serialization cannot realistically fail for a Value parsed
+            // from text, but if it ever did, fall back to the original.
+            Err(_) => return text,
+        };
+        if serialized_len <= TRUNCATED_FRAME_TARGET_BYTES {
+            // Provably under target (< MAX_TEXT_FRAME_BYTES). Emit the rewrite
+            // if we changed anything; otherwise the original under-cap text.
+            return serde_json::to_string(&value).unwrap_or(text);
+        }
+
+        // Find the largest not-yet-previewed string field.
+        let Some((path, field_escaped_len, field_raw_len)) = largest_truncatable_string(&value)
+        else {
+            // No further string field can be truncated -> structurally huge.
+            // Return the ORIGINAL frame so frame_too_large rejects it.
+            return text;
+        };
+
+        // Frame overhead = serialized frame minus this field's escaped
+        // contribution (escaped bytes + the two surrounding quote bytes). The
+        // new frame length is `overhead + 2 + new_field_escaped_len`, so to
+        // hit the target the field's escaped budget is:
+        //     budget = TARGET - overhead - 2
+        let overhead = serialized_len.saturating_sub(field_escaped_len + 2);
+        let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
+            .saturating_sub(overhead)
+            .saturating_sub(2);
+
+        let preview = match build_head_tail_preview(
+            field_at_path(&value, &path)
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            field_raw_len,
+            field_escaped_budget,
+        ) {
+            Some(preview) => preview,
+            // Even an empty preview can't fit the budget (overhead alone
+            // exceeds target — only possible with many huge sibling fields,
+            // which the iteration handles, or a pathological envelope). Mark
+            // this field as a minimal stub and continue iterating so the next
+            // field is also reduced; if nothing brings it under, the no-more-
+            // candidates branch returns the original.
+            None => UNPREVIEWABLE_STUB.to_owned(),
+        };
+        if !set_field_at_path(&mut value, &path, Value::String(preview)) {
+            // Path vanished (should not happen) -> bail to original.
+            return text;
+        }
+    }
+}
+
+/// Target serialized ceiling for a rewritten frame. Held well under the
+/// 1 MiB [`MAX_TEXT_FRAME_BYTES`] cap so the marker, JSON escaping, and the
+/// RPC envelope can never push the deliverable frame back over the hard cap.
+/// 900 KiB leaves > 124 KiB of headroom.
+const TRUNCATED_FRAME_TARGET_BYTES: usize = 900 * 1024;
+
+/// Reserved ESCAPED-length headroom for the truncation marker inserted
+/// between head and tail. The marker is `\n…… [<N> bytes truncated] ……\n`:
+/// two `\n` (escape to 2 bytes each = 4), four `…` (each a 3-byte UTF-8 char
+/// that escapes 1:1 = 12), the fixed ` [ bytes truncated] ` scaffold
+/// (~22 bytes, all 1:1), and N rendered as decimal digits (1:1). N is a byte
+/// count of a single frame field, so it is at most ~20 digits. 128 bytes is
+/// comfortably conservative; the head/tail budget reserves it so the marker
+/// can never push the field past its escaped budget.
+const MARKER_ESCAPED_RESERVE_BYTES: usize = 128;
+
+/// Minimum escaped budget below which a field cannot hold even a marker +
+/// a few bytes of head/tail; such a field is replaced with this stub so the
+/// iteration can continue reducing other fields. Rare (pathological envelope).
+const UNPREVIEWABLE_STUB: &str = "[oversized field omitted]";
+
+/// Per-byte JSON-escaped length of a UTF-8 byte buffer, EXCLUDING the
+/// surrounding quotes. Matches `serde_json`'s default string serialization
+/// (mirrors `octos_pipeline::fidelity`'s private byte-class helper; replicated
+/// here rather than taking a dependency edge on a private pipeline internal):
+/// * `"`, `\`, `\n`, `\r`, `\t`, backspace (0x08), form feed (0x0c) -> 2 bytes;
+/// * other C0 control bytes (no short escape) -> `\u00XX` = 6 bytes;
+/// * everything else (incl. multi-byte UTF-8 lead/continuation bytes) -> 1.
+///
+/// Operating on raw bytes lets us probe arbitrary offsets without panicking on
+/// a non-`&str`-boundary slice; the per-byte cost equals the char-wise escape
+/// because every UTF-8 continuation/lead byte is in the 1:1 arm.
+fn json_escaped_len_bytes(bytes: &[u8]) -> usize {
+    let mut len = 0usize;
+    for &b in bytes {
+        len += match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+    }
+    len
+}
+
+/// JSON-escaped length of a single `char`, using the same byte-class rules as
+/// [`json_escaped_len_bytes`]. Any non-ASCII scalar (>= U+0080) escapes 1:1 to
+/// its UTF-8 byte length; only the ASCII range can incur a short escape (2) or
+/// a `\u00XX` control escape (6).
+fn json_escaped_len_char(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Number of leading bytes of `s` whose JSON-escaped length fits within
+/// `escaped_budget`, stopped at a UTF-8 char boundary so a codepoint is never
+/// split. Walks chars from the front, accumulating each char's escaped cost.
+fn head_bytes_within_escaped_budget(s: &str, escaped_budget: usize) -> usize {
+    let mut used_escaped = 0usize;
+    let mut raw_end = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let cost = json_escaped_len_char(ch);
+        if used_escaped + cost > escaped_budget {
+            break;
+        }
+        used_escaped += cost;
+        raw_end = idx + ch.len_utf8();
+    }
+    raw_end
+}
+
+/// Number of trailing bytes of `s` whose JSON-escaped length fits within
+/// `escaped_budget`, stopped at a UTF-8 char boundary. Walks chars from the
+/// back. Returns the raw byte length of the kept suffix.
+fn tail_bytes_within_escaped_budget(s: &str, escaped_budget: usize) -> usize {
+    let mut used_escaped = 0usize;
+    let mut raw_start = s.len();
+    for (idx, ch) in s.char_indices().rev() {
+        let cost = json_escaped_len_char(ch);
+        if used_escaped + cost > escaped_budget {
+            break;
+        }
+        used_escaped += cost;
+        raw_start = idx;
+    }
+    s.len() - raw_start
+}
+
+/// Build a head+tail preview string for `field` whose JSON-ESCAPED length is
+/// `<= field_escaped_budget`. Keeps the first H and last T bytes (UTF-8 safe),
+/// dropping the middle, with `\n…… [<N> bytes truncated] ……\n` between them
+/// (N = `original_raw_len` minus kept head+tail bytes). Returns `None` when
+/// the budget cannot even hold the marker plus a non-empty head, so the caller
+/// can fall back. Head-leaning 50/50 split of the post-marker budget.
+fn build_head_tail_preview(
+    field: &str,
+    original_raw_len: usize,
+    field_escaped_budget: usize,
+) -> Option<String> {
+    // Reserve room for the marker; the rest is head + tail.
+    let content_escaped_budget = field_escaped_budget.checked_sub(MARKER_ESCAPED_RESERVE_BYTES)?;
+    if content_escaped_budget == 0 {
+        return None;
+    }
+    // Head-leaning split: head gets the ceil-half, tail the floor-half.
+    let head_escaped_budget = content_escaped_budget.div_ceil(2);
+    let tail_escaped_budget = content_escaped_budget - head_escaped_budget;
+
+    let head_len = head_bytes_within_escaped_budget(field, head_escaped_budget);
+    // The tail must not overlap the head.
+    let remaining = &field[head_len..];
+    let tail_len = tail_bytes_within_escaped_budget(remaining, tail_escaped_budget);
+
+    let head = &field[..head_len];
+    let tail = &field[field.len() - tail_len..];
+    let dropped = original_raw_len.saturating_sub(head_len + tail_len);
+
+    // If we kept the entire field (nothing dropped) the preview would not be a
+    // truncation at all; that only happens when the field already fit the
+    // budget, which the caller's serialized-size loop would not have reached.
+    Some(format!("{head}\n…… [{dropped} bytes truncated] ……\n{tail}"))
+}
+
+/// A path into a JSON value: object keys and array indices.
+#[derive(Clone)]
+enum PathSeg {
+    Key(String),
+    Index(usize),
+}
+
+/// Find the largest truncatable string field by JSON-escaped length, returning
+/// its path, escaped length, and raw byte length. A string is "truncatable"
+/// only if shrinking it could meaningfully reduce the frame — we skip strings
+/// that are already shorter than a marker would be (no gain) and the
+/// already-inserted [`UNPREVIEWABLE_STUB`] / our marker scaffold (idempotent).
+fn largest_truncatable_string(value: &Value) -> Option<(Vec<PathSeg>, usize, usize)> {
+    let mut best: Option<(Vec<PathSeg>, usize, usize)> = None;
+    let mut path: Vec<PathSeg> = Vec::new();
+    walk_for_largest_string(value, &mut path, &mut best);
+    best
+}
+
+fn walk_for_largest_string(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    best: &mut Option<(Vec<PathSeg>, usize, usize)>,
+) {
+    match value {
+        Value::String(s) => {
+            // Only consider strings large enough that truncating them yields a
+            // net reduction (must exceed the marker reserve + a small head/tail
+            // floor, else there is no point).
+            let escaped = json_escaped_len_bytes(s.as_bytes());
+            if escaped > MARKER_ESCAPED_RESERVE_BYTES + 32 && !s.contains("bytes truncated") {
+                let is_better = match best {
+                    Some((_, best_escaped, _)) => escaped > *best_escaped,
+                    None => true,
+                };
+                if is_better {
+                    *best = Some((path.clone(), escaped, s.len()));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(idx));
+                walk_for_largest_string(item, path, best);
+                path.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(PathSeg::Key(key.clone()));
+                walk_for_largest_string(item, path, best);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve a path to a `&Value` (for reading the current field text).
+fn field_at_path<'a>(value: &'a Value, path: &[PathSeg]) -> Option<&'a Value> {
+    let mut current = value;
+    for seg in path {
+        current = match (current, seg) {
+            (Value::Object(map), PathSeg::Key(key)) => map.get(key)?,
+            (Value::Array(items), PathSeg::Index(idx)) => items.get(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Replace the value at `path` with `new_value`. Returns false if the path no
+/// longer resolves.
+fn set_field_at_path(value: &mut Value, path: &[PathSeg], new_value: Value) -> bool {
+    let mut current = value;
+    for (i, seg) in path.iter().enumerate() {
+        let is_last = i + 1 == path.len();
+        match (current, seg) {
+            (Value::Object(map), PathSeg::Key(key)) => {
+                let Some(slot) = map.get_mut(key) else {
+                    return false;
+                };
+                if is_last {
+                    *slot = new_value;
+                    return true;
+                }
+                current = slot;
+            }
+            (Value::Array(items), PathSeg::Index(idx)) => {
+                let Some(slot) = items.get_mut(*idx) else {
+                    return false;
+                };
+                if is_last {
+                    *slot = new_value;
+                    return true;
+                }
+                current = slot;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn appui_evidence_dir() -> Option<PathBuf> {
@@ -35732,5 +36066,234 @@ ignore = []
             c.remove(&key_a2);
             c.remove(&key_b1);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Oversized outbound frame -> head+tail preview (truncate-in-place, no
+    // disk). codex-style head-tail truncation + a `[N bytes truncated]`
+    // marker so the offending frame becomes deliverable (< 1 MiB) and the
+    // user sees the beginning AND the end of the dominant payload.
+    // ---------------------------------------------------------------------
+
+    /// Build an over-cap text frame whose `params.text` field holds `body`.
+    /// The envelope around it (method/jsonrpc/keys) is small and fixed, so a
+    /// `body` slightly over `MAX_TEXT_FRAME_BYTES` forces the whole frame
+    /// over the cap.
+    fn oversized_text_frame(body: &str) -> String {
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": {
+                "session_id": "local:test",
+                "turn_id": "turn-1",
+                "text": body,
+            }
+        });
+        app_ui_codec::to_compact_json(&value).expect("serialize over-cap frame")
+    }
+
+    #[test]
+    fn under_cap_frame_passes_through_byte_identical() {
+        let frame = oversized_text_frame("a small body");
+        assert!(
+            frame.len() <= MAX_TEXT_FRAME_BYTES,
+            "fixture must be under the cap for this test"
+        );
+        let out = preview_oversized_frame(frame.clone());
+        assert_eq!(out, frame, "under-cap frame must be byte-identical");
+    }
+
+    #[test]
+    fn oversized_frame_with_one_dominant_string_becomes_head_tail_preview_under_cap() {
+        // A dominant string field well over the 1 MiB cap. Distinct head/tail
+        // sentinels let us assert both ends survived.
+        let head_sentinel = "HEAD_START_SENTINEL_0123456789";
+        let tail_sentinel = "TAIL_END_SENTINEL_9876543210";
+        let middle = "M".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        let body = format!("{head_sentinel}{middle}{tail_sentinel}");
+        let frame = oversized_text_frame(&body);
+        assert!(
+            frame.len() > MAX_TEXT_FRAME_BYTES,
+            "fixture must exceed the cap (RED: rejected as frame_too_large at base)"
+        );
+
+        let out = preview_oversized_frame(frame);
+
+        // Deliverable: strictly under the cap and single-line (no raw CR/LF).
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "rewritten frame must be < MAX_TEXT_FRAME_BYTES, got {}",
+            out.len()
+        );
+        assert!(
+            !out.contains('\n') && !out.contains('\r'),
+            "rewritten frame must remain a single-line JSON object"
+        );
+
+        // Round-trips as valid JSON; the offending field holds head, tail, and
+        // the truncation marker.
+        let parsed: Value = serde_json::from_str(&out).expect("rewritten frame is valid JSON");
+        let text = parsed["params"]["text"]
+            .as_str()
+            .expect("text field present");
+        assert!(
+            text.starts_with(head_sentinel),
+            "head of the original payload must be preserved"
+        );
+        assert!(
+            text.ends_with(tail_sentinel),
+            "tail of the original payload must be preserved"
+        );
+        assert!(
+            text.contains("bytes truncated"),
+            "a byte-count truncation marker must be inserted, got: {}",
+            &text[..text.len().min(120)]
+        );
+    }
+
+    #[test]
+    fn truncation_marker_reports_dropped_byte_count_accurately() {
+        let head_sentinel = "H".repeat(64);
+        let tail_sentinel = "T".repeat(64);
+        let original_field_len = {
+            let middle = "x".repeat(MAX_TEXT_FRAME_BYTES + 8192);
+            head_sentinel.len() + middle.len() + tail_sentinel.len()
+        };
+        let middle = "x".repeat(MAX_TEXT_FRAME_BYTES + 8192);
+        let body = format!("{head_sentinel}{middle}{tail_sentinel}");
+        assert_eq!(body.len(), original_field_len);
+        let frame = oversized_text_frame(&body);
+
+        let out = preview_oversized_frame(frame);
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        let text = parsed["params"]["text"].as_str().expect("text field");
+
+        // Parse N out of the marker `…… [<N> bytes truncated] ……`.
+        let marker_n = text
+            .split("[")
+            .nth(1)
+            .and_then(|s| s.split(" bytes truncated]").next())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .expect("marker carries a byte count");
+
+        // head bytes + tail bytes kept; N = original - kept.
+        let head_kept = text
+            .find("……")
+            .or_else(|| text.find('['))
+            .map(|i| text[..i].trim_end().len())
+            .unwrap_or(0);
+        let tail_kept = {
+            let after = text.rsplit("……").next().unwrap_or("");
+            after.trim_start().len()
+        };
+        // The dropped count plus what we kept must equal the original field
+        // length (head_kept + tail_kept + N == original).
+        assert_eq!(
+            head_kept + tail_kept + marker_n,
+            original_field_len,
+            "marker N must equal dropped bytes: head_kept={head_kept} tail_kept={tail_kept} N={marker_n}"
+        );
+    }
+
+    #[test]
+    fn oversized_frame_with_multibyte_and_control_bytes_is_boundary_safe_and_under_cap() {
+        // A body mixing a 3-byte CJK glyph (escapes 1:1) and a C0 control byte
+        // 0x01 (escapes to , 6 bytes). The 6x-escaping body is the worst
+        // case for the serialized bound; the head/tail cut must never split a
+        // codepoint and the final frame must still be < 1 MiB.
+        let unit = "情\u{0001}"; // 3 bytes + 1 byte = 4 bytes raw, escapes to 3 + 6 = 9
+        let body = unit.repeat((MAX_TEXT_FRAME_BYTES / unit.len()) + 4096);
+        assert!(body.len() > MAX_TEXT_FRAME_BYTES);
+        let frame = oversized_text_frame(&body);
+
+        let out = preview_oversized_frame(frame);
+
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "control-byte-heavy frame must be < cap after escaping, got {}",
+            out.len()
+        );
+        // No panic, valid JSON, no split codepoint (from_str would reject an
+        // invalid \uXXXX surrogate or a sliced multi-byte char anyway).
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON after escaping");
+        let text = parsed["params"]["text"].as_str().expect("text field");
+        // The head region (before the marker) and tail region (after it) must
+        // each contain ONLY full codepoints of the original alphabet — proving
+        // the cut never split a multi-byte glyph nor a control byte. The marker
+        // itself legitimately carries ASCII scaffold + `…` + `\n`.
+        let (head, rest) = text.split_once("\n…… [").expect("head + marker scaffold");
+        let (_, tail) = rest.split_once("] ……\n").expect("marker scaffold + tail");
+        for region in [head, tail] {
+            for ch in region.chars() {
+                assert!(
+                    ch == '情' || ch == '\u{0001}',
+                    "non-alphabet char leaked into a preserved region (split codepoint?): {ch:?}"
+                );
+            }
+        }
+        // head + tail of the original survive.
+        assert!(text.starts_with('情'));
+    }
+
+    #[test]
+    fn oversized_frame_with_multiple_large_fields_iterates_until_under_cap() {
+        // Two fields each ~0.7 MiB: neither alone exceeds the cap, but the
+        // envelope sum does. Truncating only the larger one is insufficient;
+        // the helper must iterate to the second field too.
+        let big_a = "A".repeat(700 * 1024);
+        let big_b = "B".repeat(700 * 1024);
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": {
+                "session_id": "local:test",
+                "turn_id": "turn-1",
+                "field_a": big_a,
+                "field_b": big_b,
+            }
+        });
+        let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+        assert!(frame.len() > MAX_TEXT_FRAME_BYTES);
+
+        let out = preview_oversized_frame(frame);
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "multi-field frame must iterate to < cap, got {}",
+            out.len()
+        );
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(parsed["params"]["field_a"].is_string());
+        assert!(parsed["params"]["field_b"].is_string());
+    }
+
+    #[test]
+    fn structurally_huge_frame_with_no_dominant_string_falls_back_to_original() {
+        // Thousands of tiny string items: no single dominant string can be
+        // truncated to bring the array under the cap. Helper must return the
+        // ORIGINAL unchanged so the transport's frame_too_large guard rejects
+        // it (no panic, no over-cap rewrite that claims success).
+        let items: Vec<String> = (0..200_000).map(|i| format!("i{i}")).collect();
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": { "items": items }
+        });
+        let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+        assert!(frame.len() > MAX_TEXT_FRAME_BYTES);
+
+        let out = preview_oversized_frame(frame.clone());
+        assert_eq!(
+            out, frame,
+            "structurally-huge frame with no dominant string must be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn non_json_oversized_frame_is_returned_unchanged() {
+        // Defensive: a frame that fails to parse must not panic; it falls
+        // through to the existing frame_too_large path unchanged.
+        let frame = "x".repeat(MAX_TEXT_FRAME_BYTES + 16);
+        let out = preview_oversized_frame(frame.clone());
+        assert_eq!(out, frame);
     }
 }
