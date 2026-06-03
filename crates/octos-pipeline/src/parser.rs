@@ -60,6 +60,7 @@ impl<'a> DotParser<'a> {
             default_model: None,
             max_total_tokens: None,
             default_timeout_secs: None,
+            result_fidelity: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
@@ -503,6 +504,12 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     // ("2400") or a suffixed duration ("40m", "2400s", "1h").
     if let Some(timeout) = attrs.get("default_timeout_secs") {
         graph.default_timeout_secs = parse_duration_secs(timeout);
+    }
+    // Gap 3.4: per-pipeline result-size fidelity. Accepts "full",
+    // "compact", "truncate:N", "summary:N". An unparseable value leaves
+    // `result_fidelity` as `None`, so the default ceiling still applies.
+    if let Some(fidelity) = attrs.get("result_fidelity") {
+        graph.result_fidelity = crate::fidelity::FidelityMode::parse(fidelity);
     }
 }
 
@@ -1171,6 +1178,55 @@ mod tests {
         "#;
         let graph = parse_dot(dot).unwrap();
         assert!(graph.default_timeout_secs.is_none());
+    }
+
+    /// Gap 3.4: the DOT graph attribute `result_fidelity` is parsed into
+    /// `PipelineGraph::result_fidelity` so a pipeline can explicitly annotate
+    /// how its result is bounded, overriding the default ceiling.
+    #[test]
+    fn should_parse_graph_result_fidelity_truncate() {
+        let dot = r#"
+            digraph test {
+                graph [result_fidelity="truncate:50000"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.result_fidelity,
+            Some(crate::fidelity::FidelityMode::Truncate { max_chars: 50000 })
+        );
+    }
+
+    /// `result_fidelity="full"` is the explicit opt-out of the default
+    /// result ceiling.
+    #[test]
+    fn should_parse_graph_result_fidelity_full() {
+        let dot = r#"
+            digraph test {
+                graph [result_fidelity="full"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.result_fidelity,
+            Some(crate::fidelity::FidelityMode::Full)
+        );
+    }
+
+    /// Backward-compat: when `result_fidelity` is absent the field stays
+    /// `None`, so `RunPipelineTool` applies the DEFAULT ceiling.
+    #[test]
+    fn should_leave_result_fidelity_none_when_attribute_absent() {
+        let dot = r#"
+            digraph test {
+                graph [label="no fidelity here"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.result_fidelity.is_none());
     }
 
     #[test]

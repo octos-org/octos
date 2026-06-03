@@ -757,10 +757,14 @@ impl Tool for RunPipelineTool {
         // raised from 1800 → 3600 so honest deep research with crawl +
         // synthesize on slow LLM lanes has room to finish without
         // synthesize-node starvation.
-        let dot_default_timeout = crate::parser::parse_dot(&dot_content)
-            .ok()
-            .and_then(|g| g.default_timeout_secs);
+        let parsed_graph = crate::parser::parse_dot(&dot_content).ok();
+        let dot_default_timeout = parsed_graph.as_ref().and_then(|g| g.default_timeout_secs);
         let timeout_secs = resolve_pipeline_timeout(input.timeout_secs, dot_default_timeout);
+        // Gap 3.4: per-pipeline result-size fidelity annotation (if any).
+        // `Some(mode)` WINS over the default ceiling; `None` lets the
+        // default ceiling degrade an oversized result. Cloned out of the
+        // parsed graph here so it survives the executor.run() borrow below.
+        let declared_result_fidelity = parsed_graph.and_then(|g| g.result_fidelity);
 
         let executor = PipelineExecutor::new(config);
         let result = tokio::time::timeout(
@@ -919,10 +923,24 @@ impl Tool for RunPipelineTool {
         // boundary before we extended `ToolResult` with `structured_metadata`.
         let structured_metadata = node_costs_metadata(&result.node_costs);
 
+        // Gap 3.4 — DEGRADE, don't wedge. Bound the result body that becomes
+        // the tool-result text (and downstream AppUI frame). An explicit
+        // per-pipeline `result_fidelity` annotation WINS; otherwise the
+        // DEFAULT ceiling truncates an oversized result with a byte-accurate
+        // `[truncated: N of M bytes]` marker so it can never trip the 1 MiB
+        // `frame_too_large` cliff at the frame layer (Gap 3.1's spill is the
+        // complementary outbound-FileRef direction). The full, un-bounded
+        // output is still spilled to the synthesized .md report above and
+        // delivered as a file, so nothing is lost.
+        let bounded_output = crate::fidelity::apply_result_ceiling(
+            &result.output,
+            declared_result_fidelity.as_ref(),
+        );
+
         Ok(ToolResult {
             output: format!(
                 "{}\n\n---\nPipeline execution summary:\n{summary}\nTotal: {} input + {} output tokens",
-                result.output, result.token_usage.input_tokens, result.token_usage.output_tokens,
+                bounded_output, result.token_usage.input_tokens, result.token_usage.output_tokens,
             ),
             success: result.success,
             tokens_used: Some(result.token_usage),
