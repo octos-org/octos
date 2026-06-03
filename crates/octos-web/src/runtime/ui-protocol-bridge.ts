@@ -19,6 +19,13 @@
 //   2. Validates the wire payload against the existing TS `Envelope`
 //      type at `ui-protocol-types.ts:219-229`. Malformed envelopes are
 //      rejected (logged + counted in `bridge_malformed_total`).
+//      NOTE (feat(envelope-wire-routing)): the wire now also carries
+//      `session_id` (+ optional `topic`) FLATTENED alongside the bare
+//      `Envelope` fields for multi-session routing (spec § 14.1). This
+//      bridge reads only `thread_id`/`seq`/`payload`/`client_message_id`
+//      and IGNORES the extra routing keys — the web SPA holds a single
+//      session per connection, so they are not needed here. The cast to
+//      `Envelope` is intentionally tolerant of the extra keys.
 //   3. Enforces the hard barrier from spec § 14.6 — once a
 //      `turn_completed` envelope arrives for `thread_id` T, any
 //      subsequent envelope on the same thread is DROPPED and the drop

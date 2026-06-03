@@ -3171,31 +3171,38 @@ pub struct Envelope {
 /// Ledger / wire wrapper around [`Envelope`] for the
 /// `projection/envelope` notification (UPCR-2026-014 M9-γ).
 ///
-/// The wire JSON-RPC `params` field MUST match the spec § 14.1 wire
-/// shape exactly — `{ thread_id, seq, client_message_id?, payload }` —
-/// with **no `session_id`** key. But the in-memory ledger needs the
-/// `SessionKey` to route the event to the right per-session ring and
-/// broadcast channel, and it needs the optional `topic` so the
-/// topic-scope live filter (`ledger_event_matches_topic_scope`) keeps
-/// envelopes flowing to the right subscriber pane.
+/// The in-memory ledger needs the `SessionKey` to route the event to
+/// the right per-session ring and broadcast channel, and it needs the
+/// optional `topic` so the topic-scope live filter
+/// (`ledger_event_matches_topic_scope`) keeps envelopes flowing to the
+/// right subscriber pane. This wrapper carries those routing fields
+/// **outside** of the `envelope` body so the durable ledger can persist
+/// them and recovery can rebuild the routing context after restart.
 ///
-/// This wrapper carries those routing fields **outside** of the
-/// `envelope` body so the durable ledger can persist them and recovery
-/// can rebuild the routing context after restart.
+/// **Wire shape (spec § 14.1, feat(envelope-wire-routing)):** the
+/// JSON-RPC `params` field is the bare `Envelope` fields FLATTENED with
+/// the routing keys — `{ thread_id, seq, client_message_id?, payload,
+/// session_id, topic? }`. `session_id` is the bare base key so a
+/// multi-session client can route the envelope to the correct session;
+/// `topic` is omitted when `None`. This replaces the original
+/// bare-`Envelope`-only wire (no routing keys), which left a
+/// multi-session consumer with an unroutable empty `session_id`. The
+/// flatten keeps the bare keys at the top level, so a tolerant client
+/// that reads `thread_id`/`seq`/`payload` top-level and ignores unknown
+/// keys (the octos-web bridge) decodes it unchanged; the decoder also
+/// accepts an OLD frame lacking `session_id` (defaults to empty / None).
+/// The wire DTO is [`EnvelopeWire`]; serialization happens only at the
+/// JSON-RPC boundary in [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`].
 ///
-/// **Serialization split (codex #1336 round-2 BLOCKER 4):** the global
-/// `Serialize` / `Deserialize` derive includes ALL fields (envelope +
-/// session_id + topic) so the DURABLE LEDGER round-trips routing
-/// state across daemon restart. The wire shape — bare `Envelope` per
-/// spec § 14.1 — is opted into only at the JSON-RPC boundary in
-/// [`UiNotification::into_rpc_notification`] /
-/// [`UiNotification::from_method_and_params`], where the bare
-/// envelope is extracted/re-wrapped. This is the "structurally honest"
-/// answer: a single global Serialize that strips routing fields means
-/// the ledger's disk records also strip them, and recovery walks the
-/// disk back into an `EnvelopeNotification` with empty `session_id` /
-/// `None` topic — topic-scoped envelope replay after restart silently
-/// loses routing.
+/// **Disk shape (codex #1336 round-2 BLOCKER 4 — UNCHANGED):** the
+/// global `Serialize` / `Deserialize` derive on this struct includes ALL
+/// fields (envelope + session_id + topic) as a NESTED `{ session_id,
+/// topic, envelope }` object so the DURABLE LEDGER round-trips routing
+/// state across daemon restart. BLOCKER 4's invariant — disk records
+/// must not lose routing, else topic-scoped replay after restart
+/// mis-routes — holds: the wire DTO above does not touch this derive,
+/// so the disk path is byte-for-byte identical to before this change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopeNotification {
     /// Session this envelope belongs to. Used for ledger routing and
@@ -3213,6 +3220,44 @@ pub struct EnvelopeNotification {
     pub topic: Option<String>,
     /// The canonical wire envelope — serializes verbatim per spec § 14.1.
     pub envelope: Envelope,
+}
+
+/// Wire DTO for the `projection/envelope` JSON-RPC notification
+/// (feat(envelope-wire-routing)).
+///
+/// This is the shape on the WIRE — distinct from the on-disk derive of
+/// [`EnvelopeNotification`]. The bare [`Envelope`] fields are
+/// `#[serde(flatten)]`-ed to the top level (`thread_id`, `seq`,
+/// `client_message_id?`, `payload`) so an older/tolerant client decodes
+/// them unchanged, and the routing keys `session_id` + `topic` sit
+/// alongside them. Used ONLY at the JSON-RPC boundary in
+/// [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`]; the durable ledger never
+/// serializes through this type.
+///
+/// Backward-compatible on decode: `session_id` defaults to the empty
+/// [`SessionKey`] and `topic` to `None` when an OLD bare-envelope frame
+/// (no routing keys) is received.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EnvelopeWire {
+    /// Bare base session key for client-side routing. Defaults to the
+    /// empty key for legacy frames that predate this wire field.
+    #[serde(default = "empty_session_key")]
+    session_id: SessionKey,
+    /// Optional topic for topic-scoped routing. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    /// Bare envelope fields, flattened to the top level so the wire is
+    /// `{ thread_id, seq, client_message_id?, payload, session_id,
+    /// topic? }`.
+    #[serde(flatten)]
+    envelope: Envelope,
+}
+
+/// Serde default for the wire `session_id`: the empty session key, used
+/// when an OLD bare-envelope frame (no routing keys) is decoded.
+fn empty_session_key() -> SessionKey {
+    SessionKey(String::new())
 }
 
 /// Draft command payloads for UI protocol v1.
@@ -5355,14 +5400,31 @@ impl UiNotification {
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
-            // UPCR-2026-014 (M9-γ): the wire shape per spec § 14.1 is the
-            // bare `Envelope` — `session_id` and `topic` are server-internal
-            // routing fields stripped here at the JSON-RPC boundary. The
-            // `EnvelopeNotification` struct itself uses a derive-based
-            // `Serialize` so the durable ledger persists routing fields
-            // on disk; recovery rebuilds them before rebroadcasting (codex
-            // #1336 round-2 BLOCKER 4).
-            Self::Envelope(params) => serde_json::to_value(&params.envelope),
+            // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
+            // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
+            // with the routing keys `session_id` (the bare base key) +
+            // optional `topic`, i.e. `{ thread_id, seq, client_message_id?,
+            // payload, session_id, topic? }`. A multi-session client routes
+            // on `session_id`; a topic-scoped pane routes on `topic`.
+            //
+            // The flatten keeps the bare Envelope keys at the TOP level so
+            // an older/tolerant client (e.g. the octos-web bridge) that
+            // reads `thread_id`/`seq`/`payload` top-level and ignores
+            // unknown keys decodes it unchanged. The matching decoder in
+            // `from_method_and_params` accepts an OLD frame lacking
+            // `session_id` (defaults to empty / `None`).
+            //
+            // Codex #1336 round-2 BLOCKER 4 required that the DURABLE
+            // LEDGER preserve routing on disk: that invariant is unchanged
+            // — the disk path uses the derive-based `Serialize` on
+            // `EnvelopeNotification` (nested `{ session_id, topic,
+            // envelope }`), which this wire DTO does NOT touch. Only the
+            // WIRE is un-stripped here.
+            Self::Envelope(params) => serde_json::to_value(&EnvelopeWire {
+                session_id: params.session_id.clone(),
+                topic: params.topic.clone(),
+                envelope: params.envelope,
+            }),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -5440,24 +5502,22 @@ impl UiNotification {
             methods::SESSION_ORCHESTRATION => {
                 Ok(Self::SessionOrchestration(decode_params(method, params)?))
             }
-            // UPCR-2026-014 (M9-γ): decode the bare wire envelope into the
-            // wrapper; `session_id` and `topic` default to empty/None and
-            // are reconstituted from the ambient ledger context by the
-            // server-side decode path (the ledger never round-trips a
-            // wire-only envelope back into routing).
-            //
-            // Codex #1336 round-2 BLOCKER 4: the JSON-RPC params carry
-            // ONLY the bare `Envelope` (the wire shape per spec § 14.1) —
-            // decode it into `Envelope` directly and wrap with empty
-            // routing fields. The full-struct `EnvelopeNotification`
-            // serialization is used by the ledger ONLY on disk, never
-            // on the wire.
+            // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
+            // the FLATTENED wire frame — bare Envelope keys plus the
+            // routing keys `session_id` + `topic`. Backward-compatible:
+            // an OLD bare-envelope frame that omits `session_id` /
+            // `topic` decodes with `session_id` defaulting to the empty
+            // `SessionKey` and `topic` to `None` (the `#[serde(default)]`
+            // on `EnvelopeWire`), so a legacy producer never errors here.
+            // A multi-session consumer routes on the recovered
+            // `session_id`; for a legacy empty key it falls back to its
+            // ambient connection context.
             methods::PROJECTION_ENVELOPE => {
-                let envelope: Envelope = decode_params(method, params)?;
+                let wire: EnvelopeWire = decode_params(method, params)?;
                 Ok(Self::Envelope(EnvelopeNotification {
-                    session_id: SessionKey(String::new()),
-                    topic: None,
-                    envelope,
+                    session_id: wire.session_id,
+                    topic: wire.topic,
+                    envelope: wire.envelope,
                 }))
             }
             _ => Err(RpcError::method_not_found(method)),
@@ -10075,10 +10135,14 @@ mod tests {
     }
 
     #[test]
-    fn envelope_notification_round_trips_through_rpc_envelope_with_bare_wire_shape() {
-        // The wire shape MUST be the bare `Envelope` per spec § 14.1 —
-        // `session_id` and `topic` are server-internal routing fields
-        // and MUST NOT leak onto the JSON-RPC `params`.
+    fn envelope_notification_round_trips_through_rpc_envelope_with_routing() {
+        // feat(envelope-wire-routing): the wire now carries `session_id`
+        // (the bare base key) + optional `topic` FLATTENED alongside the
+        // bare Envelope fields so a multi-session client can route the
+        // envelope to the right session. The envelope fields stay at the
+        // top level (no `envelope` nesting) so the existing tolerant web
+        // SPA bridge — which reads `thread_id`/`seq`/`payload` top-level
+        // and ignores unknown keys — keeps decoding it unchanged.
         let envelope = Envelope {
             thread_id: "thread-7".into(),
             seq: 42,
@@ -10099,31 +10163,72 @@ mod tests {
         });
         let rpc = notif.into_rpc_notification().expect("serialize");
         assert_eq!(rpc.method, "projection/envelope");
-        // Wire shape: bare Envelope JSON, no session_id/topic keys.
+        // Wire shape: flattened — bare Envelope keys PLUS routing keys.
         let params = &rpc.params;
-        assert!(
-            params.get("session_id").is_none(),
-            "session_id must not leak onto the wire"
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:demo")),
+            "session_id must reach the wire so the client can route",
         );
-        assert!(
-            params.get("topic").is_none(),
-            "topic must not leak onto the wire"
+        assert_eq!(
+            params.get("topic"),
+            Some(&json!("planning")),
+            "topic must reach the wire for topic-scoped routing",
         );
+        // Bare Envelope keys stay at the top level (web-bridge compat).
         assert_eq!(params.get("thread_id"), Some(&json!("thread-7")));
         assert_eq!(params.get("seq"), Some(&json!(42)));
         assert_eq!(params.get("client_message_id"), Some(&json!("cmid-x")));
+        // No `envelope` nesting on the wire — the flatten keeps the bare
+        // shape the web bridge already reads.
+        assert!(
+            params.get("envelope").is_none(),
+            "wire is flattened, not nested under `envelope`",
+        );
 
-        // Round-trip decode: session_id defaults to empty (the AppUI
-        // decode path rebuilds it from ambient context); envelope must
-        // be byte-equal.
+        // Round-trip decode: session_id + topic survive byte-for-byte and
+        // the envelope is byte-equal.
         let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
         match parsed {
             UiNotification::Envelope(ev) => {
                 assert_eq!(ev.envelope, envelope);
-                // Routing fields default on the decode path; consumer
-                // reconstructs them from ambient context.
-                assert_eq!(ev.session_id, SessionKey(String::new()));
-                assert_eq!(ev.topic, None);
+                assert_eq!(
+                    ev.session_id,
+                    SessionKey("local:demo".into()),
+                    "decode must recover the routing session_id from the wire",
+                );
+                assert_eq!(ev.topic, Some("planning".into()));
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+    }
+
+    /// feat(envelope-wire-routing) backward-compat: an OLD bare-envelope
+    /// wire frame (no `session_id` / `topic` keys — emitted by a server
+    /// before this change) must still decode without error. The routing
+    /// fields default to empty/None; the consumer is expected to fall
+    /// back to ambient connection context for those legacy frames.
+    #[test]
+    fn envelope_notification_decodes_legacy_bare_wire_frame_without_routing() {
+        // OLD wire shape: bare Envelope, no session_id/topic.
+        let legacy_params = json!({
+            "thread_id": "thread-legacy",
+            "seq": 3,
+            "payload": { "type": "assistant_delta", "data": { "text": "hi" } }
+        });
+        let decoded =
+            UiNotification::from_method_and_params(methods::PROJECTION_ENVELOPE, legacy_params)
+                .expect("legacy bare-envelope frame must still decode");
+        match decoded {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(
+                    ev.session_id,
+                    SessionKey(String::new()),
+                    "absent session_id defaults to empty for legacy frames",
+                );
+                assert_eq!(ev.topic, None, "absent topic defaults to None");
+                assert_eq!(ev.envelope.thread_id, "thread-legacy");
+                assert_eq!(ev.envelope.seq, 3);
             }
             other => panic!("expected Envelope variant, got {other:?}"),
         }
@@ -10204,16 +10309,18 @@ mod tests {
         assert_eq!(parsed, no_topic);
     }
 
-    /// Codex #1336 round-2 BLOCKER 4 — wire shape regression guard.
-    /// `into_rpc_notification` is the ONLY place the wire shape is
-    /// produced; routing fields are stripped here and ONLY here. The
-    /// disk-persistence test above pins that the routing fields DO
-    /// survive when the envelope is serialized directly (not through
-    /// into_rpc_notification).
+    /// feat(envelope-wire-routing) — wire shape guard. The wire is the
+    /// FLATTENED form: bare Envelope keys (`thread_id`, `seq`, `payload`,
+    /// no `envelope` nesting) PLUS the routing keys `session_id` +
+    /// `topic` so a multi-session client can route. Codex #1336
+    /// BLOCKER-4's actual invariant — that the DISK derive preserves
+    /// routing — is pinned by
+    /// `envelope_notification_serde_preserves_routing_fields_for_disk_persistence`
+    /// above; that disk path is untouched by un-stripping the wire.
     #[test]
-    fn envelope_notification_into_rpc_notification_strips_routing_fields() {
+    fn envelope_notification_into_rpc_notification_flattens_routing_onto_wire() {
         let notif = UiNotification::Envelope(EnvelopeNotification {
-            session_id: SessionKey("local:wire-strip".into()),
+            session_id: SessionKey("local:wire-route".into()),
             topic: Some("planning".into()),
             envelope: Envelope {
                 thread_id: "thread-wire".into(),
@@ -10225,18 +10332,56 @@ mod tests {
         let rpc = notif.into_rpc_notification().expect("serialize");
         assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
         let params = &rpc.params;
-        assert!(
-            params.get("session_id").is_none(),
-            "wire MUST strip session_id (spec § 14.1)",
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:wire-route")),
+            "wire carries session_id for routing",
         );
-        assert!(
-            params.get("topic").is_none(),
-            "wire MUST strip topic (spec § 14.1)",
+        assert_eq!(
+            params.get("topic"),
+            Some(&json!("planning")),
+            "wire carries topic for topic-scoped routing",
         );
-        // Bare envelope on the wire — `thread_id`, `seq`, `payload`
-        // are top-level keys (no `envelope` nesting).
+        // Bare envelope fields stay top-level (no `envelope` nesting) so
+        // the existing web-bridge top-level reader is unaffected.
         assert_eq!(params.get("thread_id"), Some(&json!("thread-wire")));
         assert_eq!(params.get("seq"), Some(&json!(5)));
+        assert!(
+            params.get("envelope").is_none(),
+            "wire is flattened, not nested under `envelope`",
+        );
+    }
+
+    /// feat(envelope-wire-routing): a `topic: None` envelope omits the
+    /// `topic` key on the wire (compact shape) but still carries
+    /// `session_id`. Decode recovers session_id and defaults topic.
+    #[test]
+    fn envelope_notification_wire_omits_absent_topic_but_keeps_session_id() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:no-topic".into()),
+            topic: None,
+            envelope: Envelope {
+                thread_id: "thread-nt".into(),
+                seq: 9,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "y".into() },
+            },
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        let params = &rpc.params;
+        assert_eq!(params.get("session_id"), Some(&json!("local:no-topic")));
+        assert!(
+            params.get("topic").is_none(),
+            "absent topic omitted on the wire",
+        );
+        let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
+        match parsed {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(ev.session_id, SessionKey("local:no-topic".into()));
+                assert_eq!(ev.topic, None);
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
     }
 
     // ------------------------------------------------------------------
