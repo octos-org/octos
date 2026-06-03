@@ -7,7 +7,8 @@
 //   plan_and_search ──(N dynamic workers)──→ analyze ──→ synthesize
 //
 // Tool contract:
-//   deep_search  — runs web search + crawl; generates _search_results.md
+//   search       — runs web search + crawl; saves each page as a markdown file
+//                  under .octos/research/<query>/ and returns an index
 //   read_file    — reads search results and individual source files
 //   write_file   — used by synthesize node to save the final report
 
@@ -19,11 +20,11 @@ digraph deep_research {
         handler="dynamic_parallel",
         converge="analyze",
         prompt="Generate 4-6 research search angles for this query. Each angle should cover a different aspect of the topic — do NOT just rephrase the same query.\n\nRequirements:\n- 4-6 distinct angles\n- Include at least one angle in Chinese and one in English for cross-language coverage\n- Cover: core topic, alternatives/comparisons, technical architecture, recent trends\n- Keep each task description under 80 characters\n\nRespond with ONLY a JSON array of objects with \"task\" and \"label\" fields.\nExample: [{\"task\": \"Search for Manus AI official docs and features\", \"label\": \"Official docs\"}, ...]",
-        worker_prompt="You are a research search specialist.\n\n{task}\n\nUse deep_search to find the most relevant and authoritative sources. After deep_search completes, use read_file to read _search_results.md and at least 3 of the most relevant source files.\n\nInclude ALL URLs, specific data points, and quotes in your output.",
+        worker_prompt="You are a research search specialist.\n\n{task}\n\nUse the search tool to find the most relevant and authoritative sources. After search completes, use read_file to read the returned index and at least 3 of the most relevant source files.\n\nInclude ALL URLs, specific data points, and quotes in your output.",
         label="Search",
         model="cheap",
         planner_model="strong",
-        tools="deep_search,read_file",
+        tools="search,read_file",
         max_tasks="8",
         timeout_secs="1800"
     ]

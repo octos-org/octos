@@ -834,10 +834,18 @@ pub(crate) fn build_run_pipeline_tool(
     plugin_require_signed: bool,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
 ) -> octos_pipeline::RunPipelineTool {
-    let mut pipeline_tool = octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir)
-        .with_provider_policy(provider_policy)
-        .with_plugin_dirs(plugin_dirs)
-        .with_plugin_require_signed(plugin_require_signed);
+    let mut pipeline_tool =
+        octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir.clone())
+            .with_provider_policy(provider_policy)
+            .with_plugin_dirs(plugin_dirs)
+            .with_plugin_require_signed(plugin_require_signed)
+            // Gap 4.1 BLOCKER 2/3: `octos chat` bootstraps the bundle into
+            // `<data_dir>/bundled-pipelines` (see chat.rs above). Register that
+            // exact dir as the LOWEST-precedence discovery path so the bundled
+            // `deep_research` is discoverable (bootstrap-dir == search-dir) yet
+            // any installed `deep_research.dot` in `<data_dir>/{pipelines,skills}`
+            // still wins.
+            .with_bundled_pipelines_root(data_dir);
     if let Some(embedder) = embedder {
         pipeline_tool = pipeline_tool.with_embedder(embedder);
     }

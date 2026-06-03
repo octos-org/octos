@@ -24,14 +24,20 @@ pub const PLATFORM_SKILLS_DIR: &str = "platform-skills";
 
 /// Subdirectory name for bundled generic pipelines.
 ///
-/// Matches the `data_dir.join("pipelines")` search path in
-/// `octos_pipeline::discovery::PipelineDiscovery`, and the
-/// `octos_home.join("pipelines")` path added by
-/// `RunPipelineTool::with_octos_home`, so anything written here is
-/// discoverable by `run_pipeline`.
-pub const BUNDLED_PIPELINES_DIR: &str = "pipelines";
+/// Gap 4.1 BLOCKER 3 (installed-wins precedence): the bundled `.dot` files
+/// live in their OWN directory, deliberately SEPARATE from the user-pipeline
+/// dir (`<root>/pipelines`). `octos_pipeline::discovery::PipelineDiscovery`
+/// searches this dir at the LOWEST precedence (after every installed-skill /
+/// installed-pipeline location), so an installed `deep_research.dot` — whether
+/// in `<data>/pipelines`, `<data>/skills/<x>/`, `<octos_home>/skills/<x>/`, or
+/// `<octos_home>/pipelines` — ALWAYS wins over the bundled fallback.
+///
+/// `RunPipelineTool::with_octos_home` appends `<octos_home>/{BUNDLED_PIPELINES_DIR}`
+/// as the final search path, so anything written here is discoverable by
+/// `run_pipeline` but never shadows an installed copy.
+pub const BUNDLED_PIPELINES_DIR: &str = "bundled-pipelines";
 
-/// Bootstrap bundled generic pipelines into `<octos_home>/pipelines/`.
+/// Bootstrap bundled generic pipelines into `<octos_home>/bundled-pipelines/`.
 ///
 /// Writes each embedded `.dot` (see [`crate::bundled_pipelines`]) so that
 /// load-bearing generic pipelines (e.g. `deep_research`) are always
@@ -40,12 +46,18 @@ pub const BUNDLED_PIPELINES_DIR: &str = "pipelines";
 /// `run_pipeline deep_research` into `Available: (none)`; bundling the `.dot`
 /// into the binary closes that gap.
 ///
-/// **Precedence (installed-wins):** an already-present file of the same name
-/// is left untouched — an operator- or skill-installed pipeline always wins
-/// over the bundled fallback. Combined with the discovery layer's
-/// first-found-wins dedup, this keeps a custom install authoritative.
+/// **Precedence (installed-wins):** the bundled dir is searched LAST (see
+/// [`BUNDLED_PIPELINES_DIR`]), so an operator- or skill-installed pipeline of
+/// the same name always wins over the bundled fallback. We also never clobber
+/// an already-present file of the same name within the bundled dir itself.
 ///
 /// Idempotent: returns the number of `.dot` files newly written.
+///
+/// NIT 1 (atomic no-clobber): the write uses
+/// `OpenOptions::create_new(true)` so the "is this already installed?"
+/// check and the write are a single atomic syscall — a concurrent
+/// installer racing the bootstrap can never have its file clobbered
+/// (the `AlreadyExists` error is treated as "skip").
 pub fn bootstrap_bundled_pipelines(octos_home: &Path) -> usize {
     let target_dir = octos_home.join(BUNDLED_PIPELINES_DIR);
 
@@ -57,13 +69,28 @@ pub fn bootstrap_bundled_pipelines(octos_home: &Path) -> usize {
     for &(file_name, dot_contents) in BUNDLED_PIPELINES {
         let dest = target_dir.join(file_name);
 
-        // Installed-wins: never clobber an existing (installed) pipeline.
-        if dest.exists() {
-            continue;
-        }
-
-        if std::fs::write(&dest, dot_contents).is_ok() {
-            count += 1;
+        // NIT 1: atomic no-clobber. `create_new(true)` fails with
+        // `AlreadyExists` rather than truncating an existing file, closing
+        // the exists()-then-write() TOCTOU window. A concurrent install
+        // that wrote the same path first is preserved (installed-wins).
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                if f.write_all(dot_contents.as_bytes()).is_ok() {
+                    count += 1;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Installed-wins: a file already exists, leave it untouched.
+            }
+            Err(_) => {
+                // Other I/O error (permissions, etc.) — skip silently,
+                // matching the prior best-effort behaviour.
+            }
         }
     }
 
@@ -267,6 +294,58 @@ mod tests {
         // Second run: everything already present, nothing newly written.
         let second = bootstrap_bundled_pipelines(octos_home);
         assert_eq!(second, 0, "second bootstrap must be a no-op (idempotent)");
+    }
+
+    #[test]
+    fn bootstrap_bundled_pipelines_writes_into_dedicated_bundled_dir() {
+        // BLOCKER 3: the bundle must land in the DEDICATED bundled-pipelines
+        // dir (searched last), NOT the user-pipeline dir `<root>/pipelines`
+        // (which precedes `<root>/skills` and would shadow installs).
+        let tmp = tempfile::tempdir().unwrap();
+        let octos_home = tmp.path();
+
+        bootstrap_bundled_pipelines(octos_home);
+        assert_eq!(BUNDLED_PIPELINES_DIR, "bundled-pipelines");
+        assert!(
+            octos_home
+                .join("bundled-pipelines")
+                .join("deep_research.dot")
+                .exists(),
+            "bundle must be written to the dedicated <root>/bundled-pipelines dir"
+        );
+        assert!(
+            !octos_home
+                .join("pipelines")
+                .join("deep_research.dot")
+                .exists(),
+            "bundle must NOT be written to <root>/pipelines (would shadow installs)"
+        );
+    }
+
+    #[test]
+    fn bootstrap_bundled_pipelines_create_new_preserves_concurrent_install() {
+        // NIT 1: the write is atomic (`create_new`), so a file that already
+        // exists (e.g. an installer wrote it first in a race) is preserved
+        // byte-for-byte and NOT counted as newly written.
+        let tmp = tempfile::tempdir().unwrap();
+        let octos_home = tmp.path();
+        let bundled_dir = octos_home.join(BUNDLED_PIPELINES_DIR);
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+
+        let racing = bundled_dir.join("deep_research.dot");
+        let racing_body = "digraph deep_research { concurrent_install [prompt=\"race\"] }";
+        std::fs::write(&racing, racing_body).unwrap();
+
+        let count = bootstrap_bundled_pipelines(octos_home);
+        assert_eq!(
+            count, 0,
+            "an already-present (concurrently installed) file must NOT be clobbered or counted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&racing).unwrap(),
+            racing_body,
+            "atomic create_new must preserve the racing installer's bytes"
+        );
     }
 
     #[test]

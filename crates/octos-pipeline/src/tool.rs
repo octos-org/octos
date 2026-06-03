@@ -269,13 +269,29 @@ impl RunPipelineTool {
 
     /// Add the global octos-home skills + pipelines directories as search
     /// paths. This ensures pipelines installed globally (e.g.
-    /// `~/.octos/skills/`) AND bundled generic pipelines written to
-    /// `~/.octos/pipelines/` by `bootstrap_bundled_pipelines` are discoverable
-    /// even when `data_dir` is per-profile (the per-profile discovery default
-    /// only searches `<profile_data_dir>/pipelines`, not the shared home).
+    /// `~/.octos/skills/`, `~/.octos/pipelines/`) are discoverable even when
+    /// `data_dir` is per-profile (the per-profile discovery default only
+    /// searches `<profile_data_dir>/pipelines`, not the shared home).
+    ///
+    /// Gap 4.1 BLOCKER 3: the bundled generic pipelines written to
+    /// `~/.octos/bundled-pipelines/` by `bootstrap_bundled_pipelines` are
+    /// registered as a LOWEST-precedence search path (via
+    /// `add_bundled_pipelines_dir`), so an installed `deep_research.dot` in
+    /// any skills/pipelines location always wins over the bundled fallback.
     pub fn with_octos_home(mut self, octos_home: PathBuf) -> Self {
         self.discovery.add_search_path(octos_home.join("skills"));
         self.discovery.add_search_path(octos_home.join("pipelines"));
+        self.discovery.add_bundled_pipelines_dir(&octos_home);
+        self
+    }
+
+    /// Register `<root>/bundled-pipelines` as the LOWEST-precedence
+    /// discovery path. Used by the non-octos-home hosts (`octos chat`,
+    /// `octos serve`) that bootstrap the bundle into `<data_dir>/bundled-pipelines`
+    /// but do not otherwise call `with_octos_home`. Keeps bootstrap-dir ==
+    /// search-dir while preserving installed-wins (BLOCKER 2 + BLOCKER 3).
+    pub fn with_bundled_pipelines_root(mut self, root: PathBuf) -> Self {
+        self.discovery.add_bundled_pipelines_dir(&root);
         self
     }
 
@@ -345,7 +361,7 @@ impl RunPipelineTool {
                         .map(|s| s.trim_matches('{'))
                     {
                         if !name.is_empty() {
-                            if let Ok(dot) = self.discovery.resolve(name).await {
+                            if let Ok(dot) = self.resolve_named_with_bundled_fallback(name).await {
                                 tracing::info!(
                                     name,
                                     "fell back to pre-built pipeline after inline DOT parse failure"
@@ -361,8 +377,48 @@ impl RunPipelineTool {
             }
         }
 
-        // Named pipeline or file path — use normal resolution
-        self.discovery.resolve(pipeline_str).await
+        // Named pipeline or file path — use normal resolution, with the
+        // embedded bundled bytes as a final fallback for sanctioned names.
+        self.resolve_named_with_bundled_fallback(pipeline_str).await
+    }
+
+    /// Resolve a pipeline by name/path via on-disk discovery first, falling
+    /// back to the EMBEDDED bundled `.dot` bytes (compiled into the binary
+    /// via `octos_agent::bundled_pipelines`) when discovery cannot find it.
+    ///
+    /// Gap 4.1 NIT 2 — the `run_pipeline` enum advertises the sanctioned
+    /// `deep_research` name unconditionally (it is bundled into the binary).
+    /// Blockers 2+3 make bootstrap write that `.dot` to a discoverable dir on
+    /// every host path, but a degraded filesystem (read-only, quota) could
+    /// still leave discovery empty. Without this in-memory fallback the enum
+    /// would advertise a name the tool cannot resolve — a masking lie that
+    /// `pre_flight_validate` turns into a runtime failure. With it, every
+    /// advertised name resolves: advertise == resolvable on all paths.
+    ///
+    /// Discovery still WINS when it finds a match, so an installed/operator
+    /// `deep_research.dot` overrides the embedded copy (installed-wins is
+    /// preserved — the embedded bytes are strictly a last resort).
+    async fn resolve_named_with_bundled_fallback(&self, name_or_path: &str) -> Result<String> {
+        match self.discovery.resolve(name_or_path).await {
+            Ok(dot) => Ok(dot),
+            Err(discovery_err) => {
+                // Match against the embedded bundled pipelines by bare name
+                // (file stem) or exact file name.
+                let want = name_or_path.trim();
+                for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
+                    let stem = file_name.strip_suffix(".dot").unwrap_or(file_name);
+                    if want == stem || want == file_name {
+                        tracing::info!(
+                            pipeline = want,
+                            "resolved pipeline from embedded bundled bytes (discovery miss; \
+                             likely a degraded/read-only bootstrap dir)"
+                        );
+                        return Ok(dot.to_string());
+                    }
+                }
+                Err(discovery_err)
+            }
+        }
     }
 
     /// Set the status bridge for the current message.
@@ -380,6 +436,16 @@ impl RunPipelineTool {
     #[doc(hidden)]
     pub fn embedder_for_test(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
         self.embedder.as_ref()
+    }
+
+    /// Doc-hidden test accessor — resolves a pipeline name to its DOT body
+    /// through the same discovery + embedded-bundled-fallback path
+    /// `pre_flight_validate` / `execute` use. Lets the Gap 4.1 tests assert
+    /// installed-wins and the bundled fallback at the resolution boundary
+    /// (which exact `.dot` content wins) without standing up a full run.
+    #[doc(hidden)]
+    pub async fn resolve_named_for_test(&self, name_or_path: &str) -> Result<String> {
+        self.resolve_with_fallback(name_or_path).await
     }
 }
 
