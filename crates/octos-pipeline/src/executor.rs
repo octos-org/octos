@@ -410,6 +410,105 @@ pub(crate) fn report_progress(message: &str) {
     }
 }
 
+/// Maximum bytes kept in a per-node partial-output preview (Gap 4.2). Small on
+/// purpose: progress events are frequent, so a preview must not approach the
+/// 16 KiB harness-event line cap (`MAX_HARNESS_EVENT_LINE_BYTES`) nor the 1 MiB
+/// frame cap. Reuses the Gap-3.4 [`FidelityMode::Truncate`] truncation so a
+/// huge node output can't bloat the event.
+pub(crate) const NODE_PREVIEW_MAX_CHARS: usize = 2 * 1024;
+
+/// Linear ETA estimate (seconds remaining) for a pipeline run (Gap 4.2).
+///
+/// `(elapsed / nodes_done) * nodes_remaining`. Degrades gracefully: returns
+/// `None` ("estimating…") when fewer than one node has completed — there is no
+/// per-node rate to extrapolate from yet — or when the run is already at/over
+/// the total node count.
+pub(crate) fn linear_eta_secs(
+    elapsed_secs: u64,
+    nodes_done: usize,
+    nodes_total: usize,
+) -> Option<u64> {
+    if nodes_done == 0 || nodes_total == 0 || nodes_done >= nodes_total {
+        return None;
+    }
+    let remaining = (nodes_total - nodes_done) as u64;
+    // Per-node rate from observed work; integer math keeps it monotone-ish and
+    // avoids float drift on the heartbeat.
+    let per_node = elapsed_secs / nodes_done as u64;
+    Some(per_node * remaining)
+}
+
+/// Bound a node's output to a short preview using the Gap-3.4 fidelity
+/// truncation (UTF-8 safe, appends a `[truncated]` marker). Whitespace-trimmed
+/// so a preview chip is compact in the UI.
+pub(crate) fn node_output_preview(content: &str) -> String {
+    let preview = crate::fidelity::FidelityMode::Truncate {
+        max_chars: NODE_PREVIEW_MAX_CHARS,
+    }
+    .apply(content.trim());
+    preview.trim().to_string()
+}
+
+/// Emit a structured per-node progress event into the `octos.harness.event.v1`
+/// contract (Gap 4.2). Reads the harness event sink from `TOOL_CTX`; a no-op
+/// when no sink is attached (out-of-band callers / unit tests without a sink).
+///
+/// The canonical `phase`/`message`/`progress` keep working for consumers that
+/// ignore the structured fields; the `extra` map carries `node`, `node_index`,
+/// `node_total`, and (on completion) `success` + a bounded `preview`. These
+/// ride the additive `HarnessProgressEvent.extra` flatten so existing
+/// consumers are unaffected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_pipeline_node_event(
+    pipeline_id: &str,
+    phase: &str,
+    message: &str,
+    node_id: &str,
+    node_index: usize,
+    node_total: usize,
+    success: Option<bool>,
+    preview: Option<&str>,
+) {
+    let Ok(Some(sink)) = TOOL_CTX.try_with(|c| c.harness_event_sink.clone()) else {
+        return;
+    };
+    let progress = if node_total > 0 {
+        Some((node_index as f64 / node_total as f64).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
+    extra.insert(
+        "node".to_string(),
+        serde_json::Value::String(node_id.to_string()),
+    );
+    extra.insert(
+        "node_index".to_string(),
+        serde_json::Value::from(node_index),
+    );
+    extra.insert(
+        "node_total".to_string(),
+        serde_json::Value::from(node_total),
+    );
+    if let Some(s) = success {
+        extra.insert("success".to_string(), serde_json::Value::Bool(s));
+    }
+    if let Some(p) = preview {
+        extra.insert(
+            "preview".to_string(),
+            serde_json::Value::String(p.to_string()),
+        );
+    }
+    let _ = octos_agent::harness_events::emit_registered_progress_event_with_extra(
+        sink,
+        Some(pipeline_id),
+        phase,
+        message,
+        progress,
+        extra,
+    );
+}
+
 /// Shared status snapshot updated by the pipeline executor and read by the
 /// periodic heartbeat task. Lets the chat bubble see a refreshing status
 /// chip during long-running phases (`plan_and_search` 13min, `analyze`
@@ -449,6 +548,11 @@ fn spawn_pipeline_heartbeat(
     let ctx = TOOL_CTX.try_with(|c| c.clone()).ok()?;
     let reporter = ctx.reporter.clone();
     let tool_id = ctx.tool_id.clone();
+    // Capture the harness event sink synchronously too — `tokio::spawn` loses
+    // the task-local, so the heartbeat can't read TOOL_CTX from inside the
+    // spawned task. `None` when no sink is attached (heartbeat then emits only
+    // the plain ToolProgress chip, as before).
+    let harness_sink = ctx.harness_event_sink.clone();
     tracing::info!(
         target: "octos::pipeline::heartbeat",
         tool_id = %tool_id,
@@ -470,10 +574,23 @@ fn spawn_pipeline_heartbeat(
                 Err(p) => p.into_inner().clone(),
             };
             let elapsed = snap.start.elapsed().as_secs();
+            // Gap 4.2 — naive linear ETA surfaced on every heartbeat. Degrades
+            // to "estimating…" until ≥1 node has completed (no per-node rate
+            // to extrapolate yet).
+            let eta = linear_eta_secs(elapsed, snap.nodes_done, snap.nodes_total);
+            let eta_label = match eta {
+                Some(secs) => format!("~{secs}s left"),
+                None => "estimating…".to_string(),
+            };
             let message = if snap.nodes_total > 0 {
                 format!(
-                    "Pipeline '{}' running: {} ({}/{} nodes, {}s elapsed)",
-                    snap.pipeline_id, snap.current_node, snap.nodes_done, snap.nodes_total, elapsed,
+                    "Pipeline '{}' running: {} ({}/{} nodes, {}s elapsed, {})",
+                    snap.pipeline_id,
+                    snap.current_node,
+                    snap.nodes_done,
+                    snap.nodes_total,
+                    elapsed,
+                    eta_label,
                 )
             } else {
                 format!(
@@ -486,13 +603,50 @@ fn spawn_pipeline_heartbeat(
                 tick = tick_count,
                 elapsed_s = elapsed,
                 node = %snap.current_node,
+                eta_s = ?eta,
                 "heartbeat tick: {message}"
             );
             reporter.report(ProgressEvent::ToolProgress {
                 name: "run_pipeline".to_string(),
                 tool_id: tool_id.clone(),
-                message,
+                message: message.clone(),
             });
+            // Mirror the heartbeat into the structured harness.event.v1
+            // contract so consumers that render structured progress see the
+            // ETA + N/M as typed fields, not just an opaque chip string. The
+            // ToolProgress above stays for plain chat-bubble consumers.
+            if let Some(sink) = harness_sink.as_deref() {
+                let progress = if snap.nodes_total > 0 {
+                    Some((snap.nodes_done as f64 / snap.nodes_total as f64).clamp(0.0, 1.0))
+                } else {
+                    None
+                };
+                let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
+                extra.insert(
+                    "node".to_string(),
+                    serde_json::Value::String(snap.current_node.clone()),
+                );
+                extra.insert(
+                    "node_index".to_string(),
+                    serde_json::Value::from(snap.nodes_done),
+                );
+                extra.insert(
+                    "node_total".to_string(),
+                    serde_json::Value::from(snap.nodes_total),
+                );
+                extra.insert("elapsed_secs".to_string(), serde_json::Value::from(elapsed));
+                if let Some(secs) = eta {
+                    extra.insert("eta_secs".to_string(), serde_json::Value::from(secs));
+                }
+                let _ = octos_agent::harness_events::emit_registered_progress_event_with_extra(
+                    sink,
+                    Some(snap.pipeline_id.as_str()),
+                    "heartbeat",
+                    &message,
+                    progress,
+                    extra,
+                );
+            }
         }
     });
     Some(HeartbeatGuard { handle })
@@ -2392,6 +2546,23 @@ impl PipelineExecutor {
             let seq_label = node.label.as_deref().unwrap_or(&node.id);
             report_progress(&format!("{seq_label}: running..."));
 
+            // Gap 4.2 — structured NodeStarted into the harness.event.v1
+            // contract: node name + "N of M" so the client renders real
+            // per-node progress instead of a blind heartbeat. The 1-based
+            // index is `completed.len() + 1` (nodes finished so far + this).
+            let node_total = graph.nodes.len();
+            let node_index = completed.len() + 1;
+            emit_pipeline_node_event(
+                &graph.id,
+                "node_started",
+                &format!("{seq_label} ({node_index} of {node_total})"),
+                &node.id,
+                node_index,
+                node_total,
+                None,
+                None,
+            );
+
             info!(
                 node = %node.id,
                 handler = ?node.handler,
@@ -2690,6 +2861,27 @@ impl PipelineExecutor {
             });
 
             completed.insert(current_node_id.clone(), outcome.clone());
+
+            // Gap 4.2 — structured NodeCompleted into the harness.event.v1
+            // contract: node name, success, and a BOUNDED partial-output
+            // preview (Gap-3.4 truncation) so the client shows what each node
+            // produced as it lands. The preview cap keeps the frequent event
+            // small (well under the 16 KiB harness-event line cap).
+            let node_success = outcome.status == OutcomeStatus::Pass;
+            let preview = node_output_preview(&outcome.content);
+            emit_pipeline_node_event(
+                &graph.id,
+                "node_completed",
+                &format!(
+                    "{seq_label} ({node_index} of {node_total}) — {}",
+                    if node_success { "done" } else { "failed" }
+                ),
+                &node.id,
+                node_index,
+                node_total,
+                Some(node_success),
+                Some(&preview),
+            );
 
             // Persist mission checkpoints declared on this node (if any) and
             // the store is configured. Best-effort — a failed persist logs a
@@ -3540,6 +3732,219 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    // ── Gap 4.2: structured per-node progress + ETA + previews ─────────
+
+    /// Linear ETA: `(elapsed / done) * remaining`, with graceful degradation.
+    #[test]
+    fn linear_eta_degrades_then_extrapolates() {
+        // 0 nodes done → no rate yet → "estimating…" (None).
+        assert_eq!(linear_eta_secs(30, 0, 3), None);
+        // total 0 (degenerate) → None.
+        assert_eq!(linear_eta_secs(30, 0, 0), None);
+        // 1 of 3 done in 30s → 30s/node × 2 remaining = 60s.
+        assert_eq!(linear_eta_secs(30, 1, 3), Some(60));
+        // 2 of 4 done in 40s → 20s/node × 2 remaining = 40s.
+        assert_eq!(linear_eta_secs(40, 2, 4), Some(40));
+        // last node done / over-count → None (nothing left to estimate).
+        assert_eq!(linear_eta_secs(90, 3, 3), None);
+        assert_eq!(linear_eta_secs(90, 4, 3), None);
+
+        // Monotone-ish sanity: as more nodes complete at a steady rate, the
+        // ETA decreases (or holds), never increases.
+        let mut prev = u64::MAX;
+        for done in 1..5usize {
+            // steady 10s/node.
+            let elapsed = (done as u64) * 10;
+            if let Some(eta) = linear_eta_secs(elapsed, done, 5) {
+                assert!(
+                    eta <= prev,
+                    "ETA must not grow as nodes complete at a steady rate: {eta} > {prev}"
+                );
+                prev = eta;
+            }
+        }
+    }
+
+    /// A huge node output must yield a small, bounded preview (Gap-3.4 reuse).
+    #[test]
+    fn node_output_preview_is_bounded() {
+        let huge = "x".repeat(500_000);
+        let preview = node_output_preview(&huge);
+        assert!(
+            preview.len() <= NODE_PREVIEW_MAX_CHARS + 64,
+            "preview must be bounded near the cap; got {} bytes",
+            preview.len()
+        );
+        assert!(
+            preview.contains("[truncated]"),
+            "a truncated preview must carry the Gap-3.4 marker; got: {}",
+            &preview[..preview.len().min(80)]
+        );
+        // A small output passes through unbounded (no false truncation).
+        let small = node_output_preview("short answer");
+        assert_eq!(small, "short answer");
+    }
+
+    /// NodeStarted + NodeCompleted each emit a structured `octos.harness
+    /// .event.v1` Progress event with node name + N/M (+ preview + success on
+    /// completed). RED before the executor wired the harness sink: only an
+    /// opaque heartbeat existed.
+    #[tokio::test]
+    async fn node_started_and_completed_emit_structured_harness_events() {
+        use octos_agent::harness_events::{
+            HarnessEvent, HarnessEventSinkContext, attach_event_sink_context,
+            detach_event_sink_context,
+        };
+
+        // A real on-disk sink + registered context so the emit helper resolves
+        // session/task ids and writes a v1 event line.
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-gap42".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-gap42".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let sink_for_assert = sink_uri.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                // node 2 of 3 starts.
+                emit_pipeline_node_event(
+                    "research",
+                    "node_started",
+                    "analyze (2 of 3)",
+                    "analyze",
+                    2,
+                    3,
+                    None,
+                    None,
+                );
+                // node 2 of 3 completes with a bounded preview.
+                let preview = node_output_preview(&"y".repeat(100_000));
+                emit_pipeline_node_event(
+                    "research",
+                    "node_completed",
+                    "analyze (2 of 3) — done",
+                    "analyze",
+                    2,
+                    3,
+                    Some(true),
+                    Some(&preview),
+                );
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        let lines = std::fs::read_to_string(&sink_for_assert).expect("read sink");
+        let events: Vec<HarnessEvent> = lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| HarnessEvent::from_json_line(l).expect("valid harness event"))
+            .collect();
+        assert_eq!(events.len(), 2, "expected NodeStarted + NodeCompleted");
+
+        // Both are Progress events on the v1 contract carrying the structured
+        // node fields the consumers render (via runtime_detail_value).
+        let started = events[0].runtime_detail_value(None, None);
+        assert_eq!(started["kind"], "progress");
+        assert_eq!(started["workflow_kind"], "research");
+        assert_eq!(started["phase"], "node_started");
+        assert_eq!(started["node"], "analyze");
+        assert_eq!(started["node_index"], 2);
+        assert_eq!(started["node_total"], 3);
+        assert!(
+            started["progress_message"]
+                .as_str()
+                .unwrap()
+                .contains("2 of 3")
+        );
+
+        let completed = events[1].runtime_detail_value(None, None);
+        assert_eq!(completed["phase"], "node_completed");
+        assert_eq!(completed["node"], "analyze");
+        assert_eq!(completed["success"], true);
+        let preview = completed["preview"].as_str().expect("preview field");
+        assert!(
+            preview.len() <= NODE_PREVIEW_MAX_CHARS + 64,
+            "completed preview must be bounded; got {} bytes",
+            preview.len()
+        );
+        // The whole event line must stay well under the harness line cap.
+        let line_len = serde_json::to_string(&events[1]).unwrap().len();
+        assert!(
+            line_len < octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES,
+            "structured progress event must stay under the line cap; got {line_len}"
+        );
+    }
+
+    /// The heartbeat carries the linear ETA (and "estimating…" when 0 done).
+    #[tokio::test]
+    async fn heartbeat_carries_eta_label() {
+        let reporter = CapturingReporter::default();
+        let captured = reporter.events.clone();
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-heartbeat-eta".to_string(),
+            reporter: Arc::new(reporter),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // Start with 0 done so the first ticks read "estimating…", then flip
+        // to 1-of-3 so a later tick extrapolates an ETA.
+        let status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: "research".to_string(),
+            current_node: "plan".to_string(),
+            nodes_done: 0,
+            nodes_total: 3,
+            start: Instant::now(),
+        }));
+
+        let status_for_advance = status.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                let _guard = spawn_pipeline_heartbeat(status_for_advance.clone(), 1)
+                    .expect("heartbeat should spawn");
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                if let Ok(mut g) = status_for_advance.lock() {
+                    g.nodes_done = 1;
+                    g.current_node = "analyze".to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(2_200)).await;
+            })
+            .await;
+
+        let messages: Vec<String> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                octos_agent::progress::ProgressEvent::ToolProgress { message, .. } => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let combined = messages.join("\n");
+        assert!(
+            combined.contains("estimating…"),
+            "heartbeat must say 'estimating…' before any node completes; got: {combined}"
+        );
+        assert!(
+            combined.contains("s left"),
+            "heartbeat must surface an ETA once ≥1 node completes; got: {combined}"
+        );
     }
 
     /// Phase 2-A integration — the `working_dir` set on
