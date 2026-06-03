@@ -485,6 +485,63 @@ async fn standalone_gateway_child_profile_roots_pipeline_at_bootstrap_dir() {
     );
 }
 
+/// Gap 4.1 (codex review) — the embedded bundled fallback must fire ONLY on a
+/// TRUE discovery miss, never to MASK an installed-but-unreadable pipeline.
+///
+/// `PipelineDiscovery::resolve` errors in two distinct situations:
+///   - TRUE MISS: no candidate file located anywhere → fallback to the bundled
+///     bytes is correct (covered by the other tests here).
+///   - FOUND-BUT-UNREADABLE: discovery LOCATED an installed `deep_research.dot`
+///     but failed to read/parse it (read/permission/UTF-8 error) → falling back
+///     to the bundled copy would MASK the broken install and let the fallback
+///     out-rank a present installed pipeline. That violates "fallback only on a
+///     true miss / can never out-rank an installed pipeline."
+///
+/// Here the installed `skills/<x>/deep_research.dot` is created as a DIRECTORY
+/// (not a regular file): discovery still locates it (the `.dot` extension scan
+/// matches a dir entry, stem `deep_research`), but `read_to_string` on a
+/// directory fails — the canonical found-but-unreadable case, cross-platform.
+///
+/// RED on 134623eb: `resolve_named_with_bundled_fallback` fell back on ANY
+/// discovery `Err`, so the read failure was silently masked by the bundled
+/// bytes (`Ok(...)` containing `digraph deep_research`). GREEN after the fix:
+/// the read error is propagated (NOT masked) because a candidate WAS located.
+#[tokio::test]
+async fn corrupt_installed_pipeline_is_not_masked_by_bundled_fallback() {
+    let working = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let octos_home = tempfile::tempdir().unwrap();
+
+    // Bootstrap the bundled fallback so the embedded bytes ARE available — the
+    // whole point is that the fallback exists yet must NOT mask the broken
+    // install.
+    octos_agent::bootstrap::bootstrap_bundled_pipelines(octos_home.path());
+
+    // Install a copy of the SAME pipeline name that discovery can LOCATE but
+    // not READ: a directory named `deep_research.dot` (extension scan matches,
+    // `read_to_string` on a dir errors).
+    let skill_dir = octos_home.path().join("skills").join("mofa-research");
+    std::fs::create_dir_all(skill_dir.join("deep_research.dot")).unwrap();
+
+    let tool = make_tool_with_data(working.path(), data.path())
+        .await
+        .with_octos_home(PathBuf::from(octos_home.path()));
+
+    let result = tool.resolve_named_for_test("deep_research").await;
+    assert!(
+        result.is_err(),
+        "an installed-but-unreadable deep_research.dot must surface a read error, \
+         NOT be silently masked by the embedded bundled bytes; got Ok(..): {:?}",
+        result.as_ref().ok()
+    );
+    let dot = result.unwrap_or_default();
+    assert!(
+        !dot.contains("digraph deep_research"),
+        "the embedded bundled copy must NOT out-rank a located-but-unreadable \
+         installed pipeline, got bundled bytes: {dot}"
+    );
+}
+
 /// Cross-crate guard: every pipeline bundled by `octos_agent` must parse and
 /// validate clean against THIS crate's parser/validator — otherwise
 /// `pre_flight_validate` would reject the bundled fallback the moment the

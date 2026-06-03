@@ -402,6 +402,22 @@ impl RunPipelineTool {
         match self.discovery.resolve(name_or_path).await {
             Ok(dot) => Ok(dot),
             Err(discovery_err) => {
+                // Gap 4.1 (codex review): the embedded fallback may fire ONLY
+                // on a TRUE discovery miss (`PipelineResolveError::NotFound`).
+                // If discovery LOCATED an installed candidate but failed to
+                // read/parse it (`PipelineResolveError::Read`, or any other
+                // error kind), propagate that error — falling back would MASK
+                // the broken install and let the bundled copy out-rank a
+                // present installed pipeline ("fallback only on a true miss /
+                // can never out-rank an installed pipeline").
+                let is_true_miss = matches!(
+                    discovery_err.downcast_ref::<crate::discovery::PipelineResolveError>(),
+                    Some(crate::discovery::PipelineResolveError::NotFound { .. })
+                );
+                if !is_true_miss {
+                    return Err(discovery_err);
+                }
+
                 // Match against the embedded bundled pipelines by bare name.
                 // Gap 4.1 BLOCKER 2: canonicalize the input to the SAME bare
                 // file stem discovery uses (strip any directory + trailing

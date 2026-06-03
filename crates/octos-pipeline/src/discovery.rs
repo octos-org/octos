@@ -10,6 +10,68 @@ pub struct PipelineInfo {
     pub path: PathBuf,
 }
 
+/// Typed failure kinds for [`PipelineDiscovery::resolve`], so callers can tell
+/// a TRUE miss apart from a located-but-unreadable candidate.
+///
+/// Gap 4.1 (codex review): the embedded bundled fallback in `RunPipelineTool`
+/// must fire ONLY on a true miss ([`PipelineResolveError::NotFound`]). When
+/// discovery LOCATED an installed `.dot` but failed to read/parse it
+/// ([`PipelineResolveError::Read`]), falling back would MASK the broken install
+/// and let the bundled copy out-rank a present installed pipeline. The error is
+/// carried inside the `eyre::Report` so the existing `Result<String>` signature
+/// (and all `.await?` consumers) stay unchanged — the tool layer distinguishes
+/// the two via `downcast_ref::<PipelineResolveError>()`.
+#[derive(Debug)]
+pub enum PipelineResolveError {
+    /// No candidate file was located in any search path — a TRUE miss. The
+    /// embedded bundled fallback may correctly fire for this case.
+    NotFound {
+        /// The name/path the caller asked for.
+        requested: String,
+        /// The discoverable pipeline names, for a helpful error message.
+        available: Vec<String>,
+    },
+    /// A candidate file WAS located but could not be read/parsed (I/O,
+    /// permission, or UTF-8 error). The fallback must NOT mask this — it would
+    /// out-rank a present installed pipeline. Propagate it instead.
+    Read {
+        /// The located candidate that failed to load.
+        path: PathBuf,
+        /// The underlying read error, rendered.
+        source: String,
+    },
+}
+
+impl std::fmt::Display for PipelineResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineResolveError::NotFound {
+                requested,
+                available,
+            } => {
+                write!(
+                    f,
+                    "pipeline '{requested}' not found. Available: {}",
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )
+            }
+            PipelineResolveError::Read { path, source } => {
+                write!(
+                    f,
+                    "failed to read pipeline file '{}': {source}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PipelineResolveError {}
+
 /// Subdirectory name (under an octos root) where the binary writes its
 /// embedded generic pipelines. Mirrors `octos_agent::bootstrap::BUNDLED_PIPELINES_DIR`.
 ///
@@ -107,9 +169,7 @@ impl PipelineDiscovery {
         // 1. Check if it's a direct file path
         let as_path = PathBuf::from(name_or_path);
         if as_path.exists() && as_path.extension().is_some_and(|e| e == "dot") {
-            return tokio::fs::read_to_string(&as_path)
-                .await
-                .map_err(|e| eyre::eyre!("failed to read pipeline file: {e}"));
+            return read_located(&as_path).await;
         }
 
         // 2. Check if it's a relative path like "mofa-research/deep_research.dot".
@@ -123,16 +183,12 @@ impl PipelineDiscovery {
         for dir in &self.search_paths {
             let candidate = dir.join(name_or_path);
             if candidate.exists() {
-                return tokio::fs::read_to_string(&candidate)
-                    .await
-                    .map_err(|e| eyre::eyre!("failed to read pipeline file: {e}"));
+                return read_located(&candidate).await;
             }
             // Try with .dot extension
             let with_ext = dir.join(format!("{name_or_path}.dot"));
             if with_ext.exists() {
-                return tokio::fs::read_to_string(&with_ext)
-                    .await
-                    .map_err(|e| eyre::eyre!("failed to read pipeline file: {e}"));
+                return read_located(&with_ext).await;
             }
         }
 
@@ -149,23 +205,30 @@ impl PipelineDiscovery {
         let all = self.list_available();
         for info in &all {
             if info.name == want_stem {
-                return tokio::fs::read_to_string(&info.path)
-                    .await
-                    .map_err(|e| eyre::eyre!("failed to read pipeline file: {e}"));
+                return read_located(&info.path).await;
             }
         }
 
-        let available: Vec<_> = all.iter().map(|p| p.name.as_str()).collect();
-        eyre::bail!(
-            "pipeline '{}' not found. Available: {}",
-            name_or_path,
-            if available.is_empty() {
-                "(none)".to_string()
-            } else {
-                available.join(", ")
-            }
-        )
+        // TRUE MISS: no candidate located in any search path. This is the ONLY
+        // error kind for which the tool-layer embedded bundled fallback may
+        // correctly fire (see `PipelineResolveError`).
+        Err(eyre::Report::new(PipelineResolveError::NotFound {
+            requested: name_or_path.to_string(),
+            available: all.into_iter().map(|p| p.name).collect(),
+        }))
     }
+}
+
+/// Read a LOCATED candidate file to its DOT string. A failure here is a
+/// found-but-unreadable case ([`PipelineResolveError::Read`]) — never a miss —
+/// so the tool layer propagates it instead of masking it with the bundled copy.
+async fn read_located(path: &Path) -> Result<String> {
+    tokio::fs::read_to_string(path).await.map_err(|e| {
+        eyre::Report::new(PipelineResolveError::Read {
+            path: path.to_path_buf(),
+            source: e.to_string(),
+        })
+    })
 }
 
 /// Canonicalize a pipeline name-or-path input to the bare file STEM that
@@ -350,6 +413,49 @@ mod tests {
         assert!(
             resolved.contains("INSTALLED"),
             "bundled dir registered first must still be lowest precedence, got: {resolved}"
+        );
+    }
+
+    /// A TRUE miss (no candidate anywhere) returns `PipelineResolveError::NotFound`
+    /// — the ONLY error kind the tool-layer bundled fallback may fire for.
+    #[tokio::test]
+    async fn resolve_returns_not_found_on_true_miss() {
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+
+        let err = discovery.resolve("nope_missing").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineResolveError>(),
+                Some(PipelineResolveError::NotFound { .. })
+            ),
+            "true miss must surface NotFound, got: {err:?}"
+        );
+    }
+
+    /// A LOCATED-but-unreadable candidate returns `PipelineResolveError::Read`
+    /// (NOT NotFound), so the tool layer propagates it instead of masking it
+    /// with the bundled copy. Here the installed `deep_research.dot` is a
+    /// directory: discovery's `.dot` extension scan locates it, but
+    /// `read_to_string` on a directory fails.
+    #[tokio::test]
+    async fn resolve_returns_read_error_when_located_candidate_unreadable() {
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+
+        let skill_dir = data.path().join("skills").join("mofa-research");
+        std::fs::create_dir_all(skill_dir.join("deep_research.dot")).unwrap();
+
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+        let err = discovery.resolve("deep_research").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineResolveError>(),
+                Some(PipelineResolveError::Read { .. })
+            ),
+            "located-but-unreadable candidate must surface Read, NOT NotFound (which \
+             would let the bundled fallback mask the broken install), got: {err:?}"
         );
     }
 
