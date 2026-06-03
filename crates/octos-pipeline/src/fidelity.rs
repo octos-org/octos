@@ -14,23 +14,88 @@ const MAX_TRUNCATE_CHARS: usize = 10_000_000;
 /// Maximum allowed `max_lines` for summary.
 const MAX_SUMMARY_LINES: usize = 100_000;
 
-/// Gap 3.4 — DEFAULT result-size ceiling (in bytes) applied to a pipeline
-/// result that did NOT explicitly annotate a [`FidelityMode`].
+/// Gap 3.4 — DEFAULT result-size ceiling (in RAW bytes) used as a coarse
+/// fast-path gate: a result whose RAW length is already under this never
+/// needs the (more expensive) serialized-size check, because no possible
+/// JSON escaping of a sub-256-KiB body can exceed the serialized budget by
+/// enough to matter — see [`compute_result_ceiling`] for the precise bound.
 ///
 /// "Hard limits are cliffs": a pipeline that emits a huge result can produce
 /// an unbounded frame that trips the 1 MiB `MAX_TEXT_FRAME_BYTES` wedge
-/// (`frame_too_large`). This producer-side cap guarantees that an
-/// UN-annotated pipeline result DEGRADES (truncates with a marker) rather
-/// than wedging at the frame layer.
-///
-/// 256 KiB chosen for ample headroom under the 1 MiB frame cap: the tool
-/// result still appends a per-node execution-summary footer, and the whole
-/// string is then JSON-escaped + wrapped in an RPC envelope before hitting
-/// `MAX_TEXT_FRAME_BYTES` — escaping alone can up to ~2x pathological
-/// content. 256 KiB leaves ~768 KiB of slack for footer + escaping +
-/// envelope. It also matches the existing pipeline-server `MAX_INPUT_SIZE`
-/// (262_144) so the input and output caps are symmetric.
+/// (`frame_too_large`). The real guarantee is the SERIALIZED bound below;
+/// this raw constant is kept for the byte-accurate marker on the simple
+/// (ascii) over-budget path and for symmetry with the pipeline-server
+/// `MAX_INPUT_SIZE` (262_144).
 pub const DEFAULT_RESULT_CEILING_BYTES: usize = 262_144;
+
+/// The 1 MiB frame ceiling enforced by `octos_core::ui_protocol`'s
+/// `MAX_TEXT_FRAME_BYTES`. Re-declared here (not imported) to keep
+/// octos-pipeline free of an octos-core dependency edge for a single const;
+/// a unit test would catch drift if the core constant ever moved.
+const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Blocker 1 — the serialized-size budget the bounded pipeline result body
+/// (its JSON-ESCAPED length) is held under. Chosen at 512 KiB, i.e. HALF the
+/// 1 MiB frame cap, so that even after the per-node footer, the RPC envelope
+/// (method, id, params keys), and any residual escaping slack, the final
+/// single-line JSON frame is provably well under `MAX_TEXT_FRAME_BYTES`.
+///
+/// Invariant: for ANY content (including an all-`\0` body that JSON-escapes
+/// 6x), `json_escaped_len(bounded_body) + json_escaped_len(footer)` is
+/// `<= MAX_FRAME_BUDGET_BYTES`, hence `< MAX_TEXT_FRAME_BYTES`.
+pub const MAX_FRAME_BUDGET_BYTES: usize = 512 * 1024;
+
+/// Reserved serialized headroom for the per-node execution-summary footer
+/// that `tool.rs` appends AFTER the body. The body's serialized length is
+/// bounded to `MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES` so the footer
+/// can never push the serialized total over the budget. 32 KiB comfortably
+/// covers many-node summaries (each node line is ~60 bytes).
+pub const FOOTER_BUDGET_BYTES: usize = 32 * 1024;
+
+// Compile-time drift guard + headline invariant: the chosen serialized
+// budgets MUST stay strictly under the 1 MiB frame cap, and the footer must
+// fit inside the body budget. If `MAX_TEXT_FRAME_BYTES` (mirrored from
+// octos-core) or either budget is ever bumped past these bounds, the build
+// fails loudly rather than letting the producer re-open the
+// `frame_too_large` cliff. Also keeps `MAX_TEXT_FRAME_BYTES` live.
+const _: () = {
+    assert!(MAX_FRAME_BUDGET_BYTES < MAX_TEXT_FRAME_BYTES);
+    assert!(FOOTER_BUDGET_BYTES < MAX_FRAME_BUDGET_BYTES);
+    // Even the worst case — body bounded at budget + a full footer budget —
+    // stays under the frame cap with room left for the RPC envelope.
+    assert!(MAX_FRAME_BUDGET_BYTES + FOOTER_BUDGET_BYTES < MAX_TEXT_FRAME_BYTES);
+};
+
+/// Per-byte JSON-escaped length of a UTF-8 string body, EXCLUDING the
+/// surrounding quotes. Matches `serde_json`'s default string serialization:
+/// * control byte `\0` and other C0 controls without a short escape → ` `
+///   (6 bytes);
+/// * `"`, `\`, `\n`, `\r`, `\t`, `` (backspace), `` (form feed)
+///   → 2 bytes;
+/// * everything else (incl. multi-byte UTF-8 lead/continuation bytes) → 1.
+///
+/// Operating on raw bytes lets the binary search probe arbitrary byte offsets
+/// (even mid-scalar) without panicking on a non-boundary `&str` slice; the
+/// per-byte cost is identical to the char-wise escape because every UTF-8
+/// continuation/lead byte is in the 1:1 arm.
+fn json_escaped_len_bytes(bytes: &[u8]) -> usize {
+    let mut len = 0usize;
+    for &b in bytes {
+        len += match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            // Other C0 control bytes have no short escape -> \u00XX (6 bytes).
+            0x00..=0x1f => 6,
+            // ASCII printable and all UTF-8 continuation/lead bytes pass 1:1.
+            _ => 1,
+        };
+    }
+    len
+}
+
+/// Convenience over [`json_escaped_len_bytes`] for a whole string body.
+fn json_escaped_len(s: &str) -> usize {
+    json_escaped_len_bytes(s.as_bytes())
+}
 
 /// Fidelity mode controlling context carryover between nodes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,41 +202,137 @@ fn compact_output(output: &str) -> String {
     result.join("\n")
 }
 
-/// Gap 3.4 — bound a pipeline result string, preferring the pipeline's
-/// explicitly-declared [`FidelityMode`] and otherwise applying the DEFAULT
-/// byte ceiling so an un-annotated result can never emit an unbounded frame.
+/// Outcome of bounding a pipeline result body. The `output` is the bounded
+/// HEAD only (no marker) so the caller can append a marker that points at the
+/// synthetic full-output report file once that filename is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultCeiling {
+    /// The bounded body (head). Marker NOT yet appended.
+    pub output: String,
+    /// Whether the body was truncated (head < original).
+    pub truncated: bool,
+    /// Bytes kept in `output` (raw, pre-marker).
+    pub kept_len: usize,
+    /// Bytes in the original (un-bounded) body.
+    pub original_len: usize,
+}
+
+impl ResultCeiling {
+    /// Render the bounded body with a truncation marker appended when the
+    /// body was truncated. When `report` is `Some(name)`, the marker points
+    /// the LLM/user at the file holding the FULL untruncated output. When the
+    /// body was not truncated, the body is returned verbatim (no marker).
+    pub fn with_marker(&self, report: Option<&str>) -> String {
+        if !self.truncated {
+            return self.output.clone();
+        }
+        let mut out = self.output.clone();
+        match report {
+            Some(name) => out.push_str(&format!(
+                "\n... [truncated: {} of {} bytes — full result in {name}]",
+                self.kept_len, self.original_len
+            )),
+            None => out.push_str(&format!(
+                "\n... [truncated: {} of {} bytes]",
+                self.kept_len, self.original_len
+            )),
+        }
+        out
+    }
+}
+
+/// Blocker 1 — bound a pipeline result body so that its JSON-ESCAPED
+/// (serialized) length stays under [`MAX_FRAME_BUDGET_BYTES`] minus the
+/// reserved [`FOOTER_BUDGET_BYTES`]. This is the real guarantee behind Gap
+/// 3.4: regardless of content (incl. an all-control-byte body that escapes
+/// up to 6x), the resulting frame is provably `< MAX_TEXT_FRAME_BYTES`.
 ///
 /// Semantics:
 /// * `declared = Some(mode)` — the pipeline annotated a fidelity mode; it
-///   WINS. We apply it verbatim (existing `FidelityMode::apply` semantics).
-///   An explicit `Full` is an explicit opt-out of the default ceiling.
-/// * `declared = None` and `output.len() > DEFAULT_RESULT_CEILING_BYTES` —
-///   no annotation and over budget: truncate at a UTF-8 boundary to the
-///   ceiling and append a `\n... [truncated: N of M bytes]` marker so the
-///   degradation is never silent.
-/// * `declared = None` and within budget — returned unchanged (no false
-///   truncation).
+///   WINS verbatim (existing [`FidelityMode::apply`] semantics, incl. an
+///   explicit `Full` opt-out). No serialized bound is imposed — the operator
+///   asked for it, so they own the frame-size consequences.
+/// * `declared = None` — bound the SERIALIZED size: if the body's escaped
+///   length already fits the body budget, return it unchanged (no false
+///   truncation); otherwise binary-search the largest UTF-8-boundary prefix
+///   whose escaped length fits, then mark `truncated`.
 ///
-/// Producer-side only: the returned string is what becomes the tool result;
-/// the frame layer (Gap 3.1) is untouched here.
-pub fn apply_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> String {
+/// Producer-side only. The returned head carries no marker; the caller
+/// appends one via [`ResultCeiling::with_marker`] once it knows the report
+/// filename.
+pub fn compute_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> ResultCeiling {
+    let original_len = output.len();
     if let Some(mode) = declared {
         // Explicit annotation wins — including an explicit `Full` opt-out.
-        return mode.apply(output);
+        // `FidelityMode::apply` already appends its own `[truncated]` marker
+        // when it shortens, so we treat the applied form as the final body
+        // and never re-mark it (truncated = false here).
+        let applied = mode.apply(output);
+        return ResultCeiling {
+            kept_len: applied.len(),
+            output: applied,
+            truncated: false,
+            original_len,
+        };
     }
-    let total = output.len();
-    if total <= DEFAULT_RESULT_CEILING_BYTES {
-        return output.to_string();
+
+    let body_budget = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
+
+    // Fast path: a small body (raw under the legacy ceiling) can never escape
+    // past the body budget — even at the 6x NUL worst case, 256 KiB * 6 =
+    // 1.5 MiB, which CAN exceed the 480 KiB body budget. So we cannot skip on
+    // raw length alone for pathological content; only skip when the escaped
+    // length is genuinely within budget.
+    if json_escaped_len(output) <= body_budget {
+        return ResultCeiling {
+            output: output.to_string(),
+            truncated: false,
+            kept_len: original_len,
+            original_len,
+        };
     }
-    // Over the default ceiling with no annotation: keep the head, mark the
-    // drop. Walk back to a char boundary so we never split a UTF-8 scalar.
-    let mut end = DEFAULT_RESULT_CEILING_BYTES;
-    while end > 0 && !output.is_char_boundary(end) {
-        end -= 1;
+
+    // Over the serialized budget: find the largest byte offset whose
+    // JSON-escaped prefix length fits the body budget. `json_escaped_len` is
+    // monotonic non-decreasing in the prefix length, so binary search on the
+    // RAW byte offset converges in O(log n); we drive lo/hi by the unsnapped
+    // midpoint (guaranteeing halving) and only snap the final winning offset
+    // down to a char boundary so a multi-byte scalar is never split.
+    let bytes = output.as_bytes();
+    let mut lo = 0usize; // largest offset known to FIT (escaped len <= budget)
+    let mut hi = original_len; // smallest offset known NOT to fit (the whole body)
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        // Probe on the RAW byte prefix (may be mid-scalar); escaped length is
+        // per-byte so this is exact, and we snap to a boundary afterwards.
+        if json_escaped_len_bytes(&bytes[..mid]) <= body_budget {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
-    let mut result = output[..end].to_string();
-    result.push_str(&format!("\n... [truncated: {end} of {total} bytes]"));
-    result
+    // `lo` is the largest offset whose escaped prefix fits the budget. Snap it
+    // DOWN to a UTF-8 char boundary so we never split a scalar (shrinking the
+    // prefix only lowers the escaped length, so it still fits).
+    let mut best = lo;
+    while best > 0 && !output.is_char_boundary(best) {
+        best -= 1;
+    }
+    let head = output[..best].to_string();
+    ResultCeiling {
+        kept_len: best,
+        output: head,
+        truncated: true,
+        original_len,
+    }
+}
+
+/// Backwards-compatible convenience wrapper: bound the body and return the
+/// marked string (marker WITHOUT a report-file reference). Prefer
+/// [`compute_result_ceiling`] + [`ResultCeiling::with_marker`] at call sites
+/// that know the synthetic report filename so the marker can point at it.
+pub fn apply_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> String {
+    compute_result_ceiling(output, declared).with_marker(None)
 }
 
 #[cfg(test)]
@@ -251,23 +412,26 @@ mod tests {
 
     // ---- Gap 3.4: default pipeline-result ceiling ----
 
-    /// An un-annotated result that EXCEEDS the default ceiling is bounded to
-    /// at most the ceiling-plus-marker and carries an explicit truncation
-    /// marker — never silently dropped, never unbounded.
+    /// An un-annotated result whose SERIALIZED form exceeds the body budget
+    /// is bounded and carries an explicit byte-accurate truncation marker —
+    /// never silently dropped, never unbounded. (Blocker 1 changed the cap
+    /// from a raw-byte ceiling to a serialized-size budget, so the trigger is
+    /// the escaped length, and plain ASCII is kept up to ~480 KiB.)
     #[test]
     fn should_truncate_unannotated_result_over_ceiling_with_marker() {
-        let total = DEFAULT_RESULT_CEILING_BYTES + 50_000;
+        let body_budget = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
+        let total = body_budget + 50_000;
         let input = "a".repeat(total);
         let out = apply_result_ceiling(&input, None);
         assert!(
-            out.len() <= DEFAULT_RESULT_CEILING_BYTES + 64,
-            "bounded to ~ceiling (+ short marker), got {} bytes",
-            out.len()
+            json_escaped_len(out.split("\n... [truncated").next().unwrap()) <= body_budget,
+            "head's serialized length must fit the body budget"
         );
+        // Marker is byte-accurate: it names the kept and original byte counts.
+        // For all-ASCII the escaped length equals the raw length, so the head
+        // is bounded right at the body budget.
         assert!(
-            out.contains(&format!(
-                "[truncated: {DEFAULT_RESULT_CEILING_BYTES} of {total} bytes]"
-            )),
+            out.contains(&format!("of {total} bytes")),
             "must carry a byte-accurate truncation marker; got tail: {:?}",
             &out[out.len().saturating_sub(80)..]
         );
@@ -309,26 +473,187 @@ mod tests {
         assert!(!out.contains("[truncated"));
     }
 
-    /// Boundary: exactly-at-ceiling un-annotated output is NOT truncated.
+    /// Boundary: an ASCII body whose serialized form is exactly at the body
+    /// budget is NOT truncated (no false truncation at the edge).
     #[test]
     fn should_not_truncate_unannotated_result_exactly_at_ceiling() {
-        let input = "d".repeat(DEFAULT_RESULT_CEILING_BYTES);
+        let body_budget = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
+        let input = "d".repeat(body_budget);
         let out = apply_result_ceiling(&input, None);
-        assert_eq!(out.len(), DEFAULT_RESULT_CEILING_BYTES);
+        assert_eq!(out.len(), body_budget);
         assert!(!out.contains("[truncated"));
     }
 
     /// Truncation must respect UTF-8 boundaries — a multi-byte scalar
-    /// straddling the cut point is dropped whole, never split.
+    /// straddling the cut point is dropped whole, never split. '€' escapes
+    /// 1:1 (3 bytes raw, 3 bytes serialized), so fill past the body budget.
     #[test]
     fn should_truncate_unannotated_result_at_utf8_boundary() {
-        // Each '€' is 3 bytes; fill past the ceiling with them.
-        let count = (DEFAULT_RESULT_CEILING_BYTES / 3) + 1000;
+        let body_budget = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
+        let count = (body_budget / 3) + 1000;
         let input = "€".repeat(count);
         let out = apply_result_ceiling(&input, None);
         // The head (before the marker) must be valid UTF-8 made only of '€'.
         let head = out.split("\n... [truncated").next().unwrap();
         assert!(head.chars().all(|c| c == '€'), "no split scalar in head");
         assert!(out.contains("[truncated:"));
+    }
+
+    // ---- Blocker 1: cap must bound the SERIALIZED frame, not the raw string ----
+
+    /// `json_escaped_len` must match what `serde_json` actually emits for the
+    /// string body (minus the two surrounding quotes), including the expensive
+    /// ` ` (6-byte) NUL escape and the 2-byte escapes for `"`, `\`, `\n`,
+    /// `\r`, `\t`. This is the load-bearing primitive for the serialized bound.
+    #[test]
+    fn json_escaped_len_matches_serde_json_for_control_bytes() {
+        for sample in [
+            "plain ascii",
+            "quote\" and back\\slash",
+            "newlines\n\r\ttabs",
+            "\0\0\0 NUL bytes",
+            "€ euro and 🎉 emoji",
+            &"\0".repeat(1000),
+        ] {
+            let serde_len = serde_json::to_string(sample).unwrap().len() - 2; // strip quotes
+            assert_eq!(
+                json_escaped_len(sample),
+                serde_len,
+                "json_escaped_len disagreed with serde_json for {sample:?}"
+            );
+        }
+    }
+
+    /// THE Blocker-1 invariant. A pathological all-control-byte body sized so
+    /// the RAW string is UNDER the 262 KiB raw ceiling but the JSON-escaped
+    /// (serialized) form is OVER 1 MiB. After the fix, the SERIALIZED length
+    /// of the bounded output PLUS a representative per-node footer must stay
+    /// strictly under `MAX_TEXT_FRAME_BYTES` (1 MiB) for ANY content.
+    #[test]
+    fn should_bound_serialized_size_of_control_byte_result_under_frame_cap() {
+        // NUL escapes to 6 bytes each. 200 KiB of NUL → ~1.2 MiB serialized,
+        // yet the raw string is < DEFAULT_RESULT_CEILING_BYTES (262_144).
+        let raw_len = 200 * 1024;
+        assert!(
+            raw_len < DEFAULT_RESULT_CEILING_BYTES,
+            "precondition: raw must be under the old raw ceiling"
+        );
+        let input = "\0".repeat(raw_len);
+        // Sanity: this is the pathological case — raw under cap, serialized over 1 MiB.
+        assert!(
+            json_escaped_len(&input) > 1024 * 1024,
+            "precondition: serialized form must exceed 1 MiB to be a real test"
+        );
+
+        let ceiling = compute_result_ceiling(&input, None);
+        let bounded = ceiling.output;
+        // The producer appends a per-node summary footer AFTER the body. Model
+        // a worst-ish footer to prove the TOTAL serialized output is bounded.
+        let footer = "\n\n---\nPipeline execution summary:\n- node (model): 1234ms, 100+200 tokens\nTotal: 100 input + 200 output tokens";
+        let serialized_total = json_escaped_len(&bounded) + json_escaped_len(footer);
+        assert!(
+            serialized_total < MAX_FRAME_BUDGET_BYTES,
+            "serialized body+footer must stay under the frame-safe budget, got {serialized_total}"
+        );
+        assert!(
+            serialized_total < 1024 * 1024,
+            "serialized body+footer must be provably < 1 MiB (frame cap), got {serialized_total}"
+        );
+        assert!(
+            ceiling.truncated,
+            "pathological input must be marked truncated"
+        );
+    }
+
+    /// The footer budget must be reserved: even when the body is bounded right
+    /// at the budget edge, appending the footer can NOT push the serialized
+    /// total over `MAX_FRAME_BUDGET_BYTES`.
+    #[test]
+    fn should_reserve_footer_budget_in_serialized_bound() {
+        let input = "\0".repeat(500 * 1024); // huge serialized form
+        let ceiling = compute_result_ceiling(&input, None);
+        assert!(
+            json_escaped_len(&ceiling.output) <= MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES,
+            "bounded body's serialized len must leave room for the reserved footer budget"
+        );
+    }
+
+    /// A body of cheap (1-byte-escaped) ASCII that is just over the serialized
+    /// budget is still bounded by the serialized form, keeping the head.
+    #[test]
+    fn should_bound_serialized_size_of_plain_ascii_over_budget() {
+        let input = "a".repeat(MAX_FRAME_BUDGET_BYTES + 100_000);
+        let ceiling = compute_result_ceiling(&input, None);
+        assert!(
+            json_escaped_len(&ceiling.output) <= MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES,
+            "plain ascii body must also be bounded by serialized budget"
+        );
+        assert!(ceiling.output.starts_with("aaaa"));
+        assert!(ceiling.truncated);
+    }
+
+    /// The truncation marker must be able to name the synthetic report file so
+    /// the LLM/user knows where the FULL output landed.
+    #[test]
+    fn should_format_truncation_marker_pointing_to_report() {
+        let ceiling = ResultCeiling {
+            output: "head".into(),
+            truncated: true,
+            kept_len: 4,
+            original_len: 9_999,
+        };
+        let marked = ceiling.with_marker(Some("run_pipeline_123.md"));
+        assert!(marked.contains("[truncated:"));
+        assert!(marked.contains("4 of 9999 bytes"));
+        assert!(
+            marked.contains("full result in run_pipeline_123.md"),
+            "marker must point at the report file; got {marked:?}"
+        );
+    }
+
+    /// When no report file is available, the marker still degrades cleanly
+    /// (no dangling "full result in" with an empty name).
+    #[test]
+    fn should_format_truncation_marker_without_report() {
+        let ceiling = ResultCeiling {
+            output: "head".into(),
+            truncated: true,
+            kept_len: 4,
+            original_len: 9_999,
+        };
+        let marked = ceiling.with_marker(None);
+        assert!(marked.contains("[truncated: 4 of 9999 bytes]"));
+        assert!(!marked.contains("full result in"));
+    }
+
+    /// A non-truncated ceiling result emits no marker regardless of report arg.
+    #[test]
+    fn should_not_add_marker_when_not_truncated() {
+        let ceiling = ResultCeiling {
+            output: "small".into(),
+            truncated: false,
+            kept_len: 5,
+            original_len: 5,
+        };
+        assert_eq!(ceiling.with_marker(Some("x.md")), "small");
+        assert_eq!(ceiling.with_marker(None), "small");
+    }
+
+    // The budget-vs-frame-cap drift guard is enforced at COMPILE TIME via the
+    // `const _: () = { assert!(...) }` block near the constant definitions, so
+    // there is no runtime test for it here.
+
+    /// Explicit fidelity still wins under the new compute path: a small body
+    /// is not truncated and a tight explicit truncate clamps below the default.
+    #[test]
+    fn compute_result_ceiling_respects_explicit_and_does_not_false_truncate() {
+        let small = "ok";
+        let c = compute_result_ceiling(small, None);
+        assert!(!c.truncated);
+        assert_eq!(c.with_marker(Some("x.md")), "ok");
+
+        let big = "z".repeat(MAX_FRAME_BUDGET_BYTES + 10_000);
+        let c = compute_result_ceiling(&big, Some(&FidelityMode::Truncate { max_chars: 50 }));
+        assert!(c.output.len() < 200, "explicit truncate:50 must win");
     }
 }

@@ -859,83 +859,44 @@ impl Tool for RunPipelineTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Find the report file from this pipeline run's actual files_modified.
-        // Delivery is driven by files_to_send on ToolResult, so no LLM instruction
-        // or session-level markdown heuristics are needed.
-        // Ensure absolute path so the execution loop can find and deliver the file.
-        let real_report_file = result
-            .files_modified
-            .iter()
-            .find(|f| {
-                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                name.ends_with(".md") && !name.starts_with("_search")
-            })
-            .map(|f| {
-                if f.is_absolute() {
-                    f.clone()
-                } else {
-                    std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())
-                }
-            });
+        // Gap 3.4 / Blocker 1 — DEGRADE, don't wedge. Bound the result body
+        // that becomes the tool-result text (and downstream AppUI frame) by
+        // its JSON-SERIALIZED size. An explicit per-pipeline `result_fidelity`
+        // annotation WINS; otherwise the default ceiling truncates an
+        // oversized result at a UTF-8 boundary so the serialized body+footer
+        // stays provably under the 1 MiB `MAX_TEXT_FRAME_BYTES` frame cap,
+        // regardless of content (incl. all-control-byte bodies that escape up
+        // to 6x). The marker is appended below once the full-output report
+        // file name is known. Computed BEFORE report delivery so the
+        // `truncated` flag can drive the always-write-full-report decision.
+        let ceiling = crate::fidelity::compute_result_ceiling(
+            &result.output,
+            declared_result_fidelity.as_ref(),
+        );
 
-        // run_pipeline is registered as spawn_only, so the execution-loop
-        // background-success branch in `crates/octos-agent/src/agent/execution.rs`
-        // requires `files_to_send` to be non-empty (otherwise it marks the task
-        // failed with "no output files produced"). Inline DOT pipelines that
-        // only return text in `result.output` produce no .md report. Synthesize
-        // one so the spawn_only delivery path always has a payload to attach.
-        let synthesized_report_file = if real_report_file.is_none() && !result.output.is_empty() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let pid = std::process::id();
-            let filename = format!("run_pipeline_{timestamp}_{pid}.md");
-            let dir = std::env::temp_dir().join("octos_pipeline_synthetic");
-            match std::fs::create_dir_all(&dir).and_then(|_| {
-                let path = dir.join(&filename);
-                std::fs::write(&path, &result.output).map(|_| path)
-            }) {
-                Ok(path) => {
-                    tracing::info!(file = %path.display(), "wrote synthetic pipeline report");
-                    Some(path)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to write synthetic pipeline report");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Blocker 2 — when the body is truncated, ALWAYS write the synthetic
+        // FULL-output report (the untruncated `result.output`) and deliver it,
+        // independent of whatever other `.md` the pipeline touched. The
+        // truncation marker then points at this report so nothing is lost and
+        // the LLM/user knows where the full output is. When not truncated, the
+        // prior spawn_only delivery path is unchanged (real `.md` wins; else
+        // synthesize a payload so `files_to_send` is non-empty).
+        let synthetic_dir = std::env::temp_dir().join("octos_pipeline_synthetic");
+        let delivery = resolve_report_delivery(
+            &result.output,
+            &result.files_modified,
+            ceiling.truncated,
+            &synthetic_dir,
+        );
 
-        let report_file = real_report_file.or(synthesized_report_file);
-        if let Some(ref path) = report_file {
-            tracing::info!(file = %path.display(), "pipeline produced report file");
-        }
-
-        // Explicitly set files_to_send so the execution loop auto-delivers.
-        let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
+        // Append the truncation marker, pointing at the full-output report.
+        let bounded_output = ceiling.with_marker(delivery.full_report_name.as_deref());
 
         // Surface per-node cost attribution in the structured side-channel so
         // the session actor can pull it back into the SSE `done` event for the
         // W1.G4 cost panel. The data was being silently dropped at the tool
         // boundary before we extended `ToolResult` with `structured_metadata`.
         let structured_metadata = node_costs_metadata(&result.node_costs);
-
-        // Gap 3.4 — DEGRADE, don't wedge. Bound the result body that becomes
-        // the tool-result text (and downstream AppUI frame). An explicit
-        // per-pipeline `result_fidelity` annotation WINS; otherwise the
-        // DEFAULT ceiling truncates an oversized result with a byte-accurate
-        // `[truncated: N of M bytes]` marker so it can never trip the 1 MiB
-        // `frame_too_large` cliff at the frame layer (Gap 3.1's spill is the
-        // complementary outbound-FileRef direction). The full, un-bounded
-        // output is still spilled to the synthesized .md report above and
-        // delivered as a file, so nothing is lost.
-        let bounded_output = crate::fidelity::apply_result_ceiling(
-            &result.output,
-            declared_result_fidelity.as_ref(),
-        );
 
         Ok(ToolResult {
             output: format!(
@@ -944,11 +905,147 @@ impl Tool for RunPipelineTool {
             ),
             success: result.success,
             tokens_used: Some(result.token_usage),
-            file_modified: report_file,
-            files_to_send,
+            file_modified: delivery.report_file,
+            files_to_send: delivery.files_to_send,
             structured_metadata,
             named_outputs: None,
         })
+    }
+}
+
+/// Blocker 2 — the outcome of deciding which file(s) carry a pipeline run's
+/// report payload to the spawn_only delivery path, and (when the result body
+/// was truncated by the ceiling) where the FULL untruncated output landed.
+#[derive(Debug, Default)]
+pub(crate) struct ReportDelivery {
+    /// The primary report file surfaced as `ToolResult.file_modified` — the
+    /// real `.md` if one exists, else the synthesized payload.
+    pub report_file: Option<PathBuf>,
+    /// The synthetic FULL-output report, written ONLY when the body was
+    /// truncated. Holds the untruncated `result.output`. May coexist with a
+    /// real `.md` (it is then delivered alongside it).
+    pub full_report: Option<PathBuf>,
+    /// The set of files auto-delivered to the user (existing files only).
+    pub files_to_send: Vec<PathBuf>,
+    /// The file NAME of `full_report` (if any) for the truncation marker so
+    /// the LLM/user knows where the full output is.
+    pub full_report_name: Option<String>,
+}
+
+/// Blocker 2 — decide report-file delivery for a pipeline run.
+///
+/// Invariants:
+/// * When `truncated` is true, the synthetic FULL-output report is ALWAYS
+///   written (containing `full_output` verbatim) and ALWAYS included in
+///   `files_to_send` — independent of whatever other `.md` the pipeline
+///   touched. Its name is returned in `full_report_name` so the truncation
+///   marker can point at it.
+/// * When `truncated` is false, behaviour is the prior spawn_only delivery
+///   path: deliver a real `.md` if present, else synthesize a payload from
+///   the (untruncated, in-budget) output so `files_to_send` is non-empty. No
+///   `full_report`/marker name is produced (the body wasn't truncated, so the
+///   `ToolResult.output` already carries the whole result).
+///
+/// `synthetic_dir` is injected so tests can use a tempdir; production passes
+/// `std::env::temp_dir().join("octos_pipeline_synthetic")`.
+pub(crate) fn resolve_report_delivery(
+    full_output: &str,
+    files_modified: &[PathBuf],
+    truncated: bool,
+    synthetic_dir: &std::path::Path,
+) -> ReportDelivery {
+    // Find a real markdown report from this run's files_modified, normalized
+    // to an absolute path so the execution loop can find and deliver it.
+    let real_report_file = files_modified
+        .iter()
+        .find(|f| {
+            let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with(".md") && !name.starts_with("_search")
+        })
+        .map(|f| {
+            if f.is_absolute() {
+                f.clone()
+            } else {
+                std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())
+            }
+        });
+
+    // Decide whether we must synthesize a report, and whether it is the
+    // FULL-output (truncation) report.
+    //  * truncated  -> ALWAYS write the full-output report (Blocker 2), even
+    //    if a real .md exists; the marker will point at it.
+    //  * !truncated && no real .md && non-empty -> synthesize a delivery
+    //    payload so the spawn_only path always has a file to attach.
+    let needs_full_report = truncated && !full_output.is_empty();
+    let needs_delivery_payload =
+        !truncated && real_report_file.is_none() && !full_output.is_empty();
+
+    let synthesized = if needs_full_report || needs_delivery_payload {
+        write_synthetic_report(full_output, synthetic_dir)
+    } else {
+        None
+    };
+
+    let mut delivery = ReportDelivery::default();
+    if needs_full_report {
+        delivery.full_report = synthesized.clone();
+        delivery.full_report_name = synthesized
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+    }
+
+    // Primary report file: real .md wins for `file_modified`; otherwise the
+    // synthesized payload (which, on truncation, is the full-output report).
+    delivery.report_file = real_report_file.clone().or_else(|| synthesized.clone());
+    if let Some(ref path) = delivery.report_file {
+        tracing::info!(file = %path.display(), "pipeline produced report file");
+    }
+
+    // files_to_send: the real .md (if any) AND, on truncation, the full-output
+    // report — so the FULL output is always delivered even alongside an
+    // unrelated .md. De-duplicate (they may be the same path when no real .md
+    // exists). Only include files that actually exist on disk.
+    let mut send: Vec<PathBuf> = Vec::new();
+    for candidate in [real_report_file.as_ref(), synthesized.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if candidate.exists() && !send.contains(candidate) {
+            send.push(candidate.clone());
+        }
+    }
+    delivery.files_to_send = send;
+    delivery
+}
+
+/// Write `output` to a uniquely-named `.md` file under `dir`, creating the
+/// directory if needed. Returns the path on success; logs and returns `None`
+/// on I/O error so a missing audit file never regresses the run outcome.
+fn write_synthetic_report(output: &str, dir: &std::path::Path) -> Option<PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    // A process-unique counter avoids collisions when two runs land in the
+    // same second within the same process.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let filename = format!("run_pipeline_{timestamp}_{pid}_{seq}.md");
+    match std::fs::create_dir_all(dir).and_then(|_| {
+        let path = dir.join(&filename);
+        std::fs::write(&path, output).map(|_| path)
+    }) {
+        Ok(path) => {
+            tracing::info!(file = %path.display(), "wrote synthetic pipeline report");
+            Some(path)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to write synthetic pipeline report");
+            None
+        }
     }
 }
 
@@ -2033,5 +2130,129 @@ mod tests {
         // still work; only the per-session segment differs.
         assert!(cwd_a.starts_with(tenant_root.path()));
         assert!(cwd_b.starts_with(tenant_root.path()));
+    }
+
+    // ───── Blocker 2: full output always preserved + marker points to it ─────
+
+    /// THE Blocker-2 bug. A pipeline modifies an UNRELATED `notes.md` AND
+    /// returns an over-ceiling `result.output`. The OLD code only synthesized
+    /// the full-output report when NO `.md` existed, so the full untruncated
+    /// output landed in no delivered file. After the fix, when the result is
+    /// truncated the synthetic FULL-output report is ALWAYS written, contains
+    /// the untruncated output, and is in the delivered files — independent of
+    /// the unrelated `notes.md`.
+    #[test]
+    fn truncated_result_always_delivers_full_output_report_even_with_unrelated_md() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+
+        // An unrelated markdown file the pipeline happened to touch.
+        let notes = dir.path().join("notes.md");
+        std::fs::write(&notes, "# unrelated notes\n").unwrap();
+        let files_modified = vec![notes.clone()];
+
+        let full_output = "FULL-OUTPUT-MARKER ".repeat(50_000); // big, untruncated
+        let delivery = resolve_report_delivery(
+            &full_output,
+            &files_modified,
+            /* truncated = */ true,
+            &synthetic_dir,
+        );
+
+        // The synthetic full-output report must exist and hold the FULL output.
+        let full = delivery
+            .full_report
+            .as_ref()
+            .expect("truncation must always produce a full-output report");
+        let on_disk = std::fs::read_to_string(full).expect("full report readable");
+        assert_eq!(
+            on_disk, full_output,
+            "the synthetic report must contain the UNTRUNCATED final output"
+        );
+
+        // It must be in the delivered files even though an unrelated .md exists.
+        assert!(
+            delivery.files_to_send.iter().any(|p| p == full),
+            "the full-output report MUST be among the delivered files"
+        );
+
+        // The marker name must be the synthetic report's file name.
+        let expected_name = full.file_name().and_then(|n| n.to_str()).unwrap();
+        assert_eq!(
+            delivery.full_report_name.as_deref(),
+            Some(expected_name),
+            "marker name must reference the synthetic full-output report"
+        );
+    }
+
+    /// When the result is truncated AND there is no unrelated .md, the
+    /// synthetic full-output report is still written and delivered.
+    #[test]
+    fn truncated_result_with_no_real_md_still_delivers_full_output_report() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+        let full_output = "x".repeat(40_000);
+
+        let delivery = resolve_report_delivery(&full_output, &[], true, &synthetic_dir);
+        let full = delivery.full_report.as_ref().expect("full report written");
+        assert_eq!(std::fs::read_to_string(full).unwrap(), full_output);
+        assert!(delivery.files_to_send.iter().any(|p| p == full));
+    }
+
+    /// No truncation + an unrelated .md present: the existing spawn_only
+    /// delivery path is unchanged. NO synthetic full-output report is written
+    /// (no double-write), and the real .md is delivered.
+    #[test]
+    fn untruncated_result_with_real_md_does_not_double_write_synthetic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "# real report\n").unwrap();
+
+        let delivery = resolve_report_delivery(
+            "small output",
+            std::slice::from_ref(&report),
+            false,
+            &synthetic_dir,
+        );
+        assert!(
+            delivery.full_report.is_none(),
+            "no truncation must NOT write a synthetic full-output report"
+        );
+        assert!(
+            !synthetic_dir.exists()
+                || std::fs::read_dir(&synthetic_dir)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "synthetic dir must stay empty when not truncated and a real .md exists"
+        );
+        assert_eq!(delivery.report_file.as_ref(), Some(&report));
+        assert!(delivery.files_to_send.iter().any(|p| p == &report));
+        assert!(
+            delivery.full_report_name.is_none(),
+            "no marker name when not truncated"
+        );
+    }
+
+    /// No truncation + no real .md + non-empty output: the existing
+    /// synthesize-for-spawn_only-delivery behaviour is preserved (a report is
+    /// written so files_to_send is non-empty), but it is NOT flagged as a
+    /// "full-output" report (the body wasn't truncated) so no marker name is
+    /// emitted.
+    #[test]
+    fn untruncated_result_with_no_md_synthesizes_delivery_payload_but_no_marker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+        let delivery = resolve_report_delivery("some output", &[], false, &synthetic_dir);
+        let path = delivery
+            .report_file
+            .as_ref()
+            .expect("spawn_only delivery still needs a payload file");
+        assert!(path.exists());
+        assert!(delivery.files_to_send.iter().any(|p| p == path));
+        assert!(
+            delivery.full_report_name.is_none(),
+            "untruncated payload is not a full-output report; no marker name"
+        );
     }
 }
