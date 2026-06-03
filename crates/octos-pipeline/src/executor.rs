@@ -417,6 +417,21 @@ pub(crate) fn report_progress(message: &str) {
 /// huge node output can't bloat the event.
 pub(crate) const NODE_PREVIEW_MAX_CHARS: usize = 2 * 1024;
 
+/// Blocker 1 — hard cap on the free-form `node_id` (and any other free-form
+/// string) carried in a node-progress event's `extra` map. A `node_id` is
+/// otherwise UNBOUNDED at the call sites (graph node ids, dynamic
+/// `<node>_task_<i>` worker ids), so a pathological/long id plus a large
+/// preview can serialize past the 16 KiB harness-event line cap — at which
+/// point the reader silently DROPS the event (back to opaque, defeating the
+/// gap). Bounding the id to a small cap, combined with the per-event
+/// serialized-budget check in [`emit_pipeline_node_event`], keeps the
+/// assembled line provably under `MAX_HARNESS_EVENT_LINE_BYTES`.
+///
+/// NOTE: used as `FidelityMode::Truncate { max_chars }`, which truncates at a
+/// BYTE offset snapped to a char boundary — so this is effectively a 256-BYTE
+/// cap (a generous reasonable cap for any real node/worker id).
+pub(crate) const NODE_ID_MAX_CHARS: usize = 256;
+
 /// Linear ETA estimate (seconds remaining) for a pipeline run (Gap 4.2).
 ///
 /// `(elapsed / nodes_done) * nodes_remaining`. Degrades gracefully: returns
@@ -433,9 +448,12 @@ pub(crate) fn linear_eta_secs(
     }
     let remaining = (nodes_total - nodes_done) as u64;
     // Per-node rate from observed work; integer math keeps it monotone-ish and
-    // avoids float drift on the heartbeat.
+    // avoids float drift on the heartbeat. NIT — saturate the multiply so a
+    // pathological huge `elapsed_secs` (× many remaining nodes) clamps to
+    // `u64::MAX` instead of overflowing/panicking. The increase-while-a-long-
+    // node-runs behaviour is inherent to the naive linear formula and left as-is.
     let per_node = elapsed_secs / nodes_done as u64;
-    Some(per_node * remaining)
+    Some(per_node.saturating_mul(remaining))
 }
 
 /// Bound a node's output to a short preview using the Gap-3.4 fidelity
@@ -449,6 +467,32 @@ pub(crate) fn node_output_preview(content: &str) -> String {
     preview.trim().to_string()
 }
 
+/// Blocker 1 — serialized-budget headroom reserved for the harness-event
+/// envelope NOT covered by the free-form `node_id` + `preview` (the schema,
+/// kind, session/task/workflow ids, phase, the bounded `message`, the integer
+/// counters, the JSON scaffold, and per-event escaping slack). The free-form
+/// parts are bounded against `MAX_HARNESS_EVENT_LINE_BYTES - ENVELOPE_RESERVE`
+/// so the assembled line is provably under the reader's drop cap. 6 KiB
+/// comfortably covers the ≤256B session id, ≤128B task/workflow ids, ≤2 KiB
+/// message, and all fixed keys — see [`emit_pipeline_node_event`].
+const HARNESS_EVENT_ENVELOPE_RESERVE: usize = 6 * 1024;
+
+// Compile-time guard: the envelope reserve + the (capped) node_id's WORST-CASE
+// JSON-escaped length must leave room under the line cap for a non-trivial
+// preview, so a node event is NEVER droppable for a normal node. The runtime
+// path (`bound_str_to_escaped_budget`) does the EXACT enforcement against the
+// node_id's actual escaped length; this guard only proves headroom exists.
+// `FidelityMode::Truncate { max_chars }` caps node_id at NODE_ID_MAX_CHARS
+// BYTES (offset snapped to a char boundary) plus a fixed `\n... [truncated]`
+// marker (<=32 bytes). An all-control-byte body escapes <=6x/byte, so the
+// bounded node_id serializes to <= 6 * (NODE_ID_MAX_CHARS + 32) bytes.
+const _: () = {
+    assert!(
+        HARNESS_EVENT_ENVELOPE_RESERVE + 6 * (NODE_ID_MAX_CHARS + 32)
+            < octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES
+    );
+};
+
 /// Emit a structured per-node progress event into the `octos.harness.event.v1`
 /// contract (Gap 4.2). Reads the harness event sink from `TOOL_CTX`; a no-op
 /// when no sink is attached (out-of-band callers / unit tests without a sink).
@@ -458,6 +502,18 @@ pub(crate) fn node_output_preview(content: &str) -> String {
 /// `node_total`, and (on completion) `success` + a bounded `preview`. These
 /// ride the additive `HarnessProgressEvent.extra` flatten so existing
 /// consumers are unaffected.
+///
+/// Blocker 1 — the assembled event is bounded so its SERIALIZED line stays
+/// provably under [`MAX_HARNESS_EVENT_LINE_BYTES`](octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES);
+/// otherwise the reader silently DROPS oversized lines, which would defeat the
+/// gap (back to opaque). `node_id` — UNBOUNDED at the call sites and copied
+/// verbatim into `extra` (which the Progress validator does NOT inspect) — is
+/// capped to [`NODE_ID_MAX_CHARS`], and the `preview` is shrunk by its
+/// JSON-ESCAPED length (reusing the Gap-3.4 `json_escaped_len` accounting, since
+/// an all-control-byte body escapes up to 6×) so that
+/// `escaped(node_id) + escaped(preview) <= MAX_HARNESS_EVENT_LINE_BYTES -
+/// HARNESS_EVENT_ENVELOPE_RESERVE`. The reserve covers every other (already
+/// bounded) field plus the JSON scaffold, so the full line is under the cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_pipeline_node_event(
     pipeline_id: &str,
@@ -477,10 +533,28 @@ pub(crate) fn emit_pipeline_node_event(
     } else {
         None
     };
+
+    // Bound node_id to a small cap (UTF-8 safe; Gap-3.4 truncation appends a
+    // marker when it shortens). This is the free-form key the call sites can't
+    // bound (graph ids, dynamic `<node>_task_<i>` worker ids).
+    let bounded_node_id = crate::fidelity::FidelityMode::Truncate {
+        max_chars: NODE_ID_MAX_CHARS,
+    }
+    .apply(node_id);
+
+    // The free-form budget the node_id + preview's JSON-escaped lengths must
+    // jointly fit. Everything else (envelope + bounded message) lives in the
+    // reserve, so staying within this keeps the WHOLE serialized line under the
+    // reader's drop cap.
+    let free_budget = octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES
+        .saturating_sub(HARNESS_EVENT_ENVELOPE_RESERVE);
+    let node_escaped = crate::fidelity::json_escaped_len(&bounded_node_id);
+    let preview_budget = free_budget.saturating_sub(node_escaped);
+
     let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
     extra.insert(
         "node".to_string(),
-        serde_json::Value::String(node_id.to_string()),
+        serde_json::Value::String(bounded_node_id),
     );
     extra.insert(
         "node_index".to_string(),
@@ -494,10 +568,10 @@ pub(crate) fn emit_pipeline_node_event(
         extra.insert("success".to_string(), serde_json::Value::Bool(s));
     }
     if let Some(p) = preview {
-        extra.insert(
-            "preview".to_string(),
-            serde_json::Value::String(p.to_string()),
-        );
+        // Shrink the preview by its JSON-ESCAPED length so a control-byte-heavy
+        // body (escapes up to 6×) can't push the line over the cap.
+        let bounded = bound_str_to_escaped_budget(p, preview_budget);
+        extra.insert("preview".to_string(), serde_json::Value::String(bounded));
     }
     let _ = octos_agent::harness_events::emit_registered_progress_event_with_extra(
         sink,
@@ -507,6 +581,40 @@ pub(crate) fn emit_pipeline_node_event(
         progress,
         extra,
     );
+}
+
+/// Bound `s` so its JSON-escaped length is `<= budget`, snapping the kept
+/// prefix to a UTF-8 char boundary. Reuses the Gap-3.4 escape accounting
+/// (`json_escaped_len`): `json_escaped_len` is monotonic non-decreasing in the
+/// prefix length, so a binary search on the byte offset converges in O(log n).
+/// Returns `s` unchanged when it already fits (no false truncation).
+fn bound_str_to_escaped_budget(s: &str, budget: usize) -> String {
+    if crate::fidelity::json_escaped_len(s) <= budget {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut lo = 0usize; // largest offset known to FIT
+    let mut hi = bytes.len(); // smallest offset known NOT to fit
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        // Snap the probe down to a char boundary so escaped-len is measured on
+        // a valid &str slice (and we never split a scalar).
+        let mut probe = mid;
+        while probe > lo && !s.is_char_boundary(probe) {
+            probe -= 1;
+        }
+        if probe == lo {
+            // No boundary between lo and mid; advance hi to guarantee progress.
+            hi = mid;
+            continue;
+        }
+        if crate::fidelity::json_escaped_len(&s[..probe]) <= budget {
+            lo = probe;
+        } else {
+            hi = probe;
+        }
+    }
+    s[..lo].to_string()
 }
 
 /// Shared status snapshot updated by the pipeline executor and read by the
@@ -1931,7 +2039,7 @@ impl PipelineExecutor {
                 // any worker dispatches, which keeps the concurrent
                 // branches from racing past the budget.
                 let mut fanout_reservations: Vec<ReservationHandle> = Vec::new();
-                for target_id in &targets {
+                for (target_idx, target_id) in targets.iter().enumerate() {
                     let target_node = graph
                         .nodes
                         .get(target_id)
@@ -2000,7 +2108,28 @@ impl PipelineExecutor {
                     let par_done = par_completed.clone();
                     let par_node_label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
+                    // Gap 4.2 / Blocker 2 — emit a structured `node_started`
+                    // for THIS sub-node. The static Parallel branch `continue`s
+                    // before the sequential emit sites, so without this a
+                    // parallel pipeline would surface no per-node structured
+                    // progress. N/M is the sub-node's 1-based position within
+                    // the fan-out. Bounding is handled inside the emit helper.
+                    let par_node_index = target_idx + 1;
+                    emit_pipeline_node_event(
+                        &graph.id,
+                        "node_started",
+                        &format!("{par_label} ({par_node_index} of {total_targets})"),
+                        &tid,
+                        par_node_index,
+                        total_targets,
+                        None,
+                        None,
+                    );
+
                     let sem = semaphore.clone();
+                    let pipeline_id = graph.id.clone();
+                    let completed_label = par_label.clone();
+                    let completed_tid = tid.clone();
                     futures.push(async move {
                         let _permit = sem.acquire().await.expect("semaphore closed");
                         let start = Instant::now();
@@ -2016,6 +2145,33 @@ impl PipelineExecutor {
                         report_progress(&format!(
                             "{par_node_label}: '{par_label}' done ({n}/{total_targets}, {secs}s)"
                         ));
+                        // Gap 4.2 / Blocker 2 — structured `node_completed` for
+                        // THIS sub-node with success + a bounded preview. The
+                        // futures are `join_all`-polled on THIS task (not
+                        // `tokio::spawn`ed), so the `TOOL_CTX` task-local the
+                        // emit helper reads is preserved; concurrent emits go
+                        // through the shared append-only sink (one whole line
+                        // per `writeln!`), so interleaving can't corrupt a line.
+                        let (success, preview) = match &result {
+                            Ok(o) => (
+                                o.status == OutcomeStatus::Pass,
+                                node_output_preview(&o.content),
+                            ),
+                            Err(e) => (false, node_output_preview(&format!("Error: {e}"))),
+                        };
+                        emit_pipeline_node_event(
+                            &pipeline_id,
+                            "node_completed",
+                            &format!(
+                                "{completed_label} ({par_node_index} of {total_targets}) — {}",
+                                if success { "done" } else { "failed" }
+                            ),
+                            &completed_tid,
+                            par_node_index,
+                            total_targets,
+                            Some(success),
+                            Some(&preview),
+                        );
                         (tid, target_with_prompt, start.elapsed(), result)
                     });
                     // Guard B: count the worker as dispatched (the
@@ -2338,7 +2494,9 @@ impl PipelineExecutor {
                 // the static Parallel branch — reserve per-worker up
                 // front, release en bloc when the fan-out completes.
                 let mut dp_reservations: Vec<ReservationHandle> = Vec::new();
-                for (task_id, mut synth_node) in synthetic_nodes {
+                for (worker_idx, (task_id, mut synth_node)) in
+                    synthetic_nodes.into_iter().enumerate()
+                {
                     // Apply variable substitution to synthetic prompt
                     if let Some(prompt) = synth_node.prompt.take() {
                         let mut resolved = prompt.replace("{input}", "");
@@ -2383,6 +2541,26 @@ impl PipelineExecutor {
                     let dp_label = dp_label.to_owned();
                     let done_count = completed_count.clone();
 
+                    // Gap 4.2 / Blocker 2 — `deep_research` IS dynamic_parallel,
+                    // so without this each dynamically-expanded worker would
+                    // surface NO structured progress (the branch `continue`s
+                    // before the sequential emit sites). N/M is the worker's
+                    // 1-based position within the dynamically-expanded total.
+                    let dp_node_index = worker_idx + 1;
+                    emit_pipeline_node_event(
+                        &graph.id,
+                        "node_started",
+                        &format!("{worker_label} ({dp_node_index} of {total_workers})"),
+                        &task_id,
+                        dp_node_index,
+                        total_workers,
+                        None,
+                        None,
+                    );
+
+                    let pipeline_id = graph.id.clone();
+                    let completed_label = worker_label.clone();
+                    let completed_tid = task_id.clone();
                     futures.push(async move {
                         let start = Instant::now();
                         let result =
@@ -2393,6 +2571,31 @@ impl PipelineExecutor {
                         report_progress(&format!(
                             "{dp_label}: '{worker_label}' done ({n}/{total_workers}, {secs}s)"
                         ));
+                        // Gap 4.2 / Blocker 2 — structured `node_completed` per
+                        // worker. Polled on THIS task via `join_all` (not
+                        // `tokio::spawn`), so the `TOOL_CTX` task-local survives;
+                        // the shared append-only sink serializes whole lines so
+                        // concurrent emits can't interleave-corrupt.
+                        let (success, preview) = match &result {
+                            Ok(o) => (
+                                o.status == OutcomeStatus::Pass,
+                                node_output_preview(&o.content),
+                            ),
+                            Err(e) => (false, node_output_preview(&format!("Error: {e}"))),
+                        };
+                        emit_pipeline_node_event(
+                            &pipeline_id,
+                            "node_completed",
+                            &format!(
+                                "{completed_label} ({dp_node_index} of {total_workers}) — {}",
+                                if success { "done" } else { "failed" }
+                            ),
+                            &completed_tid,
+                            dp_node_index,
+                            total_workers,
+                            Some(success),
+                            Some(&preview),
+                        );
                         (task_id, synth_node, start.elapsed(), result)
                     });
                     // Guard B: count this worker as dispatched (the
@@ -4097,5 +4300,276 @@ mod tests {
             "without catalog_dir the executor must fall back to working_dir \
              (legacy callers, pre-Phase-2-A behaviour)"
         );
+    }
+
+    // ── Gap 4.2 / Blocker 1: node-progress event line MUST stay under the
+    // 16 KiB harness-event line cap or the reader silently DROPS it ─────────
+
+    /// Blocker 1 (RED on 3d5353d5) — a node event with a pathological 4 KiB
+    /// `node_id` PLUS a 2 KiB all-control-byte preview (which JSON-escapes ~6x
+    /// to ~12 KiB) serializes to >16 KiB and would be DROPPED by the reader's
+    /// `MAX_HARNESS_EVENT_LINE_BYTES` gate — defeating the gap (back to opaque).
+    /// After the fix the assembled event line is provably under the cap.
+    #[tokio::test]
+    async fn pathological_node_event_stays_under_line_cap() {
+        use octos_agent::harness_events::{
+            HarnessEvent, HarnessEventSinkContext, MAX_HARNESS_EVENT_LINE_BYTES,
+            attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-blocker1".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-blocker1".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // A 4 KiB node_id (free-form, unbounded at the call site) and a 2 KiB
+        // body that is ALL NUL bytes — each escapes to ` ` (6 bytes) so a
+        // naive 2 KiB preview balloons to ~12 KiB serialized. node_id + preview
+        // + a long message together blow past the 16 KiB line cap.
+        let long_node_id = "n".repeat(4 * 1024);
+        let control_body = "\u{0}".repeat(2 * 1024);
+        let preview = node_output_preview(&control_body);
+        // A max-allowed message (the validator already caps `message` at 2 KiB):
+        // the OVER-CAP comes from the unbounded `node_id` + control-byte preview
+        // in `extra`, which the Progress validator never inspects.
+        let long_message = format!("{} (2 of 3)", "M".repeat(2000));
+
+        let sink_for_assert = sink_uri.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                emit_pipeline_node_event(
+                    "research",
+                    "node_completed",
+                    &long_message,
+                    &long_node_id,
+                    2,
+                    3,
+                    Some(true),
+                    Some(&preview),
+                );
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        let lines = std::fs::read_to_string(&sink_for_assert).expect("read sink");
+        let event_lines: Vec<&str> = lines.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            event_lines.len(),
+            1,
+            "expected exactly one node_completed event line"
+        );
+        let line = event_lines[0];
+        assert!(
+            line.len() < MAX_HARNESS_EVENT_LINE_BYTES,
+            "node event line must stay under the {MAX_HARNESS_EVENT_LINE_BYTES}-byte cap \
+             (else the reader DROPS it); got {} bytes",
+            line.len()
+        );
+        // And it must still be a valid, readable event (not dropped/garbled).
+        let event =
+            HarnessEvent::from_json_line(line).expect("event must round-trip (not dropped)");
+        let detail = event.runtime_detail_value(None, None);
+        assert_eq!(detail["phase"], "node_completed");
+        // node_id is bounded but still present (truncation marker is fine).
+        let node = detail["node"].as_str().expect("node field present");
+        assert!(
+            node.len() <= NODE_ID_MAX_CHARS + 16,
+            "node_id must be bounded to its cap; got {} bytes",
+            node.len()
+        );
+    }
+
+    // ── Gap 4.2 / Blocker 2: Parallel + DynamicParallel sub-nodes MUST emit
+    // structured per-node events (deep_research IS dynamic_parallel) ─────────
+
+    /// Drain all `node_started`/`node_completed` events written to `sink_path`
+    /// and return `(node_label, phase, success)` tuples for assertion.
+    fn drain_node_events(sink_path: &str) -> Vec<(String, String, Option<bool>)> {
+        use octos_agent::harness_events::HarnessEvent;
+        let lines = std::fs::read_to_string(sink_path).unwrap_or_default();
+        lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| HarnessEvent::from_json_line(l).ok())
+            .map(|e| e.runtime_detail_value(None, None))
+            .filter(|d| d["phase"] == "node_started" || d["phase"] == "node_completed")
+            .map(|d| {
+                (
+                    d["node"].as_str().unwrap_or_default().to_string(),
+                    d["phase"].as_str().unwrap_or_default().to_string(),
+                    d["success"].as_bool(),
+                )
+            })
+            .collect()
+    }
+
+    /// Blocker 2 (RED on 3d5353d5) — a static `parallel` fan-out must emit a
+    /// structured `node_started` + `node_completed` for EACH sub-node. Before
+    /// the fix the parallel branch `continue`s before the sequential emit
+    /// sites, so a parallel pipeline emitted NO per-node structured progress.
+    #[tokio::test]
+    async fn parallel_subnodes_emit_structured_events() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-parallel".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-parallel".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="noop"]
+                b [handler="noop"]
+                merge [handler="noop"]
+                fan -> a
+                fan -> b
+                a -> merge
+                b -> merge
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let result = TOOL_CTX
+            .scope(ctx, async move {
+                let config = make_capped_config(8).await;
+                let executor = PipelineExecutor::new(config);
+                executor
+                    .run(dot, "parallel happy path", &serde_json::Map::new())
+                    .await
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "parallel pipeline should complete: {result:?}"
+        );
+
+        detach_event_sink_context(&sink_uri);
+
+        let events = drain_node_events(&sink_for_run);
+        for sub in ["a", "b"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|(n, p, _)| n == sub && p == "node_started"),
+                "parallel sub-node '{sub}' must emit node_started; got {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|(n, p, s)| n == sub && p == "node_completed" && *s == Some(true)),
+                "parallel sub-node '{sub}' must emit node_completed(success); got {events:?}"
+            );
+        }
+    }
+
+    /// Blocker 2 (RED on 3d5353d5) — a `dynamic_parallel` node (the shape
+    /// `deep_research` uses) must emit structured per-sub-node events for each
+    /// dynamically-expanded worker. The `MockProvider` planner returns plain
+    /// "done" → JSON extraction fails → the 3-task fallback expands, so we
+    /// expect node_started + node_completed for each fallback worker task.
+    #[tokio::test]
+    async fn dynamic_parallel_subnodes_emit_structured_events() {
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-dynparallel".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-dynparallel".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let result = TOOL_CTX
+            .scope(ctx, async move {
+                // Generous cap so the 3-task fallback fan-out runs to completion.
+                let config = make_capped_config(64).await;
+                let executor = PipelineExecutor::new(config);
+                executor
+                    .run(dot, "dynamic happy path", &serde_json::Map::new())
+                    .await
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "dynamic_parallel pipeline should complete: {result:?}"
+        );
+
+        detach_event_sink_context(&sink_uri);
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert!(
+            started >= 2,
+            "dynamic_parallel must emit a node_started per worker (>=2 fallback tasks); got {started} ({events:?})"
+        );
+        assert_eq!(
+            started, completed,
+            "every dynamic worker that starts must also emit node_completed; \
+             started={started} completed={completed} ({events:?})"
+        );
+    }
+
+    /// NIT (RED on 3d5353d5 if multiplication were unguarded) — the linear ETA
+    /// must SATURATE instead of overflowing when `per_node * remaining` would
+    /// exceed `u64::MAX`. A pathological huge `elapsed` with many nodes
+    /// remaining must not panic / wrap.
+    #[test]
+    fn linear_eta_saturates_on_huge_elapsed() {
+        // per_node = u64::MAX / 1 = u64::MAX; remaining = large → would overflow
+        // a plain `*`. Must clamp to u64::MAX, not wrap.
+        let eta = linear_eta_secs(u64::MAX, 1, 1_000_000);
+        assert_eq!(eta, Some(u64::MAX), "ETA must saturate, not overflow");
     }
 }

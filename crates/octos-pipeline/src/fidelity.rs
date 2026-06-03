@@ -119,7 +119,12 @@ fn json_escaped_len_bytes(bytes: &[u8]) -> usize {
 }
 
 /// Convenience over [`json_escaped_len_bytes`] for a whole string body.
-fn json_escaped_len(s: &str) -> usize {
+///
+/// Exposed `pub(crate)` so the harness-event emitter (Gap 4.2 / Blocker 1) can
+/// reuse the SAME serialized-length accounting that bounds the pipeline result
+/// body, rather than re-deriving the escape rules. Returns the JSON-escaped
+/// length of `s` EXCLUDING the surrounding quotes.
+pub(crate) fn json_escaped_len(s: &str) -> usize {
     json_escaped_len_bytes(s.as_bytes())
 }
 
