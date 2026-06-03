@@ -89,6 +89,48 @@ fn sink_contexts() -> &'static Mutex<HashMap<String, HarnessEventSinkContext>> {
     SINK_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Blocker 3 — per-sink-path write locks. The harness-event sink is an
+/// append-only NDJSON file written by MULTIPLE concurrent emitters (the spawned
+/// heartbeat task + the now-more-frequent parallel/dynamic_parallel node emits,
+/// plus child tools). `writeln!` is NOT a single atomic write syscall — it can
+/// issue separate `write`s for the body and the newline — so concurrent writers
+/// can interleave a partial line and corrupt the NDJSON stream. We serialize
+/// each line into ONE buffer (incl. the trailing newline) and write it under a
+/// per-path `Mutex` so a whole line is written without interleaving. The lock is
+/// keyed by the resolved sink path, so two different sinks never contend.
+static SINK_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn sink_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    let registry = SINK_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(sink_key(path))
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Append a single, fully-formed NDJSON line (the caller's bytes plus a
+/// trailing `\n`) to `path` in ONE `write_all`, serialized against concurrent
+/// writers via the per-path [`sink_write_lock`]. Both [`write_event_to_sink`]
+/// and [`write_event_line_to_sink`] funnel through here so EVERY sink write is
+/// atomic at the whole-line granularity.
+fn append_line_atomic(path: &Path, line: &str) -> std::io::Result<()> {
+    // Build the entire line (incl. newline) up front so the locked region is a
+    // single `write_all` — no formatting work or extra syscalls under the lock.
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+
+    let write_lock = sink_write_lock(path);
+    let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(buf.as_bytes())?;
+    file.flush()
+}
+
 fn sink_path_from_raw(raw_sink: &str) -> PathBuf {
     if let Some(rest) = raw_sink.strip_prefix("file://") {
         return PathBuf::from(rest.strip_prefix("localhost").unwrap_or(rest));
@@ -141,14 +183,11 @@ pub fn write_event_to_sink(raw_sink: impl AsRef<str>, event: &HarnessEvent) -> s
         .validate()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let path = sink_path_from_raw(raw_sink.as_ref());
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
     let json = serde_json::to_string(event)
         .map_err(|error| std::io::Error::other(format!("serialize harness event: {error}")))?;
-    writeln!(file, "{json}")?;
-    file.flush()
+    // Blocker 3 — one whole line, one `write_all`, under the per-path lock so
+    // concurrent emitters (heartbeat + parallel node emits) cannot interleave.
+    append_line_atomic(&path, &json)
 }
 
 /// Append a pre-serialized event line to a sink without round-tripping
@@ -159,12 +198,8 @@ pub fn write_event_to_sink(raw_sink: impl AsRef<str>, event: &HarnessEvent) -> s
 /// JSON object; the writer adds a trailing newline.
 pub fn write_event_line_to_sink(raw_sink: impl AsRef<str>, line: &str) -> std::io::Result<()> {
     let path = sink_path_from_raw(raw_sink.as_ref());
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    writeln!(file, "{line}")?;
-    file.flush()
+    // Blocker 3 — same atomic whole-line append as `write_event_to_sink`.
+    append_line_atomic(&path, line)
 }
 
 pub fn emit_registered_progress_event(
@@ -1867,6 +1902,81 @@ mod tests {
         assert_eq!(detail["workflow_kind"], "deep_research");
         assert_eq!(detail["current_phase"], "fetching_sources");
         assert_eq!(detail["progress_message"], "Fetching source 3/12");
+    }
+
+    /// Blocker 3 — concurrent sink writes must produce only well-formed NDJSON
+    /// lines (each parses) with no interleaving. Many tasks write LARGE distinct
+    /// event lines to the SAME append-only sink at once; the spawned heartbeat +
+    /// parallel node emits race the same file in production. `writeln!` is not a
+    /// single atomic syscall, so without the per-path write lock two large lines
+    /// could interleave and corrupt the stream. After the fix every persisted
+    /// line parses and every writer's unique node id appears exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sink_writes_stay_well_formed_ndjson() {
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        register_sink_context(
+            sink_key_from_raw(&sink_uri),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-concurrent-sink".to_string(),
+            },
+        );
+
+        // Large lines (~8 KiB body each, under the 16 KiB cap) maximise the
+        // multi-syscall window the old `writeln!` left open.
+        const WRITERS: usize = 32;
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let sink = sink_uri.clone();
+            handles.push(tokio::spawn(async move {
+                let mut extra: HashMap<String, Value> = HashMap::new();
+                extra.insert("node".to_string(), Value::String(format!("worker-{i}")));
+                // A big preview body so the serialized line spans multiple
+                // syscalls' worth of bytes.
+                extra.insert("preview".to_string(), Value::String("p".repeat(8 * 1024)));
+                let event = HarnessEvent::progress_with_extra(
+                    "api:session",
+                    "tc-concurrent-sink",
+                    Some("research"),
+                    "node_completed",
+                    Some(format!("worker {i} done")),
+                    Some(1.0),
+                    extra,
+                );
+                write_event_to_sink(&sink, &event).expect("write event");
+            }));
+        }
+        for h in handles {
+            h.await.expect("writer task");
+        }
+
+        unregister_sink_context(&sink_key_from_raw(&sink_uri));
+
+        let contents = std::fs::read_to_string(sink_file.path()).expect("read sink");
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            WRITERS,
+            "expected exactly one well-formed line per writer (no merged/split \
+             lines); got {} lines",
+            lines.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for line in &lines {
+            // Every line must parse as a complete, valid harness event — a
+            // partially-interleaved write would fail here.
+            let event = HarnessEvent::from_json_line(line)
+                .unwrap_or_else(|e| panic!("line must be well-formed NDJSON: {e}; line={line:?}"));
+            let detail = event.runtime_detail_value(None, None);
+            let node = detail["node"].as_str().expect("node field").to_string();
+            assert!(seen.insert(node.clone()), "duplicate node id {node}");
+        }
+        assert_eq!(
+            seen.len(),
+            WRITERS,
+            "every writer's unique node id must appear exactly once"
+        );
     }
 
     #[test]

@@ -467,28 +467,44 @@ pub(crate) fn node_output_preview(content: &str) -> String {
     preview.trim().to_string()
 }
 
+/// Blocker 1 — JSON-escaped byte budget for the node-event `message` (the
+/// `label (N of M)` string). The `message` is otherwise (a) only RAW-byte
+/// bounded to 2 KiB *downstream*, so a >2 KiB raw label is REJECTED by the
+/// validator and the whole event silently fails to emit; and (b) NOT counted
+/// in the line budget, so a control-byte-heavy 2 KiB label escapes ~6× to
+/// ~12 KiB and — added to the free-form node_id + preview budget — pushes the
+/// serialized line past the 16 KiB reader cap. Bounding the message by its
+/// ESCAPED length to a small cap keeps it both under the 2 KiB raw validator
+/// bound (escaped ≥ raw, so escaped ≤ 1 KiB ⇒ raw ≤ 1 KiB) and small in the
+/// line, so it never trips the validator and never blows the line budget.
+const NODE_MESSAGE_ESCAPED_BUDGET: usize = 1024;
+
 /// Blocker 1 — serialized-budget headroom reserved for the harness-event
-/// envelope NOT covered by the free-form `node_id` + `preview` (the schema,
-/// kind, session/task/workflow ids, phase, the bounded `message`, the integer
-/// counters, the JSON scaffold, and per-event escaping slack). The free-form
-/// parts are bounded against `MAX_HARNESS_EVENT_LINE_BYTES - ENVELOPE_RESERVE`
-/// so the assembled line is provably under the reader's drop cap. 6 KiB
-/// comfortably covers the ≤256B session id, ≤128B task/workflow ids, ≤2 KiB
-/// message, and all fixed keys — see [`emit_pipeline_node_event`].
+/// envelope NOT covered by the bounded free-form fields (the schema, kind,
+/// session/task/workflow ids, phase, the integer counters, the JSON scaffold,
+/// and per-event escaping slack). The bounded message, node_id, and preview are
+/// all measured against the SERIALIZED line below, so this reserve only needs to
+/// cover the FIXED scaffold + the bounded fixed-size fields. The fixed fields
+/// ARE bounded: `session_id` ≤256 B, `task_id` ≤128 B, `workflow` (pipeline id)
+/// ≤128 B and control-free (escapes 1:1 — see [`graph::validate_pipeline_id`]),
+/// `phase` ≤64 B, counters/progress ≤32 B; with key names + JSON scaffold this
+/// is well under 2 KiB, so 6 KiB is a generous reserve. Even so, the final line
+/// is checked against the ACTUAL serialized length, so this is belt-and-braces.
 const HARNESS_EVENT_ENVELOPE_RESERVE: usize = 6 * 1024;
 
 // Compile-time guard: the envelope reserve + the (capped) node_id's WORST-CASE
-// JSON-escaped length must leave room under the line cap for a non-trivial
-// preview, so a node event is NEVER droppable for a normal node. The runtime
-// path (`bound_str_to_escaped_budget`) does the EXACT enforcement against the
-// node_id's actual escaped length; this guard only proves headroom exists.
-// `FidelityMode::Truncate { max_chars }` caps node_id at NODE_ID_MAX_CHARS
-// BYTES (offset snapped to a char boundary) plus a fixed `\n... [truncated]`
-// marker (<=32 bytes). An all-control-byte body escapes <=6x/byte, so the
-// bounded node_id serializes to <= 6 * (NODE_ID_MAX_CHARS + 32) bytes.
+// JSON-escaped length + the message escaped budget must leave room under the
+// line cap for a non-trivial preview, so a node event is NEVER droppable for a
+// normal node. The runtime path measures the ACTUAL serialized line and shrinks
+// the elastic preview to guarantee the bound; this guard only proves headroom
+// exists. `FidelityMode::Truncate { max_chars }` caps node_id at
+// NODE_ID_MAX_CHARS BYTES (offset snapped to a char boundary) plus a fixed
+// `\n... [truncated]` marker (<=32 bytes). An all-control-byte body escapes
+// <=6x/byte, so the bounded node_id serializes to <= 6 * (NODE_ID_MAX_CHARS +
+// 32) bytes.
 const _: () = {
     assert!(
-        HARNESS_EVENT_ENVELOPE_RESERVE + 6 * (NODE_ID_MAX_CHARS + 32)
+        HARNESS_EVENT_ENVELOPE_RESERVE + NODE_MESSAGE_ESCAPED_BUDGET + 6 * (NODE_ID_MAX_CHARS + 32)
             < octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES
     );
 };
@@ -528,6 +544,12 @@ pub(crate) fn emit_pipeline_node_event(
     let Ok(Some(sink)) = TOOL_CTX.try_with(|c| c.harness_event_sink.clone()) else {
         return;
     };
+    // The sink context (session/task ids) is needed to assemble the candidate
+    // event so we can measure its SERIALIZED line. No context ⇒ nothing to
+    // write (same no-op semantics as the registered-emit path).
+    let Some(context) = octos_agent::harness_events::lookup_event_sink_context(&sink) else {
+        return;
+    };
     let progress = if node_total > 0 {
         Some((node_index as f64 / node_total as f64).clamp(0.0, 1.0))
     } else {
@@ -542,45 +564,89 @@ pub(crate) fn emit_pipeline_node_event(
     }
     .apply(node_id);
 
-    // The free-form budget the node_id + preview's JSON-escaped lengths must
-    // jointly fit. Everything else (envelope + bounded message) lives in the
-    // reserve, so staying within this keeps the WHOLE serialized line under the
-    // reader's drop cap.
-    let free_budget = octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES
-        .saturating_sub(HARNESS_EVENT_ENVELOPE_RESERVE);
-    let node_escaped = crate::fidelity::json_escaped_len(&bounded_node_id);
-    let preview_budget = free_budget.saturating_sub(node_escaped);
+    // Blocker 1 — bound the `message` (the free-form `label (N of M)` string)
+    // by its JSON-ESCAPED length. The label is UNBOUNDED at the call sites, and
+    // the downstream validator REJECTS a >2 KiB *raw* message — so a long label
+    // would silently drop the whole event. Bounding by escaped length keeps it
+    // both under the raw validator bound (escaped ≥ raw) and small in the line.
+    let bounded_message = bound_str_to_escaped_budget(message, NODE_MESSAGE_ESCAPED_BUDGET);
 
-    let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
-    extra.insert(
-        "node".to_string(),
-        serde_json::Value::String(bounded_node_id),
-    );
-    extra.insert(
-        "node_index".to_string(),
-        serde_json::Value::from(node_index),
-    );
-    extra.insert(
-        "node_total".to_string(),
-        serde_json::Value::from(node_total),
-    );
-    if let Some(s) = success {
-        extra.insert("success".to_string(), serde_json::Value::Bool(s));
-    }
-    if let Some(p) = preview {
-        // Shrink the preview by its JSON-ESCAPED length so a control-byte-heavy
-        // body (escapes up to 6×) can't push the line over the cap.
-        let bounded = bound_str_to_escaped_budget(p, preview_budget);
-        extra.insert("preview".to_string(), serde_json::Value::String(bounded));
-    }
-    let _ = octos_agent::harness_events::emit_registered_progress_event_with_extra(
-        sink,
+    // The free-form budget the node_id + preview's JSON-escaped lengths must
+    // jointly fit. The bounded message + envelope live in the reserve; the
+    // assembled line is ALSO measured against the actual serialized length
+    // below, so this only seeds an initial preview cap.
+    let free_budget = octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES
+        .saturating_sub(HARNESS_EVENT_ENVELOPE_RESERVE)
+        .saturating_sub(NODE_MESSAGE_ESCAPED_BUDGET);
+    let node_escaped = crate::fidelity::json_escaped_len(&bounded_node_id);
+    let mut preview_budget = free_budget.saturating_sub(node_escaped);
+
+    // Assemble the candidate event and shrink the elastic `preview` until the
+    // SERIALIZED line is provably under the reader's drop cap. The fixed fields
+    // (session/task/workflow ids, phase, counters) and the bounded message are
+    // all already small, so at most one shrink iteration is expected; the loop
+    // is a hard guarantee against any reserve mis-estimate.
+    let build_extra = |preview_budget: usize| {
+        let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
+        extra.insert(
+            "node".to_string(),
+            serde_json::Value::String(bounded_node_id.clone()),
+        );
+        extra.insert(
+            "node_index".to_string(),
+            serde_json::Value::from(node_index),
+        );
+        extra.insert(
+            "node_total".to_string(),
+            serde_json::Value::from(node_total),
+        );
+        if let Some(s) = success {
+            extra.insert("success".to_string(), serde_json::Value::Bool(s));
+        }
+        if let Some(p) = preview {
+            // Shrink the preview by its JSON-ESCAPED length so a control-byte-
+            // heavy body (escapes up to 6×) can't push the line over the cap.
+            let bounded = bound_str_to_escaped_budget(p, preview_budget);
+            extra.insert("preview".to_string(), serde_json::Value::String(bounded));
+        }
+        extra
+    };
+
+    let cap = octos_agent::harness_events::MAX_HARNESS_EVENT_LINE_BYTES;
+    let mut event = octos_agent::harness_events::HarnessEvent::progress_with_extra(
+        context.session_id.clone(),
+        context.task_id.clone(),
         Some(pipeline_id),
         phase,
-        message,
+        Some(bounded_message.clone()),
         progress,
-        extra,
+        build_extra(preview_budget),
     );
+    // Measure the ACTUAL serialized line (what `write_event_to_sink` writes,
+    // sans newline) and shrink the preview budget if it's at/over the cap. This
+    // makes the bound provable regardless of the reserve estimate.
+    while preview_budget > 0 {
+        match serde_json::to_string(&event) {
+            Ok(line) if line.len() < cap => break,
+            Ok(line) => {
+                // Shrink by the overshoot (plus a small margin) — never below 0.
+                let overshoot = line.len().saturating_sub(cap) + 64;
+                preview_budget = preview_budget.saturating_sub(overshoot.max(preview_budget / 2));
+                event = octos_agent::harness_events::HarnessEvent::progress_with_extra(
+                    context.session_id.clone(),
+                    context.task_id.clone(),
+                    Some(pipeline_id),
+                    phase,
+                    Some(bounded_message.clone()),
+                    progress,
+                    build_extra(preview_budget),
+                );
+            }
+            Err(_) => return,
+        }
+    }
+    // `write_event_to_sink` re-validates + writes the single line atomically.
+    let _ = octos_agent::harness_events::write_event_to_sink(&sink, &event);
 }
 
 /// Bound `s` so its JSON-escaped length is `<= budget`, snapping the kept
@@ -2108,30 +2174,36 @@ impl PipelineExecutor {
                     let par_done = par_completed.clone();
                     let par_node_label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
-                    // Gap 4.2 / Blocker 2 — emit a structured `node_started`
-                    // for THIS sub-node. The static Parallel branch `continue`s
-                    // before the sequential emit sites, so without this a
-                    // parallel pipeline would surface no per-node structured
-                    // progress. N/M is the sub-node's 1-based position within
-                    // the fan-out. Bounding is handled inside the emit helper.
+                    // Gap 4.2 / Blocker 2 — N/M is the sub-node's 1-based
+                    // position within the fan-out. The `node_started` emit is
+                    // moved INSIDE the future (below) so a sub-node whose future
+                    // is never polled (a LATER target's prep — lookup/handler/
+                    // budget reservation — aborts the whole fan-out via `?`
+                    // before `join_all`) NEVER emits `node_started`, and so can
+                    // never dangle without a matching `node_completed`.
                     let par_node_index = target_idx + 1;
-                    emit_pipeline_node_event(
-                        &graph.id,
-                        "node_started",
-                        &format!("{par_label} ({par_node_index} of {total_targets})"),
-                        &tid,
-                        par_node_index,
-                        total_targets,
-                        None,
-                        None,
-                    );
 
                     let sem = semaphore.clone();
                     let pipeline_id = graph.id.clone();
+                    let started_pipeline_id = graph.id.clone();
+                    let started_label = par_label.clone();
+                    let started_tid = tid.clone();
                     let completed_label = par_label.clone();
                     let completed_tid = tid.clone();
                     futures.push(async move {
                         let _permit = sem.acquire().await.expect("semaphore closed");
+                        // Emit `node_started` HERE — only once the future is
+                        // actually polled, guaranteeing a started/completed pair.
+                        emit_pipeline_node_event(
+                            &started_pipeline_id,
+                            "node_started",
+                            &format!("{started_label} ({par_node_index} of {total_targets})"),
+                            &started_tid,
+                            par_node_index,
+                            total_targets,
+                            None,
+                            None,
+                        );
                         let start = Instant::now();
                         let result = execute_with_retries_static(
                             &handler,
@@ -2541,27 +2613,35 @@ impl PipelineExecutor {
                     let dp_label = dp_label.to_owned();
                     let done_count = completed_count.clone();
 
-                    // Gap 4.2 / Blocker 2 — `deep_research` IS dynamic_parallel,
-                    // so without this each dynamically-expanded worker would
-                    // surface NO structured progress (the branch `continue`s
-                    // before the sequential emit sites). N/M is the worker's
-                    // 1-based position within the dynamically-expanded total.
+                    // Gap 4.2 / Blocker 2 — `deep_research` IS dynamic_parallel.
+                    // N/M is the worker's 1-based position within the
+                    // dynamically-expanded total. The `node_started` emit is
+                    // moved INSIDE the future (below) so a worker whose future is
+                    // never polled (a LATER worker's budget reservation aborts the
+                    // whole fan-out via `?` before `join_all`) NEVER emits
+                    // `node_started`, and so can never dangle without a matching
+                    // `node_completed`.
                     let dp_node_index = worker_idx + 1;
-                    emit_pipeline_node_event(
-                        &graph.id,
-                        "node_started",
-                        &format!("{worker_label} ({dp_node_index} of {total_workers})"),
-                        &task_id,
-                        dp_node_index,
-                        total_workers,
-                        None,
-                        None,
-                    );
 
                     let pipeline_id = graph.id.clone();
+                    let started_pipeline_id = graph.id.clone();
+                    let started_label = worker_label.clone();
+                    let started_tid = task_id.clone();
                     let completed_label = worker_label.clone();
                     let completed_tid = task_id.clone();
                     futures.push(async move {
+                        // Emit `node_started` HERE — only once the future is
+                        // actually polled, guaranteeing a started/completed pair.
+                        emit_pipeline_node_event(
+                            &started_pipeline_id,
+                            "node_started",
+                            &format!("{started_label} ({dp_node_index} of {total_workers})"),
+                            &started_tid,
+                            dp_node_index,
+                            total_workers,
+                            None,
+                            None,
+                        );
                         let start = Instant::now();
                         let result =
                             execute_with_retries_static(&handler, &synth_node, &ctx, max_retries)
@@ -4391,6 +4471,96 @@ mod tests {
         );
     }
 
+    /// Blocker 1 (RED on 27c26433) — the node-event `message` (the
+    /// `label (N of M)` string) was NOT in the line budget and was only
+    /// raw-byte-bounded to 2 KiB *downstream*. Two failure modes:
+    ///   1. a control-byte-heavy `message` just under 2 KiB raw escapes ~6× to
+    ///      ~12 KiB, which — added to the ~10 KiB free-form budget for
+    ///      node_id + preview — pushes the serialized line PAST 16 KiB and the
+    ///      reader DROPS it; and
+    ///   2. a `message` *over* 2 KiB raw (a long node label) is REJECTED by the
+    ///      validator (`message exceeded 2048 bytes`) → the event never emits.
+    /// After the fix the message is bounded by its escaped length (so it never
+    /// trips the validator) AND counted in the line budget, so the serialized
+    /// line is provably under the cap and the event always emits.
+    #[tokio::test]
+    async fn pathological_node_label_message_stays_under_line_cap() {
+        use octos_agent::harness_events::{
+            HarnessEvent, HarnessEventSinkContext, MAX_HARNESS_EVENT_LINE_BYTES,
+            attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-blocker1-label".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-blocker1-label".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // A pathological node LABEL → message: 8 KiB of NUL bytes (each escapes
+        // to ` ` = 6 bytes, so raw 8 KiB → ~48 KiB escaped) plus the
+        // `(N of M)` suffix the call sites append. This both (a) exceeds the
+        // 2 KiB raw `message` validator bound (→ rejected, no emit) AND (b)
+        // would balloon the serialized line far past 16 KiB. Combined with a
+        // 4 KiB free-form node_id and a 2 KiB all-control-byte preview, an
+        // unbounded message guarantees an over-cap (or rejected) line.
+        let control_label = "\u{0}".repeat(8 * 1024);
+        let long_message = format!("{control_label} (2 of 3)");
+        let long_node_id = "n".repeat(4 * 1024);
+        let control_body = "\u{0}".repeat(2 * 1024);
+        let preview = node_output_preview(&control_body);
+
+        let sink_for_assert = sink_uri.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                emit_pipeline_node_event(
+                    "research",
+                    "node_completed",
+                    &long_message,
+                    &long_node_id,
+                    2,
+                    3,
+                    Some(true),
+                    Some(&preview),
+                );
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        let lines = std::fs::read_to_string(&sink_for_assert).expect("read sink");
+        let event_lines: Vec<&str> = lines.lines().filter(|l| !l.trim().is_empty()).collect();
+        // The event must EMIT (a long/control-byte label must not silently drop
+        // the whole event by tripping the 2 KiB raw-message validator bound).
+        assert_eq!(
+            event_lines.len(),
+            1,
+            "a pathological node LABEL must still emit exactly one node_completed \
+             event (not be rejected by the message validator); got {event_lines:?}"
+        );
+        let line = event_lines[0];
+        assert!(
+            line.len() < MAX_HARNESS_EVENT_LINE_BYTES,
+            "node event line (incl. message) must stay under the \
+             {MAX_HARNESS_EVENT_LINE_BYTES}-byte cap (else the reader DROPS it); \
+             got {} bytes",
+            line.len()
+        );
+        let event =
+            HarnessEvent::from_json_line(line).expect("event must round-trip (not dropped)");
+        let detail = event.runtime_detail_value(None, None);
+        assert_eq!(detail["phase"], "node_completed");
+    }
+
     // ── Gap 4.2 / Blocker 2: Parallel + DynamicParallel sub-nodes MUST emit
     // structured per-node events (deep_research IS dynamic_parallel) ─────────
 
@@ -4557,6 +4727,191 @@ mod tests {
         assert_eq!(
             started, completed,
             "every dynamic worker that starts must also emit node_completed; \
+             started={started} completed={completed} ({events:?})"
+        );
+    }
+
+    /// Blocker 2 (RED on 27c26433) — when a LATER sub-node's fan-out PREP
+    /// fails (here: a per-contract budget reservation that admits the 1st
+    /// codergen target but REJECTS the 2nd), the run loop early-returns via `?`
+    /// BEFORE `join_all`, so any future already pushed is never polled. On
+    /// 27c26433 `node_started` was emitted in the prep loop (outside the
+    /// future), so the 1st target's `node_started` was emitted with no matching
+    /// `node_completed` → a chip stuck "running" forever. After the fix the
+    /// `node_started` emit lives INSIDE each future, so a future that never runs
+    /// emits NOTHING and `node_started` count == `node_completed` count.
+    #[tokio::test]
+    async fn parallel_prep_failure_leaves_no_dangling_node_started() {
+        use octos_agent::cost_ledger::{CostAccountant, CostBudgetPolicy, PersistentCostLedger};
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-prepfail".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-prepfail".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // Per-contract ceiling sized against the reservation SEQUENCE:
+        // pipeline-level (0.001 below) + 1st codergen target (0.001) = 0.002 is
+        // ADMITTED, but adding the 2nd target (0.003) trips the 0.0025 ceiling.
+        // The 2nd reservation `?`-propagates out of the fan-out prep loop before
+        // `join_all`, abandoning the 1st target's already-pushed future.
+        let ledger_dir = tempfile::tempdir().expect("ledger dir");
+        let ledger = PersistentCostLedger::open(ledger_dir.path())
+            .await
+            .expect("open cost ledger");
+        let policy = CostBudgetPolicy::default().with_per_contract_usd(0.0025);
+        let accountant = Arc::new(CostAccountant::new(Arc::new(ledger), Some(policy)));
+
+        // Two codergen fan-out targets (codergen reserves; noop does not).
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="codergen", prompt="a"]
+                b [handler="codergen", prompt="b"]
+                merge [handler="noop"]
+                fan -> a
+                fan -> b
+                a -> merge
+                b -> merge
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let result = TOOL_CTX
+            .scope(ctx, async move {
+                let mut config = make_capped_config(8).await;
+                config.workspace_context = crate::context::PipelineContext::new()
+                    .with_cost_accountant(accountant)
+                    // Small pipeline-level projection so the per-NODE fan-out
+                    // reservations (not the pipeline reserve) are what trips the
+                    // ceiling on the 2nd target.
+                    .with_projected_usd(0.001);
+                let executor = PipelineExecutor::new(config);
+                executor
+                    .run(dot, "parallel prep failure", &serde_json::Map::new())
+                    .await
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        // The pipeline is EXPECTED to fail (budget breach on the 2nd target).
+        assert!(
+            result.is_err(),
+            "expected the fan-out to fail on the 2nd reservation; got {result:?}"
+        );
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert_eq!(
+            started, completed,
+            "every emitted node_started must have a matching node_completed even \
+             when fan-out prep aborts early (no stuck-running chip); \
+             started={started} completed={completed} ({events:?})"
+        );
+    }
+
+    /// Blocker 2 (RED on 27c26433) — same dangling-`node_started` guard for
+    /// `dynamic_parallel` (the shape `deep_research` uses). A LATER worker's
+    /// budget reservation is rejected, aborting the fan-out prep loop before
+    /// `join_all`; no worker may be left with a `node_started` and no matching
+    /// `node_completed`.
+    #[tokio::test]
+    async fn dynamic_parallel_prep_failure_leaves_no_dangling_node_started() {
+        use octos_agent::cost_ledger::{CostAccountant, CostBudgetPolicy, PersistentCostLedger};
+        use octos_agent::harness_events::{
+            HarnessEventSinkContext, attach_event_sink_context, detach_event_sink_context,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-pipeline-dp-prepfail".to_string(),
+            },
+        );
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-pipeline-dp-prepfail".to_string(),
+            harness_event_sink: Some(sink_uri.clone()),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        // The 3-task fallback expands (MockProvider returns "done" → JSON
+        // extraction fails). Reservation sequence: pipeline (0.001) + worker1
+        // (0.001) = 0.002 ADMITTED; adding worker2 (0.003) trips the 0.0025
+        // ceiling, aborting the prep loop before `join_all`.
+        let ledger_dir = tempfile::tempdir().expect("ledger dir");
+        let ledger = PersistentCostLedger::open(ledger_dir.path())
+            .await
+            .expect("open cost ledger");
+        let policy = CostBudgetPolicy::default().with_per_contract_usd(0.0025);
+        let accountant = Arc::new(CostAccountant::new(Arc::new(ledger), Some(policy)));
+
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let sink_for_run = sink_uri.clone();
+        let result = TOOL_CTX
+            .scope(ctx, async move {
+                let mut config = make_capped_config(64).await;
+                config.workspace_context = crate::context::PipelineContext::new()
+                    .with_cost_accountant(accountant)
+                    .with_projected_usd(0.001);
+                let executor = PipelineExecutor::new(config);
+                executor
+                    .run(dot, "dynamic prep failure", &serde_json::Map::new())
+                    .await
+            })
+            .await;
+
+        detach_event_sink_context(&sink_uri);
+
+        assert!(
+            result.is_err(),
+            "expected the dynamic fan-out to fail on a later reservation; got {result:?}"
+        );
+
+        let events = drain_node_events(&sink_for_run);
+        let started = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_started")
+            .count();
+        let completed = events
+            .iter()
+            .filter(|(_, p, _)| p == "node_completed")
+            .count();
+        assert_eq!(
+            started, completed,
+            "dynamic_parallel: every emitted node_started must have a matching \
+             node_completed even when prep aborts early; \
              started={started} completed={completed} ({events:?})"
         );
     }
