@@ -189,6 +189,13 @@ impl PluginTool {
         self
     }
 
+    /// The plugin's own execution timeout (seconds-resolution `Duration`).
+    /// Exposed for the loader tests to assert the manifest-timeout clamp.
+    #[cfg(test)]
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// S2 plumbing: set the synthesis LLM provider config injected into the
     /// plugin's args. Only honoured when the tool's manifest opts in via
     /// `x-octos-host-config-keys: ["synthesis_config"]`.
@@ -2329,7 +2336,20 @@ impl Tool for PluginTool {
         cmd.arg(&self.tool_def.name)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Cancellation-safety (codex review of 7c3e5eac): the registry's
+            // per-tool timeout (`ToolRegistry::execute_with_context`) wraps
+            // this future in `tokio::time::timeout`, which DROPS the future on
+            // elapse. The spawned `Child` below is owned by this future, so
+            // dropping the future drops the `Child`. With `kill_on_drop(true)`
+            // tokio sends SIGKILL to the child (and the runtime's reaper
+            // collects it) on that drop — so a registry-timeout cancellation
+            // can NEVER orphan the plugin subprocess, even if the hang happens
+            // BEFORE the plugin's own timeout/kill branch (e.g. wedged on the
+            // stdin write). The plugin's own kill branch below remains the
+            // graceful path (process-group kill -9 -PID) when the plugin's
+            // own `self.timeout` fires first.
+            .kill_on_drop(true);
 
         let env_allowlist = EnvAllowlist::from_strings(&self.tool_def.env);
 
@@ -2480,15 +2500,66 @@ impl Tool for PluginTool {
             "plugin process spawned"
         );
 
-        // Write args to stdin
+        // Write args to stdin.
+        //
+        // Cancellation-safety (codex review of 7c3e5eac): this write happens
+        // BEFORE the plugin's own timeout/kill branch below. A misbehaving
+        // plugin that never drains stdin (and fills the OS pipe buffer by
+        // streaming stdout before reading) could wedge `write_all` here
+        // indefinitely. `kill_on_drop(true)` on `cmd` already guarantees the
+        // child cannot be ORPHANED if the registry backstop drops this whole
+        // future, but we ALSO bound the write under the plugin's own
+        // `self.timeout` so the hang is caught by the plugin's graceful
+        // kill path (process-group kill -9 -PID) rather than only by the
+        // larger registry backstop. A timed-out write degrades to the same
+        // structured timeout error as a hung wait.
         if let Some(mut stdin) = child.stdin.take() {
             let data = serde_json::to_vec(&effective_args)?;
-            if let Err(err) = stdin.write_all(&data).await {
-                // Some plugins do not read stdin at all and exit after writing a
-                // best-effort stdout result. Treat an early pipe close as
-                // non-fatal so fallback stdout parsing can still succeed.
-                if err.kind() != ErrorKind::BrokenPipe {
-                    return Err(err.into());
+            match tokio::time::timeout(self.timeout, stdin.write_all(&data)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    // Some plugins do not read stdin at all and exit after
+                    // writing a best-effort stdout result. Treat an early pipe
+                    // close as non-fatal so fallback stdout parsing can still
+                    // succeed.
+                    if err.kind() != ErrorKind::BrokenPipe {
+                        return Err(err.into());
+                    }
+                }
+                Err(_elapsed) => {
+                    // stdin write wedged: kill the child via its process group
+                    // (matches the wait-timeout branch below) and surface a
+                    // structured timeout. Dropping the future would also kill
+                    // it via kill_on_drop, but killing here keeps the error
+                    // path symmetric and reaps the group, not just the child.
+                    let _ = child.kill().await;
+                    #[cfg(unix)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &format!("-{child_pid}")])
+                            .status();
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &child_pid.to_string()])
+                            .status();
+                    }
+                    #[cfg(windows)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &child_pid.to_string()])
+                            .status();
+                    }
+                    let timeout_secs = self.timeout.as_secs();
+                    let message = format!(
+                        "plugin '{}' tool '{}' timed out after {timeout_secs}s writing to stdin",
+                        self.plugin_name, self.tool_def.name
+                    );
+                    let classified = HarnessError::PluginTimeout {
+                        plugin_name: self.plugin_name.clone(),
+                        timeout_secs,
+                        message: message.clone(),
+                    };
+                    self.emit_plugin_error(ctx.as_ref(), &classified);
+                    return Err(eyre::eyre!(message));
                 }
             }
             // Drop stdin to signal EOF
@@ -4261,6 +4332,120 @@ mod tests {
             ),
             Ok(_) => panic!("expected timeout error, but execute succeeded"),
         }
+    }
+
+    /// A process is considered "alive" for the orphan check if `ps` reports a
+    /// non-zombie state for the pid. A reaped or zombie process is dead.
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let state = String::from_utf8_lossy(&o.stdout);
+                let state = state.trim();
+                // Empty output -> no such process (reaped). A leading 'Z' is a
+                // zombie -> the process is dead, awaiting reap.
+                !state.is_empty() && !state.starts_with('Z')
+            }
+            // Non-zero exit (or spawn error) -> no such pid.
+            _ => false,
+        }
+    }
+
+    /// Cancellation-safety regression (codex review of 7c3e5eac): the registry
+    /// timeout (`execute_with_context`) wraps the tool future in
+    /// `tokio::time::timeout`, which DROPS the future on elapse. A `PluginTool`
+    /// spawns a child subprocess that is owned by that future. If the dropped
+    /// future does not kill the child, the plugin subprocess is ORPHANED and
+    /// keeps mutating state — trading a hang for a runaway process.
+    ///
+    /// This simulates the registry path by racing `execute()` against a SHORT
+    /// timeout and dropping the future on elapse, then asserting the spawned
+    /// child PID is actually dead (not just that the future returned).
+    ///
+    /// RED on HEAD: without `kill_on_drop(true)` the `sleep` child survives the
+    /// drop and `pid_is_alive` stays true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn dropped_execute_future_kills_child_no_orphan() {
+        if std::path::Path::new("/.dockerenv").exists()
+            || std::fs::read_to_string("/proc/1/cgroup")
+                .map(|s| s.contains("docker") || s.contains("kubepods"))
+                .unwrap_or(false)
+        {
+            eprintln!("skipping dropped_execute_future_kills_child_no_orphan: container detected");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        let pidfile = dir.path().join("child.pid");
+        // `exec sleep` so the recorded pid IS the long-running process (no
+        // intermediate shell). Ignores stdin entirely, so a hang here also
+        // exercises the pre-kill stdin-write path. Sleeps far longer than the
+        // test timeout so it cannot exit on its own.
+        write_test_script(
+            &script_path,
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+                pidfile.display()
+            ),
+        );
+
+        let def = make_tool_def("hang_tool", "ignores stdin and sleeps");
+        // A long internal plugin timeout so it is NOT the plugin's own kill
+        // branch that saves us — only dropping the future can kill the child.
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
+
+        // Simulate the registry dispatch boundary: wrap the tool future in a
+        // short timeout. On elapse the future is dropped (its `Child` with it).
+        // Use a 3s window (generous even under heavy parallel test load) so the
+        // child reliably runs `echo $$ > pidfile` and reaches `sleep` BEFORE
+        // the timeout drops the future — otherwise we could not observe the
+        // pid to assert on. The cancellation-safety property is unaffected by
+        // the window length.
+        let args = json!({});
+        let fut = tool.execute(&args);
+        let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
+        assert!(
+            res.is_err(),
+            "expected the short registry-style timeout to elapse (future dropped)"
+        );
+        // `res` (the dropped future) is gone here — the `Child` was owned by it.
+
+        // The child should have written its pid before sleeping. It had the
+        // full 3s window above to do so.
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .expect("child should have recorded its pid before sleeping");
+
+        // Poll: the drop-kill + tokio reaper should make the child dead. Allow
+        // a brief window for SIGKILL delivery + reap.
+        let mut alive_after = true;
+        for _ in 0..100 {
+            if !pid_is_alive(pid) {
+                alive_after = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Best-effort cleanup so a RED run does not leak the orphan.
+        if alive_after {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+
+        assert!(
+            !alive_after,
+            "plugin child (pid {pid}) was ORPHANED after the execute future was dropped — \
+             not cancellation-safe"
+        );
     }
 
     // -------------------------------------------------------------------
