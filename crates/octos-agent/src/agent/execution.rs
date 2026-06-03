@@ -381,6 +381,17 @@ impl Agent {
                                 tc_name, reason
                             )
                         };
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever.
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&deny_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -437,6 +448,17 @@ impl Agent {
                             "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
                             tc_name, reason
                         );
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever.
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&deny_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -478,6 +500,19 @@ impl Agent {
                             "[VALIDATION FAILED] Tool '{tc_name}' rejected input: {msg}\n\n\
                              Fix the input and retry."
                         );
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever
+                        // (reproduced live on mini5: a bad run_pipeline name left
+                        // an "Orchestrating… (1 active)" chip stuck 15+ min).
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&err_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
