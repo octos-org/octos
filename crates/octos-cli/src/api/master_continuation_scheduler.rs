@@ -431,6 +431,13 @@ pub(crate) struct MasterContinuationScheduler {
     /// unified `on_terminal` enqueues of one terminal transition cannot
     /// double-deliver. Only `External` keys are recorded (see the constant
     /// doc) so recurring loop/goal/child continuations stay reusable.
+    ///
+    /// INVARIANT for future `External` producers: this guard assumes an
+    /// `External` dedupe key identifies ONE occurrence (today: spawn_only
+    /// failure keyed by task UUIDv7, one-shot — no other production producer).
+    /// Any new `External` producer that can legitimately re-enqueue the same
+    /// key within the window MUST embed a unique occurrence id in the key, or
+    /// the second enqueue will be wrongly dropped.
     recently_claimed_external: HashMap<MasterContinuationDedupeKey, SystemTime>,
 }
 
@@ -703,9 +710,13 @@ impl MasterContinuationScheduler {
 }
 
 /// True when `candidate` falls within [`RECENT_CLAIM_GUARD_WINDOW`] after
-/// `claimed_at`. Robust to clock skew: a `candidate` BEFORE `claimed_at`
-/// (negative delta) is treated as in-window so a re-enqueue that races the
-/// claim is still collapsed.
+/// `claimed_at`. Wall-clock based (`SystemTime`), so NOT fully clock-skew
+/// proof: a backward delta (`candidate` at/before `claimed_at`) is treated as
+/// in-window — the safe direction, collapsing a re-enqueue that races the
+/// claim — but a forward wall-clock jump larger than the window would let the
+/// guard MISS and fall back to the (rare) double-delivery. Acceptable today
+/// because production `External` keys are one-shot (see field doc); revisit
+/// with a monotonic/injected clock if that ever changes.
 fn within_recent_claim_window(claimed_at: SystemTime, candidate: SystemTime) -> bool {
     match candidate.duration_since(claimed_at) {
         Ok(elapsed) => elapsed <= RECENT_CLAIM_GUARD_WINDOW,
