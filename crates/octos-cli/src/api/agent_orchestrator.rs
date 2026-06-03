@@ -6705,6 +6705,216 @@ mod tests {
         );
     }
 
+    /// codex DO-NOT-SHIP TOCTOU: on the WS path BOTH the legacy `on_failure`
+    /// enqueue and the unified `on_terminal` enqueue fire SEQUENTIALLY inside
+    /// one `mark_failed`, with the IDENTICAL
+    /// `external/spawn_only_failure/<session>/<task>` dedupe key. If the AppUI
+    /// continuation tick DRAINS the legacy enqueue before the unified one runs,
+    /// the existing pending-map dedupe misses and one terminal transition
+    /// would yield TWO recovery turns. This pins the full WS interleaving for
+    /// an ACKED failure: legacy enqueue → tick drain → unified enqueue must
+    /// total EXACTLY ONE recovery continuation.
+    #[test]
+    fn acked_spawn_only_failure_drain_between_legacy_and_unified_yields_exactly_one() {
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-toctou-acked", "api", "spawn-fail-acked");
+        let profile = "tenant-toctou-acked";
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-00000000acked".into(),
+            tool_name: "mofa_slides".into(),
+            tool_call_id: "call-acked".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Failed,
+            runtime_state: octos_agent::TaskRuntimeState::Failed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec![],
+            error: Some("plugin exited 137".into()),
+            session_key: Some(session_id.to_string()),
+            tool_input: Some(json!({"topic": "rust"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: task.id.clone(),
+            tool_name: task.tool_name.clone(),
+            tool_input: task.tool_input.clone().unwrap(),
+            error_message: task.error.clone().unwrap(),
+            suggested_alternatives: vec![],
+            parent_session_key: task.parent_session_key.clone(),
+            originating_client_message_id: None,
+        };
+        let event = octos_agent::TerminalEvent {
+            task,
+            // ACKED: the synth-ack fired, so the unified consumer renders the
+            // recovery body (does NOT prompt-suppress).
+            synth_ack_emitted: true,
+            outcome: octos_agent::TerminalOutcome::Failed(signal.clone()),
+        };
+
+        // 1. Legacy `on_failure` WS enqueue (ui_protocol.rs set_on_failure_signal).
+        let legacy =
+            orchestrator.enqueue_spawn_only_failure_continuation(&session_id, profile, &signal);
+        assert!(!legacy.is_duplicate(), "legacy enqueue should queue first");
+
+        // 2. The 2s AppUI continuation tick DRAINS the legacy enqueue before
+        //    `mark_failed` reaches `notify_terminal`.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let recovery_drained = drained
+            .iter()
+            .filter(|item| {
+                item.reason
+                    == MasterContinuationReason::External(
+                        SPAWN_ONLY_FAILURE_EXTERNAL_KIND.to_owned(),
+                    )
+            })
+            .count();
+        assert_eq!(recovery_drained, 1, "tick drains exactly one recovery turn");
+
+        // 3. Unified `on_terminal` WS enqueue (route_terminal_event...Queue) —
+        //    same transition, microseconds later. Must be collapsed by the
+        //    recently-claimed guard, NOT produce a second recovery.
+        route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile),
+            TerminalFailureRouting::Queue,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+            "unified enqueue after the tick drain must NOT add a second recovery turn",
+        );
+    }
+
+    /// fail-before-ack variant of the TOCTOU race. When a spawn_only task
+    /// fails BEFORE its synth-ack is recorded, the unified `notify_terminal`
+    /// samples `synth_ack_emitted = false` and PROMPT-SUPPRESSES the recovery
+    /// (so unified alone would deliver ZERO). The legacy two-phase synth-ack
+    /// stash re-emits the deferred `SpawnOnlyFailureSignal` on ack, and THAT
+    /// legacy `on_failure` enqueue is the single delivery. Even if the tick
+    /// drains the legacy enqueue before the (suppressed) unified path runs,
+    /// the result must be EXACTLY ONE — not zero, not two.
+    #[test]
+    fn fail_before_ack_spawn_only_failure_yields_exactly_one() {
+        let orchestrator = default_agent_orchestrator();
+        let session_id =
+            SessionKey::with_profile("tenant-toctou-preack", "api", "spawn-fail-preack");
+        let profile = "tenant-toctou-preack";
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-0000000preack".into(),
+            tool_name: "mofa_slides".into(),
+            tool_call_id: "call-preack".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Failed,
+            runtime_state: octos_agent::TaskRuntimeState::Failed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec![],
+            error: Some("plugin binary missing".into()),
+            session_key: Some(session_id.to_string()),
+            tool_input: Some(json!({"topic": "rust"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: task.id.clone(),
+            tool_name: task.tool_name.clone(),
+            tool_input: task.tool_input.clone().unwrap(),
+            error_message: task.error.clone().unwrap(),
+            suggested_alternatives: vec![],
+            parent_session_key: task.parent_session_key.clone(),
+            originating_client_message_id: None,
+        };
+        // The unified terminal event for a fail-before-ack carries
+        // `synth_ack_emitted = false` (the ack had not been recorded when the
+        // event was built), which the consumer prompt-suppresses.
+        let unified_event = octos_agent::TerminalEvent {
+            task,
+            synth_ack_emitted: false,
+            outcome: octos_agent::TerminalOutcome::Failed(signal.clone()),
+        };
+
+        // 1. Unified `notify_terminal` fires first on the failed transition but
+        //    PROMPT-SUPPRESSES (ack never emitted at fire time) → enqueues nothing.
+        route_terminal_event_to_continuation_queue(
+            &unified_event,
+            Some(profile),
+            TerminalFailureRouting::Queue,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+            "fail-before-ack unified path is prompt-suppressed (synth-ack never emitted)",
+        );
+
+        // 2. The legacy two-phase stash re-emits the deferred signal once the
+        //    synth-ack is recorded (mark_synth_ack_emitted → on_failure). On the
+        //    WS path that fires `enqueue_spawn_only_failure_continuation`.
+        let legacy =
+            orchestrator.enqueue_spawn_only_failure_continuation(&session_id, profile, &signal);
+        assert!(
+            !legacy.is_duplicate(),
+            "the deferred legacy enqueue is the SINGLE delivery for fail-before-ack",
+        );
+
+        // 3. Tick drains it: exactly ONE recovery turn (not zero, not two).
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let recovery_drained = drained
+            .iter()
+            .filter(|item| {
+                item.reason
+                    == MasterContinuationReason::External(
+                        SPAWN_ONLY_FAILURE_EXTERNAL_KIND.to_owned(),
+                    )
+            })
+            .count();
+        assert_eq!(
+            recovery_drained, 1,
+            "fail-before-ack must deliver EXACTLY ONE recovery continuation",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+            "no phantom second recovery left pending for fail-before-ack",
+        );
+    }
+
     /// mini5 soak regression (task-completion notice never fired): AppUI /
     /// TUI sessions use BARE session keys ("q5", "test1") with no
     /// `profile:channel:chat` prefix, so `SessionKey::profile_id()` is
