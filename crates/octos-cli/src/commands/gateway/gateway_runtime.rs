@@ -459,6 +459,15 @@ impl GatewayRuntime {
         if n > 0 {
             info!(count = n, "bootstrapped platform skills");
         }
+        // Gap 4.1: bundle generic pipelines (deep_research) into
+        // <octos_home>/pipelines so `run_pipeline` always discovers them
+        // even when the per-profile `mofa-research` skill has drifted.
+        // Profile factories add `<octos_home>/pipelines` to discovery via
+        // `with_octos_home`. Installed pipelines of the same name win.
+        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&project_dir);
+        if n > 0 {
+            info!(count = n, "bootstrapped bundled pipelines");
+        }
 
         // Voice transcription via voice platform skill binary (after bootstrap)
         let voice_binary_path = project_dir

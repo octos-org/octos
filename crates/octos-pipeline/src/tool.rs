@@ -25,6 +25,12 @@ use octos_core::{SessionScope, TokenUsage};
 pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
     "pipeline workers don't yet propagate ContextManager (M17-B)";
 
+/// Gap 4.1 — the sanctioned generic pipeline name. Bundled into the binary
+/// via `octos_agent::bundled_pipelines` and used as the no-discovery fallback
+/// for the `run_pipeline` `pipeline` arg enum so the advertised choices are
+/// never empty even before bootstrap has written the `.dot`.
+const FALLBACK_PIPELINE_NAME: &str = "deep_research";
+
 /// Phase 2-A of the [`SessionScope`] migration (load-bearing follow-up
 /// to PR #1199 / Phase 1).
 ///
@@ -261,11 +267,15 @@ impl RunPipelineTool {
         }
     }
 
-    /// Add the global octos-home skills directory as a search path.
-    /// This ensures pipelines installed globally (e.g. `~/.octos/skills/`) are
-    /// discoverable even when data_dir is per-profile.
+    /// Add the global octos-home skills + pipelines directories as search
+    /// paths. This ensures pipelines installed globally (e.g.
+    /// `~/.octos/skills/`) AND bundled generic pipelines written to
+    /// `~/.octos/pipelines/` by `bootstrap_bundled_pipelines` are discoverable
+    /// even when `data_dir` is per-profile (the per-profile discovery default
+    /// only searches `<profile_data_dir>/pipelines`, not the shared home).
     pub fn with_octos_home(mut self, octos_home: PathBuf) -> Self {
         self.discovery.add_search_path(octos_home.join("skills"));
+        self.discovery.add_search_path(octos_home.join("pipelines"));
         self
     }
 
@@ -458,13 +468,33 @@ impl Tool for RunPipelineTool {
              user no such tool exists for their request."
             .to_string();
 
+        // Gap 4.1: advertise the LIVE discovery list, not a hard-coded
+        // `["deep_research"]`. The old static enum lied when a profile had
+        // extra installed/bundled pipelines (the model couldn't name them)
+        // and lied the other way when `deep_research` had drifted off the
+        // profile (the model emitted a name that resolved to
+        // `Available: (none)`). Populating from `list_available()` keeps the
+        // advertised choices in lock-step with what `resolve()` can actually
+        // find. No-discovery fallback keeps the sanctioned generic
+        // `deep_research` baseline (it is bundled into the binary), so the
+        // enum is never empty and the model always has the generic pipeline.
+        let mut pipeline_names: Vec<String> = self
+            .discovery
+            .list_available()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        if !pipeline_names.iter().any(|n| n == FALLBACK_PIPELINE_NAME) {
+            pipeline_names.push(FALLBACK_PIPELINE_NAME.to_string());
+        }
+
         serde_json::json!({
             "type": "object",
             "properties": {
                 "pipeline": {
                     "type": "string",
                     "description": pipeline_desc,
-                    "enum": ["deep_research"]
+                    "enum": pipeline_names
                 },
                 "input": {
                     "type": "string",

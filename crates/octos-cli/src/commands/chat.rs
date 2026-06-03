@@ -257,6 +257,14 @@ impl ChatCommand {
         if n > 0 {
             eprintln!("Bootstrapped {n} platform skills");
         }
+        // Gap 4.1: bundle generic pipelines (deep_research) into
+        // <data_dir>/pipelines so `run_pipeline` can always discover them,
+        // independent of per-profile skill deployment. Discovery searches
+        // `data_dir/pipelines`; installed pipelines of the same name win.
+        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
+        if n > 0 {
+            eprintln!("Bootstrapped {n} bundled pipelines");
+        }
 
         // Load plugins (includes app-skills from .octos/skills/).
         // Section B (codex review P1.1): honour `plugins.require_signed`
