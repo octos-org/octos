@@ -398,12 +398,13 @@ impl ServeCommand {
         // per-profile loop free of redundant disk writes.
         octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
         octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
-        // Gap 4.1: bundle generic pipelines (deep_research) into
-        // <octos_home>/pipelines so `run_pipeline` always discovers them
-        // even when the `mofa-research` skill carrying `deep_research.dot`
-        // has drifted off a profile. Per-profile `RunPipelineTool`s add
-        // `<octos_home>/pipelines` to discovery via `with_octos_home`.
-        // Installed pipelines of the same name win (no clobber).
+        // Gap 4.1: bundle generic pipelines (deep_research) into the
+        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
+        // always discovers them even when the `mofa-research` skill carrying
+        // `deep_research.dot` has drifted off a profile. Per-profile
+        // `RunPipelineTool`s register that dir as the LOWEST-precedence
+        // search path via `with_octos_home` (bootstrap-dir == search-dir).
+        // Installed pipelines of the same name always win (no clobber).
         octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
 
         // M11-D — build the per-profile runtime catalog. For every

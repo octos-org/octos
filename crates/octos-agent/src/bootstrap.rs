@@ -275,7 +275,7 @@ mod tests {
             .join("deep_research.dot");
         assert!(
             dot.exists(),
-            "bootstrap must write deep_research.dot into <octos_home>/pipelines"
+            "bootstrap must write deep_research.dot into <octos_home>/bundled-pipelines"
         );
         let body = std::fs::read_to_string(&dot).unwrap();
         assert!(

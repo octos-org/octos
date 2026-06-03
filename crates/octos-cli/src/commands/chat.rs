@@ -257,10 +257,13 @@ impl ChatCommand {
         if n > 0 {
             eprintln!("Bootstrapped {n} platform skills");
         }
-        // Gap 4.1: bundle generic pipelines (deep_research) into
-        // <data_dir>/pipelines so `run_pipeline` can always discover them,
-        // independent of per-profile skill deployment. Discovery searches
-        // `data_dir/pipelines`; installed pipelines of the same name win.
+        // Gap 4.1: bundle generic pipelines (deep_research) into the
+        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline` can
+        // always discover them, independent of per-profile skill deployment.
+        // The chat `RunPipelineTool` registers that dir as the LOWEST-
+        // precedence search path via `with_bundled_pipelines_root(data_dir)`
+        // (bootstrap-dir == search-dir); installed pipelines of the same name
+        // always win.
         let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} bundled pipelines");

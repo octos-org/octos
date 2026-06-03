@@ -136,10 +136,19 @@ impl PipelineDiscovery {
             }
         }
 
-        // 3. Search by bare name across all paths (including nested skill dirs)
+        // 3. Search by bare name across all paths (including nested skill dirs).
+        //    Gap 4.1 BLOCKER 2: discovery stores names as file STEMS
+        //    (`deep_research`), so canonicalize the input to the same stem
+        //    form (strip any directory component AND a trailing `.dot`) before
+        //    comparing. This makes `deep_research` and `deep_research.dot`
+        //    resolve identically here — both hit the INSTALLED copy — so the
+        //    embedded-bytes fallback (in the tool layer) can never out-rank an
+        //    installed pipeline for the `.dot` input form. Direct file paths
+        //    were already handled at higher precedence by steps 1-2.
+        let want_stem = pipeline_name_stem(name_or_path);
         let all = self.list_available();
         for info in &all {
-            if info.name == name_or_path {
+            if info.name == want_stem {
                 return tokio::fs::read_to_string(&info.path)
                     .await
                     .map_err(|e| eyre::eyre!("failed to read pipeline file: {e}"));
@@ -157,6 +166,29 @@ impl PipelineDiscovery {
             }
         )
     }
+}
+
+/// Canonicalize a pipeline name-or-path input to the bare file STEM that
+/// [`PipelineDiscovery`] stores in [`PipelineInfo::name`] (see
+/// [`scan_dot_files`], which uses `Path::file_stem`).
+///
+/// Strips any directory component AND a trailing `.dot` extension, so
+/// `deep_research`, `deep_research.dot`, and `mofa-research/deep_research.dot`
+/// all canonicalize to `deep_research`. Used for the bare-name discovery
+/// comparison (BLOCKER 2 installed-wins) and mirrored by the embedded-bundled
+/// fallback in `RunPipelineTool`, so both input forms resolve identically:
+/// discovery (installed) first, embedded bytes only on a true miss.
+pub fn pipeline_name_stem(name_or_path: &str) -> String {
+    // Drop any directory component first (`mofa-research/deep_research.dot`
+    // -> `deep_research.dot`).
+    let file = Path::new(name_or_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name_or_path.to_string());
+    // Strip ONLY a trailing `.dot` — never a different extension. A bare name
+    // like `my.pipeline` (no `.dot`) must stay intact so we don't accidentally
+    // canonicalize away a legitimate stem the way `Path::file_stem` would.
+    file.strip_suffix(".dot").unwrap_or(&file).to_string()
 }
 
 fn scan_dot_files(dir: &Path, pipelines: &mut Vec<PipelineInfo>) {
@@ -237,6 +269,49 @@ mod tests {
         assert!(
             !resolved.contains("BUNDLED"),
             "bundled copy must NOT shadow an installed pipeline of the same name"
+        );
+    }
+
+    /// Gap 4.1 BLOCKER 2 (`.dot`-suffixed input bypasses installed-wins) —
+    /// `resolve("deep_research.dot")` MUST resolve to the INSTALLED
+    /// `skills/mofa-research/deep_research.dot` (stem `deep_research`), the
+    /// same as the bare-name form. Discovery stores names as file stems, so
+    /// before the fix the `.dot` form missed the bare-name comparison (step 3
+    /// compared `info.name == "deep_research.dot"` against stem
+    /// `deep_research`) and discovery returned Err — which (in the tool layer)
+    /// let the embedded bundled bytes win over the installed copy. After the
+    /// fix the input is canonicalized to the bare stem before the bare-name
+    /// comparison, so both forms resolve identically to the installed copy.
+    #[tokio::test]
+    async fn dot_suffixed_input_resolves_installed_same_as_bare_name() {
+        let data = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+
+        // Installed skill copy (nested — NOT a top-level direct path), stored
+        // by discovery under the bare stem `deep_research`.
+        let skill_dir = data.path().join("skills").join("mofa-research");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("deep_research.dot"),
+            "digraph deep_research { installed [prompt=\"INSTALLED\"] }",
+        )
+        .unwrap();
+
+        let discovery = PipelineDiscovery::new(data.path(), working.path());
+
+        // Bare name resolves to the installed copy.
+        let bare = discovery.resolve("deep_research").await.unwrap();
+        assert!(
+            bare.contains("INSTALLED"),
+            "bare name must resolve installed copy, got: {bare}"
+        );
+
+        // `.dot`-suffixed form MUST resolve identically (RED before the fix:
+        // step-3 stem comparison missed `deep_research.dot`, so this errored).
+        let dotted = discovery.resolve("deep_research.dot").await.unwrap();
+        assert!(
+            dotted.contains("INSTALLED"),
+            "`.dot`-suffixed input must resolve the SAME installed copy as the bare name, got: {dotted}"
         );
     }
 

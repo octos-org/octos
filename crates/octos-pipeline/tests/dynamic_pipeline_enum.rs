@@ -146,15 +146,17 @@ async fn fallback_advertised_deep_research_actually_resolves() {
 }
 
 /// `with_octos_home` must add `<octos_home>/pipelines` as a discovery search
-/// path so bundled pipelines written there by
-/// `bootstrap_bundled_pipelines` are advertised in the enum.
+/// path so an operator-installed user pipeline written there is advertised in
+/// the enum. (NB: the BUNDLED generic pipelines now land in the dedicated
+/// `<octos_home>/bundled-pipelines` dir via `bootstrap_bundled_pipelines`, NOT
+/// here — see the bundled-fallback tests below.)
 #[tokio::test]
 async fn pipeline_enum_includes_octos_home_pipelines() {
     let working = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let octos_home = tempfile::tempdir().unwrap();
 
-    // Bundled pipeline lands in <octos_home>/pipelines (per bootstrap).
+    // Operator-installed user pipeline lands in <octos_home>/pipelines.
     // Use a NON-baseline name so a hard-coded fallback can't satisfy this.
     let home_pipelines = octos_home.path().join("pipelines");
     std::fs::create_dir_all(&home_pipelines).unwrap();
@@ -348,6 +350,141 @@ async fn gateway_path_installed_wins_and_bundled_discovers() {
     );
 }
 
+/// Gap 4.1 BLOCKER 2 (`.dot`-suffixed input bypasses installed-wins) —
+/// `resolve("deep_research.dot")` and `resolve("deep_research")` must behave
+/// IDENTICALLY through the full tool resolve path (discovery + embedded
+/// fallback):
+///   - When an installed `skills/<x>/deep_research.dot` exists, BOTH forms
+///     resolve the INSTALLED copy (installed-wins). RED on 344d0df1: the
+///     `.dot` form missed discovery's stem comparison → discovery Err → the
+///     embedded-bytes fallback's `want == file_name` matched `deep_research.dot`
+///     → BUNDLED won over INSTALLED.
+///   - When nothing is installed, BOTH forms fall to the embedded bundled
+///     bytes (fallback is the whole point of bundling).
+#[tokio::test]
+async fn dot_suffixed_input_obeys_installed_wins_and_bundled_fallback() {
+    let working = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let octos_home = tempfile::tempdir().unwrap();
+
+    // Nothing installed: BOTH input forms fall to the embedded bundled bytes.
+    {
+        let tool = make_tool_with_data(working.path(), data.path())
+            .await
+            .with_octos_home(PathBuf::from(octos_home.path()));
+        for input in ["deep_research", "deep_research.dot"] {
+            let dot = tool
+                .resolve_named_for_test(input)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("`{input}` must fall back to embedded bundled bytes, got err: {e}")
+                });
+            assert!(
+                dot.contains("digraph deep_research"),
+                "`{input}`: embedded bundled deep_research must resolve when nothing installed, got: {dot}"
+            );
+        }
+    }
+
+    // Install a skill copy of the same name — BOTH input forms must now win
+    // it (installed-wins), never the embedded bundled bytes.
+    let skill_dir = octos_home.path().join("skills").join("mofa-research");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("deep_research.dot"),
+        "digraph deep_research { installed [prompt=\"INSTALLED\"] }",
+    )
+    .unwrap();
+
+    let tool = make_tool_with_data(working.path(), data.path())
+        .await
+        .with_octos_home(PathBuf::from(octos_home.path()));
+    for input in ["deep_research", "deep_research.dot"] {
+        let dot = tool
+            .resolve_named_for_test(input)
+            .await
+            .unwrap_or_else(|e| panic!("`{input}` must resolve the installed copy, got err: {e}"));
+        assert!(
+            dot.contains("INSTALLED"),
+            "`{input}`: installed deep_research.dot must win over embedded bundled bytes, got: {dot}"
+        );
+    }
+}
+
+/// Gap 4.1 BLOCKER 1 (standalone gateway child-profile uses the wrong
+/// pipeline root) — encodes the standalone `octos gateway` invariant at the
+/// resolution boundary:
+///
+/// On the standalone path (no `--octos-home`), the gateway bootstraps bundled
+/// pipelines into `effective_octos_home` (= `data_dir`), but the child-profile
+/// factory historically rooted `run_pipeline` at `project_dir` (= `cwd/.octos`)
+/// — a DIFFERENT dir bootstrap never wrote. This test proves:
+///   1. A tool rooted at `effective_octos_home` (the bootstrap dir) discovers
+///      an installed GLOBAL pipeline there and lets it WIN over the bundled
+///      fallback (bootstrap-dir == search-dir → installed-wins).
+///   2. A tool rooted at the WRONG `project_dir` (where bootstrap never wrote)
+///      cannot see that installed pipeline at all — the exact 344d0df1 defect
+///      that let the embedded fallback beat an installed global pipeline.
+#[tokio::test]
+async fn standalone_gateway_child_profile_roots_pipeline_at_bootstrap_dir() {
+    // Standalone layout: cwd/.octos (project_dir) and data_dir
+    // (effective_octos_home) are DISTINCT dirs.
+    let cwd = tempfile::tempdir().unwrap();
+    let project_dir = cwd.path().join(".octos");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let effective_octos_home = data_dir.path();
+    // Separate per-session data dirs so the two RunPipelineTool instances
+    // below each open their own EpisodeStore (redb is single-writer).
+    let session_data_correct = tempfile::tempdir().unwrap();
+    let session_data_wrong = tempfile::tempdir().unwrap();
+
+    // Gateway bootstraps the bundled pipelines into effective_octos_home.
+    octos_agent::bootstrap::bootstrap_bundled_pipelines(effective_octos_home);
+
+    // Operator installs a GLOBAL deep_research under effective_octos_home/skills.
+    let global_skill = effective_octos_home.join("skills").join("mofa-research");
+    std::fs::create_dir_all(&global_skill).unwrap();
+    std::fs::write(
+        global_skill.join("deep_research.dot"),
+        "digraph deep_research { installed [prompt=\"GLOBAL_INSTALLED\"] }",
+    )
+    .unwrap();
+
+    // (1) CORRECT root = effective_octos_home (bootstrap-dir == search-dir):
+    // the installed GLOBAL copy must win over the bundled fallback.
+    let correct = make_tool_with_data(cwd.path(), session_data_correct.path())
+        .await
+        .with_octos_home(PathBuf::from(effective_octos_home));
+    let dot = correct
+        .resolve_named_for_test("deep_research")
+        .await
+        .expect("installed global deep_research must resolve at the bootstrap dir");
+    assert!(
+        dot.contains("GLOBAL_INSTALLED"),
+        "child-profile pipeline rooted at effective_octos_home must let the installed \
+         global pipeline win over the bundled fallback, got: {dot}"
+    );
+
+    // (2) WRONG root = project_dir (cwd/.octos), where bootstrap NEVER wrote and
+    // no install exists: the installed global pipeline is invisible. This is
+    // the 344d0df1 defect — discovery there falls through to the embedded
+    // bundled bytes instead of the installed global copy.
+    let wrong = make_tool_with_data(cwd.path(), session_data_wrong.path())
+        .await
+        .with_octos_home(project_dir.clone());
+    let dot_wrong = wrong
+        .resolve_named_for_test("deep_research")
+        .await
+        .expect("embedded bundled fallback still resolves");
+    assert!(
+        !dot_wrong.contains("GLOBAL_INSTALLED"),
+        "rooting at project_dir must NOT see the global install under \
+         effective_octos_home — demonstrating why the wrong root breaks \
+         installed-wins (it fell to the embedded bundled copy instead)"
+    );
+}
+
 /// Cross-crate guard: every pipeline bundled by `octos_agent` must parse and
 /// validate clean against THIS crate's parser/validator — otherwise
 /// `pre_flight_validate` would reject the bundled fallback the moment the
@@ -370,9 +507,9 @@ fn bundled_pipelines_parse_and_validate_clean() {
 }
 
 /// End-to-end: after `bootstrap_bundled_pipelines` writes into
-/// `<octos_home>/pipelines`, a `RunPipelineTool` built with `with_octos_home`
-/// advertises `deep_research` AND can `resolve` it. This is the exact path
-/// the mini5 soak missed (skill drift → `Available: (none)`).
+/// `<octos_home>/bundled-pipelines`, a `RunPipelineTool` built with
+/// `with_octos_home` advertises `deep_research` AND can `resolve` it. This is
+/// the exact path the mini5 soak missed (skill drift → `Available: (none)`).
 #[tokio::test]
 async fn bootstrap_then_discover_deep_research_end_to_end() {
     let working = tempfile::tempdir().unwrap();

@@ -1288,6 +1288,13 @@ impl GatewayRuntime {
                 .map(|store| ProfileActorFactoryBuilder {
                     profile_store: store.clone(),
                     project_dir: project_dir.clone(),
+                    // Gap 4.1 BLOCKER 1: thread the SAME `effective_octos_home`
+                    // the bundled pipelines were bootstrapped into (line ~473)
+                    // and the non-profile pipeline factory uses (line ~953) so
+                    // the child-profile `run_pipeline` discovers exactly that
+                    // dir. `project_dir` (= cwd/.octos when `--octos-home` is
+                    // absent) would search a dir bootstrap never wrote.
+                    effective_octos_home: effective_octos_home.clone(),
                     tool_config: tool_config.clone(),
                     memory: memory.clone(),
                     memory_store: memory_store.clone(),

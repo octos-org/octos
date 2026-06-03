@@ -402,12 +402,18 @@ impl RunPipelineTool {
         match self.discovery.resolve(name_or_path).await {
             Ok(dot) => Ok(dot),
             Err(discovery_err) => {
-                // Match against the embedded bundled pipelines by bare name
-                // (file stem) or exact file name.
-                let want = name_or_path.trim();
+                // Match against the embedded bundled pipelines by bare name.
+                // Gap 4.1 BLOCKER 2: canonicalize the input to the SAME bare
+                // file stem discovery uses (strip any directory + trailing
+                // `.dot`) so `deep_research` and `deep_research.dot` match the
+                // embedded bytes identically — and, critically, so this
+                // fallback only runs on a TRUE discovery miss for either form
+                // (when an installed copy exists, discovery now resolves both
+                // forms and this branch is never reached → installed-wins).
+                let want = crate::discovery::pipeline_name_stem(name_or_path.trim());
                 for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
                     let stem = file_name.strip_suffix(".dot").unwrap_or(file_name);
-                    if want == stem || want == file_name {
+                    if want == stem {
                         tracing::info!(
                             pipeline = want,
                             "resolved pipeline from embedded bundled bytes (discovery miss; \
