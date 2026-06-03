@@ -3240,8 +3240,11 @@ pub struct EnvelopeNotification {
 /// (no routing keys) is received.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EnvelopeWire {
-    /// Bare base session key for client-side routing. Defaults to the
-    /// empty key for legacy frames that predate this wire field.
+    /// Bare base session key for client-side routing. Normalized to the
+    /// base key at the `into_rpc_notification` boundary (any `#topic`
+    /// suffix folded in by `turn/start` is stripped here and surfaced on
+    /// `topic` below). Defaults to the empty key for legacy frames that
+    /// predate this wire field.
     #[serde(default = "empty_session_key")]
     session_id: SessionKey,
     /// Optional topic for topic-scoped routing. Omitted when absent.
@@ -5420,9 +5423,25 @@ impl UiNotification {
             // `EnvelopeNotification` (nested `{ session_id, topic,
             // envelope }`), which this wire DTO does NOT touch. Only the
             // WIRE is un-stripped here.
+            //
+            // codex BLOCKER (feat(envelope-wire-routing)): on a TOPIC
+            // turn, `turn/start` folds the topic into `session_id` as
+            // `"base#topic"` and that composite key is carried forward
+            // into the emitted `EnvelopeNotification.session_id`. A client
+            // only knows the bare base key, so a `"base#topic"` wire key
+            // misroutes the message and defeats orphan-chip self-heal —
+            // and it contradicts the spec text above (wire = bare base key
+            // + separate topic). Normalize the wire `session_id` to the
+            // base key here (wire boundary ONLY; the disk derive keeps
+            // `"base#topic"`), and keep the topic — recovering it from the
+            // suffix when the explicit `topic` field is empty so it is
+            // never lost.
             Self::Envelope(params) => serde_json::to_value(&EnvelopeWire {
-                session_id: params.session_id.clone(),
-                topic: params.topic.clone(),
+                session_id: SessionKey(params.session_id.base_key().to_owned()),
+                topic: params
+                    .topic
+                    .clone()
+                    .or_else(|| params.session_id.topic().map(str::to_owned)),
                 envelope: params.envelope,
             }),
         }?;
@@ -10382,6 +10401,81 @@ mod tests {
             }
             other => panic!("expected Envelope variant, got {other:?}"),
         }
+    }
+
+    /// feat(envelope-wire-routing) — codex BLOCKER: on a TOPIC turn the
+    /// `turn/start` flow folds the topic into `session_id` as
+    /// `"base#topic"`, which is carried forward into the emitted
+    /// `EnvelopeNotification.session_id`. The WIRE `session_id` MUST be
+    /// normalized to the bare base key (`"base"`) — a client only knows
+    /// the base key, so a `"base#topic"` wire key misroutes the message
+    /// and defeats the orphan-chip self-heal. The topic MUST NOT be lost:
+    /// it is preserved on the wire's separate `topic` field (recovered
+    /// from the suffix when the explicit `topic` field is empty). The
+    /// DISK derive on `EnvelopeNotification` keeps `"base#topic"`
+    /// untouched (pinned by the disk-persistence test above).
+    #[test]
+    fn envelope_wire_session_id_is_normalized_to_base_key_with_topic_preserved() {
+        let envelope = Envelope {
+            thread_id: "thread-topic".into(),
+            seq: 11,
+            client_message_id: None,
+            payload: Payload::AssistantDelta {
+                text: "topic delta".into(),
+            },
+        };
+
+        // Case 1: topic folded into session_id ("base#topic"), explicit
+        // `topic` field is None — the suffix must be recovered onto the
+        // wire's separate `topic` field while session_id is stripped.
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo#research".into()),
+            topic: None,
+            envelope: envelope.clone(),
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        let params = &rpc.params;
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:demo")),
+            "wire session_id must be the bare base key, not base#topic",
+        );
+        assert_eq!(
+            params.get("topic"),
+            Some(&json!("research")),
+            "topic must be preserved on the wire (recovered from suffix)",
+        );
+        // Decode must round-trip to the bare base key + separate topic.
+        let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
+        match parsed {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(
+                    ev.session_id,
+                    SessionKey("local:demo".into()),
+                    "decode recovers the bare base key from the wire",
+                );
+                assert_eq!(ev.topic, Some("research".into()));
+                assert_eq!(ev.envelope, envelope);
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+
+        // Case 2: topic folded into session_id AND an explicit `topic`
+        // field also set — the explicit topic wins, session_id still
+        // strips to the base key.
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo#research".into()),
+            topic: Some("research".into()),
+            envelope: envelope.clone(),
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        let params = &rpc.params;
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:demo")),
+            "wire session_id must be the bare base key even with explicit topic",
+        );
+        assert_eq!(params.get("topic"), Some(&json!("research")));
     }
 
     // ------------------------------------------------------------------
