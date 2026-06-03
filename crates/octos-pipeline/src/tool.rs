@@ -843,7 +843,16 @@ impl Tool for RunPipelineTool {
             &run_start_rfc3339,
         );
 
-        let summary = result
+        // Per-node summary LINES. The footer that embeds these is appended
+        // AFTER the (capped) body and was the last unbounded tail: it iterated
+        // ALL node_summaries (each line embeds an arbitrary-length
+        // node_id/model), so a many-node pipeline could push the serialized
+        // frame past the 1 MiB cap even though the body was bounded. We hand
+        // the lines to `bound_footer`, which caps the whole footer's serialized
+        // length to its reserved FOOTER_BUDGET_BYTES (with an
+        // `[+N more nodes omitted]` marker), closing the last frame_too_large
+        // hole.
+        let node_lines = result
             .node_summaries
             .iter()
             .map(|n| {
@@ -856,8 +865,7 @@ impl Tool for RunPipelineTool {
                     n.token_usage.output_tokens,
                 )
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
 
         // Gap 3.4 / Blocker 1 — DEGRADE, don't wedge. Bound the result body
         // that becomes the tool-result text (and downstream AppUI frame) by
@@ -898,11 +906,18 @@ impl Tool for RunPipelineTool {
         // boundary before we extended `ToolResult` with `structured_metadata`.
         let structured_metadata = node_costs_metadata(&result.node_costs);
 
+        // Bound the per-node footer to its reserved 32 KiB serialized budget so
+        // body + marker + footer is provably under the 1 MiB frame cap for ANY
+        // number/size of node summaries. `bound_footer` owns the scaffold and
+        // `Total:` line so the bound covers the COMPLETE footer.
+        let total_line = format!(
+            "Total: {} input + {} output tokens",
+            result.token_usage.input_tokens, result.token_usage.output_tokens,
+        );
+        let footer = crate::fidelity::bound_footer(&node_lines, &total_line);
+
         Ok(ToolResult {
-            output: format!(
-                "{}\n\n---\nPipeline execution summary:\n{summary}\nTotal: {} input + {} output tokens",
-                bounded_output, result.token_usage.input_tokens, result.token_usage.output_tokens,
-            ),
+            output: format!("{bounded_output}{footer}"),
             success: result.success,
             tokens_used: Some(result.token_usage),
             file_modified: delivery.report_file,
@@ -2253,6 +2268,138 @@ mod tests {
         assert!(
             delivery.full_report_name.is_none(),
             "untruncated payload is not a full-output report; no marker name"
+        );
+    }
+
+    // ───── Footer-bound blocker: the WIRED ToolResult.output (body + marker +
+    //       footer) stays under the frame cap for any number/size of nodes ─────
+
+    use crate::fidelity::{
+        FOOTER_BUDGET_BYTES, MAX_FRAME_BUDGET_BYTES, bound_footer, compute_result_ceiling,
+    };
+    use crate::graph::NodeSummary;
+    use octos_core::TokenUsage;
+
+    /// Build the per-node footer lines exactly as `execute()` does, so the
+    /// test exercises the SAME assembly path the producer ships.
+    fn footer_lines(summaries: &[NodeSummary]) -> Vec<String> {
+        summaries
+            .iter()
+            .map(|n| {
+                format!(
+                    "- {} ({}): {}ms, {}+{} tokens",
+                    n.node_id,
+                    n.model.as_deref().unwrap_or("default"),
+                    n.duration_ms,
+                    n.token_usage.input_tokens,
+                    n.token_usage.output_tokens,
+                )
+            })
+            .collect()
+    }
+
+    /// THE wired end-to-end frame invariant. An over-ceiling all-NUL body
+    /// (escapes 6x) PLUS thousands of long-id node summaries → the FINAL
+    /// assembled `ToolResult.output` (`{bounded_output}{footer}`, matching
+    /// `execute()`) serializes to strictly under the 1 MiB frame cap, and the
+    /// footer carries the `[+N more nodes omitted]` marker. This is the case
+    /// the codex re-review flagged: the unbounded footer reopened the
+    /// `frame_too_large` cliff even with a bounded body.
+    #[test]
+    fn wired_output_stays_under_frame_cap_with_huge_body_and_huge_footer() {
+        // Over-ceiling body.
+        let body_input = "\0".repeat(500 * 1024);
+        let ceiling = compute_result_ceiling(&body_input, None);
+        assert!(ceiling.truncated, "precondition: body must be truncated");
+        let bounded_output = ceiling.with_marker(Some("run_pipeline_1717400000_12345_0.md"));
+
+        // Thousands of long-id/model node summaries → unbounded footer is MiBs.
+        let long_id = "n".repeat(300);
+        let summaries: Vec<NodeSummary> = (0..4_000)
+            .map(|i| NodeSummary {
+                node_id: format!("{long_id}{i}"),
+                label: String::new(),
+                model: Some("some-very-long-model-name-xxxxxxxxxxxx".to_string()),
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+                duration_ms: 9999,
+                success: true,
+            })
+            .collect();
+        let lines = footer_lines(&summaries);
+        let total_line = "Total: 400000 input + 800000 output tokens";
+        let footer = bound_footer(&lines, total_line);
+
+        // Assemble EXACTLY as execute() does.
+        let output = format!("{bounded_output}{footer}");
+
+        let serialized = serde_json::to_string(&output).unwrap().len();
+        assert!(
+            serialized < 1024 * 1024,
+            "wired ToolResult.output must serialize under the 1 MiB frame cap, got {serialized}"
+        );
+        // Components individually honour their reservations.
+        assert!(
+            footer.contains("more nodes omitted"),
+            "footer must carry the omitted-nodes marker"
+        );
+        assert!(footer.contains(total_line), "footer keeps the Total line");
+        assert!(
+            footer.starts_with("\n\n---\nPipeline execution summary:\n"),
+            "footer keeps the scaffold"
+        );
+        // Earliest (most load-bearing) node survives in the head.
+        assert!(footer.contains(&format!("{long_id}0 ")));
+    }
+
+    /// A few-node run with short ids leaves the footer UNCHANGED — no false
+    /// truncation, every node line present, no omitted marker, and the wired
+    /// output is well under budget.
+    #[test]
+    fn wired_output_small_pipeline_keeps_full_footer() {
+        let bounded_output = "the pipeline produced this small result";
+        let summaries = vec![
+            NodeSummary {
+                node_id: "plan".into(),
+                label: String::new(),
+                model: Some("gpt-4".into()),
+                token_usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+                duration_ms: 100,
+                success: true,
+            },
+            NodeSummary {
+                node_id: "write".into(),
+                label: String::new(),
+                model: None, // -> "default"
+                token_usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 40,
+                    ..Default::default()
+                },
+                duration_ms: 200,
+                success: true,
+            },
+        ];
+        let lines = footer_lines(&summaries);
+        let footer = bound_footer(&lines, "Total: 40 input + 60 output tokens");
+        let output = format!("{bounded_output}{footer}");
+
+        assert!(output.contains("- plan (gpt-4): 100ms, 10+20 tokens"));
+        assert!(output.contains("- write (default): 200ms, 30+40 tokens"));
+        assert!(
+            !output.contains("more nodes omitted"),
+            "small pipeline must NOT carry an omitted marker"
+        );
+        assert!(
+            serde_json::to_string(&output).unwrap().len()
+                <= MAX_FRAME_BUDGET_BYTES + FOOTER_BUDGET_BYTES
         );
     }
 }

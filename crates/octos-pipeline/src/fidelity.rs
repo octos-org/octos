@@ -49,22 +49,48 @@ pub const MAX_FRAME_BUDGET_BYTES: usize = 512 * 1024;
 /// that `tool.rs` appends AFTER the body. The body's serialized length is
 /// bounded to `MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES` so the footer
 /// can never push the serialized total over the budget. 32 KiB comfortably
-/// covers many-node summaries (each node line is ~60 bytes).
+/// covers many-node summaries (each node line is ~60 bytes). [`bound_footer`]
+/// enforces that the actual footer NEVER exceeds this serialized reservation,
+/// truncating its node lines with an `[+N more nodes omitted]` marker when a
+/// many-node (or long-id) pipeline would otherwise overflow.
 pub const FOOTER_BUDGET_BYTES: usize = 32 * 1024;
 
+/// Reserved serialized headroom for the body-truncation marker that
+/// [`ResultCeiling::with_marker`] appends AFTER the capped body. The marker is
+/// bounded — `"\n... [truncated: {kept} of {original} bytes — full result in
+/// {name}]"` — at worst two 20-digit usize counts, the fixed scaffold, and the
+/// synthetic report's `run_pipeline_<ts>_<pid>_<seq>.md` name (none of which
+/// JSON-escape past 1:1 except the 3-byte em-dash that escapes 1:1). 256 bytes
+/// is comfortably conservative. The body budget reserves this so that
+/// `serialized(body + marker) <= MAX_FRAME_BUDGET_BYTES`, not just the bare
+/// body.
+pub const MARKER_RESERVE_BYTES: usize = 256;
+
 // Compile-time drift guard + headline invariant: the chosen serialized
-// budgets MUST stay strictly under the 1 MiB frame cap, and the footer must
-// fit inside the body budget. If `MAX_TEXT_FRAME_BYTES` (mirrored from
-// octos-core) or either budget is ever bumped past these bounds, the build
-// fails loudly rather than letting the producer re-open the
-// `frame_too_large` cliff. Also keeps `MAX_TEXT_FRAME_BYTES` live.
+// budgets MUST stay strictly under the 1 MiB frame cap, and the footer (plus
+// the body-marker reserve) must fit inside the body budget. If
+// `MAX_TEXT_FRAME_BYTES` (mirrored from octos-core) or any budget is ever
+// bumped past these bounds, the build fails loudly rather than letting the
+// producer re-open the `frame_too_large` cliff. Also keeps
+// `MAX_TEXT_FRAME_BYTES` live.
 const _: () = {
     assert!(MAX_FRAME_BUDGET_BYTES < MAX_TEXT_FRAME_BYTES);
-    assert!(FOOTER_BUDGET_BYTES < MAX_FRAME_BUDGET_BYTES);
-    // Even the worst case — body bounded at budget + a full footer budget —
-    // stays under the frame cap with room left for the RPC envelope.
+    assert!(FOOTER_BUDGET_BYTES + MARKER_RESERVE_BYTES < MAX_FRAME_BUDGET_BYTES);
+    // THE end-to-end invariant. Worst case across the whole producer output:
+    //   serialized(marked_body) + serialized(bounded_footer)
+    // The body's escaped length is bounded to (BODY_BUDGET - MARKER_RESERVE)
+    // and the marker's escaped length is bounded to MARKER_RESERVE, so the
+    // marked body is <= BODY_BUDGET = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET.
+    // The footer's escaped length is bounded to FOOTER_BUDGET. Their sum is
+    // therefore <= MAX_FRAME_BUDGET_BYTES, hence strictly < the frame cap.
     assert!(MAX_FRAME_BUDGET_BYTES + FOOTER_BUDGET_BYTES < MAX_TEXT_FRAME_BYTES);
 };
+
+/// The serialized budget the bounded result BODY (its JSON-escaped length,
+/// AFTER its truncation marker is appended) is held under. Reserves room for
+/// both the per-node footer and the body-truncation marker so that the final
+/// `serialized(marked_body) + serialized(footer) <= MAX_FRAME_BUDGET_BYTES`.
+const BODY_BUDGET_BYTES: usize = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
 
 /// Per-byte JSON-escaped length of a UTF-8 string body, EXCLUDING the
 /// surrounding quotes. Matches `serde_json`'s default string serialization:
@@ -276,13 +302,22 @@ pub fn compute_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> 
         };
     }
 
-    let body_budget = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
+    // Reserve room for BOTH the per-node footer AND the body-truncation marker
+    // that `with_marker` appends after this head. Bounding the head to
+    // (BODY_BUDGET - MARKER_RESERVE) guarantees serialized(head + marker) <=
+    // BODY_BUDGET = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET, so the marked body
+    // alone never eats into the footer's reservation. NOTE: the marker reserve
+    // only applies on the TRUNCATED path (an untruncated body carries no
+    // marker), so the fast path below still uses the full BODY_BUDGET.
+    let body_budget = BODY_BUDGET_BYTES;
+    let head_budget = body_budget - MARKER_RESERVE_BYTES;
 
     // Fast path: a small body (raw under the legacy ceiling) can never escape
     // past the body budget — even at the 6x NUL worst case, 256 KiB * 6 =
     // 1.5 MiB, which CAN exceed the 480 KiB body budget. So we cannot skip on
     // raw length alone for pathological content; only skip when the escaped
-    // length is genuinely within budget.
+    // length is genuinely within budget. An untruncated body carries no
+    // marker, so it may use the full body budget (no marker reserve).
     if json_escaped_len(output) <= body_budget {
         return ResultCeiling {
             output: output.to_string(),
@@ -305,7 +340,10 @@ pub fn compute_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> 
         let mid = lo + (hi - lo) / 2;
         // Probe on the RAW byte prefix (may be mid-scalar); escaped length is
         // per-byte so this is exact, and we snap to a boundary afterwards.
-        if json_escaped_len_bytes(&bytes[..mid]) <= body_budget {
+        // Bound against the HEAD budget (body budget minus the marker reserve)
+        // so the marker `with_marker` appends keeps serialized(head + marker)
+        // within the body budget.
+        if json_escaped_len_bytes(&bytes[..mid]) <= head_budget {
             lo = mid;
         } else {
             hi = mid;
@@ -333,6 +371,87 @@ pub fn compute_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> 
 /// that know the synthetic report filename so the marker can point at it.
 pub fn apply_result_ceiling(output: &str, declared: Option<&FidelityMode>) -> String {
     compute_result_ceiling(output, declared).with_marker(None)
+}
+
+/// Blocker (footer) — assemble the per-node execution-summary footer that
+/// `tool.rs` appends AFTER the bounded body, and BOUND its JSON-serialized
+/// length to its reserved [`FOOTER_BUDGET_BYTES`].
+///
+/// The footer is the unbounded tail that closed the `frame_too_large` cliff:
+/// it iterated ALL `node_summaries` (each line embeds an arbitrary-length
+/// `node_id`/`model`), so a many-node pipeline (or one with very long node
+/// IDs/models) could append far more than the reserved 32 KiB and push the
+/// serialized total past the 1 MiB frame cap even though the BODY was capped.
+///
+/// `node_lines` are the already-formatted `- <id> (<model>): <ms>ms, …` lines.
+/// This keeps the formatting (model-default substitution etc.) at the call
+/// site and lets this helper focus purely on the serialized-size bound. The
+/// returned string is the COMPLETE footer (leading scaffold, the kept node
+/// lines, an `[+N more nodes omitted]` marker when truncated, and the trailing
+/// `Total:` line), whose `json_escaped_len` is guaranteed `<=
+/// FOOTER_BUDGET_BYTES`.
+///
+/// Truncation policy: keep the HEAD node lines (earliest = the entry/most
+/// load-bearing nodes) that fit, then append a single
+/// `… [+N more nodes omitted]` marker. Nodes are NEVER silently dropped — the
+/// marker always names how many were elided. The scaffold + total line + the
+/// (bounded) marker are always preserved verbatim; only the variable node
+/// lines are elided.
+pub fn bound_footer(node_lines: &[String], total_line: &str) -> String {
+    const HEADER: &str = "\n\n---\nPipeline execution summary:\n";
+
+    // Build the footer with at most `keep` node lines and an omitted-marker
+    // for the rest. Returns the assembled footer string.
+    let assemble = |keep: usize| -> String {
+        let n = node_lines.len();
+        let mut body = String::with_capacity(HEADER.len() + total_line.len() + 64);
+        body.push_str(HEADER);
+        for (i, line) in node_lines.iter().take(keep).enumerate() {
+            if i > 0 {
+                body.push('\n');
+            }
+            body.push_str(line);
+        }
+        if keep < n {
+            // A short, bounded marker naming the elided count. Placed after the
+            // kept head lines so the most useful (earliest) nodes survive.
+            if keep > 0 {
+                body.push('\n');
+            }
+            body.push_str(&format!("... [+{} more nodes omitted]", n - keep));
+        }
+        body.push('\n');
+        body.push_str(total_line);
+        body
+    };
+
+    // Fast path: the full footer already fits its serialized reservation.
+    let full = assemble(node_lines.len());
+    if json_escaped_len(&full) <= FOOTER_BUDGET_BYTES {
+        return full;
+    }
+
+    // Over budget: binary-search the largest number of HEAD node lines whose
+    // assembled footer (incl. the omitted-marker + scaffold + total line) still
+    // fits FOOTER_BUDGET_BYTES. `assemble` is monotonic non-decreasing in
+    // `keep` (adding a node line never shrinks the footer: the per-line bytes
+    // dominate the constant-width count marker), so binary search converges in
+    // O(log n) — the suite must stay fast.
+    let mut lo = 0usize; // known to FIT
+    let mut hi = node_lines.len(); // known NOT to fit (the full set is over)
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if json_escaped_len(&assemble(mid)) <= FOOTER_BUDGET_BYTES {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // `lo` keeps as many head lines as fit. Even `keep = 0` (scaffold + total
+    // line + marker only) is guaranteed under budget because FOOTER_BUDGET is
+    // 32 KiB and the scaffold/total are tiny; the const drift-guard keeps that
+    // headroom honest.
+    assemble(lo)
 }
 
 #[cfg(test)]
@@ -655,5 +774,163 @@ mod tests {
         let big = "z".repeat(MAX_FRAME_BUDGET_BYTES + 10_000);
         let c = compute_result_ceiling(&big, Some(&FidelityMode::Truncate { max_chars: 50 }));
         assert!(c.output.len() < 200, "explicit truncate:50 must win");
+    }
+
+    // ---- Footer-bound blocker: per-node summary footer must fit its 32 KiB
+    //      SERIALIZED reservation, with an omitted-nodes marker ----
+
+    /// Helper mirroring the per-node line formatting tool.rs uses.
+    fn node_line(id: &str, model: &str, ms: u64, tin: u64, tout: u64) -> String {
+        format!("- {id} ({model}): {ms}ms, {tin}+{tout} tokens")
+    }
+
+    /// A small / few-node footer is returned UNCHANGED (no false truncation,
+    /// no spurious omitted-marker).
+    #[test]
+    fn should_leave_small_footer_unchanged() {
+        let lines = vec![
+            node_line("plan", "gpt-4", 100, 10, 20),
+            node_line("write", "claude", 200, 30, 40),
+        ];
+        let total = "Total: 40 input + 60 output tokens";
+        let footer = bound_footer(&lines, total);
+        assert!(footer.contains("- plan (gpt-4): 100ms, 10+20 tokens"));
+        assert!(footer.contains("- write (claude): 200ms, 30+40 tokens"));
+        assert!(footer.contains(total));
+        assert!(
+            !footer.contains("more nodes omitted"),
+            "few-node footer must NOT carry an omitted marker"
+        );
+        assert!(json_escaped_len(&footer) <= FOOTER_BUDGET_BYTES);
+    }
+
+    /// THE footer-bound invariant. A pipeline with THOUSANDS of node summaries
+    /// AND very long node-id/model strings builds a footer that — unbounded —
+    /// far exceeds its 32 KiB reservation. After the fix the footer's
+    /// SERIALIZED length is `<= FOOTER_BUDGET_BYTES`, the HEAD node lines are
+    /// kept, and an `[+N more nodes omitted]` marker names the elided count.
+    #[test]
+    fn should_bound_huge_footer_to_reserved_budget_with_omitted_marker() {
+        // Long ids/models so even a handful of lines are kilobytes, plus a huge
+        // count of them — the worst case the codex re-review flagged.
+        let long_id = "n".repeat(400);
+        let long_model = "m".repeat(400);
+        let lines: Vec<String> = (0..5_000)
+            .map(|i| node_line(&format!("{long_id}{i}"), &long_model, 1234, 100, 200))
+            .collect();
+        let total = "Total: 500000 input + 1000000 output tokens";
+
+        // Precondition: the UNBOUNDED footer is way over the reservation.
+        let unbounded: String = {
+            let mut s = String::from("\n\n---\nPipeline execution summary:\n");
+            s.push_str(&lines.join("\n"));
+            s.push('\n');
+            s.push_str(total);
+            s
+        };
+        assert!(
+            json_escaped_len(&unbounded) > FOOTER_BUDGET_BYTES * 10,
+            "precondition: the unbounded footer must massively overflow"
+        );
+
+        let footer = bound_footer(&lines, total);
+        assert!(
+            json_escaped_len(&footer) <= FOOTER_BUDGET_BYTES,
+            "bounded footer serialized len must fit its reservation, got {}",
+            json_escaped_len(&footer)
+        );
+        assert!(
+            footer.contains("more nodes omitted"),
+            "must carry an omitted-nodes marker; never silently drop"
+        );
+        // The kept head must be the EARLIEST nodes (node 0 survives).
+        assert!(
+            footer.contains(&format!("{long_id}0 ")),
+            "earliest node must be kept in the head"
+        );
+        // The scaffold + total line are always preserved.
+        assert!(footer.starts_with("\n\n---\nPipeline execution summary:\n"));
+        assert!(footer.contains(total));
+    }
+
+    /// THE end-to-end frame invariant. Worst case across the WHOLE producer
+    /// output: an over-ceiling all-NUL body (escapes 6x) PLUS a huge many-node
+    /// footer. The final serialized output — `serialized(marked_body) +
+    /// serialized(bounded_footer)` — must stay strictly under the 1 MiB frame
+    /// cap for ANY content AND any number/size of node summaries.
+    #[test]
+    fn should_keep_marked_body_plus_bounded_footer_under_frame_cap() {
+        // Body: 500 KiB of NUL -> ~3 MiB serialized; forced over the ceiling.
+        let body_input = "\0".repeat(500 * 1024);
+        let ceiling = compute_result_ceiling(&body_input, None);
+        assert!(ceiling.truncated);
+        // Marked body, pointing at a realistic synthetic report name.
+        let marked = ceiling.with_marker(Some("run_pipeline_1717400000_12345_0.md"));
+        assert!(
+            json_escaped_len(&marked) <= MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES,
+            "serialized(marked body) must fit the body budget (incl. marker reserve), got {}",
+            json_escaped_len(&marked)
+        );
+
+        // Footer: thousands of long-id node lines -> unbounded would be MiBs.
+        let long_id = "z".repeat(300);
+        let lines: Vec<String> = (0..4_000)
+            .map(|i| {
+                node_line(
+                    &format!("{long_id}{i}"),
+                    "some-very-long-model-name",
+                    9999,
+                    1,
+                    2,
+                )
+            })
+            .collect();
+        let footer = bound_footer(&lines, "Total: 1 input + 2 output tokens");
+
+        let total_serialized = json_escaped_len(&marked) + json_escaped_len(&footer);
+        assert!(
+            total_serialized <= MAX_FRAME_BUDGET_BYTES,
+            "marked body + bounded footer must fit the frame budget, got {total_serialized}"
+        );
+        assert!(
+            total_serialized < 1024 * 1024,
+            "marked body + bounded footer must be provably < 1 MiB frame cap, got {total_serialized}"
+        );
+    }
+
+    /// Body-marker accounting: an over-ceiling body's marked form (body +
+    /// truncation marker) must be `<= MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET`
+    /// — i.e. the marker is reserved, not appended OVER the body budget.
+    #[test]
+    fn should_account_for_body_marker_in_body_budget() {
+        let input = "a".repeat(MAX_FRAME_BUDGET_BYTES + 100_000);
+        let ceiling = compute_result_ceiling(&input, None);
+        assert!(ceiling.truncated);
+        // The longest realistic marker form names a report file.
+        let marked = ceiling.with_marker(Some(
+            "run_pipeline_9999999999_4294967295_18446744073709551615.md",
+        ));
+        let body_budget = MAX_FRAME_BUDGET_BYTES - FOOTER_BUDGET_BYTES;
+        assert!(
+            json_escaped_len(&marked) <= body_budget,
+            "serialized(body+marker) must stay within the body budget, got {} > {}",
+            json_escaped_len(&marked),
+            body_budget
+        );
+    }
+
+    /// `bound_footer` keeps the entire scaffold + total line even when EVERY
+    /// node line must be elided (an extreme overflow of one absurdly long
+    /// node id), and still fits the reservation.
+    #[test]
+    fn should_keep_scaffold_and_total_when_all_node_lines_elided() {
+        // A single node line larger than the whole footer budget.
+        let giant = node_line(&"q".repeat(FOOTER_BUDGET_BYTES * 2), "model", 1, 1, 1);
+        let total = "Total: 1 input + 1 output tokens";
+        let footer = bound_footer(&[giant], total);
+        assert!(json_escaped_len(&footer) <= FOOTER_BUDGET_BYTES);
+        assert!(footer.contains("[+1 more nodes omitted]"));
+        assert!(footer.contains(total));
+        assert!(footer.starts_with("\n\n---\nPipeline execution summary:\n"));
     }
 }
