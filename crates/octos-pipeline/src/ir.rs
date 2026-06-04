@@ -63,8 +63,16 @@ pub enum IrNodeKind {
     },
     /// Pure transform over prior output, cheap model.
     Transform { prompt: String },
-    /// Final synthesis, strong model.
+    /// Final synthesis (read-only), strong model. Returns its result as text;
+    /// use `Report` to also SAVE an artifact.
     Synthesize {
+        prompt: String,
+        #[serde(default)]
+        max_output_tokens: Option<u32>,
+    },
+    /// Final report: synthesize AND save an artifact via `write_file`, strong
+    /// model. The terminal "produce + persist a report/deck/file" step.
+    Report {
         prompt: String,
         #[serde(default)]
         max_output_tokens: Option<u32>,
@@ -73,6 +81,11 @@ pub enum IrNodeKind {
     Gate {},
     /// Dynamic fan-out: plan N worker tasks, run them in parallel, converge.
     Fanout {
+        /// Planner instruction — how to break the query into parallel worker
+        /// tasks. Optional; when omitted the executor uses a generic
+        /// research-angle planner.
+        #[serde(default)]
+        plan_prompt: Option<String>,
         worker_prompt: String,
         converge: String,
         #[serde(default)]
@@ -130,6 +143,15 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
             allowed_tools: &["read_file"],
             model: Some("strong"),
         },
+        // Final report: produces AND SAVES an artifact (`write_file`). Distinct
+        // from `Synthesize` because `CodergenHandler` treats any `write_file`
+        // node as a final-report writer (save full report, return a concise
+        // summary) — so intermediate analysis stays a read-only `Synthesize`.
+        IrNodeKind::Report { .. } => PaletteContract {
+            handler: HandlerKind::Codergen,
+            allowed_tools: &["read_file", "write_file"],
+            model: Some("strong"),
+        },
         IrNodeKind::Gate {} => PaletteContract {
             handler: HandlerKind::Gate,
             allowed_tools: &[],
@@ -137,7 +159,11 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
         },
         IrNodeKind::Fanout { .. } => PaletteContract {
             handler: HandlerKind::DynamicParallel,
-            allowed_tools: &["read_file"],
+            // Fan-out research workers can search the web + read sources. (The
+            // builtin `web_search`/`web_fetch`; the richer `search` skill is
+            // resolved via discovery when installed, but is not advertised here
+            // so the contract resolves on any profile.)
+            allowed_tools: &["web_search", "web_fetch", "read_file"],
             model: Some("cheap"),
         },
     }
@@ -210,6 +236,10 @@ fn compile_node(n: &IrNode) -> PipelineNode {
         | IrNodeKind::Synthesize {
             prompt,
             max_output_tokens,
+        }
+        | IrNodeKind::Report {
+            prompt,
+            max_output_tokens,
         } => {
             node.prompt = Some(prompt.clone());
             node.max_output_tokens = *max_output_tokens;
@@ -219,10 +249,14 @@ fn compile_node(n: &IrNode) -> PipelineNode {
         }
         IrNodeKind::Gate {} => {}
         IrNodeKind::Fanout {
+            plan_prompt,
             worker_prompt,
             converge,
             max_tasks,
         } => {
+            // `node.prompt` is the dynamic_parallel PLANNER prompt; `None` lets
+            // the executor fall back to its generic research-angle planner.
+            node.prompt = plan_prompt.clone();
             node.worker_prompt = Some(worker_prompt.clone());
             node.converge = Some(converge.clone());
             node.max_tasks = *max_tasks;
@@ -294,6 +328,37 @@ mod tests {
         assert_eq!(r.tools, vec!["web_search", "web_fetch", "read_file"]);
         assert_eq!(r.model.as_deref(), Some("cheap"));
         assert!(!r.tools.is_empty(), "empty tools would mean all builtins");
+    }
+
+    #[test]
+    fn fanout_synthesize_report_contracts() {
+        // Fan-out workers search the web; `synthesize` is read-only analysis;
+        // only `report` may save a file.
+        let json = r#"{"id":"p","nodes":[
+            {"id":"f","kind":{"type":"fanout","plan_prompt":"plan","worker_prompt":"do {task}","converge":"a","max_tasks":4}},
+            {"id":"a","kind":{"type":"synthesize","prompt":"analyze"}},
+            {"id":"r","kind":{"type":"report","prompt":"report"}}
+        ],"edges":[{"source":"f","target":"a"},{"source":"a","target":"r"}]}"#;
+        let g = compile(&parse(json)).unwrap();
+
+        let f = &g.nodes["f"];
+        assert_eq!(f.handler, HandlerKind::DynamicParallel);
+        assert_eq!(f.tools, vec!["web_search", "web_fetch", "read_file"]);
+        assert_eq!(f.prompt.as_deref(), Some("plan"), "plan_prompt threaded");
+        assert_eq!(f.converge.as_deref(), Some("a"));
+
+        // Intermediate synthesis is read-only — must NOT be a file-writer (so the
+        // CodergenHandler doesn't treat it as a final-report node).
+        assert_eq!(g.nodes["a"].tools, vec!["read_file"]);
+
+        // Only the report node saves an artifact.
+        let r = &g.nodes["r"];
+        assert_eq!(r.handler, HandlerKind::Codergen);
+        assert_eq!(r.tools, vec!["read_file", "write_file"]);
+        assert_eq!(r.model.as_deref(), Some("strong"));
+        for n in g.nodes.values() {
+            assert!(!n.tools.iter().any(|t| t == "shell"), "no shell anywhere");
+        }
     }
 
     #[test]

@@ -2679,12 +2679,25 @@ impl PipelineExecutor {
                         .or(graph.default_model.as_deref()),
                 )?;
 
-                // Default planning prompt
-                let planning_prompt = node.prompt.as_deref().unwrap_or(
-                    "Generate 4-6 research search angles for this query. \
-                     Each angle should cover a different aspect.\n\
-                     Respond with ONLY a JSON array of objects with \"task\" and \"label\" fields.",
-                );
+                // Default planning prompt, WITH runtime-variable substitution:
+                // the dynamic_parallel planner reads `node.prompt` directly
+                // (before the sequential node_with_prompt path), so it must get
+                // the same `{var}` substitution sequential nodes + worker
+                // prompts get — else an authored `plan_prompt` like
+                // `Plan for {topic}` reaches the planner as a literal placeholder.
+                let mut planning_prompt = node
+                    .prompt
+                    .as_deref()
+                    .unwrap_or(
+                        "Generate 4-6 research search angles for this query. \
+                         Each angle should cover a different aspect.\n\
+                         Respond with ONLY a JSON array of objects with \"task\" and \"label\" fields.",
+                    )
+                    .to_string();
+                for (k, v) in variables {
+                    planning_prompt =
+                        planning_prompt.replace(&format!("{{{k}}}"), v.as_str().unwrap_or(""));
+                }
 
                 let dp_label = node.label.as_deref().unwrap_or(&node.id);
                 report_progress(&format!("{dp_label}: planning sub-tasks..."));
@@ -2701,7 +2714,7 @@ impl PipelineExecutor {
                 // Plan tasks via LLM (with fallback)
                 let (tasks, plan_usage) = match plan_dynamic_tasks(
                     planner_provider.as_ref(),
-                    planning_prompt,
+                    &planning_prompt,
                     &dp_input,
                     max_tasks,
                 )
