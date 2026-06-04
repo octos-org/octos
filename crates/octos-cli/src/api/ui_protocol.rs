@@ -1126,7 +1126,21 @@ impl ConnectionUiFeatures {
             message_persisted: true,
             spawn_complete: true,
             file_attached: true,
-            projection_envelope: true,
+            // Do NOT auto-enable `projection.envelope.v1` for stdio
+            // connections. Legacy `turn/completed` is the turn-lifecycle
+            // source for clients that do not consume `projection/envelope`
+            // (e.g. the octos TUI over stdio, which clears its turn-active
+            // state — `live_reply`, backing the send-gate — ONLY on legacy
+            // `turn/completed`). The γ-cutover mutual-exclusion gate in
+            // `live_event_passes_capability_filter` DROPS legacy
+            // `turn/completed` whenever `projection_envelope` is true, so
+            // auto-enabling envelopes here suppresses the only lifecycle
+            // signal such clients understand and wedges them (every message
+            // after turn 1 queues "after active turn" forever). A stdio
+            // client that genuinely consumes envelopes can still opt in via
+            // `client_hello` (`from_requested_feature_tokens`), so this is a
+            // default-only change, not a capability removal.
+            projection_envelope: false,
             auxiliary_rest_to_ws_v1: true,
             coding_autonomy_v1: true,
             coding_agent_control_v1: true,
@@ -27703,14 +27717,108 @@ ignore = []
     }
 
     #[test]
-    fn projection_envelope_v1_in_stdio_defaults() {
-        // Stdio mode opts in to every known feature by construction so
-        // `octos serve --stdio` clients see the full v1 surface without
-        // needing to send a feature header.
+    fn projection_envelope_v1_off_in_stdio_defaults() {
+        // `projection.envelope.v1` is NOT auto-enabled for stdio
+        // connections. The γ-cutover mutual-exclusion gate
+        // (`live_event_passes_capability_filter`) drops the legacy
+        // `turn/completed` notification whenever `projection_envelope`
+        // is true. The octos TUI over stdio does NOT consume
+        // `projection/envelope` and clears its turn-active state ONLY on
+        // legacy `turn/completed`; auto-enabling envelopes here would
+        // suppress that lifecycle signal and wedge the client (every
+        // message after turn 1 queues "after active turn" forever). A
+        // stdio client that genuinely consumes envelopes still opts in
+        // via `client_hello` (see
+        // `projection_envelope_client_hello_over_stdio_opt_in_preserved`).
         let features = ConnectionUiFeatures::stdio_defaults();
-        assert!(features.projection_envelope);
+        assert!(!features.projection_envelope);
+        let capabilities = features.negotiated_capabilities();
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+    }
+
+    /// Over a stdio-default connection (`projection_envelope == false`),
+    /// the legacy `turn/completed` notification MUST pass the
+    /// per-connection capability filter — both the broadcast path
+    /// (`live_event_passes_capability_filter`) and the direct-send path
+    /// (`direct_send_passes_capability_filter`). This is the
+    /// turn-lifecycle signal the stdio TUI keys on to clear its
+    /// turn-active state. If it were dropped (as it is when
+    /// `projection_envelope` is true), the TUI wedges after turn 1.
+    #[tokio::test]
+    async fn stdio_default_connection_delivers_legacy_turn_completed() {
+        let session_id = SessionKey("local:stdio-turn-completed".into());
+        let completed = UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        ));
+
+        // Broadcast / live-forwarder path.
+        let features = ConnectionUiFeatures::stdio_defaults();
+        assert!(
+            live_event_passes_capability_filter(&completed, features),
+            "stdio-default connection must receive legacy turn/completed via the broadcast filter"
+        );
+
+        // Direct-send path: a stdio connection snapshots stdio_defaults
+        // into its live-features, so the direct-send gate must also let
+        // turn/completed through.
+        let (tx, _rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures::stdio_defaults());
+        assert!(
+            direct_send_passes_capability_filter(&ws, &completed),
+            "stdio-default connection must receive legacy turn/completed via the direct-send filter"
+        );
+    }
+
+    /// Opt-in preservation: a stdio connection that DOES consume
+    /// envelopes can still negotiate `projection.envelope.v1` via
+    /// `client_hello` (`from_requested_feature_tokens` with the stdio
+    /// transport flag), flipping `projection_envelope` back to true. The
+    /// default change is default-only — it does not remove the ability
+    /// to opt in. When opted in, the γ gate then (correctly) suppresses
+    /// legacy `turn/completed` for that connection in favour of the
+    /// canonical envelope.
+    #[test]
+    fn projection_envelope_client_hello_over_stdio_opt_in_preserved() {
+        let features = ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1],
+            true, // stdio_transport
+        );
+        assert!(
+            features.projection_envelope,
+            "client_hello over stdio must still be able to opt into projection.envelope.v1"
+        );
+        assert!(features.stdio_transport);
         let capabilities = features.negotiated_capabilities();
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+
+        // And once opted in, the γ gate suppresses legacy turn/completed
+        // for that connection (envelope supersedes it) — confirming the
+        // opt-in actually re-engages the mutual-exclusion contract.
+        let session_id = SessionKey("local:stdio-opt-in".into());
+        let completed = UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        ));
+        assert!(
+            !live_event_passes_capability_filter(&completed, features),
+            "an opted-in stdio connection sees the envelope, not legacy turn/completed"
+        );
     }
 
     #[test]
