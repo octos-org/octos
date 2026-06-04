@@ -19035,20 +19035,30 @@ fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
 /// for a pathological frame (one giant non-string scalar, or non-JSON / parse
 /// failure that cannot be rewritten) — we return `None`.
 ///
-/// Returning `None` is safe because every one of the five [`frame_for`] callers
-/// already tolerates `None` by SKIPPING the enqueue (never unwraps/panics):
+/// Returning `None` is safe at every one of the five [`frame_for`] call sites.
+/// NOTIFICATION callers tolerate `None` by SKIPPING the enqueue (never
+/// unwraps/panics) — dropping a notification is fine because no request id is
+/// awaiting a reply:
 ///   * `send_raw_notification_ephemeral` -> `.ok_or(SendError::BackpressureDrop)?`
-///   * `send_rpc_result` -> `.ok_or_else(|| SendError::LifecycleFailure(..))?`
-///   * `send_rpc_error` -> `.ok_or_else(|| SendError::LifecycleFailure(..))?`
-///   * `send_raw_ledger_notification_ephemeral` -> `.ok_or(SendError::BackpressureDrop)?`
+///   * `send_notification_ephemeral` -> `.ok_or(SendError::BackpressureDrop)?`
 ///   * `frame_from_ledger` -> returns the `Option<WsMessage>` directly (caller
 ///     `send_ledger_event_durable` maps `None` -> `Err(SendError::BackpressureDrop)`).
 ///
-/// So a still-over-cap frame is dropped (not sent) and logged, which is strictly
-/// better than emitting a contract-violating over-cap frame: the over-cap frame
-/// would be rejected by the transport's `frame_too_large` guard anyway, so it is
-/// undeliverable either way — `None` just makes that explicit and observable
-/// (no over-cap WsMessage is ever constructed).
+/// REQUEST/RESPONSE callers MUST NOT silently drop on `None` — the request
+/// handlers ignore the returned `Result` (`let _ =`), so a dropped reply would
+/// strand the client on its request id forever. They instead synthesize a
+/// guaranteed-tiny same-id minimal JSON-RPC error reply (see
+/// [`send_minimal_rpc_error_fallback`]):
+///   * `send_rpc_result` -> on `None`, send a minimal same-id error response.
+///   * `send_rpc_error` -> on `None`, send a minimal same-id error (drop the
+///     oversized `error.data` / `error.message`).
+///
+/// So a still-over-cap NOTIFICATION frame is dropped (not sent) and logged,
+/// which is strictly better than emitting a contract-violating over-cap frame:
+/// the over-cap frame would be rejected by the transport's `frame_too_large`
+/// guard anyway, so it is undeliverable either way — `None` just makes that
+/// explicit and observable (no over-cap WsMessage is ever constructed). For an
+/// over-cap RESPONSE the client still receives a same-id error reply.
 fn frame_text_within_cap(text: String) -> Option<String> {
     let previewed = preview_oversized_frame(text);
     if previewed.len() > MAX_TEXT_FRAME_BYTES {
@@ -19455,9 +19465,27 @@ fn walk_for_largest_string(
             // Only consider strings large enough that truncating them yields a
             // net reduction (must exceed the marker reserve + a small head/tail
             // floor, else there is no point), and that we have not already
-            // previewed on a prior pass (idempotence by path).
+            // previewed on a prior pass.
+            //
+            // Idempotence is primarily by PATH (`previewed_paths`). The
+            // secondary guard below — "this string ALREADY carries the exact
+            // full truncation-marker sentinel" — is belt-and-suspenders for the
+            // one case the path set can't track: array shrinking (later in the
+            // outer loop) removes elements, so surviving elements' index-paths
+            // SHIFT and the recorded paths go stale. A re-truncated already-
+            // previewed string can't reopen the over-cap bug (a head+tail
+            // preview is no longer the largest, so it isn't re-selected), but
+            // matching the precise sentinel keeps the "each semantic string
+            // truncated once" invariant clean regardless of index drift. We
+            // match the FULL marker scaffold (`\n…… [<N> bytes truncated] ……\n`),
+            // NOT the bare phrase `bytes truncated`, so a payload that merely
+            // contains that phrase is still truncated (see
+            // `payload_containing_marker_phrase_is_still_truncated`).
             let escaped = json_escaped_len_bytes(s.as_bytes());
-            if escaped > MARKER_ESCAPED_RESERVE_BYTES + 32 && !previewed_paths.contains(path) {
+            if escaped > MARKER_ESCAPED_RESERVE_BYTES + 32
+                && !previewed_paths.contains(path)
+                && !contains_full_truncation_marker(s)
+            {
                 let is_better = match best {
                     Some((_, best_escaped, _)) => escaped > *best_escaped,
                     None => true,
@@ -19483,6 +19511,36 @@ fn walk_for_largest_string(
         }
         _ => {}
     }
+}
+
+/// True iff `s` already contains the EXACT full head+tail truncation-marker
+/// scaffold produced by [`build_head_tail_preview`]:
+/// `\n…… [<N> bytes truncated] ……\n` (N a decimal byte count). Used as a
+/// secondary "already previewed" guard in [`walk_for_largest_string`] that is
+/// robust to array-shrink index drift (path-set staleness).
+///
+/// This matches the COMPLETE scaffold — the leading `\n…… [` prefix and the
+/// `] ……\n` suffix with a parseable decimal between — NOT the bare phrase
+/// `bytes truncated`. A user payload that merely contains the phrase (or even
+/// `[123 bytes truncated]` without the `……` glyph scaffold) is therefore NOT
+/// matched and is still eligible for truncation, preserving the
+/// `payload_containing_marker_phrase_is_still_truncated` guarantee.
+fn contains_full_truncation_marker(s: &str) -> bool {
+    // Anchor on the marker prefix, then verify the suffix scaffold follows with
+    // only decimal digits in between (the `<N> bytes truncated` slot).
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find("\n…… [") {
+        let after_prefix = search_from + rel + "\n…… [".len();
+        if let Some(suffix_rel) = s[after_prefix..].find(" bytes truncated] ……\n") {
+            let digits = &s[after_prefix..after_prefix + suffix_rel];
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+        // Advance past this prefix occurrence and keep scanning.
+        search_from = after_prefix;
+    }
+    false
 }
 
 /// Resolve a path to a `&Value` (for reading the current field text).
@@ -19834,10 +19892,43 @@ async fn stop_failover_forwarder(handle: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// Short STATIC message used for the minimal same-id error reply emitted when a
+/// request RESPONSE (result or error) is too large to deliver even after the
+/// oversized-frame preview pass. It carries NO echoed payload — only enough for
+/// the client to fail the awaiting request id cleanly.
+const RPC_RESPONSE_TOO_LARGE_MESSAGE: &str = "response payload too large to deliver";
+
+/// Build a MINIMAL JSON-RPC error response frame for `id` carrying only a short
+/// static `message` (code `INTERNAL_ERROR` / -32603, NO `data`). It is
+/// tiny by construction, so [`frame_for`] returns `Some` for every realistic
+/// `id`. Returns `None` ONLY if even this minimal frame is over cap — which can
+/// happen only when the request `id` itself is pathologically huge (practically
+/// unreachable; ids are short client-chosen tokens). Callers treat that residual
+/// `None` as the absolute last resort (latch the connection failed / close).
+fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<WsMessage> {
+    let error = RpcError::new(
+        octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR,
+        message,
+    );
+    frame_for(&RpcErrorResponse::new(id, error))
+}
+
+/// Send a JSON-RPC RESPONSE that, when over-cap and un-truncatable, falls back to
+/// a minimal same-id error instead of stranding the client request.
+///
+/// DO-NOT-SHIP fix: `frame_for` returns `None` when the primary frame is still
+/// over [`MAX_TEXT_FRAME_BYTES`] after the oversized-frame preview pass
+/// (pathological / structural). For a request RESPONSE the request handlers
+/// IGNORE the returned `Result` (the call sites `let _ =` it), so a silent
+/// `None` would leave the client waiting forever on its request id with NO reply
+/// and NO connection close. Instead we synthesize a guaranteed-tiny same-id
+/// JSON-RPC error reply (no echoed large payload) and send THAT, so the client
+/// always gets a reply to its id. The over-cap `result` is NOT echoed.
 fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
-    let frame = frame_for(&RpcResponse::success(id, result))
-        .ok_or_else(|| SendError::LifecycleFailure("rpc result serialization".into()))?;
-    ws.send_lifecycle(frame)
+    match frame_for(&RpcResponse::success(id.clone(), result)) {
+        Some(frame) => ws.send_lifecycle(frame),
+        None => send_minimal_rpc_error_fallback(ws, Some(id)),
+    }
 }
 
 fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Result<(), SendError> {
@@ -19847,10 +19938,53 @@ fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Res
     send_rpc_result(ws, id, value)
 }
 
+/// Send a JSON-RPC ERROR response, falling back to a minimal same-id error when
+/// the (possibly large) error payload is itself over-cap and un-deliverable.
+///
+/// DO-NOT-SHIP fix: same rationale as [`send_rpc_result`]. If `error.data` /
+/// `error.message` is so large that `frame_for` returns `None`, we drop the
+/// oversized data and emit a minimal same-id error with a short static message,
+/// so the client still gets a reply to its id rather than waiting forever.
 fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
-    let frame = frame_for(&RpcErrorResponse::new(id, error))
-        .ok_or_else(|| SendError::LifecycleFailure("rpc error serialization".into()))?;
-    ws.send_lifecycle(frame)
+    match frame_for(&RpcErrorResponse::new(id.clone(), error)) {
+        Some(frame) => ws.send_lifecycle(frame),
+        None => send_minimal_rpc_error_fallback(ws, id),
+    }
+}
+
+/// Emit the minimal same-id error reply for an over-cap RPC RESPONSE. Distinct
+/// counter + warn (vs. the notification-drop `over_cap_dropped` path) so the
+/// minimized-RPC path is observable. Absolute last resort: if even the minimal
+/// same-id error frame is over cap (only reachable when the request `id` is
+/// pathologically huge — practically unreachable), latch the connection failed
+/// and surface `LifecycleFailure` so the read loop tears down (rather than
+/// looping or panicking).
+fn send_minimal_rpc_error_fallback(ws: &WsConnection, id: Option<String>) -> Result<(), SendError> {
+    metrics::counter!("ws.send.rpc.over_cap_minimized").increment(1);
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        has_id = id.is_some(),
+        "rpc response over cap after preview; replacing with minimal same-id error reply"
+    );
+    match minimal_rpc_error_frame(id, RPC_RESPONSE_TOO_LARGE_MESSAGE) {
+        Some(frame) => ws.send_lifecycle(frame),
+        None => {
+            // Unreachable in practice: the only way a minimal error envelope
+            // (jsonrpc + short static message + id) exceeds the cap is a
+            // pathologically huge request `id`. Latch the connection failed and
+            // close it — do NOT loop or panic.
+            metrics::counter!("ws.send.rpc.minimal_error_over_cap").increment(1);
+            tracing::error!(
+                target: "octos::ui_protocol::ws",
+                "minimal rpc error frame itself over cap (huge request id?); closing connection"
+            );
+            ws.mark_failed();
+            let _ = close_ws_with_code(ws, 1011, "rpc_response_undeliverable");
+            Err(SendError::LifecycleFailure(
+                "minimal rpc error frame over cap".into(),
+            ))
+        }
+    }
 }
 
 /// Push a WebSocket close frame with an explicit status code and reason. The
@@ -36534,6 +36668,37 @@ ignore = []
     }
 
     #[test]
+    fn full_truncation_marker_matcher_is_precise_not_phrase_sniffing() {
+        // Positive: the exact scaffold produced by build_head_tail_preview.
+        let real = build_head_tail_preview(&"x".repeat(4096), 4096, 1024)
+            .expect("preview builds for a generous budget");
+        assert!(
+            contains_full_truncation_marker(&real),
+            "the genuine head+tail marker scaffold must match"
+        );
+        // Hand-built genuine marker (embedded in surrounding content).
+        assert!(contains_full_truncation_marker(
+            "head\n…… [12345 bytes truncated] ……\ntail"
+        ));
+
+        // Negative: the BARE phrase must NOT match (this is the over-broad-sniff
+        // nit the matcher must avoid reintroducing).
+        assert!(!contains_full_truncation_marker(
+            "see notes: 999 bytes truncated"
+        ));
+        // Negative: brackets + phrase but WITHOUT the `……` glyph scaffold.
+        assert!(!contains_full_truncation_marker("[123 bytes truncated]"));
+        // Negative: scaffold present but the count slot is non-numeric.
+        assert!(!contains_full_truncation_marker(
+            "head\n…… [lots bytes truncated] ……\ntail"
+        ));
+        // Negative: scaffold prefix but no closing suffix.
+        assert!(!contains_full_truncation_marker(
+            "head\n…… [12345 and then nothing"
+        ));
+    }
+
+    #[test]
     fn payload_containing_marker_phrase_is_still_truncated() {
         // A single >1 MiB string field whose content INCLUDES the literal
         // phrase `bytes truncated` must STILL be head+tail truncated, not
@@ -36561,6 +36726,166 @@ ignore = []
         assert!(
             text.contains("bytes truncated"),
             "truncation marker present"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // DO-NOT-SHIP: a pathological over-cap RPC RESPONSE must NEVER strand
+    // the client request. When the primary frame for a request reply
+    // cannot fit (frame_for -> None), the helpers must emit a MINIMAL
+    // same-id JSON-RPC error reply (guaranteed tiny / under cap) so the
+    // client always gets a reply to its id — never a silent drop.
+    // ------------------------------------------------------------------
+
+    /// Drain every queued text frame from the test writer receiver.
+    fn drain_text_frames(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let WsMessage::Text(text) = message {
+                frames.push(text.to_string());
+            }
+        }
+        frames
+    }
+
+    /// An over-cap JSON `Value` the preview pass CANNOT shrink: a single object
+    /// with enough tiny distinct keys to blow past the cap. The preview only
+    /// truncates string VALUES and shrinks ARRAYS — it never drops or shortens
+    /// object keys — so this is the canonical `frame_for -> None` (pathological /
+    /// structural) trigger. Keys are short non-string-value pairs (`{"k<i>":0}`).
+    fn untruncatable_over_cap_value() -> Value {
+        let mut map = serde_json::Map::new();
+        // ~250k keys of ~8 bytes each comfortably exceeds 1 MiB and is immune to
+        // both the string-truncation and array-shrink passes.
+        for i in 0..250_000u32 {
+            map.insert(format!("k{i}"), Value::from(0u8));
+        }
+        Value::Object(map)
+    }
+
+    #[tokio::test]
+    async fn over_cap_rpc_result_sends_minimal_same_id_error_not_dropped() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        let id = "req-42".to_string();
+        // A result that, once wrapped in the response envelope, exceeds the cap
+        // and whose content the preview pass cannot reduce below cap (an object
+        // with hundreds of thousands of tiny keys — neither string truncation
+        // nor array shrinking applies). Pre-fix: frame_for -> None -> the result
+        // is silently dropped and the caller's `let _ =` discards the
+        // LifecycleFailure, stranding request id `req-42` forever (RED).
+        let result = untruncatable_over_cap_value();
+        // Guard: the un-rewritable result really is over cap as a response.
+        assert!(
+            frame_for(&RpcResponse::success(id.clone(), result.clone())).is_none(),
+            "fixture must drive frame_for -> None (still over cap after preview)"
+        );
+
+        let sent = send_rpc_result(&ws, id.clone(), result);
+        assert!(
+            sent.is_ok(),
+            "send_rpc_result must succeed by delivering a minimal same-id error, not fail/drop"
+        );
+
+        let frames = drain_text_frames(&mut rx);
+        assert_eq!(frames.len(), 1, "exactly one reply frame must be sent");
+        let frame = &frames[0];
+        assert!(
+            frame.len() <= MAX_TEXT_FRAME_BYTES,
+            "the minimal reply must be under cap, got {}",
+            frame.len()
+        );
+        let parsed: Value = serde_json::from_str(frame).expect("reply is valid JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], id, "reply must carry the SAME request id");
+        assert!(
+            parsed["error"].is_object(),
+            "reply must be a JSON-RPC error response (not a result), got: {parsed}"
+        );
+        assert_eq!(
+            parsed["error"]["code"],
+            octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+        );
+        assert!(
+            parsed["error"]["message"].is_string(),
+            "minimal error carries a short static message"
+        );
+        assert!(
+            parsed["result"].is_null(),
+            "the oversized result must NOT be echoed"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_cap_rpc_error_sends_minimal_same_id_error() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let id = "err-7".to_string();
+        // An error whose `data` payload is itself over cap and un-deliverable
+        // (preview-immune object of tiny keys).
+        let error =
+            RpcError::internal_error("original detail").with_data(untruncatable_over_cap_value());
+        assert!(
+            frame_for(&RpcErrorResponse::new(Some(id.clone()), error.clone())).is_none(),
+            "fixture must drive frame_for -> None (error payload still over cap)"
+        );
+
+        let sent = send_rpc_error(&ws, Some(id.clone()), error);
+        assert!(
+            sent.is_ok(),
+            "send_rpc_error must succeed by delivering a minimal same-id error, not fail/drop"
+        );
+
+        let frames = drain_text_frames(&mut rx);
+        assert_eq!(frames.len(), 1, "exactly one reply frame must be sent");
+        let frame = &frames[0];
+        assert!(
+            frame.len() <= MAX_TEXT_FRAME_BYTES,
+            "the minimal error reply must be under cap, got {}",
+            frame.len()
+        );
+        let parsed: Value = serde_json::from_str(frame).expect("reply is valid JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], id, "reply must carry the SAME request id");
+        assert!(parsed["error"].is_object(), "reply is a JSON-RPC error");
+        assert!(
+            parsed["error"]["message"].is_string(),
+            "minimal error carries a short static message"
+        );
+        assert!(
+            parsed["error"]["data"].is_null(),
+            "the oversized error.data must be dropped from the minimal reply"
+        );
+    }
+
+    #[test]
+    fn minimal_rpc_error_frame_is_tiny_valid_and_same_id() {
+        let id = "the-request-id".to_string();
+        let frame =
+            minimal_rpc_error_frame(Some(id.clone()), "response payload too large to deliver")
+                .expect("minimal error frame must be constructible for a small id");
+        let WsMessage::Text(text) = frame else {
+            panic!("minimal error frame must be a text frame");
+        };
+        let text = text.to_string();
+        assert!(
+            text.len() <= MAX_TEXT_FRAME_BYTES,
+            "minimal error frame must be under cap, got {}",
+            text.len()
+        );
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], id);
+        assert_eq!(
+            parsed["error"]["code"],
+            octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+        );
+        assert_eq!(
+            parsed["error"]["message"],
+            "response payload too large to deliver"
+        );
+        assert!(
+            parsed["error"]["data"].is_null(),
+            "minimal error carries no data"
         );
     }
 }
