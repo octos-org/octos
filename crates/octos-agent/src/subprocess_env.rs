@@ -5,10 +5,52 @@
 //! inherit those raw secrets unless the tool explicitly allowlists them.
 
 use std::collections::HashSet;
+use std::sync::{LazyLock, RwLock};
 
 use tokio::process::Command;
 
 use crate::sandbox::BLOCKED_ENV_VARS;
+
+/// Exact env-var names known to hold a configured LLM provider API key.
+/// Populated at provider build time via [`register_secret_env_names`].
+///
+/// These are treated exactly like heuristic secrets ([`is_secret_env_name`]):
+/// stripped from the default subprocess environment, but still forwardable to a
+/// tool that explicitly allowlists them — the sanctioned path for skills that
+/// call LLMs (see `build_plugin_env`). The registry closes the gap where the
+/// NAME heuristic misses a custom `api_key_env` that doesn't look secret (e.g.
+/// `ANTHROPIC_CREDS`), so it can't be `echo`'d from the empty-allowlist shell
+/// tool / hooks / validators.
+static REGISTERED_SECRET_ENV: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Register env-var names (e.g. the resolved LLM `api_key_env`) that must
+/// always be stripped from subprocess environments. Idempotent; names are
+/// normalized (ASCII-uppercased). Safe to call repeatedly from provider
+/// construction.
+pub fn register_secret_env_names<I, S>(names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut set = REGISTERED_SECRET_ENV
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for name in names {
+        let normalized = normalize_env_name(name.as_ref());
+        if !normalized.is_empty() {
+            set.insert(normalized);
+        }
+    }
+}
+
+fn is_registered_secret_env_name(name: &str) -> bool {
+    let normalized = normalize_env_name(name);
+    REGISTERED_SECRET_ENV
+        .read()
+        .map(|set| set.contains(&normalized))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EnvAllowlist {
@@ -190,7 +232,10 @@ pub(crate) fn should_forward_env_name(name: &str, allowlist: &EnvAllowlist) -> b
     if is_injection_env_name(name) {
         return false;
     }
-    !is_secret_env_name(name) || allowlist.contains(name)
+    // Registered provider-key vars are treated like heuristic secrets: stripped
+    // by default, but still allowlistable (skills that call LLMs declare them).
+    let is_secret = is_secret_env_name(name) || is_registered_secret_env_name(name);
+    !is_secret || allowlist.contains(name)
 }
 
 pub(crate) fn sanitize_command_env(cmd: &mut Command, allowlist: &EnvAllowlist) {
@@ -247,6 +292,36 @@ mod tests {
         ] {
             assert!(!is_secret_env_name(name), "{name} should not be secret");
         }
+    }
+
+    #[test]
+    fn registered_secret_env_is_stripped_by_default_but_allowlistable() {
+        // A custom `api_key_env` whose NAME the heuristic does NOT flag.
+        let odd = "ZZ_PROVIDER_CREDS_FIXTURE";
+        assert!(
+            !is_secret_env_name(odd),
+            "fixture must be a name the heuristic does not flag"
+        );
+        // Before registration it would be forwarded (not secret-looking) — this
+        // is the gap: the shell tool could echo it.
+        assert!(should_forward_env_name(odd, &EnvAllowlist::empty()));
+
+        register_secret_env_names([odd]);
+
+        // After registration it is treated as a secret: stripped from the
+        // default (empty-allowlist) environment, so shell/hooks/validators
+        // can't echo it...
+        assert!(!should_forward_env_name(odd, &EnvAllowlist::empty()));
+        // (case-insensitive)
+        assert!(!should_forward_env_name(
+            "zz_provider_creds_fixture",
+            &EnvAllowlist::empty()
+        ));
+        // ...but a tool that declares it in its manifest allowlist may still
+        // receive it (the sanctioned path for skills that call LLMs).
+        let allowlisted = EnvAllowlist::from_names([odd]);
+        assert!(should_forward_env_name(odd, &allowlisted));
+        assert!(should_forward_env_name_strict(odd, &allowlisted));
     }
 
     #[test]

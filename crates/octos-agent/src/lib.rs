@@ -47,6 +47,7 @@ pub mod steering;
 pub mod subagent_output;
 pub mod subagent_summary;
 mod subprocess_env;
+pub use subprocess_env::register_secret_env_names;
 pub mod summarizer;
 pub mod task_supervisor;
 pub mod tools;
@@ -78,6 +79,10 @@ pub use agent::{
     realtime::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
+    },
+    verifier::{
+        AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
+        VerifierVerdict,
     },
 };
 pub use compaction_tiered::{

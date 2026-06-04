@@ -22,10 +22,10 @@ use octos_agent::tools::{
     ReadTaskOutputTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, CompactionSummarizerKind, HookContext, HookExecutor, HookPayload,
-    HookResult, LoopRetryState, PromptContextManager, PromptContextPhase, PromptContextReport,
-    PromptContextRequest, TaskSupervisor, TokenTracker, TurnAttachmentContext, WorkspacePolicy,
-    read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    Agent, AgentConfig, AgentVerifierConfig, CompactionSummarizerKind, HookContext, HookExecutor,
+    HookPayload, HookResult, LoopRetryState, PromptContextManager, PromptContextPhase,
+    PromptContextReport, PromptContextRequest, TaskSupervisor, TokenTracker, TurnAttachmentContext,
+    WorkspacePolicy, read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -174,6 +174,22 @@ fn retry_state_sidecar_path(
     data_dir: &std::path::Path,
     session_key: &SessionKey,
 ) -> std::path::PathBuf {
+    hashed_session_sidecar_path(data_dir, session_key, "retry_state", "json")
+}
+
+fn turn_ledger_sidecar_path(
+    data_dir: &std::path::Path,
+    session_key: &SessionKey,
+) -> std::path::PathBuf {
+    hashed_session_sidecar_path(data_dir, session_key, "turn_ledger", "jsonl")
+}
+
+fn hashed_session_sidecar_path(
+    data_dir: &std::path::Path,
+    session_key: &SessionKey,
+    prefix: &str,
+    extension: &str,
+) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(session_key.0.as_bytes());
@@ -187,7 +203,15 @@ fn retry_state_sidecar_path(
     let short = &hex[..16];
     data_dir
         .join("sessions")
-        .join(format!("retry_state_{short}.json"))
+        .join(format!("{prefix}_{short}.{extension}"))
+}
+
+fn verifier_flag_enabled() -> bool {
+    verifier_flag_value_enabled(std::env::var("OCTOS_AGENT_VERIFIER").ok().as_deref())
+}
+
+fn verifier_flag_value_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "on" | "ON"))
 }
 
 /// Review A F-015: read a session's persistent `LoopRetryState` from disk.
@@ -3477,6 +3501,15 @@ impl ActorFactory {
         let retry_state_initial = load_retry_state(&retry_state_path);
         let persistent_retry_state = Arc::new(StdMutex::new(retry_state_initial));
         agent = agent.with_persistent_retry_state(persistent_retry_state.clone());
+
+        if verifier_flag_enabled() {
+            let model_label = std::env::var("OCTOS_AGENT_VERIFIER_MODEL")
+                .unwrap_or_else(|_| "session-cheap-verifier".to_string());
+            agent = agent.with_verifier_config(
+                AgentVerifierConfig::with_provider(self.llm_for_compaction.clone(), model_label)
+                    .with_ledger_path(turn_ledger_sidecar_path(&self.data_dir, &session_key)),
+            );
+        }
 
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
@@ -8681,6 +8714,35 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn verifier_flag_parser_is_default_off_and_accepts_explicit_on_values() {
+        assert!(!verifier_flag_value_enabled(None));
+        assert!(!verifier_flag_value_enabled(Some("false")));
+        assert!(!verifier_flag_value_enabled(Some("0")));
+        assert!(verifier_flag_value_enabled(Some("1")));
+        assert!(verifier_flag_value_enabled(Some("true")));
+        assert!(verifier_flag_value_enabled(Some("TRUE")));
+        assert!(verifier_flag_value_enabled(Some("on")));
+        assert!(verifier_flag_value_enabled(Some("ON")));
+    }
+
+    #[test]
+    fn turn_ledger_sidecar_uses_session_hash_jsonl_name() {
+        let session_key = SessionKey::new("api", "verifier-sidecar-test");
+        let path = turn_ledger_sidecar_path(std::path::Path::new("/tmp/octos"), &session_key);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("sidecar path has file name");
+
+        assert!(
+            path.parent()
+                .is_some_and(|parent| parent.ends_with("sessions"))
+        );
+        assert!(file_name.starts_with("turn_ledger_"));
+        assert!(file_name.ends_with(".jsonl"));
     }
 
     /// #1020 / M17-B — the production session-actor delegate factory

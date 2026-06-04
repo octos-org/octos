@@ -151,6 +151,18 @@ pub struct PipelineNode {
     pub planner_model: Option<String>,
     /// For `DynamicParallel`: maximum number of dynamic tasks (default 8).
     pub max_tasks: Option<u32>,
+    /// Marks this gate as human-input backed rather than a pure expression gate.
+    #[serde(default)]
+    pub human_gate: bool,
+    /// Resolver name used by human-input gates.
+    #[serde(default)]
+    pub resolver: Option<String>,
+    /// Artifact references this node expects to read before execution.
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+    /// Mission checkpoint references this node expects to resume from or inspect.
+    #[serde(default)]
+    pub checkpoint_refs: Vec<String>,
     /// Deadline in seconds for this node's execution. On expiry, `deadline_action` fires.
     /// Uses `f64` to allow sub-second precision (e.g. `0.5` for 500ms).
     #[serde(default)]
@@ -188,6 +200,10 @@ impl Default for PipelineNode {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: Vec::new(),
+            checkpoint_refs: Vec::new(),
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,

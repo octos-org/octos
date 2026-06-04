@@ -603,7 +603,10 @@ fn bundled_pipelines_parse_and_validate_clean() {
     for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
         let graph = octos_pipeline::parser::parse_dot(dot)
             .unwrap_or_else(|e| panic!("bundled pipeline '{file_name}' fails to parse: {e}"));
-        let diags = octos_pipeline::validate::validate(&graph);
+        // Main's validate-before-execute (#1374) split the API: `validate()`
+        // now returns a pass/fail `Result`, while `diagnostics()` returns the
+        // full diagnostic list this guard inspects for error-severity entries.
+        let diags = octos_pipeline::validate::diagnostics(&graph);
         assert!(
             !octos_pipeline::validate::has_errors(&diags),
             "bundled pipeline '{file_name}' has validation errors: {:?}",
