@@ -155,7 +155,10 @@ impl RunPipelineTool {
         working_dir: PathBuf,
         data_dir: PathBuf,
     ) -> Self {
-        let discovery = PipelineDiscovery::new(&data_dir, &working_dir);
+        // Agent-facing resolution searches ONLY operator-trusted dirs — never
+        // the agent-writable `<working_dir>/.octos/pipelines` — so a model
+        // cannot run a `.dot` it wrote by bare name (codex security review).
+        let discovery = PipelineDiscovery::new_operator_trusted(&data_dir);
         Self {
             default_provider,
             provider_router: None,
@@ -349,17 +352,25 @@ impl RunPipelineTool {
     /// output capacity, context window, and cost.
     /// Resolve a `pipeline` argument to runnable DOT.
     ///
-    /// Free-form inline DOT is **rejected** here — it was the unsafe legacy
-    /// authoring surface (a model could request arbitrary tools/handlers incl.
-    /// `shell`, or an empty tool-list that silently expanded to all builtins).
-    /// Agents now author multi-step work via the capability-locked `ir`
-    /// palette; this method only resolves a sanctioned pipeline NAME (or path),
-    /// with the embedded bundled bytes as a final fallback for known names.
+    /// Both unsafe authoring surfaces are **rejected** here: free-form inline
+    /// DOT (a model could request arbitrary tools/handlers incl. `shell`, or an
+    /// empty tool-list that silently expanded to all builtins) AND caller-
+    /// supplied file PATHS (a model could write `/tmp/pwn.dot` with
+    /// `handler=shell` and feed the path — the same arbitrary surface via
+    /// `PipelineDiscovery`'s direct-path read). This method accepts ONLY a bare
+    /// sanctioned pipeline NAME, resolved through discovery + the embedded
+    /// bundled bytes. Agents author ad-hoc work via the capability-locked `ir`.
     async fn resolve_with_fallback(&self, pipeline_str: &str) -> Result<String> {
         if looks_like_inline_dot(pipeline_str) {
             eyre::bail!(INLINE_DOT_REJECTION);
         }
-        self.resolve_named_with_bundled_fallback(pipeline_str).await
+        let name = pipeline_str.trim();
+        if !is_bare_pipeline_name(name) {
+            eyre::bail!(PIPELINE_PATH_REJECTION);
+        }
+        // Resolve the TRIMMED name so a whitespace-padded input can't miss an
+        // installed copy and let the embedded fallback out-rank installed-wins.
+        self.resolve_named_with_bundled_fallback(name).await
     }
 
     /// Resolve a pipeline by name/path via on-disk discovery first, falling
@@ -518,6 +529,25 @@ const INLINE_DOT_REJECTION: &str =
      either name a sanctioned pipeline (e.g. `deep_research`) in `pipeline`, or \
      compose a typed-IR workflow program in `ir`.";
 
+/// Returned when an agent supplies a file PATH (rather than a bare sanctioned
+/// name) to `run_pipeline`. A caller-supplied `.dot` path would let a model
+/// smuggle the same arbitrary handler/tool surface that inline DOT did (e.g. a
+/// written `/tmp/pwn.dot` with `handler=shell`) through direct-path resolution.
+const PIPELINE_PATH_REJECTION: &str =
+    "pipeline file paths are not accepted: name a sanctioned pipeline (e.g. \
+     `deep_research`) — a bare name, not a path — or compose a typed-IR workflow \
+     program in `ir`.";
+
+/// A sanctioned pipeline NAME is a bare identifier (ASCII alphanumerics plus
+/// `_`/`-`). Anything containing a path separator, `.` (so `.dot`/`./`/`..`),
+/// whitespace, or other characters is a path/expression and is rejected, so a
+/// model cannot point `run_pipeline` at an arbitrary on-disk `.dot` file.
+fn is_bare_pipeline_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// True when `s` looks like an inline DOT digraph rather than a pipeline
 /// name/path. Conservative on the leading token so a real name is never
 /// mistaken for DOT; fenced/garbled DOT that slips past simply fails name
@@ -605,11 +635,15 @@ impl Tool for RunPipelineTool {
         // find. No-discovery fallback keeps the sanctioned generic
         // `deep_research` baseline (it is bundled into the binary), so the
         // enum is never empty and the model always has the generic pipeline.
+        // Only advertise names that `resolve_with_fallback` will accept (bare
+        // sanctioned names), so advertise == resolvable: a discovered stem with
+        // a dot/space/etc. would otherwise be advertised yet rejected as a path.
         let mut pipeline_names: Vec<String> = self
             .discovery
             .list_available()
             .into_iter()
             .map(|p| p.name)
+            .filter(|n| is_bare_pipeline_name(n))
             .collect();
         if !pipeline_names.iter().any(|n| n == FALLBACK_PIPELINE_NAME) {
             pipeline_names.push(FALLBACK_PIPELINE_NAME.to_string());

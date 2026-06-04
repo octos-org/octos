@@ -362,7 +362,7 @@ async fn gateway_path_installed_wins_and_bundled_discovers() {
 ///   - When nothing is installed, BOTH forms fall to the embedded bundled
 ///     bytes (fallback is the whole point of bundling).
 #[tokio::test]
-async fn dot_suffixed_input_obeys_installed_wins_and_bundled_fallback() {
+async fn bare_name_obeys_installed_wins_and_dot_path_is_rejected() {
     let working = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let octos_home = tempfile::tempdir().unwrap();
@@ -372,7 +372,7 @@ async fn dot_suffixed_input_obeys_installed_wins_and_bundled_fallback() {
         let tool = make_tool_with_data(working.path(), data.path())
             .await
             .with_octos_home(PathBuf::from(octos_home.path()));
-        for input in ["deep_research", "deep_research.dot"] {
+        for input in ["deep_research"] {
             let dot = tool
                 .resolve_named_for_test(input)
                 .await
@@ -399,7 +399,7 @@ async fn dot_suffixed_input_obeys_installed_wins_and_bundled_fallback() {
     let tool = make_tool_with_data(working.path(), data.path())
         .await
         .with_octos_home(PathBuf::from(octos_home.path()));
-    for input in ["deep_research", "deep_research.dot"] {
+    for input in ["deep_research"] {
         let dot = tool
             .resolve_named_for_test(input)
             .await
@@ -409,6 +409,18 @@ async fn dot_suffixed_input_obeys_installed_wins_and_bundled_fallback() {
             "`{input}`: installed deep_research.dot must win over embedded bundled bytes, got: {dot}"
         );
     }
+
+    // Security: the `.dot`-suffixed / path form is REJECTED for agent runs — a
+    // model could otherwise point `run_pipeline` at an on-disk `.dot` it wrote
+    // (discovery's direct-path read). Agents use the bare sanctioned name.
+    let err = tool
+        .resolve_named_for_test("deep_research.dot")
+        .await
+        .expect_err("`.dot`-suffixed / path input must be rejected for agent runs");
+    assert!(
+        err.to_string().contains("file paths are not accepted"),
+        "rejection must name the path restriction, got: {err}"
+    );
 }
 
 /// Gap 4.1 BLOCKER 1 (standalone gateway child-profile uses the wrong

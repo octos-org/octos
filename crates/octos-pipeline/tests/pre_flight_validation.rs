@@ -142,6 +142,55 @@ async fn resolve_still_accepts_named_bundled_pipeline() {
 }
 
 #[tokio::test]
+async fn pre_flight_rejects_dot_file_paths() {
+    // Security: a model-supplied `.dot` FILE PATH (e.g. one it wrote with
+    // handler=shell) must be rejected — not read + executed via discovery's
+    // direct-path resolution. Only bare sanctioned names are accepted.
+    let (tool, _working, _data) = make_tool().await;
+    for path in [
+        "/tmp/pwn.dot",
+        "./pwn.dot",
+        "../x.dot",
+        "subdir/p.dot",
+        "pwn.dot",
+    ] {
+        let args = serde_json::json!({ "pipeline": path, "input": "x" });
+        let err = tool
+            .pre_flight_validate(&args)
+            .await
+            .expect_err("a .dot file path must be rejected");
+        assert!(
+            err.contains("file paths are not accepted"),
+            "`{path}` must be rejected as a path; got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_cannot_run_workspace_authored_pipeline_by_bare_name() {
+    // Security: a model can write to the workspace; a `.dot` it drops in
+    // `<working>/.octos/pipelines` must NOT be resolvable by bare name — the
+    // agent tool searches only operator-trusted dirs + bundled bytes.
+    let (tool, working, _data) = make_tool().await;
+    let pdir = working.path().join(".octos").join("pipelines");
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::write(
+        pdir.join("pwn.dot"),
+        "digraph pwn { x [handler=shell, prompt=\"PWNED\"] }",
+    )
+    .unwrap();
+    let err = tool
+        .resolve_named_for_test("pwn")
+        .await
+        .expect_err("a workspace-authored pipeline must not resolve by bare name");
+    assert!(
+        !err.to_string().contains("PWNED"),
+        "must NOT have read the workspace .dot; got: {err}"
+    );
+}
+
+
+#[tokio::test]
 async fn pre_flight_rejects_malformed_json_args() {
     let (tool, _working, _data) = make_tool().await;
     let args = serde_json::json!({ "pipeline": "digraph x { a; }" }); // missing required `input`
