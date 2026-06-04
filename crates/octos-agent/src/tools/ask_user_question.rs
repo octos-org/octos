@@ -228,6 +228,20 @@ impl Tool for AskUserQuestionTool {
         &["code"]
     }
 
+    /// This tool BLOCKS on the human until the client answers via
+    /// `user_question/respond` (the `request_user_question` await below),
+    /// exactly as the approval gate blocks on the approval requester. It must
+    /// therefore be exempt from the dispatch-boundary timeout: a human may
+    /// take longer than any finite ceiling, and firing the Gap-3.3 timeout
+    /// would drop the requester's receiver and leak the pending question
+    /// store entry forever. The turn-interrupt drain is the correct
+    /// cancellation path (resolves the waiter as `Cancelled`). See
+    /// `ToolRegistry::execute_with_context` and the `LONG_RUNNING_TOOLS`
+    /// batch-level exemption in `agent::execution`.
+    fn blocks_on_human_input(&self) -> bool {
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -296,6 +310,10 @@ impl Tool for AskUserQuestionTool {
         };
 
         let (title, body) = fallback_title_body(&questions);
+        // Keep a copy of the parsed questions so the `Unsupported` fallback
+        // (a requester that could not surface the prompt) can describe the
+        // REAL questions even after `request` is moved into the requester (#6).
+        let questions_for_fallback = questions.clone();
         let request = UserQuestionRequest {
             questions,
             title,
@@ -338,8 +356,13 @@ impl Tool for AskUserQuestionTool {
             }),
             // A requester was attached but reported it could not surface the
             // question (e.g. wire delivery failed). Degrade like the no-context
-            // path so the turn never hard-blocks.
-            UserQuestionOutcome::Unsupported => Ok(unsupported_fallback_result(args, &[])),
+            // path so the turn never hard-blocks — and describe the ACTUAL
+            // parsed questions (carried on `request.questions`) so the
+            // structured-metadata/text fallback reflects the real prompt
+            // rather than an empty one (#6).
+            UserQuestionOutcome::Unsupported => {
+                Ok(unsupported_fallback_result(args, &questions_for_fallback))
+            }
         }
     }
 }
@@ -388,6 +411,17 @@ mod tests {
     impl UserQuestionRequester for CancellingRequester {
         async fn request_user_question(&self, _request: Req) -> UserQuestionOutcome {
             UserQuestionOutcome::Cancelled
+        }
+    }
+
+    /// A requester that was attached but could not surface the question
+    /// (wire delivery failed). Exercises the `Unsupported` fallback arm.
+    struct UnsupportedRequester;
+
+    #[async_trait]
+    impl UserQuestionRequester for UnsupportedRequester {
+        async fn request_user_question(&self, _request: Req) -> UserQuestionOutcome {
+            UserQuestionOutcome::Unsupported
         }
     }
 
@@ -459,6 +493,33 @@ mod tests {
         assert!(!result.success);
         let output: Value = serde_json::from_str(&result.output).expect("output json");
         assert_eq!(output["status"], json!("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_fallback_describes_the_real_questions() {
+        // A requester reported `Unsupported` (wire delivery failed). The
+        // structured-metadata fallback must describe the ACTUAL parsed
+        // questions, not an empty prompt (#6).
+        let requester_dyn: Arc<dyn UserQuestionRequester> = Arc::new(UnsupportedRequester);
+        let tool = AskUserQuestionTool::new();
+        let args = one_valid_question();
+        let result = USER_QUESTION_CTX
+            .scope(requester_dyn, async move { tool.execute(&args).await })
+            .await
+            .expect("unsupported degrades to fallback ok");
+        assert!(result.success);
+        let output: Value = serde_json::from_str(&result.output).expect("output json");
+        // The fallback title is the single question's text — proving the real
+        // questions reached the fallback rather than the empty `&[]` slice.
+        assert_eq!(
+            output["title"],
+            json!("Which web framework should I scaffold?")
+        );
+        let body = output["body"].as_str().expect("body string");
+        assert!(
+            body.contains("axum") && body.contains("actix"),
+            "fallback body must list the real option labels, got: {body}"
+        );
     }
 
     #[tokio::test]

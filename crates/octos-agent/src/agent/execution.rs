@@ -89,6 +89,12 @@ fn should_auto_send_tool_files(
 /// - `delegate_task` (`tools/delegate.rs`)
 /// - `search` (`tools/deep_search.rs`), `deep_crawl` (`tools/site_crawl.rs`)
 /// - `synthesize_research` (`tools/synthesize_research.rs`)
+/// - `ask_user_question` (`tools/ask_user_question.rs`) — a human-wait tool:
+///   it blocks on the requester until the client answers, exactly as the
+///   approval gate blocks. It must keep the long ceiling at the batch level
+///   (and is fully timeout-exempt at the registry dispatch boundary via
+///   `Tool::blocks_on_human_input`), so the short interactive default never
+///   kills the receiver and leaks the pending question store entry (#1).
 const LONG_RUNNING_TOOLS: &[&str] = &[
     "shell",
     "bash",
@@ -101,6 +107,7 @@ const LONG_RUNNING_TOOLS: &[&str] = &[
     "deep_crawl",
     "site_crawl",
     "synthesize_research",
+    "ask_user_question",
 ];
 
 /// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
@@ -2385,12 +2392,31 @@ mod tests {
             "deep_crawl",
             "search",
             "synthesize_research",
+            // A human-wait tool must never be killed by the short
+            // interactive batch default — it blocks on the requester exactly
+            // like `shell`'s approval gate does (#1).
+            "ask_user_question",
         ] {
             assert!(
                 is_long_running_tool(name),
                 "{name} should be classified long-running"
             );
         }
+    }
+
+    #[test]
+    fn batch_with_ask_user_question_keeps_the_long_ceiling() {
+        // A batch containing `ask_user_question` (a human-wait tool) must keep
+        // the long config default when the LLM omits `timeout_secs`, never the
+        // short interactive default that would kill the receiver and leak the
+        // pending store entry. Mirrors `shell`'s batch-level exemption.
+        let secs = compute_batch_timeout_secs(
+            &["ask_user_question"],
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, 1800);
     }
 
     #[test]

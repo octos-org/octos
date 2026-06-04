@@ -611,6 +611,24 @@ pub trait Tool: Send + Sync {
     fn execution_timeout_secs(&self) -> Option<u64> {
         None
     }
+
+    /// Whether this tool BLOCKS on human input (e.g. `ask_user_question`
+    /// awaits the [`USER_QUESTION_CTX`] requester until the client answers,
+    /// exactly as the approval gate blocks on [`TOOL_APPROVAL_CTX`]). Such a
+    /// tool must be EXEMPT from the dispatch-boundary timeout in
+    /// [`ToolRegistry::execute_with_context`]: a human may legitimately take
+    /// longer than any finite tool timeout, and firing the timeout would drop
+    /// the requester's receiver and leak the pending question/approval store
+    /// entry forever (Gap-3.3 interaction). The waiting future is instead
+    /// cancelled the right way — when the turn is interrupted the pending
+    /// store drains the entry and resolves the waiter as `Cancelled`.
+    ///
+    /// Returning `true` here makes the registry skip wrapping the call in the
+    /// dispatch timeout entirely (it still composes with the agent loop's
+    /// per-turn lifecycle and the turn-interrupt drain). Default: `false`.
+    fn blocks_on_human_input(&self) -> bool {
+        false
+    }
 }
 
 /// LRU-based tool lifecycle manager.

@@ -148,6 +148,10 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
+/// Reason recorded when a pending structured-question entry is cancelled
+/// because the `ask_user_question` tool's waiting future was dropped (timeout,
+/// interrupt, abort, panic, connection close) — UPCR-2026-023 drop-guard.
+const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
 const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
@@ -3241,6 +3245,70 @@ struct SessionUserQuestionRequester {
     turn_id: TurnId,
 }
 
+/// RAII drop-guard around the requester's wait on `response_rx`
+/// (UPCR-2026-023, fix #2). If the `ask_user_question` tool's future is
+/// dropped while it is parked on the answer — a per-tool timeout firing, a
+/// turn interrupt aborting the task, a panic unwinding, or the connection
+/// closing — this guard's `Drop` CANCELS the matching pending-question store
+/// entry (resolving the waiter as cancelled and removing the entry) instead
+/// of leaking it forever.
+///
+/// This closes the cancel-on-interrupt race codex flagged: the turn-interrupt
+/// drain (`cancel_pending_for_turn`) only cancels entries that are visible at
+/// drain time, so a question inserted AFTER the drain (the narrow window
+/// between drain and the agent task actually stopping) would otherwise leak.
+/// The guard makes cancellation robust regardless of drain timing because it
+/// is keyed to the lifetime of the waiting future itself, not to a one-shot
+/// sweep.
+///
+/// The guard is DISARMED on a clean resolution (`Answered`/`Cancelled`/wire
+/// send failure), where the store entry has already moved out of `Pending`
+/// and re-cancelling would be a no-op anyway. `cancel_pending_question` only
+/// acts on a still-`Pending` entry, so an armed drop after a clean resolution
+/// is harmless — disarming just skips the redundant lock.
+///
+/// (Approvals lack an equivalent guard today — a latent approval gap; not
+/// fixed here.)
+struct PendingQuestionWaiterGuard {
+    contracts: Arc<UiProtocolContractStores>,
+    session_id: SessionKey,
+    question_id: octos_core::ui_protocol::QuestionId,
+    armed: bool,
+}
+
+impl PendingQuestionWaiterGuard {
+    fn new(
+        contracts: Arc<UiProtocolContractStores>,
+        session_id: SessionKey,
+        question_id: octos_core::ui_protocol::QuestionId,
+    ) -> Self {
+        Self {
+            contracts,
+            session_id,
+            question_id,
+            armed: true,
+        }
+    }
+
+    /// Mark the wait as resolved cleanly so the guard does not cancel on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingQuestionWaiterGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.contracts.user_questions.cancel_pending_question(
+            &self.session_id,
+            &self.question_id,
+            APPROVAL_CANCELLED_REASON_WAITER_DROPPED,
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
     async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
@@ -3257,6 +3325,19 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
 
         let response_rx = self.contracts.user_questions.request_runtime(event.clone());
 
+        // #2 — RAII drop-guard. Arm a guard keyed to THIS pending entry the
+        // instant it is registered. If our future is dropped before a clean
+        // resolution (per-tool timeout firing, turn interrupt aborting the
+        // task, panic, connection close) the guard's `Drop` cancels the entry,
+        // closing the cancel-on-interrupt race (an entry inserted after the
+        // turn-interrupt drain would otherwise leak). We disarm it on every
+        // clean exit path below.
+        let mut waiter_guard = PendingQuestionWaiterGuard::new(
+            self.contracts.clone(),
+            self.session_id.clone(),
+            question_id.clone(),
+        );
+
         // The event is durable: if the WS drop strands the request, the ledger
         // still records it and a reconnecting client can rehydrate. We cancel
         // the pending entry and degrade to the fallback so the turn continues
@@ -3266,11 +3347,15 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             &self.ledger,
             UiNotification::UserQuestionRequested(event),
         ) {
+            // Explicit send-failure cancellation records the precise reason;
+            // disarm the guard so its `Drop` does not also fire (a no-op on a
+            // now-cancelled entry, but cleaner to skip).
             self.contracts.user_questions.cancel_pending_question(
                 &self.session_id,
                 &question_id,
                 APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED,
             );
+            waiter_guard.disarm();
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
                 error = ?err,
@@ -3281,11 +3366,17 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
 
         // This is the await boundary: the turn stays paused until the client
         // answers via user_question/respond (resolves the oneshot) or the turn
-        // is interrupted (cancel_pending_for_turn drops the sender → Err).
-        match response_rx.await {
+        // is interrupted (cancel_pending_for_turn drops the sender → Err). If
+        // OUR future is dropped here, `waiter_guard` cancels the entry.
+        let outcome = match response_rx.await {
             Ok(answers) => UserQuestionOutcome::Answered(answers),
             Err(_) => UserQuestionOutcome::Cancelled,
-        }
+        };
+        // Clean resolution — the store entry has already left `Pending`
+        // (Answered) or its sender was dropped by the turn-interrupt drain
+        // (Cancelled). Disarm so the guard does not re-cancel.
+        waiter_guard.disarm();
+        outcome
     }
 }
 
@@ -3759,6 +3850,7 @@ async fn ui_protocol_connection(
                     &state,
                     &ledger,
                     &contracts.approvals,
+                    &contracts.user_questions,
                     &live_forwarders,
                     connection_profile_id,
                     features,
@@ -3857,6 +3949,7 @@ async fn ui_protocol_connection(
                     &state,
                     &ledger,
                     &contracts.approvals,
+                    &contracts.user_questions,
                     &active_turns,
                     connection_profile_id,
                     routed_profile_id,
@@ -4270,6 +4363,7 @@ where
                     &state,
                     &ledger,
                     &contracts.approvals,
+                    &contracts.user_questions,
                     &live_forwarders,
                     next_connection_profile_id.as_deref(),
                     features,
@@ -4416,6 +4510,7 @@ where
                     &state,
                     &ledger,
                     &contracts.approvals,
+                    &contracts.user_questions,
                     &active_turns,
                     connection_profile_id_owned.as_deref(),
                     None,
@@ -7837,6 +7932,7 @@ async fn handle_session_open(
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,
     approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
     live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
@@ -7860,6 +7956,7 @@ async fn handle_session_open(
         state,
         ledger,
         approvals,
+        questions,
         ws.connection_id,
         connection_profile_id,
         features,
@@ -7930,6 +8027,20 @@ async fn handle_session_open(
             ledger,
             UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(event)),
         );
+    }
+    // UPCR-2026-023: replay still-pending structured user-questions, gated by
+    // `user_question.v1`. A client that did not negotiate the feature never
+    // received a `user_question/requested` it could answer, so it must not
+    // get one on reconnect either — run each through the same per-connection
+    // capability filter the live broadcast uses so replay and live stay in
+    // lockstep (mirrors the `message/persisted` replay-gate rationale above).
+    for event in outcome.pending_questions {
+        let ledger_event =
+            UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(event));
+        if !live_event_passes_capability_filter(&ledger_event, features) {
+            continue;
+        }
+        let _ = send_ledger_event_durable(ws, ledger, ledger_event);
     }
     // Baseline = head_seq captured atomically with replay (codex MUST-FIX-1).
     // Using opened_event.cursor.seq instead would silently filter out any
@@ -8202,6 +8313,20 @@ fn live_event_passes_capability_filter(
             return false;
         }
     }
+    // UPCR-2026-023 `user_question.v1` gate. A client that did not negotiate
+    // the structured-question capability never installed a
+    // `SessionUserQuestionRequester` and has no `user_question/respond` path,
+    // so it must never receive a `user_question/requested` it cannot answer —
+    // neither via the live broadcast NOR via reconnect replay (both routes
+    // call this filter). Mirrors the `ApprovalRequested` / typed-approval
+    // gating discipline: only deliver an interactive prompt to a connection
+    // that can act on it.
+    if !features.user_question_v1 {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(_)) = event
+        {
+            return false;
+        }
+    }
     // UPCR-2026-014 M9-γ cutover: per-connection mutual exclusion.
     //
     // Connections that NEGOTIATED `projection.envelope.v1` see canonical
@@ -8248,6 +8373,10 @@ struct SessionOpenOutcome {
     result: SessionOpenResult,
     replay: Vec<LedgeredUiProtocolEvent>,
     pending_approvals: Vec<ApprovalRequestedEvent>,
+    /// UPCR-2026-023: still-pending structured user-questions to replay on
+    /// reconnect, mirroring [`pending_approvals`](Self::pending_approvals).
+    /// Gated by the `user_question.v1` capability at the send site.
+    pending_questions: Vec<UserQuestionRequestedEvent>,
     opened_event: LedgeredUiProtocolEvent,
     /// Head seq observed atomically with the replay snapshot. The live
     /// forwarder uses this — NOT `opened_event.cursor.seq` — as its
@@ -8257,10 +8386,15 @@ struct SessionOpenOutcome {
     replay_baseline_seq: u64,
 }
 
+// Threading both the approval store and the (UPCR-2026-023) question store
+// through the session/open contract pushes this past clippy's 7-arg lint;
+// the parameters are a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn open_session_result(
     state: &Arc<AppState>,
     ledger: &UiProtocolLedger,
     approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
     connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
@@ -8389,6 +8523,34 @@ async fn open_session_result(
         .filter(|approval| !replayed_approval_ids.contains(&approval.approval_id))
         .collect::<Vec<_>>();
 
+    // UPCR-2026-023: replay still-pending structured user-questions on
+    // reconnect, mirroring the pending-approval replay above EXACTLY —
+    // topic-scope filtered, and de-duplicated against any question already
+    // carried in the cursor replay window. The `user_question.v1` capability
+    // gate is applied at the send site (`live_event_passes_capability_filter`
+    // / the dedicated send loop) so a non-negotiated client never receives a
+    // question it cannot answer.
+    let replayed_question_ids = replay
+        .iter()
+        .filter_map(|event| match &event.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(
+                question,
+            )) => Some(question.question_id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let pending_questions = questions
+        .pending_for_session(&params.session_id)
+        .into_iter()
+        .filter(|question| {
+            let event = UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(
+                question.clone(),
+            ));
+            ledger_event_matches_topic_scope(&event, topic_scope.as_deref())
+        })
+        .filter(|question| !replayed_question_ids.contains(&question.question_id))
+        .collect::<Vec<_>>();
+
     let Some(sessions) = resolve_sessions_for_lookup(
         state,
         connection_profile_id,
@@ -8451,6 +8613,7 @@ async fn open_session_result(
         result: SessionOpenResult::new(opened),
         replay,
         pending_approvals,
+        pending_questions,
         opened_event,
         replay_baseline_seq,
     })
@@ -11042,6 +11205,7 @@ async fn handle_session_hydrate(
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,
     approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
@@ -11281,6 +11445,18 @@ async fn handle_session_hydrate(
         None
     };
 
+    // UPCR-2026-023: hydrate still-pending structured user-questions alongside
+    // pending approvals (same `pending_approvals` include section), but only
+    // for a connection that negotiated `user_question.v1` — a client without
+    // the capability has no `user_question/respond` path, so the section is
+    // omitted (not `null`) exactly like a non-negotiated wire event is
+    // filtered out. Mirrors the `session/open` pending-question replay gate.
+    let pending_questions = if include_set.pending_approvals && features.user_question_v1 {
+        Some(questions.pending_for_session(&params.session_id))
+    } else {
+        None
+    };
+
     let result = SessionHydrateResult {
         session_id: params.session_id,
         cursor: head_cursor,
@@ -11290,6 +11466,7 @@ async fn handle_session_hydrate(
         threads,
         turns,
         pending_approvals,
+        pending_questions,
         replayed_envelopes,
     };
     send_serialized_rpc_result(
@@ -22723,6 +22900,7 @@ ignore = []
         let (ws, mut rx) = ws_connection_for_test(16);
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
         let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let features = ConnectionUiFeatures::stdio_defaults();
         let mut binding = Some("ada".to_owned());
@@ -22742,6 +22920,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &questions,
             &forwarders,
             candidate.as_deref(),
             features,
@@ -22794,6 +22973,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &questions,
             &forwarders,
             candidate.as_deref(),
             features,
@@ -22942,6 +23122,7 @@ ignore = []
                 &state,
                 &ledger,
                 &approvals,
+                &PendingQuestionStore::default(),
                 ConnectionId::next(),
                 Some(profile_id),
                 features,
@@ -26431,6 +26612,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26492,6 +26674,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26521,6 +26704,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26559,6 +26743,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26618,6 +26803,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26673,6 +26859,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26691,6 +26878,348 @@ ignore = []
         assert_eq!(outcome.pending_approvals.len(), 1);
         assert_eq!(outcome.pending_approvals[0].approval_id, approval_id);
         assert_eq!(outcome.pending_approvals[0].title, "Run command");
+    }
+
+    // ---- UPCR-2026-023 pending-question reconnect + capability gating ----
+
+    fn sample_pending_question(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+    ) -> UserQuestionRequestedEvent {
+        use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
+        UserQuestionRequestedEvent::new(
+            session_id,
+            question_id,
+            turn_id,
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            vec![UserQuestion {
+                header: "Framework".into(),
+                question: "Which framework?".into(),
+                options: vec![
+                    UserQuestionOption {
+                        label: "axum".into(),
+                        description: "tower-based".into(),
+                    },
+                    UserQuestionOption {
+                        label: "actix".into(),
+                        description: "actor-based".into(),
+                    },
+                ],
+                multi_select: false,
+                allow_free_text: true,
+            }],
+        )
+    }
+
+    fn features_with_user_question_v1() -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            user_question_v1: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn session_open_replays_pending_question_for_negotiated_client() {
+        // #3: a reconnecting client that negotiated `user_question.v1` must see
+        // the still-pending structured question in `pending_questions`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let session_id = SessionKey("local:test".into());
+        let question_id = QuestionId::new();
+        let _rx = questions.request_runtime(sample_pending_question(
+            session_id.clone(),
+            question_id.clone(),
+            TurnId::new(),
+        ));
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            ConnectionId::next(),
+            None,
+            features_with_user_question_v1(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("open session should replay pending question");
+
+        assert_eq!(outcome.pending_questions.len(), 1);
+        assert_eq!(outcome.pending_questions[0].question_id, question_id);
+        assert_eq!(
+            outcome.pending_questions[0].title, "Pick a framework",
+            "the reconnecting client must re-render the pending question"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_open_pending_question_filtered_out_without_capability() {
+        // #4 (replay path): a client lacking `user_question.v1` must NOT
+        // receive the pending question even though it is in the store — the
+        // outcome carries it (computed unconditionally) but the send-site
+        // capability filter drops it. Assert the filter at the unit level so
+        // the contract is pinned regardless of send wiring.
+        let event = sample_pending_question(
+            SessionKey("local:test".into()),
+            QuestionId::new(),
+            TurnId::new(),
+        );
+        let ledger_event =
+            UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(event));
+        assert!(
+            !live_event_passes_capability_filter(&ledger_event, ConnectionUiFeatures::default()),
+            "a connection without user_question.v1 must not receive UserQuestionRequested"
+        );
+        assert!(
+            live_event_passes_capability_filter(&ledger_event, features_with_user_question_v1()),
+            "a negotiated connection must receive UserQuestionRequested"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_open_does_not_duplicate_pending_question_already_in_cursor_replay() {
+        // #3: a question already carried by the cursor replay window must not
+        // be re-sent as a supplemental pending question (mirrors the approval
+        // de-dup).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let session_id = SessionKey("local:test".into());
+        let question_id = QuestionId::new();
+        let event = sample_pending_question(session_id.clone(), question_id.clone(), TurnId::new());
+        let _rx = questions.request_runtime(event.clone());
+        ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "before".into(),
+        }));
+        ledger.append_notification(UiNotification::UserQuestionRequested(event));
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            ConnectionId::next(),
+            None,
+            features_with_user_question_v1(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                after: Some(UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                }),
+            },
+        )
+        .await
+        .expect("open session should rely on cursor replay");
+
+        assert!(
+            outcome.pending_questions.is_empty(),
+            "a question already in the cursor replay must not be re-sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_question_waiter_guard_cancels_entry_on_drop() {
+        // #2: when the requester's waiting future is dropped (timeout,
+        // interrupt, abort, panic) before a clean resolution, the RAII guard
+        // cancels the pending store entry — the blocked tool sees a closed
+        // receiver (Cancelled) and the entry does not leak.
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let session_id = SessionKey("local:test".into());
+        let question_id = QuestionId::new();
+        let turn_id = TurnId::new();
+        let rx = contracts
+            .user_questions
+            .request_runtime(sample_pending_question(
+                session_id.clone(),
+                question_id.clone(),
+                turn_id,
+            ));
+
+        // Arm a guard exactly as the requester does, then drop it WITHOUT
+        // disarming — simulating the tool future being dropped mid-wait.
+        {
+            let _guard = PendingQuestionWaiterGuard::new(
+                contracts.clone(),
+                session_id.clone(),
+                question_id.clone(),
+            );
+        }
+
+        // The waiter is resolved-as-cancelled (sender dropped → Err).
+        assert!(
+            rx.await.is_err(),
+            "dropping the guard must cancel the pending entry, closing the waiter"
+        );
+        // The entry is no longer pending (it was moved to Cancelled).
+        assert!(
+            contracts
+                .user_questions
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "cancelled entry must not appear as pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_question_waiter_guard_disarmed_does_not_cancel() {
+        // The guard must NOT cancel a cleanly-resolved entry: after disarm,
+        // dropping it is a no-op and the still-pending entry survives.
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let session_id = SessionKey("local:test".into());
+        let question_id = QuestionId::new();
+        let _rx = contracts
+            .user_questions
+            .request_runtime(sample_pending_question(
+                session_id.clone(),
+                question_id.clone(),
+                TurnId::new(),
+            ));
+
+        {
+            let mut guard = PendingQuestionWaiterGuard::new(
+                contracts.clone(),
+                session_id.clone(),
+                question_id.clone(),
+            );
+            guard.disarm();
+        }
+
+        assert_eq!(
+            contracts
+                .user_questions
+                .pending_for_session(&session_id)
+                .len(),
+            1,
+            "a disarmed guard must not cancel the still-pending entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_hydrate_returns_pending_question_for_negotiated_client() {
+        // #3 (hydrate path): a reconnecting client that requests the
+        // pending-approvals section and negotiated `user_question.v1` gets the
+        // pending structured question back in `pending_questions`.
+        use octos_core::ui_protocol::hydrate_sections;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let session_id = SessionKey("local:test".into());
+        let question_id = QuestionId::new();
+        let _rx = questions.request_runtime(sample_pending_question(
+            session_id.clone(),
+            question_id.clone(),
+            TurnId::new(),
+        ));
+        // Make the session known so hydrate does not reject it.
+        {
+            let sessions = state.sessions.as_ref().expect("sessions");
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(&session_id).await;
+        }
+
+        let (ws, mut rx) = ws_connection_for_test(16);
+        handle_session_hydrate(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &active_turns,
+            None,
+            None,
+            features_with_user_question_v1(),
+            "hydrate-q".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec![hydrate_sections::PENDING_APPROVALS.into()],
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("hydrate-q"));
+        let pending = frame["result"]["pending_questions"]
+            .as_array()
+            .expect("pending_questions must be present for a negotiated client");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["question_id"], json!(question_id.0.to_string()));
+    }
+
+    #[tokio::test]
+    async fn session_hydrate_omits_pending_question_without_capability() {
+        // #3/#4: a client lacking `user_question.v1` must not receive the
+        // `pending_questions` section at all (omitted, not `null`).
+        use octos_core::ui_protocol::hydrate_sections;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let session_id = SessionKey("local:test".into());
+        let _rx = questions.request_runtime(sample_pending_question(
+            session_id.clone(),
+            QuestionId::new(),
+            TurnId::new(),
+        ));
+        {
+            let sessions = state.sessions.as_ref().expect("sessions");
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(&session_id).await;
+        }
+
+        let (ws, mut rx) = ws_connection_for_test(16);
+        handle_session_hydrate(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &active_turns,
+            None,
+            None,
+            ConnectionUiFeatures::default(),
+            "hydrate-no-q".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec![hydrate_sections::PENDING_APPROVALS.into()],
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("hydrate-no-q"));
+        assert!(
+            frame["result"].get("pending_questions").is_none(),
+            "non-negotiated client must not receive pending_questions; got {}",
+            frame["result"]
+        );
     }
 
     #[tokio::test]
@@ -26722,6 +27251,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26767,6 +27297,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures {
@@ -26840,6 +27371,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26877,6 +27409,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -26948,6 +27481,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             features,
@@ -28973,6 +29507,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -28997,6 +29532,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -30762,6 +31298,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
@@ -31477,6 +32014,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             &active_turns,
             None,
             None,
@@ -31869,6 +32407,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             &active_turns,
             None,
             None,
@@ -32023,6 +32562,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             &active_turns,
             None,
             None,
@@ -32102,6 +32642,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             &active_turns,
             None,
             None,
@@ -32180,6 +32721,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             &active_turns,
             None,
             None,
@@ -35320,6 +35862,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11e-custom-cwd"),
             features,
@@ -35410,6 +35953,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11e-multi-cwd"),
             features,
@@ -35429,6 +35973,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11e-multi-cwd"),
             features,
@@ -35577,6 +36122,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11e-rebind-attempt"),
             features,
@@ -35595,6 +36141,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11e-rebind-attempt"),
             features,
@@ -35666,6 +36213,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             // No connection identity so the routed id falls to the
             // session-id-embedded "m11e-not-registered".
@@ -35734,6 +36282,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11e-symlink"),
             features,
@@ -35858,6 +36407,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11f-tier2-default"),
             features,

@@ -447,6 +447,16 @@ pub mod rpc_error_codes {
     /// [`APPROVAL_NOT_PENDING`] / [`APPROVAL_CANCELLED`] for the
     /// structured-question surface.
     pub const USER_QUESTION_STALE: i64 = -32107;
+    /// UPCR-2026-023 `user_question_invalid`: `user_question/respond` carried
+    /// answers that do not match the STORED request (wrong answer count, a
+    /// `selected_labels` value not in that question's options, more than one
+    /// label on a non-`multi_select` question, or free text where the question
+    /// disallows it). The server rejects the call and does NOT resolve the
+    /// blocked tool with bad data. Distinct from `user_question_unknown`
+    /// (target not found) and `user_question_stale` (target no longer
+    /// pending) so the client can tell "fix your answer and retry" from "this
+    /// question is gone".
+    pub const USER_QUESTION_INVALID: i64 = -32108;
 
     /// Spec §10 `cursor_out_of_range`: stale or future cursor relative to ledger.
     pub const CURSOR_OUT_OF_RANGE: i64 = -32110;
@@ -1349,6 +1359,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
         ])
     }
 
@@ -2497,6 +2508,14 @@ pub struct SessionHydrateResult {
     pub turns: Option<Vec<HydratedTurn>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<ApprovalRequestedEvent>>,
+    /// UPCR-2026-023: still-pending structured user-questions for this
+    /// session, mirroring [`pending_approvals`](Self::pending_approvals). A
+    /// reconnecting client that negotiated `user_question.v1` re-renders these
+    /// and can still answer them; omitted (not `null`) when the request did
+    /// not ask for the `pending_approvals` section or the connection lacks the
+    /// capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questions: Option<Vec<UserQuestionRequestedEvent>>,
     /// M10 Phase 6.2 (Bug C). Retained `turn/spawn_complete` envelopes
     /// from the ledger replay window for clients that negotiated
     /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]. Populated only when
@@ -6931,6 +6950,23 @@ mod tests {
     }
 
     #[test]
+    fn full_protocol_advertises_user_question_feature() {
+        // `full_protocol()` must agree with the known/first-server feature
+        // lists, both of which already include `user_question.v1`. A client
+        // that handshakes against `full_protocol()` must see the question
+        // capability or it will never negotiate `user_question.v1` and the
+        // tool silently degrades to its fallback.
+        let caps = UiProtocolCapabilities::full_protocol();
+        assert!(
+            caps.supported_features
+                .iter()
+                .any(|f| f == UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            "full_protocol() must advertise user_question.v1; got {:?}",
+            caps.supported_features
+        );
+    }
+
+    #[test]
     fn user_question_requested_event_round_trips_with_structured_questions() {
         let event = UserQuestionRequestedEvent::new(
             SessionKey("local:demo".into()),
@@ -9025,6 +9061,32 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn sample_user_question_requested_event() -> UserQuestionRequestedEvent {
+        UserQuestionRequestedEvent::new(
+            sample_session_id(),
+            QuestionId(Uuid::from_u128(0x77)),
+            sample_turn_id(),
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            vec![UserQuestion {
+                header: "Framework".into(),
+                question: "Which framework?".into(),
+                options: vec![
+                    UserQuestionOption {
+                        label: "axum".into(),
+                        description: "tower-based".into(),
+                    },
+                    UserQuestionOption {
+                        label: "actix".into(),
+                        description: "actor-based".into(),
+                    },
+                ],
+                multi_select: false,
+                allow_free_text: true,
+            }],
+        )
+    }
+
     #[test]
     fn golden_session_hydrate_params_serde() {
         let params = SessionHydrateParams {
@@ -9084,6 +9146,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: Some(vec![]),
+            pending_questions: Some(vec![sample_user_question_requested_event()]),
             replayed_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
@@ -9101,6 +9164,7 @@ mod tests {
             threads: None,
             turns: None,
             pending_approvals: None,
+            pending_questions: None,
             replayed_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
@@ -9109,6 +9173,9 @@ mod tests {
         assert!(!object.contains_key("threads"));
         assert!(!object.contains_key("turns"));
         assert!(!object.contains_key("pending_approvals"));
+        // UPCR-2026-023: a client that did not request pending questions never
+        // sees the new field — it is omitted, never serialized as `null`.
+        assert!(!object.contains_key("pending_questions"));
         // Bug C: a non-negotiated client never sees the new field.
         assert!(!object.contains_key("replayed_envelopes"));
     }
