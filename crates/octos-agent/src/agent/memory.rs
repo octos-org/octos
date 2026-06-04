@@ -99,11 +99,13 @@ impl Agent {
             octos_core::TaskKind::Custom { name, .. } => name.clone(),
         };
 
-        // Hybrid (embedding-aware) path returns scored matches so we can
-        // filter out below-threshold noise that would otherwise contaminate
-        // unrelated sessions. The cwd-scoped `find_relevant` fallback is
-        // already filtered by working directory and keyword overlap, so it
-        // doesn't need the score gate.
+        // Episodic recall requires an embedder. The hybrid (embedding-aware)
+        // path returns scored matches so we can filter out below-threshold
+        // noise that would otherwise contaminate unrelated sessions. WITHOUT
+        // an embedder we SKIP recall entirely (the `else` below): BM25-only
+        // keyword overlap within a single shared workspace can't discriminate
+        // on-task from cross-task episodes, so injecting it leaks stale,
+        // unrelated memory into the prompt.
         if let Some(ref embedder) = self.embedder {
             // Push the modality-aware similarity floor down into the
             // index via `_filtered`. The floor is applied to every

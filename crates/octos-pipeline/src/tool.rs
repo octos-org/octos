@@ -120,14 +120,14 @@ pub struct RunPipelineTool {
     contract_id: Option<String>,
     /// NEW-06 fix: optional embedder for hybrid memory search.
     ///
-    /// Without this set, worker `Agent` instances spawned per pipeline
-    /// node fall through to the unfiltered cwd-only fallback path in
-    /// `EpisodeStore::find_relevant` — which only does keyword overlap
-    /// plus CWD filtering, NOT the modality-aware similarity gate in
-    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`]. The
-    /// gateway / serve runtimes own the embedder; this lets the
-    /// orchestrator propagate it down to pipeline workers so episodic
-    /// memory recall is contamination-safe end-to-end.
+    /// Without this set, worker `Agent` instances spawned per pipeline node
+    /// SKIP episodic memory recall entirely (the no-embedder branch in
+    /// `octos_agent::agent::memory`): BM25-only keyword recall within a single
+    /// shared workspace can't discriminate on-task from cross-task episodes, so
+    /// it would leak stale unrelated memory. The gateway / serve runtimes own
+    /// the embedder; this lets the orchestrator propagate it down to pipeline
+    /// workers so episodic memory recall is available AND contamination-safe
+    /// end-to-end.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
