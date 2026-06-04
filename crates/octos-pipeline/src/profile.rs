@@ -131,11 +131,17 @@ pub fn validate_under_profile(
             }
         }
         // A codergen node with no tools means "all builtins" — too broad for an
-        // LLM-authored level; require an explicit allowlist.
-        if node.handler == HandlerKind::Codergen && node.tools.is_empty() {
+        // LLM-authored level; require an explicit allowlist. DynamicParallel is
+        // included because its synthetic per-task workers inherit the node's
+        // tools, so an empty list there also widens to all builtins.
+        if matches!(
+            node.handler,
+            HandlerKind::Codergen | HandlerKind::DynamicParallel
+        ) && node.tools.is_empty()
+        {
             violations.push(ProfileViolation::node(
                 &node.id,
-                "codergen node must declare an explicit tool allowlist (empty = all builtins)",
+                "node must declare an explicit tool allowlist (empty = all builtins)",
             ));
         }
     }
@@ -146,12 +152,17 @@ pub fn validate_under_profile(
 /// Longest chain length (in nodes) for a DAG via topological DP, or `None` if
 /// the graph is cyclic (the cycle is reported by the structural validator).
 fn longest_chain(graph: &PipelineGraph) -> Option<usize> {
-    if graph.detect_cycles().is_err() {
-        return None;
-    }
+    // Longest FORWARD chain: marked back-edges (label == "back_edge") are
+    // treated as absent, so an intentional retry loop does not disable depth
+    // enforcement — a long forward chain plus a back-edge can't slip past
+    // max_depth. (An UNMARKED cycle is rejected earlier by the cycle gate, so
+    // by the time depth is checked the forward graph is acyclic.)
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut indeg: HashMap<&str, usize> = graph.nodes.keys().map(|k| (k.as_str(), 0)).collect();
     for e in &graph.edges {
+        if e.label.as_deref() == Some("back_edge") {
+            continue;
+        }
         adj.entry(e.source.as_str())
             .or_default()
             .push(e.target.as_str());
@@ -321,5 +332,47 @@ mod tests {
         );
         let v = validate_under_profile(&g, &p);
         assert!(!v.iter().any(|x| x.message.contains("depth")));
+    }
+
+    #[test]
+    fn should_enforce_depth_through_marked_back_edge() {
+        // P2c: a long forward chain + a MARKED retry back-edge must still hit
+        // max_depth — the back-edge must not disable depth enforcement.
+        let mut p = ValidationProfile::l2_default();
+        p.max_depth = 2;
+        let mut g = graph_with(
+            vec![
+                node("a", HandlerKind::Gate, &[]),
+                node("b", HandlerKind::Gate, &[]),
+                node("c", HandlerKind::Gate, &[]),
+                node("d", HandlerKind::Gate, &[]),
+            ],
+            &[("a", "b"), ("b", "c"), ("c", "d")],
+        );
+        g.edges.push(PipelineEdge {
+            source: "d".to_string(),
+            target: "a".to_string(),
+            label: Some("back_edge".to_string()),
+            condition: None,
+            weight: 1.0,
+        });
+        assert!(
+            validate_under_profile(&g, &p)
+                .iter()
+                .any(|x| x.message.contains("depth")),
+            "forward depth 4 must exceed max_depth 2 despite the back-edge"
+        );
+    }
+
+    #[test]
+    fn should_require_explicit_tools_on_dynamic_parallel() {
+        // P2d: dynamic_parallel with empty tools (workers inherit them) must be
+        // flagged, same as codergen.
+        let g = graph_with(vec![node("f", HandlerKind::DynamicParallel, &[])], &[]);
+        let v = validate_under_profile(&g, &ValidationProfile::l2_default());
+        assert!(
+            v.iter()
+                .any(|x| x.message.contains("explicit tool allowlist"))
+        );
     }
 }

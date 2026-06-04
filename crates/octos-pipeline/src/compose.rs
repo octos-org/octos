@@ -23,6 +23,10 @@ pub enum ComposeError {
     Compile(String),
     /// The compiled graph contains a cycle.
     Cycle(String),
+    /// The compiled graph failed structural validation (no/ambiguous start node,
+    /// unreachable nodes, fanout `converge` target missing, edge-condition parse,
+    /// …) — the same rules the executor runs, surfaced here for repair.
+    Structural(Vec<String>),
     /// The compiled graph violated the autonomy profile.
     Profile(Vec<ProfileViolation>),
 }
@@ -37,6 +41,9 @@ impl ComposeError {
                 "cycle: {m}. If this is an intentional retry/guard loop, set \
                  \"back_edge\": true on the looping edge; otherwise remove the cycle."
             )],
+            ComposeError::Structural(errs) => {
+                errs.iter().map(|e| format!("structural: {e}")).collect()
+            }
             ComposeError::Profile(vs) => vs
                 .iter()
                 .map(|v| match &v.node {
@@ -62,16 +69,98 @@ pub fn compose(ir_json: &str, profile: &ValidationProfile) -> Result<PipelineGra
     let ir: PipelineIr =
         serde_json::from_str(ir_json).map_err(|e| ComposeError::Parse(e.to_string()))?;
     let graph = ir::compile(&ir).map_err(|e| ComposeError::Compile(e.to_string()))?;
-    // Use the engine's marker-aware cycle rule, not the naive all-cycle check:
-    // intentional retry/guard back-edges (IrEdge.back_edge) are permitted.
-    if let Err(cycle) = crate::validate::detect_cycles_ignoring_marked_back_edges(&graph) {
+    // Cycle gate: exempt ONLY edges explicitly marked back_edge (label set by
+    // ir::compile from IrEdge.back_edge). Unlike the DOT helper this does NOT
+    // honor retry/guard keywords in edge CONDITION text, so an LLM's accidental
+    // wording can't bypass the cycle gate.
+    if let Err(cycle) = detect_cycle_ir(&graph) {
         return Err(ComposeError::Cycle(cycle));
+    }
+    // Structural validation (start node, reachability, fanout converge target,
+    // edge-condition parse, …) — the same rules the executor runs, so a bad IR
+    // fails foreground compose instead of dead-ending in the background run and
+    // defeating the repair loop. Models/tools come from the trusted contract, so
+    // declare them known to avoid spurious unknown-model/-tool diagnostics.
+    let known_models: Vec<String> = graph
+        .nodes
+        .values()
+        .filter_map(|n| n.model.clone())
+        .collect();
+    let known_tools: Vec<String> = graph
+        .nodes
+        .values()
+        .flat_map(|n| n.tools.iter().cloned())
+        .collect();
+    let ctx = crate::validate::ValidationContext::default()
+        .with_known_models(known_models)
+        .with_known_tools(known_tools);
+    let diags = crate::validate::diagnostics_with_context(&graph, &ctx);
+    if crate::validate::has_errors(&diags) {
+        let errs: Vec<String> = diags
+            .iter()
+            .filter(|d| d.severity == crate::validate::Severity::Error)
+            .map(|d| format!("{}: {}", d.rule_id.code(), d.message))
+            .collect();
+        return Err(ComposeError::Structural(errs));
     }
     let violations = validate_under_profile(&graph, profile);
     if !violations.is_empty() {
         return Err(ComposeError::Profile(violations));
     }
     Ok(graph)
+}
+
+/// Cycle detection for the IR path: exempts ONLY edges explicitly marked as a
+/// back-edge (`label == "back_edge"`, set by `ir::compile` from `back_edge:
+/// true`). Does NOT honor retry/guard keywords in edge condition text.
+fn detect_cycle_ir(graph: &PipelineGraph) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in &graph.edges {
+        if e.label.as_deref() == Some("back_edge") {
+            continue;
+        }
+        adj.entry(e.source.as_str())
+            .or_default()
+            .push(e.target.as_str());
+    }
+    fn dfs<'a>(
+        node: &'a str,
+        adj: &HashMap<&str, Vec<&'a str>>,
+        gray: &mut HashSet<&'a str>,
+        black: &mut HashSet<&'a str>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<(), String> {
+        gray.insert(node);
+        path.push(node);
+        if let Some(neighbors) = adj.get(node) {
+            for &next in neighbors {
+                if black.contains(next) {
+                    continue;
+                }
+                if gray.contains(next) {
+                    let start = path.iter().position(|&n| n == next).unwrap_or(0);
+                    let mut cyc: Vec<&str> = path[start..].to_vec();
+                    cyc.push(next);
+                    return Err(format!("cycle detected: {}", cyc.join(" -> ")));
+                }
+                dfs(next, adj, gray, black, path)?;
+            }
+        }
+        path.pop();
+        gray.remove(node);
+        black.insert(node);
+        Ok(())
+    }
+    let mut gray = HashSet::new();
+    let mut black = HashSet::new();
+    let mut path = Vec::new();
+    for node in graph.nodes.keys() {
+        if !black.contains(node.as_str()) {
+            dfs(node.as_str(), &adj, &mut gray, &mut black, &mut path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Convenience: compose under the L2 default profile.
@@ -123,24 +212,59 @@ mod tests {
 
     #[test]
     fn should_accept_marked_back_edge_loop() {
-        // The retry/revision loop pattern real LLMs author: a gate that loops
-        // back on failure, marked as an intentional back-edge.
+        // The retry/revision loop pattern real LLMs author: an entry node, then
+        // a gate that loops back to work on failure, marked as a back-edge.
         let json = r#"{
             "id":"p",
             "nodes":[
-                {"id":"g","kind":{"type":"gate"}},
-                {"id":"w","kind":{"type":"transform","prompt":"do work"}}
+                {"id":"start","kind":{"type":"research","prompt":"begin"}},
+                {"id":"work","kind":{"type":"transform","prompt":"do work"}},
+                {"id":"check","kind":{"type":"gate"}}
             ],
             "edges":[
-                {"source":"g","target":"w"},
-                {"source":"w","target":"g","condition":"outcome.status == \"fail\"","back_edge":true}
+                {"source":"start","target":"work"},
+                {"source":"work","target":"check"},
+                {"source":"check","target":"work","condition":"outcome.status == \"fail\"","back_edge":true}
             ]
         }"#;
         assert!(
             compose_l2(json).is_ok(),
-            "a marked retry loop should compose: {:?}",
+            "a marked retry loop with an entry node should compose: {:?}",
             compose_l2(json).err()
         );
+    }
+
+    #[test]
+    fn should_reject_unmarked_cycle_even_with_retry_in_condition() {
+        // P2b: an unmarked cycle whose condition merely contains the word
+        // "retry" must NOT bypass the cycle gate (the IR path honors only the
+        // explicit back_edge flag, not condition keywords).
+        let json = r#"{
+            "id":"p",
+            "nodes":[
+                {"id":"a","kind":{"type":"gate"}},
+                {"id":"b","kind":{"type":"gate"}}
+            ],
+            "edges":[
+                {"source":"a","target":"b"},
+                {"source":"b","target":"a","condition":"outcome.content contains \"retry\""}
+            ]
+        }"#;
+        assert!(matches!(compose_l2(json), Err(ComposeError::Cycle(_))));
+    }
+
+    #[test]
+    fn should_reject_structurally_invalid_ir() {
+        // P2a: a fanout whose converge target does not exist must fail compose
+        // (structural), not slip through to the background run.
+        let json = r#"{
+            "id":"p",
+            "nodes":[
+                {"id":"f","kind":{"type":"fanout","worker_prompt":"do {task}","converge":"ghost"}}
+            ],
+            "edges":[]
+        }"#;
+        assert!(matches!(compose_l2(json), Err(ComposeError::Structural(_))));
     }
 
     #[test]

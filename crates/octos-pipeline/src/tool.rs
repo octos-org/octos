@@ -458,7 +458,7 @@ impl Tool for RunPipelineTool {
              one fits. (b) For an ad-hoc multi-step task, compose your own \
              workflow as a typed-IR program in `ir`: a closed, capability-safe \
              palette of node kinds (research, transform, synthesize, gate, \
-             fanout, human_gate). You choose the kinds, their prompts, and how \
+             fanout). You choose the kinds, their prompts, and how \
              they connect — capability (tools/model) is fixed per kind, so you \
              never request shell or tools directly. Use `ir` to offload \
              research→synthesize, fan-out→converge, or gated retry loops to the \
@@ -521,7 +521,7 @@ impl Tool for RunPipelineTool {
         if self.ir_enabled {
             schema["properties"]["ir"] = serde_json::json!({
                 "type": "string",
-                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\",\"back_edge\":<opt bool>}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (final writeup), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"}, {\"type\":\"human_gate\",\"resolver\":\"<name>\"}. There are no tools/handler/model fields — capability is fixed per kind. For an intentional retry/revision loop set \"back_edge\":true on the looping edge."
+                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\",\"back_edge\":<opt bool>}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (final writeup), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"}. There are no tools/handler/model fields — capability is fixed per kind. For an intentional retry/revision loop set \"back_edge\":true on the looping edge."
             });
             schema["required"] = serde_json::json!(["input"]);
         }

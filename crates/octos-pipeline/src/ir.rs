@@ -78,8 +78,11 @@ pub enum IrNodeKind {
         #[serde(default)]
         max_tasks: Option<u32>,
     },
-    /// Human approval / input gate.
-    HumanGate { resolver: String },
+    // NOTE: a `human_gate` kind was intentionally NOT included — the pipeline
+    // executor does not route human-input gates through a real approval
+    // handler (a bare Gate node defaults its condition to `true` and
+    // auto-passes), so advertising one would be a silent approval bypass.
+    // Re-add only once a HumanInputProvider-backed handler is wired.
 }
 
 /// One directed edge. `condition` is an expression evaluated for routing.
@@ -136,11 +139,6 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
             handler: HandlerKind::DynamicParallel,
             allowed_tools: &["read_file"],
             model: Some("cheap"),
-        },
-        IrNodeKind::HumanGate { .. } => PaletteContract {
-            handler: HandlerKind::Gate,
-            allowed_tools: &[],
-            model: None,
         },
     }
 }
@@ -228,10 +226,6 @@ fn compile_node(n: &IrNode) -> PipelineNode {
             node.converge = Some(converge.clone());
             node.max_tasks = *max_tasks;
         }
-        IrNodeKind::HumanGate { resolver } => {
-            node.human_gate = true;
-            node.resolver = Some(resolver.clone());
-        }
     }
     node
 }
@@ -260,15 +254,14 @@ mod tests {
                 {"id":"t","kind":{"type":"transform","prompt":"clean"}},
                 {"id":"g","kind":{"type":"gate"}},
                 {"id":"f","kind":{"type":"fanout","worker_prompt":"do {task}","converge":"s"}},
-                {"id":"h","kind":{"type":"human_gate","resolver":"operator"}},
                 {"id":"s","kind":{"type":"synthesize","prompt":"write"}}
             ],
             "edges":[{"source":"r","target":"s"}]
         }"#;
         let ir = parse(json);
-        assert_eq!(ir.nodes.len(), 6);
+        assert_eq!(ir.nodes.len(), 5);
         let g = compile(&ir).expect("compiles");
-        assert_eq!(g.nodes.len(), 6);
+        assert_eq!(g.nodes.len(), 5);
         assert_eq!(g.edges.len(), 1);
     }
 
@@ -280,7 +273,6 @@ mod tests {
             r#"{"type":"synthesize","prompt":"x"}"#,
             r#"{"type":"gate"}"#,
             r#"{"type":"fanout","worker_prompt":"x","converge":"c"}"#,
-            r#"{"type":"human_gate","resolver":"op"}"#,
         ];
         for k in kinds {
             let json = format!(r#"{{"id":"p","nodes":[{{"id":"n","kind":{k}}}]}}"#);
