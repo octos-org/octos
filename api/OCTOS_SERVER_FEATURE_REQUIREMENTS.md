@@ -78,6 +78,7 @@ logs, prompt text, or private implementation details.
 | SRV-038 | Auth and profile isolation | P0 | WebSocket/API requests are authenticated, profile scoped, and cannot read/control sessions or tasks outside the authorized profile/session. | auth tests |
 | SRV-039 | Metrics and audit | P1 | Server records counters for dropped sends, replay-lossy, approval decisions, task terminal states, tool failures, and task-control commands. | metrics tests |
 | SRV-040 | Live coding UX support | P1 | Server emits enough structured data for clients to show model working state, tool cards, approvals, diffs, plan/task progress, final recap, and background task status without parsing assistant prose. | long coding tmux harness |
+| SRV-041 | Structured user-question lifecycle | P0 | Server emits `user_question/requested` with 1–4 structured questions (header, question, 2–4 options, multi_select, free-text "Other") plus mandatory generic title/body fallback; accepts `user_question/respond`, correlates it to the waiting turn/tool by `question_id`, and resumes the turn only on a valid match. Pending questions are cancelled on turn interrupt and are durable enough for reconnecting clients to render true state. Clients lacking `user_question.v1` receive the agent tool's structured-metadata/generic-text fallback instead of a hard block. | user-question unit and e2e tests; interrupt-drain and reconnect tests |
 
 ## Major Server Flows
 

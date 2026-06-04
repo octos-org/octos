@@ -72,6 +72,7 @@ truth.
 | APP-034 | Build and packaging | P0 | App builds on supported platforms, has reproducible release profile, and CI runs store/transport/app checks. | CI |
 | APP-035 | Observability | P1 | App records sanitized telemetry for connection failures, protocol errors, approval failures, task output failures, and panics. | telemetry tests |
 | APP-036 | Client parity | P0 | App behavior remains protocol-compatible with `octos-tui` for core flows: session, turns, approvals, diffs, tasks, replay, cwd, and errors. | shared fixture tests |
+| APP-037 | Structured user-question picker | P0 | `user_question/requested` renders a question picker (single/multi-select options plus a free-text "Other") for each of the 1–4 questions, with generic title/body fallback when the structured `questions` field is unknown. The picker sends `user_question/respond` with the correct `question_id` and per-question `answers` (selected labels + optional free text). Stale/expired questions render as decided/expired, not as pending. | UI snapshot and contract tests |
 
 ## Major Interaction Flows
 
