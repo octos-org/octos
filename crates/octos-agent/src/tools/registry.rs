@@ -170,7 +170,28 @@ pub struct ToolRegistry {
     session_key: Option<String>,
     /// Precomputed output directory hint for spawn_only tool messaging.
     output_dir_hint: Option<String>,
+    /// Global per-tool execution-timeout backstop (seconds) enforced at the
+    /// dispatch boundary in `execute_with_context` (Gap 3.3). A hung
+    /// foreground tool degrades to a failed `ToolResult` after this many
+    /// seconds instead of wedging the caller (e.g. the session-actor turn).
+    ///
+    /// Defaults to [`DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS`] (1800s) so it never
+    /// fires before the agent loop's own per-batch timeout on that path, and
+    /// so genuinely long-running foreground tools (`web_fetch`, `browser`,
+    /// deep research/crawl) have generous headroom. A tool can tighten this
+    /// for itself via [`Tool::execution_timeout_secs`]; the per-tool override
+    /// wins when present. `spawn_only` tools never reach this path (they are
+    /// backgrounded earlier in the execution loop).
+    tool_timeout_secs: u64,
 }
+
+/// Default per-tool execution-timeout backstop (seconds) for the registry
+/// dispatch boundary. Matches the agent loop's `MAX_TOOL_TIMEOUT_SECS`
+/// (1800s / 30 min) so this guard is a pure safety net for hung tools and
+/// for direct registry callers that do not run under the agent loop's
+/// per-batch timeout — it never pre-empts a tool the LLM legitimately
+/// requested up to 1800s for.
+pub const DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS: u64 = 1800;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -198,7 +219,21 @@ impl ToolRegistry {
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: None,
+            tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
         }
+    }
+
+    /// Set the global per-tool execution-timeout backstop (seconds) enforced
+    /// at the dispatch boundary (Gap 3.3). A value of `0` is clamped up to
+    /// `1` so the guard is always live. Per-tool overrides via
+    /// [`Tool::execution_timeout_secs`] still win when present.
+    pub fn set_tool_timeout_secs(&mut self, secs: u64) {
+        self.tool_timeout_secs = secs.max(1);
+    }
+
+    /// The global per-tool execution-timeout backstop (seconds).
+    pub fn tool_timeout_secs(&self) -> u64 {
+        self.tool_timeout_secs
     }
 
     /// Mark a tool name as coming from a plugin binary.
@@ -831,6 +866,7 @@ impl ToolRegistry {
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
+            tool_timeout_secs: self.tool_timeout_secs,
         };
         // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
         // Arcs still point to the PARENT's catalog cell. Re-register
@@ -1148,7 +1184,71 @@ impl ToolRegistry {
         // Track usage for LRU auto-eviction
         self.record_usage(name);
 
-        tool.execute_with_context(ctx, args).await
+        // Gap 3.3: per-tool execution timeout. A hung foreground tool used to
+        // block the caller's turn (the session actor's "10-min opaque
+        // pipeline" / hung-tool class) indefinitely — the agent loop's
+        // per-batch timeout only guards the agent::execution dispatch path,
+        // leaving direct registry callers (serve/API tool path, workspace
+        // contract auto-send) unbounded. This dispatch-boundary timeout
+        // bounds EVERY caller. The per-tool override
+        // (`Tool::execution_timeout_secs`) wins when present; otherwise the
+        // registry's generous global backstop applies. `spawn_only` tools are
+        // intercepted/backgrounded earlier and never reach this path.
+        let timeout_secs = tool
+            .execution_timeout_secs()
+            .unwrap_or(self.tool_timeout_secs)
+            .max(1);
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        // Layer 2 (mini5 soak): isolate a tool panic at this single dispatch
+        // boundary. A panic inside a tool used to unwind through the session
+        // actor's task, killing the actor AND every in-process sub-agent it had
+        // spawned (which then got stamped "orphaned across restart"). Catching
+        // it here degrades the panic to a failed ToolResult: the caller sees a
+        // clean tool error and the actor — plus its sub-agents — keeps running.
+        // `catch_unwind` relies on unwind (the default profile). `AssertUnwindSafe`
+        // is sound because on panic we DISCARD the tool's future/state entirely
+        // and return a fresh error; nothing from the poisoned call is reused.
+        //
+        // Timeout and panic-isolation compose: a tool can panic OR time out,
+        // and both degrade to a failed ToolResult. The timeout wraps the
+        // catch_unwind so an elapsed timeout drops the (possibly panicking)
+        // tool future entirely and returns a fresh failure.
+        let invocation = tool.execute_with_context(ctx, args);
+        let guarded = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(invocation));
+        match tokio::time::timeout(timeout, guarded).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(panic)) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::error!(
+                    tool = name,
+                    panic = %detail,
+                    "tool execution panicked — isolated to a tool error; session actor preserved"
+                );
+                Ok(ToolResult {
+                    output: format!("tool '{name}' failed (internal error): {detail}"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    tool = name,
+                    timeout_secs,
+                    "tool execution timed out — degraded to a failed tool error; \
+                     caller turn preserved"
+                );
+                Ok(ToolResult {
+                    output: format!("Tool '{name}' timed out after {timeout_secs}s"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+        }
     }
 }
 
@@ -2289,6 +2389,173 @@ mod context_threading_tests {
             seen.as_deref(),
             Some("call-m8.1"),
             "registry must forward the caller's ToolContext into execute_with_context",
+        );
+    }
+
+    struct PanickingTool;
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn name(&self) -> &str {
+            "panicker"
+        }
+        fn description(&self) -> &str {
+            "test-only: panics on execute"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            panic!("simulated tool panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_panic_is_isolated_to_a_failed_result_not_an_actor_crash() {
+        // mini5 soak (Layer 2): a panicking tool must NOT unwind through the
+        // registry — that would crash the session actor and orphan its
+        // in-process sub-agents. The dispatch boundary catches the panic and
+        // returns a failed ToolResult. This test COMPLETING (rather than
+        // panicking) is itself the core assertion.
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(PanickingTool));
+
+        let result = reg
+            .execute("panicker", &serde_json::json!({}))
+            .await
+            .expect("registry must return Ok(failed result), not propagate the panic");
+        assert!(
+            !result.success,
+            "a panicking tool must yield a failed result"
+        );
+        assert!(
+            result.output.contains("internal error"),
+            "result should flag the internal failure: {}",
+            result.output
+        );
+    }
+
+    /// Tool whose `execute` never completes. Models the mini5 soak's
+    /// "10-min opaque pipeline" / hung-foreground-tool class: without a
+    /// per-tool timeout this would block the session actor's turn forever.
+    struct HangingTool;
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hanger"
+        }
+        fn description(&self) -> &str {
+            "test-only: never completes"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            // Awaits forever; the registry's per-tool timeout must degrade
+            // this to a failed ToolResult rather than wedge the caller.
+            futures::future::pending::<()>().await;
+            unreachable!("pending() never resolves");
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_tool_degrades_to_failed_timeout_result_not_a_hang() {
+        // Gap 3.3: a foreground tool that HANGS must not wedge the caller
+        // (session actor turn). With a short injected timeout the registry
+        // degrades the hang to a failed ToolResult bearing a clear message.
+        // This test COMPLETING (rather than hanging) is itself the core
+        // assertion — `tokio::time::timeout` here is a belt-and-suspenders
+        // backstop in case the registry guard regresses.
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(HangingTool));
+        reg.set_tool_timeout_secs(1);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reg.execute("hanger", &serde_json::json!({})),
+        )
+        .await
+        .expect("registry must return within its own timeout, not hang the caller")
+        .expect("registry must return Ok(failed result), not an Err");
+
+        assert!(
+            !result.success,
+            "a hung tool must yield a failed result, got output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains("timed out") && result.output.contains("hanger"),
+            "result should name the tool and flag the timeout: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_tool_completes_well_within_timeout_no_false_positive() {
+        // A normal fast tool must NOT be killed by the per-tool timeout.
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(CapturingTool::new()));
+        reg.set_tool_timeout_secs(1);
+
+        let result = reg
+            .execute("capturing", &serde_json::json!({}))
+            .await
+            .expect("fast tool must succeed");
+        assert!(
+            result.success,
+            "fast tool must not trip the timeout, got output={}",
+            result.output
+        );
+    }
+
+    /// Tool that sleeps longer than the global default but overrides
+    /// `execution_timeout_secs` to a tight bound, proving the per-tool
+    /// override path is honoured.
+    struct SlowOverrideTool;
+
+    #[async_trait]
+    impl Tool for SlowOverrideTool {
+        fn name(&self) -> &str {
+            "slow_override"
+        }
+        fn description(&self) -> &str {
+            "test-only: sleeps forever but caps its own timeout"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn execution_timeout_secs(&self) -> Option<u64> {
+            Some(1)
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            futures::future::pending::<()>().await;
+            unreachable!("pending() never resolves");
+        }
+    }
+
+    #[tokio::test]
+    async fn per_tool_timeout_override_is_honored() {
+        // The tool caps itself at 1s via `execution_timeout_secs`, so even
+        // with the registry's long default backstop it times out fast.
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(SlowOverrideTool));
+        // Leave the registry default at its long backstop; the per-tool
+        // override must win.
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reg.execute("slow_override", &serde_json::json!({})),
+        )
+        .await
+        .expect("per-tool override must bound execution, not hang")
+        .expect("registry must return Ok(failed result)");
+
+        assert!(!result.success, "override timeout must fail the tool");
+        assert!(
+            result.output.contains("timed out"),
+            "override timeout result must flag the timeout: {}",
+            result.output
         );
     }
 

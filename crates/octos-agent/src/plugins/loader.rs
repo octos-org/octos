@@ -7,6 +7,7 @@ use eyre::Result;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::agent::MAX_TOOL_TIMEOUT_SECS;
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
@@ -534,9 +535,19 @@ impl PluginLoader {
         // Collect env vars to filter out
         let blocked_env: Vec<String> = BLOCKED_ENV_VARS.iter().map(|s| s.to_string()).collect();
 
+        // Cancellation-safety (codex review of 7c3e5eac): clamp a manifest
+        // `timeout_secs` to the registry's per-tool backstop
+        // (`MAX_TOOL_TIMEOUT_SECS` = 1800s). The registry wraps every tool in a
+        // `tokio::time::timeout` at the dispatch boundary; if a plugin manifest
+        // declared a timeout LARGER than that backstop, the registry guard
+        // would preempt the plugin's own graceful kill branch — dropping the
+        // future before the plugin could process-group-kill its child. Clamping
+        // here guarantees the plugin's own `self.timeout` always fires first,
+        // so the graceful kill path runs before the registry backstop ever
+        // engages. (`kill_on_drop(true)` is the orphan backstop regardless.)
         let timeout = manifest
             .timeout_secs
-            .map(Duration::from_secs)
+            .map(|secs| Duration::from_secs(secs.min(MAX_TOOL_TIMEOUT_SECS)))
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
         // Collect spawn_only tool names and messages before consuming
@@ -2169,6 +2180,97 @@ edition = "2021"
             .prepare_effective_args(&serde_json::json!({"query": "x"}), None)
             .unwrap();
         assert_eq!(prepared["synthesis_config"]["api_key"], "sk-loader-test");
+    }
+
+    /// Cancellation-safety (codex review of 7c3e5eac): a plugin manifest that
+    /// declares `timeout_secs` LARGER than the registry's per-tool backstop
+    /// (`MAX_TOOL_TIMEOUT_SECS` = 1800s) must be clamped at load. Otherwise the
+    /// registry's dispatch-boundary `tokio::time::timeout` would preempt the
+    /// plugin's own graceful kill branch — dropping the future before the
+    /// plugin could process-group-kill its child.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_timeout_secs_is_clamped_to_registry_backstop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("slow-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // 7200s (2h) — far above the 1800s registry backstop.
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+              "name": "slow-plugin",
+              "version": "1.0",
+              "timeout_secs": 7200,
+              "tools": [{
+                "name": "slow",
+                "description": "Long runner",
+                "input_schema": {"type": "object", "properties": {}}
+              }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("slow-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (tools, _extras) =
+            PluginLoader::load_plugin_with_options(&plugin_dir, &[], PluginLoadOptions::default())
+                .unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].timeout(),
+            Duration::from_secs(MAX_TOOL_TIMEOUT_SECS),
+            "manifest timeout_secs > MAX_TOOL_TIMEOUT_SECS must be clamped to the backstop \
+             so the plugin's own kill path fires before the registry guard preempts it"
+        );
+    }
+
+    /// A manifest timeout at or below the backstop is preserved verbatim.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_timeout_secs_below_backstop_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("brisk-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+              "name": "brisk-plugin",
+              "version": "1.0",
+              "timeout_secs": 120,
+              "tools": [{
+                "name": "brisk",
+                "description": "Quick runner",
+                "input_schema": {"type": "object", "properties": {}}
+              }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("brisk-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (tools, _extras) =
+            PluginLoader::load_plugin_with_options(&plugin_dir, &[], PluginLoadOptions::default())
+                .unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].timeout(), Duration::from_secs(120));
     }
 
     #[cfg(unix)]

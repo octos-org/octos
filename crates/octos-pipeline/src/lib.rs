@@ -40,7 +40,7 @@ pub use executor::{
     PIPELINE_DEADLINE_EXCEEDED_TOTAL, PipelineExecutor, PipelineResult, PipelineStatusBridge,
     deadline_exceeded_count,
 };
-pub use fidelity::FidelityMode;
+pub use fidelity::{DEFAULT_RESULT_CEILING_BYTES, FidelityMode, apply_result_ceiling};
 pub use graph::{
     DeadlineAction, HandlerKind, MissionCheckpoint, NodeOutcome, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode, Subgraph, validate_pipeline_id,

@@ -249,6 +249,9 @@ mod tests {
         let builder = ProfileActorFactoryBuilder {
             profile_store: store,
             project_dir: project_dir.clone(),
+            // Gap 4.1 BLOCKER 1: in this admin-parent test `--octos-home` is
+            // effectively the same dir, so mirror `project_dir`.
+            effective_octos_home: project_dir.clone(),
             tool_config,
             memory,
             memory_store,
@@ -272,6 +275,10 @@ mod tests {
             plugin_prompt_fragments: vec![],
             no_retry: false,
             sandbox_config: octos_agent::SandboxConfig::default(),
+            task_query_store: crate::session_actor::SessionTaskQueryStore::default(),
+            subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
+                base_data_dir.join("subagent-out"),
+            )),
             host_plugins: Default::default(),
         };
 

@@ -232,6 +232,7 @@ mod tests {
             default_model: None,
             max_total_tokens: None,
             default_timeout_secs: None,
+            result_fidelity: None,
             nodes,
             edges,
             subgraphs: Vec::new(),

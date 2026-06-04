@@ -459,6 +459,21 @@ impl GatewayRuntime {
         if n > 0 {
             info!(count = n, "bootstrapped platform skills");
         }
+        // Gap 4.1 BLOCKER 2: bundle generic pipelines (deep_research) into
+        // <effective_octos_home>/bundled-pipelines so `run_pipeline` always
+        // discovers them even when the per-profile `mofa-research` skill has
+        // drifted. The invariant is bootstrap-dir == search-dir: the
+        // non-profile pipeline factory below calls
+        // `with_octos_home(effective_octos_home)` UNCONDITIONALLY, so the
+        // dir we bootstrap into here is exactly the dir discovery searches.
+        // (Previously bootstrap used `project_dir` = cwd/.octos while the
+        // factory only searched `<data_dir>/...` when `--octos-home` was set,
+        // so the bundle landed where the tool never looked.) Installed
+        // pipelines of the same name still win (bundled dir is searched last).
+        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&effective_octos_home);
+        if n > 0 {
+            info!(count = n, "bootstrapped bundled pipelines");
+        }
 
         // Voice transcription via voice platform skill binary (after bootstrap)
         let voice_binary_path = project_dir
@@ -928,7 +943,14 @@ impl GatewayRuntime {
                 let policy_c = tools.provider_policy().cloned();
                 let plugins_c = plugin_dirs_for_spawn.clone();
                 let router_c = provider_router.clone();
-                let octos_home_c = cmd.octos_home.clone();
+                // Gap 4.1 BLOCKER 2: use `effective_octos_home` (always
+                // resolved: --octos-home > data_dir) — NOT the raw
+                // `cmd.octos_home` Option — so discovery searches the exact
+                // root the bundle was bootstrapped into above. With the raw
+                // Option, the default (no --octos-home) path skipped
+                // `with_octos_home` entirely and the bundled `deep_research`
+                // was never discoverable.
+                let octos_home_c = effective_octos_home.clone();
                 // Section B (codex review follow-up): capture the host's
                 // strict-signing flag so per-session `RunPipelineTool`
                 // instances honour the same `plugins.require_signed` gate.
@@ -942,7 +964,13 @@ impl GatewayRuntime {
                     policy: Option<octos_agent::ToolPolicy>,
                     plugin_dirs: Vec<PathBuf>,
                     router: Option<Arc<ProviderRouter>>,
-                    octos_home: Option<PathBuf>,
+                    /// Gap 4.1 BLOCKER 2: always-resolved octos root
+                    /// (--octos-home > data_dir). `with_octos_home` is
+                    /// called UNCONDITIONALLY in `create`, so discovery
+                    /// searches the same root the bundle was bootstrapped
+                    /// into. Previously `Option<PathBuf>` from the raw flag,
+                    /// which skipped discovery on the default path.
+                    octos_home: PathBuf,
                     plugin_require_signed: bool,
                     /// NEW-06 fix: forwarded to every worker `Agent`
                     /// via `RunPipelineTool::with_embedder` so
@@ -962,12 +990,13 @@ impl GatewayRuntime {
                         )
                         .with_provider_policy(self.policy.clone())
                         .with_plugin_dirs(self.plugin_dirs.clone())
-                        .with_plugin_require_signed(self.plugin_require_signed);
+                        .with_plugin_require_signed(self.plugin_require_signed)
+                        // BLOCKER 2: unconditional — registers
+                        // <octos_home>/{skills,pipelines} (installed) and
+                        // <octos_home>/bundled-pipelines (bundled, last).
+                        .with_octos_home(self.octos_home.clone());
                         if let Some(ref router) = self.router {
                             pt = pt.with_provider_router(router.clone());
-                        }
-                        if let Some(ref octos_home) = self.octos_home {
-                            pt = pt.with_octos_home(octos_home.clone());
                         }
                         if let Some(ref embedder) = self.embedder {
                             pt = pt.with_embedder(embedder.clone());
@@ -1259,6 +1288,13 @@ impl GatewayRuntime {
                 .map(|store| ProfileActorFactoryBuilder {
                     profile_store: store.clone(),
                     project_dir: project_dir.clone(),
+                    // Gap 4.1 BLOCKER 1: thread the SAME `effective_octos_home`
+                    // the bundled pipelines were bootstrapped into (line ~473)
+                    // and the non-profile pipeline factory uses (line ~953) so
+                    // the child-profile `run_pipeline` discovers exactly that
+                    // dir. `project_dir` (= cwd/.octos when `--octos-home` is
+                    // absent) would search a dir bootstrap never wrote.
+                    effective_octos_home: effective_octos_home.clone(),
                     tool_config: tool_config.clone(),
                     memory: memory.clone(),
                     memory_store: memory_store.clone(),

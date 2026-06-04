@@ -447,7 +447,10 @@ Task and progress:
 
 Projection and session bridging (accepted `UPCR-2026-014`):
 
-- `projection/envelope`
+- `projection/envelope` — wire `params` carries the bare `Envelope`
+  fields FLATTENED with the routing keys `session_id` (bare base key) +
+  optional `topic`, so a multi-session client can route each envelope
+  (`feat(envelope-wire-routing)`); see § 14.1.
 - `file/attached`
 - `session/event`
 
@@ -1916,9 +1919,33 @@ Wire shape (JSON):
   "thread_id": "thread-1",
   "seq": 18,
   "client_message_id": "01900000-0000-7000-8000-000000000001",
-  "payload": { "type": "...", "data": { ... } }
+  "payload": { "type": "...", "data": { ... } },
+  "session_id": "local:demo",
+  "topic": "planning"
 }
 ```
+
+The `projection/envelope` notification's JSON-RPC `params` is the bare
+`Envelope` fields (`thread_id`, `seq`, `client_message_id?`, `payload`)
+FLATTENED with the routing keys `session_id` and optional `topic`. The
+routing keys let a multi-session client (e.g. the TUI, which holds
+several sessions on one connection) route each envelope to the correct
+session and topic-scoped pane. The bare `Envelope` keys remain at the
+top level, so a client that reads `thread_id`/`seq`/`payload` top-level
+and ignores unknown keys decodes the frame unchanged — the routing
+addition is backward-compatible. A decoder that receives an OLD frame
+lacking `session_id`/`topic` defaults `session_id` to the empty key and
+`topic` to absent, and falls back to its ambient connection context for
+routing.
+
+> History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
+> BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
+> only on the durable ledger's on-disk record. That left a multi-session
+> consumer with an unroutable empty `session_id`. The wire is now
+> un-stripped (`feat(envelope-wire-routing)`); the **disk** record shape
+> — a NESTED `{ session_id, topic, envelope }` object via the
+> `EnvelopeNotification` derive — is UNCHANGED, so post-restart
+> topic-scoped replay still routes (BLOCKER 4's actual invariant holds).
 
 Field contract:
 
@@ -1935,6 +1962,12 @@ Field contract:
   server emitting `client_message_id` on a non-`user_message` envelope
   is a wire contract violation.
 - `payload` (object, required) — Sealed tagged union; see § 14.2.
+- `session_id` (`string`, optional on the wire for backward-compat,
+  always emitted by current servers) — The bare base session key for
+  client-side routing. A multi-session client routes the envelope to
+  this session; the projection itself does not consult it.
+- `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
+  Omitted when the envelope is not topic-scoped.
 
 Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
 in `octos-core::ui_protocol`. TS source: `Envelope` in

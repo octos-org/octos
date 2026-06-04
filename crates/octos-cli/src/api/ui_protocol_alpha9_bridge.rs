@@ -870,6 +870,7 @@ mod tests {
             task_id: Some("test-task".into()),
             originating_client_message_id: Some("test-cmid".into()),
             tool_call_id: Some(tool_call_id.to_string()),
+            terminal_status: None,
         }
     }
 
@@ -1554,5 +1555,58 @@ mod tests {
         } else {
             panic!("expected envelope variant");
         }
+    }
+
+    /// feat(envelope-wire-routing): an envelope emitted through the
+    /// ledger at a real (bare base) session key MUST carry that
+    /// `session_id` on the JSON-RPC WIRE form so a multi-session client
+    /// can route it. This pins the end-to-end serve path: emit →
+    /// `EnvelopeNotification` (with real session_id) →
+    /// `into_rpc_notification` (now flattens session_id onto the wire).
+    /// RED before the core wire change (wire stripped session_id).
+    #[test]
+    fn emitted_envelope_wire_form_carries_session_id_for_routing() {
+        use octos_core::ui_protocol::Payload;
+
+        let ledger = UiProtocolLedger::new(32);
+        let session = SessionKey::new("api", "wire-routing");
+
+        let ledgered = ledger
+            .emit_envelope(
+                &session,
+                "thread-route".into(),
+                Payload::AssistantDelta {
+                    text: "routed".into(),
+                },
+                None,
+            )
+            .expect("emit");
+
+        let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(notif) =
+            ledgered.event
+        else {
+            panic!("expected notification event");
+        };
+
+        // Drive the real WIRE serialization the server uses on the WS.
+        let rpc = notif
+            .into_rpc_notification()
+            .expect("serialize envelope to wire");
+        assert_eq!(rpc.method, "projection/envelope");
+        assert_eq!(
+            rpc.params.get("session_id"),
+            Some(&serde_json::json!("api:wire-routing")),
+            "the emitted envelope's wire form must carry session_id so the \
+             client can route it to the right session",
+        );
+        // Bare envelope fields remain top-level (web-bridge compat).
+        assert_eq!(
+            rpc.params.get("thread_id"),
+            Some(&serde_json::json!("thread-route")),
+        );
+        assert!(
+            rpc.params.get("envelope").is_none(),
+            "wire is flattened, not nested under `envelope`",
+        );
     }
 }

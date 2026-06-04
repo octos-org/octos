@@ -25,6 +25,12 @@ use octos_core::{SessionScope, TokenUsage};
 pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
     "pipeline workers don't yet propagate ContextManager (M17-B)";
 
+/// Gap 4.1 — the sanctioned generic pipeline name. Bundled into the binary
+/// via `octos_agent::bundled_pipelines` and used as the no-discovery fallback
+/// for the `run_pipeline` `pipeline` arg enum so the advertised choices are
+/// never empty even before bootstrap has written the `.dot`.
+const FALLBACK_PIPELINE_NAME: &str = "deep_research";
+
 /// Phase 2-A of the [`SessionScope`] migration (load-bearing follow-up
 /// to PR #1199 / Phase 1).
 ///
@@ -114,14 +120,14 @@ pub struct RunPipelineTool {
     contract_id: Option<String>,
     /// NEW-06 fix: optional embedder for hybrid memory search.
     ///
-    /// Without this set, worker `Agent` instances spawned per pipeline
-    /// node fall through to the unfiltered cwd-only fallback path in
-    /// `EpisodeStore::find_relevant` — which only does keyword overlap
-    /// plus CWD filtering, NOT the modality-aware similarity gate in
-    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`]. The
-    /// gateway / serve runtimes own the embedder; this lets the
-    /// orchestrator propagate it down to pipeline workers so episodic
-    /// memory recall is contamination-safe end-to-end.
+    /// Without this set, worker `Agent` instances spawned per pipeline node
+    /// SKIP episodic memory recall entirely (the no-embedder branch in
+    /// `octos_agent::agent::memory`): BM25-only keyword recall within a single
+    /// shared workspace can't discriminate on-task from cross-task episodes, so
+    /// it would leak stale unrelated memory. The gateway / serve runtimes own
+    /// the embedder; this lets the orchestrator propagate it down to pipeline
+    /// workers so episodic memory recall is available AND contamination-safe
+    /// end-to-end.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     /// S1-5: opt-in gate for the typed-IR ([`crate::ir`]) authoring path.
     /// When false (default) the tool only runs sanctioned named pipelines /
@@ -277,11 +283,31 @@ impl RunPipelineTool {
         }
     }
 
-    /// Add the global octos-home skills directory as a search path.
-    /// This ensures pipelines installed globally (e.g. `~/.octos/skills/`) are
-    /// discoverable even when data_dir is per-profile.
+    /// Add the global octos-home skills + pipelines directories as search
+    /// paths. This ensures pipelines installed globally (e.g.
+    /// `~/.octos/skills/`, `~/.octos/pipelines/`) are discoverable even when
+    /// `data_dir` is per-profile (the per-profile discovery default only
+    /// searches `<profile_data_dir>/pipelines`, not the shared home).
+    ///
+    /// Gap 4.1 BLOCKER 3: the bundled generic pipelines written to
+    /// `~/.octos/bundled-pipelines/` by `bootstrap_bundled_pipelines` are
+    /// registered as a LOWEST-precedence search path (via
+    /// `add_bundled_pipelines_dir`), so an installed `deep_research.dot` in
+    /// any skills/pipelines location always wins over the bundled fallback.
     pub fn with_octos_home(mut self, octos_home: PathBuf) -> Self {
         self.discovery.add_search_path(octos_home.join("skills"));
+        self.discovery.add_search_path(octos_home.join("pipelines"));
+        self.discovery.add_bundled_pipelines_dir(&octos_home);
+        self
+    }
+
+    /// Register `<root>/bundled-pipelines` as the LOWEST-precedence
+    /// discovery path. Used by the non-octos-home hosts (`octos chat`,
+    /// `octos serve`) that bootstrap the bundle into `<data_dir>/bundled-pipelines`
+    /// but do not otherwise call `with_octos_home`. Keeps bootstrap-dir ==
+    /// search-dir while preserving installed-wins (BLOCKER 2 + BLOCKER 3).
+    pub fn with_bundled_pipelines_root(mut self, root: PathBuf) -> Self {
+        self.discovery.add_bundled_pipelines_dir(&root);
         self
     }
 
@@ -351,7 +377,7 @@ impl RunPipelineTool {
                         .map(|s| s.trim_matches('{'))
                     {
                         if !name.is_empty() {
-                            if let Ok(dot) = self.discovery.resolve(name).await {
+                            if let Ok(dot) = self.resolve_named_with_bundled_fallback(name).await {
                                 tracing::info!(
                                     name,
                                     "fell back to pre-built pipeline after inline DOT parse failure"
@@ -367,8 +393,70 @@ impl RunPipelineTool {
             }
         }
 
-        // Named pipeline or file path — use normal resolution
-        self.discovery.resolve(pipeline_str).await
+        // Named pipeline or file path — use normal resolution, with the
+        // embedded bundled bytes as a final fallback for sanctioned names.
+        self.resolve_named_with_bundled_fallback(pipeline_str).await
+    }
+
+    /// Resolve a pipeline by name/path via on-disk discovery first, falling
+    /// back to the EMBEDDED bundled `.dot` bytes (compiled into the binary
+    /// via `octos_agent::bundled_pipelines`) when discovery cannot find it.
+    ///
+    /// Gap 4.1 NIT 2 — the `run_pipeline` enum advertises the sanctioned
+    /// `deep_research` name unconditionally (it is bundled into the binary).
+    /// Blockers 2+3 make bootstrap write that `.dot` to a discoverable dir on
+    /// every host path, but a degraded filesystem (read-only, quota) could
+    /// still leave discovery empty. Without this in-memory fallback the enum
+    /// would advertise a name the tool cannot resolve — a masking lie that
+    /// `pre_flight_validate` turns into a runtime failure. With it, every
+    /// advertised name resolves: advertise == resolvable on all paths.
+    ///
+    /// Discovery still WINS when it finds a match, so an installed/operator
+    /// `deep_research.dot` overrides the embedded copy (installed-wins is
+    /// preserved — the embedded bytes are strictly a last resort).
+    async fn resolve_named_with_bundled_fallback(&self, name_or_path: &str) -> Result<String> {
+        match self.discovery.resolve(name_or_path).await {
+            Ok(dot) => Ok(dot),
+            Err(discovery_err) => {
+                // Gap 4.1 (codex review): the embedded fallback may fire ONLY
+                // on a TRUE discovery miss (`PipelineResolveError::NotFound`).
+                // If discovery LOCATED an installed candidate but failed to
+                // read/parse it (`PipelineResolveError::Read`, or any other
+                // error kind), propagate that error — falling back would MASK
+                // the broken install and let the bundled copy out-rank a
+                // present installed pipeline ("fallback only on a true miss /
+                // can never out-rank an installed pipeline").
+                let is_true_miss = matches!(
+                    discovery_err.downcast_ref::<crate::discovery::PipelineResolveError>(),
+                    Some(crate::discovery::PipelineResolveError::NotFound { .. })
+                );
+                if !is_true_miss {
+                    return Err(discovery_err);
+                }
+
+                // Match against the embedded bundled pipelines by bare name.
+                // Gap 4.1 BLOCKER 2: canonicalize the input to the SAME bare
+                // file stem discovery uses (strip any directory + trailing
+                // `.dot`) so `deep_research` and `deep_research.dot` match the
+                // embedded bytes identically — and, critically, so this
+                // fallback only runs on a TRUE discovery miss for either form
+                // (when an installed copy exists, discovery now resolves both
+                // forms and this branch is never reached → installed-wins).
+                let want = crate::discovery::pipeline_name_stem(name_or_path.trim());
+                for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
+                    let stem = file_name.strip_suffix(".dot").unwrap_or(file_name);
+                    if want == stem {
+                        tracing::info!(
+                            pipeline = want,
+                            "resolved pipeline from embedded bundled bytes (discovery miss; \
+                             likely a degraded/read-only bootstrap dir)"
+                        );
+                        return Ok(dot.to_string());
+                    }
+                }
+                Err(discovery_err)
+            }
+        }
     }
 
     /// Set the status bridge for the current message.
@@ -386,6 +474,16 @@ impl RunPipelineTool {
     #[doc(hidden)]
     pub fn embedder_for_test(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
         self.embedder.as_ref()
+    }
+
+    /// Doc-hidden test accessor — resolves a pipeline name to its DOT body
+    /// through the same discovery + embedded-bundled-fallback path
+    /// `pre_flight_validate` / `execute` use. Lets the Gap 4.1 tests assert
+    /// installed-wins and the bundled fallback at the resolution boundary
+    /// (which exact `.dot` content wins) without standing up a full run.
+    #[doc(hidden)]
+    pub async fn resolve_named_for_test(&self, name_or_path: &str) -> Result<String> {
+        self.resolve_with_fallback(name_or_path).await
     }
 }
 
@@ -466,14 +564,22 @@ impl Tool for RunPipelineTool {
              errors — fix the `ir` and call again."
         } else {
             "Run a sanctioned multi-step pipeline by NAME. The only currently \
-             sanctioned pipeline is `deep_research` — use it when the user asks \
-             for in-depth, multi-source, source-citing research that needs \
-             parallel search workers + synthesis. Do NOT compose your own \
-             inline DOT graph for ad-hoc tasks (slides, media, code edits, \
-             partial regenerations, etc.) — those have purpose-built tools \
-             (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
+             sanctioned pipeline is `deep_research`, which performs MULTI-SOURCE \
+             WEB-RESEARCH SYNTHESIS: it fans out parallel web-search workers and \
+             synthesizes a source-citing report. Use it ONLY when the user asks \
+             for in-depth, multi-source research drawn from the open web. \
+             deep_research MUST NOT be used for code review, local-codebase \
+             analysis, debugging, or anything answerable from the files already \
+             in the working directory — it has no access to your repository and \
+             will fabricate or recall unrelated material. For those tasks do NOT \
+             call run_pipeline at all; answer directly with the local tools \
+             (`read_file`, `grep`, `glob`, `list_dir`, `shell`). Likewise do NOT \
+             compose your own inline DOT graph for ad-hoc tasks (slides, media, \
+             code edits, partial regenerations, etc.) — those have purpose-built \
+             tools (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
              tool exists for what the user asked, surface that as a limitation \
-             rather than improvising a custom pipeline."
+             rather than improvising a custom pipeline or force-fitting \
+             deep_research."
         }
     }
 
@@ -483,16 +589,42 @@ impl Tool for RunPipelineTool {
 
     fn input_schema(&self) -> serde_json::Value {
         let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
-             sanctioned name is `deep_research`. Do NOT pass an inline \
-             DOT graph here — inline DOT was the legacy free-form \
-             contract; the executor still accepts it for operator \
-             debugging but agent-driven runs MUST use the name form. If \
-             you find yourself wanting to compose your own DOT, the \
-             correct response is to use the purpose-built tool for that \
-             domain (`mofa_slides` for slides, `podcast_generate` for \
-             podcasts, `voice_synthesize` for TTS, etc.), or tell the \
-             user no such tool exists for their request."
+             sanctioned name is `deep_research`, which is for MULTI-SOURCE \
+             WEB-RESEARCH SYNTHESIS ONLY (parallel web-search workers + a \
+             cited synthesis). `deep_research` MUST NOT be selected for code \
+             review, local-codebase analysis, debugging, or any task \
+             answerable from the working directory — those are NOT web \
+             research; answer them directly with the local file/shell tools \
+             (`read_file`, `grep`, `glob`, `list_dir`, `shell`) instead of \
+             calling run_pipeline. Do NOT pass an inline DOT graph here — \
+             inline DOT was the legacy free-form contract; the executor \
+             still accepts it for operator debugging but agent-driven runs \
+             MUST use the name form. If you find yourself wanting to compose \
+             your own DOT, the correct response is to use the purpose-built \
+             tool for that domain (`mofa_slides` for slides, \
+             `podcast_generate` for podcasts, `voice_synthesize` for TTS, \
+             etc.), or tell the user no such tool exists for their request."
             .to_string();
+
+        // Gap 4.1: advertise the LIVE discovery list, not a hard-coded
+        // `["deep_research"]`. The old static enum lied when a profile had
+        // extra installed/bundled pipelines (the model couldn't name them)
+        // and lied the other way when `deep_research` had drifted off the
+        // profile (the model emitted a name that resolved to
+        // `Available: (none)`). Populating from `list_available()` keeps the
+        // advertised choices in lock-step with what `resolve()` can actually
+        // find. No-discovery fallback keeps the sanctioned generic
+        // `deep_research` baseline (it is bundled into the binary), so the
+        // enum is never empty and the model always has the generic pipeline.
+        let mut pipeline_names: Vec<String> = self
+            .discovery
+            .list_available()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        if !pipeline_names.iter().any(|n| n == FALLBACK_PIPELINE_NAME) {
+            pipeline_names.push(FALLBACK_PIPELINE_NAME.to_string());
+        }
 
         let mut schema = serde_json::json!({
             "type": "object",
@@ -500,7 +632,7 @@ impl Tool for RunPipelineTool {
                 "pipeline": {
                     "type": "string",
                     "description": pipeline_desc,
-                    "enum": ["deep_research"]
+                    "enum": pipeline_names
                 },
                 "input": {
                     "type": "string",
@@ -586,23 +718,13 @@ impl Tool for RunPipelineTool {
             ));
         let diags = crate::validate::diagnostics_with_context(&graph, &validation_context);
         if crate::validate::has_errors(&diags) {
-            let errors: Vec<_> = diags
-                .iter()
-                .filter(|d| d.severity == crate::validate::Severity::Error)
-                .map(|d| {
-                    format!(
-                        "{} (rule {}, {:?}): {}",
-                        d.rule_id.code(),
-                        d.rule,
-                        d.location,
-                        d.message
-                    )
-                })
-                .collect();
-            return Err(format!(
-                "pipeline validation failed:\n{}",
-                errors.join("\n")
-            ));
+            // codex pre-merge DO-NOT-SHIP: this spawn_only early-return is
+            // returned verbatim as a tool Message (agent execution.rs) BEFORE
+            // both the per-tool truncation AND the run_pipeline body/footer
+            // ceiling. An unbounded join of validation errors (many errors, or
+            // huge node IDs in a malformed DOT) would therefore emit an
+            // oversized tool result. Bound the message at the source.
+            return Err(format_bounded_preflight_errors(&diags));
         }
         Ok(())
     }
@@ -758,6 +880,11 @@ impl Tool for RunPipelineTool {
         // synthesize-node starvation.
         let dot_default_timeout = graph.default_timeout_secs;
         let timeout_secs = resolve_pipeline_timeout(input.timeout_secs, dot_default_timeout);
+        // Gap 3.4: per-pipeline result-size fidelity annotation (if any).
+        // `Some(mode)` WINS over the default ceiling; `None` lets the
+        // default ceiling degrade an oversized result. Cloned out of the
+        // parsed graph here so it survives the executor.run() borrow below.
+        let declared_result_fidelity = graph.result_fidelity.clone();
 
         let executor = PipelineExecutor::new(config);
         let result = tokio::time::timeout(
@@ -836,7 +963,16 @@ impl Tool for RunPipelineTool {
             &run_start_rfc3339,
         );
 
-        let summary = result
+        // Per-node summary LINES. The footer that embeds these is appended
+        // AFTER the (capped) body and was the last unbounded tail: it iterated
+        // ALL node_summaries (each line embeds an arbitrary-length
+        // node_id/model), so a many-node pipeline could push the serialized
+        // frame past the 1 MiB cap even though the body was bounded. We hand
+        // the lines to `bound_footer`, which caps the whole footer's serialized
+        // length to its reserved FOOTER_BUDGET_BYTES (with an
+        // `[+N more nodes omitted]` marker), closing the last frame_too_large
+        // hole.
+        let node_lines = result
             .node_summaries
             .iter()
             .map(|n| {
@@ -849,66 +985,40 @@ impl Tool for RunPipelineTool {
                     n.token_usage.output_tokens,
                 )
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
 
-        // Find the report file from this pipeline run's actual files_modified.
-        // Delivery is driven by files_to_send on ToolResult, so no LLM instruction
-        // or session-level markdown heuristics are needed.
-        // Ensure absolute path so the execution loop can find and deliver the file.
-        let real_report_file = result
-            .files_modified
-            .iter()
-            .find(|f| {
-                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                name.ends_with(".md") && !name.starts_with("_search")
-            })
-            .map(|f| {
-                if f.is_absolute() {
-                    f.clone()
-                } else {
-                    std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())
-                }
-            });
+        // Gap 3.4 / Blocker 1 — DEGRADE, don't wedge. Bound the result body
+        // that becomes the tool-result text (and downstream AppUI frame) by
+        // its JSON-SERIALIZED size. An explicit per-pipeline `result_fidelity`
+        // annotation WINS; otherwise the default ceiling truncates an
+        // oversized result at a UTF-8 boundary so the serialized body+footer
+        // stays provably under the 1 MiB `MAX_TEXT_FRAME_BYTES` frame cap,
+        // regardless of content (incl. all-control-byte bodies that escape up
+        // to 6x). The marker is appended below once the full-output report
+        // file name is known. Computed BEFORE report delivery so the
+        // `truncated` flag can drive the always-write-full-report decision.
+        let ceiling = crate::fidelity::compute_result_ceiling(
+            &result.output,
+            declared_result_fidelity.as_ref(),
+        );
 
-        // run_pipeline is registered as spawn_only, so the execution-loop
-        // background-success branch in `crates/octos-agent/src/agent/execution.rs`
-        // requires `files_to_send` to be non-empty (otherwise it marks the task
-        // failed with "no output files produced"). Inline DOT pipelines that
-        // only return text in `result.output` produce no .md report. Synthesize
-        // one so the spawn_only delivery path always has a payload to attach.
-        let synthesized_report_file = if real_report_file.is_none() && !result.output.is_empty() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let pid = std::process::id();
-            let filename = format!("run_pipeline_{timestamp}_{pid}.md");
-            let dir = std::env::temp_dir().join("octos_pipeline_synthetic");
-            match std::fs::create_dir_all(&dir).and_then(|_| {
-                let path = dir.join(&filename);
-                std::fs::write(&path, &result.output).map(|_| path)
-            }) {
-                Ok(path) => {
-                    tracing::info!(file = %path.display(), "wrote synthetic pipeline report");
-                    Some(path)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to write synthetic pipeline report");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Blocker 2 — when the body is truncated, ALWAYS write the synthetic
+        // FULL-output report (the untruncated `result.output`) and deliver it,
+        // independent of whatever other `.md` the pipeline touched. The
+        // truncation marker then points at this report so nothing is lost and
+        // the LLM/user knows where the full output is. When not truncated, the
+        // prior spawn_only delivery path is unchanged (real `.md` wins; else
+        // synthesize a payload so `files_to_send` is non-empty).
+        let synthetic_dir = std::env::temp_dir().join("octos_pipeline_synthetic");
+        let delivery = resolve_report_delivery(
+            &result.output,
+            &result.files_modified,
+            ceiling.truncated,
+            &synthetic_dir,
+        );
 
-        let report_file = real_report_file.or(synthesized_report_file);
-        if let Some(ref path) = report_file {
-            tracing::info!(file = %path.display(), "pipeline produced report file");
-        }
-
-        // Explicitly set files_to_send so the execution loop auto-delivers.
-        let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
+        // Append the truncation marker, pointing at the full-output report.
+        let bounded_output = ceiling.with_marker(delivery.full_report_name.as_deref());
 
         // Surface per-node cost attribution in the structured side-channel so
         // the session actor can pull it back into the SSE `done` event for the
@@ -916,18 +1026,161 @@ impl Tool for RunPipelineTool {
         // boundary before we extended `ToolResult` with `structured_metadata`.
         let structured_metadata = node_costs_metadata(&result.node_costs);
 
+        // Bound the per-node footer to its reserved 32 KiB serialized budget so
+        // body + marker + footer is provably under the 1 MiB frame cap for ANY
+        // number/size of node summaries. `bound_footer` owns the scaffold and
+        // `Total:` line so the bound covers the COMPLETE footer.
+        let total_line = format!(
+            "Total: {} input + {} output tokens",
+            result.token_usage.input_tokens, result.token_usage.output_tokens,
+        );
+        let footer = crate::fidelity::bound_footer(&node_lines, &total_line);
+
         Ok(ToolResult {
-            output: format!(
-                "{}\n\n---\nPipeline execution summary:\n{summary}\nTotal: {} input + {} output tokens",
-                result.output, result.token_usage.input_tokens, result.token_usage.output_tokens,
-            ),
+            output: format!("{bounded_output}{footer}"),
             success: result.success,
             tokens_used: Some(result.token_usage),
-            file_modified: report_file,
-            files_to_send,
+            file_modified: delivery.report_file,
+            files_to_send: delivery.files_to_send,
             structured_metadata,
             named_outputs: None,
         })
+    }
+}
+
+/// Blocker 2 — the outcome of deciding which file(s) carry a pipeline run's
+/// report payload to the spawn_only delivery path, and (when the result body
+/// was truncated by the ceiling) where the FULL untruncated output landed.
+#[derive(Debug, Default)]
+pub(crate) struct ReportDelivery {
+    /// The primary report file surfaced as `ToolResult.file_modified` — the
+    /// real `.md` if one exists, else the synthesized payload.
+    pub report_file: Option<PathBuf>,
+    /// The synthetic FULL-output report, written ONLY when the body was
+    /// truncated. Holds the untruncated `result.output`. May coexist with a
+    /// real `.md` (it is then delivered alongside it).
+    pub full_report: Option<PathBuf>,
+    /// The set of files auto-delivered to the user (existing files only).
+    pub files_to_send: Vec<PathBuf>,
+    /// The file NAME of `full_report` (if any) for the truncation marker so
+    /// the LLM/user knows where the full output is.
+    pub full_report_name: Option<String>,
+}
+
+/// Blocker 2 — decide report-file delivery for a pipeline run.
+///
+/// Invariants:
+/// * When `truncated` is true, the synthetic FULL-output report is ALWAYS
+///   written (containing `full_output` verbatim) and ALWAYS included in
+///   `files_to_send` — independent of whatever other `.md` the pipeline
+///   touched. Its name is returned in `full_report_name` so the truncation
+///   marker can point at it.
+/// * When `truncated` is false, behaviour is the prior spawn_only delivery
+///   path: deliver a real `.md` if present, else synthesize a payload from
+///   the (untruncated, in-budget) output so `files_to_send` is non-empty. No
+///   `full_report`/marker name is produced (the body wasn't truncated, so the
+///   `ToolResult.output` already carries the whole result).
+///
+/// `synthetic_dir` is injected so tests can use a tempdir; production passes
+/// `std::env::temp_dir().join("octos_pipeline_synthetic")`.
+pub(crate) fn resolve_report_delivery(
+    full_output: &str,
+    files_modified: &[PathBuf],
+    truncated: bool,
+    synthetic_dir: &std::path::Path,
+) -> ReportDelivery {
+    // Find a real markdown report from this run's files_modified, normalized
+    // to an absolute path so the execution loop can find and deliver it.
+    let real_report_file = files_modified
+        .iter()
+        .find(|f| {
+            let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with(".md") && !name.starts_with("_search")
+        })
+        .map(|f| {
+            if f.is_absolute() {
+                f.clone()
+            } else {
+                std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())
+            }
+        });
+
+    // Decide whether we must synthesize a report, and whether it is the
+    // FULL-output (truncation) report.
+    //  * truncated  -> ALWAYS write the full-output report (Blocker 2), even
+    //    if a real .md exists; the marker will point at it.
+    //  * !truncated && no real .md && non-empty -> synthesize a delivery
+    //    payload so the spawn_only path always has a file to attach.
+    let needs_full_report = truncated && !full_output.is_empty();
+    let needs_delivery_payload =
+        !truncated && real_report_file.is_none() && !full_output.is_empty();
+
+    let synthesized = if needs_full_report || needs_delivery_payload {
+        write_synthetic_report(full_output, synthetic_dir)
+    } else {
+        None
+    };
+
+    let mut delivery = ReportDelivery::default();
+    if needs_full_report {
+        delivery.full_report = synthesized.clone();
+        delivery.full_report_name = synthesized
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+    }
+
+    // Primary report file: real .md wins for `file_modified`; otherwise the
+    // synthesized payload (which, on truncation, is the full-output report).
+    delivery.report_file = real_report_file.clone().or_else(|| synthesized.clone());
+    if let Some(ref path) = delivery.report_file {
+        tracing::info!(file = %path.display(), "pipeline produced report file");
+    }
+
+    // files_to_send: the real .md (if any) AND, on truncation, the full-output
+    // report — so the FULL output is always delivered even alongside an
+    // unrelated .md. De-duplicate (they may be the same path when no real .md
+    // exists). Only include files that actually exist on disk.
+    let mut send: Vec<PathBuf> = Vec::new();
+    for candidate in [real_report_file.as_ref(), synthesized.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if candidate.exists() && !send.contains(candidate) {
+            send.push(candidate.clone());
+        }
+    }
+    delivery.files_to_send = send;
+    delivery
+}
+
+/// Write `output` to a uniquely-named `.md` file under `dir`, creating the
+/// directory if needed. Returns the path on success; logs and returns `None`
+/// on I/O error so a missing audit file never regresses the run outcome.
+fn write_synthetic_report(output: &str, dir: &std::path::Path) -> Option<PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    // A process-unique counter avoids collisions when two runs land in the
+    // same second within the same process.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let filename = format!("run_pipeline_{timestamp}_{pid}_{seq}.md");
+    match std::fs::create_dir_all(dir).and_then(|_| {
+        let path = dir.join(&filename);
+        std::fs::write(&path, output).map(|_| path)
+    }) {
+        Ok(path) => {
+            tracing::info!(file = %path.display(), "wrote synthetic pipeline report");
+            Some(path)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to write synthetic pipeline report");
+            None
+        }
     }
 }
 
@@ -1310,9 +1563,93 @@ fn sanitize_dot(dot: &str) -> String {
     result
 }
 
+/// Max ERROR diagnostics included in a `pre_flight_validate` failure message,
+/// and the max bytes per formatted line. The preflight early-return bypasses
+/// both the per-tool truncation and the run_pipeline body/footer ceiling, so
+/// the message MUST be bounded here (codex pre-merge DO-NOT-SHIP). 50 lines x
+/// ~512 bytes (+ markers) keeps it well under any frame/result ceiling.
+const MAX_PREFLIGHT_ERRORS: usize = 50;
+const MAX_PREFLIGHT_ERR_LINE_BYTES: usize = 512;
+
+/// Format the ERROR-severity diagnostics into a BOUNDED `pipeline validation
+/// failed` message: at most [`MAX_PREFLIGHT_ERRORS`] lines, each truncated to
+/// [`MAX_PREFLIGHT_ERR_LINE_BYTES`] on a UTF-8 char boundary, with truncation
+/// markers so nothing is silently dropped. Provably small regardless of how
+/// many errors a malformed DOT produces or how large its node IDs are.
+fn format_bounded_preflight_errors(diags: &[crate::validate::LintDiagnostic]) -> String {
+    let errors: Vec<&crate::validate::LintDiagnostic> = diags
+        .iter()
+        .filter(|d| d.severity == crate::validate::Severity::Error)
+        .collect();
+    let total = errors.len();
+    let shown: Vec<String> = errors
+        .iter()
+        .take(MAX_PREFLIGHT_ERRORS)
+        .map(|d| {
+            let line = format!(
+                "{} (rule {}, {:?}): {}",
+                d.rule_id.code(),
+                d.rule,
+                d.location,
+                d.message
+            );
+            if line.len() <= MAX_PREFLIGHT_ERR_LINE_BYTES {
+                line
+            } else {
+                let mut end = MAX_PREFLIGHT_ERR_LINE_BYTES;
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...(+{} bytes)", &line[..end], line.len() - end)
+            }
+        })
+        .collect();
+    let mut msg = format!("pipeline validation failed:\n{}", shown.join("\n"));
+    if total > MAX_PREFLIGHT_ERRORS {
+        msg.push_str(&format!(
+            "\n...and {} more error(s) (truncated)",
+            total - MAX_PREFLIGHT_ERRORS
+        ));
+    }
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_error_message_is_bounded_for_many_errors_and_huge_ids() {
+        use crate::validate::{GraphLocation, LintDiagnostic, RuleId, Severity};
+        // 1000 ERROR diagnostics, each carrying a 200 KB node id + 200 KB
+        // message. The OLD unbounded `errors.join("\n")` would be hundreds of
+        // MB and (via the spawn_only preflight early-return) bypass every
+        // downstream ceiling. The bounded formatter must cap BOTH the line
+        // count and each line's length.
+        let huge = "x".repeat(200_000);
+        let diags: Vec<LintDiagnostic> = (0..1000)
+            .map(|_| LintDiagnostic {
+                rule: RuleId::Connectivity.number(),
+                rule_id: RuleId::Connectivity,
+                severity: Severity::Error,
+                location: GraphLocation::Node(huge.clone()),
+                message: huge.clone(),
+                fix_hint: None,
+            })
+            .collect();
+        let msg = format_bounded_preflight_errors(&diags);
+        assert!(
+            msg.len() < 64 * 1024,
+            "preflight failure message must be bounded, got {} bytes",
+            msg.len()
+        );
+        assert!(msg.starts_with("pipeline validation failed"));
+        assert!(
+            msg.contains("more error(s) (truncated)"),
+            "must mark the omitted-error count"
+        );
+        assert!(msg.contains("...(+"), "must mark per-line byte truncation");
+    }
     use crate::executor::NodeCost;
 
     /// Gap 3.1 — when a pipeline run reports per-node cost rows, the tool
@@ -2074,5 +2411,261 @@ mod tests {
         assert!(base.input_schema()["properties"]["ir"].is_null());
         let enabled = make_ir_tool(true).await;
         assert!(enabled.input_schema()["properties"]["ir"].is_object());
+    }
+
+    // ───── Blocker 2: full output always preserved + marker points to it ─────
+
+    /// THE Blocker-2 bug. A pipeline modifies an UNRELATED `notes.md` AND
+    /// returns an over-ceiling `result.output`. The OLD code only synthesized
+    /// the full-output report when NO `.md` existed, so the full untruncated
+    /// output landed in no delivered file. After the fix, when the result is
+    /// truncated the synthetic FULL-output report is ALWAYS written, contains
+    /// the untruncated output, and is in the delivered files — independent of
+    /// the unrelated `notes.md`.
+    #[test]
+    fn truncated_result_always_delivers_full_output_report_even_with_unrelated_md() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+
+        // An unrelated markdown file the pipeline happened to touch.
+        let notes = dir.path().join("notes.md");
+        std::fs::write(&notes, "# unrelated notes\n").unwrap();
+        let files_modified = vec![notes.clone()];
+
+        let full_output = "FULL-OUTPUT-MARKER ".repeat(50_000); // big, untruncated
+        let delivery = resolve_report_delivery(
+            &full_output,
+            &files_modified,
+            /* truncated = */ true,
+            &synthetic_dir,
+        );
+
+        // The synthetic full-output report must exist and hold the FULL output.
+        let full = delivery
+            .full_report
+            .as_ref()
+            .expect("truncation must always produce a full-output report");
+        let on_disk = std::fs::read_to_string(full).expect("full report readable");
+        assert_eq!(
+            on_disk, full_output,
+            "the synthetic report must contain the UNTRUNCATED final output"
+        );
+
+        // It must be in the delivered files even though an unrelated .md exists.
+        assert!(
+            delivery.files_to_send.iter().any(|p| p == full),
+            "the full-output report MUST be among the delivered files"
+        );
+
+        // The marker name must be the synthetic report's file name.
+        let expected_name = full.file_name().and_then(|n| n.to_str()).unwrap();
+        assert_eq!(
+            delivery.full_report_name.as_deref(),
+            Some(expected_name),
+            "marker name must reference the synthetic full-output report"
+        );
+    }
+
+    /// When the result is truncated AND there is no unrelated .md, the
+    /// synthetic full-output report is still written and delivered.
+    #[test]
+    fn truncated_result_with_no_real_md_still_delivers_full_output_report() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+        let full_output = "x".repeat(40_000);
+
+        let delivery = resolve_report_delivery(&full_output, &[], true, &synthetic_dir);
+        let full = delivery.full_report.as_ref().expect("full report written");
+        assert_eq!(std::fs::read_to_string(full).unwrap(), full_output);
+        assert!(delivery.files_to_send.iter().any(|p| p == full));
+    }
+
+    /// No truncation + an unrelated .md present: the existing spawn_only
+    /// delivery path is unchanged. NO synthetic full-output report is written
+    /// (no double-write), and the real .md is delivered.
+    #[test]
+    fn untruncated_result_with_real_md_does_not_double_write_synthetic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "# real report\n").unwrap();
+
+        let delivery = resolve_report_delivery(
+            "small output",
+            std::slice::from_ref(&report),
+            false,
+            &synthetic_dir,
+        );
+        assert!(
+            delivery.full_report.is_none(),
+            "no truncation must NOT write a synthetic full-output report"
+        );
+        assert!(
+            !synthetic_dir.exists()
+                || std::fs::read_dir(&synthetic_dir)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "synthetic dir must stay empty when not truncated and a real .md exists"
+        );
+        assert_eq!(delivery.report_file.as_ref(), Some(&report));
+        assert!(delivery.files_to_send.iter().any(|p| p == &report));
+        assert!(
+            delivery.full_report_name.is_none(),
+            "no marker name when not truncated"
+        );
+    }
+
+    /// No truncation + no real .md + non-empty output: the existing
+    /// synthesize-for-spawn_only-delivery behaviour is preserved (a report is
+    /// written so files_to_send is non-empty), but it is NOT flagged as a
+    /// "full-output" report (the body wasn't truncated) so no marker name is
+    /// emitted.
+    #[test]
+    fn untruncated_result_with_no_md_synthesizes_delivery_payload_but_no_marker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let synthetic_dir = dir.path().join("synthetic");
+        let delivery = resolve_report_delivery("some output", &[], false, &synthetic_dir);
+        let path = delivery
+            .report_file
+            .as_ref()
+            .expect("spawn_only delivery still needs a payload file");
+        assert!(path.exists());
+        assert!(delivery.files_to_send.iter().any(|p| p == path));
+        assert!(
+            delivery.full_report_name.is_none(),
+            "untruncated payload is not a full-output report; no marker name"
+        );
+    }
+
+    // ───── Footer-bound blocker: the WIRED ToolResult.output (body + marker +
+    //       footer) stays under the frame cap for any number/size of nodes ─────
+
+    use crate::fidelity::{
+        FOOTER_BUDGET_BYTES, MAX_FRAME_BUDGET_BYTES, bound_footer, compute_result_ceiling,
+    };
+    use crate::graph::NodeSummary;
+    use octos_core::TokenUsage;
+
+    /// Build the per-node footer lines exactly as `execute()` does, so the
+    /// test exercises the SAME assembly path the producer ships.
+    fn footer_lines(summaries: &[NodeSummary]) -> Vec<String> {
+        summaries
+            .iter()
+            .map(|n| {
+                format!(
+                    "- {} ({}): {}ms, {}+{} tokens",
+                    n.node_id,
+                    n.model.as_deref().unwrap_or("default"),
+                    n.duration_ms,
+                    n.token_usage.input_tokens,
+                    n.token_usage.output_tokens,
+                )
+            })
+            .collect()
+    }
+
+    /// THE wired end-to-end frame invariant. An over-ceiling all-NUL body
+    /// (escapes 6x) PLUS thousands of long-id node summaries → the FINAL
+    /// assembled `ToolResult.output` (`{bounded_output}{footer}`, matching
+    /// `execute()`) serializes to strictly under the 1 MiB frame cap, and the
+    /// footer carries the `[+N more nodes omitted]` marker. This is the case
+    /// the codex re-review flagged: the unbounded footer reopened the
+    /// `frame_too_large` cliff even with a bounded body.
+    #[test]
+    fn wired_output_stays_under_frame_cap_with_huge_body_and_huge_footer() {
+        // Over-ceiling body.
+        let body_input = "\0".repeat(500 * 1024);
+        let ceiling = compute_result_ceiling(&body_input, None);
+        assert!(ceiling.truncated, "precondition: body must be truncated");
+        let bounded_output = ceiling.with_marker(Some("run_pipeline_1717400000_12345_0.md"));
+
+        // Thousands of long-id/model node summaries → unbounded footer is MiBs.
+        let long_id = "n".repeat(300);
+        let summaries: Vec<NodeSummary> = (0..4_000)
+            .map(|i| NodeSummary {
+                node_id: format!("{long_id}{i}"),
+                label: String::new(),
+                model: Some("some-very-long-model-name-xxxxxxxxxxxx".to_string()),
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+                duration_ms: 9999,
+                success: true,
+            })
+            .collect();
+        let lines = footer_lines(&summaries);
+        let total_line = "Total: 400000 input + 800000 output tokens";
+        let footer = bound_footer(&lines, total_line);
+
+        // Assemble EXACTLY as execute() does.
+        let output = format!("{bounded_output}{footer}");
+
+        let serialized = serde_json::to_string(&output).unwrap().len();
+        assert!(
+            serialized < 1024 * 1024,
+            "wired ToolResult.output must serialize under the 1 MiB frame cap, got {serialized}"
+        );
+        // Components individually honour their reservations.
+        assert!(
+            footer.contains("more nodes omitted"),
+            "footer must carry the omitted-nodes marker"
+        );
+        assert!(footer.contains(total_line), "footer keeps the Total line");
+        assert!(
+            footer.starts_with("\n\n---\nPipeline execution summary:\n"),
+            "footer keeps the scaffold"
+        );
+        // Earliest (most load-bearing) node survives in the head.
+        assert!(footer.contains(&format!("{long_id}0 ")));
+    }
+
+    /// A few-node run with short ids leaves the footer UNCHANGED — no false
+    /// truncation, every node line present, no omitted marker, and the wired
+    /// output is well under budget.
+    #[test]
+    fn wired_output_small_pipeline_keeps_full_footer() {
+        let bounded_output = "the pipeline produced this small result";
+        let summaries = vec![
+            NodeSummary {
+                node_id: "plan".into(),
+                label: String::new(),
+                model: Some("gpt-4".into()),
+                token_usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+                duration_ms: 100,
+                success: true,
+            },
+            NodeSummary {
+                node_id: "write".into(),
+                label: String::new(),
+                model: None, // -> "default"
+                token_usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 40,
+                    ..Default::default()
+                },
+                duration_ms: 200,
+                success: true,
+            },
+        ];
+        let lines = footer_lines(&summaries);
+        let footer = bound_footer(&lines, "Total: 40 input + 60 output tokens");
+        let output = format!("{bounded_output}{footer}");
+
+        assert!(output.contains("- plan (gpt-4): 100ms, 10+20 tokens"));
+        assert!(output.contains("- write (default): 200ms, 30+40 tokens"));
+        assert!(
+            !output.contains("more nodes omitted"),
+            "small pipeline must NOT carry an omitted marker"
+        );
+        assert!(
+            serde_json::to_string(&output).unwrap().len()
+                <= MAX_FRAME_BUDGET_BYTES + FOOTER_BUDGET_BYTES
+        );
     }
 }

@@ -1512,8 +1512,13 @@ fn forward_task_status_to_actor_inbox(
     data_dir: &Path,
     task: &octos_agent::BackgroundTask,
 ) {
+    // Channel/gateway SessionActor keys carry the profile
+    // (`profile:channel:chat`), so the key-derived fallback inside
+    // `upsert_background_task_agent` resolves the right profile here; the
+    // AppUI/serve bare-key path threads its runtime profile explicitly
+    // (see `forward_task_progress_to_channel`).
     #[cfg(feature = "api")]
-    let _ = upsert_background_task_agent(task);
+    let _ = upsert_background_task_agent(task, None);
 
     let task_json = sanitize_task_for_response(data_dir, task);
     let Ok(json) = serde_json::to_string(&task_json) else {
@@ -1632,6 +1637,43 @@ impl SessionTaskQueryStore {
         serde_json::Value::Array(tasks)
     }
 
+    /// C8 / GAP A: return the raw [`octos_agent::BackgroundTask`] snapshots for
+    /// `session_key` (and every reachable descendant session), each paired with
+    /// the owning supervisor's `data_dir` for path encoding. Mirrors
+    /// [`Self::query_json`]'s breadth-first traversal but yields the raw task
+    /// structs so the WS `session/open` handler can replay each one as a
+    /// `task/updated` event through the SAME emission path live updates use
+    /// (`background_task_to_progress_json`). A reconnecting / freshly-opening
+    /// TUI starts with an empty `session.tasks` and only applies incremental
+    /// updates, so without this replay the existing task list is invisible
+    /// until the next live transition.
+    pub fn raw_tasks_for_session(
+        &self,
+        session_key: &str,
+    ) -> Vec<(octos_agent::BackgroundTask, PathBuf)> {
+        let mut tasks: Vec<(octos_agent::BackgroundTask, PathBuf)> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        queue.push_back(session_key.to_string());
+        visited.insert(session_key.to_string());
+
+        while let Some(current) = queue.pop_front() {
+            let Some((supervisor, data_dir)) = self.lookup_live_supervisor(&current) else {
+                continue;
+            };
+            for task in supervisor.get_tasks_for_session(&current) {
+                if let Some(child_key) = task.child_session_key.as_deref() {
+                    if visited.insert(child_key.to_string()) {
+                        queue.push_back(child_key.to_string());
+                    }
+                }
+                tasks.push((task, data_dir.clone()));
+            }
+        }
+
+        tasks
+    }
+
     /// M7.9 / W2: locate the supervisor owning `task_id` and forward
     /// `cancel(task_id)` to it. Returns `Ok(())` on success, mapping
     /// supervisor errors back to the typed [`TaskCancelError`] enum so
@@ -1726,6 +1768,12 @@ async fn dispatch_background_result_to_actor(
             kind: payload.kind,
             media: payload.media,
             originating_thread_id: payload.originating_thread_id,
+            // C1 step 3: thread the task_id / tool_call_id / terminal_status
+            // from the payload onto the actor message so consumers can read
+            // an explicit terminal status instead of the content heuristic.
+            task_id: payload.task_id,
+            tool_call_id: payload.tool_call_id,
+            terminal_status: payload.terminal_status,
             ack: Some(ack_tx),
         }),
     )
@@ -1806,6 +1854,55 @@ pub(crate) fn build_recovery_prompt(signal: &octos_agent::SpawnOnlyFailureSignal
         err = signal.error_message,
         input = input_block,
         alts = alternatives_block,
+    )
+}
+
+/// Prototype gate (env `OCTOS_AUTO_REVIEW_BACKGROUND`): when truthy, a
+/// delivered background-task result triggers ONE agent turn so the model
+/// reviews/summarizes it instead of waiting for the user to type "check".
+/// Off by default — this is the event-driven completion-acknowledgment
+/// prototype; graduate it to a profile config field before GA.
+fn auto_review_background_completions_enabled() -> bool {
+    std::env::var("OCTOS_AUTO_REVIEW_BACKGROUND")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Build the synthetic `[system-internal]` prompt enqueued when a background
+/// task's result is delivered, so the LLM reviews it and summarizes for the
+/// user. Success-path sibling of [`build_recovery_prompt`]. A bounded preview
+/// of the result is inlined so the model has the gist without the actor
+/// re-reading the (possibly large) output.
+pub(crate) fn build_completion_review_prompt(
+    task_label: &str,
+    content: &str,
+    files: &[String],
+) -> String {
+    const PREVIEW_CHARS: usize = 500;
+    let preview: String = content.chars().take(PREVIEW_CHARS).collect();
+    let elided = if content.chars().count() > PREVIEW_CHARS {
+        " …(truncated)"
+    } else {
+        ""
+    };
+    // The artifact files this completion produced are copied into the workspace
+    // before the review turn, so the model can `read_file` them by name to
+    // inspect what was delivered (codex P2 — don't review blind).
+    let files_block = if files.is_empty() {
+        String::new()
+    } else {
+        let list = files
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\nFiles produced (in your workspace — read them to inspect):\n{list}")
+    };
+    format!(
+        "[system-internal] A background task `{task_label}` just finished and its \
+         result was delivered to this conversation:\n\n{preview}{elided}{files_block}\n\n\
+         Briefly review the result and tell the user what was produced and any \
+         clear next step. Be concise. Do NOT re-run the task.",
     )
 }
 
@@ -2013,6 +2110,21 @@ pub enum ActorMessage {
         /// turns have rotated the per-chat sticky thread_id. `None` for
         /// legacy callers and tests that pre-date #649.
         originating_thread_id: Option<String>,
+        /// C1 step 3: the spawn_only task id that produced this completion,
+        /// carried through from `BackgroundResultPayload::task_id`. Lets the
+        /// actor attribute the terminal result to a specific background task.
+        /// `None` for legacy callers and tests that do not track it.
+        task_id: Option<String>,
+        /// C1 step 3: the originating tool_call_id, carried through from
+        /// `BackgroundResultPayload::tool_call_id`. `None` for legacy callers.
+        tool_call_id: Option<String>,
+        /// C1 step 3: the explicit terminal supervisor status
+        /// (`Completed`/`Failed`/`Cancelled`) for the producing task, carried
+        /// through from `BackgroundResultPayload::terminal_status`. The
+        /// completion-review success gate can read this instead of inferring
+        /// success from the rendered `"✗"` content heuristic. `None` for
+        /// legacy callers and tests that do not track it.
+        terminal_status: Option<octos_agent::TaskStatus>,
         /// Completion acknowledgment for durable persistence.
         ack: Option<oneshot::Sender<bool>>,
     },
@@ -2829,18 +2941,23 @@ impl ActorFactory {
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         let supervisor = tools.supervisor();
-        // Wire supervisor on_failure_signal callback (M8.9) BEFORE
-        // `enable_persistence`. The orphan-task sweep at
-        // `task_supervisor.rs:1164-1166` can `mark_failed` resurrected
-        // tasks during `enable_persistence`, which fires the failure
-        // callback synchronously via `notify_failure`. Wiring this
-        // AFTER `enable_persistence` (pre-#1324-followup ordering) made
-        // those orphan-sweep failures silently dropped — `on_failure`
-        // was still `None` and `invoke_failure_callback` no-op'd. The
-        // PR #1324 follow-up reorders both this gateway path and the
-        // WS `run_standalone_turn` path to wire the callback first so
-        // every failure path — orphan-sweep, live `mark_failed`,
-        // cascade-fail — reaches the recovery inbox.
+        // Wire BOTH supervisor callbacks (on_failure_signal AND on_change)
+        // BEFORE `enable_persistence`. The orphan-task sweep at
+        // `task_supervisor.rs` (the `mark_failed("orphaned across restart")`
+        // sweep) can `mark_failed` resurrected tasks during
+        // `enable_persistence`, which fires BOTH callbacks synchronously
+        // via `notify_failure` AND `notify_change`. Wiring either callback
+        // AFTER `enable_persistence` (pre-#1324-followup ordering for
+        // `on_failure`; the dominant C1 bug for `on_change`) made the
+        // orphan-sweep transitions silently dropped — the callback slot was
+        // still `None` and the notify no-op'd. For `on_change` that left the
+        // TUI task count stuck at "N running" forever (chip stuck
+        // "Orchestrating") because the `task_updated` WS event the sweep
+        // should have produced never fired. The PR #1324 follow-up + C1 fix
+        // reorder both this gateway path and the WS `run_standalone_turn`
+        // path to wire the callbacks first so every terminal path —
+        // orphan-sweep, live `mark_failed`/`mark_completed`, cascade-fail —
+        // reaches the recovery inbox and the SSE/WS task-status consumers.
         let recovery_tx = tx.clone();
         supervisor.set_on_failure_signal(move |signal| {
             let prompt = build_recovery_prompt(signal);
@@ -2855,6 +2972,44 @@ impl ActorFactory {
                 // minting an orphan UUIDv7.
                 originating_client_message_id: signal.originating_client_message_id.clone(),
             });
+        });
+        // Wire supervisor on_change callback to push task status via SSE,
+        // ALSO before `enable_persistence` (see the combined ordering note
+        // above). M9-06: terminal lifecycle states (Completed/Failed/
+        // Cancelled) MUST NOT be silently dropped under inbox backpressure
+        // (32 slots), or the UI / SSE consumers stay stuck on `running`.
+        // See [`forward_task_status_to_actor_inbox`].
+        let status_tx = tx.clone();
+        let task_data_dir = self.data_dir.clone();
+        supervisor.set_on_change(move |task| {
+            forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
+        });
+        // Gap-1 unification: the single terminal sink, also wired BEFORE
+        // `enable_persistence` (see the combined ordering note above). Routes
+        // BOTH success (ChildCompleted) AND failure (recovery) re-entry
+        // through ONE profile-resolving call into the master continuation
+        // queue. Runs alongside the legacy gateway wiring (the `on_change` →
+        // `upsert_background_task_agent` success path and the
+        // `set_on_failure_signal` → `RecoveryHint` failure path) during the
+        // strangler migration; shared dedupe keys collapse double delivery.
+        // Gateway session keys carry the profile (`profile:channel:chat`), so
+        // `None` lets the key-derived profile resolve inside the router —
+        // matching `forward_task_status_to_actor_inbox`'s `None` call.
+        #[cfg(feature = "api")]
+        supervisor.set_on_terminal(move |event| {
+            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+                event,
+                None,
+                // Gateway: failure recovery stays on the `RecoveryHint` inbox
+                // (which owns the consecutive-recovery cap + per-task claim +
+                // exhaustion banner). Routing failure through the queue too
+                // would double-deliver across two distinct channels. Only the
+                // SUCCESS outcome routes through the queue here (and it
+                // collapses against the legacy on_change ChildCompleted via
+                // the step-3 dedupe key). Step 4 retires RecoveryHint and
+                // flips this to `Queue`.
+                crate::api::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
+            );
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(
@@ -3071,22 +3226,12 @@ impl ActorFactory {
             Box::pin(async move { dispatch_background_result_to_actor(tx, payload).await })
         }));
 
-        // Wire supervisor on_change callback to push task status via SSE.
-        // M9-06: terminal lifecycle states (Completed/Failed/Cancelled) MUST
-        // NOT be silently dropped under inbox backpressure (32 slots), or the
-        // UI / SSE consumers stay stuck on `running`. See
-        // [`forward_task_status_to_actor_inbox`].
-        let status_tx = tx.clone();
-        let task_data_dir = self.data_dir.clone();
-        supervisor.set_on_change(move |task| {
-            forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
-        });
-
-        // (PR #1324 follow-up moved the `set_on_failure_signal` wiring
-        // to immediately after `let supervisor = tools.supervisor();`
-        // above so the orphan-task sweep that runs during
-        // `enable_persistence` reaches the recovery inbox instead of
-        // hitting an `on_failure: None` callback slot.)
+        // (PR #1324 follow-up + C1 fix moved BOTH the `set_on_failure_signal`
+        // AND `set_on_change` wiring to immediately after
+        // `let supervisor = tools.supervisor();` above so the orphan-task
+        // sweep that runs during `enable_persistence` reaches the recovery
+        // inbox AND the SSE task-status consumers, instead of hitting
+        // `on_failure: None` / `on_change: None` callback slots.)
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
@@ -4210,6 +4355,39 @@ impl SessionActor {
         }
     }
 
+    /// Synthetic `InboundMessage` for the completion-review turn — the
+    /// success-path sibling of [`Self::synthetic_recovery_inbound`]. Stamped
+    /// `_completion_review` so `process_inbound` does NOT reset the
+    /// consecutive-auto-turn cap (the review is server-driven, not user
+    /// re-engagement); the optional originating id threads the review under
+    /// the bubble that started the work.
+    fn synthetic_completion_review_inbound(
+        &self,
+        prompt: String,
+        originating_client_message_id: Option<String>,
+    ) -> InboundMessage {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("_completion_review".to_string(), serde_json::json!(true));
+        if let Some(cmid) = originating_client_message_id {
+            if !cmid.is_empty() {
+                metadata.insert(
+                    "client_message_id".to_string(),
+                    serde_json::Value::String(cmid),
+                );
+            }
+        }
+        InboundMessage {
+            channel: self.channel.clone(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: self.chat_id.clone(),
+            content: prompt,
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::Value::Object(metadata),
+            message_id: None,
+        }
+    }
+
     #[cfg(feature = "api")]
     fn synthetic_master_continuation_inbound(
         &self,
@@ -4574,11 +4752,22 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: the explicit terminal supervisor
+                            // status now drives the completion-review success
+                            // gate below (replacing the "✗" content heuristic).
+                            // `task_id` / `tool_call_id` are not consumed here.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status,
                             ack,
                         }) => {
                             idle_sleep
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + self.idle_timeout);
+                            let review_origin = originating_thread_id.clone();
+                            // Keep the artifact paths so a (success) review turn can
+                            // actually inspect what was produced (codex P2).
+                            let review_media = media.clone();
                             let persisted = self
                                 .handle_background_result(
                                     &task_label,
@@ -4590,6 +4779,61 @@ impl SessionActor {
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
+                            }
+                            // Event-driven completion review (prototype, gated by
+                            // OCTOS_AUTO_REVIEW_BACKGROUND): the actor is idle and a
+                            // background task's result just landed — exactly the case
+                            // where the user otherwise has to type "check". Dispatch
+                            // ONE agent turn so the model reviews/summarizes the
+                            // result. Bounded by the shared consecutive-auto-turn cap
+                            // (MAX_CONSECUTIVE_RECOVERY_TURNS), which resets on the
+                            // next user turn, so a review that spawns more work cannot
+                            // run away; silently skipped (no banner) when the cap is
+                            // hit, since a missed review is harmless.
+                            //
+                            // SUCCESS ONLY (codex P2): a FAILED spawn_only task already
+                            // drives the dedicated RecoveryHint path AND emits a failure
+                            // BackgroundResult — reviewing that would (a) summarize a
+                            // failure the recovery turn is already handling and (b) burn
+                            // a shared recovery-cap slot a real recovery needs.
+                            //
+                            // This gate now reads the AUTHORITATIVE terminal status that
+                            // C1 (subagent-terminal-propagation) threads onto the
+                            // BackgroundResult message from the SAME mark_completed /
+                            // mark_failed match the producer used (spawn.rs /
+                            // execution.rs). A completion is a success iff the supervisor
+                            // marked the task `Completed`; `Failed` / `Cancelled` / a
+                            // legacy `None` (callers/tests that don't track status) all
+                            // suppress the review. This replaces the previous "✗ content
+                            // prefix" heuristic — the rendered body is not load-bearing
+                            // anymore, the explicit terminal status is.
+                            let is_success_completion =
+                                matches!(terminal_status, Some(octos_agent::TaskStatus::Completed));
+                            if persisted
+                                && is_success_completion
+                                && auto_review_background_completions_enabled()
+                                && self.try_begin_recovery_turn()
+                            {
+                                debug!(
+                                    session = %self.session_key,
+                                    task_label,
+                                    "dispatching synthetic completion-review turn"
+                                );
+                                // Reference the delivered artifacts by path (they
+                                // already exist where the task produced them). Do NOT
+                                // re-copy into the workspace: copy_media_to_workspace
+                                // targets user_workspace/<basename>, so an artifact
+                                // already there would be truncated by std::fs::copy
+                                // onto itself (codex P1).
+                                let prompt = build_completion_review_prompt(
+                                    &task_label,
+                                    &content,
+                                    &review_media,
+                                );
+                                let synthetic = self
+                                    .synthetic_completion_review_inbound(prompt, review_origin);
+                                self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
+                                    .await;
                             }
                             let _ = self.drain_master_continuations().await;
                         }
@@ -5388,6 +5632,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             let persisted = self
@@ -5472,6 +5723,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             let persisted = self
@@ -5825,6 +6083,19 @@ impl SessionActor {
             return None;
         }
         if self.channel == "system" {
+            return None;
+        }
+        // A completion-review turn is a system-internal prompt that EMBEDS the
+        // finished task's label (e.g. "Deep research"). Running forced-workflow
+        // detection on it would match that label and spawn a DUPLICATE workflow
+        // instead of reviewing the result — re-triggering on every completion up
+        // to the auto-turn cap. Never force a workflow from a review prompt.
+        if inbound
+            .metadata
+            .get("_completion_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return None;
         }
         WorkflowKind::detect_forced_background(&inbound.content).map(WorkflowKind::build)
@@ -6445,6 +6716,13 @@ impl SessionActor {
                             kind,
                             media,
                             originating_thread_id,
+                            // C1 step 3: new attribution fields are bound but
+                            // not yet consumed here — the explicit terminal
+                            // status is available for the completion-review
+                            // gate to read instead of the "✗" heuristic.
+                            task_id: _,
+                            tool_call_id: _,
+                            terminal_status: _,
                             ack,
                         }) => {
                             let persisted = self
@@ -7677,8 +7955,17 @@ impl SessionActor {
             .get("_recovery_turn")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // A completion-review turn (event-driven background acknowledgment) is
+        // server-driven too — it must NOT reset the consecutive-auto-turn cap,
+        // otherwise a review that spawns more background work could review its
+        // own follow-ups without bound.
+        let is_completion_review = inbound
+            .metadata
+            .get("_completion_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let is_master_continuation_inbound = inbound_is_master_continuation(&inbound);
-        if !is_recovery_turn && !is_master_continuation_inbound {
+        if !is_recovery_turn && !is_completion_review && !is_master_continuation_inbound {
             self.reset_consecutive_recovery_turns();
         }
 
@@ -9237,6 +9524,42 @@ mod tests {
         let finalized = finalize_assistant_content(&session_key, dir.path(), &original);
 
         assert_eq!(finalized, original);
+    }
+
+    /// C8 / GAP A: `raw_tasks_for_session` returns the live `BackgroundTask`
+    /// snapshots (paired with the owning supervisor's data_dir) so the WS
+    /// `session/open` handler can replay them as `task/updated` events. It must
+    /// surface the same tasks `query_json` does, keyed by the registered
+    /// `SessionKey`, and return empty for an unknown session.
+    #[test]
+    fn raw_tasks_for_session_returns_live_supervisor_tasks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("run_pipeline", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let tasks = store.raw_tasks_for_session(&session_key.to_string());
+        assert_eq!(tasks.len(), 1, "the running task must be surfaced");
+        let (task, returned_data_dir) = &tasks[0];
+        assert_eq!(task.id, task_id);
+        assert_eq!(task.tool_name, "run_pipeline");
+        assert_eq!(task.tool_call_id, "call-1");
+        assert_eq!(task.status, octos_agent::TaskStatus::Running);
+        assert_eq!(returned_data_dir, &data_dir);
+
+        // An unknown session has no live supervisor → empty replay.
+        assert!(
+            store
+                .raw_tasks_for_session(&SessionKey::new("api", "other").to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -11946,6 +12269,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: None,
         })
         .await
@@ -12024,6 +12350,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: None,
         })
         .await
@@ -12097,6 +12426,9 @@ mod tests {
             kind: BackgroundResultKind::Notification,
             media: vec![media_path.to_string_lossy().to_string()],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12164,6 +12496,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: Some(originating_cmid.to_string()),
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12288,6 +12623,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: Some(originating_cmid.to_string()),
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12371,6 +12709,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12409,6 +12750,9 @@ mod tests {
             kind: BackgroundResultKind::Report,
             media: vec![],
             originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: None,
             ack: Some(ack_tx),
         })
         .await
@@ -12435,6 +12779,64 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// C1 step 3: `dispatch_background_result_to_actor` must thread the
+    /// payload's `task_id` and `terminal_status` (and `tool_call_id`) onto
+    /// the produced `ActorMessage::BackgroundResult`, so the consumer can
+    /// read an explicit terminal status instead of the "✗" content heuristic.
+    #[tokio::test]
+    async fn dispatch_background_result_carries_task_id_and_terminal_status() {
+        let (tx, mut rx) = mpsc::channel::<ActorMessage>(4);
+
+        let payload = BackgroundResultPayload {
+            task_label: "mofa_slides".to_string(),
+            content: "✗ mofa_slides failed: contract rejected".to_string(),
+            kind: BackgroundResultKind::Notification,
+            media: vec![],
+            envelope_media: vec![],
+            originating_thread_id: None,
+            task_id: Some("task-abc".to_string()),
+            originating_client_message_id: None,
+            tool_call_id: Some("tc-xyz".to_string()),
+            terminal_status: Some(octos_agent::TaskStatus::Failed),
+        };
+
+        // Producer waits for an ack; receive the message and ack it.
+        let dispatch =
+            tokio::spawn(async move { dispatch_background_result_to_actor(tx, payload).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("message");
+
+        let ActorMessage::BackgroundResult {
+            task_id,
+            tool_call_id,
+            terminal_status,
+            ack,
+            ..
+        } = msg
+        else {
+            panic!("expected BackgroundResult variant");
+        };
+        assert_eq!(task_id.as_deref(), Some("task-abc"));
+        assert_eq!(tool_call_id.as_deref(), Some("tc-xyz"));
+        assert_eq!(terminal_status, Some(octos_agent::TaskStatus::Failed));
+
+        // Ack so the producer returns rather than timing out.
+        if let Some(ack) = ack {
+            let _ = ack.send(true);
+        }
+        let persisted = tokio::time::timeout(Duration::from_secs(2), dispatch)
+            .await
+            .expect("dispatch timeout")
+            .expect("join");
+        assert!(
+            persisted,
+            "producer should return the acked persistence flag"
+        );
     }
 
     #[tokio::test]
@@ -13955,6 +14357,88 @@ mod tests {
         assert!(
             recovery_user_msgs[0].content.contains("vivian"),
             "recovery prompt should include parsed alternatives"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[test]
+    fn completion_review_prompt_frames_result_for_the_model() {
+        let prompt = build_completion_review_prompt(
+            "deep research",
+            "Found 3 sources on X.",
+            &["report.md".to_string(), "data.csv".to_string()],
+        );
+        assert!(prompt.starts_with("[system-internal]"));
+        assert!(prompt.contains("deep research"));
+        assert!(prompt.contains("Found 3 sources on X."));
+        assert!(prompt.contains("Do NOT re-run"));
+        // Artifact files are surfaced so the review turn can inspect them.
+        assert!(prompt.contains("report.md"));
+        assert!(prompt.contains("data.csv"));
+        // Long results are previewed, not dumped whole.
+        let long = "z".repeat(2000);
+        let truncated = build_completion_review_prompt("t", &long, &[]);
+        assert!(truncated.contains("truncated"));
+        assert!(
+            truncated.len() < long.len(),
+            "prompt should preview, not inline the whole result"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_result_does_not_auto_review_when_gate_disabled() {
+        // Default (OCTOS_AUTO_REVIEW_BACKGROUND unset): a delivered background
+        // result is persisted + broadcast but must NOT spend an extra LLM turn,
+        // preserving the pre-prototype behavior. (The enabled path is validated
+        // live; edition-2024 makes `set_var` unsafe under deny(unsafe_code), so
+        // the env gate can't be flipped in-process here.)
+        //
+        // codex P3: if the suite is run in an environment that already enables
+        // the prototype gate, the review path is taken and this negative
+        // assertion is meaningless — skip rather than spuriously fail.
+        if auto_review_background_completions_enabled() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("AUTO-REVIEWED"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "deep research".into(),
+            content: "Found 3 sources.".into(),
+            kind: BackgroundResultKind::Notification,
+            media: vec![],
+            originating_thread_id: None,
+            task_id: None,
+            tool_call_id: None,
+            terminal_status: Some(octos_agent::TaskStatus::Completed),
+            ack: None,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+        }
+        // The result was delivered to the conversation...
+        assert!(
+            responses.iter().any(|c| c.contains("Found 3 sources")),
+            "background result should be delivered: {responses:?}"
+        );
+        // ...but the model was NOT invoked to review it (gate off by default).
+        assert!(
+            !responses.iter().any(|c| c.contains("AUTO-REVIEWED")),
+            "no review turn should run when the gate is disabled: {responses:?}"
         );
 
         drop(tx);

@@ -175,6 +175,8 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
                     .get("runtime_policy_stamp")
                     .cloned()
                     .filter(|v| !v.is_null()),
+                // C1 step 4: stamp the originating turn id (see map_task_updated).
+                turn_id: turn_id_field(event).or_else(|| Some(context.turn_id.clone())),
             },
         )]);
     }
@@ -255,6 +257,15 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
             .get("runtime_policy_stamp")
             .cloned()
             .filter(|v| !v.is_null()),
+        // C1 step 4: stamp the originating turn id so the client can
+        // reconcile its per-turn "N running" task count when a sub-agent
+        // reaches a terminal state. The source is the in-flight standalone
+        // turn's `TurnId` carried on `ProgressMappingContext` — the task
+        // snapshot itself records only a `client_message_id` (cmid), not a
+        // TurnId, so the context turn is the authoritative turn identity for
+        // events emitted during this turn. The producer JSON may override it
+        // with an explicit `turn_id` field when present.
+        turn_id: turn_id_field(event).or_else(|| Some(context.turn_id.clone())),
     })])
 }
 
@@ -532,6 +543,15 @@ fn task_id_field(value: &Value, keys: &[&str]) -> Option<TaskId> {
     string_field(value, keys).and_then(|task_id| task_id.parse().ok())
 }
 
+/// C1 step 4: extract an explicit `turn_id` from the producer progress JSON
+/// when present (a UUID string). Callers fall back to the in-flight turn on
+/// the `ProgressMappingContext` when this returns `None`.
+fn turn_id_field(value: &Value) -> Option<TurnId> {
+    string_field(value, &["turn_id"])
+        .and_then(|raw| uuid::Uuid::parse_str(&raw).ok())
+        .map(TurnId)
+}
+
 fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
     match state {
         "pending" | "queued" | "spawned" => Some(UiTaskRuntimeState::Pending),
@@ -588,6 +608,44 @@ pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTas
         }
     }
     payload
+}
+
+/// C8 / GAP A: build the `task/updated` notification used to REPLAY an
+/// already-known supervisor task to a freshly-opened / reconnecting client.
+///
+/// A reconnecting TUI starts with an empty `session.tasks` and only applies
+/// incremental `task/updated` deltas, so without replaying the current task
+/// list on `session/open` the existing tasks are invisible until their next
+/// live transition. This routes the raw [`octos_agent::BackgroundTask`]
+/// through the SAME mapping live updates use
+/// ([`background_task_to_progress_json`] -> [`map_progress_json`]), so the
+/// replayed wire shape is byte-identical to a live `task/updated`.
+///
+/// Unlike a live update, a replay is NOT tied to an in-flight turn, so the
+/// originating `turn_id` is cleared (`None`) — the client only needs the task
+/// to populate its list; the per-turn "N running" reconciliation that
+/// `turn_id` drives applies to live transitions during a turn, not to a
+/// snapshot replay. Returns `None` if the task JSON cannot be mapped (the
+/// only failure mode is an unmappable task_id / lifecycle state, which
+/// [`map_progress_json`] turns into a `warning` rather than a notification).
+pub(crate) fn replay_task_updated_notification(
+    session_id: &SessionKey,
+    task: &octos_agent::BackgroundTask,
+) -> Option<UiNotification> {
+    let event = background_task_to_progress_json(task);
+    // The context turn is never surfaced: map_task_updated's fallback stamps
+    // it, but we clear it below. A throwaway TurnId keeps the mapper happy.
+    let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+    let mapping = map_progress_json(&context, &event);
+    mapping.notifications.into_iter().find_map(|notification| {
+        if let UiNotification::TaskUpdated(mut updated) = notification {
+            // Replay snapshot — not attributable to a live turn.
+            updated.turn_id = None;
+            Some(UiNotification::TaskUpdated(updated))
+        } else {
+            None
+        }
+    })
 }
 
 fn stable_task_runtime_detail(task: &octos_agent::BackgroundTask) -> Option<String> {
@@ -951,6 +1009,56 @@ mod tests {
         assert_eq!(updated.title, "search");
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
+        // C1 step 4: when the producer JSON omits an explicit turn_id, the
+        // emitter falls back to the in-flight turn on the context.
+        assert_eq!(
+            updated.turn_id,
+            Some(TurnId(Uuid::from_u128(7))),
+            "task_updated must stamp the originating turn from the context",
+        );
+    }
+
+    /// C1 step 4: an explicit `turn_id` on the producer JSON overrides the
+    /// context turn, and a `task_updated` notification carrying `turn_id`
+    /// round-trips through serde while omitting it when absent.
+    #[test]
+    fn ui_protocol_progress_task_updated_turn_id_override_and_serde_roundtrip() {
+        let explicit = Uuid::from_u128(0xABCD);
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-000000000003",
+                "title": "search",
+                "state": "running",
+                "turn_id": explicit.to_string(),
+            }),
+        );
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.turn_id,
+            Some(TurnId(explicit)),
+            "explicit turn_id on the producer JSON must override the context turn",
+        );
+
+        // Serde round-trip with turn_id set: it appears on the wire and
+        // decodes back unchanged.
+        let value = serde_json::to_value(updated).expect("serialize");
+        assert_eq!(value.get("turn_id"), Some(&json!(explicit.to_string())));
+        let parsed: octos_core::ui_protocol::TaskUpdatedEvent =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.turn_id, Some(TurnId(explicit)));
+
+        // serde omits turn_id when None.
+        let mut bare = updated.clone();
+        bare.turn_id = None;
+        let bare_value = serde_json::to_value(&bare).expect("serialize bare");
+        assert!(
+            bare_value.get("turn_id").is_none(),
+            "turn_id must be omitted from the wire when None",
+        );
     }
 
     /// Codex P2 rev2 follow-up on #1156: a `null` runtime_policy_stamp
@@ -1148,6 +1256,65 @@ mod tests {
         assert_eq!(event["title"], "search");
         assert_eq!(event["state"], "verifying");
         assert_eq!(event["runtime_detail"], "Writing report");
+    }
+
+    /// C8 / GAP A: a session-open task replay must reproduce the live
+    /// `task/updated` wire shape (same task_id / title / state / projection
+    /// fields routed through `background_task_to_progress_json` ->
+    /// `map_progress_json`) but with `turn_id` cleared — a snapshot replay is
+    /// not attributable to any in-flight turn.
+    #[test]
+    fn replay_task_updated_notification_clears_turn_id_and_preserves_shape() {
+        let session_id = SessionKey("local:demo".into());
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000099".into(),
+            tool_name: "run_pipeline".into(),
+            tool_call_id: "call-replay".into(),
+            parent_session_key: Some("local:demo".into()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::ExecutingTool,
+            runtime_detail: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:demo".into()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        let notification = replay_task_updated_notification(&session_id, &task)
+            .expect("running task should map to a task/updated notification");
+        let UiNotification::TaskUpdated(updated) = notification else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.task_id.to_string(),
+            "01900000-0000-7000-8000-000000000099"
+        );
+        assert_eq!(updated.title, "run_pipeline");
+        assert_eq!(updated.tool_call_id.as_deref(), Some("call-replay"));
+        assert_eq!(updated.state, UiTaskRuntimeState::Running);
+        assert_eq!(updated.session_id, session_id);
+        // The whole point of GAP A's clearing: a replayed snapshot is NOT
+        // tied to a live turn, unlike the live mapping which stamps the
+        // in-flight context turn.
+        assert_eq!(
+            updated.turn_id, None,
+            "a session-open replay snapshot must not carry an originating turn_id",
+        );
     }
 
     /// #1113 codex P2 follow-up: when `set_m13b_projection` populates
