@@ -15,13 +15,13 @@ use crate::task_supervisor::TaskSupervisor;
 use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
-    ApplyPatchTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool, ConfigureToolTool,
-    DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool, ImageGenerationTool,
-    ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, ShellTool,
-    SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolLifecycle, ToolResult,
-    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ApplyPatchTool, AskUserQuestionTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool,
+    ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
+    ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
+    SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore,
+    ToolLifecycle, ToolResult, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
+    WaitAgentTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -520,6 +520,25 @@ impl ToolRegistry {
             .get(name)
             .map(|t| t.concurrency_class())
             .unwrap_or_default()
+    }
+
+    /// Whether the named tool blocks on human input (e.g. `ask_user_question`
+    /// awaiting the requester until the client answers). Mirrors
+    /// [`Tool::blocks_on_human_input`]; unknown tools report `false`.
+    ///
+    /// Used by the agent batch dispatcher (`agent::execution`) to detect a
+    /// human-wait batch and skip the finite batch-level `tokio::time::timeout`
+    /// wrap that would otherwise detach the still-running tool task after the
+    /// ceiling fired — leaking the pending-question store entry and replaying a
+    /// stale prompt after the turn moved on (UPCR-2026-023). The registry
+    /// dispatch boundary already exempts these tools via
+    /// [`Tool::blocks_on_human_input`]; this surfaces the same fact one layer
+    /// up so the outer batch wrap can be skipped too.
+    pub fn blocks_on_human_input(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|t| t.blocks_on_human_input())
+            .unwrap_or(false)
     }
 
     /// Get tool specifications for the LLM, filtered by provider policy if set.
@@ -1184,22 +1203,6 @@ impl ToolRegistry {
         // Track usage for LRU auto-eviction
         self.record_usage(name);
 
-        // Gap 3.3: per-tool execution timeout. A hung foreground tool used to
-        // block the caller's turn (the session actor's "10-min opaque
-        // pipeline" / hung-tool class) indefinitely — the agent loop's
-        // per-batch timeout only guards the agent::execution dispatch path,
-        // leaving direct registry callers (serve/API tool path, workspace
-        // contract auto-send) unbounded. This dispatch-boundary timeout
-        // bounds EVERY caller. The per-tool override
-        // (`Tool::execution_timeout_secs`) wins when present; otherwise the
-        // registry's generous global backstop applies. `spawn_only` tools are
-        // intercepted/backgrounded earlier and never reach this path.
-        let timeout_secs = tool
-            .execution_timeout_secs()
-            .unwrap_or(self.tool_timeout_secs)
-            .max(1);
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-
         // Layer 2 (mini5 soak): isolate a tool panic at this single dispatch
         // boundary. A panic inside a tool used to unwind through the session
         // actor's task, killing the actor AND every in-process sub-agent it had
@@ -1216,25 +1219,43 @@ impl ToolRegistry {
         // tool future entirely and returns a fresh failure.
         let invocation = tool.execute_with_context(ctx, args);
         let guarded = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(invocation));
+
+        // #1 — human-wait exemption. A tool that blocks on human input (e.g.
+        // `ask_user_question` awaiting the requester, mirroring the approval
+        // gate) must NOT be killed by the dispatch timeout: a human may take
+        // longer than any finite ceiling, and firing the timeout would drop
+        // the requester's receiver and leak the pending store entry forever.
+        // Skip the timeout wrap entirely for these tools — the turn-interrupt
+        // drain (which resolves the waiter as `Cancelled`) is the correct
+        // cancellation path, not a fixed timeout. Panic isolation still
+        // applies. This matches how the approval-blocking `shell` gate is not
+        // double-killed by the tool timeout.
+        if tool.blocks_on_human_input() {
+            return match guarded.await {
+                Ok(result) => result,
+                Err(panic) => Ok(panic_to_failed_result(name, panic)),
+            };
+        }
+
+        // Gap 3.3: per-tool execution timeout. A hung foreground tool used to
+        // block the caller's turn (the session actor's "10-min opaque
+        // pipeline" / hung-tool class) indefinitely — the agent loop's
+        // per-batch timeout only guards the agent::execution dispatch path,
+        // leaving direct registry callers (serve/API tool path, workspace
+        // contract auto-send) unbounded. This dispatch-boundary timeout
+        // bounds EVERY caller. The per-tool override
+        // (`Tool::execution_timeout_secs`) wins when present; otherwise the
+        // registry's generous global backstop applies. `spawn_only` tools are
+        // intercepted/backgrounded earlier and never reach this path.
+        let timeout_secs = tool
+            .execution_timeout_secs()
+            .unwrap_or(self.tool_timeout_secs)
+            .max(1);
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
         match tokio::time::timeout(timeout, guarded).await {
             Ok(Ok(result)) => result,
-            Ok(Err(panic)) => {
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                tracing::error!(
-                    tool = name,
-                    panic = %detail,
-                    "tool execution panicked — isolated to a tool error; session actor preserved"
-                );
-                Ok(ToolResult {
-                    output: format!("tool '{name}' failed (internal error): {detail}"),
-                    success: false,
-                    ..Default::default()
-                })
-            }
+            Ok(Err(panic)) => Ok(panic_to_failed_result(name, panic)),
             Err(_elapsed) => {
                 tracing::error!(
                     tool = name,
@@ -1249,6 +1270,28 @@ impl ToolRegistry {
                 })
             }
         }
+    }
+}
+
+/// Degrade a caught tool panic to a failed [`ToolResult`] (Layer-2 panic
+/// isolation, mini5 soak). Shared by the timeout-guarded dispatch arm and the
+/// human-wait (timeout-exempt) dispatch arm so both isolate a panic
+/// identically.
+fn panic_to_failed_result(name: &str, panic: Box<dyn std::any::Any + Send>) -> ToolResult {
+    let detail = panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+    tracing::error!(
+        tool = name,
+        panic = %detail,
+        "tool execution panicked — isolated to a tool error; session actor preserved"
+    );
+    ToolResult {
+        output: format!("tool '{name}' failed (internal error): {detail}"),
+        success: false,
+        ..Default::default()
     }
 }
 
@@ -1298,6 +1341,9 @@ impl ToolRegistry {
         registry.register(WriteStdinTool);
         registry.register(UpdatePlanTool);
         registry.register(RequestUserInputTool);
+        // UPCR-2026-023: structured AskUserQuestion. The synchronous,
+        // answer-routed superset of `request_user_input`.
+        registry.register(AskUserQuestionTool::new());
         registry.register(SpawnAgentTool::new());
         // #1172: Codex-compatible `delegate` one-call wrapper. The default
         // instance has no spawn_agent bound — `register("spawn")` swaps
@@ -2532,6 +2578,76 @@ mod context_threading_tests {
             futures::future::pending::<()>().await;
             unreachable!("pending() never resolves");
         }
+    }
+
+    /// A human-wait tool: blocks on a requester (like `ask_user_question`'s
+    /// `request_user_question` await). It must be EXEMPT from the dispatch
+    /// timeout — a human may legitimately take longer than any finite tool
+    /// timeout, and killing the future would drop the receiver and leak the
+    /// pending store entry forever.
+    struct HumanWaitTool {
+        unblock: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for HumanWaitTool {
+        fn name(&self) -> &str {
+            "human_wait"
+        }
+        fn description(&self) -> &str {
+            "test-only: blocks on a human until notified"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn blocks_on_human_input(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            self.unblock.notified().await;
+            Ok(ToolResult {
+                output: "answered".into(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn human_wait_tool_is_exempt_from_dispatch_timeout() {
+        // A human-wait tool must NOT be killed by the dispatch timeout even
+        // when the registry backstop is set to 1s — it stays blocked until
+        // the human answers, then returns success. Mirrors how `shell`'s
+        // approval gate is not killed by the tool timeout (#1).
+        let mut reg = ToolRegistry::new();
+        let unblock = Arc::new(tokio::sync::Notify::new());
+        reg.register_arc(Arc::new(HumanWaitTool {
+            unblock: unblock.clone(),
+        }));
+        // A tight backstop that WOULD kill a normal tool.
+        reg.set_tool_timeout_secs(1);
+
+        let unblock_for_task = unblock.clone();
+        // Answer the "human" after 2s — comfortably past the 1s backstop.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            unblock_for_task.notify_one();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reg.execute("human_wait", &serde_json::json!({})),
+        )
+        .await
+        .expect("human-wait tool must not hang the test")
+        .expect("registry returns Ok");
+
+        assert!(
+            result.success,
+            "human-wait tool must survive the dispatch timeout and return its answer, got: {}",
+            result.output
+        );
+        assert_eq!(result.output, "answered");
     }
 
     #[tokio::test]
