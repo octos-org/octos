@@ -1115,7 +1115,7 @@ fn graph_checkpoint_names(graph: &PipelineGraph, context: &ValidationContext) ->
     names
 }
 
-fn detect_cycles_ignoring_marked_back_edges(graph: &PipelineGraph) -> Result<(), String> {
+pub fn detect_cycles_ignoring_marked_back_edges(graph: &PipelineGraph) -> Result<(), String> {
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in &graph.edges {
         if edge_allows_back_edge(edge, graph) {
