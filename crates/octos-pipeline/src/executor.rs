@@ -1420,11 +1420,28 @@ fn resolve_search_result_files(content: &str, working_dir: &std::path::Path) -> 
 /// The main pipeline executor.
 pub struct PipelineExecutor {
     config: ExecutorConfig,
+    /// Explicit DAG-scheduler override. `Some(true)`/`Some(false)` force the
+    /// scheduler on/off and take PRECEDENCE over the `OCTOS_PIPELINE_DAG` env;
+    /// `None` defers to the env. Default `None` → byte-identical production
+    /// until an operator opts in. The builder sets it so a test can force the
+    /// legacy path even when an opted-in env (`OCTOS_PIPELINE_DAG=1`) is set.
+    dag_override: Option<bool>,
 }
 
 impl PipelineExecutor {
     pub fn new(config: ExecutorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            dag_override: None,
+        }
+    }
+
+    /// Builder: force the DAG scheduler on or off, overriding the env. Used by
+    /// tests (env vars race across parallel tests) and by callers that must pin
+    /// a path deterministically.
+    pub fn with_dag_scheduler(mut self, on: bool) -> Self {
+        self.dag_override = Some(on);
+        self
     }
 
     /// Builder: attach a workspace-contract context (coding-blue FA-7).
@@ -1653,10 +1670,27 @@ impl PipelineExecutor {
             .await
             .wrap_err("pipeline cost reservation failed")?;
 
-        // Execute graph
-        let mut result = self
-            .execute_graph(&graph, &handlers, &start_node, user_input, variables)
-            .await;
+        // Execute graph. The ready-set DAG scheduler replaces the single-path
+        // walk ONLY for graphs it fully supports (no Parallel/DynamicParallel
+        // fan-out, no `converge` — those need the legacy runtime orchestration)
+        // and ONLY when opted in. Setup (model fill, pipeline reservation) and
+        // teardown (terminal validators, reservation commit) are shared.
+        // Explicit builder override wins over the env; otherwise read the env.
+        // Checkpoint-backed runs stay on the legacy walk: the DAG path does not
+        // build the resume skip-set or persist `node.checkpoints`, so a
+        // checkpointed pipeline must not silently lose resume/persist parity.
+        let dag_selected = self.dag_override.unwrap_or_else(dag_scheduler_enabled);
+        let use_dag = dag_selected
+            && graph_is_dag_schedulable(&graph)
+            && self.config.checkpoint_store.is_none();
+        let mut result = if use_dag {
+            info!(pipeline = %graph.id, "executing on ready-set DAG scheduler");
+            self.execute_graph_dag(&graph, &handlers, &start_node, user_input, variables)
+                .await
+        } else {
+            self.execute_graph(&graph, &handlers, &start_node, user_input, variables)
+                .await
+        };
 
         // coding-blue FA-7: pipeline-terminal validators. The gate
         // runs only on a successful pipeline (failure results already
@@ -3675,6 +3709,577 @@ impl PipelineExecutor {
     }
 
     /// 5-step edge selection algorithm.
+    /// Ready-set DAG scheduler — the traversal that replaces the single-path
+    /// walk for schedulable graphs (gated; see `run_graph_with_handlers`).
+    ///
+    /// A node runs once ALL its forward predecessors are settled (completed or
+    /// pruned) AND at least one incoming edge fired — so a diamond
+    /// `A→B, A→C, B→D, C→D` runs BOTH branches and `D` joins both, the bug the
+    /// single-path walk silently half-executed. Conditional edges fire on
+    /// `condition` match; unconditional edges fire only on success
+    /// (fail-closed). Nodes whose every forward predecessor settled with no
+    /// fired in-edge are pruned (recursively). A fired back-edge
+    /// (`label=="back_edge"`) re-runs its forward-reachable region, bounded by
+    /// a per-node run guard so retry loops terminate.
+    async fn execute_graph_dag(
+        &self,
+        graph: &PipelineGraph,
+        handlers: &HandlerRegistry,
+        start_node: &str,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PipelineResult> {
+        /// Max times any single node may execute — terminates retry loops.
+        const MAX_NODE_RUNS: u32 = 10;
+
+        let rc = DagRunCtx {
+            graph,
+            handlers,
+            user_input,
+            variables,
+        };
+
+        // Startup parity with the legacy walk: the initial "started" progress
+        // event + the 5s heartbeat the pipeline UI relies on (long nodes would
+        // otherwise look frozen).
+        report_progress(&format!(
+            "Pipeline '{}' started ({} nodes)",
+            graph.id,
+            graph.nodes.len()
+        ));
+        let heartbeat_status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: graph.id.clone(),
+            current_node: start_node.to_string(),
+            nodes_done: 0,
+            nodes_total: graph.nodes.len(),
+            start: Instant::now(),
+        }));
+        let _heartbeat = spawn_pipeline_heartbeat(heartbeat_status.clone(), 5);
+
+        let mut completed: HashMap<String, NodeOutcome> = HashMap::new();
+        let mut pruned: HashMap<String, PruneReason> = HashMap::new();
+        let mut summaries: Vec<NodeSummary> = Vec::new();
+        let mut node_costs: Vec<NodeCost> = Vec::new();
+        let mut total_tokens = TokenUsage::default();
+        // Back-edge critique to feed a node on its next (retry) run, keyed by
+        // the back-edge target. Captured when the back-edge fires, consumed when
+        // the target re-runs.
+        let mut feedback: HashMap<String, NodeOutcome> = HashMap::new();
+        // Set when any node is pruned because a REQUIRED input failed: such a
+        // run did not complete a required path, so it must report failure even
+        // if some unrelated terminal node passed.
+        let mut any_failure_prune = false;
+        // Per-back-edge-TARGET retry counter, bounding loops. Keyed by target and
+        // incremented on every retry — unlike counting the target's executions it
+        // advances even when the target itself never runs (e.g. it is pruned each
+        // round), so a back-edge that fires before its target executes cannot
+        // spin forever.
+        let mut retry_count: HashMap<String, u32> = HashMap::new();
+
+        loop {
+            // ---- Forward pass: run ready nodes, prune dead ones, until quiescent.
+            loop {
+                let settled = |id: &str| completed.contains_key(id) || pruned.contains_key(id);
+
+                // A node is runnable when every NON-PRUNED forward predecessor's
+                // edge has fired (a join thus has all its required inputs — a
+                // failed predecessor whose edge is fail-closed makes the join
+                // prunable, not partial) and ≥1 fired (or it's a root). Pick the
+                // lexicographically smallest ready id so concurrent branches
+                // execute in a deterministic order (HashMap key iteration is
+                // randomized — matters under budgets / goal-gate / side effects).
+                let runnable = graph
+                    .nodes
+                    .keys()
+                    .filter(|id| {
+                        !settled(id)
+                            && matches!(
+                                dag_node_readiness(graph, id, &completed, &pruned),
+                                Ok(NodeReadiness::Runnable)
+                            )
+                    })
+                    .min()
+                    .cloned();
+
+                if let Some(node_id) = runnable {
+                    // Refresh the heartbeat snapshot so the periodic chip shows
+                    // the node currently executing.
+                    if let Ok(mut s) = heartbeat_status.lock() {
+                        s.current_node = node_id.clone();
+                        s.nodes_done = completed.len();
+                    }
+
+                    // Pre-dispatch budget gate (parity with the legacy walk):
+                    // refuse to start a node once the pipeline token budget is
+                    // exhausted; otherwise cap this node's output to what remains.
+                    let remaining_tokens =
+                        remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens);
+                    if remaining_tokens == Some(0) {
+                        let msg = format!(
+                            "Pipeline token budget exhausted before node '{}': spent {} tokens",
+                            node_id,
+                            total_pipeline_tokens(&total_tokens)
+                        );
+                        return Ok(dag_build_result(
+                            Some(false),
+                            Some(msg),
+                            &completed,
+                            summaries,
+                            total_tokens,
+                            node_costs,
+                            graph,
+                            false,
+                        ));
+                    }
+
+                    // Keep graph-edge order (fired_forward_into walks
+                    // graph.edges) — the documented fan-in order downstream
+                    // handlers/synthesis depend on; do NOT re-sort.
+                    let fired = fired_forward_into(graph, &node_id, &completed)?;
+                    let node_feedback = feedback.get(&node_id).cloned();
+                    let step = match self
+                        .dag_execute_node(
+                            &rc,
+                            &node_id,
+                            &fired,
+                            &completed,
+                            remaining_tokens,
+                            node_feedback.as_ref(),
+                        )
+                        .await?
+                    {
+                        DagStep::Ran(o) => *o,
+                        DagStep::Aborted(reason) => {
+                            return Ok(dag_build_result(
+                                Some(false),
+                                Some(format!("Pipeline aborted before node '{node_id}': {reason}")),
+                                &completed,
+                                summaries,
+                                total_tokens,
+                                node_costs,
+                                graph,
+                                false,
+                            ));
+                        }
+                    };
+                    feedback.remove(&node_id); // critique consumed by this run
+
+                    total_tokens.input_tokens += step.outcome.token_usage.input_tokens;
+                    total_tokens.output_tokens += step.outcome.token_usage.output_tokens;
+                    if let Some(ref bridge) = self.config.status_bridge {
+                        bridge.add_tokens(&step.outcome.token_usage);
+                    }
+                    summaries.push(step.summary);
+                    node_costs.push(step.cost);
+
+                    let status = step.outcome.status;
+                    let node_meta = graph.nodes.get(&node_id);
+                    let continue_on_error = node_meta.map(|n| n.continue_on_error).unwrap_or(false);
+                    let is_goal_gate = node_meta.map(|n| n.goal_gate).unwrap_or(false);
+                    completed.insert(node_id.clone(), step.outcome);
+
+                    // Hard error stops the pipeline (mirrors the single-path walk).
+                    if status == OutcomeStatus::Error && !continue_on_error {
+                        let msg = format!(
+                            "Pipeline failed at node '{}': {}",
+                            node_id,
+                            completed.get(&node_id).map(|o| o.content.as_str()).unwrap_or("")
+                        );
+                        return Ok(dag_build_result(
+                            Some(false),
+                            Some(msg),
+                            &completed,
+                            summaries,
+                            total_tokens,
+                            node_costs,
+                            graph,
+                            false,
+                        ));
+                    }
+
+                    // Goal gate: a passing goal node ends the pipeline
+                    // immediately and successfully (mirrors the single-path walk).
+                    if is_goal_gate && status == OutcomeStatus::Pass {
+                        let content = completed
+                            .get(&node_id)
+                            .map(|o| o.content.clone())
+                            .unwrap_or_default();
+                        info!(pipeline = %graph.id, goal_node = %node_id, "DAG: goal gate passed — pipeline complete");
+                        return Ok(dag_build_result(
+                            Some(true),
+                            Some(content),
+                            &completed,
+                            summaries,
+                            total_tokens,
+                            node_costs,
+                            graph,
+                            false,
+                        ));
+                    }
+
+                    // Token-budget ceiling (post-node, mirrors the legacy walk).
+                    if let Some(max_total) = graph.max_total_tokens {
+                        let spent = total_tokens
+                            .input_tokens
+                            .saturating_add(total_tokens.output_tokens);
+                        if spent >= max_total {
+                            let msg = format!(
+                                "Pipeline token budget exhausted after node '{node_id}': spent {spent}/{max_total} tokens"
+                            );
+                            return Ok(dag_build_result(
+                                Some(false),
+                                Some(msg),
+                                &completed,
+                                summaries,
+                                total_tokens,
+                                node_costs,
+                                graph,
+                                false,
+                            ));
+                        }
+                    }
+
+                    // Eager back-edge: if THIS node's outcome fires a back-edge,
+                    // retry its region NOW — before any forward consumer of the
+                    // SAME (e.g. failed) outcome is scheduled (a `report` node on
+                    // the same fail condition would otherwise run on a transient
+                    // failure that's about to be retried). Bounded by the guard.
+                    for e in graph
+                        .edges
+                        .iter()
+                        .filter(|e| e.source == node_id && edge_is_back(graph, e))
+                    {
+                        let fires = completed
+                            .get(&node_id)
+                            .map(|src| dag_back_edge_fires(e, src).unwrap_or(false))
+                            .unwrap_or(false);
+                        if fires
+                            && retry_count.get(&e.target).copied().unwrap_or(0) < MAX_NODE_RUNS
+                        {
+                            *retry_count.entry(e.target.clone()).or_insert(0) += 1;
+                            if let Some(src_outcome) = completed.get(&node_id).cloned() {
+                                feedback.insert(e.target.clone(), src_outcome);
+                            }
+                            let region = forward_reachable(graph, &e.target);
+                            info!(node = %e.target, region = region.len(), "DAG: eager back-edge retry");
+                            for r in &region {
+                                completed.remove(r);
+                                pruned.remove(r);
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // No runnable node — prune one that is settled but can never get
+                // all its required inputs (a not-taken conditional branch, or a
+                // join missing a failed/fail-closed predecessor). Smallest id
+                // first; carry the prune REASON so failure-prunes propagate.
+                let prunable = graph
+                    .nodes
+                    .keys()
+                    .filter(|id| !settled(id))
+                    .filter_map(|id| {
+                        match dag_node_readiness(graph, id, &completed, &pruned) {
+                            Ok(NodeReadiness::Prune(reason)) => Some((id.clone(), reason)),
+                            _ => None,
+                        }
+                    })
+                    .min_by(|a, b| a.0.cmp(&b.0));
+
+                match prunable {
+                    Some((p, reason)) => {
+                        if reason == PruneReason::Failure {
+                            any_failure_prune = true;
+                        }
+                        info!(node = %p, failure = (reason == PruneReason::Failure), "DAG: pruning node");
+                        pruned.insert(p, reason);
+                    }
+                    None => break, // forward pass quiescent
+                }
+            }
+
+            // ---- Back-edge retries: a fired back-edge re-runs its region,
+            // carrying the source's critique forward as feedback to the target.
+            let fired_back: Vec<(String, NodeOutcome)> = graph
+                .edges
+                .iter()
+                .filter(|e| edge_is_back(graph, e))
+                .filter_map(|e| {
+                    let src = completed.get(&e.source)?;
+                    if dag_back_edge_fires(e, src).unwrap_or(false) {
+                        Some((e.target.clone(), src.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut retried = false;
+            for (target, src_outcome) in fired_back {
+                let rc = retry_count.get(&target).copied().unwrap_or(0);
+                if rc < MAX_NODE_RUNS {
+                    *retry_count.entry(target.clone()).or_insert(0) += 1;
+                    // Hand the target the critique that triggered the retry so
+                    // the re-run is feedback-driven, not a blind repeat.
+                    feedback.insert(target.clone(), src_outcome);
+                    let region = forward_reachable(graph, &target);
+                    info!(node = %target, region = region.len(), "DAG: back-edge retry");
+                    for r in &region {
+                        completed.remove(r);
+                        pruned.remove(r);
+                    }
+                    retried = true;
+                    break;
+                }
+                warn!(
+                    node = %target,
+                    max = MAX_NODE_RUNS,
+                    "DAG: loop guard hit; not retrying"
+                );
+            }
+            if !retried {
+                break;
+            }
+        }
+
+        // Normal quiescence: derive success from the terminal nodes (those with
+        // no fired outgoing forward edge) rather than assuming success — a
+        // terminal that settled Fail/Skipped (or a retry loop whose guard was
+        // hit while still failing) must report failure, like the legacy walk.
+        Ok(dag_build_result(
+            None,
+            None,
+            &completed,
+            summaries,
+            total_tokens,
+            node_costs,
+            graph,
+            any_failure_prune,
+        ))
+    }
+
+    /// Execute one node on the DAG path. Mirrors the per-node body of
+    /// `execute_graph` (input join, template/model resolution, task
+    /// registration, per-node budget reservation, dispatch-with-retries+
+    /// deadline, per-node validators, cost row, supervisor terminal) but is
+    /// driven by the scheduler's fired-predecessor set rather than a single
+    /// walk pointer. Fan-out/converge/recovery-loop are NOT handled here —
+    /// such graphs are routed to the legacy walk by `graph_is_dag_schedulable`.
+    async fn dag_execute_node(
+        &self,
+        rc: &DagRunCtx<'_>,
+        node_id: &str,
+        fired_preds: &[String],
+        completed: &HashMap<String, NodeOutcome>,
+        remaining_tokens: Option<u32>,
+        feedback: Option<&NodeOutcome>,
+    ) -> Result<DagStep> {
+        let graph = rc.graph;
+        let handlers = rc.handlers;
+        let user_input = rc.user_input;
+        let variables = rc.variables;
+        let node = graph
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| eyre::eyre!("DAG: unknown node {node_id}"))?;
+        let handler = handlers
+            .get(&node.handler)
+            .ok_or_else(|| eyre::eyre!("no handler for {:?}", node.handler))?;
+
+        // Input = fired forward-predecessor outputs, PLUS any back-edge
+        // feedback that triggered a retry of this node (the evaluator/check
+        // critique). Without the feedback a repair loop would re-run on the
+        // same original input and never converge (legacy includes the back-edge
+        // source as a predecessor; the DAG forward graph excludes it, so it is
+        // threaded explicitly here).
+        let mut input_parts: Vec<&str> = fired_preds
+            .iter()
+            .filter_map(|p| completed.get(p))
+            .map(|o| o.content.as_str())
+            .collect();
+        if let Some(fb) = feedback {
+            input_parts.push(fb.content.as_str());
+        }
+        let input_text = if input_parts.is_empty() {
+            user_input.to_string()
+        } else {
+            input_parts.join("\n\n---\n\n")
+        };
+
+        let mut node_with_prompt = node.clone();
+        if let Some(ref prompt) = node_with_prompt.prompt {
+            let mut resolved = prompt.replace("{input}", "");
+            for (k, v) in variables {
+                let placeholder = format!("{{{k}}}");
+                resolved = resolved.replace(&placeholder, v.as_str().unwrap_or(""));
+            }
+            node_with_prompt.prompt = Some(resolved.trim_end().to_string());
+        }
+        if node_with_prompt.model.is_none() {
+            node_with_prompt.model = graph.default_model.clone();
+        }
+
+        // Cap this node's output to the remaining pipeline budget before
+        // dispatch (parity with the legacy walk) so a Codergen node can't
+        // request its full limit and overshoot `max_total_tokens`.
+        if let Some(rem) = remaining_tokens {
+            cap_node_output_tokens_for_remaining_budget(&mut node_with_prompt, rem, 1);
+        }
+
+        let mut predecessor_outcomes: Vec<NodeOutcome> = fired_preds
+            .iter()
+            .filter_map(|p| completed.get(p).cloned())
+            .collect();
+        if let Some(fb) = feedback {
+            predecessor_outcomes.push(fb.clone());
+        }
+        let ctx = HandlerContext {
+            input: input_text,
+            completed: completed.clone(),
+            predecessor_outcomes,
+            working_dir: self.config.working_dir.clone(),
+        };
+
+        let seq_label = node.label.as_deref().unwrap_or(&node.id).to_string();
+        report_progress(&format!("{seq_label}: running..."));
+        let node_total = graph.nodes.len();
+        let node_index = completed.len() + 1;
+        let guard = NodeProgressGuard::arm(&graph.id, &node.id, &seq_label, node_index, node_total);
+
+        if let Some(ref bridge) = self.config.status_bridge {
+            bridge.set_words(vec![seq_label.clone()]);
+        }
+
+        // Registration refusal (terminal parent / fanout cap) → structured
+        // failure result, NOT an execution error (parity with the legacy walk).
+        let node_task_id = match self.register_node_task(&node.id) {
+            Ok(opt) => opt,
+            Err(reason) => return Ok(DagStep::Aborted(reason)),
+        };
+        if let Some(ref id) = node_task_id {
+            if let Some(ref supervisor) = self.config.host_context.task_supervisor {
+                supervisor.mark_running(id);
+            }
+        }
+
+        let node_reservation = self.reserve_node_budget(&graph.id, &node_with_prompt).await?;
+        let node_reserved_usd = node_reservation
+            .as_ref()
+            .map(|h| h.reserved_amount_usd())
+            .unwrap_or(0.0);
+
+        let node_start = Instant::now();
+        let dispatch = self
+            .dispatch_node(handler, &node_with_prompt, &ctx, node.max_retries)
+            .await;
+        let mut outcome = match dispatch? {
+            DispatchOutcome::Completed(o) => o,
+            DispatchOutcome::Skipped { .. } => NodeOutcome {
+                node_id: node.id.clone(),
+                status: OutcomeStatus::Skipped,
+                content: format!("Node '{}' skipped (deadline exceeded)", node.id),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            },
+        };
+
+        // M8.9 recovery (parity with the walk): one re-attempt on a retryable
+        // first failure before the outcome is allowed to prune/abort. Skipped/
+        // Pass outcomes short-circuit inside `classify_outcome`.
+        let recovery_input = serde_json::json!({ "node": node.id, "input": ctx.input });
+        if let crate::recovery::RecoveryDecision::Retryable(signal) =
+            crate::recovery::classify_outcome(&node_with_prompt, &outcome, &recovery_input)
+        {
+            match crate::recovery::recover_node(
+                handler,
+                &node_with_prompt,
+                &ctx,
+                &signal,
+                &self.config.shutdown,
+            )
+            .await
+            {
+                Ok(r) if r.retried => outcome = r.outcome,
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(node = %node.id, error = %error, "DAG: M8.9 recovery dispatch errored");
+                }
+            }
+        }
+
+        // Per-node terminal validators — only on a passing outcome (parity with
+        // the walk): a node that already returned Fail/Error/Skipped must route
+        // through its failure edge, not be demoted to Error by a validator.
+        if outcome.status == OutcomeStatus::Pass {
+            if let Err(reason) = self.run_node_validators(&node.id).await {
+                warn!(node = %node.id, reason = %reason, "DAG: per-node validator rejected outcome");
+                outcome.status = OutcomeStatus::Error;
+                outcome.content =
+                    format!("Pipeline node validator rejected '{}': {reason}", node.id);
+            }
+        }
+
+        // Measure AFTER recovery + validators (parity) so a recovery re-attempt
+        // is included in the reported node duration.
+        let duration_ms = node_start.elapsed().as_millis() as u64;
+
+        let node_cost_committed = node_reservation.is_some();
+        drop(node_reservation);
+        let actual_usd = octos_agent::cost_ledger::project_cost_usd(
+            node_with_prompt.model.as_deref().unwrap_or("pipeline-node"),
+            outcome.token_usage.input_tokens,
+            outcome.token_usage.output_tokens,
+        )
+        .unwrap_or(node_reserved_usd);
+        let cost = NodeCost {
+            node_id: node.id.clone(),
+            model: node_with_prompt.model.clone(),
+            reserved_usd: node_reserved_usd,
+            actual_usd,
+            tokens_in: outcome.token_usage.input_tokens,
+            tokens_out: outcome.token_usage.output_tokens,
+            committed: node_cost_committed,
+        };
+
+        if let Some(task_id) = node_task_id {
+            if let Some(ref supervisor) = self.config.host_context.task_supervisor {
+                match outcome.status {
+                    OutcomeStatus::Pass => {
+                        let files = outcome
+                            .files_modified
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect();
+                        supervisor.mark_completed(&task_id, files);
+                    }
+                    OutcomeStatus::Fail | OutcomeStatus::Error => {
+                        supervisor.mark_failed(&task_id, format!("node {} failed", node.id));
+                    }
+                    OutcomeStatus::Skipped => supervisor.mark_completed(&task_id, Vec::new()),
+                }
+            }
+        }
+
+        let success = outcome.status == OutcomeStatus::Pass;
+        let summary = NodeSummary {
+            node_id: node.id.clone(),
+            label: seq_label,
+            model: node_with_prompt.model.clone(),
+            token_usage: outcome.token_usage.clone(),
+            duration_ms,
+            success,
+        };
+        guard.complete(success, &node_output_preview(&outcome.content));
+
+        Ok(DagStep::Ran(Box::new(DagNodeOutput {
+            outcome,
+            summary,
+            cost,
+        })))
+    }
+
     fn select_next_edge(
         &self,
         graph: &PipelineGraph,
@@ -3779,10 +4384,549 @@ fn pick_by_weight(edges: &[&PipelineEdge]) -> String {
         .clone()
 }
 
+// ---------------------------------------------------------------------------
+// DAG scheduler helpers (ready-set traversal). Free functions so both the
+// readiness closures and `execute_graph_dag` share one definition.
+// ---------------------------------------------------------------------------
+
+/// Per-node result the DAG scheduler accumulates from `dag_execute_node`.
+struct DagNodeOutput {
+    outcome: NodeOutcome,
+    summary: NodeSummary,
+    cost: NodeCost,
+}
+
+/// Outcome of a single `dag_execute_node` call: either the node ran, or its
+/// task registration was refused (terminal parent / fanout cap) — which the
+/// scheduler converts into a structured failure `PipelineResult`, like the
+/// legacy walk, rather than an execution error.
+enum DagStep {
+    Ran(Box<DagNodeOutput>),
+    Aborted(String),
+}
+
+/// Why a node was pruned from a DAG run. The distinction is load-bearing for
+/// fail-closed joins: an `Optional` prune (a conditional branch not taken) is a
+/// legitimately-absent input a downstream join may proceed without, but a
+/// `Failure` prune (a required input failed upstream) must PROPAGATE — a join
+/// consuming a failure-pruned predecessor is itself failure-pruned, never run
+/// with partial input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PruneReason {
+    Optional,
+    Failure,
+}
+
+/// Readiness verdict for a node in the DAG forward pass.
+enum NodeReadiness {
+    /// Not all forward predecessors are settled yet.
+    NotReady,
+    /// Every required input is available — run it.
+    Runnable,
+    /// Settled but cannot obtain all required inputs — prune with this reason.
+    Prune(PruneReason),
+}
+
+/// Run-invariant context threaded to every `dag_execute_node` call (keeps the
+/// per-node signature small — the graph/handlers/input/vars never change
+/// across a single DAG run).
+struct DagRunCtx<'a> {
+    graph: &'a PipelineGraph,
+    handlers: &'a HandlerRegistry,
+    user_input: &'a str,
+    variables: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+/// Production opt-in for the DAG scheduler. Tests use the
+/// `with_dag_scheduler` builder instead (env is process-global / racy).
+fn dag_scheduler_enabled() -> bool {
+    matches!(
+        std::env::var("OCTOS_PIPELINE_DAG").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// A graph is DAG-schedulable when it uses none of the routing features the
+/// ready-set scheduler does not implement (and which the single-path
+/// `select_next_edge` walk does): runtime fan-out
+/// (`Parallel`/`DynamicParallel`/`converge`), `node.suggested_next` hints, and
+/// content-matching forward edge `label`s. The DAG path understands only
+/// `condition` predicates + source status for edge firing, so a graph that
+/// routes by label or suggested_next must stay on the legacy walk to avoid
+/// firing every labeled branch. Marked back-edge labels are exempt (they encode
+/// loops, not routing). Everything else (linear, diamonds, conditional
+/// branches, bounded retry loops) the scheduler handles.
+fn graph_is_dag_schedulable(graph: &PipelineGraph) -> bool {
+    let nodes_ok = graph.nodes.values().all(|n| {
+        !matches!(
+            n.handler,
+            HandlerKind::Parallel | HandlerKind::DynamicParallel
+        ) && n.converge.is_none()
+            && n.suggested_next.is_none()
+    });
+    // A non-back-edge forward edge carrying a `label` (content-matching) or a
+    // non-default `weight` (the legacy selector uses weight to pick exactly one
+    // edge; DAG firing would fan out to all) is routing the DAG firing logic
+    // does not implement → keep such graphs on the legacy walk.
+    let edges_ok = graph.edges.iter().all(|e| {
+        edge_is_back(graph, e)
+            || (e.label.is_none() && (e.weight - 1.0).abs() < f64::EPSILON)
+    });
+    // A back-edge must (a) carry a condition — a conditionless back-edge can't
+    // fire meaningfully (always → guard loop; never → dead retry) — and (b)
+    // target either the validated START node or a node that ALSO has a forward
+    // predecessor. A back-edge-only NON-start target would be a spurious initial
+    // root (the legacy walk reaches it only via the back-edge); route such loops
+    // to the legacy walk. A retry edge back to the start IS valid — start is the
+    // legitimate root and re-runs under the loop guard.
+    let start = validate::find_start_node(graph);
+    let back_edges_ok = graph.edges.iter().all(|e| {
+        !edge_is_back(graph, e)
+            || (e.condition.is_some()
+                && (start.as_deref() == Some(e.target.as_str())
+                    || !forward_preds(graph, &e.target).is_empty()))
+    });
+    nodes_ok && edges_ok && back_edges_ok
+}
+
+/// A back-edge is an edge that (a) carries a `retry`/`back_edge`/`guard_back`
+/// marker on its label or condition — the same predicate
+/// `validate::edge_allows_back_edge` uses to PERMIT a cycle — AND (b) actually
+/// closes a cycle (its target can reach its source through the graph). Both
+/// conditions matter: the marker alone is insufficient (an acyclic forward edge
+/// whose condition merely contains "retry" must NOT be stripped from the
+/// forward graph, or its target would become a spurious root), and only marked
+/// edges may legally close a cycle (validation rejects unmarked ones).
+fn edge_is_back(graph: &PipelineGraph, edge: &PipelineEdge) -> bool {
+    let marked = edge.label.as_deref().is_some_and(validate::has_back_edge_marker)
+        || edge
+            .condition
+            .as_deref()
+            .is_some_and(validate::has_back_edge_marker);
+    marked && graph_reaches(graph, &edge.target, &edge.source)
+}
+
+/// Can `to` be reached from `from` over the graph's edges? Used to decide
+/// whether a marked edge is topologically backward (target reaches source).
+/// Bounded by a visited-set, so cycles in the graph don't loop it.
+fn graph_reaches(graph: &PipelineGraph, from: &str, to: &str) -> bool {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = vec![from];
+    while let Some(n) = stack.pop() {
+        if n == to {
+            return true;
+        }
+        if !seen.insert(n) {
+            continue;
+        }
+        for e in graph.edges.iter().filter(|e| e.source == n) {
+            stack.push(e.target.as_str());
+        }
+    }
+    false
+}
+
+/// Readiness of a node for the DAG forward pass — distinguishing optional from
+/// failure prunes so fail-closed semantics propagate across multiple hops.
+///
+/// A forward predecessor `p` of `id` is satisfied when its edge fired (input
+/// provided) or it was `Optional`-pruned (a not-taken branch). It is a MISSING
+/// REQUIRED input when: it was `Failure`-pruned (propagated upstream failure),
+/// or it completed with a Fail/Error and the (unconditional) edge to `id` is
+/// fail-closed. Any missing required input ⇒ `Prune(Failure)`. Otherwise the
+/// node runs if ≥1 input fired, or is `Prune(Optional)` if every predecessor was
+/// an optional not-taken branch.
+fn dag_node_readiness(
+    graph: &PipelineGraph,
+    id: &str,
+    completed: &HashMap<String, NodeOutcome>,
+    pruned: &HashMap<String, PruneReason>,
+) -> Result<NodeReadiness> {
+    let fpreds = forward_preds(graph, id);
+    if !fpreds
+        .iter()
+        .all(|p| completed.contains_key(p) || pruned.contains_key(p))
+    {
+        return Ok(NodeReadiness::NotReady);
+    }
+    if fpreds.is_empty() {
+        // Root. `graph_is_dag_schedulable` guarantees every non-start node has a
+        // forward predecessor (a back-edge-only target — a spurious root — keeps
+        // its graph on the legacy walk), so the only no-forward-pred node here
+        // is the validated start.
+        return Ok(NodeReadiness::Runnable);
+    }
+    let fired = fired_forward_into(graph, id, completed)?;
+    let mut missing_required = false;
+    for p in &fpreds {
+        if fired.contains(p) {
+            continue; // input provided
+        }
+        match pruned.get(p) {
+            Some(PruneReason::Failure) => missing_required = true, // propagate
+            Some(PruneReason::Optional) => {}                      // not-taken branch
+            None => {
+                // p completed but its edge to `id` did not fire. Strict
+                // fail-closed: a failed source on an UNCONDITIONAL (required)
+                // edge is a missing required input — a join never runs on
+                // partial input. A conditional mismatch or a router suppression
+                // is an optional not-taken branch. (A recovery that should
+                // rejoin a join is expressed with a conditional success edge
+                // `p -> join [condition=pass]`, which is an optional miss on
+                // failure, not a hard dependency.)
+                let edge_unconditional = graph.edges.iter().any(|e| {
+                    e.source.as_str() == p.as_str()
+                        && e.target.as_str() == id
+                        && !edge_is_back(graph, e)
+                        && e.condition.is_none()
+                });
+                let coe = graph
+                    .nodes
+                    .get(p)
+                    .map(|n| n.continue_on_error)
+                    .unwrap_or(false);
+                let p_failed = completed
+                    .get(p)
+                    .map(|o| matches!(o.status, OutcomeStatus::Fail | OutcomeStatus::Error))
+                    .unwrap_or(false)
+                    && !coe;
+                if edge_unconditional && p_failed {
+                    missing_required = true;
+                }
+            }
+        }
+    }
+    if missing_required {
+        Ok(NodeReadiness::Prune(PruneReason::Failure))
+    } else if fired.is_empty() {
+        Ok(NodeReadiness::Prune(PruneReason::Optional))
+    } else {
+        Ok(NodeReadiness::Runnable)
+    }
+}
+
+/// Forward (non-back-edge) predecessor sources of `node_id`.
+fn forward_preds(graph: &PipelineGraph, node_id: &str) -> Vec<String> {
+    graph
+        .edges
+        .iter()
+        .filter(|e| e.target == node_id && !edge_is_back(graph, e))
+        .map(|e| e.source.clone())
+        .collect()
+}
+
+/// Forward predecessor sources whose edge into `node_id` *fired*, given the
+/// current `completed` outcomes. The DAG join feeds a node exactly these.
+fn fired_forward_into(
+    graph: &PipelineGraph,
+    node_id: &str,
+    completed: &HashMap<String, NodeOutcome>,
+) -> Result<Vec<String>> {
+    let mut fired = Vec::new();
+    for e in graph
+        .edges
+        .iter()
+        .filter(|e| e.target == node_id && !edge_is_back(graph, e))
+    {
+        if let Some(src) = completed.get(&e.source) {
+            let continue_on_error = graph
+                .nodes
+                .get(&e.source)
+                .map(|n| n.continue_on_error)
+                .unwrap_or(false);
+            if dag_forward_edge_fires(graph, e, src, continue_on_error)? {
+                fired.push(e.source.clone());
+            }
+        }
+    }
+    Ok(fired)
+}
+
+/// Does a forward edge fire under the normal rules? Conditional edges fire on
+/// `condition` match; unconditional edges fire only on a successful source
+/// (fail-closed — an unconditional edge out of a `Fail` source does NOT fire),
+/// and not when a conditional sibling matched (conditions take precedence).
+fn dag_edge_fires_normally(
+    graph: &PipelineGraph,
+    edge: &PipelineEdge,
+    src_outcome: &NodeOutcome,
+    src_continue_on_error: bool,
+) -> Result<bool> {
+    if let Some(cond) = &edge.condition {
+        let expr = condition::parse_condition(cond)?;
+        return Ok(condition::evaluate(&expr, src_outcome));
+    }
+    let src_success = matches!(
+        src_outcome.status,
+        OutcomeStatus::Pass | OutcomeStatus::Skipped
+    ) || (src_outcome.status == OutcomeStatus::Error && src_continue_on_error);
+    if !src_success {
+        return Ok(false);
+    }
+    let conditional_sibling_matched = graph
+        .edges
+        .iter()
+        .filter(|e| e.source == edge.source && !edge_is_back(graph, e))
+        .filter_map(|e| e.condition.as_deref())
+        .any(|cond| {
+            condition::parse_condition(cond)
+                .map(|expr| condition::evaluate(&expr, src_outcome))
+                .unwrap_or(false)
+        });
+    Ok(!conditional_sibling_matched)
+}
+
+/// Does a forward edge fire? Normal firing (see [`dag_edge_fires_normally`]),
+/// plus the legacy `select_next_edge` Step-6 fallback: an ALL-CONDITIONAL
+/// router with NO matching condition routes to its lowest-target edge rather
+/// than dead-ending. Restricted to all-conditional sources because legacy only
+/// reaches that fallback when no unconditional edge exists, so an unconditional
+/// edge out of a failed source stays fail-closed.
+fn dag_forward_edge_fires(
+    graph: &PipelineGraph,
+    edge: &PipelineEdge,
+    src_outcome: &NodeOutcome,
+    src_continue_on_error: bool,
+) -> Result<bool> {
+    if dag_edge_fires_normally(graph, edge, src_outcome, src_continue_on_error)? {
+        return Ok(true);
+    }
+    let outgoing: Vec<&PipelineEdge> = graph
+        .edges
+        .iter()
+        .filter(|e| e.source == edge.source && !edge_is_back(graph, e))
+        .collect();
+    // Fallback applies only to all-conditional routers (no unconditional edge).
+    if outgoing.is_empty() || !outgoing.iter().all(|e| e.condition.is_some()) {
+        return Ok(false);
+    }
+    let mut any_matched = false;
+    for e in &outgoing {
+        if let Some(cond) = e.condition.as_deref() {
+            let expr = condition::parse_condition(cond)?;
+            if condition::evaluate(&expr, src_outcome) {
+                any_matched = true;
+                break;
+            }
+        }
+    }
+    if any_matched {
+        return Ok(false);
+    }
+    // Nothing matched → route to the lowest-target outgoing edge.
+    let min_target = outgoing.iter().map(|e| e.target.as_str()).min();
+    Ok(min_target == Some(edge.target.as_str()))
+}
+
+/// A back-edge fires only when its condition matches (an unconditional
+/// back-edge is inert — a meaningful retry carries e.g.
+/// `condition="outcome.status == \"fail\""`). The per-node run guard bounds it.
+fn dag_back_edge_fires(edge: &PipelineEdge, src_outcome: &NodeOutcome) -> Result<bool> {
+    match &edge.condition {
+        Some(cond) => {
+            let expr = condition::parse_condition(cond)?;
+            Ok(condition::evaluate(&expr, src_outcome))
+        }
+        None => Ok(false),
+    }
+}
+
+/// Nodes reachable from `start` over forward edges (the region a fired
+/// back-edge must re-run so its consumers see the retried output).
+fn forward_reachable(graph: &PipelineGraph, start: &str) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        for e in graph
+            .edges
+            .iter()
+            .filter(|e| e.source == n && !edge_is_back(graph, e))
+        {
+            stack.push(e.target.clone());
+        }
+    }
+    seen
+}
+
+/// Terminal nodes of a finished DAG run: completed nodes from which NO outgoing
+/// forward edge fired (nothing downstream ran from them). These are the
+/// effective sinks of the *executed* subgraph — the analogue of the node where
+/// the single-path walk stops — so both the result output and the success
+/// verdict derive from them, not from raw structural sinks (which a dead/pruned
+/// branch could distort). Sorted for determinism.
+fn dag_terminal_nodes(graph: &PipelineGraph, completed: &HashMap<String, NodeOutcome>) -> Vec<String> {
+    let mut terms: Vec<String> = completed
+        .keys()
+        .filter(|n| {
+            let coe = graph
+                .nodes
+                .get(*n)
+                .map(|x| x.continue_on_error)
+                .unwrap_or(false);
+            let Some(outcome) = completed.get(*n) else {
+                return false;
+            };
+            !graph
+                .edges
+                .iter()
+                .filter(|e| &e.source == *n && !edge_is_back(graph, e))
+                .any(|e| dag_forward_edge_fires(graph, e, outcome, coe).unwrap_or(false))
+        })
+        .cloned()
+        .collect();
+    terms.sort();
+    terms
+}
+
+/// Assemble the terminal [`PipelineResult`] from accumulated DAG state.
+///
+/// * `success`: `Some(s)` for explicit early-exit paths (hard error, budget,
+///   goal gate); `None` to DERIVE it from the terminal nodes — the run
+///   succeeds iff there is ≥1 terminal and every terminal settled `Pass`.
+/// * `override_output`: explicit output for early-exit paths; `None` joins the
+///   terminal nodes' content.
+#[allow(clippy::too_many_arguments)] // cohesive result-builder; splitting hurts clarity
+fn dag_build_result(
+    success: Option<bool>,
+    override_output: Option<String>,
+    completed: &HashMap<String, NodeOutcome>,
+    summaries: Vec<NodeSummary>,
+    total_tokens: TokenUsage,
+    node_costs: Vec<NodeCost>,
+    graph: &PipelineGraph,
+    had_failure_prune: bool,
+) -> PipelineResult {
+    let mut all_files: Vec<std::path::PathBuf> = Vec::new();
+    for o in completed.values() {
+        all_files.extend(o.files_modified.iter().cloned());
+    }
+    all_files.sort();
+    all_files.dedup();
+
+    let terminals = dag_terminal_nodes(graph, completed);
+
+    // `None` => normal quiescent termination (success derived from terminals).
+    let derived = success.is_none();
+    let success = success.unwrap_or_else(|| {
+        !terminals.is_empty()
+            && terminals
+                .iter()
+                .filter_map(|n| completed.get(n))
+                .all(|o| o.status == OutcomeStatus::Pass)
+    });
+    // A run that failure-pruned a required join did not complete a required
+    // path, so it reports failure even if an unrelated terminal passed.
+    let success = success && !had_failure_prune;
+
+    let output = override_output.unwrap_or_else(|| {
+        terminals
+            .iter()
+            .filter_map(|n| completed.get(n))
+            .map(|o| o.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    });
+
+    // A normally-terminated run preserves files written by completed nodes even
+    // when the terminal outcome was Fail/guard-hit (parity with the legacy
+    // no-outgoing terminal); only explicit early-exit failures (hard error /
+    // budget / aborted registration) drop them.
+    let files_modified = if success || derived { all_files } else { vec![] };
+
+    PipelineResult {
+        output,
+        success,
+        token_usage: total_tokens,
+        node_summaries: summaries,
+        files_modified,
+        node_costs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::{NodeOutcome, OutcomeStatus};
+
+    #[test]
+    fn dag_schedulable_excludes_fanout_and_converge() {
+        // Plain static graphs schedule on the DAG path.
+        let linear = crate::parser::parse_dot(
+            "digraph d { a [handler=codergen, tools=read_file]; \
+             b [handler=codergen, tools=read_file]; a -> b }",
+        )
+        .unwrap();
+        assert!(graph_is_dag_schedulable(&linear));
+
+        // Runtime fan-out (converge + dynamic_parallel) needs the legacy walk.
+        let fanout = crate::parser::parse_dot(
+            "digraph p { s [handler=dynamic_parallel, prompt=\"plan\", converge=\"m\"]; \
+             m [handler=codergen, tools=read_file]; s -> m }",
+        )
+        .unwrap();
+        assert!(!graph_is_dag_schedulable(&fanout));
+
+        // A normal retry loop (back-edge target `work` has a forward pred
+        // `start`) is schedulable.
+        let retry = crate::parser::parse_dot(
+            "digraph r { start [handler=codergen, tools=read_file]; \
+             work [handler=codergen, tools=read_file]; \
+             check [handler=codergen, tools=read_file]; \
+             start -> work; work -> check; \
+             check -> work [label=\"back_edge\", condition=\"outcome.status == \\\"fail\\\"\"] }",
+        )
+        .unwrap();
+        assert!(graph_is_dag_schedulable(&retry));
+
+        // A back-edge-only target (`work` reachable solely via the back-edge,
+        // no forward predecessor) is a spurious root → legacy.
+        let spurious = crate::parser::parse_dot(
+            "digraph b { start [handler=codergen, tools=read_file]; \
+             check [handler=codergen, tools=read_file]; \
+             work [handler=codergen, tools=read_file]; \
+             start -> check; work -> check; \
+             check -> work [label=\"back_edge\", condition=\"outcome.status == \\\"fail\\\"\"] }",
+        )
+        .unwrap();
+        assert!(!graph_is_dag_schedulable(&spurious));
+
+        // A retry edge back to the START node is valid (start is the root).
+        let retry_to_start = crate::parser::parse_dot(
+            "digraph s { start [handler=codergen, tools=read_file]; \
+             check [handler=codergen, tools=read_file]; \
+             start -> check; \
+             check -> start [label=\"back_edge\", condition=\"outcome.status == \\\"fail\\\"\"] }",
+        )
+        .unwrap();
+        assert!(graph_is_dag_schedulable(&retry_to_start));
+    }
+
+    #[test]
+    fn dag_forward_edge_fail_closed_on_unconditional_fail() {
+        let pass = NodeOutcome {
+            node_id: "x".into(),
+            status: OutcomeStatus::Pass,
+            content: String::new(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+        let fail = NodeOutcome {
+            status: OutcomeStatus::Fail,
+            ..pass.clone()
+        };
+        let graph = crate::parser::parse_dot(
+            "digraph g { x [handler=codergen, tools=read_file]; \
+             y [handler=codergen, tools=read_file]; x -> y }",
+        )
+        .unwrap();
+        let edge = &graph.edges[0];
+        // Unconditional edge fires on Pass, NOT on Fail (fail-closed).
+        assert!(dag_forward_edge_fires(&graph, edge, &pass, false).unwrap());
+        assert!(!dag_forward_edge_fires(&graph, edge, &fail, false).unwrap());
+    }
 
     #[test]
     fn test_edge_selection_condition_match() {

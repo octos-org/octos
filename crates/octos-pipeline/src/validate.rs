@@ -1186,7 +1186,7 @@ fn edge_allows_back_edge(edge: &PipelineEdge, _graph: &PipelineGraph) -> bool {
     label_marker || condition_marker
 }
 
-fn has_back_edge_marker(value: &str) -> bool {
+pub(crate) fn has_back_edge_marker(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     value.contains("retry")
         || value.contains("back_edge")
