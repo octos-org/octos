@@ -64,8 +64,10 @@ Pauses the turn at the blocking-tool boundary. Carries:
 - Required fallback: `session_id`, `question_id`, `turn_id`, `title`, `body`
   (generic, mandatory).
 - Structured (gated by `user_question.v1`): `questions` — 1–4 entries, each with
-  `header` (≤ 12 chars), `question`, `options` (2–4 of `label` + `description`),
-  `multi_select` (bool), and `allow_free_text` (bool, server-forced `true`).
+  `header` (≤ 12 chars — a longer header is **truncated** server-side, not
+  rejected; live-soak hardening 2026-06-04), `question`, `options` (2–4 of
+  `label` + `description`), `multi_select` (bool), and `allow_free_text` (bool,
+  server-forced `true`).
 
 ### `user_question/respond` (command)
 

@@ -175,7 +175,7 @@ pub struct UserQuestionRequestedEvent {
 }
 
 pub struct UserQuestion {
-    pub header: String,                 // short label, ≤ 12 chars
+    pub header: String,                 // short label, ≤ 12 chars (over-long truncated, not rejected)
     pub question: String,
     pub options: Vec<UserQuestionOption>, // 2..=4
     pub multi_select: bool,
