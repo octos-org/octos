@@ -19899,18 +19899,43 @@ async fn stop_failover_forwarder(handle: Option<tokio::task::JoinHandle<()>>) {
 const RPC_RESPONSE_TOO_LARGE_MESSAGE: &str = "response payload too large to deliver";
 
 /// Build a MINIMAL JSON-RPC error response frame for `id` carrying only a short
-/// static `message` (code `INTERNAL_ERROR` / -32603, NO `data`). It is
-/// tiny by construction, so [`frame_for`] returns `Some` for every realistic
-/// `id`. Returns `None` ONLY if even this minimal frame is over cap — which can
-/// happen only when the request `id` itself is pathologically huge (practically
-/// unreachable; ids are short client-chosen tokens). Callers treat that residual
-/// `None` as the absolute last resort (latch the connection failed / close).
+/// static `message` (code `INTERNAL_ERROR` / -32603, NO `data`). It is tiny by
+/// construction, so it fits under [`MAX_TEXT_FRAME_BYTES`] for every realistic
+/// `id`. Returns `None` ONLY if even this minimal envelope is over cap — which
+/// can happen only when the request `id` itself is pathologically huge (inbound
+/// parsing caps the whole request frame at 1 MiB but NOT the id alone, so a
+/// near-cap string id is acceptable). Callers treat that residual `None` as the
+/// absolute last resort (latch the connection failed / close).
+///
+/// CRITICAL (codex DO-NOT-SHIP): this MUST serialize and size-check the envelope
+/// DIRECTLY — it must NOT route through [`frame_for`]/[`preview_oversized_frame`].
+/// The preview pass truncates the largest string field; for a near-cap `id` that
+/// is the `id` itself, which would emit a valid under-cap error under a MODIFIED
+/// id the client never awaited, leaving the original request stranded. The `id`
+/// must be preserved EXACTLY: either the exact-id envelope already fits and we
+/// send it, or it does not and we return `None` (caller fail-closes) — never a
+/// wrong-id reply.
 fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<WsMessage> {
     let error = RpcError::new(
         octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR,
         message,
     );
-    frame_for(&RpcErrorResponse::new(id, error))
+    match app_ui_codec::to_compact_json(&RpcErrorResponse::new(id, error)) {
+        Ok(text) if text.len() <= MAX_TEXT_FRAME_BYTES => Some(WsMessage::text(text)),
+        // Only reachable when the request `id` itself is pathologically huge.
+        // Do NOT truncate to fit — that would corrupt the id. Return `None` so
+        // the caller fail-closes rather than sending a wrong-id reply.
+        Ok(_) => None,
+        Err(error) => {
+            metrics::counter!("ws.send.error.lifecycle").increment(1);
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                error = %error,
+                "failed to serialize minimal rpc error frame"
+            );
+            None
+        }
+    }
 }
 
 /// Send a JSON-RPC RESPONSE that, when over-cap and un-truncatable, falls back to
@@ -19978,8 +20003,13 @@ fn send_minimal_rpc_error_fallback(ws: &WsConnection, id: Option<String>) -> Res
                 target: "octos::ui_protocol::ws",
                 "minimal rpc error frame itself over cap (huge request id?); closing connection"
             );
-            ws.mark_failed();
+            // Enqueue the close BEFORE latching failed: `send_lifecycle` is
+            // rejected (FatalClosed) once `mark_failed` sets the latch, which
+            // would silently drop the 1011 close frame. Close first so the
+            // client actually receives the code, THEN latch failed to tear down
+            // the read loop.
             let _ = close_ws_with_code(ws, 1011, "rpc_response_undeliverable");
+            ws.mark_failed();
             Err(SendError::LifecycleFailure(
                 "minimal rpc error frame over cap".into(),
             ))
@@ -36886,6 +36916,41 @@ ignore = []
         assert!(
             parsed["error"]["data"].is_null(),
             "minimal error carries no data"
+        );
+    }
+
+    #[test]
+    fn minimal_rpc_error_frame_with_huge_id_returns_none_not_truncated_id() {
+        // codex DO-NOT-SHIP: a near/over-cap request id must NOT be truncated to
+        // make the minimal error fit. Truncating the id would emit a valid
+        // under-cap error under a MODIFIED id the client never awaited, leaving
+        // the original request stranded. Either the exact-id envelope fits, or
+        // we return None so the caller fail-closes — never a wrong-id reply.
+        let huge_id = "x".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        assert!(
+            minimal_rpc_error_frame(Some(huge_id), "response payload too large to deliver")
+                .is_none(),
+            "a pathologically huge id must yield None (fail-close), never a truncated-id frame"
+        );
+    }
+
+    #[test]
+    fn minimal_rpc_error_frame_preserves_exact_id() {
+        // The minimal error must carry the request id BYTE-EXACT (never the
+        // preview-truncated id). Use a sizeable-but-fitting id so the only way it
+        // could be altered is the (now-removed) field-truncation path.
+        let id = format!("req-{}", "a".repeat(4096));
+        let frame =
+            minimal_rpc_error_frame(Some(id.clone()), "response payload too large to deliver")
+                .expect("a sizeable-but-fitting id must still produce a frame");
+        let WsMessage::Text(text) = frame else {
+            panic!("minimal error frame must be a text frame");
+        };
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            parsed["id"].as_str(),
+            Some(id.as_str()),
+            "id must be preserved exactly, not truncated"
         );
     }
 }
