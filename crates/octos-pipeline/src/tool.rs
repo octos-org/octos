@@ -556,6 +556,7 @@ impl Tool for RunPipelineTool {
                 return crate::compose::compose(
                     ir,
                     &crate::profile::ValidationProfile::l2_default(),
+                    &input.variables,
                 )
                 .map(|_| ())
                 .map_err(|e| format!("IR validation failed:\n{}", e.feedback_lines().join("\n")));
@@ -636,7 +637,11 @@ impl Tool for RunPipelineTool {
             && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty())
         {
             let ir = input.ir.as_deref().unwrap_or_default();
-            match crate::compose::compose(ir, &crate::profile::ValidationProfile::l2_default()) {
+            match crate::compose::compose(
+                ir,
+                &crate::profile::ValidationProfile::l2_default(),
+                &input.variables,
+            ) {
                 Ok(g) => {
                     let id = g.id.clone();
                     (g, id)

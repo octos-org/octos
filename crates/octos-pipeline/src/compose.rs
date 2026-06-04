@@ -63,9 +63,16 @@ impl std::fmt::Display for ComposeError {
 
 impl std::error::Error for ComposeError {}
 
-/// Compile + validate an IR JSON string under a profile. Returns a graph only
-/// if every gate passed; otherwise structured feedback for repair.
-pub fn compose(ir_json: &str, profile: &ValidationProfile) -> Result<PipelineGraph, ComposeError> {
+/// Compile + validate an IR JSON string under a profile. `variables` carries
+/// the caller-supplied runtime template variable keys (the same `variables`
+/// `run_pipeline` receives) so structural validation doesn't flag prompts that
+/// reference them as unbound. Returns a graph only if every gate passed;
+/// otherwise structured feedback for repair.
+pub fn compose(
+    ir_json: &str,
+    profile: &ValidationProfile,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<PipelineGraph, ComposeError> {
     let ir: PipelineIr =
         serde_json::from_str(ir_json).map_err(|e| ComposeError::Parse(e.to_string()))?;
     let graph = ir::compile(&ir).map_err(|e| ComposeError::Compile(e.to_string()))?;
@@ -92,6 +99,7 @@ pub fn compose(ir_json: &str, profile: &ValidationProfile) -> Result<PipelineGra
         .flat_map(|n| n.tools.iter().cloned())
         .collect();
     let ctx = crate::validate::ValidationContext::default()
+        .with_runtime_variables(variables.keys().cloned())
         .with_known_models(known_models)
         .with_known_tools(known_tools);
     let diags = crate::validate::diagnostics_with_context(&graph, &ctx);
@@ -163,9 +171,13 @@ fn detect_cycle_ir(graph: &PipelineGraph) -> Result<(), String> {
     Ok(())
 }
 
-/// Convenience: compose under the L2 default profile.
+/// Convenience: compose under the L2 default profile with no custom variables.
 pub fn compose_l2(ir_json: &str) -> Result<PipelineGraph, ComposeError> {
-    compose(ir_json, &ValidationProfile::l2_default())
+    compose(
+        ir_json,
+        &ValidationProfile::l2_default(),
+        &serde_json::Map::new(),
+    )
 }
 
 #[cfg(test)]
@@ -268,11 +280,35 @@ mod tests {
     }
 
     #[test]
+    fn should_accept_caller_supplied_runtime_variables() {
+        // codex round-2 P2: a prompt referencing a caller-supplied variable must
+        // validate when that variable is passed in, not be flagged unbound.
+        let json = r#"{
+            "id":"p",
+            "nodes":[{"id":"r","kind":{"type":"research","prompt":"research {customer_topic}"}}],
+            "edges":[]
+        }"#;
+        let mut vars = serde_json::Map::new();
+        vars.insert(
+            "customer_topic".to_string(),
+            serde_json::Value::String("widgets".into()),
+        );
+        let p = ValidationProfile::l2_default();
+        assert!(
+            compose(json, &p, &vars).is_ok(),
+            "custom var should validate: {:?}",
+            compose(json, &p, &vars).err()
+        );
+        // Without the variable it's an unbound-template-var structural error.
+        assert!(matches!(compose_l2(json), Err(ComposeError::Structural(_))));
+    }
+
+    #[test]
     fn should_reject_profile_violation_with_feedback() {
         // A tiny profile makes the 2-node graph exceed max_nodes.
         let mut p = ValidationProfile::l2_default();
         p.max_nodes = 1;
-        match compose(VALID, &p) {
+        match compose(VALID, &p, &serde_json::Map::new()) {
             Err(e @ ComposeError::Profile(_)) => {
                 assert!(e.feedback_lines().iter().any(|l| l.contains("max_nodes")));
             }

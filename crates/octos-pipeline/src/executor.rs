@@ -978,7 +978,7 @@ impl PipelineExecutor {
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PipelineResult> {
-        let graph = crate::compose::compose(ir_json, profile)
+        let graph = crate::compose::compose(ir_json, profile, variables)
             .map_err(|e| eyre::eyre!("IR compose failed: {e}"))?;
         let handlers = self.build_handlers();
         self.run_graph_with_handlers(graph, user_input, variables, handlers)
