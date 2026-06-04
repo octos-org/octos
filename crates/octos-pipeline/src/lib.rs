@@ -5,6 +5,7 @@
 
 pub mod artifact;
 pub mod checkpoint;
+pub mod compose;
 pub mod condition;
 pub mod context;
 pub mod discovery;
@@ -15,9 +16,11 @@ pub mod graph;
 pub mod handler;
 pub mod host_context;
 pub mod human_gate;
+pub mod ir;
 pub mod manager;
 pub mod model_assignment;
 pub mod parser;
+pub mod profile;
 pub mod recovery;
 pub mod run_dir;
 pub mod server;

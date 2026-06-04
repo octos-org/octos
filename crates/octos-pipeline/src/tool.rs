@@ -123,6 +123,12 @@ pub struct RunPipelineTool {
     /// orchestrator propagate it down to pipeline workers so episodic
     /// memory recall is contamination-safe end-to-end.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// S1-5: opt-in gate for the typed-IR ([`crate::ir`]) authoring path.
+    /// When false (default) the tool only runs sanctioned named pipelines /
+    /// inline DOT — byte-identical to pre-S1-5 behaviour. When true, the LLM
+    /// may pass an `ir` program which is compiled (capability-locked via the
+    /// closed palette + [`crate::profile::ValidationProfile`]) and executed.
+    ir_enabled: bool,
 }
 
 impl RunPipelineTool {
@@ -146,7 +152,17 @@ impl RunPipelineTool {
             cost_accountant: None,
             contract_id: None,
             embedder: None,
+            ir_enabled: false,
         }
+    }
+
+    /// S1-5: enable the typed-IR authoring path (opt-in; default off). The
+    /// operator/runtime sets this when an autonomy level permits LLM-composed
+    /// workflows. With it off, `ir` inputs are ignored and the tool advertises
+    /// only the named-pipeline contract.
+    pub fn with_ir_enabled(mut self, enabled: bool) -> Self {
+        self.ir_enabled = enabled;
+        self
     }
 
     /// NEW-06 fix: attach an embedder that the pipeline executor will
@@ -375,8 +391,14 @@ impl RunPipelineTool {
 
 #[derive(Deserialize)]
 struct Input {
+    #[serde(default)]
     pipeline: String,
     input: String,
+    /// S1-5: an optional typed-IR workflow program (JSON). When present and the
+    /// tool has IR enabled, it is compiled to a capability-locked
+    /// [`crate::graph::PipelineGraph`] and run instead of a named pipeline.
+    #[serde(default)]
+    ir: Option<String>,
     #[serde(default)]
     variables: serde_json::Map<String, serde_json::Value>,
     /// Pipeline-level timeout in seconds. Default: 1800 (30 min),
@@ -430,15 +452,29 @@ impl Tool for RunPipelineTool {
     }
 
     fn description(&self) -> &str {
-        "Run a sanctioned multi-step pipeline by NAME. The only currently \
-         sanctioned pipeline is `deep_research` — use it when the user asks \
-         for in-depth, multi-source, source-citing research that needs \
-         parallel search workers + synthesis. Do NOT compose your own \
-         inline DOT graph for ad-hoc tasks (slides, media, code edits, \
-         partial regenerations, etc.) — those have purpose-built tools \
-         (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
-         tool exists for what the user asked, surface that as a limitation \
-         rather than improvising a custom pipeline."
+        if self.ir_enabled {
+            "Run a multi-step pipeline, either by NAME or by composing one. \
+             (a) Name a sanctioned pipeline (`deep_research`) in `pipeline` when \
+             one fits. (b) For an ad-hoc multi-step task, compose your own \
+             workflow as a typed-IR program in `ir`: a closed, capability-safe \
+             palette of node kinds (research, transform, synthesize, gate, \
+             fanout, human_gate). You choose the kinds, their prompts, and how \
+             they connect — capability (tools/model) is fixed per kind, so you \
+             never request shell or tools directly. Use `ir` to offload \
+             research→synthesize, fan-out→converge, or gated retry loops to the \
+             harness. If composition is invalid the tool returns the exact \
+             errors — fix the `ir` and call again."
+        } else {
+            "Run a sanctioned multi-step pipeline by NAME. The only currently \
+             sanctioned pipeline is `deep_research` — use it when the user asks \
+             for in-depth, multi-source, source-citing research that needs \
+             parallel search workers + synthesis. Do NOT compose your own \
+             inline DOT graph for ad-hoc tasks (slides, media, code edits, \
+             partial regenerations, etc.) — those have purpose-built tools \
+             (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
+             tool exists for what the user asked, surface that as a limitation \
+             rather than improvising a custom pipeline."
+        }
     }
 
     fn tags(&self) -> &[&str] {
@@ -458,7 +494,7 @@ impl Tool for RunPipelineTool {
              user no such tool exists for their request."
             .to_string();
 
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "pipeline": {
@@ -481,7 +517,15 @@ impl Tool for RunPipelineTool {
                 }
             },
             "required": ["pipeline", "input"]
-        })
+        });
+        if self.ir_enabled {
+            schema["properties"]["ir"] = serde_json::json!({
+                "type": "string",
+                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\",\"back_edge\":<opt bool>}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (final writeup), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"}, {\"type\":\"human_gate\",\"resolver\":\"<name>\"}. There are no tools/handler/model fields — capability is fixed per kind. For an intentional retry/revision loop set \"back_edge\":true on the looping edge."
+            });
+            schema["required"] = serde_json::json!(["input"]);
+        }
+        schema
     }
 
     /// Synchronously parse and structurally validate the DOT graph before
@@ -503,6 +547,20 @@ impl Tool for RunPipelineTool {
     async fn pre_flight_validate(&self, args: &serde_json::Value) -> Result<(), String> {
         let input: Input = serde_json::from_value(args.clone())
             .map_err(|e| format!("invalid run_pipeline input: {e}"))?;
+        // S1-5: when an IR program is supplied (and enabled), the pre-flight is
+        // a compose() — the same parse/compile/cycle/profile gates the run uses,
+        // surfaced synchronously so a malformed IR fails the foreground turn
+        // (the LLM can repair) instead of dead-ending in the spawn_only task.
+        if self.ir_enabled {
+            if let Some(ir) = input.ir.as_deref().filter(|s| !s.trim().is_empty()) {
+                return crate::compose::compose(
+                    ir,
+                    &crate::profile::ValidationProfile::l2_default(),
+                )
+                .map(|_| ())
+                .map_err(|e| format!("IR validation failed:\n{}", e.feedback_lines().join("\n")));
+            }
+        }
         let dot_content = self
             .resolve_with_fallback(&input.pipeline)
             .await
@@ -570,7 +628,37 @@ impl Tool for RunPipelineTool {
         let run_start_rfc3339 = systemtime_to_rfc3339(run_started_at);
         let pipeline_started = std::time::Instant::now();
 
-        let dot_content = self.resolve_with_fallback(&input.pipeline).await?;
+        // S1-5: obtain the executable graph from either the typed-IR program
+        // (compiled + capability-locked) or a named/inline DOT pipeline. The
+        // entire downstream (config, timeout, summary, files_to_send, spawn_only
+        // delivery) is graph-agnostic, so only acquisition differs.
+        let (graph, graph_id): (crate::graph::PipelineGraph, String) = if self.ir_enabled
+            && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty())
+        {
+            let ir = input.ir.as_deref().unwrap_or_default();
+            match crate::compose::compose(ir, &crate::profile::ValidationProfile::l2_default()) {
+                Ok(g) => {
+                    let id = g.id.clone();
+                    (g, id)
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "IR compose failed — fix the workflow and call run_pipeline again:\n{}",
+                            e.feedback_lines().join("\n")
+                        ),
+                        ..Default::default()
+                    });
+                }
+            }
+        } else {
+            let dot_content = self.resolve_with_fallback(&input.pipeline).await?;
+            let graph =
+                crate::parser::parse_dot(&dot_content).wrap_err("failed to parse pipeline DOT")?;
+            let id = graph_id_from_dot(&dot_content);
+            (graph, id)
+        };
 
         let status_bridge = self
             .status_bridge
@@ -663,15 +751,13 @@ impl Tool for RunPipelineTool {
         // raised from 1800 → 3600 so honest deep research with crawl +
         // synthesize on slow LLM lanes has room to finish without
         // synthesize-node starvation.
-        let dot_default_timeout = crate::parser::parse_dot(&dot_content)
-            .ok()
-            .and_then(|g| g.default_timeout_secs);
+        let dot_default_timeout = graph.default_timeout_secs;
         let timeout_secs = resolve_pipeline_timeout(input.timeout_secs, dot_default_timeout);
 
         let executor = PipelineExecutor::new(config);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            executor.run(&dot_content, &input.input, &input.variables),
+            executor.run_graph(graph, &input.input, &input.variables),
         )
         .await;
 
@@ -684,7 +770,7 @@ impl Tool for RunPipelineTool {
         // success), otherwise timed-out runs were the one scenario
         // missing audit-trail evidence — exactly the runs validators
         // most need to inspect.
-        let graph_id = graph_id_from_dot(&dot_content);
+        // graph_id computed at acquisition (works for both IR and DOT paths).
         let run_id = generate_run_id(&graph_id, run_started_at);
 
         let result = match result {
@@ -1921,5 +2007,67 @@ mod tests {
         // still work; only the per-session segment differs.
         assert!(cwd_a.starts_with(tenant_root.path()));
         assert!(cwd_b.starts_with(tenant_root.path()));
+    }
+
+    // ── S1-5: typed-IR pre-flight (compose gate; no provider call) ─────────
+
+    struct StubProvider;
+    #[async_trait]
+    impl octos_llm::LlmProvider for StubProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            unimplemented!("pre-flight never calls the provider")
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    async fn make_ir_tool(ir_enabled: bool) -> RunPipelineTool {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        RunPipelineTool::new(
+            Arc::new(StubProvider),
+            memory,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        )
+        .with_ir_enabled(ir_enabled)
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_valid_ir_when_enabled() {
+        let tool = make_ir_tool(true).await;
+        let args = serde_json::json!({
+            "input": "x",
+            "ir": r#"{"id":"p","nodes":[{"id":"r","kind":{"type":"research","prompt":"find"}},{"id":"s","kind":{"type":"synthesize","prompt":"write"}}],"edges":[{"source":"r","target":"s"}]}"#
+        });
+        assert!(tool.pre_flight_validate(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_unsafe_ir_kind() {
+        let tool = make_ir_tool(true).await;
+        let args = serde_json::json!({
+            "input": "x",
+            "ir": r#"{"id":"p","nodes":[{"id":"n","kind":{"type":"shell"}}]}"#
+        });
+        let err = tool.pre_flight_validate(&args).await.unwrap_err();
+        assert!(err.contains("IR validation failed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn input_schema_exposes_ir_only_when_enabled() {
+        let base = make_ir_tool(false).await;
+        assert!(base.input_schema()["properties"]["ir"].is_null());
+        let enabled = make_ir_tool(true).await;
+        assert!(enabled.input_schema()["properties"]["ir"].is_object());
     }
 }

@@ -951,6 +951,40 @@ impl PipelineExecutor {
             .await
     }
 
+    /// Run an already-parsed [`PipelineGraph`] using the executor's default
+    /// handler registry — the graph-accepting analog of [`Self::run`]. Lets an
+    /// IR-composed graph execute with the full production tool set without
+    /// round-tripping through DOT text.
+    pub async fn run_graph(
+        &self,
+        graph: PipelineGraph,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PipelineResult> {
+        let handlers = self.build_handlers();
+        self.run_graph_with_handlers(graph, user_input, variables, handlers)
+            .await
+    }
+
+    /// Compile an L2 typed-IR program (see [`crate::compose`]) under `profile`
+    /// and run it. The IR is lowered straight to a [`PipelineGraph`] and never
+    /// round-trips through DOT text. Compose-time failures (unknown kind,
+    /// dangling edge, cycle, profile violation) are surfaced as an error
+    /// carrying the structured repair feedback.
+    pub async fn run_ir(
+        &self,
+        ir_json: &str,
+        profile: &crate::profile::ValidationProfile,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PipelineResult> {
+        let graph = crate::compose::compose(ir_json, profile)
+            .map_err(|e| eyre::eyre!("IR compose failed: {e}"))?;
+        let handlers = self.build_handlers();
+        self.run_graph_with_handlers(graph, user_input, variables, handlers)
+            .await
+    }
+
     /// Run a pipeline from a DOT string using a caller-supplied handler
     /// registry. Useful for tests that want to install a custom
     /// `Handler` against a given `HandlerKind` without touching the
@@ -962,9 +996,25 @@ impl PipelineExecutor {
         variables: &serde_json::Map<String, serde_json::Value>,
         handlers: HandlerRegistry,
     ) -> Result<PipelineResult> {
-        // Parse and validate
-        let mut graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        self.run_graph_with_handlers(graph, user_input, variables, handlers)
+            .await
+    }
 
+    /// Run a pipeline from an already-parsed [`PipelineGraph`] using a
+    /// caller-supplied handler registry. This graph-accepting entry lets
+    /// L2-composed pipelines (see [`crate::compose`]) execute WITHOUT
+    /// round-tripping through DOT text — [`Self::run_with_handlers`] is now just
+    /// `parse_dot(...)` followed by this. The per-node capability lock
+    /// (`CodergenHandler`'s tool deny-list) runs regardless of how the graph was
+    /// built, so a compiled-IR graph inherits identical gating to a DOT graph.
+    pub async fn run_graph_with_handlers(
+        &self,
+        mut graph: PipelineGraph,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+        handlers: HandlerRegistry,
+    ) -> Result<PipelineResult> {
         // Replace the historical pipeline-guard plugin's
         // before_tool_call hook with an in-process pass that fills
         // `node.model` / `node.planner_model` for any node the LLM
@@ -3506,6 +3556,97 @@ mod tests {
             result.is_ok(),
             "fan-out below cap should complete: {result:?}"
         );
+    }
+
+    // ── L2 typed-IR execution (S1-3) ───────────────────────────────────
+
+    /// A composed typed-IR program executes through `run_graph_with_handlers`
+    /// without ever round-tripping through DOT text.
+    #[tokio::test]
+    async fn run_ir_executes_composed_graph_without_dot_roundtrip() {
+        let executor = PipelineExecutor::new(make_capped_config(4).await);
+        let ir = r#"{"id":"p","nodes":[{"id":"g","kind":{"type":"gate"}}]}"#;
+        let result = executor
+            .run_ir(
+                ir,
+                &crate::profile::ValidationProfile::l2_default(),
+                "hi",
+                &serde_json::Map::new(),
+            )
+            .await;
+        assert!(result.is_ok(), "composed gate graph should run: {result:?}");
+    }
+
+    /// Compose-time failures surface as an error before any execution begins.
+    #[tokio::test]
+    async fn run_ir_surfaces_compose_errors_before_execution() {
+        let executor = PipelineExecutor::new(make_capped_config(4).await);
+        let bad = r#"{"id":"p","nodes":[{"id":"n","kind":{"type":"shell"}}]}"#;
+        let err = executor
+            .run_ir(
+                bad,
+                &crate::profile::ValidationProfile::l2_default(),
+                "x",
+                &serde_json::Map::new(),
+            )
+            .await
+            .expect_err("unknown palette kind must fail at compose");
+        assert!(err.to_string().contains("compose"), "got: {err}");
+    }
+
+    /// Real END-TO-END: compile an L2 typed-IR "deep research" workflow and
+    /// EXECUTE it against a live DeepSeek model (not MockProvider). Env-gated +
+    /// `#[ignore]` so normal CI skips it. Run with:
+    ///   DEEPSEEK_API_KEY=... cargo test -p octos-pipeline \
+    ///     run_ir_e2e_deepseek_real -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs DEEPSEEK_API_KEY + network"]
+    async fn run_ir_e2e_deepseek_real() {
+        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
+            eprintln!("SKIP: DEEPSEEK_API_KEY not set");
+            return;
+        };
+        let provider: Arc<dyn LlmProvider> = Arc::new(
+            octos_llm::openai::OpenAIProvider::new(key, "deepseek-chat")
+                .with_base_url("https://api.deepseek.com/v1"),
+        );
+        let mut config = make_capped_config(4).await;
+        config.default_provider = provider;
+        let executor = PipelineExecutor::new(config);
+
+        // A small but real "deep research" IR: research -> synthesize report.
+        let ir = r#"{
+            "id": "deep_research_e2e",
+            "nodes": [
+                {"id":"research","kind":{"type":"research","prompt":"Briefly research the current state of Rust async runtimes (Tokio, smol, io_uring runtimes). List 4-5 concrete factual points. Keep it under 120 words."}},
+                {"id":"report","kind":{"type":"synthesize","prompt":"Using the prior research findings, write a tight ~150-word summary report with a title, in markdown."}}
+            ],
+            "edges": [ {"source":"research","target":"report"} ]
+        }"#;
+
+        let result = executor
+            .run_ir(
+                ir,
+                &crate::profile::ValidationProfile::l2_default(),
+                "Rust async runtimes, 2026",
+                &serde_json::Map::new(),
+            )
+            .await;
+
+        match &result {
+            Ok(r) => {
+                eprintln!(
+                    "=== e2e success={} nodes_run={} ===",
+                    r.success,
+                    r.node_summaries.len()
+                );
+                eprintln!("=== FINAL OUTPUT ===\n{}\n=== END ===", r.output);
+            }
+            Err(e) => eprintln!("=== e2e ERROR ===\n{e:?}"),
+        }
+        let r = result.expect("composed IR pipeline should execute end-to-end");
+        assert!(r.success, "pipeline should succeed");
+        assert!(!r.output.trim().is_empty(), "should produce report output");
     }
 
     // ── Heartbeat (#964 follow-up) ─────────────────────────────────────
