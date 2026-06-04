@@ -287,6 +287,20 @@ Current M9 sandbox-parity decision:
   It lets AppUI clients inspect the server-owned prompt context generation,
   transcript hash, checkpoint, compaction, and recovery state without
   reconstructing it from chat rows.
+- The additive structured mid-turn user-question surface (the
+  `user_question/respond` command, the `user_question/requested` notification,
+  the `questions[]` / `answers[]` payloads, and the new `question_id`
+  correlation id) is governed by proposed
+  [UPCR-2026-023](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_023_ASK_USER_QUESTION.md),
+  gated behind the `user_question.v1` feature flag. It is the codex/Claude
+  `AskUserQuestion` shape implemented as "approval + choices + free-text": the
+  agent tool blocks the turn at a deterministic tool boundary (mirroring
+  `approval/requested`), the server emits `user_question/requested`, the client
+  renders a single/multi-select picker plus a free-text "Other", and
+  `user_question/respond` resumes the waiting tool. A turn interrupt cancels
+  pending questions; a client lacking the capability receives the agent tool's
+  structured-metadata/generic-text fallback instead of a blocking question. See
+  [docs/design/ask-user-question-2026-06-03.md](../docs/design/ask-user-question-2026-06-03.md).
 
 ## 5. Identity Model
 
@@ -362,6 +376,7 @@ Session, turn, and approval core:
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
 - `approval/scopes/list` (approval-scope discovery; first-server slice)
+- `user_question/respond` (gate `user_question.v1`, proposed `UPCR-2026-023`)
 - `permission/profile/list`, `permission/profile/set`
   (accepted `UPCR-2026-018`)
 - `diff/preview/get`
@@ -436,6 +451,11 @@ Approval lifecycle:
 
 - `approval/requested`, `approval/auto_resolved`, `approval/decided`,
   `approval/cancelled`
+
+Structured user-question lifecycle (gate `user_question.v1`, proposed
+`UPCR-2026-023`):
+
+- `user_question/requested`
 
 Task and progress:
 
@@ -735,6 +755,30 @@ Optional params from accepted `UPCR-2026-001`:
   String registry with initial values `request`, `turn`, and `session`.
   Scope is advisory in v1alpha1 and must not silently create persistent allow
   rules.
+- `client_note`
+  Human-readable client note for audit/display. Servers must not require it.
+
+### `user_question/respond`
+
+Purpose:
+
+- answer a `user_question/requested` event
+
+Minimum params:
+
+- `session_id`
+- `question_id`
+- `answers`
+  Per-question answer list, one entry per question in the originating
+  `user_question/requested` event, in question order. Each entry carries:
+  - `selected_labels` — selected option label(s). Empty when the user supplied
+    only free text. For a single-select question this is 0 or 1 entries; for a
+    `multi_select` question it is 0..N. Labels must match the option labels from
+    the request.
+  - `free_text` — optional string from the free-text "Other" escape hatch.
+
+Optional params (governed by accepted `UPCR-2026-023`):
+
 - `client_note`
   Human-readable client note for audit/display. Servers must not require it.
 
@@ -1560,6 +1604,52 @@ Capability feature:
 - `approval.typed.v1`
   Advertised through optional `supported_features` in `UiProtocolCapabilities`.
   The capability payload schema version is `2`.
+
+### `user_question/requested`
+
+Carries a structured multiple-choice question the agent is asking the user
+mid-turn. While this is unresolved, the turn remains paused at a deterministic
+boundary (the same blocking-tool boundary as `approval/requested`).
+
+Required fallback fields:
+
+- `session_id`
+- `question_id`
+- `turn_id`
+- `title`
+  Mandatory generic fallback text.
+- `body`
+  Mandatory generic fallback text.
+
+Structured field (governed by accepted `UPCR-2026-023`):
+
+- `questions`
+  An array of 1–4 questions. Each question carries:
+  - `header` — short label, ≤ 12 characters.
+  - `question` — the question text.
+  - `options` — an array of 2–4 options, each with `label` and `description`.
+  - `multi_select` — `bool`; when `true` the user may select more than one
+    option.
+  - `allow_free_text` — `bool`; the server forces this `true` so a free-text
+    "Other" escape hatch is always offered alongside the options.
+
+Compatibility rules:
+
+- Generic `title` and `body` remain mandatory fallback text for v1alpha1.
+- Unknown fields must fall back to generic rendering and remain actionable: a
+  client that does not understand `questions` renders `title`/`body` and the
+  user can still answer (for example via free text).
+- Clients that do not advertise the `user_question.v1` capability receive the
+  agent tool's structured-metadata / generic-text fallback instead of a blocking
+  question, so the turn never hard-blocks on a non-supporting client (the agent
+  tool degrades exactly like the existing `request_user_input` codex tool).
+
+Capability feature:
+
+- `user_question.v1`
+  Advertised through optional `supported_features` in `UiProtocolCapabilities`.
+  Clients request it through `X-Octos-Ui-Features` using comma or
+  space-separated feature tokens.
 
 ### `task/updated`
 
