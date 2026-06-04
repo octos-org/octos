@@ -676,18 +676,28 @@ impl Agent {
                 // `tokio::spawn` moves `task_id` into the closure) can carry
                 // the same handle the supervisor and the SubAgentOutputRouter
                 // know it by.
+                // C1 step 2 / codex round-5 (orphan-sweep liveness): arm the
+                // RAII terminal guard HERE, in the FOREGROUND, before the
+                // `tokio::spawn`. `register_task_with_input_and_cmid` above
+                // already persisted a non-terminal `Spawned` row; arming the
+                // guard inside the spawned future (its previous home) left a
+                // window where a fast next-turn orphan-sweep could see the row
+                // non-terminal AND not-live and falsely reap a
+                // scheduled-but-not-yet-polled worker. Constructing it
+                // synchronously within the spawning turn inserts the id into
+                // the process-global live-set before the turn returns (turns
+                // are serialized per session, so this completes before any
+                // next-turn `enable_persistence` sweep). The guard is MOVED
+                // into the future below so its Drop — which clears the live-set
+                // and drives an unfinished task to Failed (so the TUI task
+                // count decrements instead of hanging on "N running") — still
+                // fires when the worker terminates. Idempotent on normal
+                // completion: the body's own terminal mark wins; Drop no-ops.
+                let terminal_guard = TaskTerminalGuard::new(bg_supervisor.clone(), task_id.clone());
                 let task_id_for_handle = task_id.clone();
                 tokio::spawn(async move {
+                    let _terminal_guard = terminal_guard;
                     bg_supervisor.mark_running(&task_id);
-                    // C1 step 2: arm a RAII terminal guard right after
-                    // mark_running. If this body panics or is aborted before
-                    // one of its mark_completed/mark_failed arms runs, the
-                    // guard's Drop drives the task to Failed so the TUI task
-                    // count decrements instead of hanging on "N running".
-                    // Idempotent on normal completion (the body's own
-                    // terminal mark wins; Drop then no-ops).
-                    let _terminal_guard =
-                        TaskTerminalGuard::new(bg_supervisor.clone(), task_id.clone());
                     // M8.7 (item 4): start a periodic-summary watcher for
                     // this background task. The watcher honours
                     // `min_runtime` so short tasks never trigger an LLM

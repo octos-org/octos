@@ -6712,4 +6712,65 @@ mod tests {
              (proxy-exemption is bounded to pipeline children)",
         );
     }
+
+    /// codex round-5 DO-NOT-SHIP regression: the terminal guard is now armed in
+    /// the FOREGROUND (in `execution.rs` / `spawn.rs`, before `tokio::spawn`),
+    /// not inside the spawned worker future. This mirrors the real call-site
+    /// ordering — register (persist `Spawned`) → arm guard (foreground) →
+    /// spawn → [a fast next turn sweeps] → the worker future finally gets its
+    /// first poll. The pre-fix code armed the guard INSIDE the future, so a
+    /// sweep that ran in the pre-poll window saw the row non-terminal AND
+    /// not-live and falsely reaped a scheduled-but-not-yet-polled worker. With
+    /// foreground arming the id is in the live-set before the spawning turn
+    /// returns, so the pre-poll sweep skips it.
+    #[tokio::test]
+    async fn foreground_armed_guard_survives_sweep_before_worker_polls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let turn1 = Arc::new(TaskSupervisor::new());
+        turn1.enable_persistence(&ledger_path).unwrap();
+        // Foreground: register persists a Spawned row, THEN the guard is armed
+        // in the foreground (the fix), BEFORE the worker future is spawned.
+        let id = turn1.register("run_pipeline", "call-fg-guard", Some("api:sess"));
+        let guard = TaskTerminalGuard::new(Arc::clone(&turn1), id.clone());
+
+        // The worker future is spawned but blocked on a gate: it has NOT yet
+        // polled past the gate, so it has NOT called mark_running. In the
+        // pre-fix world the guard would not exist yet either.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker_sup = Arc::clone(&turn1);
+        let worker_id = id.clone();
+        let worker = tokio::spawn(async move {
+            // Foreground-armed guard moved into the future; Drop fires at end.
+            let _guard = guard;
+            let _ = release_rx.await;
+            worker_sup.mark_running(&worker_id);
+            worker_sup.mark_completed(&worker_id, vec!["report.md".to_string()]);
+        });
+
+        // Turn 2 sweeps the SAME ledger BEFORE the worker future progresses
+        // past the gate. Pre-fix (guard armed inside the future) this reaps the
+        // still-`Spawned`, not-yet-live row.
+        let turn2 = TaskSupervisor::new();
+        turn2.enable_persistence(&ledger_path).unwrap();
+        let mid = turn2.get_task(&id).expect("row restored on turn-2");
+        assert_ne!(
+            mid.error.as_deref(),
+            Some("orphaned across restart"),
+            "a foreground-armed guard must keep a pre-poll worker out of the sweep",
+        );
+
+        // The worker finishes normally.
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert_eq!(
+            turn1.get_task(&id).expect("task").status,
+            TaskStatus::Completed,
+        );
+        assert!(
+            !is_task_live(&id),
+            "live-set cleared after the worker future drops"
+        );
+    }
 }
