@@ -52,48 +52,13 @@ async fn make_tool() -> (RunPipelineTool, tempfile::TempDir, tempfile::TempDir) 
 }
 
 #[tokio::test]
-async fn pre_flight_rejects_dot_with_ambiguous_start() {
-    // Real-world LLM mistake captured on mini5 2026-05-14: five parallel
-    // search nodes without a common entry. Pre-fix, this only surfaced
-    // inside the spawn_only background task — the LLM's foreground turn
-    // had already returned "Pipeline started in background…" and never
-    // saw the validator's complaint. Now the same shape is rejected
-    // synchronously so the LLM can fix the DOT in the next iteration.
-    let (tool, _working, _data) = make_tool().await;
-    let args = serde_json::json!({
-        "pipeline": "digraph bad {\n\
-            search_a [handler=DynamicParallel, tools=search];\n\
-            search_b [handler=DynamicParallel, tools=search];\n\
-            search_c [handler=DynamicParallel, tools=search];\n\
-            search_d [handler=DynamicParallel, tools=search];\n\
-            search_e [handler=DynamicParallel, tools=search];\n\
-            analyze [handler=Codergen, tools=read_file];\n\
-            synthesize [handler=Codergen, tools=write_file];\n\
-            search_a -> analyze;\n\
-            search_b -> analyze;\n\
-            search_c -> analyze;\n\
-            search_d -> analyze;\n\
-            search_e -> analyze;\n\
-            analyze -> synthesize;\n\
-        }",
-        "input": "anything",
-    });
-    let err = tool
-        .pre_flight_validate(&args)
-        .await
-        .expect_err("structurally invalid DOT must be rejected by pre-flight");
-    assert!(
-        err.contains("pipeline validation failed"),
-        "error must surface the validator's complaint verbatim — got: {err}"
-    );
-    assert!(
-        err.contains("ambiguous start") || err.contains("rule 1"),
-        "error must identify rule 1 (ambiguous start) — got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn pre_flight_accepts_well_formed_dot() {
+async fn pre_flight_rejects_inline_dot_even_when_well_formed() {
+    // Killing the unsafe authoring surface: free-form inline DOT let a model
+    // request arbitrary tools/handlers (incl. `shell`) or an empty tool-list
+    // that silently expanded to all builtins. It is now rejected at the tool
+    // boundary REGARDLESS of whether the DOT is structurally valid — validity
+    // is irrelevant once the surface itself is unsafe. Agents author via the
+    // capability-locked `ir` palette or name a sanctioned pipeline.
     let (tool, _working, _data) = make_tool().await;
     let args = serde_json::json!({
         "pipeline": "digraph ok {\n\
@@ -103,11 +68,76 @@ async fn pre_flight_accepts_well_formed_dot() {
         }",
         "input": "anything",
     });
-    let result = tool.pre_flight_validate(&args).await;
+    let err = tool
+        .pre_flight_validate(&args)
+        .await
+        .expect_err("inline DOT must be rejected even when well-formed");
     assert!(
-        result.is_ok(),
-        "well-formed DOT must pass pre-flight; got Err: {:?}",
-        result.err()
+        err.contains("inline DOT"),
+        "error must name the inline-DOT rejection — got: {err}"
+    );
+    assert!(
+        err.contains("`ir`") || err.contains("sanctioned pipeline"),
+        "error must point the LLM at the safe alternatives — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pre_flight_rejects_multi_node_inline_dot_before_structural_validation() {
+    // Real-world LLM mistake captured on mini5 2026-05-14 (five parallel search
+    // nodes without a common entry). It used to reach the structural validator
+    // ("ambiguous start"); now the inline-DOT surface is rejected FIRST, so the
+    // model never gets to author this shape at all. Structural-rule coverage
+    // lives in `validate.rs` unit tests, exercised on named/bundled pipelines.
+    let (tool, _working, _data) = make_tool().await;
+    let args = serde_json::json!({
+        "pipeline": "digraph bad {\n\
+            search_a [handler=DynamicParallel, tools=search];\n\
+            search_b [handler=DynamicParallel, tools=search];\n\
+            analyze [handler=Codergen, tools=read_file];\n\
+            search_a -> analyze;\n\
+            search_b -> analyze;\n\
+        }",
+        "input": "anything",
+    });
+    let err = tool
+        .pre_flight_validate(&args)
+        .await
+        .expect_err("inline DOT must be rejected by pre-flight");
+    assert!(
+        err.contains("inline DOT"),
+        "rejection must fire before structural validation — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_rejects_inline_dot_at_chokepoint() {
+    // The single resolution chokepoint both `execute` and `pre_flight` funnel
+    // through must reject inline DOT, so no path can smuggle it to the parser.
+    let (tool, _working, _data) = make_tool().await;
+    let err = tool
+        .resolve_named_for_test("digraph x { a -> b }")
+        .await
+        .expect_err("inline DOT must not resolve");
+    assert!(
+        err.to_string().contains("inline DOT"),
+        "chokepoint must reject inline DOT — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_still_accepts_named_bundled_pipeline() {
+    // Regression guard: killing inline DOT must NOT break the safe path. The
+    // sanctioned bundled `deep_research` name still resolves to runnable DOT
+    // (discovery miss → embedded bundled bytes).
+    let (tool, _working, _data) = make_tool().await;
+    let dot = tool
+        .resolve_named_for_test("deep_research")
+        .await
+        .expect("bundled deep_research must still resolve");
+    assert!(
+        dot.contains("digraph"),
+        "resolved named pipeline must be DOT — got: {dot:.80}"
     );
 }
 

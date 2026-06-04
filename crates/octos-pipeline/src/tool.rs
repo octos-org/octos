@@ -347,65 +347,18 @@ impl RunPipelineTool {
 
     /// Build a model catalog string for the LLM, showing each model's key,
     /// output capacity, context window, and cost.
-    /// Resolve pipeline with fallback: try inline DOT first, if it fails to parse,
-    /// try as a named pipeline. This handles cases where the LLM produces slightly
-    /// malformed DOT — the pre-built pipeline still works as a safety net.
+    /// Resolve a `pipeline` argument to runnable DOT.
+    ///
+    /// Free-form inline DOT is **rejected** here — it was the unsafe legacy
+    /// authoring surface (a model could request arbitrary tools/handlers incl.
+    /// `shell`, or an empty tool-list that silently expanded to all builtins).
+    /// Agents now author multi-step work via the capability-locked `ir`
+    /// palette; this method only resolves a sanctioned pipeline NAME (or path),
+    /// with the embedded bundled bytes as a final fallback for known names.
     async fn resolve_with_fallback(&self, pipeline_str: &str) -> Result<String> {
-        let trimmed = pipeline_str.trim();
-        let is_inline = trimmed.starts_with("digraph ") || trimmed.starts_with("digraph{");
-
-        if is_inline {
-            // Sanitize common LLM DOT mistakes before parsing
-            let sanitized = sanitize_dot(trimmed);
-            let trimmed = sanitized.as_str();
-
-            // Validate inline DOT parses correctly
-            match crate::parser::parse_dot(trimmed) {
-                Ok(_) => return Ok(pipeline_str.to_string()),
-                Err(parse_err) => {
-                    // Log the full DOT for debugging parse failures
-                    let dot_preview = if trimmed.len() > 500 {
-                        let mut end = 500;
-                        while !trimmed.is_char_boundary(end) && end > 0 {
-                            end -= 1;
-                        }
-                        format!(
-                            "{}...(truncated at {} bytes)",
-                            &trimmed[..end],
-                            trimmed.len()
-                        )
-                    } else {
-                        trimmed.to_string()
-                    };
-                    tracing::warn!(
-                        dot = %dot_preview,
-                        "inline DOT parse failed, trying named fallback: {parse_err}"
-                    );
-                    // Try to extract a pipeline name hint from the DOT (e.g. "digraph deep_research")
-                    if let Some(name) = trimmed
-                        .strip_prefix("digraph ")
-                        .and_then(|s| s.split_whitespace().next())
-                        .map(|s| s.trim_matches('{'))
-                    {
-                        if !name.is_empty() {
-                            if let Ok(dot) = self.resolve_named_with_bundled_fallback(name).await {
-                                tracing::info!(
-                                    name,
-                                    "fell back to pre-built pipeline after inline DOT parse failure"
-                                );
-                                return Ok(dot);
-                            }
-                        }
-                    }
-                    // No fallback found — return the original parse error
-                    tracing::error!(dot = %dot_preview, "no fallback available, returning parse error");
-                    return Err(parse_err.wrap_err("inline DOT parse failed with no fallback"));
-                }
-            }
+        if looks_like_inline_dot(pipeline_str) {
+            eyre::bail!(INLINE_DOT_REJECTION);
         }
-
-        // Named pipeline or file path — use normal resolution, with the
-        // embedded bundled bytes as a final fallback for sanctioned names.
         self.resolve_named_with_bundled_fallback(pipeline_str).await
     }
 
@@ -554,6 +507,30 @@ fn resolve_pipeline_timeout(llm_value: Option<u64>, dot_default: Option<u64>) ->
         .clamp(PIPELINE_TIMEOUT_MIN_SECS, PIPELINE_TIMEOUT_MAX_SECS)
 }
 
+/// Returned when an agent passes a free-form inline DOT graph to
+/// `run_pipeline`. Free-form DOT was the unsafe legacy authoring surface — the
+/// model could name arbitrary tools/handlers (incl. `shell`) or an empty
+/// tool-list that silently expanded to all builtins. Agents now author via the
+/// capability-locked `ir` palette, or name a sanctioned pipeline.
+const INLINE_DOT_REJECTION: &str =
+    "inline DOT graphs are not accepted: free-form DOT was the unsafe legacy \
+     authoring surface and has been removed. To run a multi-step workflow, \
+     either name a sanctioned pipeline (e.g. `deep_research`) in `pipeline`, or \
+     compose a typed-IR workflow program in `ir`.";
+
+/// True when `s` looks like an inline DOT digraph rather than a pipeline
+/// name/path. Conservative on the leading token so a real name is never
+/// mistaken for DOT; fenced/garbled DOT that slips past simply fails name
+/// resolution downstream (still rejected, just with a less specific message).
+fn looks_like_inline_dot(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("digraph ")
+        || t.starts_with("digraph{")
+        || t.starts_with("digraph\t")
+        || t.starts_with("digraph\n")
+        || t.starts_with("digraph\r")
+}
+
 #[async_trait]
 impl Tool for RunPipelineTool {
     fn name(&self) -> &str {
@@ -608,9 +585,10 @@ impl Tool for RunPipelineTool {
              research; answer them directly with the local file/shell tools \
              (`read_file`, `grep`, `glob`, `list_dir`, `shell`) instead of \
              calling run_pipeline. Do NOT pass an inline DOT graph here — \
-             inline DOT was the legacy free-form contract; the executor \
-             still accepts it for operator debugging but agent-driven runs \
-             MUST use the name form. If you find yourself wanting to compose \
+             free-form DOT was the unsafe legacy contract and is now REJECTED; \
+             this field accepts only a sanctioned pipeline name. For an ad-hoc \
+             multi-step workflow, compose a typed-IR program in `ir` instead. \
+             If you find yourself wanting to compose \
              your own DOT, the correct response is to use the purpose-built \
              tool for that domain (`mofa_slides` for slides, \
              `podcast_generate` for podcasts, `voice_synthesize` for TTS, \
@@ -705,6 +683,12 @@ impl Tool for RunPipelineTool {
                 .map_err(|e| format!("IR validation failed:\n{}", e.feedback_lines().join("\n")));
             }
         }
+        // Free-form inline DOT is rejected (unsafe legacy surface) — surface the
+        // same actionable message the run path returns, synchronously, so the
+        // LLM sees it in the foreground turn rather than as a spawn_only failure.
+        if looks_like_inline_dot(&input.pipeline) {
+            return Err(INLINE_DOT_REJECTION.to_string());
+        }
         let dot_content = self
             .resolve_with_fallback(&input.pipeline)
             .await
@@ -744,13 +728,27 @@ impl Tool for RunPipelineTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid run_pipeline input")?;
 
-        let is_inline = input.pipeline.trim().starts_with("digraph ");
+        let using_ir =
+            self.ir_enabled && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+        // Free-form inline DOT is no longer an agent-authorable surface. Reject
+        // it up front with an actionable message (mirrors the IR compose-error
+        // path) rather than letting it reach the parser. When IR is in use the
+        // `pipeline` field is ignored, so only guard the DOT path.
+        if !using_ir && looks_like_inline_dot(&input.pipeline) {
+            return Ok(ToolResult {
+                success: false,
+                output: INLINE_DOT_REJECTION.to_string(),
+                ..Default::default()
+            });
+        }
+
         tracing::info!(
-            inline = is_inline,
-            pipeline_arg = if is_inline {
-                "(inline DOT)"
+            using_ir,
+            pipeline_arg = if using_ir {
+                "(ir)"
             } else {
-                &input.pipeline
+                input.pipeline.as_str()
             },
             "run_pipeline invoked"
         );
@@ -766,9 +764,7 @@ impl Tool for RunPipelineTool {
         // (compiled + capability-locked) or a named/inline DOT pipeline. The
         // entire downstream (config, timeout, summary, files_to_send, spawn_only
         // delivery) is graph-agnostic, so only acquisition differs.
-        let (graph, graph_id): (crate::graph::PipelineGraph, String) = if self.ir_enabled
-            && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty())
-        {
+        let (graph, graph_id): (crate::graph::PipelineGraph, String) = if using_ir {
             let ir = input.ir.as_deref().unwrap_or_default();
             match crate::compose::compose(
                 ir,
@@ -1537,41 +1533,6 @@ fn node_costs_metadata(rows: &[crate::executor::NodeCost]) -> Option<serde_json:
             "node_costs": rows,
         }))
     }
-}
-
-/// Sanitize common LLM DOT mistakes that would cause parse failures.
-fn sanitize_dot(dot: &str) -> String {
-    let mut result = dot.to_string();
-
-    // Fix: digraph{ → digraph {
-    if result.contains("digraph{") {
-        result = result.replace("digraph{", "digraph pipeline {");
-    }
-
-    // Fix: digraph { (no name) → digraph pipeline {
-    // The parser now handles this, but belt-and-suspenders
-    if result.starts_with("digraph {") || result.starts_with("digraph  {") {
-        result = result.replacen("digraph", "digraph pipeline", 1);
-    }
-
-    // Fix: markdown code fences around DOT
-    if result.starts_with("```") {
-        // Strip ```dot or ```graphviz or ``` prefix/suffix
-        let lines: Vec<&str> = result.lines().collect();
-        let start = if lines.first().map(|l| l.starts_with("```")).unwrap_or(false) {
-            1
-        } else {
-            0
-        };
-        let end = if lines.last().map(|l| l.trim() == "```").unwrap_or(false) {
-            lines.len() - 1
-        } else {
-            lines.len()
-        };
-        result = lines[start..end].join("\n");
-    }
-
-    result
 }
 
 /// Max ERROR diagnostics included in a `pre_flight_validate` failure message,
