@@ -647,3 +647,72 @@ async fn bootstrap_then_discover_deep_research_end_to_end() {
         .await
         .expect("bootstrapped deep_research must pass pre_flight_validate");
 }
+
+/// Routing guidance ("Jingkang artifact" routing-collapse fix). The tool
+/// exposes exactly one pipeline (`deep_research`), and the agent force-fit a
+/// CODE-REVIEW task onto it — the web-research-synthesis pipeline then ran
+/// over a shared workspace and recalled a stale unrelated research artifact.
+///
+/// We cannot reliably classify intent in code without a brittle classifier,
+/// so the enforcement is a STRONG description/schema guardrail: both the
+/// tool `description()` and the `pipeline` arg's enum-doc must state in plain
+/// terms that `deep_research` is for multi-source WEB-research synthesis ONLY
+/// and MUST NOT be used for code review / local-codebase analysis / anything
+/// answerable from the working directory (those use the direct
+/// file/shell/grep/read tools). This test pins that guidance so it cannot
+/// silently regress.
+#[tokio::test]
+async fn run_pipeline_guidance_steers_code_review_away_from_deep_research() {
+    let working = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let tool = make_tool_with_data(working.path(), data.path()).await;
+
+    let description = tool.description().to_ascii_lowercase();
+    let schema = tool.input_schema();
+    let pipeline_desc = schema["properties"]["pipeline"]["description"]
+        .as_str()
+        .expect("pipeline arg must carry a description")
+        .to_ascii_lowercase();
+
+    // The two surfaces the model actually reads when deciding to call.
+    let combined = format!("{description}\n{pipeline_desc}");
+
+    // 1. It must scope deep_research to multi-source WEB research synthesis.
+    assert!(
+        combined.contains("web") && combined.contains("research"),
+        "guidance must scope deep_research to web-research synthesis; got:\n{combined}"
+    );
+
+    // 2. It must explicitly steer code review away.
+    assert!(
+        combined.contains("code review") || combined.contains("code-review"),
+        "guidance must explicitly mention code review as a NON-use; got:\n{combined}"
+    );
+
+    // 3. It must explicitly steer local-codebase / working-directory tasks away.
+    assert!(
+        combined.contains("local") || combined.contains("codebase"),
+        "guidance must mention local-codebase analysis as a NON-use; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("working directory") || combined.contains("working-directory"),
+        "guidance must mention working-directory-answerable tasks as a NON-use; got:\n{combined}"
+    );
+
+    // 4. It must point such tasks at the direct file/shell tools instead.
+    let names_direct_tools = ["read_file", "read", "grep", "shell", "list_dir"]
+        .iter()
+        .any(|t| combined.contains(t));
+    assert!(
+        names_direct_tools,
+        "guidance must redirect code-review / local tasks to the direct \
+         file/shell/grep/read tools; got:\n{combined}"
+    );
+
+    // 5. A clear MUST NOT / do-not prohibition (not merely a soft hint).
+    assert!(
+        combined.contains("must not") || combined.contains("do not use"),
+        "guidance must carry a strong prohibition (MUST NOT / do not use), not \
+         a soft suggestion; got:\n{combined}"
+    );
+}

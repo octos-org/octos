@@ -120,14 +120,14 @@ pub struct RunPipelineTool {
     contract_id: Option<String>,
     /// NEW-06 fix: optional embedder for hybrid memory search.
     ///
-    /// Without this set, worker `Agent` instances spawned per pipeline
-    /// node fall through to the unfiltered cwd-only fallback path in
-    /// `EpisodeStore::find_relevant` — which only does keyword overlap
-    /// plus CWD filtering, NOT the modality-aware similarity gate in
-    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`]. The
-    /// gateway / serve runtimes own the embedder; this lets the
-    /// orchestrator propagate it down to pipeline workers so episodic
-    /// memory recall is contamination-safe end-to-end.
+    /// Without this set, worker `Agent` instances spawned per pipeline node
+    /// SKIP episodic memory recall entirely (the no-embedder branch in
+    /// `octos_agent::agent::memory`): BM25-only keyword recall within a single
+    /// shared workspace can't discriminate on-task from cross-task episodes, so
+    /// it would leak stale unrelated memory. The gateway / serve runtimes own
+    /// the embedder; this lets the orchestrator propagate it down to pipeline
+    /// workers so episodic memory recall is available AND contamination-safe
+    /// end-to-end.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
@@ -529,14 +529,22 @@ impl Tool for RunPipelineTool {
 
     fn description(&self) -> &str {
         "Run a sanctioned multi-step pipeline by NAME. The only currently \
-         sanctioned pipeline is `deep_research` — use it when the user asks \
-         for in-depth, multi-source, source-citing research that needs \
-         parallel search workers + synthesis. Do NOT compose your own \
-         inline DOT graph for ad-hoc tasks (slides, media, code edits, \
-         partial regenerations, etc.) — those have purpose-built tools \
-         (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
+         sanctioned pipeline is `deep_research`, which performs MULTI-SOURCE \
+         WEB-RESEARCH SYNTHESIS: it fans out parallel web-search workers and \
+         synthesizes a source-citing report. Use it ONLY when the user asks \
+         for in-depth, multi-source research drawn from the open web. \
+         deep_research MUST NOT be used for code review, local-codebase \
+         analysis, debugging, or anything answerable from the files already \
+         in the working directory — it has no access to your repository and \
+         will fabricate or recall unrelated material. For those tasks do NOT \
+         call run_pipeline at all; answer directly with the local tools \
+         (`read_file`, `grep`, `glob`, `list_dir`, `shell`). Likewise do NOT \
+         compose your own inline DOT graph for ad-hoc tasks (slides, media, \
+         code edits, partial regenerations, etc.) — those have purpose-built \
+         tools (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
          tool exists for what the user asked, surface that as a limitation \
-         rather than improvising a custom pipeline."
+         rather than improvising a custom pipeline or force-fitting \
+         deep_research."
     }
 
     fn tags(&self) -> &[&str] {
@@ -545,15 +553,21 @@ impl Tool for RunPipelineTool {
 
     fn input_schema(&self) -> serde_json::Value {
         let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
-             sanctioned name is `deep_research`. Do NOT pass an inline \
-             DOT graph here — inline DOT was the legacy free-form \
-             contract; the executor still accepts it for operator \
-             debugging but agent-driven runs MUST use the name form. If \
-             you find yourself wanting to compose your own DOT, the \
-             correct response is to use the purpose-built tool for that \
-             domain (`mofa_slides` for slides, `podcast_generate` for \
-             podcasts, `voice_synthesize` for TTS, etc.), or tell the \
-             user no such tool exists for their request."
+             sanctioned name is `deep_research`, which is for MULTI-SOURCE \
+             WEB-RESEARCH SYNTHESIS ONLY (parallel web-search workers + a \
+             cited synthesis). `deep_research` MUST NOT be selected for code \
+             review, local-codebase analysis, debugging, or any task \
+             answerable from the working directory — those are NOT web \
+             research; answer them directly with the local file/shell tools \
+             (`read_file`, `grep`, `glob`, `list_dir`, `shell`) instead of \
+             calling run_pipeline. Do NOT pass an inline DOT graph here — \
+             inline DOT was the legacy free-form contract; the executor \
+             still accepts it for operator debugging but agent-driven runs \
+             MUST use the name form. If you find yourself wanting to compose \
+             your own DOT, the correct response is to use the purpose-built \
+             tool for that domain (`mofa_slides` for slides, \
+             `podcast_generate` for podcasts, `voice_synthesize` for TTS, \
+             etc.), or tell the user no such tool exists for their request."
             .to_string();
 
         // Gap 4.1: advertise the LIVE discovery list, not a hard-coded

@@ -358,9 +358,10 @@ pub struct ExecutorConfig {
     /// node worker [`octos_agent::Agent`] so episodic memory recall
     /// stays on the contamination-safe hybrid scored + filtered path.
     ///
-    /// `None` keeps the legacy unfiltered cwd-only fallback in
-    /// `EpisodeStore::find_relevant` — identical to pre-fix behaviour
-    /// for callers that don't propagate the orchestrator's embedder.
+    /// `None` means per-node workers SKIP episodic recall entirely (the
+    /// no-embedder branch in `octos_agent::agent::memory`) — BM25-only cwd
+    /// recall can't separate cross-task episodes, so injecting it would leak
+    /// stale unrelated memory; skipping is the contamination-safe choice.
     pub embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     /// Phase 2-A — directory used to load `pipeline_models.json` and
     /// `model_catalog.json` for per-node model assignment, plus to
