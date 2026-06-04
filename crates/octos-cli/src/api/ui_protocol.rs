@@ -36953,4 +36953,58 @@ ignore = []
             "id must be preserved exactly, not truncated"
         );
     }
+
+    #[tokio::test]
+    async fn send_minimal_rpc_error_fallback_huge_id_closes_1011_and_fails_no_loop() {
+        // codex nit: directly exercise the absolute-last-resort path in
+        // `send_minimal_rpc_error_fallback`. When the request `id` is so large
+        // that even the MINIMAL error envelope exceeds `MAX_TEXT_FRAME_BYTES`,
+        // `minimal_rpc_error_frame` returns `None`. The fallback must NOT loop or
+        // panic: it must (1) enqueue a `Close(1011)` frame BEFORE latching (so the
+        // client receives the code), (2) latch the connection failed, and (3)
+        // surface `LifecycleFailure` so the read loop tears down.
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        // An id whose exact-id minimal envelope provably exceeds the 1 MiB cap.
+        let huge_id = "x".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        // Guard: the minimal envelope for this id really is over cap (None).
+        assert!(
+            minimal_rpc_error_frame(Some(huge_id.clone()), RPC_RESPONSE_TOO_LARGE_MESSAGE)
+                .is_none(),
+            "fixture must drive minimal_rpc_error_frame -> None (huge id over cap)"
+        );
+
+        let result = send_minimal_rpc_error_fallback(&ws, Some(huge_id));
+        assert!(
+            matches!(result, Err(SendError::LifecycleFailure(_))),
+            "huge-id fallback must surface LifecycleFailure (read loop tears down), got {result:?}"
+        );
+
+        // The connection must be latched failed so the read loop stops dispatch.
+        assert!(
+            ws.is_failed(),
+            "connection must latch failed after the un-deliverable minimal error"
+        );
+
+        // A Close(1011) frame must have been enqueued BEFORE the fail latch, so
+        // the client actually receives the close code. No text reply is sent.
+        let mut close_codes = Vec::new();
+        let mut text_frames = 0usize;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                WsMessage::Close(Some(frame)) => close_codes.push(frame.code),
+                WsMessage::Text(_) => text_frames += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            close_codes,
+            vec![1011u16],
+            "exactly one Close(1011) frame must be queued before the fail latch"
+        );
+        assert_eq!(
+            text_frames, 0,
+            "no text reply must be sent on the un-deliverable last-resort path"
+        );
+    }
 }
