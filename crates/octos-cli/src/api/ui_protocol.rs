@@ -35,29 +35,30 @@ use octos_core::ui_protocol::{
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
-    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
-    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    SessionOpened, SessionOrchestrationEvent, SessionSnapshotParams, SessionStatusGetParams,
+    SessionTasksListParams, SessionTitleSetParams, SessionWorkspaceGetParams,
+    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
+    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
+    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
+    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
+    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
+    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
+    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
+    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
     approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
@@ -103,6 +104,7 @@ use super::ui_protocol_ledger::{
 };
 use super::ui_protocol_progress::{
     ProgressMappingContext, UiProgressMapping, background_task_to_progress_json, map_progress_json,
+    replay_task_updated_notification,
 };
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
@@ -2899,6 +2901,7 @@ fn forward_task_progress_to_channel(
     tx: &tokio::sync::mpsc::Sender<String>,
     progress_dropped: &Arc<AtomicU64>,
     task: &octos_agent::BackgroundTask,
+    runtime_profile_id: Option<&str>,
 ) {
     let event = background_task_to_progress_json(task);
     let Ok(json) = serde_json::to_string(&event) else {
@@ -2906,7 +2909,7 @@ fn forward_task_progress_to_channel(
     };
     forward_task_progress_json_to_channel(tx, progress_dropped, task, "task_progress", json);
 
-    if let Some((session_id, agent)) = upsert_background_task_agent(task) {
+    if let Some((session_id, agent)) = upsert_background_task_agent(task, runtime_profile_id) {
         let event = json!({
             "type": "agent_updated",
             "session_id": session_id,
@@ -2922,6 +2925,53 @@ fn forward_task_progress_to_channel(
             );
         }
     }
+}
+
+/// Mirror a TERMINAL `BackgroundTask` snapshot onto the durable, per-session
+/// ledger as an `agent/updated` notification.
+///
+/// **Why this exists (stuck-chip root cause):** the per-turn progress channel
+/// (`forward_task_progress_to_channel` → `progress_tx`) is torn down when the
+/// spawning turn ends. A spawn_only background child that outlives its turn and
+/// only THEN goes terminal has no live receiver — the terminal `task_progress`
+/// AND `agent_updated` frames are both dropped ("terminal task update dropped:
+/// progress receiver gone"), so the client's chip never flips off
+/// "Orchestrating…".
+///
+/// [`send_notification_durable`] appends the event to the per-session ledger
+/// (in-memory ring + disk + `publish_live` broadcast) BEFORE it attempts live
+/// delivery to `ws`. That append is connection-independent, so the terminal
+/// flip survives the originating connection being gone: a reconnecting client
+/// replays it via cursor, and any sibling connection on the same session sees
+/// it on the live broadcast forwarder. The carried [`UiAgentRecord`] includes
+/// `task_id` + `status`, which the TUI uses to reconcile its chip.
+///
+/// Only TERMINAL snapshots (`completed` / `failed` / `cancelled`) are mirrored
+/// here — non-terminal updates already flow on the live per-turn channel and
+/// are coalesce-friendly, so appending each to the durable ledger would only
+/// bloat replay history with redundant in-flight states.
+fn forward_terminal_agent_update_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    task: &octos_agent::BackgroundTask,
+    runtime_profile_id: Option<&str>,
+) {
+    if !task.status.is_terminal() {
+        return;
+    }
+    let Some((session_id, agent_value)) = upsert_background_task_agent(task, runtime_profile_id)
+    else {
+        return;
+    };
+    let Ok(agent) = serde_json::from_value::<octos_core::ui_protocol::UiAgentRecord>(agent_value)
+    else {
+        return;
+    };
+    let _ = send_notification_durable(
+        ws,
+        ledger,
+        UiNotification::AgentUpdated(AgentUpdatedEvent { session_id, agent }),
+    );
 }
 
 fn forward_task_progress_json_to_channel(
@@ -3436,6 +3486,22 @@ async fn ui_protocol_connection(
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let connection_profile_id = connection_profile_id.as_deref();
     let routed_profile_id = routed_profile_id.as_deref();
+    // mini5 soak gap #2: the profile a `session/open` bound this connection to.
+    // The WS connection's authenticated `connection_profile_id` is frozen at
+    // upgrade time and an admin / unscoped connection (`connection_profile_id ==
+    // None`) carries no profile, so a later `turn/start` resolved to `<unset>`
+    // and the per-connection continuation drain filtered by `None`. Mirror the
+    // stdio handler (`stdio_session_open_candidate_profile` ->
+    // `connection_profile_id_owned`): remember the profile a successful
+    // `session/open` resolved to and use it as a fallback for both the turn
+    // profile and the drain filter. For an authenticated profile-scoped
+    // connection this is a no-op (validate_authenticated_session_scope already
+    // forces the session to that profile); it only fills the gap left by
+    // None-scoped (admin) connections, which are authorized for every profile.
+    let mut session_open_profile_id: Option<String> = None;
+    // Last-emitted whole-job orchestration status per session (dedup so only
+    // changes hit the wire). Drives the client's composer top-border indicator.
+    let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
 
     // #924 BLOCK 1: wake the read loop the instant a lifecycle/RPC
     // send marks the connection failed. Without this, an idle socket
@@ -3474,7 +3540,9 @@ async fn ui_protocol_connection(
                 break;
             }
             _ = appui_continuation_tick.tick() => {
-                let profile_filter = connection_profile_id.or(routed_profile_id);
+                let profile_filter = connection_profile_id
+                    .or(routed_profile_id)
+                    .or(session_open_profile_id.as_deref());
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -3484,6 +3552,13 @@ async fn ui_protocol_connection(
                     &connection_turns,
                     profile_filter,
                     features,
+                ).await;
+                emit_session_orchestration_updates(
+                    &ws,
+                    &ledger,
+                    &active_turns,
+                    &live_forwarders,
+                    &mut last_orchestration,
                 ).await;
                 continue;
             }
@@ -3578,7 +3653,23 @@ async fn ui_protocol_connection(
                 }
             }
             UiCommand::SessionOpen(params) => {
-                handle_session_open(
+                // gap #2 (codex P2): record the profile this open RESOLVES to so
+                // a None-scoped (admin) connection's later turn/start +
+                // continuation drain can recover it, committed only on success.
+                // For a None connection `handle_session_open` ->
+                // `validate_session_scope` resolves
+                // `params.profile_id.or(session_id.profile_id())`, so mirror that
+                // exactly — do NOT carry the previous session's profile onto a
+                // profile-less open (that would mis-bind a session opened under
+                // the default/_main runtime to the prior profile). For an
+                // authenticated connection this value is unused downstream
+                // (connection_profile_id dominates the turn + drain filter); the
+                // auth gate stays in handle_session_open.
+                let resolved_open_profile = params
+                    .profile_id
+                    .clone()
+                    .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
+                let opened = handle_session_open(
                     &ws,
                     &state,
                     &ledger,
@@ -3590,6 +3681,18 @@ async fn ui_protocol_connection(
                     params,
                 )
                 .await;
+                if opened {
+                    // codex P2 (re-review): a successful open always resolves to
+                    // a concrete runtime — a profile-less default open resolves
+                    // to MAIN_PROFILE_ID, not "no profile". Record that concrete
+                    // profile so the per-connection drain filter
+                    // (`connection.or(routed).or(session_open)`) scopes to this
+                    // session's profile instead of degrading to `None` (= ALL
+                    // profiles) for an unscoped/admin connection, which would let
+                    // it drain unrelated profiles' continuations.
+                    session_open_profile_id =
+                        Some(resolved_open_profile.unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()));
+                }
             }
             UiCommand::TurnStart(params) => {
                 handle_turn_start(
@@ -3600,7 +3703,9 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
-                    routed_profile_id,
+                    // gap #2: fall back to the session-open profile when the
+                    // connection supplied no routing profile (admin / unscoped).
+                    routed_profile_id.or(session_open_profile_id.as_deref()),
                     features,
                     id,
                     params,
@@ -3933,6 +4038,7 @@ where
     let mut features = ConnectionUiFeatures::stdio_defaults();
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
+    let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let failed_notify = ws.failed_notify();
@@ -3964,6 +4070,13 @@ where
                     &connection_turns,
                     connection_profile_id_owned.as_deref(),
                     features,
+                ).await;
+                emit_session_orchestration_updates(
+                    &ws,
+                    &ledger,
+                    &active_turns,
+                    &live_forwarders,
+                    &mut last_orchestration,
                 ).await;
                 continue;
             }
@@ -7723,6 +7836,30 @@ async fn handle_session_open(
         }
         _ => session_id_for_subscribe,
     };
+
+    // C8 / GAP A: replay the supervisor's CURRENT task snapshot to this
+    // freshly-opened / reconnecting connection as `task/updated` events. A
+    // TUI starts with an empty `session.tasks` and only applies incremental
+    // updates, so without this it cannot see tasks that were already running
+    // when it connected (it would have to wait for the next live transition,
+    // and a stable long-running task may never produce one). Each task is
+    // routed through the SAME mapping live updates use
+    // (`background_task_to_progress_json` -> `map_progress_json`), so the wire
+    // shape is identical to a live `task/updated`.
+    //
+    // These are sent EPHEMERAL (direct to this connection, NOT appended to the
+    // ledger): the snapshot is catch-up state for one client, not a new event
+    // in session history. Any historical durable `task/updated` events were
+    // already shipped by the replay loop above; the client merges by `task_id`
+    // (last-write-wins), so a duplicate is harmless and the latest state wins.
+    if let Some(store) = state.task_query_store.as_ref() {
+        for (task, _data_dir) in store.raw_tasks_for_session(&session_id.0) {
+            if let Some(notification) = replay_task_updated_notification(&session_id, &task) {
+                let _ = send_notification_ephemeral(ws, ledger, notification);
+            }
+        }
+    }
+
     let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
 
@@ -9687,6 +9824,277 @@ async fn drain_appui_due_master_continuations(
         )
         .await;
     }
+}
+
+/// Snapshot of sessions that currently have an in-flight (non-terminal) turn in
+/// the process-global active-turns registry. One lock acquisition; used to feed
+/// the whole-job orchestration status without re-locking per session.
+async fn active_turn_sessions(
+    active_turns: &SharedActiveTurns,
+) -> std::collections::HashSet<SessionKey> {
+    let mut sessions = std::collections::HashSet::new();
+    let active = active_turns.lock().await;
+    for (session_id, turn) in active.iter() {
+        if !matches!(&*turn.state.lock().await, TurnState::Terminal(_)) {
+            sessions.insert(session_id.clone());
+        }
+    }
+    sessions
+}
+
+/// Compute + emit `session/orchestration` updates for the whole-job indicator.
+///
+/// The "active orchestration" set is the union of: sessions with an in-flight
+/// turn, sessions with a non-terminal sub-agent, and sessions with a queued
+/// master continuation. For each such session we emit a status carrying
+/// `active:true` + counts + a coarse phase; a session that drops out of the set
+/// gets one final `active:false`. Emissions are deduped per connection via
+/// `last` (only changes go on the wire). The client keeps its job indicator
+/// live across the sub-agent-complete → master-re-entry gap because such a
+/// session stays in the set (pending continuation) even with no running turn.
+async fn emit_session_orchestration_updates(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    live_forwarders: &SharedLiveForwarders,
+    last: &mut std::collections::HashMap<SessionKey, SessionOrchestrationEvent>,
+) {
+    // Scope to THIS connection's open/subscribed sessions so we don't (a) emit
+    // another profile's session status to a connection that never opened it
+    // (cross-profile leak) or (b) have every connection re-emit for every active
+    // session (the redundant N× the per-connection design otherwise produces).
+    // A session enters `live_forwarders` only via a scope-validated
+    // `session/open`, so this is the connection's authorized session set.
+    let subscribed: std::collections::HashSet<SessionKey> =
+        live_forwarders.lock().await.keys().cloned().collect();
+    if subscribed.is_empty() {
+        // Still drain `last` to idle so a connection that closed its sessions
+        // doesn't leave a stale active indicator on its own dedup map.
+        last.clear();
+        return;
+    }
+    let turn_sessions = active_turn_sessions(active_turns).await;
+    let orchestrator = default_agent_orchestrator();
+    let mut candidates = orchestrator.sessions_with_active_orchestration();
+    candidates.extend(turn_sessions.iter().cloned());
+    candidates.retain(|session_id| subscribed.contains(session_id));
+
+    let mut current: std::collections::HashMap<SessionKey, SessionOrchestrationEvent> =
+        std::collections::HashMap::new();
+    for session_id in &candidates {
+        let (running_agents, pending_continuations) =
+            orchestrator.session_orchestration_counts(session_id);
+        let turn_active = turn_sessions.contains(session_id);
+        // A candidate is here because at least one of these holds; if a stale
+        // continuation cleared between set-build and count, skip it.
+        if !turn_active && running_agents == 0 && pending_continuations == 0 {
+            continue;
+        }
+        let phase = if turn_active && running_agents > 0 {
+            "orchestrating"
+        } else if turn_active {
+            "working"
+        } else if pending_continuations > 0 {
+            "re-entering"
+        } else {
+            "orchestrating"
+        };
+        current.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents,
+                pending_continuations,
+                phase: Some(phase.to_owned()),
+            },
+        );
+    }
+
+    // Sessions that just went idle: emit one terminal active:false.
+    for (session_id, previous) in last.iter() {
+        if previous.active && !current.contains_key(session_id) {
+            let _ = send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::SessionOrchestration(SessionOrchestrationEvent {
+                    session_id: session_id.clone(),
+                    active: false,
+                    running_agents: 0,
+                    pending_continuations: 0,
+                    phase: None,
+                }),
+            );
+        }
+    }
+    // New / changed active sessions.
+    for (session_id, event) in &current {
+        if last.get(session_id) != Some(event) {
+            let _ = send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::SessionOrchestration(event.clone()),
+            );
+        }
+    }
+    *last = current;
+}
+
+/// Cadence for the server-level (connection-independent) master-continuation
+/// drain. Deliberately slower than the per-connection `appui_continuation_tick`
+/// (2s) so a live ws/stdio client almost always wins the race and renders the
+/// re-entry turn on its own connection; this loop is the safety net that drains
+/// queued continuations when NO client is connected.
+const GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS: u64 = 5;
+
+/// Spawn a server-level background task that drains due master continuations
+/// regardless of whether any ws/stdio client is connected.
+///
+/// The AppUI re-entry path (`appui_continuation_tick` ->
+/// `drain_appui_due_master_continuations`) runs ONLY inside a live connection's
+/// handler loop. So when a sub-agent finishes while the user's TUI is
+/// disconnected — or after a serve restart re-loads the persisted queue — the
+/// `ChildCompleted` / `ScatterJoinComplete` / `GoalContinue` / `LoopFire`
+/// continuation sits in the scheduler with nothing to drain it until a client
+/// reconnects. This loop closes that gap (mini5 soak gap #1).
+///
+/// It reuses the exact same drain primitive as the per-connection tick and
+/// shares the process-global `active_turns_registry()`, so the scheduler's
+/// atomic pop + the per-session active-turn guard prevent any double-run when a
+/// client IS connected: whoever pops the continuation first wins, the other
+/// side finds it gone / the session occupied. Turn events persist to the
+/// durable ledger, so connected clients receive them live via their session's
+/// live forwarder and disconnected clients replay them on reconnect.
+///
+/// `profile_filter = None` so it sweeps every profile (each per-connection tick
+/// scopes to its own profile; the safety net must cover all of them).
+pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        // Detached connection: there is no live peer. Outbound frames are
+        // discarded by a drain task (the durable record is the ledger); keep
+        // the receiver alive so sends never backpressure-fail and mark the
+        // connection dead.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+        tokio::spawn(async move { while writer_rx.recv().await.is_some() {} });
+        let ws = WsConnection::new(writer_tx);
+        let active_turns = active_turns_registry();
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let contracts = contract_stores();
+        let ledger = event_ledger(&state).await;
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; skip it so we don't race the serve's
+        // own startup wiring before any session can exist.
+        tick.tick().await;
+        info!(
+            interval_secs = GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS,
+            "global master-continuation drain loop started (connection-independent)"
+        );
+        loop {
+            tick.tick().await;
+
+            // codex P2 (reap): this loop never closes, so the per-connection
+            // cleanup path (`abort_connection_turns` on socket close) never runs
+            // for the turns we spawn. Without this, every disconnected session
+            // we drain would leave a Terminal active-turn entry behind forever.
+            // Drop our own entries once their turn has reached Terminal.
+            {
+                let mut conns = connection_turns.lock().await;
+                if !conns.is_empty() {
+                    let mut active = active_turns.lock().await;
+                    let mut finished: Vec<SessionKey> = Vec::new();
+                    for (session, turn_id) in conns.iter() {
+                        match active.get(session) {
+                            Some(existing) if existing.turn_id == *turn_id => {
+                                if matches!(&*existing.state.lock().await, TurnState::Terminal(_)) {
+                                    finished.push(session.clone());
+                                }
+                            }
+                            // Replaced by a newer turn (or already gone): our
+                            // mapping is stale, drop it.
+                            _ => finished.push(session.clone()),
+                        }
+                    }
+                    for session in finished {
+                        if let Some(existing) = active.get(&session) {
+                            if conns.get(&session) == Some(&existing.turn_id) {
+                                active.remove(&session);
+                            }
+                        }
+                        conns.remove(&session);
+                    }
+                }
+            }
+
+            // Drive the drain ourselves (rather than
+            // `drain_appui_due_master_continuations`) so we can gate each
+            // target on a known workspace.
+            //
+            // codex P1 + P2 (rounds 2-4): only run a headless turn for a session
+            // whose workspace is already established in-memory (opened this
+            // process run). A continuation rehydrated across a serve restart has
+            // no `session_workspaces()` entry yet; running it blind would
+            // bootstrap the profile-default workspace and could run tools in the
+            // wrong repo for a custom-cwd session — so such targets must be
+            // deferred to reconnect (session/open repopulates the workspace).
+            //
+            // The gate is pushed INTO `due_loop_targets_with_filter` so it is
+            // applied BEFORE the `max_items` limit: a bounded `DRAIN_SPAWN_CAP`
+            // window returns up to N *runnable* targets (bounded result +
+            // allocation), and deferred (workspace-unknown) sessions at the head
+            // of the queue can neither fill the window (starving runnable ones)
+            // nor force an unbounded per-tick scan/allocation under the
+            // orchestrator mutex.
+            // Request more RUNNABLE candidates than we will spawn so a
+            // candidate that can't advance this tick (already-active/occupied
+            // turn, or nothing drainable → `maybe_spawn` returns false) does not
+            // consume the per-tick spawn budget and skip runnable sessions
+            // behind it (codex round-5). Only SUCCESSFUL spawns count toward the
+            // cap. The window stays bounded (<= DRAIN_CANDIDATE_WINDOW); a
+            // session is "occupied" only while it holds an in-flight turn, so
+            // more than DRAIN_CANDIDATE_WINDOW simultaneously-occupied runnable
+            // sessions is not operationally reachable on a single serve.
+            const DRAIN_SPAWN_CAP: usize = 8;
+            const DRAIN_CANDIDATE_WINDOW: usize = 64;
+            let runnable = |session: &SessionKey| session_workspaces().get(session).is_some();
+            let due = default_agent_orchestrator().due_loop_targets_with_filter(
+                None,
+                DRAIN_CANDIDATE_WINDOW,
+                Some(&runnable),
+            );
+            let mut advanced = 0usize;
+            for (session_id, profile_id) in due {
+                if advanced >= DRAIN_SPAWN_CAP {
+                    break;
+                }
+                if maybe_spawn_appui_master_continuation_runner(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts,
+                    &active_turns,
+                    &connection_turns,
+                    session_id,
+                    profile_id,
+                    features,
+                )
+                .await
+                {
+                    advanced += 1;
+                }
+            }
+            if advanced > 0 {
+                info!(
+                    advanced,
+                    "global master-continuation drain (connection-independent)"
+                );
+            }
+        }
+    });
 }
 
 async fn handle_turn_interrupt(
@@ -13055,6 +13463,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            // C1 step 4: stamp the originating turn.
+                            turn_id: Some(turn_id.clone()),
                         }),
                     );
                     let _ = send_notification_durable(
@@ -13084,6 +13494,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            // C1 step 4: stamp the originating turn.
+                            turn_id: Some(turn_id.clone()),
                         }),
                     );
                     if m9_fixture_delay_or_interrupt(
@@ -14058,6 +14470,8 @@ async fn run_native_code_review_turn(
             summary: Some("Launching native code review specialists".to_owned()),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     let _ = send_notification_durable(
@@ -14212,6 +14626,8 @@ async fn run_native_code_review_turn(
                         summary: Some("Code review interrupted".to_owned()),
                         artifact_count: Some(0),
                         runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+                        // C1 step 4: stamp the originating turn.
+                        turn_id: Some(turn_id.clone()),
                     }),
                 );
                 try_emit_terminal(
@@ -14330,6 +14746,8 @@ async fn run_native_code_review_turn(
             )),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     try_emit_terminal(
@@ -14820,6 +15238,8 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     let _ = send_notification_durable(
@@ -14958,6 +15378,8 @@ async fn run_m15_live_subagent_fixture_turn(
                         summary: None,
                         artifact_count: None,
                         runtime_policy_stamp: None,
+                        // C1 step 4: stamp the originating turn.
+                        turn_id: Some(turn_id.clone()),
                     }),
                 );
                 return M9FixtureOutcome::Interrupted;
@@ -15055,6 +15477,8 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // C1 step 4: stamp the originating turn.
+            turn_id: Some(turn_id.clone()),
         }),
     );
     append_appui_evidence_jsonl(
@@ -15237,7 +15661,7 @@ async fn seed_m9_task_output_fixture(
         ))
         .map_err(|error| format!("failed to enable task persistence: {error}"))?;
     supervisor.set_on_change(move |task| {
-        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task) else {
+        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task, None) else {
             return;
         };
         let Ok(agent) = serde_json::from_value::<UiAgentRecord>(agent_value) else {
@@ -15688,6 +16112,21 @@ async fn run_standalone_turn(
     // Falls back to the server-wide data dir for local sessions / dev.
     let plugin_root_dir = session_runtime.profile.data_dir.clone();
 
+    // C1 fix: create the progress channel + drop counter UP HERE — BEFORE
+    // the `enable_persistence` block below — so the supervisor `on_change`
+    // callback (which captures clones of these) can be installed BEFORE
+    // `enable_persistence`. The orphan-task sweep that runs inside
+    // `enable_persistence` fires terminal `mark_failed("orphaned across
+    // restart")` transitions; if `on_change` is installed AFTER persistence
+    // (the pre-C1 ordering) the sweep's `notify_change` hits
+    // `on_change == None` and the `task_updated` event is silently dropped,
+    // leaving the TUI task count stuck at "N running". The channel itself is
+    // consumed (`progress_rx` drained) much later in the function — only its
+    // sender clone needs to exist this early.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
+    let progress_dropped = Arc::new(AtomicU64::new(0));
+
     // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
     // completions and explicit `send_file` calls persist as assistant
     // messages on the session and reach connected WS clients via the
@@ -15772,6 +16211,79 @@ async fn run_standalone_turn(
                     "spawn_only failure recovery continuation queued (WS path)"
                 );
             }
+        });
+        // C1 fix: wire the supervisor `on_change` callback BEFORE
+        // `enable_persistence` — same ordering rule as `set_on_failure_signal`
+        // above. The orphan-task sweep that runs inside `enable_persistence`
+        // fires terminal `mark_failed("orphaned across restart")`
+        // transitions; if `on_change` is installed AFTER persistence (the
+        // pre-C1 ordering, where it lived next to the per-turn agent build)
+        // the sweep's `notify_change` hits `on_change == None` and the
+        // `task_updated` WS event is silently dropped, leaving the TUI task
+        // count stuck at "N running" / chip "Orchestrating".
+        // M9-06: terminal updates (completed/failed/cancelled) must not be
+        // dropped under WebSocket backpressure either — see
+        // `forward_task_progress_to_channel`.
+        let progress_tx_for_tasks = progress_tx.clone();
+        let task_progress_dropped = progress_dropped.clone();
+        // mini5 soak fix: thread the turn's resolved runtime profile into the
+        // agent-record mirror so the terminal-agent continuation inherits the
+        // profile the turn actually runs under (mirrors `failure_profile_id`
+        // above) instead of the bare-session-key "_main" fallback that left
+        // the task-completion re-entry stranded (`runtime_unavailable` /
+        // profile-scoped drain skip).
+        let change_profile_id = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        // Stuck-chip fix: a spawn_only background task that goes TERMINAL after
+        // its spawning turn ended has no live `progress_tx_for_tasks` receiver
+        // (it was torn down at end-of-turn), so the terminal `task_progress` +
+        // `agent_updated` frames are silently dropped and the chip stays on
+        // "Orchestrating…". In addition to the best-effort per-turn channel
+        // forward below, mirror the TERMINAL agent record onto the DURABLE,
+        // connection-independent ledger (`send_notification_durable` →
+        // `ledger.append`) so a reconnecting / sibling client still observes the
+        // terminal flip via cursor replay + the live broadcast forwarder. See
+        // `forward_terminal_agent_update_durable` for the durability contract.
+        let change_ws = ws.clone();
+        let change_ledger = ledger.clone();
+        task_supervisor.set_on_change(move |task| {
+            forward_task_progress_to_channel(
+                &progress_tx_for_tasks,
+                &task_progress_dropped,
+                task,
+                Some(change_profile_id.as_str()),
+            );
+            forward_terminal_agent_update_durable(
+                &change_ws,
+                change_ledger.as_ref(),
+                task,
+                Some(change_profile_id.as_str()),
+            );
+        });
+        // Gap-1 unification: the single terminal sink. Routes BOTH success
+        // (ChildCompleted) AND failure (recovery) re-entry through ONE
+        // profile-resolving call into the master continuation queue. Runs
+        // alongside the legacy `set_on_change` (success) and
+        // `set_on_failure_signal` (failure) wiring during the strangler
+        // migration — shared dedupe keys collapse the double delivery to one
+        // continuation. The threaded `terminal_profile_id` (mirrors
+        // `change_profile_id` / `failure_profile_id`) kills the `_main`
+        // failure-stranding by construction.
+        let terminal_profile_id = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        task_supervisor.set_on_terminal(move |event| {
+            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+                event,
+                Some(terminal_profile_id.as_str()),
+                // WS / standalone-turn path: the queue IS the only failure
+                // channel here (the legacy `set_on_failure_signal` enqueues
+                // the SAME dedupe key), so route both outcomes.
+                crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+            );
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
             warn!(
@@ -16332,9 +16844,10 @@ async fn run_standalone_turn(
     // `done`/`error`.
     let tool_registry = Arc::new(tool_registry);
 
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
-    let progress_dropped = Arc::new(AtomicU64::new(0));
+    // C1 fix: `progress_tx` / `progress_dropped` are now created earlier
+    // (before the `enable_persistence` block) so the supervisor `on_change`
+    // callback can be wired before the orphan sweep runs. See the note at
+    // their construction site.
     // PR F (M8.10 thread-binding chain `#649 → #740`): bind the originating
     // `TurnId` into the reporter so every progress event the agent emits
     // carries `thread_id`. Closes the wire-side leak where standalone-turn
@@ -16375,15 +16888,10 @@ async fn run_standalone_turn(
     };
 
     let progress_tx_for_result = progress_tx.clone();
-    let progress_tx_for_tasks = progress_tx.clone();
-    let task_progress_dropped = progress_dropped.clone();
-    tool_registry.supervisor().set_on_change(move |task| {
-        // M9-06: terminal updates (completed/failed/cancelled) must not be
-        // dropped under WebSocket backpressure — dropping one would leave the
-        // UI stuck on `running` indefinitely. See
-        // `forward_task_progress_to_channel`.
-        forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
-    });
+    // C1 fix: the supervisor `on_change` callback is now wired earlier
+    // (before `enable_persistence`, inside the background-result block) so
+    // the orphan sweep's terminal `task_updated` events are not dropped. See
+    // the note at that wiring site.
     drop(progress_tx);
     // M11-E: the agent is built per-turn (so per-turn callbacks layer in
     // without mutating shared session state), but its LLM, memory,
@@ -18502,7 +19010,7 @@ async fn abort_connection_turns(
 /// when a payload contains non-serializable data; treat as lifecycle).
 fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
     match app_ui_codec::to_compact_json(value) {
-        Ok(text) => Some(WsMessage::text(text)),
+        Ok(text) => frame_text_within_cap(text).map(WsMessage::text),
         Err(error) => {
             metrics::counter!("ws.send.error.lifecycle").increment(1);
             tracing::warn!(
@@ -18513,6 +19021,572 @@ fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
             None
         }
     }
+}
+
+/// Turn a serialized frame into a deliverable (< [`MAX_TEXT_FRAME_BYTES`]) body,
+/// or `None` if it cannot be made deliverable.
+///
+/// HARD GUARANTEE / last-resort behavior: [`frame_for`] must NEVER cause an
+/// over-cap frame to be enqueued/sent as a successful send. [`preview_oversized_frame`]
+/// truncates the largest string field(s) and then the largest JSON array(s) to
+/// fit under [`TRUNCATED_FRAME_TARGET_BYTES`]; that recovers every realistic
+/// oversized frame (one dominant string OR a large history/list array). If after
+/// ALL of that the body is STILL over [`MAX_TEXT_FRAME_BYTES`] — only reachable
+/// for a pathological frame (one giant non-string scalar, or non-JSON / parse
+/// failure that cannot be rewritten) — we return `None`.
+///
+/// Returning `None` is safe at every one of the five [`frame_for`] call sites.
+/// NOTIFICATION callers tolerate `None` by SKIPPING the enqueue (never
+/// unwraps/panics) — dropping a notification is fine because no request id is
+/// awaiting a reply:
+///   * `send_raw_notification_ephemeral` -> `.ok_or(SendError::BackpressureDrop)?`
+///   * `send_notification_ephemeral` -> `.ok_or(SendError::BackpressureDrop)?`
+///   * `frame_from_ledger` -> returns the `Option<WsMessage>` directly (caller
+///     `send_ledger_event_durable` maps `None` -> `Err(SendError::BackpressureDrop)`).
+///
+/// REQUEST/RESPONSE callers MUST NOT silently drop on `None` — the request
+/// handlers ignore the returned `Result` (`let _ =`), so a dropped reply would
+/// strand the client on its request id forever. They instead synthesize a
+/// guaranteed-tiny same-id minimal JSON-RPC error reply (see
+/// [`send_minimal_rpc_error_fallback`]):
+///   * `send_rpc_result` -> on `None`, send a minimal same-id error response.
+///   * `send_rpc_error` -> on `None`, send a minimal same-id error (drop the
+///     oversized `error.data` / `error.message`).
+///
+/// So a still-over-cap NOTIFICATION frame is dropped (not sent) and logged,
+/// which is strictly better than emitting a contract-violating over-cap frame:
+/// the over-cap frame would be rejected by the transport's `frame_too_large`
+/// guard anyway, so it is undeliverable either way — `None` just makes that
+/// explicit and observable (no over-cap WsMessage is ever constructed). For an
+/// over-cap RESPONSE the client still receives a same-id error reply.
+fn frame_text_within_cap(text: String) -> Option<String> {
+    let previewed = preview_oversized_frame(text);
+    if previewed.len() > MAX_TEXT_FRAME_BYTES {
+        metrics::counter!("ws.send.error.over_cap_dropped").increment(1);
+        // Surface the routing method (best-effort parse) + byte size so this is
+        // observable. The over-cap body is dropped, never enqueued.
+        let method = serde_json::from_str::<Value>(&previewed)
+            .ok()
+            .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| "<unparseable>".to_owned());
+        tracing::warn!(
+            target: "octos::ui_protocol::ws",
+            method = %method,
+            bytes = previewed.len(),
+            cap = MAX_TEXT_FRAME_BYTES,
+            "outbound frame still over cap after truncation; dropping (not enqueued)"
+        );
+        return None;
+    }
+    Some(previewed)
+}
+
+/// Oversized outbound frame -> head+tail preview (truncate-in-place, NO disk).
+///
+/// Today an outbound UI-protocol frame whose serialized length exceeds
+/// [`MAX_TEXT_FRAME_BYTES`] (1 MiB) is undeliverable: the transport's
+/// `validate_text_frame_boundary` rejects it with `frame_too_large` and the
+/// content is lost ("Message too large"). This is the codex pattern for
+/// user-facing output: when a frame would exceed the cap, truncate its
+/// largest string field(s) IN PLACE to a head + tail preview (keep the
+/// beginning AND the end, drop the middle) with a byte-count marker, so the
+/// frame becomes deliverable (< 1 MiB) and the user still sees the start and
+/// the end of the dominant payload. NO disk write, NO FileRef, NO file store,
+/// NO session/owner scoping (that whole class of complexity is intentionally
+/// avoided — it is the entire point of this approach).
+///
+/// Because EVERY outbound frame flows through [`frame_for`], this covers
+/// every oversized frame type: `assistant_persisted` / `message_delta`
+/// notifications, `tool_end` errors, the legacy `MessagePersisted` /
+/// `ToolCompleted` notifications, and `session/hydrate` RPC results.
+///
+/// Algorithm (serialized frame `> MAX_TEXT_FRAME_BYTES`):
+///   1. Parse the frame JSON. Parse failure -> return the original unchanged;
+///      [`frame_text_within_cap`] then drops it (returns `None`) because it is
+///      still over cap and cannot be rewritten.
+///   2. Find the LARGEST string field (the dominant payload) by JSON-escaped
+///      length, descending recursively into objects/arrays.
+///   3. Rewrite that field to a head+tail preview: keep the first H and last T
+///      bytes (UTF-8 char-boundary safe — never split a codepoint), drop the
+///      middle, insert `\n…… [<N> bytes truncated] ……\n` between head and
+///      tail (N = dropped byte count of the ORIGINAL field). The field's
+///      budget is computed by ESCAPED length so the rewritten frame is
+///      provably under the target. Already-previewed field PATHS are tracked
+///      in a `HashSet` so each is rewritten at most once (idempotent, no
+///      content-sniffing).
+///   4. Re-serialize; if still over (multiple dominant fields), truncate the
+///      next-largest field too; repeat until under cap.
+///   5. STRUCTURAL case: if no string field can be further truncated but the
+///      frame is still over target, find the LARGEST JSON array and drop its
+///      middle/trailing elements (keeping valid JSON — elements are simply
+///      removed; the count is implicit, no heterogeneous marker is injected
+///      into an array of objects). Re-measure and keep iterating over strings
+///      and arrays until under target or nothing left to shrink. Most
+///      structurally-huge frames are big because of one large array
+///      (history/list), so this recovers the realistic structural case while
+///      keeping the frame valid JSON.
+///   6. LAST RESORT: if after ALL string + array truncation the body is STILL
+///      over target (pathological: one giant non-string scalar, or a parse
+///      failure that could not be rewritten), return the best-effort body
+///      unchanged. [`frame_text_within_cap`] then observes it is still over
+///      [`MAX_TEXT_FRAME_BYTES`] and returns `None` so `frame_for` drops it
+///      (never enqueues an over-cap frame). Never panics, never emits an
+///      over-cap frame as a successful send.
+fn preview_oversized_frame(text: String) -> String {
+    // Fast path: under the cap -> byte-identical pass-through.
+    if text.len() <= MAX_TEXT_FRAME_BYTES {
+        return text;
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+        // Not parseable as JSON -> cannot rewrite; return unchanged. The
+        // caller (`frame_text_within_cap`) drops it as still-over-cap.
+        return text;
+    };
+
+    // Paths already rewritten by string truncation; skipped on later passes so
+    // each string is previewed at most once (idempotence by PATH, not by
+    // sniffing field content — see `largest_truncatable_string`).
+    let mut previewed_string_paths: HashSet<Vec<PathSeg>> = HashSet::new();
+
+    // Iterate: truncate the largest string field, re-measure, repeat; when no
+    // string can be shrunk further, drop elements from the largest array. The
+    // bound is (number of string fields) + (total array elements), each pass
+    // either previews one string path or removes >= 1 array element, so this
+    // terminates.
+    loop {
+        let serialized_len = match serde_json::to_string(&value) {
+            Ok(s) => s.len(),
+            // Re-serialization cannot realistically fail for a Value parsed
+            // from text, but if it ever did, fall back to the original.
+            Err(_) => return text,
+        };
+        if serialized_len <= TRUNCATED_FRAME_TARGET_BYTES {
+            // Provably under target (< MAX_TEXT_FRAME_BYTES). Emit the rewrite
+            // if we changed anything; otherwise the original under-cap text.
+            return serde_json::to_string(&value).unwrap_or(text);
+        }
+
+        // Find the largest not-yet-previewed string field.
+        if let Some((path, field_escaped_len, field_raw_len)) =
+            largest_truncatable_string(&value, &previewed_string_paths)
+        {
+            // Frame overhead = serialized frame minus this field's escaped
+            // contribution (escaped bytes + the two surrounding quote bytes).
+            // The new frame length is `overhead + 2 + new_field_escaped_len`,
+            // so to hit the target the field's escaped budget is:
+            //     budget = TARGET - overhead - 2
+            let overhead = serialized_len.saturating_sub(field_escaped_len + 2);
+            let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
+                .saturating_sub(overhead)
+                .saturating_sub(2);
+
+            let preview = match build_head_tail_preview(
+                field_at_path(&value, &path)
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                field_raw_len,
+                field_escaped_budget,
+            ) {
+                Some(preview) => preview,
+                // Even an empty preview can't fit the budget (overhead alone
+                // exceeds target — only possible with many huge sibling
+                // fields, which the iteration handles, or a pathological
+                // envelope). Mark this field as a minimal stub and continue.
+                None => UNPREVIEWABLE_STUB.to_owned(),
+            };
+            if !set_field_at_path(&mut value, &path, Value::String(preview)) {
+                // Path vanished (should not happen) -> bail to original.
+                return text;
+            }
+            // Record the path so this string is not re-selected next pass.
+            previewed_string_paths.insert(path);
+            continue;
+        }
+
+        // No string field can be further truncated, but we are still over
+        // target -> STRUCTURAL case. Drop middle/trailing elements from the
+        // largest array (keeping valid JSON) and re-measure.
+        if shrink_largest_array(&mut value) {
+            continue;
+        }
+
+        // Nothing left to shrink (no truncatable string, no shrinkable array)
+        // -> pathological. Return the best-effort body unchanged; the caller
+        // observes it is still over cap and drops it (returns `None`).
+        return serde_json::to_string(&value).unwrap_or(text);
+    }
+}
+
+/// Drop elements from the LARGEST JSON array in `value` to shrink the frame,
+/// keeping the result valid JSON. Returns `true` if it removed at least one
+/// element (so the caller should re-measure and keep iterating); `false` if
+/// there is no array with > 1 element left to shrink.
+///
+/// We remove from the MIDDLE outward (keeping the head and tail of the list, so
+/// a history/timeline still shows its start and end), and we never inject a
+/// heterogeneous marker element — for an array of objects that would break a
+/// consumer's element schema. The dropped count is implicit (consumers see a
+/// shorter list); validity is preserved.
+fn shrink_largest_array(value: &mut Value) -> bool {
+    // Locate the path of the largest (by element count) array with > 1 element.
+    let mut best: Option<(Vec<PathSeg>, usize)> = None;
+    let mut path: Vec<PathSeg> = Vec::new();
+    walk_for_largest_array(value, &mut path, &mut best);
+    let Some((array_path, len)) = best else {
+        return false;
+    };
+    if len <= 1 {
+        return false;
+    }
+    let Some(Value::Array(items)) = field_at_path_mut(value, &array_path) else {
+        return false;
+    };
+    // Remove ~half of the elements from the middle, but always at least one and
+    // at least enough to make progress on a very large array. Keep the head and
+    // tail so the start/end of the list survive.
+    let drop_count = (items.len() / 2).max(1);
+    let keep = items.len() - drop_count;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let total = items.len();
+    // Retain the first `head` and last `tail` elements; drop the middle.
+    let mut idx = 0usize;
+    items.retain(|_| {
+        let keep_this = idx < head || idx >= total - tail;
+        idx += 1;
+        keep_this
+    });
+    true
+}
+
+/// Walk the tree recording the path of the array with the most elements.
+fn walk_for_largest_array(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    best: &mut Option<(Vec<PathSeg>, usize)>,
+) {
+    match value {
+        Value::Array(items) => {
+            let is_better = match best {
+                Some((_, best_len)) => items.len() > *best_len,
+                None => true,
+            };
+            if is_better {
+                *best = Some((path.clone(), items.len()));
+            }
+            for (idx, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(idx));
+                walk_for_largest_array(item, path, best);
+                path.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(PathSeg::Key(key.clone()));
+                walk_for_largest_array(item, path, best);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve a path to a `&mut Value` (for shrinking an array in place).
+fn field_at_path_mut<'a>(value: &'a mut Value, path: &[PathSeg]) -> Option<&'a mut Value> {
+    let mut current = value;
+    for seg in path {
+        current = match (current, seg) {
+            (Value::Object(map), PathSeg::Key(key)) => map.get_mut(key)?,
+            (Value::Array(items), PathSeg::Index(idx)) => items.get_mut(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Target serialized ceiling for a rewritten frame. Held well under the
+/// 1 MiB [`MAX_TEXT_FRAME_BYTES`] cap so the marker, JSON escaping, and the
+/// RPC envelope can never push the deliverable frame back over the hard cap.
+/// 900 KiB leaves > 124 KiB of headroom.
+const TRUNCATED_FRAME_TARGET_BYTES: usize = 900 * 1024;
+
+/// Reserved ESCAPED-length headroom for the truncation marker inserted
+/// between head and tail. The marker is `\n…… [<N> bytes truncated] ……\n`:
+/// two `\n` (escape to 2 bytes each = 4), four `…` (each a 3-byte UTF-8 char
+/// that escapes 1:1 = 12), the fixed ` [ bytes truncated] ` scaffold
+/// (~22 bytes, all 1:1), and N rendered as decimal digits (1:1). N is a byte
+/// count of a single frame field, so it is at most ~20 digits. 128 bytes is
+/// comfortably conservative; the head/tail budget reserves it so the marker
+/// can never push the field past its escaped budget.
+const MARKER_ESCAPED_RESERVE_BYTES: usize = 128;
+
+/// Minimum escaped budget below which a field cannot hold even a marker +
+/// a few bytes of head/tail; such a field is replaced with this stub so the
+/// iteration can continue reducing other fields. Rare (pathological envelope).
+const UNPREVIEWABLE_STUB: &str = "[oversized field omitted]";
+
+/// Per-byte JSON-escaped length of a UTF-8 byte buffer, EXCLUDING the
+/// surrounding quotes. Matches `serde_json`'s default string serialization
+/// (mirrors `octos_pipeline::fidelity`'s private byte-class helper; replicated
+/// here rather than taking a dependency edge on a private pipeline internal):
+/// * `"`, `\`, `\n`, `\r`, `\t`, backspace (0x08), form feed (0x0c) -> 2 bytes;
+/// * other C0 control bytes (no short escape) -> `\u00XX` = 6 bytes;
+/// * everything else (incl. multi-byte UTF-8 lead/continuation bytes) -> 1.
+///
+/// Operating on raw bytes lets us probe arbitrary offsets without panicking on
+/// a non-`&str`-boundary slice; the per-byte cost equals the char-wise escape
+/// because every UTF-8 continuation/lead byte is in the 1:1 arm.
+fn json_escaped_len_bytes(bytes: &[u8]) -> usize {
+    let mut len = 0usize;
+    for &b in bytes {
+        len += match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+    }
+    len
+}
+
+/// JSON-escaped length of a single `char`, using the same byte-class rules as
+/// [`json_escaped_len_bytes`]. Any non-ASCII scalar (>= U+0080) escapes 1:1 to
+/// its UTF-8 byte length; only the ASCII range can incur a short escape (2) or
+/// a `\u00XX` control escape (6).
+fn json_escaped_len_char(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Number of leading bytes of `s` whose JSON-escaped length fits within
+/// `escaped_budget`, stopped at a UTF-8 char boundary so a codepoint is never
+/// split. Walks chars from the front, accumulating each char's escaped cost.
+fn head_bytes_within_escaped_budget(s: &str, escaped_budget: usize) -> usize {
+    let mut used_escaped = 0usize;
+    let mut raw_end = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let cost = json_escaped_len_char(ch);
+        if used_escaped + cost > escaped_budget {
+            break;
+        }
+        used_escaped += cost;
+        raw_end = idx + ch.len_utf8();
+    }
+    raw_end
+}
+
+/// Number of trailing bytes of `s` whose JSON-escaped length fits within
+/// `escaped_budget`, stopped at a UTF-8 char boundary. Walks chars from the
+/// back. Returns the raw byte length of the kept suffix.
+fn tail_bytes_within_escaped_budget(s: &str, escaped_budget: usize) -> usize {
+    let mut used_escaped = 0usize;
+    let mut raw_start = s.len();
+    for (idx, ch) in s.char_indices().rev() {
+        let cost = json_escaped_len_char(ch);
+        if used_escaped + cost > escaped_budget {
+            break;
+        }
+        used_escaped += cost;
+        raw_start = idx;
+    }
+    s.len() - raw_start
+}
+
+/// Build a head+tail preview string for `field` whose JSON-ESCAPED length is
+/// `<= field_escaped_budget`. Keeps the first H and last T bytes (UTF-8 safe),
+/// dropping the middle, with `\n…… [<N> bytes truncated] ……\n` between them
+/// (N = `original_raw_len` minus kept head+tail bytes). Returns `None` when
+/// the budget cannot even hold the marker plus a non-empty head, so the caller
+/// can fall back. Head-leaning 50/50 split of the post-marker budget.
+fn build_head_tail_preview(
+    field: &str,
+    original_raw_len: usize,
+    field_escaped_budget: usize,
+) -> Option<String> {
+    // Reserve room for the marker; the rest is head + tail.
+    let content_escaped_budget = field_escaped_budget.checked_sub(MARKER_ESCAPED_RESERVE_BYTES)?;
+    if content_escaped_budget == 0 {
+        return None;
+    }
+    // Head-leaning split: head gets the ceil-half, tail the floor-half.
+    let head_escaped_budget = content_escaped_budget.div_ceil(2);
+    let tail_escaped_budget = content_escaped_budget - head_escaped_budget;
+
+    let head_len = head_bytes_within_escaped_budget(field, head_escaped_budget);
+    // The tail must not overlap the head.
+    let remaining = &field[head_len..];
+    let tail_len = tail_bytes_within_escaped_budget(remaining, tail_escaped_budget);
+
+    let head = &field[..head_len];
+    let tail = &field[field.len() - tail_len..];
+    let dropped = original_raw_len.saturating_sub(head_len + tail_len);
+
+    // If we kept the entire field (nothing dropped) the preview would not be a
+    // truncation at all; that only happens when the field already fit the
+    // budget, which the caller's serialized-size loop would not have reached.
+    Some(format!("{head}\n…… [{dropped} bytes truncated] ……\n{tail}"))
+}
+
+/// A path into a JSON value: object keys and array indices.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PathSeg {
+    Key(String),
+    Index(usize),
+}
+
+/// Find the largest truncatable string field by JSON-escaped length, returning
+/// its path, escaped length, and raw byte length. A string is "truncatable"
+/// only if shrinking it could meaningfully reduce the frame — we skip strings
+/// that are already shorter than a marker would be (no gain) and any field PATH
+/// already previewed on a prior pass (idempotence by path, recorded in
+/// `previewed_paths` by the caller — NOT by sniffing field content, so a
+/// legitimate >1 MiB payload that merely contains a phrase like "bytes
+/// truncated" is still truncated rather than wrongly skipped).
+fn largest_truncatable_string(
+    value: &Value,
+    previewed_paths: &HashSet<Vec<PathSeg>>,
+) -> Option<(Vec<PathSeg>, usize, usize)> {
+    let mut best: Option<(Vec<PathSeg>, usize, usize)> = None;
+    let mut path: Vec<PathSeg> = Vec::new();
+    walk_for_largest_string(value, &mut path, previewed_paths, &mut best);
+    best
+}
+
+fn walk_for_largest_string(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    previewed_paths: &HashSet<Vec<PathSeg>>,
+    best: &mut Option<(Vec<PathSeg>, usize, usize)>,
+) {
+    match value {
+        Value::String(s) => {
+            // Only consider strings large enough that truncating them yields a
+            // net reduction (must exceed the marker reserve + a small head/tail
+            // floor, else there is no point), and that we have not already
+            // previewed on a prior pass.
+            //
+            // Idempotence is primarily by PATH (`previewed_paths`). The
+            // secondary guard below — "this string ALREADY carries the exact
+            // full truncation-marker sentinel" — is belt-and-suspenders for the
+            // one case the path set can't track: array shrinking (later in the
+            // outer loop) removes elements, so surviving elements' index-paths
+            // SHIFT and the recorded paths go stale. A re-truncated already-
+            // previewed string can't reopen the over-cap bug (a head+tail
+            // preview is no longer the largest, so it isn't re-selected), but
+            // matching the precise sentinel keeps the "each semantic string
+            // truncated once" invariant clean regardless of index drift. We
+            // match the FULL marker scaffold (`\n…… [<N> bytes truncated] ……\n`),
+            // NOT the bare phrase `bytes truncated`, so a payload that merely
+            // contains that phrase is still truncated (see
+            // `payload_containing_marker_phrase_is_still_truncated`).
+            let escaped = json_escaped_len_bytes(s.as_bytes());
+            if escaped > MARKER_ESCAPED_RESERVE_BYTES + 32
+                && !previewed_paths.contains(path)
+                && !contains_full_truncation_marker(s)
+            {
+                let is_better = match best {
+                    Some((_, best_escaped, _)) => escaped > *best_escaped,
+                    None => true,
+                };
+                if is_better {
+                    *best = Some((path.clone(), escaped, s.len()));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(idx));
+                walk_for_largest_string(item, path, previewed_paths, best);
+                path.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(PathSeg::Key(key.clone()));
+                walk_for_largest_string(item, path, previewed_paths, best);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True iff `s` already contains the EXACT full head+tail truncation-marker
+/// scaffold produced by [`build_head_tail_preview`]:
+/// `\n…… [<N> bytes truncated] ……\n` (N a decimal byte count). Used as a
+/// secondary "already previewed" guard in [`walk_for_largest_string`] that is
+/// robust to array-shrink index drift (path-set staleness).
+///
+/// This matches the COMPLETE scaffold — the leading `\n…… [` prefix and the
+/// `] ……\n` suffix with a parseable decimal between — NOT the bare phrase
+/// `bytes truncated`. A user payload that merely contains the phrase (or even
+/// `[123 bytes truncated]` without the `……` glyph scaffold) is therefore NOT
+/// matched and is still eligible for truncation, preserving the
+/// `payload_containing_marker_phrase_is_still_truncated` guarantee.
+fn contains_full_truncation_marker(s: &str) -> bool {
+    // Anchor on the marker prefix, then verify the suffix scaffold follows with
+    // only decimal digits in between (the `<N> bytes truncated` slot).
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find("\n…… [") {
+        let after_prefix = search_from + rel + "\n…… [".len();
+        if let Some(suffix_rel) = s[after_prefix..].find(" bytes truncated] ……\n") {
+            let digits = &s[after_prefix..after_prefix + suffix_rel];
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+        // Advance past this prefix occurrence and keep scanning.
+        search_from = after_prefix;
+    }
+    false
+}
+
+/// Resolve a path to a `&Value` (for reading the current field text).
+fn field_at_path<'a>(value: &'a Value, path: &[PathSeg]) -> Option<&'a Value> {
+    let mut current = value;
+    for seg in path {
+        current = match (current, seg) {
+            (Value::Object(map), PathSeg::Key(key)) => map.get(key)?,
+            (Value::Array(items), PathSeg::Index(idx)) => items.get(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Replace the value at `path` with `new_value`. Returns false if the path no
+/// longer resolves.
+fn set_field_at_path(value: &mut Value, path: &[PathSeg], new_value: Value) -> bool {
+    let mut current = value;
+    for (i, seg) in path.iter().enumerate() {
+        let is_last = i + 1 == path.len();
+        match (current, seg) {
+            (Value::Object(map), PathSeg::Key(key)) => {
+                let Some(slot) = map.get_mut(key) else {
+                    return false;
+                };
+                if is_last {
+                    *slot = new_value;
+                    return true;
+                }
+                current = slot;
+            }
+            (Value::Array(items), PathSeg::Index(idx)) => {
+                let Some(slot) = items.get_mut(*idx) else {
+                    return false;
+                };
+                if is_last {
+                    *slot = new_value;
+                    return true;
+                }
+                current = slot;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn appui_evidence_dir() -> Option<PathBuf> {
@@ -18818,10 +19892,68 @@ async fn stop_failover_forwarder(handle: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// Short STATIC message used for the minimal same-id error reply emitted when a
+/// request RESPONSE (result or error) is too large to deliver even after the
+/// oversized-frame preview pass. It carries NO echoed payload — only enough for
+/// the client to fail the awaiting request id cleanly.
+const RPC_RESPONSE_TOO_LARGE_MESSAGE: &str = "response payload too large to deliver";
+
+/// Build a MINIMAL JSON-RPC error response frame for `id` carrying only a short
+/// static `message` (code `INTERNAL_ERROR` / -32603, NO `data`). It is tiny by
+/// construction, so it fits under [`MAX_TEXT_FRAME_BYTES`] for every realistic
+/// `id`. Returns `None` ONLY if even this minimal envelope is over cap — which
+/// can happen only when the request `id` itself is pathologically huge (inbound
+/// parsing caps the whole request frame at 1 MiB but NOT the id alone, so a
+/// near-cap string id is acceptable). Callers treat that residual `None` as the
+/// absolute last resort (latch the connection failed / close).
+///
+/// CRITICAL (codex DO-NOT-SHIP): this MUST serialize and size-check the envelope
+/// DIRECTLY — it must NOT route through [`frame_for`]/[`preview_oversized_frame`].
+/// The preview pass truncates the largest string field; for a near-cap `id` that
+/// is the `id` itself, which would emit a valid under-cap error under a MODIFIED
+/// id the client never awaited, leaving the original request stranded. The `id`
+/// must be preserved EXACTLY: either the exact-id envelope already fits and we
+/// send it, or it does not and we return `None` (caller fail-closes) — never a
+/// wrong-id reply.
+fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<WsMessage> {
+    let error = RpcError::new(
+        octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR,
+        message,
+    );
+    match app_ui_codec::to_compact_json(&RpcErrorResponse::new(id, error)) {
+        Ok(text) if text.len() <= MAX_TEXT_FRAME_BYTES => Some(WsMessage::text(text)),
+        // Only reachable when the request `id` itself is pathologically huge.
+        // Do NOT truncate to fit — that would corrupt the id. Return `None` so
+        // the caller fail-closes rather than sending a wrong-id reply.
+        Ok(_) => None,
+        Err(error) => {
+            metrics::counter!("ws.send.error.lifecycle").increment(1);
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                error = %error,
+                "failed to serialize minimal rpc error frame"
+            );
+            None
+        }
+    }
+}
+
+/// Send a JSON-RPC RESPONSE that, when over-cap and un-truncatable, falls back to
+/// a minimal same-id error instead of stranding the client request.
+///
+/// DO-NOT-SHIP fix: `frame_for` returns `None` when the primary frame is still
+/// over [`MAX_TEXT_FRAME_BYTES`] after the oversized-frame preview pass
+/// (pathological / structural). For a request RESPONSE the request handlers
+/// IGNORE the returned `Result` (the call sites `let _ =` it), so a silent
+/// `None` would leave the client waiting forever on its request id with NO reply
+/// and NO connection close. Instead we synthesize a guaranteed-tiny same-id
+/// JSON-RPC error reply (no echoed large payload) and send THAT, so the client
+/// always gets a reply to its id. The over-cap `result` is NOT echoed.
 fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
-    let frame = frame_for(&RpcResponse::success(id, result))
-        .ok_or_else(|| SendError::LifecycleFailure("rpc result serialization".into()))?;
-    ws.send_lifecycle(frame)
+    match frame_for(&RpcResponse::success(id.clone(), result)) {
+        Some(frame) => ws.send_lifecycle(frame),
+        None => send_minimal_rpc_error_fallback(ws, Some(id)),
+    }
 }
 
 fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Result<(), SendError> {
@@ -18831,10 +19963,58 @@ fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Res
     send_rpc_result(ws, id, value)
 }
 
+/// Send a JSON-RPC ERROR response, falling back to a minimal same-id error when
+/// the (possibly large) error payload is itself over-cap and un-deliverable.
+///
+/// DO-NOT-SHIP fix: same rationale as [`send_rpc_result`]. If `error.data` /
+/// `error.message` is so large that `frame_for` returns `None`, we drop the
+/// oversized data and emit a minimal same-id error with a short static message,
+/// so the client still gets a reply to its id rather than waiting forever.
 fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
-    let frame = frame_for(&RpcErrorResponse::new(id, error))
-        .ok_or_else(|| SendError::LifecycleFailure("rpc error serialization".into()))?;
-    ws.send_lifecycle(frame)
+    match frame_for(&RpcErrorResponse::new(id.clone(), error)) {
+        Some(frame) => ws.send_lifecycle(frame),
+        None => send_minimal_rpc_error_fallback(ws, id),
+    }
+}
+
+/// Emit the minimal same-id error reply for an over-cap RPC RESPONSE. Distinct
+/// counter + warn (vs. the notification-drop `over_cap_dropped` path) so the
+/// minimized-RPC path is observable. Absolute last resort: if even the minimal
+/// same-id error frame is over cap (only reachable when the request `id` is
+/// pathologically huge — practically unreachable), latch the connection failed
+/// and surface `LifecycleFailure` so the read loop tears down (rather than
+/// looping or panicking).
+fn send_minimal_rpc_error_fallback(ws: &WsConnection, id: Option<String>) -> Result<(), SendError> {
+    metrics::counter!("ws.send.rpc.over_cap_minimized").increment(1);
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        has_id = id.is_some(),
+        "rpc response over cap after preview; replacing with minimal same-id error reply"
+    );
+    match minimal_rpc_error_frame(id, RPC_RESPONSE_TOO_LARGE_MESSAGE) {
+        Some(frame) => ws.send_lifecycle(frame),
+        None => {
+            // Unreachable in practice: the only way a minimal error envelope
+            // (jsonrpc + short static message + id) exceeds the cap is a
+            // pathologically huge request `id`. Latch the connection failed and
+            // close it — do NOT loop or panic.
+            metrics::counter!("ws.send.rpc.minimal_error_over_cap").increment(1);
+            tracing::error!(
+                target: "octos::ui_protocol::ws",
+                "minimal rpc error frame itself over cap (huge request id?); closing connection"
+            );
+            // Enqueue the close BEFORE latching failed: `send_lifecycle` is
+            // rejected (FatalClosed) once `mark_failed` sets the latch, which
+            // would silently drop the 1011 close frame. Close first so the
+            // client actually receives the code, THEN latch failed to tear down
+            // the read loop.
+            let _ = close_ws_with_code(ws, 1011, "rpc_response_undeliverable");
+            ws.mark_failed();
+            Err(SendError::LifecycleFailure(
+                "minimal rpc error frame over cap".into(),
+            ))
+        }
+    }
 }
 
 /// Push a WebSocket close frame with an explicit status code and reason. The
@@ -19139,6 +20319,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // the surrounding LedgeredUiProtocolEvent.
             | UiNotification::ContextCompactionCompleted(_)
             | UiNotification::ContextNormalizationReported(_)
+            // Whole-job orchestration status is a stateless lifecycle push
+            // (no durable cursor of its own).
+            | UiNotification::SessionOrchestration(_)
             // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
             // `seq` allocated by `ThreadSeqAllocator`, not the per-session
             // `UiCursor` the legacy ledger replay uses. The durable
@@ -29460,7 +30643,7 @@ ignore = []
             octos_agent::TaskStatus::Completed,
             octos_agent::TaskRuntimeState::Completed,
         );
-        forward_task_progress_to_channel(&tx, &dropped, &task);
+        forward_task_progress_to_channel(&tx, &dropped, &task, None);
 
         // The synchronous try_send must have failed (channel was full),
         // bumping the drop counter that feeds the replay_lossy machinery.
@@ -29508,7 +30691,7 @@ ignore = []
             octos_agent::TaskStatus::Running,
             octos_agent::TaskRuntimeState::ExecutingTool,
         );
-        forward_task_progress_to_channel(&tx, &dropped, &task);
+        forward_task_progress_to_channel(&tx, &dropped, &task, None);
 
         // Drop counter must increment for both the task-progress frame and
         // the paired agent mirror frame.
@@ -29545,12 +30728,470 @@ ignore = []
             octos_agent::TaskStatus::Failed,
             octos_agent::TaskRuntimeState::Failed,
         );
-        forward_task_progress_to_channel(&tx, &dropped, &task);
+        forward_task_progress_to_channel(&tx, &dropped, &task, None);
 
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         let event = rx.try_recv().expect("event must be available immediately");
         let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
         assert_eq!(parsed["state"], "failed");
+    }
+
+    /// Regression: a spawn_only background task that goes terminal AFTER its
+    /// spawning turn ended has no live per-turn `progress_tx` to deliver the
+    /// flip on (the receiver was torn down at end-of-turn). The per-turn
+    /// channel path drops it ("terminal task update dropped: progress receiver
+    /// gone") and the client's chip stays stuck on "Orchestrating…".
+    ///
+    /// The fix routes the TERMINAL agent-record mirror through the durable,
+    /// connection-independent ledger so a reconnecting / sibling client still
+    /// observes the terminal `agent/updated`. This pins that the ledger append
+    /// happens EVEN WHEN the per-turn progress receiver is already gone (the
+    /// `local:test` task's `progress_tx` has been dropped before the terminal
+    /// snapshot arrives).
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_agent_update_reaches_ledger_when_progress_channel_gone() {
+        // Simulate end-of-turn: the per-turn progress receiver is already gone.
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<String>(8);
+        drop(progress_rx);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(writer_tx);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey("local:test".into());
+
+        // A terminal (Failed) background task — the spawn_only child that
+        // outlived its turn and only NOW went terminal.
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000fc",
+            octos_agent::TaskStatus::Failed,
+            octos_agent::TaskRuntimeState::Failed,
+        );
+
+        // The per-turn path (best-effort, will silently drop since rx is gone)
+        // PLUS the new durable terminal path.
+        forward_task_progress_to_channel(&progress_tx, &dropped, &task, None);
+        forward_terminal_agent_update_durable(&ws, &ledger, &task, None);
+
+        // The durable ledger must carry the terminal agent/updated even though
+        // the per-turn progress receiver was gone. Replay from the start.
+        let events = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay must succeed");
+        let terminal_agent = events.iter().find_map(|event| match &event.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(agent_event))
+                if agent_event.agent.status == "failed" =>
+            {
+                Some(agent_event.clone())
+            }
+            _ => None,
+        });
+        let terminal_agent = terminal_agent.expect(
+            "durable ledger must carry the terminal agent/updated even when the per-turn progress receiver is gone",
+        );
+        assert_eq!(
+            terminal_agent.agent.task_id.as_deref(),
+            Some("01900000-0000-7000-8000-0000000000fc"),
+            "the durable agent record must carry the task_id so the TUI can reconcile its chip",
+        );
+    }
+
+    /// The durable terminal mirror must NOT fire for non-terminal snapshots —
+    /// those are coalesce-friendly and already flow on the live per-turn
+    /// channel; appending every running update to the durable ledger would
+    /// bloat replay history with redundant in-flight states.
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_terminal_mirror_skips_non_terminal_snapshots() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(writer_tx);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let session_id = SessionKey("local:test".into());
+
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000bb",
+            octos_agent::TaskStatus::Running,
+            octos_agent::TaskRuntimeState::ExecutingTool,
+        );
+        forward_terminal_agent_update_durable(&ws, &ledger, &task, None);
+
+        let events = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay must succeed");
+        assert!(
+            !events.iter().any(|event| matches!(
+                &event.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(_))
+            )),
+            "non-terminal snapshots must not append an agent/updated to the durable ledger",
+        );
+    }
+
+    /// Re-entry parity regression (mini5 soak `12fcb8c0` + `e1f611f4`):
+    /// a SUCCESSFUL spawn_only background completion (e.g.
+    /// `run_pipeline pipeline=deep_research`) must AUTONOMOUSLY trigger the
+    /// master's re-entry without a user command. The production wiring is
+    /// the per-turn supervisor's `set_on_change` callback
+    /// (`run_standalone_turn`) → `forward_task_progress_to_channel(...,
+    /// Some(runtime_profile))` → `upsert_background_task_agent` → terminal
+    /// transition → `enqueue_agent_terminal_continuations` (`ChildCompleted`),
+    /// which the connection-independent `spawn_global_master_continuation_drain`
+    /// + AppUI tick drain via `due_loop_targets` / `drain_ready_continuations`.
+    ///
+    /// The prior coverage (`background_task_mirror_uses_agent_orchestrator_and_queues_continuations`)
+    /// calls `upsert_background_task_agent` DIRECTLY; this pins the same
+    /// behavior through the actual `set_on_change` forwarding helper, for a
+    /// `run_pipeline` spawn_only success, AND asserts the continuation is
+    /// enqueued under the THREADED runtime profile (not the `_main`
+    /// fallback that stranded re-entry before the mini5 fix) so a profile
+    /// regression here can't silently disable autonomous success re-entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentry() {
+        // Unique session + profile so the session-scoped assertions stay
+        // local under the process-wide orchestrator static (matches the
+        // isolation discipline of the spawn_only_failure WS test).
+        let session_id = SessionKey("web:reentry#spawn-only-success".to_owned());
+        let runtime_profile = "test-spawn-only-success-reentry";
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // Production-shaped run_pipeline spawn_only task: tracked under the
+        // turn's session_key, no child_session_key, terminal Completed with
+        // a delivered synthesis artifact.
+        let now = chrono::Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-00000000re01".into(),
+            tool_name: "run_pipeline".into(),
+            // Empty tool_call_id: ID-less providers (deepseek/kimi) stream
+            // none. Autonomous re-entry must not depend on a non-empty one.
+            tool_call_id: String::new(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec!["/Users/cloud/tmp/deep_research/synthesis.md".into()],
+            error: None,
+            session_key: Some(session_id.to_string()),
+            tool_input: Some(serde_json::json!({"pipeline": "deep_research"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        // The production `set_on_change` callback, threading the resolved
+        // runtime profile exactly as `run_standalone_turn` does.
+        forward_task_progress_to_channel(&tx, &dropped, &task, Some(runtime_profile));
+
+        // The terminal completion must have enqueued auto-drainable
+        // continuation(s) under the THREADED runtime profile. A
+        // single-agent terminal group enqueues BOTH `ChildCompleted` and
+        // the group's `ScatterJoinComplete` (all siblings terminal) — the
+        // important invariant is that at least one autonomous re-entry is
+        // queued and the `ChildCompleted` is present.
+        let pending = default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&session_id, runtime_profile);
+        assert!(
+            pending >= 1,
+            "successful spawn_only completion must enqueue an autonomous re-entry continuation under the runtime profile, got {pending}",
+        );
+
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            runtime_profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "spawn_only success re-entry must drain a ChildCompleted master continuation autonomously (no user command); got {:?}",
+            drained
+                .iter()
+                .map(|item| item.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        // Nothing may be stranded under the `_main` fallback profile (the
+        // pre-mini5 bug that left the completion notice never firing).
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "no continuation may be stranded under the '_main' fallback profile",
+        );
+
+        // The re-entry prompt must be system-internal so the LLM treats it
+        // as runtime guidance, not a user turn.
+        let child_completed = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .expect("ChildCompleted continuation present");
+        let prompt = master_continuation_prompt(child_completed);
+        assert!(
+            prompt.contains("[system-internal]"),
+            "autonomous re-entry prompt must be framed system-internal; got: {prompt}",
+        );
+    }
+
+    // ====================================================================
+    // Gap-1 unification: parity contract over the SINGLE terminal sink
+    // (`route_terminal_event_to_continuation_queue`). The same consumer fn
+    // is wired via `set_on_terminal` in every runtime mode (WS, gateway,
+    // headless drain), so driving it directly proves the cross-mode parity:
+    // exactly one continuation, correct reason, enqueued under the resolved
+    // runtime profile (ZERO under `_main`), idempotent under repeated
+    // terminal marks, recovery prompt body unchanged for failure-with-ack.
+    // ====================================================================
+
+    /// Build a production-shaped spawn_only `BackgroundTask` for the matrix.
+    fn unified_terminal_test_task(
+        id: &str,
+        session: &SessionKey,
+        tool_call_id: &str,
+        status: octos_agent::TaskStatus,
+        error: Option<&str>,
+    ) -> octos_agent::BackgroundTask {
+        let now = chrono::Utc::now();
+        let runtime_state = match status {
+            octos_agent::TaskStatus::Completed => octos_agent::TaskRuntimeState::Completed,
+            octos_agent::TaskStatus::Failed => octos_agent::TaskRuntimeState::Failed,
+            octos_agent::TaskStatus::Cancelled => octos_agent::TaskRuntimeState::Cancelled,
+            _ => octos_agent::TaskRuntimeState::ExecutingTool,
+        };
+        octos_agent::BackgroundTask {
+            id: id.into(),
+            tool_name: "mofa_slides".into(),
+            tool_call_id: tool_call_id.into(),
+            parent_session_key: Some(session.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status,
+            runtime_state,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec![],
+            error: error.map(str::to_owned),
+            session_key: Some(session.to_string()),
+            tool_input: Some(serde_json::json!({"topic": "rust"})),
+            originating_client_message_id: Some("cmid-unified".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        }
+    }
+
+    /// failure-WITH-ack across the unified sink: exactly one recovery
+    /// continuation under the resolved profile (ZERO under `_main`), the
+    /// recovery prompt body unchanged, idempotent under repeated marks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() {
+        let session_id = SessionKey("web:tester#unified-fail-ack".to_owned());
+        let profile_id = "test-unified-fail-ack";
+
+        let task = unified_terminal_test_task(
+            "01900000-0000-7000-8000-0000000fa001",
+            &session_id,
+            "call-unified-ack",
+            octos_agent::TaskStatus::Failed,
+            Some("plugin exited 137 (sigkill). available: a, b, c"),
+        );
+        let event = octos_agent::TerminalEvent {
+            task: task.clone(),
+            synth_ack_emitted: true,
+            outcome: octos_agent::TerminalOutcome::Failed(octos_agent::SpawnOnlyFailureSignal {
+                task_id: task.id.clone(),
+                tool_name: task.tool_name.clone(),
+                tool_input: task.tool_input.clone().unwrap(),
+                error_message: task.error.clone().unwrap(),
+                suggested_alternatives: vec!["a".into(), "b".into(), "c".into()],
+                parent_session_key: task.parent_session_key.clone(),
+                originating_client_message_id: task.originating_client_message_id.clone(),
+            }),
+        };
+
+        // Drive the unified sink twice — idempotent collapse via dedupe key.
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        );
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        );
+
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, profile_id),
+            1,
+            "failure-with-ack must enqueue exactly one recovery continuation (idempotent)",
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "no recovery continuation may be stranded under '_main'",
+        );
+
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            profile_id,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "exactly one continuation drains");
+        assert!(matches!(
+            drained[0].reason,
+            MasterContinuationReason::External(ref kind)
+                if kind == crate::api::agent_orchestrator::SPAWN_ONLY_FAILURE_EXTERNAL_KIND
+        ));
+        let prompt = master_continuation_prompt(&drained[0]);
+        assert!(
+            prompt.contains("[system-internal]")
+                && prompt.contains("mofa_slides")
+                && prompt.contains("plugin exited 137"),
+            "recovery prompt body must be unchanged (system-internal + tool + error); got: {prompt}",
+        );
+    }
+
+    /// failure-WITHOUT-ack: the unified sink suppresses the recovery turn at
+    /// PROMPT SELECTION (matching the documented sibling-error / pre-flight
+    /// skip cases) — ZERO continuations anywhere.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_terminal_sink_failure_without_ack_suppresses_recovery() {
+        let session_id = SessionKey("web:tester#unified-fail-noack".to_owned());
+        let profile_id = "test-unified-fail-noack";
+
+        let task = unified_terminal_test_task(
+            "01900000-0000-7000-8000-0000000fa002",
+            &session_id,
+            "call-unified-noack",
+            octos_agent::TaskStatus::Failed,
+            Some("sibling tool already errored"),
+        );
+        let event = octos_agent::TerminalEvent {
+            task: task.clone(),
+            synth_ack_emitted: false,
+            outcome: octos_agent::TerminalOutcome::Failed(octos_agent::SpawnOnlyFailureSignal {
+                task_id: task.id.clone(),
+                tool_name: task.tool_name.clone(),
+                tool_input: task.tool_input.clone().unwrap(),
+                error_message: task.error.clone().unwrap(),
+                suggested_alternatives: vec![],
+                parent_session_key: task.parent_session_key.clone(),
+                originating_client_message_id: None,
+            }),
+        };
+
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        );
+
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, profile_id),
+            0,
+            "failure-without-ack must be suppressed at prompt selection (no recovery turn)",
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "and nothing stranded under '_main' either",
+        );
+    }
+
+    /// success across the unified sink: exactly one autonomous
+    /// `ChildCompleted` re-entry under the resolved profile (ZERO under
+    /// `_main`), idempotent under repeated terminal marks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_terminal_sink_success_queues_child_completed_under_profile() {
+        let session_id = SessionKey("web:tester#unified-success".to_owned());
+        let profile_id = "test-unified-success";
+
+        let task = unified_terminal_test_task(
+            "01900000-0000-7000-8000-0000000fa003",
+            &session_id,
+            String::new().as_str(),
+            octos_agent::TaskStatus::Completed,
+            None,
+        );
+        let event = octos_agent::TerminalEvent {
+            task,
+            synth_ack_emitted: false,
+            outcome: octos_agent::TerminalOutcome::Completed,
+        };
+
+        // Idempotent: two terminal marks collapse to one continuation.
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        );
+        crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile_id),
+            crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        );
+
+        let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            profile_id,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let child_completed = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .count();
+        assert_eq!(
+            child_completed,
+            1,
+            "success must enqueue exactly one ChildCompleted re-entry (idempotent); got drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0,
+            "no ChildCompleted may be stranded under '_main'",
+        );
     }
 
     // ====================================================================
@@ -34763,5 +36404,607 @@ ignore = []
             c.remove(&key_a2);
             c.remove(&key_b1);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Oversized outbound frame -> head+tail preview (truncate-in-place, no
+    // disk). codex-style head-tail truncation + a `[N bytes truncated]`
+    // marker so the offending frame becomes deliverable (< 1 MiB) and the
+    // user sees the beginning AND the end of the dominant payload.
+    // ---------------------------------------------------------------------
+
+    /// Build an over-cap text frame whose `params.text` field holds `body`.
+    /// The envelope around it (method/jsonrpc/keys) is small and fixed, so a
+    /// `body` slightly over `MAX_TEXT_FRAME_BYTES` forces the whole frame
+    /// over the cap.
+    fn oversized_text_frame(body: &str) -> String {
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": {
+                "session_id": "local:test",
+                "turn_id": "turn-1",
+                "text": body,
+            }
+        });
+        app_ui_codec::to_compact_json(&value).expect("serialize over-cap frame")
+    }
+
+    #[test]
+    fn under_cap_frame_passes_through_byte_identical() {
+        let frame = oversized_text_frame("a small body");
+        assert!(
+            frame.len() <= MAX_TEXT_FRAME_BYTES,
+            "fixture must be under the cap for this test"
+        );
+        let out = preview_oversized_frame(frame.clone());
+        assert_eq!(out, frame, "under-cap frame must be byte-identical");
+    }
+
+    #[test]
+    fn oversized_frame_with_one_dominant_string_becomes_head_tail_preview_under_cap() {
+        // A dominant string field well over the 1 MiB cap. Distinct head/tail
+        // sentinels let us assert both ends survived.
+        let head_sentinel = "HEAD_START_SENTINEL_0123456789";
+        let tail_sentinel = "TAIL_END_SENTINEL_9876543210";
+        let middle = "M".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        let body = format!("{head_sentinel}{middle}{tail_sentinel}");
+        let frame = oversized_text_frame(&body);
+        assert!(
+            frame.len() > MAX_TEXT_FRAME_BYTES,
+            "fixture must exceed the cap (RED: rejected as frame_too_large at base)"
+        );
+
+        let out = preview_oversized_frame(frame);
+
+        // Deliverable: strictly under the cap and single-line (no raw CR/LF).
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "rewritten frame must be < MAX_TEXT_FRAME_BYTES, got {}",
+            out.len()
+        );
+        assert!(
+            !out.contains('\n') && !out.contains('\r'),
+            "rewritten frame must remain a single-line JSON object"
+        );
+
+        // Round-trips as valid JSON; the offending field holds head, tail, and
+        // the truncation marker.
+        let parsed: Value = serde_json::from_str(&out).expect("rewritten frame is valid JSON");
+        let text = parsed["params"]["text"]
+            .as_str()
+            .expect("text field present");
+        assert!(
+            text.starts_with(head_sentinel),
+            "head of the original payload must be preserved"
+        );
+        assert!(
+            text.ends_with(tail_sentinel),
+            "tail of the original payload must be preserved"
+        );
+        assert!(
+            text.contains("bytes truncated"),
+            "a byte-count truncation marker must be inserted, got: {}",
+            &text[..text.len().min(120)]
+        );
+    }
+
+    #[test]
+    fn truncation_marker_reports_dropped_byte_count_accurately() {
+        let head_sentinel = "H".repeat(64);
+        let tail_sentinel = "T".repeat(64);
+        let original_field_len = {
+            let middle = "x".repeat(MAX_TEXT_FRAME_BYTES + 8192);
+            head_sentinel.len() + middle.len() + tail_sentinel.len()
+        };
+        let middle = "x".repeat(MAX_TEXT_FRAME_BYTES + 8192);
+        let body = format!("{head_sentinel}{middle}{tail_sentinel}");
+        assert_eq!(body.len(), original_field_len);
+        let frame = oversized_text_frame(&body);
+
+        let out = preview_oversized_frame(frame);
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        let text = parsed["params"]["text"].as_str().expect("text field");
+
+        // Parse N out of the marker `…… [<N> bytes truncated] ……`.
+        let marker_n = text
+            .split("[")
+            .nth(1)
+            .and_then(|s| s.split(" bytes truncated]").next())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .expect("marker carries a byte count");
+
+        // head bytes + tail bytes kept; N = original - kept.
+        let head_kept = text
+            .find("……")
+            .or_else(|| text.find('['))
+            .map(|i| text[..i].trim_end().len())
+            .unwrap_or(0);
+        let tail_kept = {
+            let after = text.rsplit("……").next().unwrap_or("");
+            after.trim_start().len()
+        };
+        // The dropped count plus what we kept must equal the original field
+        // length (head_kept + tail_kept + N == original).
+        assert_eq!(
+            head_kept + tail_kept + marker_n,
+            original_field_len,
+            "marker N must equal dropped bytes: head_kept={head_kept} tail_kept={tail_kept} N={marker_n}"
+        );
+    }
+
+    #[test]
+    fn oversized_frame_with_multibyte_and_control_bytes_is_boundary_safe_and_under_cap() {
+        // A body mixing a 3-byte CJK glyph (escapes 1:1) and a C0 control byte
+        // 0x01 (escapes to , 6 bytes). The 6x-escaping body is the worst
+        // case for the serialized bound; the head/tail cut must never split a
+        // codepoint and the final frame must still be < 1 MiB.
+        let unit = "情\u{0001}"; // 3 bytes + 1 byte = 4 bytes raw, escapes to 3 + 6 = 9
+        let body = unit.repeat((MAX_TEXT_FRAME_BYTES / unit.len()) + 4096);
+        assert!(body.len() > MAX_TEXT_FRAME_BYTES);
+        let frame = oversized_text_frame(&body);
+
+        let out = preview_oversized_frame(frame);
+
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "control-byte-heavy frame must be < cap after escaping, got {}",
+            out.len()
+        );
+        // No panic, valid JSON, no split codepoint (from_str would reject an
+        // invalid \uXXXX surrogate or a sliced multi-byte char anyway).
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON after escaping");
+        let text = parsed["params"]["text"].as_str().expect("text field");
+        // The head region (before the marker) and tail region (after it) must
+        // each contain ONLY full codepoints of the original alphabet — proving
+        // the cut never split a multi-byte glyph nor a control byte. The marker
+        // itself legitimately carries ASCII scaffold + `…` + `\n`.
+        let (head, rest) = text.split_once("\n…… [").expect("head + marker scaffold");
+        let (_, tail) = rest.split_once("] ……\n").expect("marker scaffold + tail");
+        for region in [head, tail] {
+            for ch in region.chars() {
+                assert!(
+                    ch == '情' || ch == '\u{0001}',
+                    "non-alphabet char leaked into a preserved region (split codepoint?): {ch:?}"
+                );
+            }
+        }
+        // head + tail of the original survive.
+        assert!(text.starts_with('情'));
+    }
+
+    #[test]
+    fn oversized_frame_with_multiple_large_fields_iterates_until_under_cap() {
+        // Two fields each ~0.7 MiB: neither alone exceeds the cap, but the
+        // envelope sum does. Truncating only the larger one is insufficient;
+        // the helper must iterate to the second field too.
+        let big_a = "A".repeat(700 * 1024);
+        let big_b = "B".repeat(700 * 1024);
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": {
+                "session_id": "local:test",
+                "turn_id": "turn-1",
+                "field_a": big_a,
+                "field_b": big_b,
+            }
+        });
+        let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+        assert!(frame.len() > MAX_TEXT_FRAME_BYTES);
+
+        let out = preview_oversized_frame(frame);
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "multi-field frame must iterate to < cap, got {}",
+            out.len()
+        );
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(parsed["params"]["field_a"].is_string());
+        assert!(parsed["params"]["field_b"].is_string());
+    }
+
+    #[test]
+    fn structurally_huge_string_array_is_truncated_to_valid_under_cap_json() {
+        // Thousands of tiny string items: no single dominant string, but the
+        // array as a whole is over cap. The structural pass must drop array
+        // elements to bring the frame under cap while keeping it valid JSON.
+        let items: Vec<String> = (0..200_000).map(|i| format!("i{i}")).collect();
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": { "items": items }
+        });
+        let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+        assert!(frame.len() > MAX_TEXT_FRAME_BYTES);
+
+        let out = preview_oversized_frame(frame);
+        assert!(
+            out.len() <= MAX_TEXT_FRAME_BYTES,
+            "structurally-huge array frame must be truncated to <= cap, got {}",
+            out.len()
+        );
+        let parsed: Value =
+            serde_json::from_str(&out).expect("array-truncated frame is valid JSON");
+        // The array survives (shorter) and routing keys are intact.
+        assert!(parsed["params"]["items"].is_array());
+        assert_eq!(parsed["method"], "notifications/message_delta");
+    }
+
+    // ------------------------------------------------------------------
+    // DO-NOT-SHIP regression guards: `frame_for` / `preview_oversized_frame`
+    // must NEVER cause an over-cap frame (> MAX_TEXT_FRAME_BYTES) to be
+    // enqueued/sent as a successful send. `frame_text_within_cap` is the
+    // boundary helper used by `frame_for`; it returns `None` (drop, not
+    // enqueue) when a frame is still over cap after all truncation.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn structurally_huge_frame_does_not_emit_over_cap() {
+        // Over-cap due to a big array of small scalars (no dominant string).
+        // After preview the produced frame must be <= cap (array truncated),
+        // OR frame_text_within_cap returns None — either way NO over-cap
+        // WsMessage is producible.
+        let items: Vec<i64> = (0..400_000).collect();
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": { "session_id": "local:test", "items": items }
+        });
+        let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+        assert!(
+            frame.len() > MAX_TEXT_FRAME_BYTES,
+            "fixture must exceed the cap (RED: original returned over-cap)"
+        );
+
+        match frame_text_within_cap(frame) {
+            Some(body) => assert!(
+                body.len() <= MAX_TEXT_FRAME_BYTES,
+                "if a body is produced it must be under cap, got {}",
+                body.len()
+            ),
+            None => {} // dropped, not enqueued — also acceptable
+        }
+    }
+
+    #[test]
+    fn non_json_or_pathological_over_cap_is_not_sent_over_cap() {
+        // (a) Non-JSON pathological input: cannot be parsed/rewritten -> must
+        //     NOT be emitted over cap (frame_text_within_cap returns None).
+        let non_json = "x".repeat(MAX_TEXT_FRAME_BYTES + 16);
+        assert!(
+            frame_text_within_cap(non_json).is_none(),
+            "non-JSON over-cap frame must be dropped (None), never enqueued over cap"
+        );
+
+        // (b) Whole-chain invariant via frame_for on a structurally-huge value
+        //     (over-cap array of small non-string scalars): frame_for must NEVER
+        //     produce an over-cap WsMessage — it either truncates the array under
+        //     cap or drops the frame (None).
+        let items: Vec<bool> = (0..600_000).map(|i| i % 2 == 0).collect();
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message_delta",
+            "params": { "items": items }
+        });
+        if let Some(WsMessage::Text(body)) = frame_for(&value) {
+            assert!(
+                body.len() <= MAX_TEXT_FRAME_BYTES,
+                "frame_for must never produce an over-cap WsMessage, got {}",
+                body.len()
+            );
+        }
+        // None is also acceptable (dropped).
+    }
+
+    #[test]
+    fn full_truncation_marker_matcher_is_precise_not_phrase_sniffing() {
+        // Positive: the exact scaffold produced by build_head_tail_preview.
+        let real = build_head_tail_preview(&"x".repeat(4096), 4096, 1024)
+            .expect("preview builds for a generous budget");
+        assert!(
+            contains_full_truncation_marker(&real),
+            "the genuine head+tail marker scaffold must match"
+        );
+        // Hand-built genuine marker (embedded in surrounding content).
+        assert!(contains_full_truncation_marker(
+            "head\n…… [12345 bytes truncated] ……\ntail"
+        ));
+
+        // Negative: the BARE phrase must NOT match (this is the over-broad-sniff
+        // nit the matcher must avoid reintroducing).
+        assert!(!contains_full_truncation_marker(
+            "see notes: 999 bytes truncated"
+        ));
+        // Negative: brackets + phrase but WITHOUT the `……` glyph scaffold.
+        assert!(!contains_full_truncation_marker("[123 bytes truncated]"));
+        // Negative: scaffold present but the count slot is non-numeric.
+        assert!(!contains_full_truncation_marker(
+            "head\n…… [lots bytes truncated] ……\ntail"
+        ));
+        // Negative: scaffold prefix but no closing suffix.
+        assert!(!contains_full_truncation_marker(
+            "head\n…… [12345 and then nothing"
+        ));
+    }
+
+    #[test]
+    fn payload_containing_marker_phrase_is_still_truncated() {
+        // A single >1 MiB string field whose content INCLUDES the literal
+        // phrase `bytes truncated` must STILL be head+tail truncated, not
+        // skipped into the fallback by the old content-sniffing guard.
+        let head_sentinel = "HEAD_SENTINEL_bytes truncated_marker_in_content";
+        let tail_sentinel = "TAIL_SENTINEL_END";
+        let middle = "M".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        let body = format!("{head_sentinel}{middle}{tail_sentinel}");
+        let frame = oversized_text_frame(&body);
+        assert!(frame.len() > MAX_TEXT_FRAME_BYTES);
+
+        let out = preview_oversized_frame(frame);
+        assert!(
+            out.len() < MAX_TEXT_FRAME_BYTES,
+            "payload containing the marker phrase must still be truncated under cap, got {}",
+            out.len()
+        );
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        let text = parsed["params"]["text"].as_str().expect("text field");
+        assert!(
+            text.starts_with(head_sentinel),
+            "head (which contains the phrase) must be preserved"
+        );
+        assert!(text.ends_with(tail_sentinel), "tail must be preserved");
+        assert!(
+            text.contains("bytes truncated"),
+            "truncation marker present"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // DO-NOT-SHIP: a pathological over-cap RPC RESPONSE must NEVER strand
+    // the client request. When the primary frame for a request reply
+    // cannot fit (frame_for -> None), the helpers must emit a MINIMAL
+    // same-id JSON-RPC error reply (guaranteed tiny / under cap) so the
+    // client always gets a reply to its id — never a silent drop.
+    // ------------------------------------------------------------------
+
+    /// Drain every queued text frame from the test writer receiver.
+    fn drain_text_frames(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let WsMessage::Text(text) = message {
+                frames.push(text.to_string());
+            }
+        }
+        frames
+    }
+
+    /// An over-cap JSON `Value` the preview pass CANNOT shrink: a single object
+    /// with enough tiny distinct keys to blow past the cap. The preview only
+    /// truncates string VALUES and shrinks ARRAYS — it never drops or shortens
+    /// object keys — so this is the canonical `frame_for -> None` (pathological /
+    /// structural) trigger. Keys are short non-string-value pairs (`{"k<i>":0}`).
+    fn untruncatable_over_cap_value() -> Value {
+        let mut map = serde_json::Map::new();
+        // ~250k keys of ~8 bytes each comfortably exceeds 1 MiB and is immune to
+        // both the string-truncation and array-shrink passes.
+        for i in 0..250_000u32 {
+            map.insert(format!("k{i}"), Value::from(0u8));
+        }
+        Value::Object(map)
+    }
+
+    #[tokio::test]
+    async fn over_cap_rpc_result_sends_minimal_same_id_error_not_dropped() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        let id = "req-42".to_string();
+        // A result that, once wrapped in the response envelope, exceeds the cap
+        // and whose content the preview pass cannot reduce below cap (an object
+        // with hundreds of thousands of tiny keys — neither string truncation
+        // nor array shrinking applies). Pre-fix: frame_for -> None -> the result
+        // is silently dropped and the caller's `let _ =` discards the
+        // LifecycleFailure, stranding request id `req-42` forever (RED).
+        let result = untruncatable_over_cap_value();
+        // Guard: the un-rewritable result really is over cap as a response.
+        assert!(
+            frame_for(&RpcResponse::success(id.clone(), result.clone())).is_none(),
+            "fixture must drive frame_for -> None (still over cap after preview)"
+        );
+
+        let sent = send_rpc_result(&ws, id.clone(), result);
+        assert!(
+            sent.is_ok(),
+            "send_rpc_result must succeed by delivering a minimal same-id error, not fail/drop"
+        );
+
+        let frames = drain_text_frames(&mut rx);
+        assert_eq!(frames.len(), 1, "exactly one reply frame must be sent");
+        let frame = &frames[0];
+        assert!(
+            frame.len() <= MAX_TEXT_FRAME_BYTES,
+            "the minimal reply must be under cap, got {}",
+            frame.len()
+        );
+        let parsed: Value = serde_json::from_str(frame).expect("reply is valid JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], id, "reply must carry the SAME request id");
+        assert!(
+            parsed["error"].is_object(),
+            "reply must be a JSON-RPC error response (not a result), got: {parsed}"
+        );
+        assert_eq!(
+            parsed["error"]["code"],
+            octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+        );
+        assert!(
+            parsed["error"]["message"].is_string(),
+            "minimal error carries a short static message"
+        );
+        assert!(
+            parsed["result"].is_null(),
+            "the oversized result must NOT be echoed"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_cap_rpc_error_sends_minimal_same_id_error() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let id = "err-7".to_string();
+        // An error whose `data` payload is itself over cap and un-deliverable
+        // (preview-immune object of tiny keys).
+        let error =
+            RpcError::internal_error("original detail").with_data(untruncatable_over_cap_value());
+        assert!(
+            frame_for(&RpcErrorResponse::new(Some(id.clone()), error.clone())).is_none(),
+            "fixture must drive frame_for -> None (error payload still over cap)"
+        );
+
+        let sent = send_rpc_error(&ws, Some(id.clone()), error);
+        assert!(
+            sent.is_ok(),
+            "send_rpc_error must succeed by delivering a minimal same-id error, not fail/drop"
+        );
+
+        let frames = drain_text_frames(&mut rx);
+        assert_eq!(frames.len(), 1, "exactly one reply frame must be sent");
+        let frame = &frames[0];
+        assert!(
+            frame.len() <= MAX_TEXT_FRAME_BYTES,
+            "the minimal error reply must be under cap, got {}",
+            frame.len()
+        );
+        let parsed: Value = serde_json::from_str(frame).expect("reply is valid JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], id, "reply must carry the SAME request id");
+        assert!(parsed["error"].is_object(), "reply is a JSON-RPC error");
+        assert!(
+            parsed["error"]["message"].is_string(),
+            "minimal error carries a short static message"
+        );
+        assert!(
+            parsed["error"]["data"].is_null(),
+            "the oversized error.data must be dropped from the minimal reply"
+        );
+    }
+
+    #[test]
+    fn minimal_rpc_error_frame_is_tiny_valid_and_same_id() {
+        let id = "the-request-id".to_string();
+        let frame =
+            minimal_rpc_error_frame(Some(id.clone()), "response payload too large to deliver")
+                .expect("minimal error frame must be constructible for a small id");
+        let WsMessage::Text(text) = frame else {
+            panic!("minimal error frame must be a text frame");
+        };
+        let text = text.to_string();
+        assert!(
+            text.len() <= MAX_TEXT_FRAME_BYTES,
+            "minimal error frame must be under cap, got {}",
+            text.len()
+        );
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], id);
+        assert_eq!(
+            parsed["error"]["code"],
+            octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+        );
+        assert_eq!(
+            parsed["error"]["message"],
+            "response payload too large to deliver"
+        );
+        assert!(
+            parsed["error"]["data"].is_null(),
+            "minimal error carries no data"
+        );
+    }
+
+    #[test]
+    fn minimal_rpc_error_frame_with_huge_id_returns_none_not_truncated_id() {
+        // codex DO-NOT-SHIP: a near/over-cap request id must NOT be truncated to
+        // make the minimal error fit. Truncating the id would emit a valid
+        // under-cap error under a MODIFIED id the client never awaited, leaving
+        // the original request stranded. Either the exact-id envelope fits, or
+        // we return None so the caller fail-closes — never a wrong-id reply.
+        let huge_id = "x".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        assert!(
+            minimal_rpc_error_frame(Some(huge_id), "response payload too large to deliver")
+                .is_none(),
+            "a pathologically huge id must yield None (fail-close), never a truncated-id frame"
+        );
+    }
+
+    #[test]
+    fn minimal_rpc_error_frame_preserves_exact_id() {
+        // The minimal error must carry the request id BYTE-EXACT (never the
+        // preview-truncated id). Use a sizeable-but-fitting id so the only way it
+        // could be altered is the (now-removed) field-truncation path.
+        let id = format!("req-{}", "a".repeat(4096));
+        let frame =
+            minimal_rpc_error_frame(Some(id.clone()), "response payload too large to deliver")
+                .expect("a sizeable-but-fitting id must still produce a frame");
+        let WsMessage::Text(text) = frame else {
+            panic!("minimal error frame must be a text frame");
+        };
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            parsed["id"].as_str(),
+            Some(id.as_str()),
+            "id must be preserved exactly, not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_minimal_rpc_error_fallback_huge_id_closes_1011_and_fails_no_loop() {
+        // codex nit: directly exercise the absolute-last-resort path in
+        // `send_minimal_rpc_error_fallback`. When the request `id` is so large
+        // that even the MINIMAL error envelope exceeds `MAX_TEXT_FRAME_BYTES`,
+        // `minimal_rpc_error_frame` returns `None`. The fallback must NOT loop or
+        // panic: it must (1) enqueue a `Close(1011)` frame BEFORE latching (so the
+        // client receives the code), (2) latch the connection failed, and (3)
+        // surface `LifecycleFailure` so the read loop tears down.
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        // An id whose exact-id minimal envelope provably exceeds the 1 MiB cap.
+        let huge_id = "x".repeat(MAX_TEXT_FRAME_BYTES + 4096);
+        // Guard: the minimal envelope for this id really is over cap (None).
+        assert!(
+            minimal_rpc_error_frame(Some(huge_id.clone()), RPC_RESPONSE_TOO_LARGE_MESSAGE)
+                .is_none(),
+            "fixture must drive minimal_rpc_error_frame -> None (huge id over cap)"
+        );
+
+        let result = send_minimal_rpc_error_fallback(&ws, Some(huge_id));
+        assert!(
+            matches!(result, Err(SendError::LifecycleFailure(_))),
+            "huge-id fallback must surface LifecycleFailure (read loop tears down), got {result:?}"
+        );
+
+        // The connection must be latched failed so the read loop stops dispatch.
+        assert!(
+            ws.is_failed(),
+            "connection must latch failed after the un-deliverable minimal error"
+        );
+
+        // A Close(1011) frame must have been enqueued BEFORE the fail latch, so
+        // the client actually receives the close code. No text reply is sent.
+        let mut close_codes = Vec::new();
+        let mut text_frames = 0usize;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                WsMessage::Close(Some(frame)) => close_codes.push(frame.code),
+                WsMessage::Text(_) => text_frames += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            close_codes,
+            vec![1011u16],
+            "exactly one Close(1011) frame must be queued before the fail latch"
+        );
+        assert_eq!(
+            text_frames, 0,
+            "no text reply must be sent on the un-deliverable last-resort path"
+        );
     }
 }

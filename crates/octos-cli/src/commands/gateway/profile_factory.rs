@@ -5,7 +5,7 @@
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -478,6 +478,18 @@ pub(crate) fn build_synthesis_config(
 pub(super) struct ProfileActorFactoryBuilder {
     pub(super) profile_store: Arc<crate::profiles::ProfileStore>,
     pub(super) project_dir: PathBuf,
+    /// Gap 4.1 BLOCKER 1: the effective octos root the gateway bootstraps
+    /// bundled pipelines into (`--octos-home` > `data_dir`). The child-profile
+    /// `run_pipeline` tool is built `with_octos_home(effective_octos_home)` so
+    /// its discovery searches the EXACT dir bootstrap wrote into
+    /// (bootstrap-dir == search-dir). Previously the child factory reused
+    /// `project_dir` (= `cwd/.octos` on the standalone path where
+    /// `--octos-home` is absent), so discovery searched a dir bootstrap never
+    /// wrote — letting the embedded fallback beat an installed global
+    /// pipeline. In production `--octos-home` is always passed so
+    /// `effective_octos_home == project_dir`, but the standalone/default path
+    /// must also be correct.
+    pub(super) effective_octos_home: PathBuf,
     pub(super) tool_config: Arc<octos_agent::ToolConfigStore>,
     pub(super) memory: Arc<EpisodeStore>,
     pub(super) memory_store: Arc<MemoryStore>,
@@ -514,6 +526,16 @@ pub(super) struct ProfileActorFactoryBuilder {
 }
 
 impl ProfileActorFactoryBuilder {
+    /// Gap 4.1 BLOCKER 1: the octos root a child-profile `run_pipeline` tool
+    /// must search. It is the effective octos home (`--octos-home` > data_dir)
+    /// the gateway bootstrapped the bundled pipelines into — NOT `project_dir`
+    /// (= `cwd/.octos` on the standalone path), which bootstrap never wrote.
+    /// Keeping these identical preserves bootstrap-dir == search-dir, so an
+    /// installed global pipeline always wins over the bundled fallback.
+    pub(super) fn child_pipeline_octos_home(&self) -> &Path {
+        &self.effective_octos_home
+    }
+
     pub(super) async fn build(&self, profile_id: &str) -> Result<ActorFactory> {
         let profile = self
             .profile_store
@@ -859,7 +881,13 @@ impl ProfileActorFactoryBuilder {
                 policy: provider_policy.clone(),
                 plugin_dirs: plugin_dirs.clone(),
                 router: provider_router.clone(),
-                octos_home: self.project_dir.clone(),
+                // Gap 4.1 BLOCKER 1: the child-profile pipeline root MUST be
+                // the same `effective_octos_home` the gateway bootstrapped the
+                // bundled pipelines into — NOT `project_dir` (= `cwd/.octos`
+                // on the standalone path). bootstrap-dir == search-dir, so an
+                // installed global pipeline wins over the bundled fallback on
+                // every path, including standalone `octos gateway`.
+                octos_home: self.child_pipeline_octos_home().to_path_buf(),
                 // Section B (codex review follow-up): propagate the
                 // profile's strict-signing policy.
                 plugin_require_signed: profile_config.plugins.require_signed,
@@ -1074,5 +1102,105 @@ mod tests {
         if let Some(v) = prev_key {
             unsafe { std::env::set_var("OPENAI_API_KEY", v) };
         }
+    }
+
+    /// Gap 4.1 BLOCKER 1 (standalone gateway child-profile uses the wrong
+    /// pipeline root) — on the standalone path `project_dir` (= `cwd/.octos`)
+    /// and `effective_octos_home` (= `data_dir`) DIFFER, and the gateway
+    /// bootstraps bundled pipelines into `effective_octos_home`. The
+    /// child-profile `run_pipeline` factory MUST be rooted at
+    /// `effective_octos_home` (bootstrap-dir == search-dir), NOT `project_dir`.
+    ///
+    /// RED on 344d0df1: the builder had no `effective_octos_home` field and the
+    /// child factory was rooted at `self.project_dir` — so this test could not
+    /// even be written (the field/helper did not exist), and a global pipeline
+    /// installed under `effective_octos_home` was invisible to child sessions.
+    #[tokio::test]
+    async fn child_pipeline_root_is_effective_octos_home_not_project_dir() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Standalone layout: these two dirs are DISTINCT.
+        let project_dir = tmp.path().join("cwd").join(".octos");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let effective_octos_home = tmp.path().join("data");
+        std::fs::create_dir_all(&effective_octos_home).unwrap();
+        assert_ne!(
+            project_dir, effective_octos_home,
+            "test precondition: standalone roots must differ"
+        );
+
+        let store = Arc::new(crate::profiles::ProfileStore::open(tmp.path()).unwrap());
+        let tool_config = Arc::new(
+            octos_agent::ToolConfigStore::open(&effective_octos_home)
+                .await
+                .unwrap(),
+        );
+        let memory = Arc::new(EpisodeStore::open(&effective_octos_home).await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(&effective_octos_home).await.unwrap());
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&effective_octos_home).unwrap(),
+        ));
+        let active_sessions = Arc::new(RwLock::new(
+            ActiveSessionStore::open(&effective_octos_home).unwrap(),
+        ));
+        let pending_messages: crate::session_actor::PendingMessages =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel(4);
+        let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);
+        let cron_service = Arc::new(CronService::new(
+            effective_octos_home.join("cron"),
+            cron_in_tx,
+        ));
+
+        let builder = ProfileActorFactoryBuilder {
+            profile_store: store,
+            project_dir: project_dir.clone(),
+            effective_octos_home: effective_octos_home.clone(),
+            tool_config,
+            memory,
+            memory_store,
+            agent_config: AgentConfig::default(),
+            session_mgr,
+            out_tx,
+            spawn_inbound_tx,
+            cron_service,
+            tool_registry_factory: Arc::new(SnapshotToolRegistryFactory::new(ToolRegistry::new())),
+            pipeline_factory: None,
+            max_history: Arc::new(AtomicUsize::new(50)),
+            session_timeout_secs: octos_agent::DEFAULT_SESSION_TIMEOUT_SECS,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cwd: project_dir.clone(),
+            provider_policy: None,
+            worker_prompt: None,
+            provider_router: None,
+            active_sessions,
+            pending_messages,
+            queue_mode: crate::config::QueueMode::Followup,
+            plugin_prompt_fragments: vec![],
+            no_retry: false,
+            sandbox_config: octos_agent::SandboxConfig::default(),
+            task_query_store: crate::session_actor::SessionTaskQueryStore::default(),
+            subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
+                effective_octos_home.join("subagent-out"),
+            )),
+            host_plugins: Default::default(),
+        };
+
+        // The child-profile pipeline root MUST be effective_octos_home — the
+        // dir the gateway bootstraps bundled pipelines into — so bootstrap-dir
+        // == search-dir and an installed global pipeline wins over the bundle.
+        assert_eq!(
+            builder.child_pipeline_octos_home(),
+            effective_octos_home.as_path(),
+            "child-profile pipeline root must be effective_octos_home (bootstrap dir)"
+        );
+        assert_ne!(
+            builder.child_pipeline_octos_home(),
+            project_dir.as_path(),
+            "child-profile pipeline root must NOT be project_dir (cwd/.octos), which \
+             bootstrap never wrote — the 344d0df1 defect"
+        );
     }
 }

@@ -5,7 +5,29 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// codex DO-NOT-SHIP TOCTOU window: the WS spawn_only-failure recovery fires
+/// the legacy `on_failure` enqueue and the unified `on_terminal` enqueue
+/// SEQUENTIALLY inside one `mark_failed` (microseconds apart). Both carry the
+/// identical `external/spawn_only_failure/<session>/<task>` dedupe key. If the
+/// AppUI continuation tick drains the first enqueue before the second runs,
+/// the key has already left `pending_by_key` so the existing dedupe misses and
+/// one terminal transition would produce TWO recovery turns.
+///
+/// The recently-claimed guard records the moment an `External` continuation is
+/// claimed (drained/popped) and rejects a re-enqueue of the SAME key inside
+/// this window as a duplicate. The window is generous relative to the
+/// same-transition gap (sub-millisecond) yet bounded so a genuinely later
+/// external occurrence that reuses a key is NOT stranded.
+///
+/// Scoped to `External` reasons ONLY: those keys are externally-identity-keyed
+/// (spawn_only failure embeds the task's UUIDv7, never reused; manual-wakeup is
+/// a one-shot), so a same-key re-enqueue inside the window is always the same
+/// logical event. The recurring reasons (`LoopFire`/`GoalContinue`/
+/// `ChildCompleted`) deliberately re-enqueue the same key tick-after-tick and
+/// must stay reusable, so they are never guarded.
+pub(crate) const RECENT_CLAIM_GUARD_WINDOW: Duration = Duration::from_secs(30);
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -401,6 +423,22 @@ pub(crate) struct MasterContinuationScheduler {
     pending_by_key: HashMap<MasterContinuationDedupeKey, QueuedMasterContinuation>,
     next_id: u64,
     next_sequence: u64,
+    /// codex DO-NOT-SHIP TOCTOU guard: timestamp (the claimed item's
+    /// `enqueued_at`) at which an `External` continuation was last
+    /// claimed (drained/popped) out of `pending_by_key`. A re-enqueue of
+    /// the same key inside [`RECENT_CLAIM_GUARD_WINDOW`] is rejected as a
+    /// duplicate so a drain that races between the legacy `on_failure` and
+    /// unified `on_terminal` enqueues of one terminal transition cannot
+    /// double-deliver. Only `External` keys are recorded (see the constant
+    /// doc) so recurring loop/goal/child continuations stay reusable.
+    ///
+    /// INVARIANT for future `External` producers: this guard assumes an
+    /// `External` dedupe key identifies ONE occurrence (today: spawn_only
+    /// failure keyed by task UUIDv7, one-shot — no other production producer).
+    /// Any new `External` producer that can legitimately re-enqueue the same
+    /// key within the window MUST embed a unique occurrence id in the key, or
+    /// the second enqueue will be wrongly dropped.
+    recently_claimed_external: HashMap<MasterContinuationDedupeKey, SystemTime>,
 }
 
 impl Default for MasterContinuationScheduler {
@@ -416,6 +454,7 @@ impl MasterContinuationScheduler {
             pending_by_key: HashMap::new(),
             next_id: 1,
             next_sequence: 0,
+            recently_claimed_external: HashMap::new(),
         }
     }
 
@@ -444,6 +483,27 @@ impl MasterContinuationScheduler {
             return MasterContinuationEnqueueOutcome::Duplicate {
                 dedupe_key,
                 existing_id: existing.id,
+            };
+        }
+
+        // codex DO-NOT-SHIP TOCTOU guard: reject a same-transition re-enqueue
+        // of an External key that was claimed (drained/popped) moments ago.
+        // The legacy `on_failure` and unified `on_terminal` enqueues fire
+        // sequentially inside one `mark_failed`; a drain between them removes
+        // the key from `pending_by_key` so the check above misses. The
+        // recently-claimed window catches it. Pruning runs lazily here so the
+        // map stays bounded by the live churn rate. Scoped to External so
+        // recurring loop/goal/child keys stay reusable across ticks.
+        self.prune_recently_claimed(enqueued_at);
+        if matches!(request.reason, MasterContinuationReason::External(_))
+            && let Some(claimed_at) = self.recently_claimed_external.get(&dedupe_key)
+            && within_recent_claim_window(*claimed_at, enqueued_at)
+        {
+            return MasterContinuationEnqueueOutcome::Duplicate {
+                dedupe_key,
+                // No live pending item to point at; the guard collapses the
+                // re-enqueue onto the already-claimed continuation.
+                existing_id: MasterContinuationId::new(0),
             };
         }
 
@@ -509,6 +569,7 @@ impl MasterContinuationScheduler {
             let entry = self.heap.pop()?;
             if self.entry_matches_pending(&entry) {
                 if let Some(item) = self.pending_by_key.remove(&entry.dedupe_key) {
+                    self.record_external_claim(&item);
                     return Some(item);
                 }
             }
@@ -562,6 +623,7 @@ impl MasterContinuationScheduler {
                 });
             if matches_session {
                 if let Some(item) = self.pending_by_key.remove(&entry.dedupe_key) {
+                    self.record_external_claim(&item);
                     drained.push(item);
                 }
             } else {
@@ -621,6 +683,46 @@ impl MasterContinuationScheduler {
         self.pending_by_key
             .get(&entry.dedupe_key)
             .is_some_and(|item| item.sequence == entry.sequence && item.priority == entry.priority)
+    }
+
+    /// codex DO-NOT-SHIP TOCTOU guard: record that `item` was just claimed
+    /// (drained/popped) so a same-transition re-enqueue of its key is
+    /// rejected inside [`RECENT_CLAIM_GUARD_WINDOW`]. Only `External` claims
+    /// are recorded — recurring loop/goal/child keys re-enqueue legitimately
+    /// every tick and must stay reusable. The claim time is the item's
+    /// `enqueued_at` so the comparison is deterministic in tests (which thread
+    /// explicit timestamps) and matches wall-clock `now()` in production
+    /// (where both enqueue and drain use `SystemTime::now()`).
+    fn record_external_claim(&mut self, item: &QueuedMasterContinuation) {
+        if matches!(item.reason, MasterContinuationReason::External(_)) {
+            self.recently_claimed_external
+                .insert(item.dedupe_key.clone(), item.enqueued_at);
+        }
+    }
+
+    /// Drop recently-claimed entries older than the guard window relative to
+    /// `now`. Keeps the map bounded to live churn. `now` is the enqueue
+    /// timestamp of the call that triggered the prune.
+    fn prune_recently_claimed(&mut self, now: SystemTime) {
+        self.recently_claimed_external
+            .retain(|_, claimed_at| within_recent_claim_window(*claimed_at, now));
+    }
+}
+
+/// True when `candidate` falls within [`RECENT_CLAIM_GUARD_WINDOW`] after
+/// `claimed_at`. Wall-clock based (`SystemTime`), so NOT fully clock-skew
+/// proof: a backward delta (`candidate` at/before `claimed_at`) is treated as
+/// in-window — the safe direction, collapsing a re-enqueue that races the
+/// claim — but a forward wall-clock jump larger than the window would let the
+/// guard MISS and fall back to the (rare) double-delivery. Acceptable today
+/// because production `External` keys are one-shot (see field doc); revisit
+/// with a monotonic/injected clock if that ever changes.
+fn within_recent_claim_window(claimed_at: SystemTime, candidate: SystemTime) -> bool {
+    match candidate.duration_since(claimed_at) {
+        Ok(elapsed) => elapsed <= RECENT_CLAIM_GUARD_WINDOW,
+        // `candidate` is at or before `claimed_at`: same instant or reordered
+        // sampling within one transition — always in-window.
+        Err(_) => true,
     }
 }
 
@@ -882,6 +984,100 @@ mod tests {
             .expect("requeued continuation should still be pending");
         assert_eq!(second.id, requeued.id);
         assert!(scheduler.is_empty());
+    }
+
+    /// codex DO-NOT-SHIP TOCTOU: the WS spawn_only-failure recovery fires
+    /// the legacy `on_failure` enqueue and the unified `on_terminal` enqueue
+    /// SEQUENTIALLY (not atomically) inside one `mark_failed`. Both use the
+    /// IDENTICAL `external/spawn_only_failure/<session>/<task>` dedupe key.
+    /// If the AppUI continuation tick DRAINS the first enqueue before the
+    /// second one runs, the pending-map dedupe misses (the key already left
+    /// `pending_by_key`) and ONE terminal transition produces TWO recovery
+    /// turns. The recently-claimed guard rejects the re-enqueue of a key that
+    /// was claimed moments ago within the same transition window.
+    #[test]
+    fn recent_claim_guard_collapses_drain_between_two_spawn_only_failure_enqueues() {
+        let mut scheduler = MasterContinuationScheduler::new();
+        let key = "external/spawn_only_failure/session-1/task-uuid-v7";
+        let make_request = |seconds: u64| {
+            MasterContinuationRequest::new(
+                "spawn-only-failure",
+                "session-1",
+                "profile-1",
+                MasterContinuationReason::External("spawn_only_failure".to_string()),
+                ts(seconds),
+            )
+            .with_dedupe_key(key)
+        };
+
+        // 1. Legacy `on_failure` enqueues key K.
+        let first = scheduler.enqueue_at(make_request(20), ts(20));
+        assert!(
+            matches!(first, MasterContinuationEnqueueOutcome::Queued(_)),
+            "first enqueue should queue"
+        );
+
+        // 2. The 2s AppUI continuation tick DRAINS K before `mark_failed`
+        //    reaches the unified `notify_terminal` — so K leaves
+        //    `pending_by_key`.
+        let drained = scheduler.drain_ready(MasterContinuationRuntimeState::idle(), usize::MAX);
+        assert_eq!(drained.len(), 1, "tick drains the legacy-enqueued recovery");
+        assert!(scheduler.is_empty());
+
+        // 3. Unified `on_terminal` enqueues K AGAIN — same transition,
+        //    microseconds later. The pending map no longer holds K, so the
+        //    EXISTING dedupe misses. The recently-claimed guard must reject
+        //    this re-enqueue so ONE transition yields ONE continuation.
+        let second = scheduler.enqueue_at(make_request(20), ts(20));
+        assert!(
+            second.is_duplicate(),
+            "re-enqueue of a just-drained spawn_only-failure key within the transition \
+             window must be suppressed; got {second:?}"
+        );
+
+        // No phantom second recovery turn is left pending.
+        let after = scheduler.drain_ready(MasterContinuationRuntimeState::idle(), usize::MAX);
+        assert!(
+            after.is_empty(),
+            "exactly one recovery turn must result from one terminal transition; \
+             a second drained: {after:?}"
+        );
+    }
+
+    /// The recently-claimed guard must be bounded to the same-transition
+    /// window so a legitimately-distinct LATER external continuation that
+    /// reuses a key (e.g. a second genuine failure of a relaunched task) is
+    /// NOT stranded once the window has elapsed.
+    #[test]
+    fn recent_claim_guard_does_not_strand_distinct_later_external_reuse() {
+        let mut scheduler = MasterContinuationScheduler::new();
+        let key = "external/spawn_only_failure/session-1/task-uuid-v7";
+        let make_request = |seconds: u64| {
+            MasterContinuationRequest::new(
+                "spawn-only-failure",
+                "session-1",
+                "profile-1",
+                MasterContinuationReason::External("spawn_only_failure".to_string()),
+                ts(seconds),
+            )
+            .with_dedupe_key(key)
+        };
+
+        let first = scheduler.enqueue_at(make_request(20), ts(20));
+        assert!(matches!(first, MasterContinuationEnqueueOutcome::Queued(_)));
+        let drained = scheduler.drain_ready(MasterContinuationRuntimeState::idle(), usize::MAX);
+        assert_eq!(drained.len(), 1);
+
+        // Re-enqueue well AFTER the guard window — a genuinely new occurrence.
+        let later = scheduler.enqueue_at(
+            make_request(20 + RECENT_CLAIM_GUARD_WINDOW.as_secs() + 5),
+            ts(20 + RECENT_CLAIM_GUARD_WINDOW.as_secs() + 5),
+        );
+        assert!(
+            matches!(later, MasterContinuationEnqueueOutcome::Queued(_)),
+            "an external re-enqueue outside the transition window must NOT be stranded; \
+             got {later:?}"
+        );
     }
 
     #[test]

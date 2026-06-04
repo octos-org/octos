@@ -398,6 +398,14 @@ impl ServeCommand {
         // per-profile loop free of redundant disk writes.
         octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
         octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+        // Gap 4.1: bundle generic pipelines (deep_research) into the
+        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
+        // always discovers them even when the `mofa-research` skill carrying
+        // `deep_research.dot` has drifted off a profile. Per-profile
+        // `RunPipelineTool`s register that dir as the LOWEST-precedence
+        // search path via `with_octos_home` (bootstrap-dir == search-dir).
+        // Installed pipelines of the same name always win (no clobber).
+        octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
 
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
@@ -926,6 +934,16 @@ impl ServeCommand {
                 tracing::info!("monitor started (watchdog + health checks + alerts)");
             }
         }
+
+        // mini5 soak gap #1: drain queued master continuations
+        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
+        // even when NO ws/stdio client is connected. The per-connection
+        // `appui_continuation_tick` only runs inside a live handler loop, so a
+        // sub-agent finishing while the TUI is disconnected (or a continuation
+        // re-loaded after a serve restart) would otherwise sit undrained until
+        // a client reconnects. Shares the process-global active-turns registry
+        // with the per-connection ticks, so there is no double-run.
+        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
 
         let app = build_router(state);
         let addr = format!("{}:{}", self.host, self.port);

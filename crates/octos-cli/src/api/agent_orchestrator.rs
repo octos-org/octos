@@ -394,10 +394,29 @@ pub(crate) struct NativeSpecialistRunResult {
 
 pub(crate) fn upsert_background_task_agent(
     task: &octos_agent::BackgroundTask,
+    runtime_profile_id: Option<&str>,
 ) -> Option<(SessionKey, Value)> {
     let session_id = background_task_session_id(task)?;
-    let profile_id = session_id
-        .profile_id()
+    // mini5 soak fix: AppUI/TUI sessions use BARE session keys ("q5",
+    // "test1") with no `profile:channel:chat` prefix, so
+    // `SessionKey::profile_id()` is `None` and the terminal-agent
+    // continuation used to fall back to `MAIN_PROFILE_ID` ("_main"). But
+    // the owning turn actually runs under a real profile (e.g. "coding"
+    // resolved from the connection / `session/open` `profile_id`), and
+    // only THAT profile has a registered `ProfileRuntime`. Enqueuing the
+    // `ChildCompleted` / `ScatterJoinComplete` continuation under "_main"
+    // breaks re-entry two ways: a profile-scoped connection skips it in
+    // `due_loop_targets` (profile mismatch) and an unscoped connection
+    // drains it into a `run_standalone_turn` that fails closed with
+    // `runtime_unavailable` (no runtime for "_main"). Either way the
+    // task-completion notice never fires. Prefer the runtime profile the
+    // caller threads in (mirrors `set_on_failure_signal`'s
+    // `active_profile_id.or(routed_profile_id)` resolution); fall back to
+    // the key-derived profile for channel sessions whose key DOES carry
+    // it.
+    let profile_id = runtime_profile_id
+        .filter(|profile| !profile.is_empty())
+        .or_else(|| session_id.profile_id())
         .unwrap_or(MAIN_PROFILE_ID)
         .to_owned();
     let agent_id = background_task_agent_id(task);
@@ -433,6 +452,135 @@ pub(crate) fn upsert_background_task_agent(
         }
     }
     Some((session_id, agent))
+}
+
+/// Gap-1 unification: how a runtime mode wants the unified terminal sink to
+/// route the FAILURE outcome.
+///
+/// Success always routes through the queue (`ChildCompleted`); the question
+/// is only whether the failure outcome also enqueues a recovery
+/// continuation HERE, or stays on the mode's legacy failure delivery during
+/// the strangler migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalFailureRouting {
+    /// Route the failure outcome through the queue
+    /// (`External("spawn_only_failure")`). Used by the WS / standalone-turn
+    /// path, whose only failure channel IS the queue (the legacy
+    /// `set_on_failure_signal` enqueues the SAME dedupe key, so the two
+    /// collapse to one continuation).
+    Queue,
+    /// Skip the failure outcome — the mode still drives failure recovery
+    /// through its OWN channel (the gateway `ActorMessage::RecoveryHint`
+    /// inbox, which carries the consecutive-recovery cap + per-task claim +
+    /// exhaustion banner the queue drain does not yet replicate). Routing
+    /// failure here too would DOUBLE-deliver across the two distinct
+    /// channels (no shared dedupe key between the inbox and the queue).
+    /// Retiring `RecoveryHint` (Gap-1 step 4) flips this to `Queue`.
+    LegacyChannel,
+}
+
+/// Gap-1 unification: the SINGLE sink that routes terminal background
+/// transitions through the master continuation queue. Wired via
+/// `TaskSupervisor::set_on_terminal` in every runtime mode (gateway, WS,
+/// headless drain).
+///
+/// - **Success** (`TerminalOutcome::Completed`) → mirror the agent record
+///   under the resolved runtime profile via [`upsert_background_task_agent`];
+///   its terminal transition enqueues a `ChildCompleted` (and, when all
+///   siblings are terminal, a `ScatterJoinComplete`) continuation. This is
+///   exactly the success path the legacy `on_change` callback already
+///   drives — the explicit `child/...` dedupe key (step 3) keeps the
+///   strangler double-delivery collapsed to one continuation.
+/// - **Failure** (`TerminalOutcome::Failed`) → when `failure_routing` is
+///   [`TerminalFailureRouting::Queue`], enqueue an
+///   `External("spawn_only_failure")` recovery continuation under the SAME
+///   profile-resolving rule (killing `_main` stranding for failures by
+///   construction). The synth-ack gate moves to PROMPT SELECTION here: a
+///   failure whose synth-ack was never emitted (sibling-error / pre-flight
+///   short-circuit) is SUPPRESSED — matching the documented skip cases —
+///   while the recovery body is rendered only when the LLM was previously
+///   told the work started. The failure dedupe key
+///   (`external/<kind>/<session>/<task_id>`) is shared with the legacy WS
+///   `enqueue_spawn_only_failure_continuation`, so double-delivery on the WS
+///   path collapses to one continuation. The gateway passes
+///   [`TerminalFailureRouting::LegacyChannel`] so its `RecoveryHint` inbox
+///   (which owns the runaway-recovery caps) remains the single failure
+///   channel until step 4 retires it.
+///
+/// `runtime_profile_id` is the turn's resolved profile (mirrors the
+/// `active_profile_id.or(routed_profile_id)` resolution the call sites use);
+/// `None` falls back to the session-key-derived profile inside
+/// `upsert_background_task_agent` / `background_task_session_id`.
+pub(crate) fn route_terminal_event_to_continuation_queue(
+    event: &octos_agent::TerminalEvent,
+    runtime_profile_id: Option<&str>,
+    failure_routing: TerminalFailureRouting,
+) {
+    match &event.outcome {
+        octos_agent::TerminalOutcome::Completed => {
+            // Mirror the terminal agent record; the upsert's terminal
+            // transition enqueues the autonomous ChildCompleted re-entry
+            // under the resolved profile.
+            let _ = upsert_background_task_agent(&event.task, runtime_profile_id);
+        }
+        octos_agent::TerminalOutcome::Failed(_)
+            if failure_routing == TerminalFailureRouting::LegacyChannel =>
+        {
+            // The mode drives failure recovery through its own channel
+            // (gateway RecoveryHint inbox). Routing it here too would
+            // double-deliver across two channels with no shared dedupe key.
+        }
+        octos_agent::TerminalOutcome::Failed(signal) => {
+            // Synth-ack-as-prompt-selection: only the ack-emitted failures
+            // get a recovery turn. The non-ack cases (the LLM already saw a
+            // sibling error or a `[VALIDATION FAILED]` synchronous result)
+            // are suppressed so we don't double-signal the model.
+            if !event.synth_ack_emitted {
+                tracing::debug!(
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    "spawn_only failure terminal event suppressed (synth-ack never emitted; prompt selection)"
+                );
+                return;
+            }
+            let Some(session_id) = background_task_session_id(&event.task) else {
+                tracing::debug!(
+                    task_id = %signal.task_id,
+                    "spawn_only failure terminal event has no resolvable session; skipping recovery enqueue"
+                );
+                return;
+            };
+            // Resolve the profile the SAME way the success side does (the
+            // threaded runtime profile, then the key-derived profile),
+            // never the `_main` fallback for a profile-bearing session.
+            let profile_id = runtime_profile_id
+                .filter(|profile| !profile.is_empty())
+                .or_else(|| session_id.profile_id())
+                .unwrap_or(MAIN_PROFILE_ID)
+                .to_owned();
+            let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+                &session_id,
+                &profile_id,
+                signal,
+            );
+            if outcome.is_duplicate() {
+                tracing::debug!(
+                    session = %session_id,
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                );
+            } else {
+                tracing::info!(
+                    session = %session_id,
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    profile = %profile_id,
+                    "spawn_only failure recovery continuation queued (unified terminal sink)"
+                );
+            }
+        }
+    }
 }
 
 impl InProcessAgentOrchestrator {
@@ -1132,6 +1280,24 @@ impl InProcessAgentOrchestrator {
         profile_filter: Option<&str>,
         max_items: usize,
     ) -> Vec<(SessionKey, String)> {
+        self.due_loop_targets_with_filter(profile_filter, max_items, None)
+    }
+
+    /// Like [`Self::due_loop_targets`] but only counts a target toward
+    /// `max_items` when `runnable(session)` is true. The connection-independent
+    /// global drain passes a "workspace is known in-memory" predicate so it can
+    /// use a small `max_items` (bounded result + bounded allocation) yet never
+    /// let deferred (workspace-unknown) sessions at the head of the queue starve
+    /// runnable continuations behind them: the filter is applied BEFORE the
+    /// limit, so non-runnable candidates are skipped without consuming a slot.
+    /// (codex review of e1f611f4: filter-before-limit, replacing an unbounded
+    /// `usize::MAX` scan that materialized the whole due set every tick.)
+    pub(crate) fn due_loop_targets_with_filter(
+        &self,
+        profile_filter: Option<&str>,
+        max_items: usize,
+        runnable: Option<&dyn Fn(&SessionKey) -> bool>,
+    ) -> Vec<(SessionKey, String)> {
         if max_items == 0 {
             return Vec::new();
         }
@@ -1164,6 +1330,9 @@ impl InProcessAgentOrchestrator {
                 loop_record.session_id.clone(),
                 loop_record.profile_id.clone(),
             );
+            if runnable.is_some_and(|is_runnable| !is_runnable(&target.0)) {
+                continue;
+            }
             if !targets.contains(&target) {
                 targets.push(target);
                 if targets.len() >= max_items {
@@ -1203,6 +1372,9 @@ impl InProcessAgentOrchestrator {
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
                     continue;
                 }
+                if runnable.is_some_and(|is_runnable| !is_runnable(session_id)) {
+                    continue;
+                }
                 let target = (session_id.clone(), goal.profile_id.clone());
                 if !targets.contains(&target) {
                     targets.push(target);
@@ -1238,6 +1410,9 @@ impl InProcessAgentOrchestrator {
                     continue;
                 }
                 let session_key = SessionKey(item.session_id.as_str().to_owned());
+                if runnable.is_some_and(|is_runnable| !is_runnable(&session_key)) {
+                    continue;
+                }
                 if seen_sessions.insert(session_key.clone()) {
                     targets.push((session_key, item.profile_id.as_str().to_owned()));
                     if targets.len() >= max_items {
@@ -1630,6 +1805,50 @@ impl InProcessAgentOrchestrator {
     #[cfg(test)]
     pub(crate) fn pending_continuation_count_for_test(&self) -> usize {
         self.state().continuations.len()
+    }
+
+    /// Whole-job orchestration inputs for a session: (non-terminal sub-agents,
+    /// queued master continuations). Combined with the session's in-flight turn
+    /// (tracked in the AppUI `active_turns` registry) this drives the
+    /// `session/orchestration` status — `active` is true when any of the three
+    /// is non-zero, so the client's job indicator stays live across the
+    /// sub-agent-complete → master-re-entry gap.
+    pub(crate) fn session_orchestration_counts(&self, session_id: &SessionKey) -> (u32, u32) {
+        let state = self.state();
+        let running_agents = state
+            .agents
+            .values()
+            .filter(|agent| {
+                agent.session_id == *session_id && !is_agent_terminal_status(&agent.status)
+            })
+            .count() as u32;
+        let session_str = session_id.to_string();
+        let pending_continuations = state
+            .continuations
+            .pending_items()
+            .filter(|item| item.session_id.as_str() == session_str)
+            .count() as u32;
+        (running_agents, pending_continuations)
+    }
+
+    /// Sessions that currently have active orchestration from the
+    /// orchestrator's view: a non-terminal sub-agent OR a queued master
+    /// continuation. The AppUI tick unions this with its in-flight-turn set to
+    /// decide which sessions to emit `session/orchestration` for.
+    pub(crate) fn sessions_with_active_orchestration(
+        &self,
+    ) -> std::collections::HashSet<SessionKey> {
+        let state = self.state();
+        let mut sessions = std::collections::HashSet::new();
+        for agent in state.agents.values() {
+            if !is_agent_terminal_status(&agent.status) {
+                sessions.insert(agent.session_id.clone());
+            }
+        }
+        for item in state.continuations.pending_items() {
+            sessions.insert(SessionKey(item.session_id.as_str().to_owned()));
+        }
+        sessions
     }
 
     #[cfg(test)]
@@ -3467,6 +3686,20 @@ fn enqueue_agent_terminal_continuations(
         SystemTime::now(),
     )
     .with_child_agent_id(agent.agent_id.clone())
+    // Gap-1 step 3: explicit success dedupe key, symmetric to the failure
+    // key `external/<kind>/<session>/<task_id>`. Keyed ONLY on stable
+    // identity (group + session + agent_id) so repeated terminal marks of
+    // the same agent (live + cascade + orphan-sweep, AND the strangler's
+    // legacy on_change + unified on_terminal double-delivery) collapse to
+    // one ChildCompleted continuation via `pending_by_key` — independent of
+    // metadata drift (status/summary/nickname/role), which the auto-derived
+    // `stable_dedupe_key` would otherwise fold into the key and split into
+    // distinct entries.
+    .with_dedupe_key(child_completed_dedupe_key(
+        &group_id,
+        &agent.session_id.0,
+        &agent.agent_id,
+    ))
     .with_metadata("status", agent.status.clone())
     .with_metadata("nickname", agent.nickname.clone())
     .with_metadata("role", agent.role.clone());
@@ -3492,6 +3725,13 @@ fn enqueue_agent_terminal_continuations(
     {
         return;
     }
+    // NOTE: the `ScatterJoinComplete` continuation deliberately keeps the
+    // auto-derived `stable_dedupe_key` (which folds in the
+    // `terminal_children` count). The join only enqueues on the
+    // all-siblings-terminal edge, and a re-expanded group that finishes
+    // again SHOULD be able to re-join — so an identity-only key would be a
+    // behavior change here. Only the per-child `ChildCompleted` gets the
+    // explicit Gap-1 step-3 key.
     let scatter = MasterContinuationRequest::new(
         group_id,
         agent.session_id.to_string(),
@@ -3508,6 +3748,15 @@ fn enqueue_agent_terminal_continuations(
     )
     .with_metadata("terminal_children", siblings.len().to_string());
     enqueue_and_persist_continuation(state, scatter);
+}
+
+/// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
+/// failure key `external/<kind>/<session>/<task_id>`. Keyed on stable
+/// identity only (group + session + agent_id) so metadata drift
+/// (status/summary/nickname/role) never splits the dedupe across the
+/// strangler double-delivery or repeated terminal marks.
+fn child_completed_dedupe_key(group_id: &str, session_id: &str, agent_id: &str) -> String {
+    format!("child/{group_id}/{session_id}/{agent_id}")
 }
 
 fn agent_continuation_group_id(agent: &AutonomyAgentRecord) -> String {
@@ -6282,7 +6531,7 @@ mod tests {
         };
 
         let (mirrored_session, agent) =
-            upsert_background_task_agent(&task).expect("task should mirror");
+            upsert_background_task_agent(&task, None).expect("task should mirror");
 
         assert_eq!(mirrored_session, session_id);
         assert_eq!(agent["status"], json!("completed"));
@@ -6306,6 +6555,550 @@ mod tests {
                 MasterContinuationReason::ChildCompleted,
                 MasterContinuationReason::ScatterJoinComplete
             ]
+        );
+    }
+
+    /// Gap-1 step 3: the explicit `child/<group>/<session>/<agent_id>`
+    /// dedupe key collapses repeated terminal enqueues of the SAME agent —
+    /// even when the terminal status (and thus the auto-derived key's
+    /// metadata) drifts between marks (e.g. a cascade re-mark flips
+    /// completed→failed). The auto key would split these into two distinct
+    /// `ChildCompleted` continuations; the explicit identity-only key
+    /// collapses them to one.
+    #[test]
+    fn child_completed_dedupe_key_collapses_terminal_status_drift() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-step3", "api", "dedupe-drift");
+        let agent_id = "task-step3-drift".to_owned();
+
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "step3".to_owned(),
+            backend_kind: "task_supervisor:run_pipeline".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-step3".to_owned(),
+        };
+
+        // First terminal transition (completed) enqueues ChildCompleted.
+        orchestrator.upsert_agent(upsert("completed"));
+        // A terminal-status CHANGE (completed → failed) would re-enqueue a
+        // ChildCompleted under the auto key (different `status`/`summary`
+        // metadata). The explicit identity key must collapse it.
+        orchestrator.upsert_agent(upsert("failed"));
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-step3",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let child_completed = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .count();
+        assert_eq!(
+            child_completed,
+            1,
+            "explicit dedupe key must collapse terminal-status drift to one ChildCompleted; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn child_completed_dedupe_key_is_identity_only() {
+        // Symmetric to the failure key `external/<kind>/<session>/<task>`.
+        assert_eq!(
+            child_completed_dedupe_key("agent-group:p:s:master", "p:api:s", "task-x"),
+            "child/agent-group:p:s:master/p:api:s/task-x",
+        );
+    }
+
+    /// Gap-1 step 2/4 boundary: the gateway wires the unified sink with
+    /// `TerminalFailureRouting::LegacyChannel` so failure recovery stays on
+    /// the `RecoveryHint` inbox (which owns the runaway-recovery caps).
+    /// Routing failure through the queue here too would DOUBLE-deliver
+    /// across two channels with no shared dedupe key. This pins that a
+    /// failure event under `LegacyChannel` enqueues NOTHING, while the same
+    /// event under `Queue` (WS path) enqueues exactly one recovery.
+    #[test]
+    fn legacy_channel_failure_routing_does_not_double_enqueue() {
+        let session_legacy = SessionKey::with_profile("tenant-legacy", "api", "fail-legacy");
+        let session_queue = SessionKey::with_profile("tenant-queue", "api", "fail-queue");
+        let now = Utc::now();
+        let make_event = |session: &SessionKey, task_id: &str| {
+            let task = octos_agent::BackgroundTask {
+                id: task_id.into(),
+                tool_name: "mofa_slides".into(),
+                tool_call_id: "call-legacy".into(),
+                parent_session_key: Some(session.to_string()),
+                child_session_key: None,
+                child_terminal_state: None,
+                child_join_state: None,
+                child_joined_at: None,
+                child_failure_action: None,
+                task_ledger_path: None,
+                status: octos_agent::TaskStatus::Failed,
+                runtime_state: octos_agent::TaskRuntimeState::Failed,
+                runtime_detail: None,
+                started_at: now,
+                updated_at: now,
+                completed_at: Some(now),
+                output_files: vec![],
+                error: Some("plugin exited 137".into()),
+                session_key: Some(session.to_string()),
+                tool_input: Some(json!({"topic": "rust"})),
+                originating_client_message_id: None,
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
+            };
+            octos_agent::TerminalEvent {
+                task: task.clone(),
+                synth_ack_emitted: true,
+                outcome: octos_agent::TerminalOutcome::Failed(
+                    octos_agent::SpawnOnlyFailureSignal {
+                        task_id: task.id.clone(),
+                        tool_name: task.tool_name.clone(),
+                        tool_input: task.tool_input.clone().unwrap(),
+                        error_message: task.error.clone().unwrap(),
+                        suggested_alternatives: vec![],
+                        parent_session_key: task.parent_session_key.clone(),
+                        originating_client_message_id: None,
+                    },
+                ),
+            }
+        };
+
+        // Gateway: LegacyChannel — failure must NOT reach the queue.
+        route_terminal_event_to_continuation_queue(
+            &make_event(&session_legacy, "task-legacy"),
+            Some("tenant-legacy"),
+            TerminalFailureRouting::LegacyChannel,
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_legacy, "tenant-legacy"),
+            0,
+            "LegacyChannel failure routing must not enqueue (recovery stays on RecoveryHint)",
+        );
+
+        // WS: Queue — same shaped failure enqueues exactly one recovery.
+        route_terminal_event_to_continuation_queue(
+            &make_event(&session_queue, "task-queue"),
+            Some("tenant-queue"),
+            TerminalFailureRouting::Queue,
+        );
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_queue, "tenant-queue"),
+            1,
+            "Queue failure routing must enqueue exactly one recovery continuation",
+        );
+    }
+
+    /// codex DO-NOT-SHIP TOCTOU: on the WS path BOTH the legacy `on_failure`
+    /// enqueue and the unified `on_terminal` enqueue fire SEQUENTIALLY inside
+    /// one `mark_failed`, with the IDENTICAL
+    /// `external/spawn_only_failure/<session>/<task>` dedupe key. If the AppUI
+    /// continuation tick DRAINS the legacy enqueue before the unified one runs,
+    /// the existing pending-map dedupe misses and one terminal transition
+    /// would yield TWO recovery turns. This pins the full WS interleaving for
+    /// an ACKED failure: legacy enqueue → tick drain → unified enqueue must
+    /// total EXACTLY ONE recovery continuation.
+    #[test]
+    fn acked_spawn_only_failure_drain_between_legacy_and_unified_yields_exactly_one() {
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-toctou-acked", "api", "spawn-fail-acked");
+        let profile = "tenant-toctou-acked";
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-00000000acked".into(),
+            tool_name: "mofa_slides".into(),
+            tool_call_id: "call-acked".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Failed,
+            runtime_state: octos_agent::TaskRuntimeState::Failed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec![],
+            error: Some("plugin exited 137".into()),
+            session_key: Some(session_id.to_string()),
+            tool_input: Some(json!({"topic": "rust"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: task.id.clone(),
+            tool_name: task.tool_name.clone(),
+            tool_input: task.tool_input.clone().unwrap(),
+            error_message: task.error.clone().unwrap(),
+            suggested_alternatives: vec![],
+            parent_session_key: task.parent_session_key.clone(),
+            originating_client_message_id: None,
+        };
+        let event = octos_agent::TerminalEvent {
+            task,
+            // ACKED: the synth-ack fired, so the unified consumer renders the
+            // recovery body (does NOT prompt-suppress).
+            synth_ack_emitted: true,
+            outcome: octos_agent::TerminalOutcome::Failed(signal.clone()),
+        };
+
+        // 1. Legacy `on_failure` WS enqueue (ui_protocol.rs set_on_failure_signal).
+        let legacy =
+            orchestrator.enqueue_spawn_only_failure_continuation(&session_id, profile, &signal);
+        assert!(!legacy.is_duplicate(), "legacy enqueue should queue first");
+
+        // 2. The 2s AppUI continuation tick DRAINS the legacy enqueue before
+        //    `mark_failed` reaches `notify_terminal`.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let recovery_drained = drained
+            .iter()
+            .filter(|item| {
+                item.reason
+                    == MasterContinuationReason::External(
+                        SPAWN_ONLY_FAILURE_EXTERNAL_KIND.to_owned(),
+                    )
+            })
+            .count();
+        assert_eq!(recovery_drained, 1, "tick drains exactly one recovery turn");
+
+        // 3. Unified `on_terminal` WS enqueue (route_terminal_event...Queue) —
+        //    same transition, microseconds later. Must be collapsed by the
+        //    recently-claimed guard, NOT produce a second recovery.
+        route_terminal_event_to_continuation_queue(
+            &event,
+            Some(profile),
+            TerminalFailureRouting::Queue,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+            "unified enqueue after the tick drain must NOT add a second recovery turn",
+        );
+    }
+
+    /// fail-before-ack variant of the TOCTOU race. When a spawn_only task
+    /// fails BEFORE its synth-ack is recorded, the unified `notify_terminal`
+    /// samples `synth_ack_emitted = false` and PROMPT-SUPPRESSES the recovery
+    /// (so unified alone would deliver ZERO). The legacy two-phase synth-ack
+    /// stash re-emits the deferred `SpawnOnlyFailureSignal` on ack, and THAT
+    /// legacy `on_failure` enqueue is the single delivery. Even if the tick
+    /// drains the legacy enqueue before the (suppressed) unified path runs,
+    /// the result must be EXACTLY ONE — not zero, not two.
+    #[test]
+    fn fail_before_ack_spawn_only_failure_yields_exactly_one() {
+        let orchestrator = default_agent_orchestrator();
+        let session_id =
+            SessionKey::with_profile("tenant-toctou-preack", "api", "spawn-fail-preack");
+        let profile = "tenant-toctou-preack";
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-0000000preack".into(),
+            tool_name: "mofa_slides".into(),
+            tool_call_id: "call-preack".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Failed,
+            runtime_state: octos_agent::TaskRuntimeState::Failed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: vec![],
+            error: Some("plugin binary missing".into()),
+            session_key: Some(session_id.to_string()),
+            tool_input: Some(json!({"topic": "rust"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: task.id.clone(),
+            tool_name: task.tool_name.clone(),
+            tool_input: task.tool_input.clone().unwrap(),
+            error_message: task.error.clone().unwrap(),
+            suggested_alternatives: vec![],
+            parent_session_key: task.parent_session_key.clone(),
+            originating_client_message_id: None,
+        };
+        // The unified terminal event for a fail-before-ack carries
+        // `synth_ack_emitted = false` (the ack had not been recorded when the
+        // event was built), which the consumer prompt-suppresses.
+        let unified_event = octos_agent::TerminalEvent {
+            task,
+            synth_ack_emitted: false,
+            outcome: octos_agent::TerminalOutcome::Failed(signal.clone()),
+        };
+
+        // 1. Unified `notify_terminal` fires first on the failed transition but
+        //    PROMPT-SUPPRESSES (ack never emitted at fire time) → enqueues nothing.
+        route_terminal_event_to_continuation_queue(
+            &unified_event,
+            Some(profile),
+            TerminalFailureRouting::Queue,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+            "fail-before-ack unified path is prompt-suppressed (synth-ack never emitted)",
+        );
+
+        // 2. The legacy two-phase stash re-emits the deferred signal once the
+        //    synth-ack is recorded (mark_synth_ack_emitted → on_failure). On the
+        //    WS path that fires `enqueue_spawn_only_failure_continuation`.
+        let legacy =
+            orchestrator.enqueue_spawn_only_failure_continuation(&session_id, profile, &signal);
+        assert!(
+            !legacy.is_duplicate(),
+            "the deferred legacy enqueue is the SINGLE delivery for fail-before-ack",
+        );
+
+        // 3. Tick drains it: exactly ONE recovery turn (not zero, not two).
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let recovery_drained = drained
+            .iter()
+            .filter(|item| {
+                item.reason
+                    == MasterContinuationReason::External(
+                        SPAWN_ONLY_FAILURE_EXTERNAL_KIND.to_owned(),
+                    )
+            })
+            .count();
+        assert_eq!(
+            recovery_drained, 1,
+            "fail-before-ack must deliver EXACTLY ONE recovery continuation",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+            "no phantom second recovery left pending for fail-before-ack",
+        );
+    }
+
+    /// mini5 soak regression (task-completion notice never fired): AppUI /
+    /// TUI sessions use BARE session keys ("q5", "test1") with no
+    /// `profile:channel:chat` prefix, so `SessionKey::profile_id()` is
+    /// `None`. The terminal-agent continuation used to fall back to
+    /// `MAIN_PROFILE_ID` ("_main"), which has no registered `ProfileRuntime`
+    /// on the serve — so a profile-scoped connection skipped the
+    /// continuation in `due_loop_targets` (profile mismatch) and an
+    /// unscoped connection drained it into a `runtime_unavailable` turn.
+    /// The reconciliation now threads the turn's real runtime profile, so
+    /// the continuation is enqueued under THAT profile and re-entry fires.
+    #[test]
+    fn bare_key_background_task_continuation_inherits_runtime_profile_not_main_fallback() {
+        let session_id = SessionKey("soak-bareprofile-1".into());
+        assert_eq!(
+            session_id.profile_id(),
+            None,
+            "precondition: AppUI session key carries no profile prefix"
+        );
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-0000000000c1".into(),
+            tool_name: "spawn".into(),
+            tool_call_id: "call-bp1".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: Some(format!("{session_id}#child-abc")),
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some(session_id.to_string()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: Some("deep code review".into()),
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        // Reconcile under the profile the turn actually runs under ("coding"),
+        // exactly as `forward_task_progress_to_channel` now threads it.
+        let (mirrored_session, agent) = upsert_background_task_agent(&task, Some("coding"))
+            .expect("terminal background task should mirror to an agent record");
+        assert_eq!(mirrored_session, session_id);
+        assert_eq!(
+            agent["profile_id"],
+            json!("coding"),
+            "agent record must carry the runtime profile, not the _main fallback"
+        );
+
+        // The continuation must drain under the runtime profile — NOT "_main".
+        let under_runtime_profile = default_agent_orchestrator()
+            .drain_ready_continuations_for_session(
+                &session_id,
+                "coding",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+        assert!(
+            under_runtime_profile
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "ChildCompleted continuation must be drainable under the runtime profile 'coding'"
+        );
+        assert!(
+            under_runtime_profile
+                .iter()
+                .all(|item| item.profile_id.as_str() == "coding"),
+            "every drained continuation must be tagged with the runtime profile, got {:?}",
+            under_runtime_profile
+                .iter()
+                .map(|item| item.profile_id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        // And nothing must linger under the broken "_main" fallback profile.
+        let under_main = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &session_id,
+            MAIN_PROFILE_ID,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            under_main.is_empty(),
+            "no continuation may be stranded under the '_main' fallback, got {:?}",
+            under_main
+                .iter()
+                .map(|item| item.reason.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// mini5 soak gap #1: the server-level drain
+    /// (`spawn_global_master_continuation_drain`) sweeps `due_loop_targets`
+    /// with `profile_filter = None` precisely so it surfaces continuations that
+    /// a connection scoped to a DIFFERENT profile would skip — i.e. it drains
+    /// for sessions that have no matching live connection. A per-connection
+    /// tick filtered to profile Q misses a continuation enqueued under profile
+    /// P; the connection-independent None sweep catches it.
+    #[test]
+    fn unscoped_due_loop_targets_surfaces_continuation_a_scoped_connection_skips() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey("gap1-unscoped-sweep".into());
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-x".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-x".into(),
+            role: "worker".into(),
+            nickname: "Xena".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("done".into()),
+            cwd: None,
+            profile_id: "coding".into(),
+        });
+
+        // A connection scoped to a DIFFERENT profile never surfaces it — this
+        // is the gap: with no coding-scoped connection open, nothing drains it.
+        let scoped_other = orchestrator.due_loop_targets(Some("ocean"), 8);
+        assert!(
+            !scoped_other
+                .iter()
+                .any(|(session, _)| *session == session_id),
+            "a connection scoped to a different profile must not surface the continuation, got {scoped_other:?}"
+        );
+
+        // The server-level None sweep surfaces it regardless of profile, so the
+        // global drain loop can run it even when no client is connected.
+        let unscoped = orchestrator.due_loop_targets(None, 8);
+        assert!(
+            unscoped
+                .iter()
+                .any(|(session, profile)| *session == session_id && profile == "coding"),
+            "the connection-independent (None) sweep must surface the queued continuation, got {unscoped:?}"
+        );
+    }
+
+    /// codex e1f611f4 re-review (filter-before-limit): the global drain's
+    /// workspace gate is applied INSIDE `due_loop_targets_with_filter` BEFORE
+    /// the `max_items` limit, so a non-runnable (deferred / workspace-unknown)
+    /// session can never consume a result slot and starve a runnable one behind
+    /// it — even at `max_items == 1`. This replaces the unbounded `usize::MAX`
+    /// scan with a bounded result + no starvation.
+    #[test]
+    fn filtered_due_loop_targets_skips_non_runnable_before_the_limit() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let deferred = SessionKey("gap1-deferred-no-workspace".into());
+        let runnable = SessionKey("gap1-runnable-has-workspace".into());
+        for (session, agent_id) in [(&deferred, "child-d"), (&runnable, "child-r")] {
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.to_string(),
+                parent_agent_id: Some("master".into()),
+                session_id: session.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "worker".into(),
+                nickname: "w".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("done".into()),
+                cwd: None,
+                profile_id: "coding".into(),
+            });
+        }
+
+        // Only `runnable` passes the predicate; `deferred` must be skipped
+        // WITHOUT consuming the single slot.
+        let is_runnable = |session: &SessionKey| *session == runnable;
+        let targets = orchestrator.due_loop_targets_with_filter(None, 1, Some(&is_runnable));
+        assert_eq!(
+            targets,
+            vec![(runnable.clone(), "coding".to_owned())],
+            "the non-runnable session must be dropped before the limit so the runnable one is not starved, got {targets:?}"
         );
     }
 

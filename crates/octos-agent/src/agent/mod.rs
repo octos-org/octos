@@ -63,6 +63,17 @@ pub struct AgentConfig {
     pub worker_prompt: Option<String>,
     /// Maximum seconds for all parallel tool calls to complete. Default: 300.
     pub tool_timeout_secs: u64,
+    /// Default timeout (seconds) for a batch of ordinary interactive/fast
+    /// tools (`glob`, `list_dir`, `read_file`, `grep`, ...) when the LLM does
+    /// NOT request a per-call `timeout_secs`. Genuinely long-running tools
+    /// (`shell`, `spawn`, `run_pipeline`, `browser`, deep research/crawl)
+    /// keep `tool_timeout_secs` / `MAX_TOOL_TIMEOUT_SECS` instead.
+    ///
+    /// Default 120s; env override `OCTOS_INTERACTIVE_TOOL_TIMEOUT_SECS`
+    /// (clamped [1, 1800]). mini5 soak motivation: a read-only `glob`/
+    /// `list_dir` over an unscoped home dir must not inherit the 1800s
+    /// ceiling and hang the whole turn.
+    pub default_interactive_tool_timeout_secs: u64,
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
@@ -70,6 +81,51 @@ pub struct AgentConfig {
     /// Background spawned workers rely on their outer workflow/session runtime
     /// to persist terminal results exactly once.
     pub suppress_auto_send_files: bool,
+    /// Grace period awaiting the FIRST streamed chunk (time-to-first-token).
+    /// Reasoning models (e.g. `deepseek-v4-pro`) can legitimately take minutes
+    /// before the first token, so this is generous. Default 180s; env override
+    /// `OCTOS_LLM_FIRST_TOKEN_GRACE_SECS`.
+    pub llm_first_token_grace: std::time::Duration,
+    /// Inter-chunk idle timeout once streaming has begun. A stalled provider
+    /// that stops yielding tokens trips this and aborts the call (retryable).
+    /// Default 90s; env override `OCTOS_LLM_STREAM_IDLE_SECS`.
+    pub llm_stream_idle: std::time::Duration,
+    /// Overall wall-clock cap on a single streaming LLM call, measured from
+    /// call start. Final backstop so a stream that keeps trickling a token
+    /// every <idle> seconds forever still terminates. Default 1200s (20 min);
+    /// env override `OCTOS_LLM_CALL_MAX_SECS`.
+    pub llm_call_max: std::time::Duration,
+}
+
+/// Default time-to-first-token grace for streaming LLM calls (180s).
+pub const DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS: u64 = 180;
+/// Default inter-chunk idle timeout for streaming LLM calls (90s).
+pub const DEFAULT_LLM_STREAM_IDLE_SECS: u64 = 90;
+/// Default overall wall-clock cap for a single streaming LLM call (1200s / 20m).
+pub const DEFAULT_LLM_CALL_MAX_SECS: u64 = 1200;
+
+/// Read an env-overridable seconds value, mirroring the convention in
+/// `octos-cli/src/session_actor.rs` (`std::env::var(...).parse()` with a clamp
+/// so a misconfigured value cannot disable the guard entirely). A parsed `0`
+/// is clamped up to `1` so the timeout is always live.
+fn env_secs_or(var: &str, default_secs: u64) -> std::time::Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|v| v.clamp(1, 86_400))
+        .unwrap_or(default_secs);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Like [`env_secs_or`] but returns a raw `u64` seconds value clamped to
+/// `[1, MAX_TOOL_TIMEOUT_SECS]`. Used for the interactive-tool-timeout knob,
+/// which is stored as a `u64` on [`AgentConfig`] (not a `Duration`).
+fn env_secs_u64_or(var: &str, default_secs: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|v| v.clamp(1, MAX_TOOL_TIMEOUT_SECS))
+        .unwrap_or(default_secs)
 }
 
 /// Default tool execution timeout in seconds.
@@ -79,6 +135,11 @@ pub struct AgentConfig {
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1800;
 /// Maximum tool timeout the LLM can request (30 minutes).
 pub const MAX_TOOL_TIMEOUT_SECS: u64 = 1800;
+/// Default timeout (seconds) for a batch of ordinary interactive/fast tools
+/// (`glob`, `list_dir`, `read_file`, `grep`, ...) when the LLM omits a
+/// per-call `timeout_secs`. Genuinely long-running tools keep the 1800s
+/// default. See [`AgentConfig::default_interactive_tool_timeout_secs`].
+pub const DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS: u64 = 120;
 /// Default session processing timeout in seconds.
 pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
 
@@ -91,8 +152,21 @@ impl Default for AgentConfig {
             save_episodes: true,
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
+            default_interactive_tool_timeout_secs: env_secs_u64_or(
+                "OCTOS_INTERACTIVE_TOOL_TIMEOUT_SECS",
+                DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS,
+            ),
             chat_max_tokens: None,
             suppress_auto_send_files: false,
+            llm_first_token_grace: env_secs_or(
+                "OCTOS_LLM_FIRST_TOKEN_GRACE_SECS",
+                DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS,
+            ),
+            llm_stream_idle: env_secs_or(
+                "OCTOS_LLM_STREAM_IDLE_SECS",
+                DEFAULT_LLM_STREAM_IDLE_SECS,
+            ),
+            llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
         }
     }
 }

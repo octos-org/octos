@@ -23,6 +23,24 @@ pub fn parse_dot(input: &str) -> Result<PipelineGraph> {
     parser.parse()
 }
 
+/// Maximum byte length the graph id is kept to at parse time. Matches the
+/// harness-event `workflow` validator cap so a parsed graph id can never make a
+/// node-progress event un-emittable (Gap 4.2 / Blocker 3).
+const MAX_GRAPH_ID_BYTES: usize = 128;
+
+/// Truncate a parsed graph id to [`MAX_GRAPH_ID_BYTES`] at a UTF-8 char
+/// boundary. Returns the id unchanged when it already fits (the common case).
+fn bound_graph_id(id: String) -> String {
+    if id.len() <= MAX_GRAPH_ID_BYTES {
+        return id;
+    }
+    let mut end = MAX_GRAPH_ID_BYTES;
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    id[..end].to_string()
+}
+
 /// Internal parser state.
 struct DotParser<'a> {
     input: &'a str,
@@ -49,6 +67,15 @@ impl<'a> DotParser<'a> {
             self.parse_identifier()
                 .wrap_err("expected graph name or '{'")?
         };
+        // Gap 4.2 / Blocker 3 — bound the graph id at PARSE time so it can never
+        // exceed the harness-event `workflow` validator cap (128 B). The graph id
+        // flows into every node-progress event's `workflow` field; an
+        // over-long id (a pathological LLM-emitted DOT) would otherwise make the
+        // emit-site truncation the only thing standing between the run and a
+        // silently-dropped event. This makes the in-memory id itself provably
+        // safe (the emit-site bound in `executor::emit_node_event_to_sink` is the
+        // must-have belt; this is the suspenders).
+        let id = bound_graph_id(id);
         self.skip_ws();
 
         // Parse opening brace
@@ -60,6 +87,7 @@ impl<'a> DotParser<'a> {
             default_model: None,
             max_total_tokens: None,
             default_timeout_secs: None,
+            result_fidelity: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
@@ -503,6 +531,12 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     // ("2400") or a suffixed duration ("40m", "2400s", "1h").
     if let Some(timeout) = attrs.get("default_timeout_secs") {
         graph.default_timeout_secs = parse_duration_secs(timeout);
+    }
+    // Gap 3.4: per-pipeline result-size fidelity. Accepts "full",
+    // "compact", "truncate:N", "summary:N". An unparseable value leaves
+    // `result_fidelity` as `None`, so the default ceiling still applies.
+    if let Some(fidelity) = attrs.get("result_fidelity") {
+        graph.result_fidelity = crate::fidelity::FidelityMode::parse(fidelity);
     }
 }
 
@@ -1232,6 +1266,55 @@ mod tests {
         assert!(graph.default_timeout_secs.is_none());
     }
 
+    /// Gap 3.4: the DOT graph attribute `result_fidelity` is parsed into
+    /// `PipelineGraph::result_fidelity` so a pipeline can explicitly annotate
+    /// how its result is bounded, overriding the default ceiling.
+    #[test]
+    fn should_parse_graph_result_fidelity_truncate() {
+        let dot = r#"
+            digraph test {
+                graph [result_fidelity="truncate:50000"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.result_fidelity,
+            Some(crate::fidelity::FidelityMode::Truncate { max_chars: 50000 })
+        );
+    }
+
+    /// `result_fidelity="full"` is the explicit opt-out of the default
+    /// result ceiling.
+    #[test]
+    fn should_parse_graph_result_fidelity_full() {
+        let dot = r#"
+            digraph test {
+                graph [result_fidelity="full"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.result_fidelity,
+            Some(crate::fidelity::FidelityMode::Full)
+        );
+    }
+
+    /// Backward-compat: when `result_fidelity` is absent the field stays
+    /// `None`, so `RunPipelineTool` applies the DEFAULT ceiling.
+    #[test]
+    fn should_leave_result_fidelity_none_when_attribute_absent() {
+        let dot = r#"
+            digraph test {
+                graph [label="no fidelity here"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.result_fidelity.is_none());
+    }
+
     #[test]
     fn should_parse_continue_on_error() {
         let dot = r#"
@@ -1271,6 +1354,34 @@ mod tests {
         );
         assert_eq!(parse_deadline_action("retry:0"), None);
         assert_eq!(parse_deadline_action("bogus"), None);
+    }
+
+    /// Gap 4.2 / Blocker 3 — a pathological >128-byte graph id (an LLM-emitted
+    /// DOT) is truncated to the harness-event `workflow` validator cap at PARSE
+    /// time, so the in-memory id can never make a node-progress event
+    /// un-emittable. The truncated id is still a prefix of the original.
+    #[test]
+    fn parse_bounds_oversized_graph_id() {
+        let huge = "g".repeat(512);
+        let dot = format!("digraph {huge} {{ a [prompt=\"x\"] }}");
+        let graph = parse_dot(&dot).unwrap();
+        assert!(
+            graph.id.len() <= MAX_GRAPH_ID_BYTES,
+            "graph id must be bounded at parse time; got {} bytes",
+            graph.id.len()
+        );
+        assert!(
+            huge.starts_with(&graph.id),
+            "the bounded id must be a prefix of the original"
+        );
+    }
+
+    /// A normal-length graph id must pass through the bound UNCHANGED (no false
+    /// truncation of the common case).
+    #[test]
+    fn parse_keeps_short_graph_id_unchanged() {
+        let graph = parse_dot("digraph research { a [prompt=\"x\"] }").unwrap();
+        assert_eq!(graph.id, "research");
     }
 
     #[test]

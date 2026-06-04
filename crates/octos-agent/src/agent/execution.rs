@@ -36,7 +36,7 @@ use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
-use crate::task_supervisor::TaskRuntimeState;
+use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 use crate::workspace_contract::{
@@ -67,6 +67,74 @@ fn should_auto_send_tool_files(
     tool_name: &str,
 ) -> bool {
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
+}
+
+/// Names of tools whose work can legitimately run for many minutes and so
+/// must keep the long [`MAX_TOOL_TIMEOUT_SECS`] (1800s) default when the LLM
+/// omits a per-call `timeout_secs`. Everything NOT in this set is treated as
+/// an interactive/fast tool and defaults to the much shorter
+/// `default_interactive_tool_timeout_secs`.
+///
+/// mini5 soak motivation: a read-only `glob`/`list_dir` that walks an
+/// unscoped home dir used to inherit the 1800s ceiling and hang the whole
+/// turn with no output. Fast read-only tools have no business waiting 30
+/// minutes; only genuinely long-running tools (shells, background spawns,
+/// pipelines, browser sessions, deep research/crawl) do.
+///
+/// Names verified against the registered `Tool::name()` impls:
+/// - `shell` (`tools/shell.rs`), `bash` alias
+/// - `spawn` (`tools/spawn.rs`), `spawn_agent` alias
+/// - `run_pipeline` (spawn_only pipeline tool registered via manifest)
+/// - `browser` (`tools/browser.rs`)
+/// - `delegate_task` (`tools/delegate.rs`)
+/// - `search` (`tools/deep_search.rs`), `deep_crawl` (`tools/site_crawl.rs`)
+/// - `synthesize_research` (`tools/synthesize_research.rs`)
+const LONG_RUNNING_TOOLS: &[&str] = &[
+    "shell",
+    "bash",
+    "spawn",
+    "spawn_agent",
+    "run_pipeline",
+    "browser",
+    "delegate_task",
+    "search",
+    "deep_crawl",
+    "site_crawl",
+    "synthesize_research",
+];
+
+/// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
+fn is_long_running_tool(name: &str) -> bool {
+    LONG_RUNNING_TOOLS.contains(&name)
+}
+
+/// Compute the timeout (seconds) for a parallel/serial tool batch.
+///
+/// Behaviour:
+/// - When the LLM requested a per-call `timeout_secs` (`llm_requested > 0`),
+///   honour it: clamp to [`MAX_TOOL_TIMEOUT_SECS`] and floor at the batch's
+///   default (so an explicit request never makes a batch flakier than its
+///   own baseline). This mirrors the pre-fix `.min(MAX).max(default)`.
+/// - When the LLM omitted `timeout_secs`, the default depends on the batch:
+///   a batch containing ANY long-running tool keeps `config_tool_timeout`
+///   (1800s today); a batch of only fast/interactive tools uses the much
+///   shorter `interactive_default`.
+fn compute_batch_timeout_secs(
+    tool_names: &[&str],
+    llm_requested: u64,
+    config_tool_timeout: u64,
+    interactive_default: u64,
+) -> u64 {
+    let batch_default = if tool_names.iter().any(|n| is_long_running_tool(n)) {
+        config_tool_timeout
+    } else {
+        interactive_default
+    };
+    if llm_requested > 0 {
+        llm_requested.min(MAX_TOOL_TIMEOUT_SECS).max(batch_default)
+    } else {
+        batch_default
+    }
 }
 
 /// Issue #896 — spawn_only filename propagation (Layer 1).
@@ -313,6 +381,17 @@ impl Agent {
                                 tc_name, reason
                             )
                         };
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever.
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&deny_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -369,6 +448,17 @@ impl Agent {
                             "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
                             tc_name, reason
                         );
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever.
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&deny_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -410,6 +500,19 @@ impl Agent {
                             "[VALIDATION FAILED] Tool '{tc_name}' rejected input: {msg}\n\n\
                              Fix the input and retry."
                         );
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever
+                        // (reproduced live on mini5: a bad run_pipeline name left
+                        // an "Orchestrating… (1 active)" chip stuck 15+ min).
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&err_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -527,6 +630,15 @@ impl Agent {
                 let task_id_for_handle = task_id.clone();
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
+                    // C1 step 2: arm a RAII terminal guard right after
+                    // mark_running. If this body panics or is aborted before
+                    // one of its mark_completed/mark_failed arms runs, the
+                    // guard's Drop drives the task to Failed so the TUI task
+                    // count decrements instead of hanging on "N running".
+                    // Idempotent on normal completion (the body's own
+                    // terminal mark wins; Drop then no-ops).
+                    let _terminal_guard =
+                        TaskTerminalGuard::new(bg_supervisor.clone(), task_id.clone());
                     // M8.7 (item 4): start a periodic-summary watcher for
                     // this background task. The watcher honours
                     // `min_runtime` so short tasks never trigger an LLM
@@ -749,6 +861,11 @@ impl Agent {
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
                                             tool_call_id: Some(bg_tc_id.clone()),
+                                            // C1 step 3: contract-Satisfied success path
+                                            // (mark_completed below).
+                                            terminal_status: Some(
+                                                crate::task_supervisor::TaskStatus::Completed,
+                                            ),
                                         })
                                         .await
                                     } else {
@@ -811,6 +928,11 @@ impl Agent {
                                                                 bg_originating_client_message_id
                                                                     .clone(),
                                                             tool_call_id: Some(bg_tc_id.clone()),
+                                                            // C1 step 3: produced-files
+                                                            // follow-up after mark_completed.
+                                                            terminal_status: Some(
+                                                                crate::task_supervisor::TaskStatus::Completed,
+                                                            ),
                                                         })
                                                         .await;
                                                 }
@@ -856,6 +978,11 @@ impl Agent {
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
                                             tool_call_id: Some(bg_tc_id.clone()),
+                                            // C1 step 3: contract-rejected failure
+                                            // (mark_failed above).
+                                            terminal_status: Some(
+                                                crate::task_supervisor::TaskStatus::Failed,
+                                            ),
                                         })
                                         .await;
                                     }
@@ -885,6 +1012,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: required-but-unconfigured
+                                                // contract failure (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -943,6 +1075,11 @@ impl Agent {
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
                                                     tool_call_id: Some(bg_tc_id.clone()),
+                                                    // C1 step 3: text-only success
+                                                    // (mark_completed above).
+                                                    terminal_status: Some(
+                                                        crate::task_supervisor::TaskStatus::Completed,
+                                                    ),
                                                 })
                                                 .await;
                                             }
@@ -980,6 +1117,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: no-files-no-text failure
+                                                // (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -1115,6 +1257,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: file-delivery failure
+                                                // (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -1225,6 +1372,11 @@ impl Agent {
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
                                                     tool_call_id: Some(bg_tc_id.clone()),
+                                                    // C1 step 3: file-delivery success
+                                                    // (mark_completed above).
+                                                    terminal_status: Some(
+                                                        crate::task_supervisor::TaskStatus::Completed,
+                                                    ),
                                                 })
                                                 .await;
 
@@ -1299,6 +1451,11 @@ impl Agent {
                                                                 bg_originating_client_message_id
                                                                     .clone(),
                                                             tool_call_id: Some(bg_tc_id.clone()),
+                                                            // C1 step 3: produced-files
+                                                            // follow-up after mark_completed.
+                                                            terminal_status: Some(
+                                                                crate::task_supervisor::TaskStatus::Completed,
+                                                            ),
                                                         })
                                                         .await;
                                                     }
@@ -1329,6 +1486,11 @@ impl Agent {
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
                                     tool_call_id: Some(bg_tc_id.clone()),
+                                    // C1 step 3: tool returned non-success
+                                    // (mark_failed above).
+                                    terminal_status: Some(
+                                        crate::task_supervisor::TaskStatus::Failed,
+                                    ),
                                 })
                                 .await;
                             }
@@ -1352,6 +1514,11 @@ impl Agent {
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
                                     tool_call_id: Some(bg_tc_id.clone()),
+                                    // C1 step 3: tool execution errored
+                                    // (mark_failed above).
+                                    terminal_status: Some(
+                                        crate::task_supervisor::TaskStatus::Failed,
+                                    ),
                                 })
                                 .await;
                             }
@@ -1710,13 +1877,18 @@ impl Agent {
             .filter_map(|tc| tc.arguments.get("timeout_secs").and_then(|v| v.as_u64()))
             .max()
             .unwrap_or(0);
-        let tool_timeout_secs = if llm_requested_timeout > 0 {
-            llm_requested_timeout
-                .min(MAX_TOOL_TIMEOUT_SECS)
-                .max(self.config.tool_timeout_secs)
-        } else {
-            self.config.tool_timeout_secs
-        };
+        // mini5 soak fix: when the LLM omits `timeout_secs`, a batch of only
+        // fast/interactive tools (e.g. `glob`, `list_dir`) defaults to the
+        // short `default_interactive_tool_timeout_secs` instead of inheriting
+        // the 1800s ceiling that hung the turn. A batch containing any
+        // genuinely long-running tool keeps the long default; an explicit
+        // LLM-requested timeout is still honoured (clamped + floored).
+        let tool_timeout_secs = compute_batch_timeout_secs(
+            &tool_names,
+            llm_requested_timeout,
+            self.config.tool_timeout_secs,
+            self.config.default_interactive_tool_timeout_secs,
+        );
         let tool_timeout = Duration::from_secs(tool_timeout_secs);
 
         let results: Vec<ToolCallResult> = if any_exclusive {
@@ -2191,5 +2363,124 @@ mod tests {
              `isFinalArrived` heuristic plus any downstream regex \
              matchers in dashboards / debugging tooling"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // FIX 1: fast read-only tools must not inherit the 1800s timeout.
+    // ------------------------------------------------------------------
+
+    use super::{MAX_TOOL_TIMEOUT_SECS, compute_batch_timeout_secs, is_long_running_tool};
+
+    #[test]
+    fn long_running_tools_are_recognised() {
+        // The genuinely-long-running set keeps the 1800s ceiling.
+        for name in [
+            "shell",
+            "bash",
+            "spawn",
+            "spawn_agent",
+            "run_pipeline",
+            "browser",
+            "delegate_task",
+            "deep_crawl",
+            "search",
+            "synthesize_research",
+        ] {
+            assert!(
+                is_long_running_tool(name),
+                "{name} should be classified long-running"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_read_only_tools_are_not_long_running() {
+        for name in [
+            "glob",
+            "list_dir",
+            "read_file",
+            "grep",
+            "write_file",
+            "edit_file",
+            "web_search",
+            "web_fetch",
+        ] {
+            assert!(
+                !is_long_running_tool(name),
+                "{name} must NOT be classified long-running"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_of_only_fast_tools_uses_short_interactive_default() {
+        // mini5 soak shape: `list_dir` + `glob` with NO LLM-requested
+        // timeout must default to the short interactive timeout, NOT the
+        // 1800s tool ceiling that hung the turn.
+        let secs = compute_batch_timeout_secs(
+            &["list_dir", "glob"],
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, 120);
+    }
+
+    #[test]
+    fn batch_with_a_long_running_tool_keeps_the_long_ceiling() {
+        // A `shell` (or `run_pipeline`) in the batch keeps the long
+        // config-default timeout when the LLM omits `timeout_secs`.
+        let secs = compute_batch_timeout_secs(
+            &["glob", "shell"],
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, 1800);
+    }
+
+    #[test]
+    fn llm_requested_timeout_still_honoured_for_fast_batch() {
+        // An explicit LLM `timeout_secs` is clamped to MAX and floored at
+        // the config default — unchanged from the pre-fix behaviour. For a
+        // fast-only batch the floor is the interactive default, not 1800.
+        let secs = compute_batch_timeout_secs(
+            &["glob"],
+            /* llm_requested */ 300,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, 300);
+
+        // Over-the-cap request is clamped to MAX_TOOL_TIMEOUT_SECS.
+        let capped =
+            compute_batch_timeout_secs(&["glob"], /* llm_requested */ 99_999, 1800, 120);
+        assert_eq!(capped, MAX_TOOL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn llm_requested_below_interactive_floor_is_raised_for_fast_batch() {
+        // A fast-only batch floors at the interactive default so a tiny
+        // LLM-requested value cannot make the batch flakier than baseline.
+        let secs = compute_batch_timeout_secs(
+            &["glob"],
+            /* llm_requested */ 5,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, 120);
+    }
+
+    #[test]
+    fn long_batch_llm_request_floors_at_config_default() {
+        // A long batch floors at the config tool timeout (existing
+        // behaviour preserved).
+        let secs = compute_batch_timeout_secs(
+            &["shell"],
+            /* llm_requested */ 10,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, 1800);
     }
 }

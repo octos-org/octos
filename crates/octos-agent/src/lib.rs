@@ -14,6 +14,7 @@ pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
+pub mod bundled_pipelines;
 pub mod compaction;
 pub mod compaction_tiered;
 pub mod cost_ledger;
@@ -153,7 +154,7 @@ pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
     TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
-    TaskSupervisor, parse_alternatives,
+    TaskSupervisor, TerminalEvent, TerminalOutcome, parse_alternatives,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
