@@ -1314,18 +1314,46 @@ impl TaskSupervisor {
         // load and sweep.
         let orphans: Vec<(String, String, String)> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+
+            // fix/orphan-sweep-liveness-gate (codex round-2): a live detached
+            // parent (e.g. `run_pipeline deep_research`) registers
+            // `pipeline:<node>` CHILD rows that SHARE its `tool_call_id` but
+            // carry their OWN task ids — and only the PARENT worker arms a
+            // `TaskTerminalGuard`, so the children are never inserted into the
+            // live-set. Gating solely on `is_task_live(&task.id)` therefore
+            // protects the live parent yet still falsely reaps its active
+            // children. Collect the `tool_call_id` of every currently-live
+            // task so the sweep can exempt the whole family: while a parent
+            // worker is live it OWNS its tool_call_id family (it drives the
+            // children to terminal, or cascade-fails them on its own timeout
+            // via `mark_descendants_failed`), so none of them is an orphan.
+            // `tool_call_id`s are unique per LLM tool call (synthesized ids are
+            // process-unique), so the only rows sharing a live tcid are that
+            // parent and its pipeline children — no unrelated task is exempted.
+            // Empty tcids are skipped so an id-less row cannot blanket-exempt
+            // every other empty-tcid row.
+            let live_tool_call_ids: HashSet<&str> = tasks
+                .values()
+                .filter(|task| !task.tool_call_id.is_empty() && is_task_live(&task.id))
+                .map(|task| task.tool_call_id.as_str())
+                .collect();
+
             tasks
                 .values()
-                // fix/orphan-sweep-liveness-gate: CHECK the sweep's
-                // "non-terminal ⇒ no live worker" precondition instead of
-                // assuming it. A still-live DETACHED spawn_only worker (alive
-                // on a prior per-turn supervisor in THIS process) is in the
-                // process-global live-set, so it is NEVER swept — its own
-                // worker will drive it terminal. A genuinely dead task from a
-                // true cross-process restart is absent from the live-set (new
-                // process ⇒ empty set) ⇒ still correctly reaped below.
+                // CHECK the sweep's "non-terminal ⇒ no live worker"
+                // precondition instead of assuming it. A still-live DETACHED
+                // spawn_only worker (alive on a prior per-turn supervisor in
+                // THIS process) is in the process-global live-set, so it is
+                // NEVER swept — its own worker will drive it terminal. A child
+                // of such a worker is live-by-proxy (it shares the live
+                // parent's tool_call_id) and is likewise exempt. A genuinely
+                // dead task from a true cross-process restart is absent from
+                // the live-set (new process ⇒ empty set) and shares no live
+                // tcid ⇒ still correctly reaped below.
                 .filter(|task| {
-                    !is_terminal_runtime_state(&task.runtime_state) && !is_task_live(&task.id)
+                    !is_terminal_runtime_state(&task.runtime_state)
+                        && !is_task_live(&task.id)
+                        && !live_tool_call_ids.contains(task.tool_call_id.as_str())
                 })
                 .map(|task| {
                     (
@@ -6522,6 +6550,108 @@ mod tests {
         assert!(
             !is_task_live(&id),
             "live-set cleared after the worker completes"
+        );
+    }
+
+    /// codex round-2 DO-NOT-SHIP regression: a live `run_pipeline` parent
+    /// registers `pipeline:<node>` CHILD rows that SHARE its `tool_call_id`
+    /// but carry their OWN task ids. Only the PARENT worker arms a
+    /// `TaskTerminalGuard`, so the children are never inserted into the
+    /// live-set. The turn N+1 sweep must NOT reap those active children as
+    /// orphans while their parent is live — otherwise `run_pipeline
+    /// deep_research` shows the mini3 "spinner stuck orchestrating" symptom:
+    /// children falsely marked "orphaned across restart" (direct sweep) /
+    /// "parent task orphaned across restart" (cascade) even though the
+    /// pipeline is still running on the prior turn's live worker.
+    #[test]
+    fn live_pipeline_child_is_not_swept_when_parent_is_live() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Turn N: a detached run_pipeline parent + its active pipeline child,
+        // both persisted Running under the SAME tool_call_id.
+        let turn_n = TaskSupervisor::new();
+        turn_n.enable_persistence(&ledger_path).unwrap();
+        let parent = turn_n.register("run_pipeline", "call-pipe-1", Some("api:sess"));
+        turn_n.mark_running(&parent);
+        let child = turn_n.register("pipeline:research_node", "call-pipe-1", Some("api:sess"));
+        turn_n.mark_running(&child);
+
+        // Only the PARENT worker is live (pipeline children don't arm guards).
+        mark_task_live(&parent);
+        struct ClearOnDrop<'a>(Vec<&'a str>);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                for id in &self.0 {
+                    clear_task_live(id);
+                }
+            }
+        }
+        let _clear = ClearOnDrop(vec![&parent, &child]);
+
+        // Turn N+1: a brand-new supervisor opens the SAME ledger and sweeps.
+        let turn_n1 = TaskSupervisor::new();
+        turn_n1.enable_persistence(&ledger_path).unwrap();
+
+        let restored_parent = turn_n1.get_task(&parent).expect("parent restored");
+        assert_eq!(
+            restored_parent.status,
+            TaskStatus::Running,
+            "live run_pipeline parent must not be swept",
+        );
+
+        let restored_child = turn_n1.get_task(&child).expect("child restored");
+        assert_eq!(
+            restored_child.status,
+            TaskStatus::Running,
+            "an active pipeline child of a LIVE parent must NOT be reaped",
+        );
+        assert_ne!(
+            restored_child.error.as_deref(),
+            Some("orphaned across restart"),
+            "child must not carry the direct-sweep false-orphan reason",
+        );
+        assert_ne!(
+            restored_child.error.as_deref(),
+            Some("parent task orphaned across restart"),
+            "child must not carry the cascade false-orphan reason either",
+        );
+    }
+
+    /// Boundary counterpart: when NO member of the tool_call_id family is live
+    /// (a true cross-process restart ⇒ empty live-set), BOTH the parent and
+    /// its pipeline children are still reaped. The proxy-exemption only fires
+    /// for a genuinely live family, so reaping of real orphans is preserved.
+    #[test]
+    fn dead_pipeline_family_is_still_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let writer = TaskSupervisor::new();
+        writer.enable_persistence(&ledger_path).unwrap();
+        let parent = writer.register("run_pipeline", "call-pipe-dead", Some("api:sess"));
+        writer.mark_running(&parent);
+        let child = writer.register("pipeline:node", "call-pipe-dead", Some("api:sess"));
+        writer.mark_running(&child);
+        drop(writer);
+
+        // True restart: empty live-set for the whole family. Defensive clears
+        // in case a prior test leaked an id.
+        clear_task_live(&parent);
+        clear_task_live(&child);
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        assert_eq!(
+            restored.get_task(&parent).expect("parent").status,
+            TaskStatus::Failed,
+            "dead parent absent from the live-set must still be reaped",
+        );
+        assert_eq!(
+            restored.get_task(&child).expect("child").status,
+            TaskStatus::Failed,
+            "dead pipeline child must still be reaped when no parent is live",
         );
     }
 }
