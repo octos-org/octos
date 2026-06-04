@@ -31,6 +31,17 @@ pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
 /// never empty even before bootstrap has written the `.dot`.
 const FALLBACK_PIPELINE_NAME: &str = "deep_research";
 
+/// S1-5 opt-in: whether the typed-IR ([`crate::ir`]) authoring path is exposed
+/// to the LLM by default. OFF unless the operator sets `OCTOS_PIPELINE_IR=1`
+/// (or `true`) in the daemon environment (e.g. the launchd plist) — the same
+/// env-based opt-in pattern used for other gated capabilities. Explicit
+/// [`RunPipelineTool::with_ir_enabled`] overrides this (used by tests).
+fn ir_authoring_default() -> bool {
+    std::env::var("OCTOS_PIPELINE_IR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Phase 2-A of the [`SessionScope`] migration (load-bearing follow-up
 /// to PR #1199 / Phase 1).
 ///
@@ -158,7 +169,7 @@ impl RunPipelineTool {
             cost_accountant: None,
             contract_id: None,
             embedder: None,
-            ir_enabled: false,
+            ir_enabled: ir_authoring_default(),
         }
     }
 
@@ -653,7 +664,7 @@ impl Tool for RunPipelineTool {
         if self.ir_enabled {
             schema["properties"]["ir"] = serde_json::json!({
                 "type": "string",
-                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\",\"back_edge\":<opt bool>}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (final writeup), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"}. There are no tools/handler/model fields — capability is fixed per kind. For an intentional retry/revision loop set \"back_edge\":true on the looping edge."
+                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\",\"back_edge\":<opt bool>}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (final writeup), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"}. There are no tools/handler/model fields — capability is fixed per kind. For an intentional retry/revision loop set \"back_edge\":true on the looping edge. Examples: (1) linear research→report — {\"id\":\"demo\",\"nodes\":[{\"id\":\"research\",\"kind\":{\"type\":\"research\",\"prompt\":\"Research the topic; list 5 key facts each with a source URL\"}},{\"id\":\"report\",\"kind\":{\"type\":\"synthesize\",\"prompt\":\"Write a cited report from the findings\"}}],\"edges\":[{\"source\":\"research\",\"target\":\"report\"}]}. (2) fan-out with a retry back-edge — {\"id\":\"demo2\",\"nodes\":[{\"id\":\"plan\",\"kind\":{\"type\":\"research\",\"prompt\":\"Identify the sub-topics to cover\"}},{\"id\":\"work\",\"kind\":{\"type\":\"fanout\",\"worker_prompt\":\"Investigate {task}\",\"converge\":\"check\"}},{\"id\":\"check\",\"kind\":{\"type\":\"gate\"}},{\"id\":\"final\",\"kind\":{\"type\":\"synthesize\",\"prompt\":\"Synthesize the verified findings into a report\"}}],\"edges\":[{\"source\":\"plan\",\"target\":\"work\"},{\"source\":\"work\",\"target\":\"check\"},{\"source\":\"check\",\"target\":\"final\"},{\"source\":\"check\",\"target\":\"work\",\"back_edge\":true}]}."
             });
             schema["required"] = serde_json::json!(["input"]);
         }
@@ -2411,6 +2422,24 @@ mod tests {
         assert!(base.input_schema()["properties"]["ir"].is_null());
         let enabled = make_ir_tool(true).await;
         assert!(enabled.input_schema()["properties"]["ir"].is_object());
+    }
+
+    #[test]
+    fn advertised_ir_examples_compose() {
+        // The worked examples embedded in the `ir` input description MUST be
+        // valid — a broken example teaches the LLM the wrong shape.
+        let ex1 = r#"{"id":"demo","nodes":[{"id":"research","kind":{"type":"research","prompt":"Research the topic; list 5 key facts each with a source URL"}},{"id":"report","kind":{"type":"synthesize","prompt":"Write a cited report from the findings"}}],"edges":[{"source":"research","target":"report"}]}"#;
+        let ex2 = r#"{"id":"demo2","nodes":[{"id":"plan","kind":{"type":"research","prompt":"Identify the sub-topics to cover"}},{"id":"work","kind":{"type":"fanout","worker_prompt":"Investigate {task}","converge":"check"}},{"id":"check","kind":{"type":"gate"}},{"id":"final","kind":{"type":"synthesize","prompt":"Synthesize the verified findings into a report"}}],"edges":[{"source":"plan","target":"work"},{"source":"work","target":"check"},{"source":"check","target":"final"},{"source":"check","target":"work","back_edge":true}]}"#;
+        assert!(
+            crate::compose::compose_l2(ex1).is_ok(),
+            "advertised example 1 must compose: {:?}",
+            crate::compose::compose_l2(ex1).err()
+        );
+        assert!(
+            crate::compose::compose_l2(ex2).is_ok(),
+            "advertised example 2 must compose: {:?}",
+            crate::compose::compose_l2(ex2).err()
+        );
     }
 
     // ───── Blocker 2: full output always preserved + marker points to it ─────
