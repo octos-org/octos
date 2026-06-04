@@ -696,9 +696,12 @@ fn is_terminal_runtime_state(state: &TaskRuntimeState) -> bool {
 /// `deny(unsafe_code)`.
 ///
 /// Membership is owned by the detached worker via [`TaskTerminalGuard`]:
-/// constructed (insert) at the top of the `tokio::spawn` body right after
-/// `mark_running`, dropped (clear) on EVERY exit path — success, failure,
-/// cancel, or panic-unwind — so a finished task is never kept "live" forever.
+/// constructed (insert) in the FOREGROUND, before the `tokio::spawn`, so the
+/// id is live within the spawning turn (closing the pre-poll window where a
+/// fast next-turn sweep could reap a scheduled-but-not-yet-polled worker); the
+/// guard is then moved into the worker future and dropped (clear) on EVERY
+/// exit path — success, failure, cancel, panic-unwind, or unpolled drop — so a
+/// finished task is never kept "live" forever.
 fn live_detached_tasks() -> &'static Mutex<HashSet<String>> {
     static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     LIVE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -3074,11 +3077,11 @@ impl TaskSupervisor {
 /// would otherwise leave the task `Running` forever — the TUI task count
 /// never decrements and the chip stays "Orchestrating".
 ///
-/// Construct the guard at the top of each background body right after
-/// `mark_running`. No explicit disarm is needed: on normal completion the
-/// body's own `mark_*` arm has already moved the task terminal, so by the
-/// time `Drop` runs the task is no longer `is_active()` and the guard's
-/// `mark_failed` is a no-op (the terminal guards inside `mark_failed` /
+/// Construct the guard in the FOREGROUND (before `tokio::spawn`) and move it
+/// into the background body. No explicit disarm is needed: on normal
+/// completion the body's own `mark_*` arm has already moved the task terminal,
+/// so by the time `Drop` runs the task is no longer `is_active()` and the
+/// guard's `mark_failed` is a no-op (the terminal guards inside `mark_failed` /
 /// `mark_completed` make this idempotent).
 pub struct TaskTerminalGuard {
     supervisor: Arc<TaskSupervisor>,
@@ -3090,11 +3093,13 @@ impl TaskTerminalGuard {
     ///
     /// fix/orphan-sweep-liveness-gate: arming the guard also records the task
     /// id in the process-global live-set ([`mark_task_live`]). The guard is
-    /// constructed at the top of every detached `spawn_only` worker body
-    /// (`execution.rs`, `spawn.rs`) right after `mark_running`, so this is the
-    /// single insert site for "a detached worker is live". The matching clear
-    /// happens in `Drop`, which runs on EVERY exit path (success, failure,
-    /// cancel, panic-unwind).
+    /// constructed in the FOREGROUND, before each detached `spawn_only` worker
+    /// is spawned (`execution.rs`, `spawn.rs`), then moved into the worker
+    /// future — so the id enters the live-set synchronously within the
+    /// spawning turn (closing the pre-poll window) and this is the single
+    /// insert site for "a detached worker is live". The matching clear happens
+    /// in `Drop`, which runs on EVERY exit path (success, failure, cancel,
+    /// panic-unwind, or unpolled drop).
     pub fn new(supervisor: Arc<TaskSupervisor>, task_id: String) -> Self {
         mark_task_live(&task_id);
         Self {
@@ -6717,10 +6722,11 @@ mod tests {
     /// the FOREGROUND (in `execution.rs` / `spawn.rs`, before `tokio::spawn`),
     /// not inside the spawned worker future. This mirrors the real call-site
     /// ordering — register (persist `Spawned`) → arm guard (foreground) →
-    /// spawn → [a fast next turn sweeps] → the worker future finally gets its
-    /// first poll. The pre-fix code armed the guard INSIDE the future, so a
-    /// sweep that ran in the pre-poll window saw the row non-terminal AND
-    /// not-live and falsely reaped a scheduled-but-not-yet-polled worker. With
+    /// spawn → [a fast next turn sweeps] → the worker future finally runs. The
+    /// pre-fix code armed the guard INSIDE the future, so a sweep that ran
+    /// before the worker future had progressed (the test gates it explicitly)
+    /// saw the row non-terminal AND not-live and falsely reaped a
+    /// scheduled-but-not-yet-run worker. With
     /// foreground arming the id is in the live-set before the spawning turn
     /// returns, so the pre-poll sweep skips it.
     #[tokio::test]
