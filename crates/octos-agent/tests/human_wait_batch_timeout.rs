@@ -22,7 +22,7 @@
 //! - serial: pairing the human-wait tool with an `Exclusive` peer forces the
 //!   serial (per-call) dispatch path.
 //!
-//! RED on d3caf325 (the batch ceiling is finite and fires after 1s, producing
+//! RED before this fix (the batch ceiling is finite and fires after 1s, producing
 //! `"timed out"`); GREEN after `compute_batch_timeout_secs` yields `None` for a
 //! human-wait batch and both dispatch paths await the handles directly.
 
