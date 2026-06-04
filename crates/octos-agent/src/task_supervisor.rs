@@ -671,6 +671,66 @@ fn is_terminal_runtime_state(state: &TaskRuntimeState) -> bool {
     )
 }
 
+/// Process-global set of task ids whose DETACHED worker is currently live in
+/// THIS process.
+///
+/// fix/orphan-sweep-liveness-gate — root cause: the WS turn path builds a
+/// BRAND-NEW per-turn [`TaskSupervisor`] every turn (`run_standalone_turn` →
+/// `ToolRegistry::snapshot_excluding` → `TaskSupervisor::new()`) and calls
+/// [`TaskSupervisor::enable_persistence`] every turn over the SHARED per-session
+/// ledger. The orphan-sweep inside `enable_persistence` *assumes* "non-terminal
+/// ⇒ no live worker" (true only at true cross-process startup). But a detached
+/// `spawn_only` task (e.g. `run_pipeline deep_research`, up to ~3600s) outlives
+/// the turn that launched it: when turn N+1 opens, its fresh supervisor restores
+/// turn N's still-`Running` row and falsely reaps it as "orphaned across
+/// restart" — even though the worker is alive on turn N's supervisor and will
+/// `mark_completed` shortly (evidence: 23/23 tasks ever marked orphaned ended
+/// `completed`).
+///
+/// The set CHECKS that precondition instead of assuming it. It is a
+/// `static`/`OnceLock` so it survives the per-turn supervisor rebuild within one
+/// process (the different per-turn `TaskSupervisor` instances are distinct
+/// objects, so per-supervisor state cannot carry liveness across the rebuild),
+/// yet starts EMPTY after a genuine cross-process restart (new process ⇒ no
+/// entries ⇒ stale rows still reaped). No `unsafe` — the workspace is
+/// `deny(unsafe_code)`.
+///
+/// Membership is owned by the detached worker via [`TaskTerminalGuard`]:
+/// constructed (insert) at the top of the `tokio::spawn` body right after
+/// `mark_running`, dropped (clear) on EVERY exit path — success, failure,
+/// cancel, or panic-unwind — so a finished task is never kept "live" forever.
+fn live_detached_tasks() -> &'static Mutex<HashSet<String>> {
+    static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record that the detached worker for `task_id` is live in this process.
+/// Called by [`TaskTerminalGuard::new`]; idempotent.
+fn mark_task_live(task_id: &str) {
+    live_detached_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(task_id.to_string());
+}
+
+/// Remove `task_id` from the live-set once its worker terminates. Called by
+/// [`TaskTerminalGuard`]'s `Drop` on every exit path; idempotent.
+fn clear_task_live(task_id: &str) {
+    live_detached_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_id);
+}
+
+/// Whether the detached worker for `task_id` is currently live in this process.
+/// Used by the orphan-sweep filter to skip still-live detached tasks.
+fn is_task_live(task_id: &str) -> bool {
+    live_detached_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(task_id)
+}
+
 fn record_workflow_phase_transition(workflow_kind: &str, from_phase: &str, to_phase: &str) {
     counter!(
         "octos_workflow_phase_transition_total",
@@ -1256,7 +1316,17 @@ impl TaskSupervisor {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks
                 .values()
-                .filter(|task| !is_terminal_runtime_state(&task.runtime_state))
+                // fix/orphan-sweep-liveness-gate: CHECK the sweep's
+                // "non-terminal ⇒ no live worker" precondition instead of
+                // assuming it. A still-live DETACHED spawn_only worker (alive
+                // on a prior per-turn supervisor in THIS process) is in the
+                // process-global live-set, so it is NEVER swept — its own
+                // worker will drive it terminal. A genuinely dead task from a
+                // true cross-process restart is absent from the live-set (new
+                // process ⇒ empty set) ⇒ still correctly reaped below.
+                .filter(|task| {
+                    !is_terminal_runtime_state(&task.runtime_state) && !is_task_live(&task.id)
+                })
                 .map(|task| {
                     (
                         task.id.clone(),
@@ -2977,7 +3047,16 @@ pub struct TaskTerminalGuard {
 
 impl TaskTerminalGuard {
     /// Arm a guard for `task_id` on `supervisor`.
+    ///
+    /// fix/orphan-sweep-liveness-gate: arming the guard also records the task
+    /// id in the process-global live-set ([`mark_task_live`]). The guard is
+    /// constructed at the top of every detached `spawn_only` worker body
+    /// (`execution.rs`, `spawn.rs`) right after `mark_running`, so this is the
+    /// single insert site for "a detached worker is live". The matching clear
+    /// happens in `Drop`, which runs on EVERY exit path (success, failure,
+    /// cancel, panic-unwind).
     pub fn new(supervisor: Arc<TaskSupervisor>, task_id: String) -> Self {
+        mark_task_live(&task_id);
         Self {
             supervisor,
             task_id,
@@ -2987,6 +3066,11 @@ impl TaskTerminalGuard {
 
 impl Drop for TaskTerminalGuard {
     fn drop(&mut self) {
+        // fix/orphan-sweep-liveness-gate: clear the live-set entry FIRST so the
+        // task is no longer "live" the instant its worker future terminates —
+        // on every exit path, including panic-unwind. After this, a genuinely
+        // stale row from a later restart is correctly reapable.
+        clear_task_live(&self.task_id);
         // Only fire if the task is still active. For already-terminal tasks
         // this lookup short-circuits and we leave the recorded outcome
         // (Completed/Failed/Cancelled) untouched — and even if we raced and
@@ -6253,6 +6337,191 @@ mod tests {
         assert_eq!(
             task.error.as_deref(),
             Some("worker dropped before reaching terminal state"),
+        );
+    }
+
+    // ── Orphan-sweep liveness gate (fix/orphan-sweep-liveness-gate) ──
+    //
+    // The WS turn path rebuilds a BRAND-NEW per-turn `TaskSupervisor`
+    // every turn and calls `enable_persistence(...)` over the SHARED
+    // per-session ledger. `enable_persistence`'s orphan-sweep ASSUMES
+    // "non-terminal ⇒ no live worker", so it FALSELY marks a still-Running
+    // DETACHED spawn_only task (run_pipeline deep_research, up to ~3600s)
+    // as "orphaned across restart" — even though the worker is alive on the
+    // PREVIOUS turn's supervisor and will mark_completed shortly. The fix
+    // gates the sweep on a process-global live-set that survives the
+    // per-turn supervisor rebuild and is empty after a true cross-process
+    // restart.
+
+    /// RED→GREEN: a task in the process-global live-set + a `Running` row in
+    /// the shared ledger must NOT be swept as "orphaned across restart" by a
+    /// NEW supervisor's `enable_persistence`. Mirrors the real bug: turn N's
+    /// detached worker is alive (id in live-set) when turn N+1's fresh
+    /// supervisor opens the same ledger.
+    #[test]
+    fn live_detached_task_is_not_swept_as_orphan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Turn N: supervisor registers + runs a detached spawn_only task and
+        // persists a still-Running row.
+        let turn_n = TaskSupervisor::new();
+        turn_n.enable_persistence(&ledger_path).unwrap();
+        let id = turn_n.register("run_pipeline", "call-live-1", Some("api:sess"));
+        turn_n.mark_running(&id);
+
+        // The detached worker is alive: its id is in the process-global
+        // live-set (in production the TaskTerminalGuard inserts it).
+        mark_task_live(&id);
+        // RAII clear at scope end so the global set does not leak across tests.
+        struct ClearOnDrop<'a>(&'a str);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                clear_task_live(self.0);
+            }
+        }
+        let _clear = ClearOnDrop(&id);
+
+        // Turn N+1: a BRAND-NEW supervisor opens the SAME ledger. Pre-fix this
+        // sweep marks the still-Running row "orphaned across restart".
+        let turn_n1 = TaskSupervisor::new();
+        turn_n1.enable_persistence(&ledger_path).unwrap();
+
+        let restored = turn_n1.get_task(&id).expect("row restored");
+        assert_eq!(
+            restored.status,
+            TaskStatus::Running,
+            "a LIVE detached task (id in live-set) must NOT be swept as orphan",
+        );
+        assert_ne!(
+            restored.error.as_deref(),
+            Some("orphaned across restart"),
+            "live detached task must never carry the false-orphan reason",
+        );
+    }
+
+    /// A `Running` row whose id is NOT in the live-set (a true cross-process
+    /// restart: new process ⇒ empty live-set) is STILL reaped. Reaping
+    /// behaviour for genuinely-orphaned tasks is preserved.
+    #[test]
+    fn dead_task_not_in_live_set_is_still_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let writer = TaskSupervisor::new();
+        writer.enable_persistence(&ledger_path).unwrap();
+        let id = writer.register("run_pipeline", "call-dead-1", Some("api:sess"));
+        writer.mark_running(&id);
+        drop(writer);
+
+        // Simulate a true cross-process restart: the live-set is empty for
+        // this id (no live worker in this process). Defensive clear in case a
+        // prior test leaked the id.
+        clear_task_live(&id);
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let task = restored.get_task(&id).expect("row restored");
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "a dead task absent from the live-set must still be reaped",
+        );
+        assert_eq!(
+            task.error.as_deref(),
+            Some("orphaned across restart"),
+            "genuine orphan must still carry the standard reason",
+        );
+    }
+
+    /// The RAII drop-guard removes the id from the live-set when the worker
+    /// future completes/drops, so a finished task is not kept "live" forever
+    /// and a later genuine restart can reap a stale row.
+    #[test]
+    fn live_set_cleared_on_task_terminal() {
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("run_pipeline", "call-clear-1", Some("api:sess"));
+        supervisor.mark_running(&id);
+
+        {
+            // Constructing the guard (production: top of the spawn_only body)
+            // inserts the id into the live-set.
+            let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+            assert!(
+                is_task_live(&id),
+                "guard construction must mark the task live",
+            );
+            supervisor.mark_completed(&id, vec!["deck.pdf".to_string()]);
+            // Guard still in scope: id stays live until the worker future drops.
+            assert!(is_task_live(&id), "task stays live until the future drops");
+        }
+
+        // Drop ran (worker future terminated): id is cleared.
+        assert!(
+            !is_task_live(&id),
+            "guard Drop must clear the id from the live-set on every exit path",
+        );
+    }
+
+    /// Higher-level guard mirroring the real bug: turn-1 spawns a (mock) long
+    /// detached spawn_only task whose worker stays alive; turn-2 supervisor
+    /// rebuild + sweep does NOT orphan it; then the task completes normally.
+    #[tokio::test]
+    async fn turn_rebuild_does_not_orphan_live_detached_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Turn 1: register + spawn a detached worker (guarded), persist Running.
+        let turn1 = Arc::new(TaskSupervisor::new());
+        turn1.enable_persistence(&ledger_path).unwrap();
+        let id = turn1.register("run_pipeline", "call-real-bug", Some("api:sess"));
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker_sup = Arc::clone(&turn1);
+        let worker_id = id.clone();
+        let worker = tokio::spawn(async move {
+            worker_sup.mark_running(&worker_id);
+            // Production: TaskTerminalGuard armed right after mark_running.
+            let _guard = TaskTerminalGuard::new(Arc::clone(&worker_sup), worker_id.clone());
+            // Long detached work: block until the test releases us.
+            let _ = release_rx.await;
+            worker_sup.mark_completed(&worker_id, vec!["report.md".to_string()]);
+        });
+
+        // Spin until the worker has marked the task Running + live.
+        for _ in 0..1000 {
+            if is_task_live(&id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            is_task_live(&id),
+            "worker should be live before turn-2 sweep"
+        );
+
+        // Turn 2: a fresh per-turn supervisor opens the SAME ledger and sweeps.
+        let turn2 = TaskSupervisor::new();
+        turn2.enable_persistence(&ledger_path).unwrap();
+        let mid_turn = turn2.get_task(&id).expect("row restored on turn-2");
+        assert_ne!(
+            mid_turn.error.as_deref(),
+            Some("orphaned across restart"),
+            "turn-2 sweep must NOT falsely orphan the still-live detached task",
+        );
+
+        // The detached worker finishes normally and returns its artifact.
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+
+        let done = turn1.get_task(&id).expect("task");
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.output_files, vec!["report.md".to_string()]);
+        // Worker future dropped ⇒ live-set cleared.
+        assert!(
+            !is_task_live(&id),
+            "live-set cleared after the worker completes"
         );
     }
 }
