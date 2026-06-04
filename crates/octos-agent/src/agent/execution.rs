@@ -38,7 +38,10 @@ use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
-use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
+use crate::tools::{
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalRequester,
+    ToolContext, USER_QUESTION_CTX, UserQuestionRequester,
+};
 use crate::workspace_contract::{
     SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
 };
@@ -377,6 +380,23 @@ impl Agent {
         // consumers (pipeline workers, file tools, plugins) come online
         // in Phase 2.
         let session_scope = self.session_scope.clone();
+
+        // UPCR-2026-023 live-soak BUG 1: capture the per-turn human-blocking
+        // bridges (`TOOL_APPROVAL_CTX`, `USER_QUESTION_CTX`) HERE — in the turn
+        // task where they are still scoped — before the `tokio::spawn` below.
+        // tokio task-locals are NOT inherited across `tokio::spawn`, so without
+        // re-establishing them inside the spawned task a tool that reads either
+        // requester (`shell`/`edit_file` approval, `ask_user_question`) would
+        // find NONE and silently degrade (the live mini5 soak symptom: a valid
+        // `ask_user_question` call emitted its "no synchronous host response
+        // channel" text fallback even though the serve turn handler had
+        // installed a `SessionUserQuestionRequester`). `try_with` returns the
+        // `Arc` clone when scoped and `None` for a non-interactive turn (e.g.
+        // CLI / gateway batch), preserving the graceful-degradation contract.
+        let captured_approval_ctx: Option<std::sync::Arc<dyn ToolApprovalRequester>> =
+            TOOL_APPROVAL_CTX.try_with(std::sync::Arc::clone).ok();
+        let captured_user_question_ctx: Option<std::sync::Arc<dyn UserQuestionRequester>> =
+            USER_QUESTION_CTX.try_with(std::sync::Arc::clone).ok();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -1658,12 +1678,40 @@ impl Agent {
             // whose trait impl only overrides `execute` still work via the
             // default delegation path; migrated tools read the typed fields.
             // TOOL_CTX is still scoped for plugin tools that read the task-local.
-            let result = TOOL_CTX
-                .scope(
-                    ctx.clone(),
-                    tools.execute_with_context(&ctx, &tc_name, &effective_args),
-                )
-                .await;
+            //
+            // UPCR-2026-023 live-soak BUG 1: re-establish the per-turn
+            // human-blocking bridges (captured above before this `tokio::spawn`)
+            // INSIDE the spawned task so approval-gated tools (`shell`,
+            // `edit_file`, …) and `ask_user_question` see their requester via
+            // `try_with`. Without this, both the parallel (`join_all`) and
+            // serial dispatch paths — which BOTH run the tool through this
+            // `spawn_tool_task` `tokio::spawn` — would lose the task-local and
+            // the tool would degrade (approval denied / question text fallback).
+            // We scope each bridge ONLY when it was scoped in the parent
+            // (`Some(_)`), so a non-interactive turn (CLI / gateway batch with
+            // no requester) keeps the graceful-degradation path unchanged.
+            let exec_future = TOOL_CTX.scope(ctx.clone(), async {
+                tools
+                    .execute_with_context(&ctx, &tc_name, &effective_args)
+                    .await
+            });
+            let result = match (&captured_approval_ctx, &captured_user_question_ctx) {
+                (Some(approval), Some(question)) => {
+                    TOOL_APPROVAL_CTX
+                        .scope(
+                            approval.clone(),
+                            USER_QUESTION_CTX.scope(question.clone(), exec_future),
+                        )
+                        .await
+                }
+                (Some(approval), None) => {
+                    TOOL_APPROVAL_CTX.scope(approval.clone(), exec_future).await
+                }
+                (None, Some(question)) => {
+                    USER_QUESTION_CTX.scope(question.clone(), exec_future).await
+                }
+                (None, None) => exec_future.await,
+            };
 
             let duration = tool_start.elapsed();
 

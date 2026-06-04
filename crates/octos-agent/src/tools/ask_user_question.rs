@@ -32,8 +32,28 @@ const MIN_QUESTIONS: usize = 1;
 const MAX_QUESTIONS: usize = 4;
 const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 4;
-/// `header` is a short label; the spec caps it at 12 characters.
+/// `header` is a short label; the spec caps it at 12 characters. Over-long
+/// headers are TRUNCATED to this ceiling (not rejected) — see [`clamp_header`].
 const MAX_HEADER_CHARS: usize = 12;
+/// Ellipsis appended when a `header` is truncated. Counts toward the
+/// [`MAX_HEADER_CHARS`] budget so the final label never exceeds the ceiling.
+const HEADER_TRUNCATION_ELLIPSIS: char = '\u{2026}';
+
+/// Clamp a `header` to [`MAX_HEADER_CHARS`] on a char boundary, appending an
+/// ellipsis when truncation occurs. The ellipsis is counted INSIDE the budget
+/// so the returned label is always `<= MAX_HEADER_CHARS` characters. A header
+/// already within the limit is returned verbatim. Char-based (not byte-based)
+/// so multibyte labels ("颜色偏好…") clamp correctly.
+fn clamp_header(header: &str) -> String {
+    if header.chars().count() <= MAX_HEADER_CHARS {
+        return header.to_owned();
+    }
+    // Reserve one char for the ellipsis so the total stays within the ceiling.
+    let keep = MAX_HEADER_CHARS.saturating_sub(1);
+    let mut clamped: String = header.chars().take(keep).collect();
+    clamped.push(HEADER_TRUNCATION_ELLIPSIS);
+    clamped
+}
 
 /// Structured user-question tool (`ask_user_question`).
 #[derive(Debug, Default)]
@@ -70,20 +90,23 @@ fn parse_questions(args: &Value) -> Result<Vec<UserQuestion>> {
             .as_object()
             .ok_or_else(|| eyre!("ask_user_question: question {idx} must be an object"))?;
 
-        let header = entry
+        let header_raw = entry
             .get("header")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|h| !h.is_empty())
             .ok_or_else(|| {
                 eyre!("ask_user_question: question {idx} requires a non-empty `header`")
-            })?
-            .to_owned();
-        if header.chars().count() > MAX_HEADER_CHARS {
-            return Err(eyre!(
-                "ask_user_question: question {idx} `header` exceeds {MAX_HEADER_CHARS} characters"
-            ));
-        }
+            })?;
+        // Header length is a COSMETIC ceiling (the picker renders a short tab
+        // label). Real LLMs routinely send a longer descriptive header
+        // ("Favorite Color") — hard-failing there made the whole call fail and
+        // the agent degrade (live mini5 soak: a DeepSeek call with a 14-char
+        // header hard-erred, then the retry fell to the text fallback). Clamp
+        // it char-boundary-safe instead of rejecting so the request stays
+        // answerable. The truncation marker keeps the label readable when it
+        // overflows.
+        let header = clamp_header(header_raw);
 
         let question = entry
             .get("question")
@@ -217,11 +240,12 @@ impl Tool for AskUserQuestionTool {
 
     fn description(&self) -> &str {
         "Ask the user a structured multiple-choice question mid-turn and block on \
-         the answer. Carry 1-4 questions, each with a short `header` (<=12 chars), \
-         a `question`, 2-4 `options` (each `label` + `description`), and a \
-         `multi_select` flag. The user is always also offered a free-text \"Other\". \
-         Use this instead of guessing when a bounded choice would resolve an \
-         ambiguity (which framework, which file, opt-in to a cleanup)."
+         the answer. Carry 1-4 questions, each with a short `header` (kept to <=12 \
+         chars — a longer header is truncated, not rejected), a `question`, 2-4 \
+         `options` (each `label` + `description`), and a `multi_select` flag. The \
+         user is always also offered a free-text \"Other\". Use this instead of \
+         guessing when a bounded choice would resolve an ambiguity (which \
+         framework, which file, opt-in to a cleanup)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -257,7 +281,7 @@ impl Tool for AskUserQuestionTool {
                             "header": {
                                 "type": "string",
                                 "maxLength": MAX_HEADER_CHARS,
-                                "description": "Short label for the question (<=12 chars)."
+                                "description": "Short label for the question (kept to <=12 chars; a longer header is truncated server-side, not rejected)."
                             },
                             "question": {
                                 "type": "string",
@@ -560,11 +584,15 @@ mod tests {
         });
         assert!(tool.execute(&bad_options).await.is_err());
 
-        // Over-long header (> 12 chars).
-        let long_header = json!({
+        // NOTE: an over-long `header` is NOT a hard error — it is truncated.
+        // See `over_long_header_is_truncated_not_rejected`.
+
+        // Empty `header` (after trim) IS still a hard error — a question with no
+        // label is not answerable.
+        let empty_header = json!({
             "questions": [
                 {
-                    "header": "this-header-is-way-too-long",
+                    "header": "   ",
                     "question": "q?",
                     "options": [
                         { "label": "a", "description": "" },
@@ -573,6 +601,111 @@ mod tests {
                 }
             ]
         });
-        assert!(tool.execute(&long_header).await.is_err());
+        assert!(tool.execute(&empty_header).await.is_err());
+
+        // Empty option `label` IS still a hard error — an unlabeled option is
+        // not selectable.
+        let empty_label = json!({
+            "questions": [
+                {
+                    "header": "Pick",
+                    "question": "q?",
+                    "options": [
+                        { "label": "  ", "description": "" },
+                        { "label": "b", "description": "" }
+                    ]
+                }
+            ]
+        });
+        assert!(tool.execute(&empty_label).await.is_err());
+    }
+
+    #[test]
+    fn clamp_header_keeps_short_headers_verbatim() {
+        assert_eq!(clamp_header("Framework"), "Framework");
+        // Exactly at the ceiling is left untouched.
+        let exactly_12 = "abcdefghijkl";
+        assert_eq!(exactly_12.chars().count(), MAX_HEADER_CHARS);
+        assert_eq!(clamp_header(exactly_12), exactly_12);
+    }
+
+    #[test]
+    fn clamp_header_truncates_with_ellipsis_within_budget() {
+        // "Favorite Color" is 14 chars — the exact live-soak failure header.
+        let clamped = clamp_header("Favorite Color");
+        assert!(
+            clamped.chars().count() <= MAX_HEADER_CHARS,
+            "clamped header must fit the ceiling, got {} chars: {clamped:?}",
+            clamped.chars().count()
+        );
+        assert!(
+            clamped.ends_with(HEADER_TRUNCATION_ELLIPSIS),
+            "truncated header must end with the ellipsis marker: {clamped:?}"
+        );
+        // The kept prefix is the start of the original.
+        assert!(clamped.starts_with("Favorite Co"));
+    }
+
+    #[test]
+    fn clamp_header_is_char_boundary_safe_for_multibyte() {
+        // 颜色偏好选择题目 = 8 multibyte chars; build a >12-char multibyte header.
+        let header = "颜色偏好选择题目内容标签字段值"; // 13 chars
+        assert!(header.chars().count() > MAX_HEADER_CHARS);
+        let clamped = clamp_header(header);
+        assert!(clamped.chars().count() <= MAX_HEADER_CHARS);
+        // Must still be valid UTF-8 (no panic / no split codepoint).
+        assert!(clamped.is_char_boundary(clamped.len()));
+        assert!(clamped.ends_with(HEADER_TRUNCATION_ELLIPSIS));
+    }
+
+    #[tokio::test]
+    async fn over_long_header_is_truncated_not_rejected() {
+        // Real LLMs send descriptive headers longer than 12 chars. The tool
+        // must TRUNCATE (not reject) so the question stays answerable. We
+        // capture the validated request via a recording requester and assert
+        // the header was clamped to the ceiling.
+        let answer = vec![UserQuestionAnswer {
+            selected_labels: vec!["red".into()],
+            free_text: None,
+        }];
+        let requester = Arc::new(RecordingRequester {
+            captured: Mutex::new(None),
+            answer,
+        });
+        let requester_dyn: Arc<dyn UserQuestionRequester> = requester.clone();
+
+        let tool = AskUserQuestionTool::new();
+        let args = json!({
+            "questions": [
+                {
+                    "header": "Favorite Color",
+                    "question": "Which color do you prefer?",
+                    "options": [
+                        { "label": "red", "description": "" },
+                        { "label": "blue", "description": "" }
+                    ]
+                }
+            ]
+        });
+
+        let result = USER_QUESTION_CTX
+            .scope(requester_dyn, async move { tool.execute(&args).await })
+            .await
+            .expect("over-long header is truncated, not an error");
+        assert!(result.success);
+
+        let captured = requester
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured request");
+        let header = &captured.questions[0].header;
+        assert!(
+            header.chars().count() <= MAX_HEADER_CHARS,
+            "header must be truncated to the ceiling, got {} chars: {header:?}",
+            header.chars().count()
+        );
+        assert_eq!(header, &clamp_header("Favorite Color"));
     }
 }

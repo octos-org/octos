@@ -1625,7 +1625,11 @@ Structured field (governed by accepted `UPCR-2026-023`):
 
 - `questions`
   An array of 1–4 questions. Each question carries:
-  - `header` — short label, ≤ 12 characters.
+  - `header` — short label, ≤ 12 characters. An over-long header is
+    **truncated** to the limit (char-boundary safe, ellipsis-marked) server-side
+    rather than rejected, so a model that sends a descriptive header
+    ("Favorite Color") still gets a rendered picker (live-soak hardening
+    2026-06-04).
   - `question` — the question text.
   - `options` — an array of 2–4 options, each with `label` and `description`.
   - `multi_select` — `bool`; when `true` the user may select more than one
