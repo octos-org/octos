@@ -645,23 +645,13 @@ impl Tool for RunPipelineTool {
             ));
         let diags = crate::validate::diagnostics_with_context(&graph, &validation_context);
         if crate::validate::has_errors(&diags) {
-            let errors: Vec<_> = diags
-                .iter()
-                .filter(|d| d.severity == crate::validate::Severity::Error)
-                .map(|d| {
-                    format!(
-                        "{} (rule {}, {:?}): {}",
-                        d.rule_id.code(),
-                        d.rule,
-                        d.location,
-                        d.message
-                    )
-                })
-                .collect();
-            return Err(format!(
-                "pipeline validation failed:\n{}",
-                errors.join("\n")
-            ));
+            // codex pre-merge DO-NOT-SHIP: this spawn_only early-return is
+            // returned verbatim as a tool Message (agent execution.rs) BEFORE
+            // both the per-tool truncation AND the run_pipeline body/footer
+            // ceiling. An unbounded join of validation errors (many errors, or
+            // huge node IDs in a malformed DOT) would therefore emit an
+            // oversized tool result. Bound the message at the source.
+            return Err(format_bounded_preflight_errors(&diags));
         }
         Ok(())
     }
@@ -1467,9 +1457,93 @@ fn sanitize_dot(dot: &str) -> String {
     result
 }
 
+/// Max ERROR diagnostics included in a `pre_flight_validate` failure message,
+/// and the max bytes per formatted line. The preflight early-return bypasses
+/// both the per-tool truncation and the run_pipeline body/footer ceiling, so
+/// the message MUST be bounded here (codex pre-merge DO-NOT-SHIP). 50 lines x
+/// ~512 bytes (+ markers) keeps it well under any frame/result ceiling.
+const MAX_PREFLIGHT_ERRORS: usize = 50;
+const MAX_PREFLIGHT_ERR_LINE_BYTES: usize = 512;
+
+/// Format the ERROR-severity diagnostics into a BOUNDED `pipeline validation
+/// failed` message: at most [`MAX_PREFLIGHT_ERRORS`] lines, each truncated to
+/// [`MAX_PREFLIGHT_ERR_LINE_BYTES`] on a UTF-8 char boundary, with truncation
+/// markers so nothing is silently dropped. Provably small regardless of how
+/// many errors a malformed DOT produces or how large its node IDs are.
+fn format_bounded_preflight_errors(diags: &[crate::validate::LintDiagnostic]) -> String {
+    let errors: Vec<&crate::validate::LintDiagnostic> = diags
+        .iter()
+        .filter(|d| d.severity == crate::validate::Severity::Error)
+        .collect();
+    let total = errors.len();
+    let shown: Vec<String> = errors
+        .iter()
+        .take(MAX_PREFLIGHT_ERRORS)
+        .map(|d| {
+            let line = format!(
+                "{} (rule {}, {:?}): {}",
+                d.rule_id.code(),
+                d.rule,
+                d.location,
+                d.message
+            );
+            if line.len() <= MAX_PREFLIGHT_ERR_LINE_BYTES {
+                line
+            } else {
+                let mut end = MAX_PREFLIGHT_ERR_LINE_BYTES;
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...(+{} bytes)", &line[..end], line.len() - end)
+            }
+        })
+        .collect();
+    let mut msg = format!("pipeline validation failed:\n{}", shown.join("\n"));
+    if total > MAX_PREFLIGHT_ERRORS {
+        msg.push_str(&format!(
+            "\n...and {} more error(s) (truncated)",
+            total - MAX_PREFLIGHT_ERRORS
+        ));
+    }
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_error_message_is_bounded_for_many_errors_and_huge_ids() {
+        use crate::validate::{GraphLocation, LintDiagnostic, RuleId, Severity};
+        // 1000 ERROR diagnostics, each carrying a 200 KB node id + 200 KB
+        // message. The OLD unbounded `errors.join("\n")` would be hundreds of
+        // MB and (via the spawn_only preflight early-return) bypass every
+        // downstream ceiling. The bounded formatter must cap BOTH the line
+        // count and each line's length.
+        let huge = "x".repeat(200_000);
+        let diags: Vec<LintDiagnostic> = (0..1000)
+            .map(|_| LintDiagnostic {
+                rule: RuleId::Connectivity.number(),
+                rule_id: RuleId::Connectivity,
+                severity: Severity::Error,
+                location: GraphLocation::Node(huge.clone()),
+                message: huge.clone(),
+                fix_hint: None,
+            })
+            .collect();
+        let msg = format_bounded_preflight_errors(&diags);
+        assert!(
+            msg.len() < 64 * 1024,
+            "preflight failure message must be bounded, got {} bytes",
+            msg.len()
+        );
+        assert!(msg.starts_with("pipeline validation failed"));
+        assert!(
+            msg.contains("more error(s) (truncated)"),
+            "must mark the omitted-error count"
+        );
+        assert!(msg.contains("...(+"), "must mark per-line byte truncation");
+    }
     use crate::executor::NodeCost;
 
     /// Gap 3.1 — when a pipeline run reports per-node cost rows, the tool
