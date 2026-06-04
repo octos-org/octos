@@ -148,10 +148,14 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
-/// Reason recorded when a pending structured-question entry is cancelled
-/// because the `ask_user_question` tool's waiting future was dropped (timeout,
-/// interrupt, abort, panic, connection close) — UPCR-2026-023 drop-guard.
-const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
+/// Reason recorded when a pending structured-USER-QUESTION entry is cancelled
+/// because the `ask_user_question` tool's waiting future was dropped (turn
+/// interrupt/abort, panic, connection close) — UPCR-2026-023 drop-guard. This
+/// is the QUESTION-store reason and is intentionally distinct from the approval
+/// reasons (`APPROVAL_CANCELLED_REASON_*`): approvals keep their own audit
+/// reasons. The wire value stays `"waiter_dropped"` (used by both stores'
+/// drop-guards conceptually, but each store records it under its own const).
+const USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
 const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
@@ -3304,7 +3308,7 @@ impl Drop for PendingQuestionWaiterGuard {
         self.contracts.user_questions.cancel_pending_question(
             &self.session_id,
             &self.question_id,
-            APPROVAL_CANCELLED_REASON_WAITER_DROPPED,
+            USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED,
         );
     }
 }

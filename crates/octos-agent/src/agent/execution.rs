@@ -89,12 +89,14 @@ fn should_auto_send_tool_files(
 /// - `delegate_task` (`tools/delegate.rs`)
 /// - `search` (`tools/deep_search.rs`), `deep_crawl` (`tools/site_crawl.rs`)
 /// - `synthesize_research` (`tools/synthesize_research.rs`)
-/// - `ask_user_question` (`tools/ask_user_question.rs`) — a human-wait tool:
-///   it blocks on the requester until the client answers, exactly as the
-///   approval gate blocks. It must keep the long ceiling at the batch level
-///   (and is fully timeout-exempt at the registry dispatch boundary via
-///   `Tool::blocks_on_human_input`), so the short interactive default never
-///   kills the receiver and leaks the pending question store entry (#1).
+///
+/// NOTE: human-wait tools (`ask_user_question`) are deliberately NOT in this
+/// list. A batch containing one gets NO batch-level timeout at all (see
+/// [`compute_batch_timeout_secs`] / `any_human_wait`), so the long-vs-short
+/// classification never applies to it — wrapping it in even the 1800s ceiling
+/// would detach the still-running tool task and leak the pending question
+/// (UPCR-2026-023). They remain fully timeout-exempt at the registry dispatch
+/// boundary too, via `Tool::blocks_on_human_input`.
 const LONG_RUNNING_TOOLS: &[&str] = &[
     "shell",
     "bash",
@@ -107,7 +109,6 @@ const LONG_RUNNING_TOOLS: &[&str] = &[
     "deep_crawl",
     "site_crawl",
     "synthesize_research",
-    "ask_user_question",
 ];
 
 /// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
@@ -115,9 +116,25 @@ fn is_long_running_tool(name: &str) -> bool {
     LONG_RUNNING_TOOLS.contains(&name)
 }
 
-/// Compute the timeout (seconds) for a parallel/serial tool batch.
+/// Compute the timeout for a parallel/serial tool batch.
+///
+/// Returns `None` when the batch must run with NO finite batch-level timeout,
+/// and `Some(secs)` otherwise.
 ///
 /// Behaviour:
+/// - **Human-wait batch (UPCR-2026-023):** when `any_human_wait` is `true`
+///   (some tool in the batch reports [`crate::tools::Tool::blocks_on_human_input`],
+///   e.g. `ask_user_question`), return `None`. Such a batch MUST NOT be wrapped
+///   in `tokio::time::timeout`: a human may legitimately take longer than any
+///   finite ceiling, and firing the ceiling would detach the still-running tool
+///   task (its `JoinHandle` dropped, not awaited), so its
+///   `PendingQuestionWaiterGuard` never drops → the pending question leaks and
+///   is later replayed as a stale prompt after the turn moved on. Cleanup for a
+///   human-wait batch comes from the user answering (resolves the oneshot) or a
+///   turn interrupt/abort (the interrupt drains pending questions and aborts the
+///   turn task), NEVER from the batch timeout. NON-human-wait tools sharing the
+///   batch keep their own per-tool registry timeouts, applied INSIDE each tool's
+///   registry dispatch — unaffected by removing this outer wrap.
 /// - When the LLM requested a per-call `timeout_secs` (`llm_requested > 0`),
 ///   honour it: clamp to [`MAX_TOOL_TIMEOUT_SECS`] and floor at the batch's
 ///   default (so an explicit request never makes a batch flakier than its
@@ -128,20 +145,25 @@ fn is_long_running_tool(name: &str) -> bool {
 ///   shorter `interactive_default`.
 fn compute_batch_timeout_secs(
     tool_names: &[&str],
+    any_human_wait: bool,
     llm_requested: u64,
     config_tool_timeout: u64,
     interactive_default: u64,
-) -> u64 {
+) -> Option<u64> {
+    // A human-wait batch is unbounded at the batch layer — see the doc above.
+    if any_human_wait {
+        return None;
+    }
     let batch_default = if tool_names.iter().any(|n| is_long_running_tool(n)) {
         config_tool_timeout
     } else {
         interactive_default
     };
-    if llm_requested > 0 {
+    Some(if llm_requested > 0 {
         llm_requested.min(MAX_TOOL_TIMEOUT_SECS).max(batch_default)
     } else {
         batch_default
-    }
+    })
 }
 
 /// Issue #896 — spawn_only filename propagation (Layer 1).
@@ -1884,19 +1906,34 @@ impl Agent {
             .filter_map(|tc| tc.arguments.get("timeout_secs").and_then(|v| v.as_u64()))
             .max()
             .unwrap_or(0);
+        // UPCR-2026-023: a batch containing a human-wait tool
+        // (`ask_user_question`) must run with NO finite batch timeout — the
+        // human may take arbitrarily long, and a fired ceiling would detach the
+        // still-running tool task and leak the pending question (replayed later
+        // as a stale prompt). `compute_batch_timeout_secs` returns `None` for
+        // such a batch; the dispatch paths below branch on that. NON-human-wait
+        // peers keep their per-tool registry timeouts (applied inside each
+        // tool's registry dispatch), unaffected by skipping this outer wrap.
+        let any_human_wait = response
+            .tool_calls
+            .iter()
+            .any(|tc| self.tools.blocks_on_human_input(&tc.name));
+
         // mini5 soak fix: when the LLM omits `timeout_secs`, a batch of only
         // fast/interactive tools (e.g. `glob`, `list_dir`) defaults to the
         // short `default_interactive_tool_timeout_secs` instead of inheriting
         // the 1800s ceiling that hung the turn. A batch containing any
         // genuinely long-running tool keeps the long default; an explicit
-        // LLM-requested timeout is still honoured (clamped + floored).
+        // LLM-requested timeout is still honoured (clamped + floored). A
+        // human-wait batch yields `None` (no batch timeout at all).
         let tool_timeout_secs = compute_batch_timeout_secs(
             &tool_names,
+            any_human_wait,
             llm_requested_timeout,
             self.config.tool_timeout_secs,
             self.config.default_interactive_tool_timeout_secs,
         );
-        let tool_timeout = Duration::from_secs(tool_timeout_secs);
+        let tool_timeout = tool_timeout_secs.map(Duration::from_secs);
 
         let results: Vec<ToolCallResult> = if any_exclusive {
             // Serial admission: run each tool in LLM call order, bail out of
@@ -1925,15 +1962,33 @@ impl Agent {
                 })
                 .collect();
 
-            match tokio::time::timeout(tool_timeout, futures::future::join_all(handles)).await {
+            // UPCR-2026-023: a human-wait batch (`tool_timeout == None`) awaits
+            // `join_all` DIRECTLY, with no `tokio::time::timeout` wrap, so the
+            // human-wait tool task is never detached by a fired ceiling. It is
+            // unblocked by the user answering or by a turn interrupt/abort
+            // (which drains the pending question). All other batches keep the
+            // finite ceiling. `Ok(Vec<JoinResult>)` is mapped identically in
+            // both arms.
+            let join_outcome = match tool_timeout {
+                Some(dur) => tokio::time::timeout(dur, futures::future::join_all(handles))
+                    .await
+                    .map_err(|_| ()),
+                None => Ok(futures::future::join_all(handles).await),
+            };
+
+            match join_outcome {
                 Ok(results) => results
                     .into_iter()
                     .zip(response.tool_calls.iter())
                     .map(|(r, tc)| r.unwrap_or_else(|e| panic_result(tc, &e.to_string())))
                     .collect(),
-                Err(_) => {
+                Err(()) => {
+                    // Only reachable when `tool_timeout` was `Some` (a `None`
+                    // human-wait batch always yields `Ok`), so the seconds are
+                    // present for the diagnostic / synthetic-result message.
+                    let elapsed_secs = tool_timeout_secs.unwrap_or(0);
                     tracing::error!(
-                        timeout_secs = tool_timeout_secs,
+                        timeout_secs = elapsed_secs,
                         tool_count = response.tool_calls.len(),
                         tools = %tool_names.join(", "),
                         "tool execution timed out -- spawned tasks continue running for cleanup"
@@ -1945,7 +2000,7 @@ impl Agent {
                             role: MessageRole::Tool,
                             content: format!(
                                 "Tool '{}' timed out after {} seconds",
-                                tc.name, tool_timeout_secs
+                                tc.name, elapsed_secs
                             ),
                             media: vec![],
                             tool_calls: None,
@@ -2053,13 +2108,22 @@ impl Agent {
     /// single-call [`JoinHandle`] in `tokio::time::timeout`. A timeout on any
     /// one call fails that call and cascades to its peers the same way a
     /// regular error does.
+    ///
+    /// UPCR-2026-023: when the batch contains a human-wait tool the caller
+    /// passes `tool_timeout == None`; every call in the batch is then awaited
+    /// DIRECTLY with no `tokio::time::timeout` wrap, so the human-wait tool is
+    /// never detached by a fired ceiling. NON-human-wait peers in the same
+    /// (now-unbounded) batch keep their own per-tool registry timeouts, applied
+    /// inside `spawn_tool_task` → `ToolRegistry::execute_with_context`. Cleanup
+    /// of the human-wait call comes from the user answering or a turn
+    /// interrupt/abort draining the pending question — never from this wrap.
     async fn execute_serial_batch(
         &self,
         response: &ChatResponse,
         explicit_send_file_requested: bool,
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
-        tool_timeout: Duration,
-        tool_timeout_secs: u64,
+        tool_timeout: Option<Duration>,
+        tool_timeout_secs: Option<u64>,
     ) -> Vec<ToolCallResult> {
         let mut results: Vec<ToolCallResult> = Vec::with_capacity(response.tool_calls.len());
         let mut cancelled = false;
@@ -2080,7 +2144,18 @@ impl Agent {
             let handle =
                 self.spawn_tool_task(tool_call, explicit_send_file_requested, turn_attachment_ctx);
 
-            let outcome = match tokio::time::timeout(tool_timeout, handle).await {
+            // `None` (human-wait batch) awaits the handle directly — no finite
+            // wrap — so the human-wait call cannot be detached by a ceiling.
+            // The `Err(())` arm is unreachable in that case.
+            let join_outcome = match tool_timeout {
+                Some(dur) => match tokio::time::timeout(dur, handle).await {
+                    Ok(joined) => Ok(joined),
+                    Err(_) => Err(()),
+                },
+                None => Ok(handle.await),
+            };
+
+            let outcome = match join_outcome {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
                     tracing::warn!(
@@ -2090,9 +2165,10 @@ impl Agent {
                     );
                     panic_result(tool_call, &e.to_string())
                 }
-                Err(_) => {
+                Err(()) => {
+                    let elapsed_secs = tool_timeout_secs.unwrap_or(0);
                     tracing::error!(
-                        timeout_secs = tool_timeout_secs,
+                        timeout_secs = elapsed_secs,
                         tool = %tool_call.name,
                         tool_id = %tool_call.id,
                         "serial tool execution timed out"
@@ -2102,7 +2178,7 @@ impl Agent {
                             role: MessageRole::Tool,
                             content: format!(
                                 "Tool '{}' timed out after {} seconds",
-                                tool_call.name, tool_timeout_secs
+                                tool_call.name, elapsed_secs
                             ),
                             media: vec![],
                             tool_calls: None,
@@ -2392,10 +2468,6 @@ mod tests {
             "deep_crawl",
             "search",
             "synthesize_research",
-            // A human-wait tool must never be killed by the short
-            // interactive batch default — it blocks on the requester exactly
-            // like `shell`'s approval gate does (#1).
-            "ask_user_question",
         ] {
             assert!(
                 is_long_running_tool(name),
@@ -2405,18 +2477,80 @@ mod tests {
     }
 
     #[test]
-    fn batch_with_ask_user_question_keeps_the_long_ceiling() {
-        // A batch containing `ask_user_question` (a human-wait tool) must keep
-        // the long config default when the LLM omits `timeout_secs`, never the
-        // short interactive default that would kill the receiver and leak the
-        // pending store entry. Mirrors `shell`'s batch-level exemption.
+    fn human_wait_tool_is_not_in_long_running_set() {
+        // UPCR-2026-023: `ask_user_question` is NOT classified long-running.
+        // A batch containing it gets NO batch timeout at all (the
+        // `any_human_wait` short-circuit), so the long-vs-short ceiling never
+        // applies — wrapping it in even the 1800s ceiling would detach the
+        // still-running tool task and leak the pending question.
+        assert!(
+            !is_long_running_tool("ask_user_question"),
+            "ask_user_question must be handled by the any_human_wait no-timeout \
+             path, not the long-running ceiling"
+        );
+    }
+
+    #[test]
+    fn batch_with_human_wait_tool_has_no_batch_timeout() {
+        // UPDATED for UPCR-2026-023 (was `batch_with_ask_user_question_keeps_
+        // the_long_ceiling`, which asserted 1800s). A batch containing a
+        // human-wait tool must run with NO finite batch timeout: the previous
+        // 1800s ceiling, while long, would still eventually FIRE and detach the
+        // still-running `ask_user_question` task (its `JoinHandle` dropped, not
+        // awaited), so its `PendingQuestionWaiterGuard` never drops → the
+        // pending question leaks and is later replayed as a stale prompt. The
+        // human may take arbitrarily long; cleanup comes from the user
+        // answering or a turn interrupt/abort, never from the batch timeout.
         let secs = compute_batch_timeout_secs(
             &["ask_user_question"],
+            /* any_human_wait */ true,
             /* llm_requested */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
-        assert_eq!(secs, 1800);
+        assert_eq!(
+            secs, None,
+            "a human-wait batch must yield None (no finite batch timeout)"
+        );
+    }
+
+    #[test]
+    fn human_wait_batch_has_no_timeout_even_with_llm_requested_secs() {
+        // The `any_human_wait` short-circuit wins over an explicit
+        // LLM-requested `timeout_secs`: a human-wait tool is unbounded at the
+        // batch layer regardless of what the LLM asked for, so a bogus tiny or
+        // huge `timeout_secs` cannot reintroduce the detach/leak.
+        let secs = compute_batch_timeout_secs(
+            &["ask_user_question"],
+            /* any_human_wait */ true,
+            /* llm_requested */ 30,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, None);
+    }
+
+    #[test]
+    fn mixed_human_wait_batch_is_unbounded_normal_tool_keeps_per_tool_timeout() {
+        // A mixed batch (human-wait + a normal/long-running tool) is unbounded
+        // at the BATCH layer (None). The normal tool does NOT lose its bound —
+        // its per-tool registry timeout is applied INSIDE the tool's own
+        // registry dispatch (`ToolRegistry::execute_with_context`), which is
+        // untouched by removing the outer batch wrap. So the human-wait call
+        // waits for the human while the `shell` peer is still bounded by its
+        // registry-level ceiling.
+        let secs = compute_batch_timeout_secs(
+            &["ask_user_question", "shell"],
+            /* any_human_wait */ true,
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(
+            secs, None,
+            "a mixed human-wait batch is unbounded at the batch layer; \
+             normal peers keep their per-tool registry timeouts"
+        );
     }
 
     #[test]
@@ -2445,11 +2579,12 @@ mod tests {
         // 1800s tool ceiling that hung the turn.
         let secs = compute_batch_timeout_secs(
             &["list_dir", "glob"],
+            /* any_human_wait */ false,
             /* llm_requested */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
-        assert_eq!(secs, 120);
+        assert_eq!(secs, Some(120));
     }
 
     #[test]
@@ -2458,11 +2593,12 @@ mod tests {
         // config-default timeout when the LLM omits `timeout_secs`.
         let secs = compute_batch_timeout_secs(
             &["glob", "shell"],
+            /* any_human_wait */ false,
             /* llm_requested */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
-        assert_eq!(secs, 1800);
+        assert_eq!(secs, Some(1800));
     }
 
     #[test]
@@ -2472,16 +2608,22 @@ mod tests {
         // fast-only batch the floor is the interactive default, not 1800.
         let secs = compute_batch_timeout_secs(
             &["glob"],
+            /* any_human_wait */ false,
             /* llm_requested */ 300,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
-        assert_eq!(secs, 300);
+        assert_eq!(secs, Some(300));
 
         // Over-the-cap request is clamped to MAX_TOOL_TIMEOUT_SECS.
-        let capped =
-            compute_batch_timeout_secs(&["glob"], /* llm_requested */ 99_999, 1800, 120);
-        assert_eq!(capped, MAX_TOOL_TIMEOUT_SECS);
+        let capped = compute_batch_timeout_secs(
+            &["glob"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 99_999,
+            1800,
+            120,
+        );
+        assert_eq!(capped, Some(MAX_TOOL_TIMEOUT_SECS));
     }
 
     #[test]
@@ -2490,11 +2632,12 @@ mod tests {
         // LLM-requested value cannot make the batch flakier than baseline.
         let secs = compute_batch_timeout_secs(
             &["glob"],
+            /* any_human_wait */ false,
             /* llm_requested */ 5,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
-        assert_eq!(secs, 120);
+        assert_eq!(secs, Some(120));
     }
 
     #[test]
@@ -2503,10 +2646,11 @@ mod tests {
         // behaviour preserved).
         let secs = compute_batch_timeout_secs(
             &["shell"],
+            /* any_human_wait */ false,
             /* llm_requested */ 10,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
-        assert_eq!(secs, 1800);
+        assert_eq!(secs, Some(1800));
     }
 }

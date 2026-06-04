@@ -522,6 +522,25 @@ impl ToolRegistry {
             .unwrap_or_default()
     }
 
+    /// Whether the named tool blocks on human input (e.g. `ask_user_question`
+    /// awaiting the requester until the client answers). Mirrors
+    /// [`Tool::blocks_on_human_input`]; unknown tools report `false`.
+    ///
+    /// Used by the agent batch dispatcher (`agent::execution`) to detect a
+    /// human-wait batch and skip the finite batch-level `tokio::time::timeout`
+    /// wrap that would otherwise detach the still-running tool task after the
+    /// ceiling fired — leaking the pending-question store entry and replaying a
+    /// stale prompt after the turn moved on (UPCR-2026-023). The registry
+    /// dispatch boundary already exempts these tools via
+    /// [`Tool::blocks_on_human_input`]; this surfaces the same fact one layer
+    /// up so the outer batch wrap can be skipped too.
+    pub fn blocks_on_human_input(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|t| t.blocks_on_human_input())
+            .unwrap_or(false)
+    }
+
     /// Get tool specifications for the LLM, filtered by provider policy if set.
     /// Results are cached and invalidated when the registry is mutated.
     /// Codex round 2 P2: visibility-aware tool lookup.
