@@ -30,7 +30,7 @@ use crate::graph::{
     PipelineGraph, PipelineNode,
 };
 use crate::handler::{
-    CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler, ShellHandler,
+    CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler,
 };
 use crate::parser::parse_dot;
 use crate::validate;
@@ -2140,10 +2140,10 @@ impl PipelineExecutor {
         let codergen = self.build_codergen();
 
         registry.register(HandlerKind::Codergen, Arc::new(codergen));
-        registry.register(
-            HandlerKind::Shell,
-            Arc::new(ShellHandler::new(self.config.working_dir.clone())),
-        );
+        // The `shell` handler is intentionally NOT registered: shell is
+        // arbitrary code execution and is banned in pipelines (rule_23_no_shell
+        // rejects any such graph before execution). Leaving it unregistered is
+        // defense-in-depth — a `handler=shell` node has no handler to dispatch.
         registry.register(HandlerKind::Gate, Arc::new(GateHandler));
         registry.register(HandlerKind::Noop, Arc::new(NoopHandler));
         // DynamicParallel is handled directly in execute_graph, but needs a registry entry
