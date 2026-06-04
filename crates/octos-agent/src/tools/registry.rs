@@ -15,13 +15,13 @@ use crate::task_supervisor::TaskSupervisor;
 use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
-    ApplyPatchTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool, ConfigureToolTool,
-    DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool, ImageGenerationTool,
-    ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, ShellTool,
-    SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolLifecycle, ToolResult,
-    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ApplyPatchTool, AskUserQuestionTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool,
+    ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
+    ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
+    SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore,
+    ToolLifecycle, ToolResult, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
+    WaitAgentTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -1298,6 +1298,9 @@ impl ToolRegistry {
         registry.register(WriteStdinTool);
         registry.register(UpdatePlanTool);
         registry.register(RequestUserInputTool);
+        // UPCR-2026-023: structured AskUserQuestion. The synchronous,
+        // answer-routed superset of `request_user_input`.
+        registry.register(AskUserQuestionTool::new());
         registry.register(SpawnAgentTool::new());
         // #1172: Codex-compatible `delegate` one-call wrapper. The default
         // instance has no spawn_agent bound — `register("spawn")` swaps

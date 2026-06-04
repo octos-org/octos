@@ -353,6 +353,53 @@ tokio::task_local! {
     pub static TOOL_APPROVAL_CTX: Arc<dyn ToolApprovalRequester>;
 }
 
+/// Request emitted by the `ask_user_question` tool when it asks the user a
+/// structured multiple-choice question mid-turn (UPCR-2026-023).
+///
+/// Mirrors [`ToolApprovalRequest`]: a typed payload the
+/// [`UserQuestionRequester`] surfaces to the attached client, blocking the
+/// tool on a oneshot until the client answers. `questions` is already
+/// validated (1..=4 questions, 2..=4 options each); `title`/`body` are the
+/// mandatory generic fallback text a non-structured client renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionRequest {
+    pub questions: Vec<octos_core::ui_protocol::UserQuestion>,
+    pub title: String,
+    pub body: String,
+}
+
+/// Outcome returned to the blocked `ask_user_question` tool after client
+/// handling (UPCR-2026-023). Mirrors [`ToolApprovalDecision`] but carries the
+/// structured per-question answers and distinguishes a cancelled turn from an
+/// unsupported client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserQuestionOutcome {
+    /// The client answered; one entry per question, in question order.
+    Answered(Vec<octos_core::ui_protocol::UserQuestionAnswer>),
+    /// The turn was interrupted / the pending question drained before an
+    /// answer arrived. The tool returns a cancelled result.
+    Cancelled,
+    /// No capable client was attached for this turn; the tool degrades to the
+    /// structured-metadata fallback (§4.4).
+    Unsupported,
+}
+
+/// Async user-question bridge provided by clients that negotiated
+/// `user_question.v1` (UPCR-2026-023). Mirrors [`ToolApprovalRequester`]:
+/// scoped per-turn via [`USER_QUESTION_CTX`] so the `ask_user_question` tool
+/// can block on a oneshot until `user_question/respond` resolves it.
+#[async_trait]
+pub trait UserQuestionRequester: Send + Sync {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome;
+}
+
+tokio::task_local! {
+    /// Optional task-local user-question bridge scoped around a turn by
+    /// interactive clients that negotiated `user_question.v1`. When unset the
+    /// `ask_user_question` tool degrades gracefully (no hard block).
+    pub static USER_QUESTION_CTX: Arc<dyn UserQuestionRequester>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnAttachmentContext {
     pub attachment_paths: Vec<String>,
@@ -669,6 +716,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod ask_user_question;
 pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
@@ -711,6 +759,7 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use ask_user_question::AskUserQuestionTool;
 pub use coding_tools::{
     ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
     ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,

@@ -21,6 +21,7 @@ use futures::{SinkExt, StreamExt};
 use octos_agent::{
     Agent, BackgroundResultKind, BackgroundResultPayload, PromptContextManager, PromptContextPhase,
     PromptContextReport, PromptContextRequest, ToolApprovalDecision, ToolApprovalRequest,
+    UserQuestionOutcome, UserQuestionRequest,
 };
 use octos_core::app_ui_codec::{self, AppUiFrame, MAX_TEXT_FRAME_BYTES};
 use octos_core::ui_protocol::{
@@ -54,13 +55,14 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
-    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
-    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
-    approval_kinds, hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
@@ -106,6 +108,7 @@ use super::ui_protocol_progress::{
     ProgressMappingContext, UiProgressMapping, background_task_to_progress_json, map_progress_json,
     replay_task_updated_notification,
 };
+use super::ui_protocol_questions::PendingQuestionStore;
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
 use super::ui_protocol_task_output;
@@ -667,6 +670,10 @@ impl WsConnection {
 #[derive(Default)]
 struct UiProtocolContractStores {
     approvals: PendingApprovalStore,
+    /// UPCR-2026-023: pending structured user-questions, keyed by
+    /// `question_id`. Mirrors `approvals`; the blocked `ask_user_question`
+    /// tool awaits a oneshot resolved by `user_question/respond`.
+    user_questions: PendingQuestionStore,
     /// Lazily-initialized pending diff-preview store. With a `data_dir`
     /// the first call hydrates from disk and subsequent inserts
     /// write-ahead before returning, so `diff/preview/get` survives
@@ -1007,6 +1014,12 @@ struct ConnectionUiFeatures {
     review_start_v1: bool,
     /// M16 backend-owned context generation/checkpoint/compaction lifecycle.
     context_lifecycle_v1: bool,
+    /// UPCR-2026-023 `user_question.v1` negotiated. When set, the connection's
+    /// turn task installs a [`SessionUserQuestionRequester`] so the agent's
+    /// `ask_user_question` tool blocks on `user_question/respond`. When unset,
+    /// the requester is not installed and the tool degrades to its
+    /// structured-metadata fallback.
+    user_question_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -1086,6 +1099,7 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             ),
+            user_question_v1: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -1112,6 +1126,7 @@ impl ConnectionUiFeatures {
             coding_loop_runtime_v1: true,
             review_start_v1: true,
             context_lifecycle_v1: true,
+            user_question_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -1148,6 +1163,7 @@ impl ConnectionUiFeatures {
             coding_loop_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
             review_start_v1: has(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
             context_lifecycle_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
+            user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             header_present: true,
             stdio_transport,
         }
@@ -1223,6 +1239,9 @@ impl ConnectionUiFeatures {
         }
         if self.review_start_v1 {
             requested.push(UI_PROTOCOL_FEATURE_REVIEW_START_V1);
+        }
+        if self.user_question_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_USER_QUESTION_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -3204,6 +3223,72 @@ fn cancel_approval_after_request_send_failure(
     );
 }
 
+/// UPCR-2026-023 bridge: implements the agent's [`UserQuestionRequester`]
+/// trait by minting a `question_id`, parking the request in the
+/// [`PendingQuestionStore`], emitting `user_question/requested`, and awaiting
+/// the oneshot the `user_question/respond` handler resolves. Mirrors
+/// [`UiProtocolApprovalRequester`] end-to-end.
+///
+/// The requester is gated on the connection negotiating `user_question.v1`:
+/// when the feature is NOT negotiated this requester is never installed (the
+/// task-local stays unset), so the `ask_user_question` tool degrades to its
+/// structured-metadata fallback and the turn never hard-blocks.
+struct SessionUserQuestionRequester {
+    ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
+    contracts: Arc<UiProtocolContractStores>,
+    session_id: SessionKey,
+    turn_id: TurnId,
+}
+
+#[async_trait::async_trait]
+impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
+        let question_id = octos_core::ui_protocol::QuestionId::new();
+        let event = UserQuestionRequestedEvent {
+            session_id: self.session_id.clone(),
+            topic: self.session_id.topic().map(ToOwned::to_owned),
+            question_id: question_id.clone(),
+            turn_id: self.turn_id.clone(),
+            title: request.title,
+            body: request.body,
+            questions: request.questions,
+        };
+
+        let response_rx = self.contracts.user_questions.request_runtime(event.clone());
+
+        // The event is durable: if the WS drop strands the request, the ledger
+        // still records it and a reconnecting client can rehydrate. We cancel
+        // the pending entry and degrade to the fallback so the turn continues
+        // rather than hanging on a dead channel.
+        if let Err(err) = send_notification_durable(
+            &self.ws,
+            &self.ledger,
+            UiNotification::UserQuestionRequested(event),
+        ) {
+            self.contracts.user_questions.cancel_pending_question(
+                &self.session_id,
+                &question_id,
+                APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED,
+            );
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                error = ?err,
+                "user_question/requested notification not delivered; degrading to fallback"
+            );
+            return UserQuestionOutcome::Unsupported;
+        }
+
+        // This is the await boundary: the turn stays paused until the client
+        // answers via user_question/respond (resolves the oneshot) or the turn
+        // is interrupted (cancel_pending_for_turn drops the sender → Err).
+        match response_rx.await {
+            Ok(answers) => UserQuestionOutcome::Answered(answers),
+            Err(_) => UserQuestionOutcome::Cancelled,
+        }
+    }
+}
+
 fn approval_event_from_tool_request(
     request: ToolApprovalRequest,
     session_id: SessionKey,
@@ -3737,6 +3822,10 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::UserQuestionRespond(params) => {
+                handle_user_question_respond(&ws, &contracts, connection_profile_id, id, params)
+                    .await;
+            }
             UiCommand::DiffPreviewGet(params) => {
                 let store = diff_preview_store(&state, contracts.as_ref()).await;
                 handle_diff_preview_get(&ws, store.as_ref(), connection_profile_id, id, params)
@@ -3995,6 +4084,7 @@ async fn ui_protocol_connection(
         &contracts.scopes,
         &ledger,
         &contracts.approvals,
+        &contracts.user_questions,
     )
     .await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
@@ -4231,6 +4321,16 @@ where
                 handle_approval_scopes_list(
                     &ws,
                     &contracts.scopes,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::UserQuestionRespond(params) => {
+                handle_user_question_respond(
+                    &ws,
+                    &contracts,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4690,6 +4790,7 @@ async fn cleanup_stdio_connection_resources(
         &contracts.scopes,
         ledger,
         &contracts.approvals,
+        &contracts.user_questions,
     )
     .await;
     abort_live_forwarders(live_forwarders, ledger).await;
@@ -7571,6 +7672,11 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE => {
             Some(features.auxiliary_rest_to_ws_v1)
         }
+        // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
+        // that did not negotiate `user_question.v1` never received a
+        // `user_question/requested`, so it has nothing to answer; reject the
+        // method outright instead of routing a forged response.
+        octos_core::ui_protocol::methods::USER_QUESTION_RESPOND => Some(features.user_question_v1),
         _ => None,
     };
     if let Some(false) = strict_gated {
@@ -10330,6 +10436,46 @@ async fn handle_approval_respond(
             );
         }
     }
+}
+
+/// UPCR-2026-023 `user_question/respond` handler. Mirrors
+/// [`handle_approval_respond`]: validate session scope, resolve the pending
+/// question's oneshot (typed `user_question_unknown` / `user_question_stale`
+/// on miss), and return the ack result.
+async fn handle_user_question_respond(
+    ws: &WsConnection,
+    contracts: &Arc<UiProtocolContractStores>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: UserQuestionRespondParams,
+) {
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+
+    let outcome = match contracts.user_questions.respond_with_context(&params) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+
+    let result = match serde_json::to_value(&outcome.result) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!(
+                    "failed to serialize user_question/respond result: {error}"
+                )),
+            );
+            return;
+        }
+    };
+    let _ = send_rpc_result(ws, id, result);
 }
 
 async fn handle_approval_scopes_list(
@@ -17023,6 +17169,20 @@ async fn run_standalone_turn(
             turn_id: turn_id.clone(),
             features,
         });
+    // UPCR-2026-023: install the structured-user-question bridge ONLY when the
+    // connection negotiated `user_question.v1`. When unset the task-local stays
+    // empty, so the agent's `ask_user_question` tool degrades to its
+    // structured-metadata fallback and the turn never hard-blocks.
+    let user_question_requester: Option<Arc<dyn octos_agent::UserQuestionRequester>> =
+        features.user_question_v1.then(|| {
+            Arc::new(SessionUserQuestionRequester {
+                ws: ws.clone(),
+                ledger: ledger.clone(),
+                contracts: contracts.clone(),
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            }) as Arc<dyn octos_agent::UserQuestionRequester>
+        });
     // PR F (M8.10): capture the originating `TurnId` as a string so the
     // tokio::spawn closure (which moves everything it touches) can pre-stamp
     // each persisted Assistant/Tool message with the correct thread_id.
@@ -17127,14 +17287,30 @@ async fn run_standalone_turn(
         // recurses through the agent loop. Lane and router contexts
         // are orthogonal — lane filters slot eligibility, router
         // context attributes failover events.
+        // UPCR-2026-023: nest the user-question task-local INSIDE the approval
+        // scope, mirroring how `TOOL_APPROVAL_CTX` wraps the turn. The two are
+        // orthogonal blocking bridges. The scope is installed only when the
+        // connection negotiated `user_question.v1` (`user_question_requester`
+        // is `Some`); otherwise the agent's `ask_user_question` tool sees no
+        // requester and degrades to its structured-metadata fallback.
+        let message_future = request_agent.process_message(&prompt, &history, turn_media_paths);
+        let scoped_message_future: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = eyre::Result<octos_agent::ConversationResponse>>
+                    + Send,
+            >,
+        > = match user_question_requester {
+            Some(requester) => {
+                Box::pin(octos_agent::tools::USER_QUESTION_CTX.scope(requester, message_future))
+            }
+            None => Box::pin(message_future),
+        };
         let result = octos_llm::with_router_context(
             router_ctx,
             octos_llm::with_lane_context(
                 lane_ctx,
-                octos_agent::tools::TOOL_APPROVAL_CTX.scope(
-                    approval_requester,
-                    request_agent.process_message(&prompt, &history, turn_media_paths),
-                ),
+                octos_agent::tools::TOOL_APPROVAL_CTX
+                    .scope(approval_requester, scoped_message_future),
             ),
         )
         .await;
@@ -17868,6 +18044,17 @@ async fn run_standalone_turn(
                 )),
             );
         }
+        // UPCR-2026-023: drain pending structured user-questions for the
+        // interrupted turn, mirroring the approval drain. Dropping each
+        // oneshot resolves the blocked `ask_user_question` tool to a
+        // `Cancelled` outcome; the turn then terminates via the
+        // `turn/error code=interrupted` emitted below (Phase-1 reuses the
+        // terminal path rather than a dedicated question-cancelled signal).
+        contracts.user_questions.cancel_pending_for_turn(
+            &session_id,
+            &turn_id,
+            approval_cancelled_reasons::TURN_INTERRUPTED,
+        );
         // Handler is awaiting our terminal emission + ack. Emit exactly once.
         try_emit_terminal(
             &turn_state,
@@ -18936,6 +19123,7 @@ async fn abort_connection_turns(
     scopes: &ScopePolicy,
     ledger: &UiProtocolLedger,
     approvals: &PendingApprovalStore,
+    user_questions: &PendingQuestionStore,
 ) {
     let turns = std::mem::take(&mut *connection_turns.lock().await);
     if turns.is_empty() {
@@ -18996,6 +19184,14 @@ async fn abort_connection_turns(
                 },
             ));
         }
+        // UPCR-2026-023: also drain pending structured user-questions for the
+        // aborted turn so a reconnect doesn't re-show a question for a dead
+        // turn and the blocked `ask_user_question` tool unblocks (Cancelled).
+        user_questions.cancel_pending_for_turn(
+            &session_id,
+            &turn_id,
+            approval_cancelled_reasons::TURN_INTERRUPTED,
+        );
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
         // outlive the WebSocket. Per M9-FIX-06 § "Out of scope", an explicit
@@ -20286,6 +20482,10 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ApprovalAutoResolved(_)
             | UiNotification::ApprovalDecided(_)
             | UiNotification::ApprovalCancelled(_)
+            // UPCR-2026-023: structured user-questions are non-cursor-bearing
+            // (like approval/requested); the durable ledger cursor on the
+            // surrounding LedgeredUiProtocolEvent is authoritative for replay.
+            | UiNotification::UserQuestionRequested(_)
             | UiNotification::TaskUpdated(_)
             // TaskOutputDelta carries an `OutputCursor`, not a `UiCursor`.
             | UiNotification::TaskOutputDelta(_)
@@ -20404,7 +20604,7 @@ mod tests {
         ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
         DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-        approval_scopes, methods, rpc_error_codes,
+        QuestionId, approval_scopes, methods, rpc_error_codes,
     };
 
     fn local_profile_state(dir: &Path) -> AppState {
@@ -20523,6 +20723,11 @@ mod tests {
                 "decision": "approve",
             }),
             methods::APPROVAL_SCOPES_LIST => json!({ "session_id": session_id }),
+            methods::USER_QUESTION_RESPOND => json!({
+                "session_id": session_id,
+                "question_id": QuestionId::new(),
+                "answers": [{ "selected_labels": ["axum"] }],
+            }),
             methods::PERMISSION_PROFILE_LIST => json!({ "session_id": session_id }),
             methods::PERMISSION_PROFILE_SET => json!({
                 "session_id": session_id,
@@ -24412,6 +24617,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -24473,6 +24679,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -24579,6 +24786,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -24640,6 +24848,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -24694,6 +24903,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -24791,6 +25001,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -26578,6 +26789,7 @@ ignore = []
                 coding_loop_runtime_v1: false,
                 review_start_v1: false,
                 context_lifecycle_v1: false,
+                user_question_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -28599,12 +28811,14 @@ ignore = []
         let scopes = ScopePolicy::default();
         let ledger = UiProtocolLedger::new(16);
         let approvals = PendingApprovalStore::default();
+        let user_questions = PendingQuestionStore::default();
         abort_connection_turns(
             &active_turns,
             &connection_turns,
             &scopes,
             &ledger,
             &approvals,
+            &user_questions,
         )
         .await;
 
