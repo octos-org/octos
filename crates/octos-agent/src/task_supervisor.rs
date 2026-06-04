@@ -1323,20 +1323,32 @@ impl TaskSupervisor {
             // live-set. Gating solely on `is_task_live(&task.id)` therefore
             // protects the live parent yet still falsely reaps its active
             // children. Collect the `tool_call_id` of every currently-live
-            // task so the sweep can exempt the whole family: while a parent
-            // worker is live it OWNS its tool_call_id family (it drives the
-            // children to terminal, or cascade-fails them on its own timeout
-            // via `mark_descendants_failed`), so none of them is an orphan.
-            // `tool_call_id`s are unique per LLM tool call (synthesized ids are
-            // process-unique), so the only rows sharing a live tcid are that
-            // parent and its pipeline children — no unrelated task is exempted.
-            // Empty tcids are skipped so an id-less row cannot blanket-exempt
-            // every other empty-tcid row.
+            // task so the sweep can exempt the children: while a parent worker
+            // is live it OWNS its tool_call_id family (it drives the children
+            // to terminal, or cascade-fails them on its own timeout via
+            // `mark_descendants_failed`), so none of them is an orphan. Empty
+            // tcids are skipped so an id-less row cannot blanket-exempt every
+            // other empty-tcid row.
             let live_tool_call_ids: HashSet<&str> = tasks
                 .values()
                 .filter(|task| !task.tool_call_id.is_empty() && is_task_live(&task.id))
                 .map(|task| task.tool_call_id.as_str())
                 .collect();
+
+            // True for a row that is live-by-proxy: a `pipeline:<node>` child
+            // whose live parent shares its `tool_call_id`. Synthesized
+            // `tool_call_id`s are process-unique (codex round-3/4 made Gemini +
+            // inline-invoke so), and native provider ids are unique, so the
+            // only rows sharing a live tcid are that parent and its pipeline
+            // children. The `pipeline:` guard is defense-in-depth: it bounds
+            // the proxy-exemption to genuine pipeline nodes, so even a FUTURE
+            // non-unique producer could at worst spare a stray `pipeline:` row,
+            // never an arbitrary dead task. The live parent itself is exempted
+            // by its own unique id below, not by this proxy.
+            let is_live_pipeline_child = |task: &BackgroundTask| {
+                task.tool_name.starts_with("pipeline:")
+                    && live_tool_call_ids.contains(task.tool_call_id.as_str())
+            };
 
             tasks
                 .values()
@@ -1344,16 +1356,16 @@ impl TaskSupervisor {
                 // precondition instead of assuming it. A still-live DETACHED
                 // spawn_only worker (alive on a prior per-turn supervisor in
                 // THIS process) is in the process-global live-set, so it is
-                // NEVER swept — its own worker will drive it terminal. A child
-                // of such a worker is live-by-proxy (it shares the live
-                // parent's tool_call_id) and is likewise exempt. A genuinely
-                // dead task from a true cross-process restart is absent from
-                // the live-set (new process ⇒ empty set) and shares no live
-                // tcid ⇒ still correctly reaped below.
+                // NEVER swept — its own worker will drive it terminal. A
+                // pipeline child of such a worker is live-by-proxy and is
+                // likewise exempt. A genuinely dead task from a true
+                // cross-process restart is absent from the live-set (new
+                // process ⇒ empty set) and shares no live tcid ⇒ still
+                // correctly reaped below.
                 .filter(|task| {
                     !is_terminal_runtime_state(&task.runtime_state)
                         && !is_task_live(&task.id)
-                        && !live_tool_call_ids.contains(task.tool_call_id.as_str())
+                        && !is_live_pipeline_child(task)
                 })
                 .map(|task| {
                     (
@@ -6652,6 +6664,52 @@ mod tests {
             restored.get_task(&child).expect("child").status,
             TaskStatus::Failed,
             "dead pipeline child must still be reaped when no parent is live",
+        );
+    }
+
+    /// Defense-in-depth (codex round-4): the proxy-exemption is bounded to
+    /// `pipeline:<node>` rows. Even if a future non-unique producer let an
+    /// UNRELATED dead task collide on a live task's `tool_call_id`, that dead
+    /// task — being a NON-pipeline tool — must still be reaped. Only genuine
+    /// pipeline children may be spared by proxy; the live owner is spared by
+    /// its own unique id, not by sharing a tcid.
+    #[test]
+    fn non_pipeline_task_sharing_live_tcid_is_still_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let turn_n = TaskSupervisor::new();
+        turn_n.enable_persistence(&ledger_path).unwrap();
+        // A live detached parent.
+        let live = turn_n.register("run_pipeline", "call-collide", Some("api:sess"));
+        turn_n.mark_running(&live);
+        // A SEPARATE, genuinely-dead NON-pipeline task that (hypothetically)
+        // collides on the same tcid — simulating a future non-unique producer.
+        let dead = turn_n.register("tts", "call-collide", Some("api:sess"));
+        turn_n.mark_running(&dead);
+
+        mark_task_live(&live);
+        struct ClearOnDrop<'a>(&'a str);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                clear_task_live(self.0);
+            }
+        }
+        let _clear = ClearOnDrop(&live);
+
+        let turn_n1 = TaskSupervisor::new();
+        turn_n1.enable_persistence(&ledger_path).unwrap();
+
+        assert_eq!(
+            turn_n1.get_task(&live).expect("live").status,
+            TaskStatus::Running,
+            "the live task is exempt via its own unique id",
+        );
+        assert_eq!(
+            turn_n1.get_task(&dead).expect("dead").status,
+            TaskStatus::Failed,
+            "a NON-pipeline task sharing a live tcid must still be reaped \
+             (proxy-exemption is bounded to pipeline children)",
         );
     }
 }
