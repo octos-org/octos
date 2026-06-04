@@ -17,6 +17,38 @@ use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::{
     ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-global monotonic counter for synthesizing Gemini tool-call ids.
+///
+/// Gemini's API returns `functionCall` parts WITHOUT a call id — it matches
+/// `functionResponse` parts back by function NAME, not by id (see the
+/// `MessageRole::Tool` arm of `to_gemini_contents`, which resolves the name
+/// from a `tool_call_id → name` map). The synthesized id is therefore purely
+/// octos-internal correlation, but it MUST be process-unique: it becomes
+/// `BackgroundTask::tool_call_id`, and several long-lived per-session
+/// structures key on it — `TaskSupervisor`'s synth-ack set (commit 9e972d8a),
+/// the `mark_descendants_failed` pipeline cascade, and the orphan-sweep
+/// liveness gate's tool_call_id-family exemption (fix/orphan-sweep-liveness-
+/// gate). A POSITIONAL `call_{index}` resets every response, so two unrelated
+/// tool calls in different turns both get `call_0`, which (a) could match a
+/// stale synth-ack and fire an unwarranted recovery turn, and (b) lets a live
+/// task's tcid falsely exempt a genuinely-dead task from orphan reaping. A
+/// process-global monotonic counter never repeats within the process.
+///
+/// octos-agent's empty-id fallback (`streaming.rs`) uses the same scheme with
+/// a distinct `call_synth_` prefix; the `call_gemini_` prefix here keeps the
+/// two synthesized id spaces disjoint even if one session ever switched
+/// providers mid-conversation.
+static GEMINI_TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Mint the next process-unique synthesized Gemini tool-call id.
+fn next_gemini_tool_call_id() -> String {
+    format!(
+        "call_gemini_{}",
+        GEMINI_TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// Google Gemini provider.
 pub struct GeminiProvider {
@@ -157,7 +189,7 @@ impl LlmProvider for GeminiProvider {
                     let metadata = thought_signature
                         .map(|sig| serde_json::json!({ "thought_signature": sig }));
                     tool_calls.push(octos_core::ToolCall {
-                        id: format!("call_{}", tool_calls.len()),
+                        id: next_gemini_tool_call_id(),
                         name: function_call.name,
                         arguments: function_call.args,
                         metadata,
@@ -716,7 +748,7 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                             .map(|s| serde_json::json!({ "thought_signature": s }));
                         events.push(StreamEvent::ToolCallDelta {
                             index: state.tool_count,
-                            id: Some(format!("call_{}", state.tool_count)),
+                            id: Some(next_gemini_tool_call_id()),
                             name: Some(name),
                             arguments_delta: args.to_string(),
                         });
@@ -1036,6 +1068,55 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Done(StopReason::ToolUse)))
+        );
+    }
+
+    fn first_tool_call_id(events: Vec<StreamEvent>) -> String {
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                StreamEvent::ToolCallDelta { id, .. } => id,
+                _ => None,
+            })
+            .expect("a ToolCallDelta carrying an id")
+    }
+
+    /// Regression (codex round-3 / fix/orphan-sweep-liveness-gate): Gemini
+    /// synthesizes tool-call ids (its API supplies none — it matches results
+    /// by function name). Those ids MUST be PROCESS-UNIQUE, not positional. A
+    /// positional `call_{index}` resets every response, so two unrelated tool
+    /// calls in different turns both get `call_0` — colliding in the
+    /// supervisor's per-session synth-ack set and the orphan-sweep
+    /// tool_call_id-family exemption (a live task's tcid would then falsely
+    /// exempt a genuinely-dead task from reaping). Two independent SSE
+    /// responses (each a fresh state with tool_count back at 0) must mint
+    /// disjoint ids.
+    #[test]
+    fn synthesized_gemini_tool_call_ids_are_unique_across_responses() {
+        let fc = r#"{"candidates": [{"content": {"parts": [{"functionCall": {"name": "search", "args": {}}}]}}]}"#;
+
+        let mut resp1 = GeminiStreamState::default();
+        let id1 = first_tool_call_id(map_gemini_sse(
+            &mut resp1,
+            &crate::sse::SseEvent {
+                event: None,
+                data: fc.into(),
+            },
+        ));
+
+        let mut resp2 = GeminiStreamState::default();
+        let id2 = first_tool_call_id(map_gemini_sse(
+            &mut resp2,
+            &crate::sse::SseEvent {
+                event: None,
+                data: fc.into(),
+            },
+        ));
+
+        assert!(id1.starts_with("call_gemini_"), "got {id1}");
+        assert_ne!(
+            id1, id2,
+            "synthesized ids must be process-unique across responses, not positional",
         );
     }
 
