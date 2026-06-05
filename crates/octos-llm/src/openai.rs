@@ -74,21 +74,23 @@ impl ModelHints {
         let fixed_temperature =
             is_o_series || m.starts_with("gpt-5") || m.contains("kimi-k2") || m == "gpt-4.1-nano";
 
-        let lacks_vision = m.starts_with("deepseek")
-            || m.starts_with("minimax")
-            || m.contains("codestral")
-            || m.starts_with("mistral")
-            || m.starts_with("yi-")
-            // 2026-05-18: kimi-k2.5 returns
-            //   `400 InvalidParameter: incorrect modal "image" was entered,
-            //    which may not be supported by the model`
-            // when image_url content parts are present. Production users on
-            // mini3 (dspfac profile) hit this when attaching slide PNGs as
-            // user-uploaded media. The text-only fallback (`[user-uploaded
-            // files: ...]`) lets kimi still process the turn and ask the
-            // agent to `read_file` the attachment if needed.
-            || m.contains("kimi")
-            || m.contains("moonshot");
+        // Vision capability is NO LONGER inferred from the model name. The old
+        // allow/deny list wrongly stripped images from vision-capable models —
+        // kimi-k2.5/k2.6 are natively multimodal, moonshot/minimax/deepseek
+        // also ship vision variants (deepseek-v4/VL), and the SAME model name
+        // can front either a vision endpoint (e.g. `moonshot@api/kimi-k2.6`)
+        // or a proxy that rejects `image_url` parts (e.g. `moonshot@autodl`).
+        // A name heuristic cannot tell those apart, so it silently dropped
+        // images users uploaded to vision-capable models.
+        //
+        // Instead we ATTEMPT images for user uploads and rely on the graceful
+        // image-modality fallback in `chat()` / `chat_stream()`: if the
+        // endpoint returns the `400 ... incorrect modal "image"` (or similar)
+        // error, we retry the request once text-only. `lacks_vision` remains a
+        // config-overridable field so an operator CAN pre-strip for a known
+        // text-only endpoint and skip the one doomed attempt — it just is not
+        // auto-asserted from the model name.
+        let lacks_vision = false;
 
         Self {
             uses_completion_tokens,
@@ -186,13 +188,70 @@ impl OpenAIProvider {
         self
     }
 
+    /// POST a non-streaming chat request. Factored so the graceful
+    /// image-modality fallback can re-send a rebuilt (text-only) request
+    /// without duplicating the wire setup.
+    async fn post_chat(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
+        self.client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+            ))
+            .json(request)
+            .send()
+            .await
+            .wrap_err("failed to send request to OpenAI")
+    }
+
+    /// POST a streaming chat request (adds `stream` + `stream_options`).
+    /// Factored for the same image-modality fallback as [`Self::post_chat`].
+    async fn post_chat_stream(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
+        let mut body =
+            serde_json::to_value(request).wrap_err("failed to serialize OpenAI request")?;
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
+        obj.insert("stream".into(), true.into());
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
+        self.client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send streaming request to OpenAI")
+    }
+
     /// Build the shared request struct used by both chat() and chat_stream().
+    ///
+    /// `force_text_only` strips user-uploaded images even when the model is
+    /// treated as vision-capable. It is set on the retry leg of the graceful
+    /// image-modality fallback (see `chat()` / `chat_stream()`): when an
+    /// endpoint rejects `image_url` parts with a 400, the request is rebuilt
+    /// text-only so the turn still proceeds.
     fn build_request<'a>(
         &'a self,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
         config: &ChatConfig,
+        force_text_only: bool,
     ) -> OpenAIRequest<'a> {
+        // Effective content hints: honour the configured `lacks_vision`, and
+        // additionally strip images on the text-only retry leg.
+        let mut content_hints = self.hints.clone();
+        content_hints.lacks_vision = content_hints.lacks_vision || force_text_only;
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
             .filter(|m| {
@@ -233,7 +292,7 @@ impl OpenAIProvider {
 
                 OpenAIMessage {
                     role,
-                    content: build_openai_content(m, &self.hints),
+                    content: build_openai_content(m, &content_hints),
                     reasoning_content: reasoning,
                     tool_call_id: m.tool_call_id.as_deref(),
                     tool_calls,
@@ -322,23 +381,35 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let request = self.build_request(messages, tools, config);
+        let request = self.build_request(messages, tools, config, false);
+        let mut response = self.post_chat(&request).await?;
 
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(
-                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
-            ))
-            .json(&request)
-            .send()
-            .await
-            .wrap_err("failed to send request to OpenAI")?;
+        // Graceful image-modality fallback: a vision-capable model behind a
+        // proxy that rejects `image_url` parts (or a genuinely text-only
+        // model) returns a 400 when images are present. Retry once text-only
+        // so the turn proceeds instead of erroring — the agent can still
+        // `read_file` the attachment via the media note. See
+        // `is_image_modality_error` / `ModelHints::detect`.
+        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+            let body = response.text().await.unwrap_or_default();
+            if is_image_modality_error(&body) {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    "endpoint rejected image content (400); retrying text-only"
+                );
+                let retry = self.build_request(messages, tools, config, true);
+                response = self.post_chat(&retry).await?;
+            } else {
+                let body = crate::provider::truncate_error_body(&body);
+                return Err(crate::error::LlmError::from_status_with_label(
+                    400,
+                    &body,
+                    format!("{}/{}", self.provider_label, self.model),
+                )
+                .into());
+            }
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -435,31 +506,31 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let request = self.build_request(messages, tools, config);
+        let request = self.build_request(messages, tools, config, false);
+        let mut response = self.post_chat_stream(&request).await?;
 
-        let mut body =
-            serde_json::to_value(&request).wrap_err("failed to serialize OpenAI request")?;
-        let obj = body
-            .as_object_mut()
-            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
-        obj.insert("stream".into(), true.into());
-        obj.insert(
-            "stream_options".into(),
-            serde_json::json!({"include_usage": true}),
-        );
-
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .wrap_err("failed to send streaming request to OpenAI")?;
+        // Graceful image-modality fallback (see `chat()`): retry once
+        // text-only if the endpoint rejected the image content parts.
+        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+            let text = response.text().await.unwrap_or_default();
+            if is_image_modality_error(&text) {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    "endpoint rejected image content (400); retrying text-only (stream)"
+                );
+                let retry = self.build_request(messages, tools, config, true);
+                response = self.post_chat_stream(&retry).await?;
+            } else {
+                let body = crate::provider::truncate_error_body(&text);
+                return Err(crate::error::LlmError::from_status_with_label(
+                    400,
+                    &body,
+                    format!("{}/{}", self.provider_label, self.model),
+                )
+                .into());
+            }
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -583,6 +654,36 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
         result.push(msg);
     }
     result
+}
+
+/// Whether a provider 400 means "this endpoint/model can't accept image
+/// content parts" — as opposed to any other bad request. Vision-capable
+/// models fronted by a text-only proxy, and genuinely text-only models,
+/// return these when `image_url` parts are present. Matched case-insensitively
+/// against the (truncated) error body.
+///
+/// Examples seen in production (mini3 `dspfac`): kimi via the autodl proxy
+/// returns `400 InvalidParameter: incorrect modal "image" was entered, which
+/// may not be supported by the model`.
+fn is_image_modality_error(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("incorrect modal")
+        || (b.contains("modal") && b.contains("image"))
+        || b.contains("does not support image")
+        || b.contains("image input is not supported")
+        || b.contains("not support vision")
+        || b.contains("vision is not supported")
+        || (b.contains("image_url") && b.contains("not support"))
+}
+
+/// Whether the request carries at least one user-uploaded image we would have
+/// inlined (i.e. images are not already stripped by the configured
+/// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
+fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
+    !hints.lacks_vision
+        && messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_image(p)))
 }
 
 fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
@@ -905,31 +1006,86 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_kimi_k25() {
+    fn test_detect_kimi_k25_is_not_pre_stripped() {
         let h = ModelHints::detect("kimi-k2.5");
         assert!(!h.uses_completion_tokens);
         assert!(h.fixed_temperature);
-        // 2026-05-18: empirically kimi-k2.5 returns
-        //   `400 InvalidParameter: incorrect modal "image" was entered`
-        // when sent image_url content parts. Reproduced live on mini3
-        // (dspfac profile, session slides-1779130130502-th18yr) with
-        // a user-uploaded PNG. Treat kimi as text-only.
-        assert!(h.lacks_vision);
+        // Vision is NO LONGER inferred from the model name. Kimi K2.5/K2.6 are
+        // natively multimodal; the old heuristic wrongly stripped images from
+        // them. The same model name can also front a vision endpoint
+        // (moonshot@api) or an image-rejecting proxy (moonshot@autodl), which a
+        // name check can't distinguish — so we attempt images and let the
+        // graceful image-modality fallback retry text-only if the endpoint 400s.
+        assert!(!h.lacks_vision);
     }
 
     #[test]
-    fn test_detect_deepseek() {
+    fn test_detect_deepseek_is_not_pre_stripped() {
+        // deepseek-chat is text-only, but deepseek-v4/VL are vision; we no
+        // longer pre-strip by name. A text-only endpoint that 400s on an image
+        // is handled by the image-modality fallback, not a hardcoded flag.
         let h = ModelHints::detect("deepseek-chat");
         assert!(!h.uses_completion_tokens);
         assert!(!h.fixed_temperature);
-        assert!(h.lacks_vision);
+        assert!(!h.lacks_vision);
     }
 
     #[test]
-    fn test_detect_minimax() {
+    fn test_detect_minimax_is_not_pre_stripped() {
         let h = ModelHints::detect("MiniMax-Text-01");
-        assert!(h.lacks_vision);
+        assert!(!h.lacks_vision);
         assert!(h.merge_system_messages);
+    }
+
+    #[test]
+    fn is_image_modality_error_matches_known_provider_400s() {
+        // The exact string observed live on mini3 (kimi via the autodl proxy).
+        assert!(is_image_modality_error(
+            "InvalidParameter: incorrect modal \"image\" was entered, which may not be supported by the model"
+        ));
+        assert!(is_image_modality_error(
+            "This model does not support image input"
+        ));
+        assert!(is_image_modality_error(
+            "vision is not supported by this endpoint"
+        ));
+        // Unrelated 400s must NOT trigger the text-only retry.
+        assert!(!is_image_modality_error("invalid api key"));
+        assert!(!is_image_modality_error("context length exceeded"));
+        assert!(!is_image_modality_error("rate limit reached"));
+    }
+
+    #[test]
+    fn request_has_user_images_gates_the_fallback() {
+        let img = Message {
+            role: MessageRole::User,
+            content: "look at this".into(),
+            media: vec!["/tmp/pic.png".into()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let vision = ModelHints::default();
+        assert!(request_has_user_images(std::slice::from_ref(&img), &vision));
+        // Already configured text-only ⇒ images were never sent ⇒ no retry.
+        let text_only = ModelHints {
+            lacks_vision: true,
+            ..ModelHints::default()
+        };
+        assert!(!request_has_user_images(
+            std::slice::from_ref(&img),
+            &text_only
+        ));
+        // A non-image attachment is not an image-modality concern.
+        let mut doc = img.clone();
+        doc.media = vec!["/tmp/data.csv".into()];
+        assert!(!request_has_user_images(
+            std::slice::from_ref(&doc),
+            &vision
+        ));
     }
 
     #[test]
