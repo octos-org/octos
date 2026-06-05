@@ -118,8 +118,8 @@ fn deep_research_ir_composes_to_a_dynamic_web_research_pipeline() {
 #[tokio::test]
 #[ignore = "requires DEEPSEEK_API_KEY (real LLM); optional web-search backend"]
 async fn deep_research_ir_runs_end_to_end() {
-    use octos_llm::openai::OpenAIProvider;
     use octos_llm::LlmProvider;
+    use octos_llm::openai::OpenAIProvider;
     use octos_memory::EpisodeStore;
     use octos_pipeline::executor::{ExecutorConfig, PipelineExecutor};
     use octos_pipeline::profile::ValidationProfile;
@@ -129,8 +129,7 @@ async fn deep_research_ir_runs_end_to_end() {
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
     let config = ExecutorConfig {
         default_provider: Arc::new(
-            OpenAIProvider::new(key, "deepseek-chat")
-                .with_base_url("https://api.deepseek.com/v1"),
+            OpenAIProvider::new(key, "deepseek-chat").with_base_url("https://api.deepseek.com/v1"),
         ) as Arc<dyn LlmProvider>,
         provider_router: None,
         memory,
@@ -174,10 +173,7 @@ async fn deep_research_ir_runs_end_to_end() {
     eprintln!("=== report:\n{}\n===", result.output);
 
     assert!(ran.iter().any(|n| n == "search"), "fan-out search must run");
-    assert!(
-        ran.iter().any(|n| n == "synthesize"),
-        "synthesis must run"
-    );
+    assert!(ran.iter().any(|n| n == "synthesize"), "synthesis must run");
     assert!(
         result.output.len() > 200,
         "must produce a non-trivial report"

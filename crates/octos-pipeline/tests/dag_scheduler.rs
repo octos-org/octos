@@ -68,7 +68,11 @@ struct RecordingHandler {
 
 #[async_trait]
 impl Handler for RecordingHandler {
-    async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> eyre::Result<NodeOutcome> {
+    async fn execute(
+        &self,
+        node: &PipelineNode,
+        ctx: &HandlerContext,
+    ) -> eyre::Result<NodeOutcome> {
         let call = {
             let mut st = self.state.lock().unwrap();
             let c = st.calls.entry(node.id.clone()).or_insert(0);
@@ -95,7 +99,11 @@ fn pass_all() -> Decider {
     Arc::new(|_n, _c| OutcomeStatus::Pass)
 }
 
-async fn run_with(dot: &str, decide: Decider, dag: bool) -> (PipelineResult, Arc<Mutex<ExecState>>) {
+async fn run_with(
+    dot: &str,
+    decide: Decider,
+    dag: bool,
+) -> (PipelineResult, Arc<Mutex<ExecState>>) {
     let dir = TempDir::new().unwrap();
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
     let config = ExecutorConfig {
@@ -285,7 +293,11 @@ async fn bounded_retry_loop_terminates_on_pass() {
     });
     let (result, state) = run_with(dot, decide, true).await;
     let st = state.lock().unwrap();
-    assert!(result.success, "loop must settle to success: {}", result.output);
+    assert!(
+        result.success,
+        "loop must settle to success: {}",
+        result.output
+    );
     let work_runs = st.calls.get("work").copied().unwrap_or(0);
     assert!(
         work_runs >= 2,
@@ -512,7 +524,10 @@ async fn back_edge_retries_before_failure_consumer_runs() {
         "loop should settle to success: {}",
         result.output
     );
-    assert!(st.calls.contains_key("done"), "the pass path must run on settle");
+    assert!(
+        st.calls.contains_key("done"),
+        "the pass path must run on settle"
+    );
     assert!(
         !st.calls.contains_key("report"),
         "failure consumer must NOT run on a transient (retried) failure; ran {:?}",
@@ -756,4 +771,3 @@ async fn back_edge_firing_before_target_runs_is_bounded() {
         st.calls.get("a")
     );
 }
-
