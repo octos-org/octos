@@ -639,6 +639,19 @@ impl WsConnection {
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
                         Some(msg) => {
+                            // Mirror the stdio transport's evidence recording:
+                            // capture every server->client frame into the AppUI
+                            // evidence transcript when M15 UX capture is active.
+                            // Without this the WebSocket evidence transcript only
+                            // held client->server requests, so soak verifiers that
+                            // require backend `task/updated` / `agent/updated`
+                            // notifications could never pass over WS. The append
+                            // is a no-op unless OCTOS_TUI_M15_UX_OUTPUT_DIR is set.
+                            if let WsMessage::Text(text) = &msg {
+                                if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
+                                    append_appui_transcript_frame("server_to_client", frame);
+                                }
+                            }
                             if sink.send(msg).await.is_err() {
                                 break;
                             }
@@ -6212,15 +6225,25 @@ async fn tool_status_list_result(
         });
     let tool_names = model_visible_tool_names(registry);
     let registered_names = registered_tool_names(registry);
+    let deferred_names = deferred_model_tool_names(registry);
     let visible_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
+    let deferred_set: HashSet<&str> = deferred_names.iter().map(String::as_str).collect();
+    // A registered-but-not-visible tool is either disabled by the effective
+    // tool policy OR merely LRU-deferred (registered, filtered out of
+    // `specs()`, recoverable via `activate_tools`). The coding tool contract
+    // checks the disabled set before the deferred set, so the deferred names
+    // MUST be excluded here — otherwise the canonical P0 runtime/subagent
+    // tools regress to `disabled_by_policy` and the contract drops to
+    // `status: incomplete` on a healthy solo session. #970 / M14-E.
     let disabled_tool_names = registered_names
         .iter()
-        .filter(|name| !visible_names.contains(name.as_str()))
+        .filter(|name| {
+            !visible_names.contains(name.as_str()) && !deferred_set.contains(name.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let deferred_names = deferred_model_tool_names(registry);
     let deferred_name_refs: Vec<&str> = deferred_names.iter().map(String::as_str).collect();
     let permission_state = session_permission_profiles().get_state(session_id);
     let session_id_wire = session_id.to_string();
@@ -15503,6 +15526,21 @@ async fn run_m15_live_subagent_fixture_turn(
         .map(PathBuf::from)
         .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // The supervised subagent processes are spawned with `cwd(workdir)`.
+    // When the workdir is derived from the evidence dir (the default when
+    // OCTOS_TUI_M15_UX_WORKDIR is unset) it does not exist yet, so the
+    // process spawn fails with "No such file or directory (os error 2)"
+    // and every review agent reports `m15subagentfailed`. Materialize it
+    // up front so the fixture's child processes have a valid cwd.
+    if let Err(error) = std::fs::create_dir_all(&workdir) {
+        return M9FixtureOutcome::Errored {
+            code: "m15_workdir_failed",
+            message: format!(
+                "failed to create live subagent workdir {}: {error}",
+                workdir.display()
+            ),
+        };
+    }
     let evidence_dir = appui_evidence_dir().unwrap_or_else(|| workdir.join(".octos-m15-evidence"));
     let artifact_dir = evidence_dir.join("agent-artifacts");
     if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
@@ -24727,6 +24765,74 @@ ignore = []
         assert_ne!(
             exec_command["status"],
             json!(coding_tool_contract::TOOL_STATUS_MISSING)
+        );
+    }
+
+    #[test]
+    fn lru_deferred_required_tools_are_reported_deferred_not_disabled_by_policy() {
+        // Regression: the live `tool_status_list_result` path computes the
+        // disabled set as `registered ∧ ¬visible`, which subsumes the
+        // LRU-deferred set (deferred tools are registered but filtered out
+        // of `specs()`). The coding tool contract checks `disabled` before
+        // `deferred`, so without excluding the deferred names the canonical
+        // P0 runtime/subagent tools regress to `disabled_by_policy` and the
+        // contract reports `status: incomplete` on a healthy solo session.
+        // Mirror the exact live-path computation here so the call site stays
+        // honest. #970 / M14-E.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        // Auto-defer (not context-filter) the canonical runtime + subagent
+        // groups, exactly as the per-session LRU resolver does once a
+        // profile carries enough tools to trip the defer threshold.
+        registry.defer_group("group:runtime");
+        registry.defer_group("group:sessions");
+
+        let deferred = deferred_model_tool_names(Some(&registry));
+        assert!(
+            deferred.iter().any(|name| name == "exec_command"),
+            "test precondition: exec_command must be deferred, got {deferred:?}"
+        );
+
+        let visible = model_visible_tool_names(Some(&registry));
+        let registered = registered_tool_names(Some(&registry));
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        let deferred_set: HashSet<&str> = deferred.iter().map(String::as_str).collect();
+        // This is the production computation under test: disabled must NOT
+        // include deferred-but-recoverable tools.
+        let disabled = registered
+            .iter()
+            .filter(|name| {
+                !visible_set.contains(name.as_str()) && !deferred_set.contains(name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
+        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = deferred.iter().map(String::as_str).collect::<Vec<_>>();
+        let payload = coding_tool_contract::tool_status_list_payload(
+            coding_tool_contract::ToolStatusListContext {
+                available_model_tools: &visible_refs,
+                disabled_model_tools: &disabled_refs,
+                deferred_model_tools: &deferred_refs,
+                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
+            },
+        );
+        let contract = &payload["coding_tool_contract"];
+        assert_eq!(
+            contract["status"],
+            json!("ready"),
+            "LRU-deferred P0 tools must keep the contract ready; missing={:?}",
+            contract["missing_required_tools"]
+        );
+        assert_eq!(contract["missing_required_tools"], json!([]));
+        let required = contract["required_tools"].as_array().expect("required");
+        let exec_command = required
+            .iter()
+            .find(|tool| tool["name"] == json!("exec_command"))
+            .expect("exec_command status");
+        assert_eq!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
         );
     }
 
