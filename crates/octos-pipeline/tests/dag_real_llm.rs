@@ -19,8 +19,7 @@ use octos_memory::EpisodeStore;
 use octos_pipeline::executor::{ExecutorConfig, PipelineExecutor};
 use tempfile::TempDir;
 
-const TOPIC: &str =
-    "The economic and environmental impacts of urban vertical farming.";
+const TOPIC: &str = "The economic and environmental impacts of urban vertical farming.";
 
 // Text-only nodes (`tools=""` = deny-all sentinel) so the run is deterministic
 // LLM reasoning with no tool-calling. `plan` fans out to two angles; both
@@ -39,9 +38,7 @@ const RESEARCH_DIAMOND: &str = r#"digraph deep_research_dag {
 
 fn deepseek() -> Arc<dyn LlmProvider> {
     let key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY required");
-    Arc::new(
-        OpenAIProvider::new(key, "deepseek-chat").with_base_url("https://api.deepseek.com/v1"),
-    )
+    Arc::new(OpenAIProvider::new(key, "deepseek-chat").with_base_url("https://api.deepseek.com/v1"))
 }
 
 async fn make_executor(dir: &TempDir, dag: bool) -> PipelineExecutor {
@@ -93,7 +90,10 @@ async fn dag_deep_research_diamond_joins_both_angles() {
 
     assert!(result.success, "DAG pipeline failed: {}", result.output);
     for n in ["plan", "angle_a", "angle_b", "synthesize"] {
-        assert!(ran.contains(&n.to_string()), "node {n} must run; ran={ran:?}");
+        assert!(
+            ran.contains(&n.to_string()),
+            "node {n} must run; ran={ran:?}"
+        );
     }
     let out = result.output.to_uppercase();
     assert!(

@@ -18,13 +18,7 @@ use crate::graph::{HandlerKind, PipelineGraph};
 /// Tool names treated as a shell escape hatch and banned under `ban_shell`.
 /// `write_stdin` is included: it can drive an existing `exec-*` shell session
 /// (created by `exec_command`), so it's a shell escape just like the starters.
-pub(crate) const SHELL_TOOLS: &[&str] = &[
-    "shell",
-    "bash",
-    "exec",
-    "exec_command",
-    "write_stdin",
-];
+pub(crate) const SHELL_TOOLS: &[&str] = &["shell", "bash", "exec", "exec_command", "write_stdin"];
 
 /// Bounds applied to an LLM-authored / -influenced graph at a given autonomy
 /// level.

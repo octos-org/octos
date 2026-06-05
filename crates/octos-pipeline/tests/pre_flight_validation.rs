@@ -208,7 +208,6 @@ async fn deep_research_resolves_to_the_bundled_ir() {
         .expect("bundled deep_research IR must pre-flight clean");
 }
 
-
 #[tokio::test]
 async fn pre_flight_rejects_malformed_json_args() {
     let (tool, _working, _data) = make_tool().await;

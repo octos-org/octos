@@ -139,7 +139,11 @@ async fn deepseek_prefers_run_pipeline_for_deep_research() {
     let web_fetch = WebFetchTool::new();
     let dir = tempfile::TempDir::new().unwrap();
     let data = tempfile::TempDir::new().unwrap();
-    let memory = Arc::new(EpisodeStore::open(data.path().join(".octos")).await.unwrap());
+    let memory = Arc::new(
+        EpisodeStore::open(data.path().join(".octos"))
+            .await
+            .unwrap(),
+    );
     let run_pipeline = RunPipelineTool::new(
         provider.clone(),
         memory,
@@ -154,7 +158,9 @@ async fn deepseek_prefers_run_pipeline_for_deep_research() {
     assert_eq!(new_pipeline_spec.name, "run_pipeline");
     assert!(
         new_pipeline_spec.description.contains("PREFER")
-            || new_pipeline_spec.description.contains("ALWAYS use `deep_research`"),
+            || new_pipeline_spec
+                .description
+                .contains("ALWAYS use `deep_research`"),
         "NEW spec must carry the imperative steering — got: {}",
         new_pipeline_spec.description
     );
@@ -162,10 +168,7 @@ async fn deepseek_prefers_run_pipeline_for_deep_research() {
     let mut old_pipeline_spec = new_pipeline_spec.clone();
     old_pipeline_spec.description = OLD_NON_IR_DESCRIPTION.to_string();
 
-    let variants: [(&str, ToolSpec); 2] = [
-        ("OLD", old_pipeline_spec),
-        ("NEW", new_pipeline_spec),
-    ];
+    let variants: [(&str, ToolSpec); 2] = [("OLD", old_pipeline_spec), ("NEW", new_pipeline_spec)];
 
     // (label, prompt, expect_pipeline)
     let mut cases: Vec<(&str, &str, bool)> = Vec::new();
@@ -181,7 +184,10 @@ async fn deepseek_prefers_run_pipeline_for_deep_research() {
 
     eprintln!("\n================= deepseek tool-selection A/B =================");
     eprintln!("model=deepseek-chat  tool_choice=Auto  temp=0  ir_enabled=false");
-    eprintln!("tools offered: run_pipeline, {}, {}\n", web_search_spec.name, web_fetch_spec.name);
+    eprintln!(
+        "tools offered: run_pipeline, {}, {}\n",
+        web_search_spec.name, web_fetch_spec.name
+    );
 
     let mut deep_pipeline = [0usize; 2];
     let mut bord_pipeline = [0usize; 2];
@@ -206,7 +212,11 @@ async fn deepseek_prefers_run_pipeline_for_deep_research() {
                 "ctrl" if routed => ctrl_pipeline[vi] += 1,
                 _ => {}
             }
-            let want = if *expect_pipeline { "→run_pipeline" } else { "→inline/direct" };
+            let want = if *expect_pipeline {
+                "→run_pipeline"
+            } else {
+                "→inline/direct"
+            };
             // borderline has no single "right" answer, so don't mark it ok/!!
             let mark = if *label == "bord" {
                 "   "
@@ -220,7 +230,12 @@ async fn deepseek_prefers_run_pipeline_for_deep_research() {
         }
         eprintln!(
             "  >>> {vname}: deep→pipeline {}/{}, BORDERLINE→pipeline {}/{}, ctrl→pipeline {}/{}\n",
-            deep_pipeline[vi], deep_total, bord_pipeline[vi], bord_total, ctrl_pipeline[vi], ctrl_total
+            deep_pipeline[vi],
+            deep_total,
+            bord_pipeline[vi],
+            bord_total,
+            ctrl_pipeline[vi],
+            ctrl_total
         );
     }
 

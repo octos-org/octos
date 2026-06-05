@@ -29,9 +29,7 @@ use crate::graph::{
     DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode,
 };
-use crate::handler::{
-    CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler,
-};
+use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler};
 use crate::parser::parse_dot;
 use crate::validate;
 
@@ -3865,7 +3863,9 @@ impl PipelineExecutor {
                         DagStep::Aborted(reason) => {
                             return Ok(dag_build_result(
                                 Some(false),
-                                Some(format!("Pipeline aborted before node '{node_id}': {reason}")),
+                                Some(format!(
+                                    "Pipeline aborted before node '{node_id}': {reason}"
+                                )),
                                 &completed,
                                 summaries,
                                 total_tokens,
@@ -3896,7 +3896,10 @@ impl PipelineExecutor {
                         let msg = format!(
                             "Pipeline failed at node '{}': {}",
                             node_id,
-                            completed.get(&node_id).map(|o| o.content.as_str()).unwrap_or("")
+                            completed
+                                .get(&node_id)
+                                .map(|o| o.content.as_str())
+                                .unwrap_or("")
                         );
                         return Ok(dag_build_result(
                             Some(false),
@@ -3966,8 +3969,7 @@ impl PipelineExecutor {
                             .get(&node_id)
                             .map(|src| dag_back_edge_fires(e, src).unwrap_or(false))
                             .unwrap_or(false);
-                        if fires
-                            && retry_count.get(&e.target).copied().unwrap_or(0) < MAX_NODE_RUNS
+                        if fires && retry_count.get(&e.target).copied().unwrap_or(0) < MAX_NODE_RUNS
                         {
                             *retry_count.entry(e.target.clone()).or_insert(0) += 1;
                             if let Some(src_outcome) = completed.get(&node_id).cloned() {
@@ -3993,12 +3995,12 @@ impl PipelineExecutor {
                     .nodes
                     .keys()
                     .filter(|id| !settled(id))
-                    .filter_map(|id| {
-                        match dag_node_readiness(graph, id, &completed, &pruned) {
+                    .filter_map(
+                        |id| match dag_node_readiness(graph, id, &completed, &pruned) {
                             Ok(NodeReadiness::Prune(reason)) => Some((id.clone(), reason)),
                             _ => None,
-                        }
-                    })
+                        },
+                    )
                     .min_by(|a, b| a.0.cmp(&b.0));
 
                 match prunable {
@@ -4177,7 +4179,9 @@ impl PipelineExecutor {
             }
         }
 
-        let node_reservation = self.reserve_node_budget(&graph.id, &node_with_prompt).await?;
+        let node_reservation = self
+            .reserve_node_budget(&graph.id, &node_with_prompt)
+            .await?;
         let node_reserved_usd = node_reservation
             .as_ref()
             .map(|h| h.reserved_amount_usd())
@@ -4482,8 +4486,7 @@ fn graph_is_dag_schedulable(graph: &PipelineGraph) -> bool {
     // edge; DAG firing would fan out to all) is routing the DAG firing logic
     // does not implement → keep such graphs on the legacy walk.
     let edges_ok = graph.edges.iter().all(|e| {
-        edge_is_back(graph, e)
-            || (e.label.is_none() && (e.weight - 1.0).abs() < f64::EPSILON)
+        edge_is_back(graph, e) || (e.label.is_none() && (e.weight - 1.0).abs() < f64::EPSILON)
     });
     // A back-edge must (a) carry a condition — a conditionless back-edge can't
     // fire meaningfully (always → guard loop; never → dead retry) — and (b)
@@ -4511,7 +4514,10 @@ fn graph_is_dag_schedulable(graph: &PipelineGraph) -> bool {
 /// forward graph, or its target would become a spurious root), and only marked
 /// edges may legally close a cycle (validation rejects unmarked ones).
 fn edge_is_back(graph: &PipelineGraph, edge: &PipelineEdge) -> bool {
-    let marked = edge.label.as_deref().is_some_and(validate::has_back_edge_marker)
+    let marked = edge
+        .label
+        .as_deref()
+        .is_some_and(validate::has_back_edge_marker)
         || edge
             .condition
             .as_deref()
@@ -4770,7 +4776,10 @@ fn forward_reachable(graph: &PipelineGraph, start: &str) -> HashSet<String> {
 /// the single-path walk stops — so both the result output and the success
 /// verdict derive from them, not from raw structural sinks (which a dead/pruned
 /// branch could distort). Sorted for determinism.
-fn dag_terminal_nodes(graph: &PipelineGraph, completed: &HashMap<String, NodeOutcome>) -> Vec<String> {
+fn dag_terminal_nodes(
+    graph: &PipelineGraph,
+    completed: &HashMap<String, NodeOutcome>,
+) -> Vec<String> {
     let mut terms: Vec<String> = completed
         .keys()
         .filter(|n| {
@@ -4847,7 +4856,11 @@ fn dag_build_result(
     // when the terminal outcome was Fail/guard-hit (parity with the legacy
     // no-outgoing terminal); only explicit early-exit failures (hard error /
     // budget / aborted registration) drop them.
-    let files_modified = if success || derived { all_files } else { vec![] };
+    let files_modified = if success || derived {
+        all_files
+    } else {
+        vec![]
+    };
 
     PipelineResult {
         output,

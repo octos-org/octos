@@ -563,8 +563,7 @@ fn resolve_pipeline_timeout(llm_value: Option<u64>, dot_default: Option<u64>) ->
 /// model could name arbitrary tools/handlers (incl. `shell`) or an empty
 /// tool-list that silently expanded to all builtins. Agents now author via the
 /// capability-locked `ir` palette, or name a sanctioned pipeline.
-const INLINE_DOT_REJECTION: &str =
-    "inline DOT graphs are not accepted: free-form DOT was the unsafe legacy \
+const INLINE_DOT_REJECTION: &str = "inline DOT graphs are not accepted: free-form DOT was the unsafe legacy \
      authoring surface and has been removed. To run a multi-step workflow, \
      either name a sanctioned pipeline (e.g. `deep_research`) in `pipeline`, or \
      compose a typed-IR workflow program in `ir`.";
@@ -573,8 +572,7 @@ const INLINE_DOT_REJECTION: &str =
 /// name) to `run_pipeline`. A caller-supplied `.dot` path would let a model
 /// smuggle the same arbitrary handler/tool surface that inline DOT did (e.g. a
 /// written `/tmp/pwn.dot` with `handler=shell`) through direct-path resolution.
-const PIPELINE_PATH_REJECTION: &str =
-    "pipeline file paths are not accepted: name a sanctioned pipeline (e.g. \
+const PIPELINE_PATH_REJECTION: &str = "pipeline file paths are not accepted: name a sanctioned pipeline (e.g. \
      `deep_research`) — a bare name, not a path — or compose a typed-IR workflow \
      program in `ir`.";
 
@@ -849,8 +847,7 @@ impl Tool for RunPipelineTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid run_pipeline input")?;
 
-        let using_ir =
-            self.ir_enabled && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let using_ir = self.ir_enabled && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty());
 
         // Free-form inline DOT is no longer an agent-authorable surface. Reject
         // it up front with an actionable message (mirrors the IR compose-error
@@ -933,8 +930,8 @@ impl Tool for RunPipelineTool {
                     }
                 },
                 Ok(ResolvedPipeline::Dot(dot)) => {
-                    let graph = crate::parser::parse_dot(&dot)
-                        .wrap_err("failed to parse pipeline DOT")?;
+                    let graph =
+                        crate::parser::parse_dot(&dot).wrap_err("failed to parse pipeline DOT")?;
                     let id = graph_id_from_dot(&dot);
                     (graph, id)
                 }
