@@ -596,6 +596,7 @@ impl Agent {
         if let Some(max) = self.config.chat_max_tokens {
             c.max_tokens = Some(max);
         }
+        c.reasoning_effort = self.config.reasoning_effort;
         c
     }
 

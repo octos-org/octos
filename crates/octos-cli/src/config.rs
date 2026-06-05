@@ -921,6 +921,13 @@ pub struct GatewayConfig {
     /// default from model_limits.json. Pipeline nodes can further override per-node.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+
+    /// Reasoning effort for thinking models (`low`|`medium`|`high`). Applied to
+    /// every turn; only models that declare a reasoning style receive it
+    /// (DeepSeek V4 gets `reasoning_effort` + `thinking`, OpenAI reasoning models
+    /// and Grok get `reasoning_effort`), so non-thinking models silently ignore it.
+    #[serde(default)]
+    pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
 }
 
 impl Default for GatewayConfig {
@@ -942,6 +949,7 @@ impl Default for GatewayConfig {
             tool_timeout_secs: None,
             session_timeout_secs: None,
             max_output_tokens: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -1410,6 +1418,18 @@ mod tests {
         assert_eq!(gw.channels[0].channel_type, "cli");
         assert_eq!(gw.max_history, 30);
         assert!(gw.system_prompt.is_none());
+        // reasoning_effort is optional and defaults to None when omitted.
+        assert!(gw.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn test_gateway_reasoning_effort_parses() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "reasoning_effort": "high"
+        }"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.reasoning_effort, Some(octos_llm::ReasoningEffort::High));
     }
 
     #[test]
