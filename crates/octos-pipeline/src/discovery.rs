@@ -252,6 +252,29 @@ impl PipelineDiscovery {
             available: all.into_iter().map(|p| p.name).collect(),
         }))
     }
+
+    /// Resolve a bare pipeline NAME against only the operator-INSTALLED search
+    /// paths (skill dirs / user pipeline dirs) — NOT the bundled-pipelines dirs.
+    /// Returns `Ok(Some(dot))` for an installed copy, `Ok(None)` if none.
+    ///
+    /// This lets a caller honor installed-wins (an operator override beats a
+    /// bundled canonical pipeline) WITHOUT the bootstrapped bundled `.dot` — which
+    /// lives under a `bundled_dirs` entry — shadowing a preferred bundled-IR
+    /// rebuild of the same name.
+    pub async fn resolve_installed(&self, name: &str) -> Result<Option<String>> {
+        let want_stem = pipeline_name_stem(name.trim());
+        for info in self.list_available() {
+            // Skip anything located under a bundled-pipelines dir — that's the
+            // embedded fallback, not an operator install.
+            if self.bundled_dirs.iter().any(|b| info.path.starts_with(b)) {
+                continue;
+            }
+            if info.name == want_stem {
+                return Ok(Some(read_located(&info.path).await?));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Whether `path` is an actual pipeline FILE — a regular file with the `.dot`

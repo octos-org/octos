@@ -24,6 +24,25 @@ pub const BUNDLED_PIPELINES: &[(&str, &str)] = &[(
     include_str!("assets/pipelines/deep_research.dot"),
 )];
 
+/// `(pipeline_name, ir_json)` for each bundled generic pipeline rebuilt as a
+/// capability-locked typed-IR program. These are the CANONICAL sanctioned
+/// pipelines: `run_pipeline` resolves a bare name to the IR here (composed via
+/// the safe palette) IN PREFERENCE to the embedded `.dot`, so the shipped
+/// `deep_research` runs the audited IR rather than raw DOT. An operator-INSTALLED
+/// pipeline of the same name in a skill dir still wins (installed-wins).
+pub const BUNDLED_IR_PIPELINES: &[(&str, &str)] = &[(
+    "deep_research",
+    include_str!("assets/pipelines/deep_research.ir.json"),
+)];
+
+/// Embedded IR JSON for a bundled pipeline `name` (the file stem), if any.
+pub fn bundled_ir(name: &str) -> Option<&'static str> {
+    BUNDLED_IR_PIPELINES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, ir)| *ir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +75,14 @@ mod tests {
                 .any(|(name, _)| *name == "deep_research.dot"),
             "deep_research.dot (the load-bearing generic pipeline) must be bundled"
         );
+    }
+
+    #[test]
+    fn bundled_ir_includes_deep_research_as_valid_json() {
+        let ir = bundled_ir("deep_research").expect("deep_research IR must be bundled");
+        let v: serde_json::Value = serde_json::from_str(ir).expect("bundled IR must be valid JSON");
+        assert_eq!(v["id"], "deep_research");
+        assert!(v["nodes"].as_array().is_some_and(|n| !n.is_empty()));
+        assert!(bundled_ir("nonexistent").is_none());
     }
 }

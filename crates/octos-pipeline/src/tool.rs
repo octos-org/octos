@@ -373,6 +373,36 @@ impl RunPipelineTool {
         self.resolve_named_with_bundled_fallback(name).await
     }
 
+    /// Resolve a bare sanctioned pipeline NAME to a runnable program, preferring
+    /// the capability-locked typed-IR rebuild of a sanctioned pipeline over the
+    /// embedded DOT. Precedence:
+    /// 1. an operator-INSTALLED copy in a skill/user dir (installed-wins);
+    /// 2. the bundled IR (canonical sanctioned rebuild, e.g. `deep_research`);
+    /// 3. the embedded bundled DOT (legacy fallback).
+    ///
+    /// Inline DOT and file paths are rejected (same as `resolve_with_fallback`).
+    async fn resolve_named(&self, pipeline_str: &str) -> Result<ResolvedPipeline> {
+        if looks_like_inline_dot(pipeline_str) {
+            eyre::bail!(INLINE_DOT_REJECTION);
+        }
+        let name = pipeline_str.trim();
+        if !is_bare_pipeline_name(name) {
+            eyre::bail!(PIPELINE_PATH_REJECTION);
+        }
+        // 1. Operator-installed copy wins (skill dirs, NOT the bundled dir).
+        if let Some(dot) = self.discovery.resolve_installed(name).await? {
+            return Ok(ResolvedPipeline::Dot(dot));
+        }
+        // 2. Bundled IR — the canonical, audited rebuild.
+        if let Some(ir) = octos_agent::bundled_pipelines::bundled_ir(name) {
+            return Ok(ResolvedPipeline::Ir(ir.to_string()));
+        }
+        // 3. Embedded bundled DOT (discovery full search + embedded bytes).
+        Ok(ResolvedPipeline::Dot(
+            self.resolve_named_with_bundled_fallback(name).await?,
+        ))
+    }
+
     /// Resolve a pipeline by name/path via on-disk discovery first, falling
     /// back to the EMBEDDED bundled `.dot` bytes (compiled into the binary
     /// via `octos_agent::bundled_pipelines`) when discovery cannot find it.
@@ -460,6 +490,16 @@ impl RunPipelineTool {
     pub async fn resolve_named_for_test(&self, name_or_path: &str) -> Result<String> {
         self.resolve_with_fallback(name_or_path).await
     }
+
+    /// Test-only: which form a named pipeline resolves to — `"ir"` (bundled IR,
+    /// composed via the safe palette) or `"dot"` (installed/embedded DOT).
+    #[doc(hidden)]
+    pub async fn resolve_named_kind_for_test(&self, name: &str) -> Result<&'static str> {
+        Ok(match self.resolve_named(name).await? {
+            ResolvedPipeline::Ir(_) => "ir",
+            ResolvedPipeline::Dot(_) => "dot",
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -546,6 +586,13 @@ fn is_bare_pipeline_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Outcome of resolving a sanctioned pipeline NAME: a typed-IR program (composed
+/// via the safe palette) or a DOT graph string (parsed).
+enum ResolvedPipeline {
+    Ir(String),
+    Dot(String),
 }
 
 /// True when `s` looks like an inline DOT digraph rather than a pipeline
@@ -723,10 +770,26 @@ impl Tool for RunPipelineTool {
         if looks_like_inline_dot(&input.pipeline) {
             return Err(INLINE_DOT_REJECTION.to_string());
         }
-        let dot_content = self
-            .resolve_with_fallback(&input.pipeline)
-            .await
-            .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
+        let dot_content = match self.resolve_named(&input.pipeline).await {
+            Ok(ResolvedPipeline::Ir(ir)) => {
+                // A bundled IR is validated by compose() itself — return its
+                // structured feedback synchronously.
+                return crate::compose::compose(
+                    &ir,
+                    &crate::profile::ValidationProfile::l2_default(),
+                    &input.variables,
+                )
+                .map(|_| ())
+                .map_err(|e| {
+                    format!(
+                        "bundled pipeline IR failed to compose:\n{}",
+                        e.feedback_lines().join("\n")
+                    )
+                });
+            }
+            Ok(ResolvedPipeline::Dot(dot)) => dot,
+            Err(e) => return Err(format!("failed to resolve pipeline: {e}")),
+        };
         let graph = crate::parser::parse_dot(&dot_content)
             .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
         let validation_context = crate::validate::ValidationContext::default()
@@ -821,11 +884,44 @@ impl Tool for RunPipelineTool {
                 }
             }
         } else {
-            let dot_content = self.resolve_with_fallback(&input.pipeline).await?;
-            let graph =
-                crate::parser::parse_dot(&dot_content).wrap_err("failed to parse pipeline DOT")?;
-            let id = graph_id_from_dot(&dot_content);
-            (graph, id)
+            // A named pipeline resolves to a bundled IR (composed via the safe
+            // palette) or a DOT graph; the canonical sanctioned pipelines (e.g.
+            // `deep_research`) now ship as IR and run the audited palette.
+            match self.resolve_named(&input.pipeline).await {
+                Ok(ResolvedPipeline::Ir(ir)) => match crate::compose::compose(
+                    &ir,
+                    &crate::profile::ValidationProfile::l2_default(),
+                    &input.variables,
+                ) {
+                    Ok(g) => {
+                        let id = g.id.clone();
+                        (g, id)
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: format!(
+                                "bundled pipeline IR failed to compose:\n{}",
+                                e.feedback_lines().join("\n")
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                },
+                Ok(ResolvedPipeline::Dot(dot)) => {
+                    let graph = crate::parser::parse_dot(&dot)
+                        .wrap_err("failed to parse pipeline DOT")?;
+                    let id = graph_id_from_dot(&dot);
+                    (graph, id)
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: e.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
         };
 
         let status_bridge = self

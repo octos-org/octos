@@ -189,6 +189,25 @@ async fn agent_cannot_run_workspace_authored_pipeline_by_bare_name() {
     );
 }
 
+#[tokio::test]
+async fn deep_research_resolves_to_the_bundled_ir() {
+    // The sanctioned `deep_research` now ships as a capability-locked IR program
+    // and runs the audited palette, not the embedded raw DOT.
+    let (tool, _working, _data) = make_tool().await;
+    assert_eq!(
+        tool.resolve_named_kind_for_test("deep_research")
+            .await
+            .unwrap(),
+        "ir",
+        "deep_research must resolve to the bundled IR"
+    );
+    // ...and it pre-flights clean (the bundled IR composes under l2_default).
+    let args = serde_json::json!({ "pipeline": "deep_research", "input": "x" });
+    tool.pre_flight_validate(&args)
+        .await
+        .expect("bundled deep_research IR must pre-flight clean");
+}
+
 
 #[tokio::test]
 async fn pre_flight_rejects_malformed_json_args() {
