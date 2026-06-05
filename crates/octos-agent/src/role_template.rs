@@ -85,6 +85,7 @@ pub const APPROVAL_NEVER: &str = "never";
 /// from inside a detached subagent.
 pub(crate) const SPAWN_BUILTIN_TOOLS: &[&str] = &[
     "apply_patch",
+    "ask_user_question",
     "bash",
     "browser",
     "check_workspace_contract",

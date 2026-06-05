@@ -2714,6 +2714,25 @@ impl Tool for SpawnTool {
                     )),
                 );
             }
+            // codex round-5 (orphan-sweep liveness): arm the RAII terminal
+            // guard HERE, in the FOREGROUND, before the `tokio::spawn` below.
+            // `register_with_lineage` above already persisted a non-terminal
+            // `Spawned` row; arming the guard inside the spawned future left a
+            // window where a fast next-turn orphan-sweep could see the row
+            // non-terminal AND not-live and falsely reap a
+            // scheduled-but-not-yet-polled detached child. Constructing it
+            // synchronously within the spawning turn inserts the id into the
+            // process-global live-set before the turn returns (turns are
+            // serialized per session ⇒ this completes before any next-turn
+            // sweep). Moved into the future below so its Drop (clear live-set +
+            // drive an unfinished task to Failed) still fires at worker end.
+            let foreground_terminal_guard: Option<TaskTerminalGuard> =
+                match (self.task_supervisor.as_ref(), tracked_task_id.as_ref()) {
+                    (Some(supervisor), Some(task_id)) => {
+                        Some(TaskTerminalGuard::new(supervisor.clone(), task_id.clone()))
+                    }
+                    _ => None,
+                };
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();
@@ -2812,18 +2831,22 @@ impl Tool for SpawnTool {
             let child_session_scope = ctx.session_scope.clone();
 
             tokio::spawn(async move {
-                // C1 step 2: arm a RAII terminal guard right after
-                // mark_running so an aborted/panicked child body does not
-                // leave the task stuck Running (TUI count never decrements).
-                // Idempotent on the normal terminal arms below; Drop no-ops
-                // once the body marked the task terminal itself.
-                let mut _terminal_guard: Option<TaskTerminalGuard> = None;
+                // codex round-5: the terminal guard was armed in the
+                // FOREGROUND (before this spawn) so the task id entered the
+                // process-global live-set synchronously within the spawning
+                // turn — closing the window where a fast next-turn orphan-sweep
+                // could reap a scheduled-but-not-yet-polled detached child.
+                // Move it in here so its Drop — which clears the live-set and
+                // drives an unfinished task to Failed (so the TUI count
+                // decrements instead of hanging on "N running") — still fires
+                // when this worker future terminates. Idempotent on the normal
+                // terminal arms below; Drop no-ops once the body marked the
+                // task terminal itself.
+                let _terminal_guard = foreground_terminal_guard;
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
                     supervisor.mark_running(task_id);
-                    _terminal_guard =
-                        Some(TaskTerminalGuard::new(supervisor.clone(), task_id.clone()));
                     if let Some(workflow) = workflow_metadata.as_ref() {
                         // Seed `runtime_detail.progress` with a small non-null
                         // value at workflow start. Without this, dashboards

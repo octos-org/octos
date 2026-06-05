@@ -227,6 +227,16 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1: &str =
 /// `agent/artifact/*` aliases remain gated on agent control.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
 
+/// Feature flag for UPCR-2026-023 structured `AskUserQuestion` mid-turn
+/// user questions. Gates the `user_question/respond` command, the
+/// `user_question/requested` notification, and the structured `questions`
+/// field on the request event. Advertised through optional
+/// `supported_features` in [`UiProtocolCapabilities`]; clients request it
+/// through `X-Octos-Ui-Features`. When it is NOT negotiated the agent's
+/// `ask_user_question` tool degrades to the `request_user_input`
+/// structured-metadata fallback, so the turn never hard-blocks.
+pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -253,6 +263,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -306,6 +317,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::LOOP_RESUME
         | methods::LOOP_FIRE_NOW => Some(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
         methods::REVIEW_START => Some(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
+        methods::USER_QUESTION_RESPOND => Some(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
         _ => None,
     }
 }
@@ -426,6 +438,26 @@ pub mod rpc_error_codes {
     /// Spec §10 `approval_cancelled`: `respond` against an administratively cancelled approval.
     pub const APPROVAL_CANCELLED: i64 = -32105;
 
+    /// UPCR-2026-023 `user_question_unknown`: `user_question/respond` against a
+    /// `question_id` not pending for the caller's session. Mirrors
+    /// [`UNKNOWN_APPROVAL_ID`] for the structured-question surface.
+    pub const USER_QUESTION_UNKNOWN: i64 = -32106;
+    /// UPCR-2026-023 `user_question_stale`: `user_question/respond` against a
+    /// question that was already answered or cancelled. Mirrors
+    /// [`APPROVAL_NOT_PENDING`] / [`APPROVAL_CANCELLED`] for the
+    /// structured-question surface.
+    pub const USER_QUESTION_STALE: i64 = -32107;
+    /// UPCR-2026-023 `user_question_invalid`: `user_question/respond` carried
+    /// answers that do not match the STORED request (wrong answer count, a
+    /// `selected_labels` value not in that question's options, more than one
+    /// label on a non-`multi_select` question, or free text where the question
+    /// disallows it). The server rejects the call and does NOT resolve the
+    /// blocked tool with bad data. Distinct from `user_question_unknown`
+    /// (target not found) and `user_question_stale` (target no longer
+    /// pending) so the client can tell "fix your answer and retry" from "this
+    /// question is gone".
+    pub const USER_QUESTION_INVALID: i64 = -32108;
+
     /// Spec §10 `cursor_out_of_range`: stale or future cursor relative to ledger.
     pub const CURSOR_OUT_OF_RANGE: i64 = -32110;
     /// Spec §10 cursor variant: cursor malformed or wrong-session. Distinct from
@@ -513,6 +545,27 @@ impl ApprovalId {
 }
 
 impl Default for ApprovalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stable identity for a structured user-question request (UPCR-2026-023).
+///
+/// Mirrors [`ApprovalId`]: a `Uuid` newtype minted server-side per
+/// `ask_user_question` tool call. The client cannot forge it — a
+/// `user_question/respond` is accepted only for a pending `question_id`
+/// on the caller's session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QuestionId(pub Uuid);
+
+impl QuestionId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for QuestionId {
     fn default() -> Self {
         Self::new()
     }
@@ -892,6 +945,9 @@ pub mod methods {
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const APPROVAL_RESPOND: &str = "approval/respond";
     pub const APPROVAL_SCOPES_LIST: &str = "approval/scopes/list";
+    /// UPCR-2026-023 `user_question/respond` — answer a structured
+    /// `user_question/requested` event. Gated by `user_question.v1`.
+    pub const USER_QUESTION_RESPOND: &str = "user_question/respond";
     pub const PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
     pub const PERMISSION_PROFILE_SET: &str = "permission/profile/set";
     pub const DIFF_PREVIEW_GET: &str = "diff/preview/get";
@@ -952,6 +1008,11 @@ pub mod methods {
     pub const APPROVAL_AUTO_RESOLVED: &str = "approval/auto_resolved";
     pub const APPROVAL_DECIDED: &str = "approval/decided";
     pub const APPROVAL_CANCELLED: &str = "approval/cancelled";
+    /// UPCR-2026-023 `user_question/requested` — structured multiple-choice
+    /// question the agent is asking the user mid-turn. While unresolved the
+    /// turn stays paused at the blocking-tool boundary (same boundary as
+    /// `approval/requested`). Gated by `user_question.v1`.
+    pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
     pub const TASK_UPDATED: &str = "task/updated";
     pub const TASK_OUTPUT_DELTA: &str = "task/output/delta";
     pub const PROGRESS_UPDATED: &str = "progress/updated";
@@ -1082,6 +1143,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
     methods::DIFF_PREVIEW_GET,
@@ -1142,6 +1204,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_AUTO_RESOLVED,
     methods::APPROVAL_DECIDED,
     methods::APPROVAL_CANCELLED,
+    methods::USER_QUESTION_REQUESTED,
     methods::TASK_UPDATED,
     methods::TASK_OUTPUT_DELTA,
     methods::PROGRESS_UPDATED,
@@ -1174,6 +1237,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
     methods::DIFF_PREVIEW_GET,
@@ -1295,6 +1359,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
         ])
     }
 
@@ -1715,6 +1780,75 @@ impl ApprovalRespondResult {
             approval_id,
             accepted: true,
             status: ApprovalRespondStatus::Accepted,
+            runtime_resumed,
+        }
+    }
+}
+
+/// One per-question answer carried by `user_question/respond` (UPCR-2026-023).
+///
+/// Forward-compat: serde defaults mean a client that omits `selected_labels`
+/// (free-text only) or `free_text` still decodes; unknown sibling fields are
+/// ignored. `selected_labels` holds 0..1 entries for a single-select question
+/// and 0..N for a `multi_select` question; the labels must match the option
+/// labels from the originating request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionAnswer {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text: Option<String>,
+}
+
+/// Params for `user_question/respond` — the client's answer to a
+/// `user_question/requested` event (UPCR-2026-023). Mirrors
+/// [`ApprovalRespondParams`]: correlated by `question_id`, scoped to the
+/// caller's `session_id`, with an optional audit/display `client_note` the
+/// server must not require.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionRespondParams {
+    pub session_id: SessionKey,
+    pub question_id: QuestionId,
+    /// One entry per question, in question order.
+    pub answers: Vec<UserQuestionAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_note: Option<String>,
+}
+
+impl UserQuestionRespondParams {
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        answers: Vec<UserQuestionAnswer>,
+    ) -> Self {
+        Self {
+            session_id,
+            question_id,
+            answers,
+            client_note: None,
+        }
+    }
+}
+
+/// Ack result for `user_question/respond` (UPCR-2026-023). Mirrors
+/// [`ApprovalRespondResult`]: confirms the answer was accepted and whether the
+/// waiting runtime turn was resumed by it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionRespondResult {
+    pub question_id: QuestionId,
+    pub accepted: bool,
+    pub runtime_resumed: bool,
+}
+
+impl UserQuestionRespondResult {
+    pub fn accepted(question_id: QuestionId) -> Self {
+        Self::accepted_with_runtime_resumed(question_id, false)
+    }
+
+    pub fn accepted_with_runtime_resumed(question_id: QuestionId, runtime_resumed: bool) -> Self {
+        Self {
+            question_id,
+            accepted: true,
             runtime_resumed,
         }
     }
@@ -2374,6 +2508,14 @@ pub struct SessionHydrateResult {
     pub turns: Option<Vec<HydratedTurn>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<ApprovalRequestedEvent>>,
+    /// UPCR-2026-023: still-pending structured user-questions for this
+    /// session, mirroring [`pending_approvals`](Self::pending_approvals). A
+    /// reconnecting client that negotiated `user_question.v1` re-renders these
+    /// and can still answer them; omitted (not `null`) when the request did
+    /// not ask for the `pending_approvals` section or the connection lacks the
+    /// capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questions: Option<Vec<UserQuestionRequestedEvent>>,
     /// M10 Phase 6.2 (Bug C). Retained `turn/spawn_complete` envelopes
     /// from the ledger replay window for clients that negotiated
     /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]. Populated only when
@@ -3273,6 +3415,7 @@ pub enum UiCommand {
     TurnInterrupt(TurnInterruptParams),
     ApprovalRespond(ApprovalRespondParams),
     ApprovalScopesList(ApprovalScopesListParams),
+    UserQuestionRespond(UserQuestionRespondParams),
     PermissionProfileList(PermissionProfileListParams),
     PermissionProfileSet(PermissionProfileSetParams),
     DiffPreviewGet(DiffPreviewGetParams),
@@ -3313,6 +3456,7 @@ impl UiCommand {
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
             Self::ApprovalScopesList(_) => methods::APPROVAL_SCOPES_LIST,
+            Self::UserQuestionRespond(_) => methods::USER_QUESTION_RESPOND,
             Self::PermissionProfileList(_) => methods::PERMISSION_PROFILE_LIST,
             Self::PermissionProfileSet(_) => methods::PERMISSION_PROFILE_SET,
             Self::DiffPreviewGet(_) => methods::DIFF_PREVIEW_GET,
@@ -3355,6 +3499,7 @@ impl UiCommand {
             Self::TurnInterrupt(params) => serde_json::to_value(params),
             Self::ApprovalRespond(params) => serde_json::to_value(params),
             Self::ApprovalScopesList(params) => serde_json::to_value(params),
+            Self::UserQuestionRespond(params) => serde_json::to_value(params),
             Self::PermissionProfileList(params) => serde_json::to_value(params),
             Self::PermissionProfileSet(params) => serde_json::to_value(params),
             Self::DiffPreviewGet(params) => serde_json::to_value(params),
@@ -3410,6 +3555,9 @@ impl UiCommand {
             methods::APPROVAL_RESPOND => Ok(Self::ApprovalRespond(decode_params(method, params)?)),
             methods::APPROVAL_SCOPES_LIST => {
                 Ok(Self::ApprovalScopesList(decode_params(method, params)?))
+            }
+            methods::USER_QUESTION_RESPOND => {
+                Ok(Self::UserQuestionRespond(decode_params(method, params)?))
             }
             methods::PERMISSION_PROFILE_LIST => {
                 Ok(Self::PermissionProfileList(decode_params(method, params)?))
@@ -4563,6 +4711,73 @@ impl ApprovalCancelledEvent {
     }
 }
 
+/// One selectable option on a [`UserQuestion`] (UPCR-2026-023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One structured multiple-choice question carried by a
+/// [`UserQuestionRequestedEvent`] (UPCR-2026-023). 2–4 `options`, an optional
+/// `multi_select`, and a server-forced `allow_free_text` ("Other" escape
+/// hatch). `header` is a short label (≤ 12 chars).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserQuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    /// Server forces this `true` so a free-text "Other" is always offered.
+    #[serde(default)]
+    pub allow_free_text: bool,
+}
+
+/// Notification emitted when the agent's `ask_user_question` tool asks the user
+/// a structured multiple-choice question mid-turn (UPCR-2026-023). Mirrors
+/// [`ApprovalRequestedEvent`]: while unresolved the turn stays paused at the
+/// blocking-tool boundary, and the mandatory generic `title`/`body` keep a
+/// client that does not understand the structured `questions` field
+/// actionable. The structured `questions` field is gated by `user_question.v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionRequestedEvent {
+    pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question_id: QuestionId,
+    pub turn_id: TurnId,
+    /// Mandatory generic fallback text.
+    pub title: String,
+    /// Mandatory generic fallback text.
+    pub body: String,
+    /// 1–4 structured questions. A client that does not understand this field
+    /// falls back to rendering `title`/`body` and answering via free text.
+    pub questions: Vec<UserQuestion>,
+}
+
+impl UserQuestionRequestedEvent {
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        questions: Vec<UserQuestion>,
+    ) -> Self {
+        Self {
+            session_id,
+            topic: None,
+            question_id,
+            turn_id,
+            title: title.into(),
+            body: body.into(),
+            questions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRuntimeState {
@@ -5126,6 +5341,9 @@ pub enum UiNotification {
     ApprovalAutoResolved(ApprovalAutoResolvedEvent),
     ApprovalDecided(ApprovalDecidedEvent),
     ApprovalCancelled(ApprovalCancelledEvent),
+    /// UPCR-2026-023: structured mid-turn user question. Mirrors
+    /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
+    UserQuestionRequested(UserQuestionRequestedEvent),
     TaskUpdated(TaskUpdatedEvent),
     TaskOutputDelta(TaskOutputDeltaEvent),
     ProgressUpdated(ProgressUpdatedEvent),
@@ -5217,6 +5435,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(_) => methods::APPROVAL_AUTO_RESOLVED,
             Self::ApprovalDecided(_) => methods::APPROVAL_DECIDED,
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
+            Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
             Self::TaskOutputDelta(_) => methods::TASK_OUTPUT_DELTA,
             Self::ProgressUpdated(_) => methods::PROGRESS_UPDATED,
@@ -5258,6 +5477,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => &event.session_id,
             Self::ApprovalDecided(event) => &event.session_id,
             Self::ApprovalCancelled(event) => &event.session_id,
+            Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
             Self::TaskOutputDelta(event) => &event.session_id,
             Self::ProgressUpdated(event) => &event.session_id,
@@ -5312,6 +5532,9 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::UserQuestionRequested(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::TaskOutputDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
@@ -5351,6 +5574,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5378,6 +5602,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(params) => serde_json::to_value(params),
             Self::ApprovalDecided(params) => serde_json::to_value(params),
             Self::ApprovalCancelled(params) => serde_json::to_value(params),
+            Self::UserQuestionRequested(params) => serde_json::to_value(params),
             Self::TaskUpdated(params) => serde_json::to_value(params),
             Self::TaskOutputDelta(params) => serde_json::to_value(params),
             Self::ProgressUpdated(params) => serde_json::to_value(params),
@@ -5477,6 +5702,9 @@ impl UiNotification {
             methods::APPROVAL_DECIDED => Ok(Self::ApprovalDecided(decode_params(method, params)?)),
             methods::APPROVAL_CANCELLED => {
                 Ok(Self::ApprovalCancelled(decode_params(method, params)?))
+            }
+            methods::USER_QUESTION_REQUESTED => {
+                Ok(Self::UserQuestionRequested(decode_params(method, params)?))
             }
             methods::TASK_UPDATED => Ok(Self::TaskUpdated(decode_params(method, params)?)),
             methods::TASK_OUTPUT_DELTA => Ok(Self::TaskOutputDelta(decode_params(method, params)?)),
@@ -5983,6 +6211,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
                 "diff/preview/get",
@@ -6044,6 +6273,7 @@ mod tests {
                 "approval/auto_resolved",
                 "approval/decided",
                 "approval/cancelled",
+                "user_question/requested",
                 "task/updated",
                 "task/output/delta",
                 "progress/updated",
@@ -6077,6 +6307,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
                 "diff/preview/get",
@@ -6149,6 +6380,7 @@ mod tests {
                     "turn/interrupt",
                     "approval/respond",
                     "approval/scopes/list",
+                    "user_question/respond",
                     "permission/profile/list",
                     "permission/profile/set",
                     "diff/preview/get",
@@ -6207,6 +6439,7 @@ mod tests {
                     "approval/auto_resolved",
                     "approval/decided",
                     "approval/cancelled",
+                    "user_question/requested",
                     "task/updated",
                     "task/output/delta",
                     "progress/updated",
@@ -6251,7 +6484,8 @@ mod tests {
                     "review.start.v1",
                     "context.lifecycle.v1",
                     "harness.task_supervision_inspection.v1",
-                    "harness.task_artifacts.v1"
+                    "harness.task_artifacts.v1",
+                    "user_question.v1"
                 ]
             })
         );
@@ -6697,6 +6931,204 @@ mod tests {
         );
         assert_eq!(decoded.title, "Future approval");
         assert_eq!(decoded.body, "Fallback body remains actionable");
+    }
+
+    // ---- UPCR-2026-023 AskUserQuestion protocol round-trips ----
+
+    #[test]
+    fn user_question_methods_and_feature_are_registered() {
+        assert_eq!(methods::USER_QUESTION_RESPOND, "user_question/respond");
+        assert_eq!(methods::USER_QUESTION_REQUESTED, "user_question/requested");
+        assert_eq!(UI_PROTOCOL_FEATURE_USER_QUESTION_V1, "user_question.v1");
+        assert!(UI_PROTOCOL_COMMAND_METHODS.contains(&methods::USER_QUESTION_RESPOND));
+        assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::USER_QUESTION_REQUESTED));
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_USER_QUESTION_V1));
+        assert_eq!(
+            method_capability_gate(methods::USER_QUESTION_RESPOND),
+            Some(UI_PROTOCOL_FEATURE_USER_QUESTION_V1)
+        );
+    }
+
+    #[test]
+    fn full_protocol_advertises_user_question_feature() {
+        // `full_protocol()` must agree with the known/first-server feature
+        // lists, both of which already include `user_question.v1`. A client
+        // that handshakes against `full_protocol()` must see the question
+        // capability or it will never negotiate `user_question.v1` and the
+        // tool silently degrades to its fallback.
+        let caps = UiProtocolCapabilities::full_protocol();
+        assert!(
+            caps.supported_features
+                .iter()
+                .any(|f| f == UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            "full_protocol() must advertise user_question.v1; got {:?}",
+            caps.supported_features
+        );
+    }
+
+    #[test]
+    fn user_question_requested_event_round_trips_with_structured_questions() {
+        let event = UserQuestionRequestedEvent::new(
+            SessionKey("local:demo".into()),
+            QuestionId(Uuid::from_u128(7)),
+            TurnId(Uuid::from_u128(1)),
+            "Pick a framework",
+            "The agent needs you to choose a target framework and runtimes.",
+            vec![
+                UserQuestion {
+                    header: "Framework".into(),
+                    question: "Which web framework should I scaffold?".into(),
+                    options: vec![
+                        UserQuestionOption {
+                            label: "axum".into(),
+                            description: "tower-based async framework".into(),
+                        },
+                        UserQuestionOption {
+                            label: "actix".into(),
+                            description: "actor-based framework".into(),
+                        },
+                    ],
+                    multi_select: false,
+                    allow_free_text: true,
+                },
+                UserQuestion {
+                    header: "Runtimes".into(),
+                    question: "Which runtimes should CI cover?".into(),
+                    options: vec![
+                        UserQuestionOption {
+                            label: "stable".into(),
+                            description: "latest stable toolchain".into(),
+                        },
+                        UserQuestionOption {
+                            label: "nightly".into(),
+                            description: "nightly toolchain".into(),
+                        },
+                        UserQuestionOption {
+                            label: "msrv".into(),
+                            description: "minimum supported rust version".into(),
+                        },
+                    ],
+                    multi_select: true,
+                    allow_free_text: true,
+                },
+            ],
+        );
+
+        let notification = UiNotification::UserQuestionRequested(event.clone());
+        assert_eq!(notification.method(), methods::USER_QUESTION_REQUESTED);
+        let wire = notification
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize user_question/requested");
+        assert_eq!(wire.method, methods::USER_QUESTION_REQUESTED);
+        // snake_case wire field names + mandatory title/body fallback.
+        assert_eq!(wire.params["title"], json!("Pick a framework"));
+        assert_eq!(wire.params["questions"][0]["header"], json!("Framework"));
+        assert_eq!(wire.params["questions"][0]["multi_select"], json!(false));
+        assert_eq!(wire.params["questions"][1]["multi_select"], json!(true));
+        assert_eq!(wire.params["questions"][1]["allow_free_text"], json!(true));
+        assert_eq!(
+            wire.params["questions"][0]["options"][0]["label"],
+            json!("axum")
+        );
+
+        let decoded =
+            UiNotification::from_rpc_notification(wire).expect("decode user_question/requested");
+        assert_eq!(decoded, notification);
+    }
+
+    #[test]
+    fn user_question_respond_params_round_trip_multi_question_and_free_text() {
+        let params = UserQuestionRespondParams {
+            session_id: SessionKey("local:demo".into()),
+            question_id: QuestionId(Uuid::from_u128(7)),
+            answers: vec![
+                // single-select: one label
+                UserQuestionAnswer {
+                    selected_labels: vec!["axum".into()],
+                    free_text: None,
+                },
+                // multi-select: several labels
+                UserQuestionAnswer {
+                    selected_labels: vec!["stable".into(), "msrv".into()],
+                    free_text: None,
+                },
+                // free-text-only: empty labels + free_text
+                UserQuestionAnswer {
+                    selected_labels: Vec::new(),
+                    free_text: Some("rocket, please".into()),
+                },
+            ],
+            client_note: Some("answered from TUI".into()),
+        };
+
+        let command = UiCommand::UserQuestionRespond(params.clone());
+        assert_eq!(command.method(), methods::USER_QUESTION_RESPOND);
+        let request = command
+            .clone()
+            .into_rpc_request("req-uq-1")
+            .expect("serialize user_question/respond");
+        assert_eq!(request.method, methods::USER_QUESTION_RESPOND);
+        // free-text-only answer omits the empty selected_labels but keeps free_text.
+        assert_eq!(
+            request.params["answers"][2]["free_text"],
+            json!("rocket, please")
+        );
+        assert!(
+            request.params["answers"][2]
+                .get("selected_labels")
+                .is_none()
+        );
+
+        let decoded = UiCommand::from_rpc_request(request).expect("decode user_question/respond");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn user_question_respond_decodes_minimal_and_unknown_fields() {
+        // Minimal params: client_note omitted, free-text-only answer with no
+        // selected_labels, plus an unknown forward-compat sibling field.
+        let value = json!({
+            "session_id": "local:demo",
+            "question_id": QuestionId(Uuid::from_u128(7)),
+            "answers": [
+                { "free_text": "something else" }
+            ],
+            "future_field": { "anything": true }
+        });
+        let decoded: UserQuestionRespondParams =
+            serde_json::from_value(value).expect("minimal user_question/respond decodes");
+        assert_eq!(decoded.client_note, None);
+        assert_eq!(decoded.answers.len(), 1);
+        assert!(decoded.answers[0].selected_labels.is_empty());
+        assert_eq!(
+            decoded.answers[0].free_text.as_deref(),
+            Some("something else")
+        );
+    }
+
+    #[test]
+    fn user_question_requested_keeps_generic_fallback_on_unknown_fields() {
+        // A client that does not understand `questions` must still get the
+        // mandatory generic title/body, and an unknown extra field must not
+        // break decoding (forward-compat).
+        let value = json!({
+            "session_id": "local:demo",
+            "question_id": QuestionId(Uuid::from_u128(7)),
+            "turn_id": TurnId(Uuid::from_u128(1)),
+            "title": "Generic fallback title",
+            "body": "Generic fallback body the user can still answer via free text.",
+            "questions": [],
+            "future_render_hint": "wizard"
+        });
+        let decoded: UserQuestionRequestedEvent =
+            serde_json::from_value(value).expect("unknown-field event decodes");
+        assert_eq!(decoded.title, "Generic fallback title");
+        assert_eq!(
+            decoded.body,
+            "Generic fallback body the user can still answer via free text."
+        );
+        assert!(decoded.questions.is_empty());
     }
 
     #[test]
@@ -8629,6 +9061,32 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn sample_user_question_requested_event() -> UserQuestionRequestedEvent {
+        UserQuestionRequestedEvent::new(
+            sample_session_id(),
+            QuestionId(Uuid::from_u128(0x77)),
+            sample_turn_id(),
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            vec![UserQuestion {
+                header: "Framework".into(),
+                question: "Which framework?".into(),
+                options: vec![
+                    UserQuestionOption {
+                        label: "axum".into(),
+                        description: "tower-based".into(),
+                    },
+                    UserQuestionOption {
+                        label: "actix".into(),
+                        description: "actor-based".into(),
+                    },
+                ],
+                multi_select: false,
+                allow_free_text: true,
+            }],
+        )
+    }
+
     #[test]
     fn golden_session_hydrate_params_serde() {
         let params = SessionHydrateParams {
@@ -8688,6 +9146,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: Some(vec![]),
+            pending_questions: Some(vec![sample_user_question_requested_event()]),
             replayed_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
@@ -8705,6 +9164,7 @@ mod tests {
             threads: None,
             turns: None,
             pending_approvals: None,
+            pending_questions: None,
             replayed_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
@@ -8713,6 +9173,9 @@ mod tests {
         assert!(!object.contains_key("threads"));
         assert!(!object.contains_key("turns"));
         assert!(!object.contains_key("pending_approvals"));
+        // UPCR-2026-023: a client that did not request pending questions never
+        // sees the new field — it is omitted, never serialized as `null`.
+        assert!(!object.contains_key("pending_questions"));
         // Bug C: a non-negotiated client never sees the new field.
         assert!(!object.contains_key("replayed_envelopes"));
     }
