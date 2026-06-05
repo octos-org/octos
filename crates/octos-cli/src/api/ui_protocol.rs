@@ -8611,10 +8611,11 @@ async fn open_session_result(
     // mark its menu. Read from the same disk-backed store the turn path writes
     // (`<data_dir>/users/.../<topic>.reasoning_effort.json`); `None` when the
     // session has never set an effort.
-    let reasoning_effort = crate::api::ui_protocol_reasoning_effort::read_reasoning_effort(
+    let reasoning_effort = crate::api::ui_protocol_reasoning_effort::read_reasoning_effort_async(
         &data_dir,
         &params.session_id,
-    );
+    )
+    .await;
     // Tag the broadcast with our connection id so the live forwarder
     // installed below skips this event (we direct-send it inline at the
     // call site). Other connections still observe the broadcast.
@@ -16379,7 +16380,8 @@ async fn run_standalone_turn(
             &effort_data_dir,
             &session_id,
             params.reasoning_effort,
-        );
+        )
+        .await;
     if let Some(level) = resolved_effort {
         agent_config.reasoning_effort = Some(reasoning_effort_from_wire(level));
     }

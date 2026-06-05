@@ -57,7 +57,10 @@ pub(crate) fn reasoning_effort_path(data_dir: &Path, session_id: &SessionKey) ->
         .join(format!("{encoded_topic}.reasoning_effort.json"))
 }
 
-/// Read the persisted reasoning effort for a session, if any.
+/// Read the persisted reasoning effort for a session, if any. **Blocking** —
+/// performs synchronous disk IO. Async callers must reach it via
+/// [`read_reasoning_effort_async`] (which offloads it onto a blocking thread)
+/// rather than calling it directly on a Tokio worker.
 ///
 /// Returns `None` when no file exists or the file is unreadable/corrupt — the
 /// caller treats that as "no override".
@@ -71,7 +74,26 @@ pub(crate) fn read_reasoning_effort(
     Some(record.reasoning_effort)
 }
 
+/// Read the persisted reasoning effort, offloading the blocking disk read onto a
+/// Tokio blocking thread so it never stalls an async executor worker.
+///
+/// `None` on missing/corrupt/cancelled — identical "no override" semantics to
+/// the sync [`read_reasoning_effort`].
+pub(crate) async fn read_reasoning_effort_async(
+    data_dir: &Path,
+    session_id: &SessionKey,
+) -> Option<ReasoningEffortLevel> {
+    let data_dir = data_dir.to_path_buf();
+    let session_id = session_id.clone();
+    tokio::task::spawn_blocking(move || read_reasoning_effort(&data_dir, &session_id))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Persist the reasoning effort for a session (atomic write-then-rename).
+/// **Blocking** — performs synchronous disk IO including an `fsync`. Async
+/// callers must offload it (see [`resolve_and_persist_reasoning_effort`]).
 ///
 /// Best-effort: returns the IO error to the caller, which logs and continues —
 /// a failed persist must never abort a turn.
@@ -94,19 +116,23 @@ pub(crate) fn write_reasoning_effort(
     // target. The temp name embeds the pid so concurrent writers from the same
     // data_dir don't clobber each other's temp file before the rename.
     let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    {
+    // Write + fsync the temp file. On ANY failure along the way (create,
+    // write_all, sync_all, or the rename) we must remove the temp sibling so we
+    // never leak `*.reasoning_effort.json.tmp.<pid>` files on disk.
+    let write_result = (|| {
         let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(&serialized)?;
-        file.sync_all()?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
     }
-    match std::fs::rename(&tmp_path, &path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // Clean up the temp file on a failed rename so we don't leak it.
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(error)
-        }
+    if let Err(error) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
     }
+    Ok(())
 }
 
 /// Resolve the effective per-session reasoning effort for a turn and persist
@@ -122,23 +148,58 @@ pub(crate) fn write_reasoning_effort(
 ///      before the client re-sends it.
 ///   3. `turn_param = None` and nothing stored — return `None`; the caller
 ///      leaves the gateway/profile default untouched.
-pub(crate) fn resolve_and_persist_reasoning_effort(
+///
+/// Async + write-on-change. The TUI attaches `reasoning_effort` to **every**
+/// `turn/start`, so this runs on every turn once an effort is set. To keep the
+/// hot path off the disk:
+///   - the stored value is read first on a blocking thread, and
+///   - the `fsync`ing write is issued **only when the incoming value actually
+///     differs** from what is already stored, and even then it is offloaded onto
+///     a blocking thread.
+///
+/// In the common case (effort unchanged turn-to-turn) no write — and thus no
+/// `fsync` — happens at all, and the executor worker is never blocked.
+pub(crate) async fn resolve_and_persist_reasoning_effort(
     data_dir: &Path,
     session_id: &SessionKey,
     turn_param: Option<ReasoningEffortLevel>,
 ) -> Option<ReasoningEffortLevel> {
+    let stored = read_reasoning_effort_async(data_dir, session_id).await;
     match turn_param {
+        // Turn carries an explicit effort: it wins. Persist only when it changed
+        // the stored value (this is the per-turn write the TUI would otherwise
+        // trigger on every turn). The write — and its fsync — runs on a blocking
+        // thread so it never stalls the executor.
         Some(level) => {
-            if let Err(error) = write_reasoning_effort(data_dir, session_id, level) {
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    %error,
-                    "failed to persist per-session reasoning_effort; applying for this turn only"
-                );
+            if stored != Some(level) {
+                let data_dir = data_dir.to_path_buf();
+                let session_id_owned = session_id.clone();
+                let persist = tokio::task::spawn_blocking(move || {
+                    write_reasoning_effort(&data_dir, &session_id_owned, level)
+                })
+                .await;
+                match persist {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            %error,
+                            "failed to persist per-session reasoning_effort; applying for this turn only"
+                        );
+                    }
+                    Err(join_error) => {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            %join_error,
+                            "reasoning_effort persist task failed to join; applying for this turn only"
+                        );
+                    }
+                }
             }
             Some(level)
         }
-        None => read_reasoning_effort(data_dir, session_id),
+        // Turn omits the effort: fall back to the stored value (already read).
+        None => stored,
     }
 }
 
@@ -197,8 +258,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_let_turn_param_win_and_persist_it() {
+    #[tokio::test]
+    async fn should_let_turn_param_win_and_persist_it() {
         // A turn that carries reasoning_effort wins over any stored value AND
         // is persisted so a later restart sees it.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -211,7 +272,8 @@ mod tests {
             data_dir,
             &session,
             Some(ReasoningEffortLevel::Max),
-        );
+        )
+        .await;
         assert_eq!(resolved, Some(ReasoningEffortLevel::Max));
         // Persisted, so a subsequent turn that omits the param observes Max.
         assert_eq!(
@@ -220,8 +282,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_fall_back_to_stored_when_turn_omits_effort() {
+    #[tokio::test]
+    async fn should_fall_back_to_stored_when_turn_omits_effort() {
         // A turn that omits reasoning_effort falls back to the persisted value —
         // the stored choice survives a restart even before the client re-sends.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -230,20 +292,86 @@ mod tests {
 
         write_reasoning_effort(data_dir, &session, ReasoningEffortLevel::High).expect("seed high");
 
-        let resolved = resolve_and_persist_reasoning_effort(data_dir, &session, None);
+        let resolved = resolve_and_persist_reasoning_effort(data_dir, &session, None).await;
         assert_eq!(resolved, Some(ReasoningEffortLevel::High));
     }
 
-    #[test]
-    fn should_resolve_none_when_no_param_and_nothing_stored() {
+    #[tokio::test]
+    async fn should_resolve_none_when_no_param_and_nothing_stored() {
         // Nothing stored + turn omits → no override; caller keeps the default.
         let tmp = tempfile::tempdir().expect("tempdir");
         let data_dir = tmp.path();
         let session = SessionKey("api:fresh".into());
 
         assert_eq!(
-            resolve_and_persist_reasoning_effort(data_dir, &session, None),
+            resolve_and_persist_reasoning_effort(data_dir, &session, None).await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_rewrite_when_turn_param_matches_stored() {
+        // The hot path: the TUI re-attaches the SAME effort on every turn. When
+        // the incoming value already equals the stored value we must NOT touch
+        // the file (no write, no fsync) — the per-turn write is exactly what the
+        // P2 fix eliminates.
+        //
+        // Detect the no-write deterministically (no clock/mtime-resolution
+        // dependence): seed the file with a byte-distinct-but-equivalent JSON
+        // encoding (extra whitespace) that still parses to `High`. A genuine
+        // rewrite would normalize it to serde's compact form, so byte-equality
+        // after the call proves no write happened.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let session = SessionKey("api:abc".into());
+
+        let path = reasoning_effort_path(data_dir, &session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let sentinel = b"{ \"reasoning_effort\" : \"high\" }";
+        std::fs::write(&path, sentinel).expect("seed sentinel");
+        // Sanity: the sentinel parses to High but is NOT byte-equal to a fresh
+        // canonical write, so a rewrite is observable.
+        assert_eq!(
+            read_reasoning_effort(data_dir, &session),
+            Some(ReasoningEffortLevel::High)
+        );
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec(&ReasoningEffortRecord {
+                reasoning_effort: ReasoningEffortLevel::High
+            })
+            .unwrap()
+        );
+
+        let resolved = resolve_and_persist_reasoning_effort(
+            data_dir,
+            &session,
+            Some(ReasoningEffortLevel::High),
+        )
+        .await;
+        assert_eq!(resolved, Some(ReasoningEffortLevel::High));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sentinel,
+            "unchanged effort must not rewrite (and re-fsync) the file"
+        );
+
+        // A genuinely different value, by contrast, DOES rewrite.
+        let resolved_changed = resolve_and_persist_reasoning_effort(
+            data_dir,
+            &session,
+            Some(ReasoningEffortLevel::Low),
+        )
+        .await;
+        assert_eq!(resolved_changed, Some(ReasoningEffortLevel::Low));
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            sentinel,
+            "a changed effort must rewrite the file"
+        );
+        assert_eq!(
+            read_reasoning_effort(data_dir, &session),
+            Some(ReasoningEffortLevel::Low)
         );
     }
 
