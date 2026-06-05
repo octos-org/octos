@@ -16380,6 +16380,10 @@ async fn run_standalone_turn(
             &effort_data_dir,
             &session_id,
             params.reasoning_effort,
+            // A user turn is authoritative: when it omits the effort the user
+            // chose "default", so clear the stored override. Server-initiated
+            // continuations keep falling back to the stored value.
+            !internal_master_continuation,
         )
         .await;
     if let Some(level) = resolved_effort {

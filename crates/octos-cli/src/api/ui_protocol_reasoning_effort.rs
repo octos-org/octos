@@ -143,11 +143,13 @@ pub(crate) fn write_reasoning_effort(
 ///      WINS, and is persisted so a later restart (or a turn that omits it)
 ///      observes the same value. A failed persist is logged and the value is
 ///      still applied for this turn.
-///   2. `turn_param = None` — fall back to the persisted stored value, so the
-///      stored choice stays authoritative across a serve/TUI restart even
-///      before the client re-sends it.
-///   3. `turn_param = None` and nothing stored — return `None`; the caller
-///      leaves the gateway/profile default untouched.
+///   2. `turn_param = None` on a CONTINUATION turn (`from_user_turn = false`) —
+///      fall back to the persisted stored value, so a server-initiated
+///      continuation mid-loop doesn't lose the session's effort.
+///   3. `turn_param = None` on a USER turn (`from_user_turn = true`) — the user
+///      chose "default": CLEAR the stored override and return `None` so future
+///      turns use the gateway/profile default. (Without this, "default" was a
+///      no-op: the server kept applying the stored level — codex finding.)
 ///
 /// Async + write-on-change. The TUI attaches `reasoning_effort` to **every**
 /// `turn/start`, so this runs on every turn once an effort is set. To keep the
@@ -163,6 +165,7 @@ pub(crate) async fn resolve_and_persist_reasoning_effort(
     data_dir: &Path,
     session_id: &SessionKey,
     turn_param: Option<ReasoningEffortLevel>,
+    from_user_turn: bool,
 ) -> Option<ReasoningEffortLevel> {
     let stored = read_reasoning_effort_async(data_dir, session_id).await;
     match turn_param {
@@ -198,8 +201,50 @@ pub(crate) async fn resolve_and_persist_reasoning_effort(
             }
             Some(level)
         }
-        // Turn omits the effort: fall back to the stored value (already read).
-        None => stored,
+        // Turn omits the effort. A USER turn that omits it means the user chose
+        // "default" — clear any stored override so future turns (including
+        // server-initiated continuations) use the profile default rather than the
+        // previously-stored level. Continuation turns (from_user_turn=false) keep
+        // falling back to the stored value so a mid-loop continuation doesn't lose
+        // the session's effort.
+        None => {
+            if from_user_turn {
+                if stored.is_some() {
+                    let data_dir = data_dir.to_path_buf();
+                    let session_id_owned = session_id.clone();
+                    let cleared = tokio::task::spawn_blocking(move || {
+                        clear_reasoning_effort(&data_dir, &session_id_owned)
+                    })
+                    .await;
+                    if let Ok(Err(error)) = &cleared {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            %error,
+                            "failed to clear per-session reasoning_effort"
+                        );
+                    }
+                }
+                None
+            } else {
+                stored
+            }
+        }
+    }
+}
+
+/// Delete the persisted per-session reasoning effort (used when a user turn
+/// explicitly clears the override via `/thinking default`). A missing file is a
+/// no-op. Blocking I/O — callers must offload it (see
+/// [`resolve_and_persist_reasoning_effort`]).
+pub(crate) fn clear_reasoning_effort(
+    data_dir: &Path,
+    session_id: &SessionKey,
+) -> std::io::Result<()> {
+    let path = reasoning_effort_path(data_dir, session_id);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -272,6 +317,7 @@ mod tests {
             data_dir,
             &session,
             Some(ReasoningEffortLevel::Max),
+            true,
         )
         .await;
         assert_eq!(resolved, Some(ReasoningEffortLevel::Max));
@@ -292,7 +338,7 @@ mod tests {
 
         write_reasoning_effort(data_dir, &session, ReasoningEffortLevel::High).expect("seed high");
 
-        let resolved = resolve_and_persist_reasoning_effort(data_dir, &session, None).await;
+        let resolved = resolve_and_persist_reasoning_effort(data_dir, &session, None, false).await;
         assert_eq!(resolved, Some(ReasoningEffortLevel::High));
     }
 
@@ -304,7 +350,33 @@ mod tests {
         let session = SessionKey("api:fresh".into());
 
         assert_eq!(
-            resolve_and_persist_reasoning_effort(data_dir, &session, None).await,
+            resolve_and_persist_reasoning_effort(data_dir, &session, None, true).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn should_clear_stored_when_user_turn_omits_effort() {
+        // A USER turn (from_user_turn=true) that omits the effort means the user
+        // chose "default": it must CLEAR the stored override so future turns use
+        // the profile default (codex #1424 follow-up — "default" was a no-op).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let session = SessionKey("api:abc".into());
+        write_reasoning_effort(data_dir, &session, ReasoningEffortLevel::High).expect("seed high");
+
+        let resolved = resolve_and_persist_reasoning_effort(data_dir, &session, None, true).await;
+        assert_eq!(resolved, None, "user 'default' yields no override");
+        assert_eq!(
+            read_reasoning_effort(data_dir, &session),
+            None,
+            "user 'default' must clear the stored override on disk"
+        );
+
+        // A continuation turn (from_user_turn=false) does NOT clear — it would
+        // fall back to stored, but nothing is stored now, so it stays None.
+        assert_eq!(
+            resolve_and_persist_reasoning_effort(data_dir, &session, None, false).await,
             None
         );
     }
@@ -347,6 +419,7 @@ mod tests {
             data_dir,
             &session,
             Some(ReasoningEffortLevel::High),
+            true,
         )
         .await;
         assert_eq!(resolved, Some(ReasoningEffortLevel::High));
@@ -361,6 +434,7 @@ mod tests {
             data_dir,
             &session,
             Some(ReasoningEffortLevel::Low),
+            true,
         )
         .await;
         assert_eq!(resolved_changed, Some(ReasoningEffortLevel::Low));
