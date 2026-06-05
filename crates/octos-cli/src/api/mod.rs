@@ -39,6 +39,7 @@ mod ui_protocol_diff;
 mod ui_protocol_ledger;
 pub(crate) mod ui_protocol_progress;
 mod ui_protocol_questions;
+mod ui_protocol_reasoning_effort;
 mod ui_protocol_sanitize;
 mod ui_protocol_scope;
 mod ui_protocol_task_output;

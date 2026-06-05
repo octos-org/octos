@@ -3787,6 +3787,20 @@ pub struct SessionOpened {
     /// `serde(default)` for forward compatibility.
     #[serde(default = "UiProtocolCapabilities::first_server_slice")]
     pub capabilities: UiProtocolCapabilities,
+    /// Server-persisted per-session reasoning/thinking effort, surfaced on
+    /// session open/reconnect so a restarting TUI can restore its local
+    /// `/thinking` state and mark its menu without re-deriving it. `None`
+    /// (omitted on the wire) means no effort has ever been persisted for this
+    /// session — the client should treat that as "default" (no override).
+    ///
+    /// This is the authoritative value across a full serve/TUI restart: in
+    /// `--stdio` mode the serve is a child of the TUI, so a TUI restart
+    /// respawns the serve and only this disk-backed value survives. The server
+    /// persists it whenever a `turn/start` carries `reasoning_effort` and reads
+    /// it back here. Additive + backward-compatible: older clients ignore the
+    /// field, and older serialized payloads decode it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5836,6 +5850,50 @@ mod tests {
     }
 
     #[test]
+    fn should_surface_persisted_reasoning_effort_on_session_open() {
+        // The persisted per-session effort is surfaced back to a
+        // reconnecting/restarting TUI via `SessionOpened.reasoning_effort` so
+        // the client can restore its local `/thinking` state and mark its menu.
+        let opened = SessionOpened {
+            session_id: SessionKey("local:demo".into()),
+            active_profile_id: None,
+            workspace_root: None,
+            context: None,
+            context_state: None,
+            cursor: None,
+            panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: Some(ReasoningEffortLevel::High),
+        };
+        let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+        assert_eq!(wire["reasoning_effort"], json!("high"));
+        let back: SessionOpened = serde_json::from_value(wire).expect("round-trip");
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffortLevel::High));
+
+        // Omitted on the wire when None, and older payloads (no field) decode
+        // to None — additive + backward-compatible.
+        let none_opened = SessionOpened {
+            reasoning_effort: None,
+            ..opened.clone()
+        };
+        let none_wire = serde_json::to_value(&none_opened).expect("serialize None");
+        assert!(
+            none_wire.get("reasoning_effort").is_none(),
+            "reasoning_effort must be omitted from the wire when None"
+        );
+        let legacy = json!({
+            "session_id": "local:demo",
+            "capabilities": serde_json::to_value(
+                UiProtocolCapabilities::first_server_slice()
+            )
+            .unwrap()
+        });
+        let parsed: SessionOpened =
+            serde_json::from_value(legacy).expect("legacy payload without field decodes");
+        assert_eq!(parsed.reasoning_effort, None);
+    }
+
+    #[test]
     fn ui_command_method_matches_expected_transport_name() {
         let cmd = UiCommand::TurnInterrupt(TurnInterruptParams {
             session_id: SessionKey("local:demo".into()),
@@ -6008,6 +6066,7 @@ mod tests {
                 limitations: Vec::new(),
             }),
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         };
 
         let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -6041,6 +6100,7 @@ mod tests {
             cursor: None,
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         };
         let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
         let capabilities = wire
@@ -7554,6 +7614,7 @@ mod tests {
             }),
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         };
 
         let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -8396,6 +8457,7 @@ mod tests {
             cursor: Some(opened_cursor.clone()),
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         });
 
         let opened_wire = opened

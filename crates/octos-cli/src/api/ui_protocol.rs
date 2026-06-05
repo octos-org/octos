@@ -8606,6 +8606,15 @@ async fn open_session_result(
     // clients don't have to rely on out-of-band knowledge of which feature
     // tokens the server honours.
     let capabilities = features.advertised_capabilities(state);
+    // Surface the server-persisted per-session reasoning/thinking effort so a
+    // restarting/reconnecting TUI can restore its local `/thinking` state and
+    // mark its menu. Read from the same disk-backed store the turn path writes
+    // (`<data_dir>/users/.../<topic>.reasoning_effort.json`); `None` when the
+    // session has never set an effort.
+    let reasoning_effort = crate::api::ui_protocol_reasoning_effort::read_reasoning_effort(
+        &data_dir,
+        &params.session_id,
+    );
     // Tag the broadcast with our connection id so the live forwarder
     // installed below skips this event (we direct-send it inline at the
     // call site). Other connections still observe the broadcast.
@@ -8619,6 +8628,7 @@ async fn open_session_result(
             cursor: None,
             panes,
             capabilities,
+            reasoning_effort,
         }),
         connection_id,
     );
@@ -16348,11 +16358,29 @@ async fn run_standalone_turn(
     let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
     let mut agent_config = session_runtime.agent.agent_config();
-    // Per-turn reasoning/thinking effort override (TUI `/thinking`). When the
-    // client attaches `reasoning_effort` to turn/start it wins over the
-    // gateway/profile default for this turn; providers translate it per model
-    // (no-op for models without a reasoning style).
-    if let Some(level) = params.reasoning_effort {
+    // Per-session reasoning/thinking effort (TUI `/thinking`), persisted
+    // server-side so it survives a full serve/TUI restart (in `--stdio` mode a
+    // TUI restart respawns the serve; only the disk-backed value reloads).
+    //
+    // Precedence:
+    //   1. A turn that CARRIES `reasoning_effort` wins — apply it AND persist it
+    //      for this session so a later restart (or a turn that omits it) sees
+    //      the same value.
+    //   2. A turn that OMITS it falls back to the persisted stored value, so the
+    //      stored choice is authoritative across a restart even before the
+    //      client re-sends it.
+    //   3. No turn-param and nothing stored → the gateway/profile default is
+    //      left untouched (no override).
+    // Providers translate the chosen effort per model (no-op for models without
+    // a reasoning style).
+    let effort_data_dir = sessions.lock().await.data_dir();
+    let resolved_effort =
+        crate::api::ui_protocol_reasoning_effort::resolve_and_persist_reasoning_effort(
+            &effort_data_dir,
+            &session_id,
+            params.reasoning_effort,
+        );
+    if let Some(level) = resolved_effort {
         agent_config.reasoning_effort = Some(reasoning_effort_from_wire(level));
     }
     // Per-session system prompt override. Gateway path reads
@@ -23818,6 +23846,7 @@ ignore = []
                 cursor: Some(cursor.clone()),
                 panes: None,
                 capabilities: octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
+                reasoning_effort: None,
             }));
         assert_eq!(ledger_event_cursor(&opened), Some(cursor.clone()));
 
@@ -35412,6 +35441,7 @@ ignore = []
                 cursor: None,
                 panes: None,
                 capabilities: UiProtocolCapabilities::first_server_slice(),
+                reasoning_effort: None,
             }),
             ws.connection_id(),
         );
