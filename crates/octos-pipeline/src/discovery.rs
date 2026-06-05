@@ -109,6 +109,28 @@ impl PipelineDiscovery {
         }
     }
 
+    /// Build a discovery for AGENT-facing resolution. Searches the per-profile
+    /// `<data>/pipelines` + `<data>/skills` (plus any `add_search_path` /
+    /// `add_bundled_pipelines_dir`), but OMITS the project-level
+    /// `<working_dir>/.octos/pipelines` — the most directly agent-writable
+    /// location — so a model can't run a `.dot` it dropped there by bare name.
+    ///
+    /// KNOWN RESIDUAL (tracked follow-up): when the per-profile `data_dir`
+    /// itself aliases the workspace (`data_dir == <working_dir>/.octos`, e.g.
+    /// `$HOME` chat, or gateway/profile runtimes that set `working_dir ==
+    /// data_dir`), `<data>/pipelines` is also agent-writable and cannot be
+    /// distinguished from an operator install here. Fully closing that requires
+    /// a trusted-pipeline-location decision (e.g. a bundled-only agent mode, or
+    /// an agent-inaccessible install dir) rather than a path heuristic — a blunt
+    /// "exclude everything under `working_dir`" filter would break legitimate
+    /// operator pipelines in exactly those `working_dir == data_dir` configs.
+    pub fn new_operator_trusted(data_dir: &Path) -> Self {
+        Self {
+            search_paths: vec![data_dir.join("pipelines"), data_dir.join("skills")],
+            bundled_dirs: Vec::new(),
+        }
+    }
+
     /// Add an installed-pipeline / installed-skill search path (e.g. global
     /// `octos_home/skills/`). These are searched at HIGHER precedence than
     /// any bundled-pipelines dir.
@@ -229,6 +251,29 @@ impl PipelineDiscovery {
             requested: name_or_path.to_string(),
             available: all.into_iter().map(|p| p.name).collect(),
         }))
+    }
+
+    /// Resolve a bare pipeline NAME against only the operator-INSTALLED search
+    /// paths (skill dirs / user pipeline dirs) — NOT the bundled-pipelines dirs.
+    /// Returns `Ok(Some(dot))` for an installed copy, `Ok(None)` if none.
+    ///
+    /// This lets a caller honor installed-wins (an operator override beats a
+    /// bundled canonical pipeline) WITHOUT the bootstrapped bundled `.dot` — which
+    /// lives under a `bundled_dirs` entry — shadowing a preferred bundled-IR
+    /// rebuild of the same name.
+    pub async fn resolve_installed(&self, name: &str) -> Result<Option<String>> {
+        let want_stem = pipeline_name_stem(name.trim());
+        for info in self.list_available() {
+            // Skip anything located under a bundled-pipelines dir — that's the
+            // embedded fallback, not an operator install.
+            if self.bundled_dirs.iter().any(|b| info.path.starts_with(b)) {
+                continue;
+            }
+            if info.name == want_stem {
+                return Ok(Some(read_located(&info.path).await?));
+            }
+        }
+        Ok(None)
     }
 }
 

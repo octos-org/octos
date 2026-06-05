@@ -620,6 +620,15 @@ impl Handler for CodergenHandler {
                     "run_pipeline".into(),
                     "send_file".into(),
                     "message".into(),
+                    // Shell is arbitrary code execution — banned in pipelines.
+                    // Denied unconditionally so no node's agent can run shell,
+                    // even via an empty tool-list (which widens to all builtins).
+                    // `write_stdin` drives existing exec sessions → also denied.
+                    "shell".into(),
+                    "exec_command".into(),
+                    "bash".into(),
+                    "exec".into(),
+                    "write_stdin".into(),
                 ],
                 ..Default::default()
             }

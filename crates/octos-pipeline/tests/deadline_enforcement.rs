@@ -128,13 +128,13 @@ fn base_config(
 }
 
 /// Build a `HandlerRegistry` with the `SleepHandler` bound to
-/// `HandlerKind::Shell`. All other slots use the cheap built-in `NoopHandler`
-/// so only `handler="shell"` nodes stall in tests.
+/// `HandlerKind::Codergen` (the slow node), and `NoopHandler` everywhere else
+/// (the fast `start` node uses `handler="noop"`). The `shell` handler is banned
+/// in pipelines, so it can no longer be used as the slow-node vehicle.
 fn handlers_with_sleep(sleep_handler: Arc<dyn Handler>) -> HandlerRegistry {
     let mut registry = HandlerRegistry::new();
-    registry.register(HandlerKind::Shell, sleep_handler);
+    registry.register(HandlerKind::Codergen, sleep_handler);
     registry.register(HandlerKind::Noop, Arc::new(NoopHandler));
-    registry.register(HandlerKind::Codergen, Arc::new(NoopHandler));
     registry.register(HandlerKind::Gate, Arc::new(NoopHandler));
     registry.register(HandlerKind::Parallel, Arc::new(NoopHandler));
     registry.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
@@ -142,15 +142,14 @@ fn handlers_with_sleep(sleep_handler: Arc<dyn Handler>) -> HandlerRegistry {
 }
 
 fn single_slow_node_dot(action: &str) -> String {
-    // `start` uses a fast built-in handler (Codergen -> NoopHandler in the
-    // test registry); `slow` uses the custom SleepHandler bound to
-    // HandlerKind::Shell. This separation lets us assert deadline bounds
-    // precisely — only the `slow` node stalls.
+    // `start` uses a fast `noop` handler; `slow` uses the custom SleepHandler
+    // bound to `HandlerKind::Codergen`. This separation lets us assert deadline
+    // bounds precisely — only the `slow` node stalls.
     format!(
         r#"
         digraph t {{
-            start [handler="codergen"]
-            slow [handler="shell", deadline_secs="1", deadline_action="{action}"]
+            start [handler="noop"]
+            slow [handler="codergen", deadline_secs="1", deadline_action="{action}"]
             start -> slow
         }}
         "#

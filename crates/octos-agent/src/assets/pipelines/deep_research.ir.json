@@ -1,0 +1,34 @@
+{
+  "id": "deep_research",
+  "label": "Deep Research (IR)",
+  "nodes": [
+    {
+      "id": "search",
+      "kind": {
+        "type": "fanout",
+        "plan_prompt": "Generate 4-6 distinct research search angles for the user's query — cover the core topic, alternatives/comparisons, technical detail, and recent developments; do NOT just rephrase the same query. Include at least one angle in Chinese and one in English for cross-language coverage. Respond with ONLY a JSON array of {\"task\",\"label\"} objects, each task under 80 chars.",
+        "worker_prompt": "You are a research search specialist.\n\n{task}\n\nUse web_search to find the most relevant, authoritative sources, then web_fetch/read_file to read at least 3 of them. Include ALL URLs, specific data points, and quotes in your output.",
+        "converge": "analyze",
+        "max_tasks": 6
+      }
+    },
+    {
+      "id": "analyze",
+      "kind": {
+        "type": "synthesize",
+        "prompt": "You are a research analyst. Cross-reference the search results from all angles: identify the key facts and data, note where sources agree or disagree, organize findings by subtopic, rate source credibility (official docs > papers > news > blogs), and flag contradictions. Preserve ALL specific numbers, dates, names, quotes, and URLs — do not summarize away detail."
+      }
+    },
+    {
+      "id": "synthesize",
+      "kind": {
+        "type": "report",
+        "prompt": "You are a research synthesis expert. Produce a comprehensive, structured report: Executive Summary, Key Findings by topic, Detailed Analysis with [title](url) citations, Areas of Uncertainty, and Conclusions. Include specific numbers, dates, and quotes; note a confidence level per major finding; match the query's language. SAVE the final report with write_file, then return a concise executive summary as text."
+      }
+    }
+  ],
+  "edges": [
+    {"source": "search", "target": "analyze"},
+    {"source": "analyze", "target": "synthesize"}
+  ]
+}

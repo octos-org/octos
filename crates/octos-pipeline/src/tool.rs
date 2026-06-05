@@ -155,7 +155,10 @@ impl RunPipelineTool {
         working_dir: PathBuf,
         data_dir: PathBuf,
     ) -> Self {
-        let discovery = PipelineDiscovery::new(&data_dir, &working_dir);
+        // Agent-facing resolution searches ONLY operator-trusted dirs — never
+        // the agent-writable `<working_dir>/.octos/pipelines` — so a model
+        // cannot run a `.dot` it wrote by bare name (codex security review).
+        let discovery = PipelineDiscovery::new_operator_trusted(&data_dir);
         Self {
             default_provider,
             provider_router: None,
@@ -347,66 +350,57 @@ impl RunPipelineTool {
 
     /// Build a model catalog string for the LLM, showing each model's key,
     /// output capacity, context window, and cost.
-    /// Resolve pipeline with fallback: try inline DOT first, if it fails to parse,
-    /// try as a named pipeline. This handles cases where the LLM produces slightly
-    /// malformed DOT — the pre-built pipeline still works as a safety net.
+    /// Resolve a `pipeline` argument to runnable DOT.
+    ///
+    /// Both unsafe authoring surfaces are **rejected** here: free-form inline
+    /// DOT (a model could request arbitrary tools/handlers incl. `shell`, or an
+    /// empty tool-list that silently expanded to all builtins) AND caller-
+    /// supplied file PATHS (a model could write `/tmp/pwn.dot` with
+    /// `handler=shell` and feed the path — the same arbitrary surface via
+    /// `PipelineDiscovery`'s direct-path read). This method accepts ONLY a bare
+    /// sanctioned pipeline NAME, resolved through discovery + the embedded
+    /// bundled bytes. Agents author ad-hoc work via the capability-locked `ir`.
     async fn resolve_with_fallback(&self, pipeline_str: &str) -> Result<String> {
-        let trimmed = pipeline_str.trim();
-        let is_inline = trimmed.starts_with("digraph ") || trimmed.starts_with("digraph{");
-
-        if is_inline {
-            // Sanitize common LLM DOT mistakes before parsing
-            let sanitized = sanitize_dot(trimmed);
-            let trimmed = sanitized.as_str();
-
-            // Validate inline DOT parses correctly
-            match crate::parser::parse_dot(trimmed) {
-                Ok(_) => return Ok(pipeline_str.to_string()),
-                Err(parse_err) => {
-                    // Log the full DOT for debugging parse failures
-                    let dot_preview = if trimmed.len() > 500 {
-                        let mut end = 500;
-                        while !trimmed.is_char_boundary(end) && end > 0 {
-                            end -= 1;
-                        }
-                        format!(
-                            "{}...(truncated at {} bytes)",
-                            &trimmed[..end],
-                            trimmed.len()
-                        )
-                    } else {
-                        trimmed.to_string()
-                    };
-                    tracing::warn!(
-                        dot = %dot_preview,
-                        "inline DOT parse failed, trying named fallback: {parse_err}"
-                    );
-                    // Try to extract a pipeline name hint from the DOT (e.g. "digraph deep_research")
-                    if let Some(name) = trimmed
-                        .strip_prefix("digraph ")
-                        .and_then(|s| s.split_whitespace().next())
-                        .map(|s| s.trim_matches('{'))
-                    {
-                        if !name.is_empty() {
-                            if let Ok(dot) = self.resolve_named_with_bundled_fallback(name).await {
-                                tracing::info!(
-                                    name,
-                                    "fell back to pre-built pipeline after inline DOT parse failure"
-                                );
-                                return Ok(dot);
-                            }
-                        }
-                    }
-                    // No fallback found — return the original parse error
-                    tracing::error!(dot = %dot_preview, "no fallback available, returning parse error");
-                    return Err(parse_err.wrap_err("inline DOT parse failed with no fallback"));
-                }
-            }
+        if looks_like_inline_dot(pipeline_str) {
+            eyre::bail!(INLINE_DOT_REJECTION);
         }
+        let name = pipeline_str.trim();
+        if !is_bare_pipeline_name(name) {
+            eyre::bail!(PIPELINE_PATH_REJECTION);
+        }
+        // Resolve the TRIMMED name so a whitespace-padded input can't miss an
+        // installed copy and let the embedded fallback out-rank installed-wins.
+        self.resolve_named_with_bundled_fallback(name).await
+    }
 
-        // Named pipeline or file path — use normal resolution, with the
-        // embedded bundled bytes as a final fallback for sanctioned names.
-        self.resolve_named_with_bundled_fallback(pipeline_str).await
+    /// Resolve a bare sanctioned pipeline NAME to a runnable program, preferring
+    /// the capability-locked typed-IR rebuild of a sanctioned pipeline over the
+    /// embedded DOT. Precedence:
+    /// 1. an operator-INSTALLED copy in a skill/user dir (installed-wins);
+    /// 2. the bundled IR (canonical sanctioned rebuild, e.g. `deep_research`);
+    /// 3. the embedded bundled DOT (legacy fallback).
+    ///
+    /// Inline DOT and file paths are rejected (same as `resolve_with_fallback`).
+    async fn resolve_named(&self, pipeline_str: &str) -> Result<ResolvedPipeline> {
+        if looks_like_inline_dot(pipeline_str) {
+            eyre::bail!(INLINE_DOT_REJECTION);
+        }
+        let name = pipeline_str.trim();
+        if !is_bare_pipeline_name(name) {
+            eyre::bail!(PIPELINE_PATH_REJECTION);
+        }
+        // 1. Operator-installed copy wins (skill dirs, NOT the bundled dir).
+        if let Some(dot) = self.discovery.resolve_installed(name).await? {
+            return Ok(ResolvedPipeline::Dot(dot));
+        }
+        // 2. Bundled IR — the canonical, audited rebuild.
+        if let Some(ir) = octos_agent::bundled_pipelines::bundled_ir(name) {
+            return Ok(ResolvedPipeline::Ir(ir.to_string()));
+        }
+        // 3. Embedded bundled DOT (discovery full search + embedded bytes).
+        Ok(ResolvedPipeline::Dot(
+            self.resolve_named_with_bundled_fallback(name).await?,
+        ))
     }
 
     /// Resolve a pipeline by name/path via on-disk discovery first, falling
@@ -496,6 +490,16 @@ impl RunPipelineTool {
     pub async fn resolve_named_for_test(&self, name_or_path: &str) -> Result<String> {
         self.resolve_with_fallback(name_or_path).await
     }
+
+    /// Test-only: which form a named pipeline resolves to — `"ir"` (bundled IR,
+    /// composed via the safe palette) or `"dot"` (installed/embedded DOT).
+    #[doc(hidden)]
+    pub async fn resolve_named_kind_for_test(&self, name: &str) -> Result<&'static str> {
+        Ok(match self.resolve_named(name).await? {
+            ResolvedPipeline::Ir(_) => "ir",
+            ResolvedPipeline::Dot(_) => "dot",
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -554,6 +558,56 @@ fn resolve_pipeline_timeout(llm_value: Option<u64>, dot_default: Option<u64>) ->
         .clamp(PIPELINE_TIMEOUT_MIN_SECS, PIPELINE_TIMEOUT_MAX_SECS)
 }
 
+/// Returned when an agent passes a free-form inline DOT graph to
+/// `run_pipeline`. Free-form DOT was the unsafe legacy authoring surface — the
+/// model could name arbitrary tools/handlers (incl. `shell`) or an empty
+/// tool-list that silently expanded to all builtins. Agents now author via the
+/// capability-locked `ir` palette, or name a sanctioned pipeline.
+const INLINE_DOT_REJECTION: &str =
+    "inline DOT graphs are not accepted: free-form DOT was the unsafe legacy \
+     authoring surface and has been removed. To run a multi-step workflow, \
+     either name a sanctioned pipeline (e.g. `deep_research`) in `pipeline`, or \
+     compose a typed-IR workflow program in `ir`.";
+
+/// Returned when an agent supplies a file PATH (rather than a bare sanctioned
+/// name) to `run_pipeline`. A caller-supplied `.dot` path would let a model
+/// smuggle the same arbitrary handler/tool surface that inline DOT did (e.g. a
+/// written `/tmp/pwn.dot` with `handler=shell`) through direct-path resolution.
+const PIPELINE_PATH_REJECTION: &str =
+    "pipeline file paths are not accepted: name a sanctioned pipeline (e.g. \
+     `deep_research`) — a bare name, not a path — or compose a typed-IR workflow \
+     program in `ir`.";
+
+/// A sanctioned pipeline NAME is a bare identifier (ASCII alphanumerics plus
+/// `_`/`-`). Anything containing a path separator, `.` (so `.dot`/`./`/`..`),
+/// whitespace, or other characters is a path/expression and is rejected, so a
+/// model cannot point `run_pipeline` at an arbitrary on-disk `.dot` file.
+fn is_bare_pipeline_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Outcome of resolving a sanctioned pipeline NAME: a typed-IR program (composed
+/// via the safe palette) or a DOT graph string (parsed).
+enum ResolvedPipeline {
+    Ir(String),
+    Dot(String),
+}
+
+/// True when `s` looks like an inline DOT digraph rather than a pipeline
+/// name/path. Conservative on the leading token so a real name is never
+/// mistaken for DOT; fenced/garbled DOT that slips past simply fails name
+/// resolution downstream (still rejected, just with a less specific message).
+fn looks_like_inline_dot(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("digraph ")
+        || t.starts_with("digraph{")
+        || t.starts_with("digraph\t")
+        || t.starts_with("digraph\n")
+        || t.starts_with("digraph\r")
+}
+
 #[async_trait]
 impl Tool for RunPipelineTool {
     fn name(&self) -> &str {
@@ -563,22 +617,39 @@ impl Tool for RunPipelineTool {
     fn description(&self) -> &str {
         if self.ir_enabled {
             "Run a multi-step pipeline, either by NAME or by composing one. \
-             (a) Name a sanctioned pipeline (`deep_research`) in `pipeline` when \
-             one fits. (b) For an ad-hoc multi-step task, compose your own \
-             workflow as a typed-IR program in `ir`: a closed, capability-safe \
-             palette of node kinds (research, transform, synthesize, gate, \
-             fanout). You choose the kinds, their prompts, and how \
-             they connect — capability (tools/model) is fixed per kind, so you \
-             never request shell or tools directly. Use `ir` to offload \
-             research→synthesize or parallel fan-out→converge work to the \
-             harness. If composition is invalid the tool returns the exact \
-             errors — fix the `ir` and call again."
+             (a) Name a sanctioned pipeline (`deep_research`) in `pipeline`. \
+             ALWAYS use `deep_research` for an in-depth / comprehensive / \
+             multi-source research request — e.g. \"deep research X\", \"research \
+             and write a report on Y\", \"thoroughly investigate Z\". Do NOT \
+             answer such a request with a single inline `web_search`/`web_fetch`: \
+             that is a shallow one-angle pass; `deep_research` fans out PARALLEL \
+             searches across multiple distinct angles and synthesizes a cited \
+             report. Reserve inline `web_search` for a quick single-fact lookup. \
+             `deep_research` is WEB-ONLY: it has no access to your repository, so \
+             NEVER use it for code review, local-codebase analysis, or debugging \
+             (\"investigate this test failure\", \"audit this code\") — answer \
+             those directly with the local file/shell tools (`read_file`, \
+             `grep`, `glob`, `list_dir`, `shell`). \
+             (b) For an ad-hoc multi-step task, compose your own workflow as a \
+             typed-IR program in `ir`: a closed, capability-safe palette of node \
+             kinds (research, transform, synthesize, report, gate, fanout). You \
+             choose the kinds, their prompts, and how they connect — capability \
+             (tools/model) is fixed per kind, so you never request shell or tools \
+             directly. Use `ir` to offload research→synthesize or parallel \
+             fan-out→converge work to the harness. If composition is invalid the \
+             tool returns the exact errors — fix the `ir` and call again."
         } else {
             "Run a sanctioned multi-step pipeline by NAME. The only currently \
              sanctioned pipeline is `deep_research`, which performs MULTI-SOURCE \
-             WEB-RESEARCH SYNTHESIS: it fans out parallel web-search workers and \
-             synthesizes a source-citing report. Use it ONLY when the user asks \
-             for in-depth, multi-source research drawn from the open web. \
+             WEB-RESEARCH SYNTHESIS: it fans out PARALLEL web-search workers \
+             across distinct angles and synthesizes a source-citing report. \
+             ALWAYS use `deep_research` for an in-depth / comprehensive / \
+             multi-source research request — e.g. \"deep research X\", \"research \
+             and write a report on Y\", \"investigate Z thoroughly\". Do NOT \
+             answer such a request with a single inline `web_search`/`web_fetch`: \
+             that is a shallow one-angle pass that misses the parallel-angle \
+             coverage + synthesis the pipeline provides. Reserve inline \
+             `web_search` for a quick single-fact lookup. \
              deep_research MUST NOT be used for code review, local-codebase \
              analysis, debugging, or anything answerable from the files already \
              in the working directory — it has no access to your repository and \
@@ -602,15 +673,23 @@ impl Tool for RunPipelineTool {
         let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
              sanctioned name is `deep_research`, which is for MULTI-SOURCE \
              WEB-RESEARCH SYNTHESIS ONLY (parallel web-search workers + a \
-             cited synthesis). `deep_research` MUST NOT be selected for code \
+             cited synthesis). PREFER `deep_research` over a single inline \
+             `web_search`/`web_fetch` for any in-depth, comprehensive, or \
+             multi-source research request (\"deep research X\", \"research and \
+             write a report on Y\", \"investigate Z thoroughly\") — one inline \
+             search is a shallow one-angle pass, whereas the pipeline fans out \
+             parallel angles and synthesizes a cited report; reserve inline \
+             search for a quick single-fact lookup. `deep_research` MUST NOT be \
+             selected for code \
              review, local-codebase analysis, debugging, or any task \
              answerable from the working directory — those are NOT web \
              research; answer them directly with the local file/shell tools \
              (`read_file`, `grep`, `glob`, `list_dir`, `shell`) instead of \
              calling run_pipeline. Do NOT pass an inline DOT graph here — \
-             inline DOT was the legacy free-form contract; the executor \
-             still accepts it for operator debugging but agent-driven runs \
-             MUST use the name form. If you find yourself wanting to compose \
+             free-form DOT was the unsafe legacy contract and is now REJECTED; \
+             this field accepts only a sanctioned pipeline name. For an ad-hoc \
+             multi-step workflow, compose a typed-IR program in `ir` instead. \
+             If you find yourself wanting to compose \
              your own DOT, the correct response is to use the purpose-built \
              tool for that domain (`mofa_slides` for slides, \
              `podcast_generate` for podcasts, `voice_synthesize` for TTS, \
@@ -627,11 +706,15 @@ impl Tool for RunPipelineTool {
         // find. No-discovery fallback keeps the sanctioned generic
         // `deep_research` baseline (it is bundled into the binary), so the
         // enum is never empty and the model always has the generic pipeline.
+        // Only advertise names that `resolve_with_fallback` will accept (bare
+        // sanctioned names), so advertise == resolvable: a discovered stem with
+        // a dot/space/etc. would otherwise be advertised yet rejected as a path.
         let mut pipeline_names: Vec<String> = self
             .discovery
             .list_available()
             .into_iter()
             .map(|p| p.name)
+            .filter(|n| is_bare_pipeline_name(n))
             .collect();
         if !pipeline_names.iter().any(|n| n == FALLBACK_PIPELINE_NAME) {
             pipeline_names.push(FALLBACK_PIPELINE_NAME.to_string());
@@ -664,7 +747,7 @@ impl Tool for RunPipelineTool {
         if self.ir_enabled {
             schema["properties"]["ir"] = serde_json::json!({
                 "type": "string",
-                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\"}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (final writeup), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"}. There are no tools/handler/model fields — capability is fixed per kind. Execution walks a SINGLE path: each non-fanout node hands off to exactly ONE next node. Routing from a node with several outgoing edges: the executor takes a matching `condition` edge, and if none match (or several tie) it falls through to the lowest target id — it never stops. So put `condition`s on the branch edges AND include exactly one unconditional default edge as the catch-all. The ONLY parallelism is `fanout` — it runs workers then continues at `converge` (which also needs an edge into it). Do NOT author diamond fan-ins (e.g. a→c and b→c expecting both a and b to finish first) — only one path runs. Examples: (1) linear research→report — {\"id\":\"demo\",\"nodes\":[{\"id\":\"research\",\"kind\":{\"type\":\"research\",\"prompt\":\"Research the topic; list 5 key facts each with a source URL\"}},{\"id\":\"report\",\"kind\":{\"type\":\"synthesize\",\"prompt\":\"Write a cited report from the findings\"}}],\"edges\":[{\"source\":\"research\",\"target\":\"report\"}]}. (2) parallel fan-out — {\"id\":\"demo2\",\"nodes\":[{\"id\":\"plan\",\"kind\":{\"type\":\"research\",\"prompt\":\"Identify the sub-topics to cover\"}},{\"id\":\"work\",\"kind\":{\"type\":\"fanout\",\"worker_prompt\":\"Investigate {task}\",\"converge\":\"final\"}},{\"id\":\"final\",\"kind\":{\"type\":\"synthesize\",\"prompt\":\"Synthesize the findings into a report\"}}],\"edges\":[{\"source\":\"plan\",\"target\":\"work\"},{\"source\":\"work\",\"target\":\"final\"}]}."
+                "description": "A typed-IR workflow as a JSON string. Shape: {\"id\":\"<name>\",\"nodes\":[{\"id\":\"<nid>\",\"kind\":<KIND>}],\"edges\":[{\"source\":\"a\",\"target\":\"b\",\"condition\":\"<opt>\"}]}. <KIND> is EXACTLY one of (tagged by \"type\", no other fields): {\"type\":\"research\",\"prompt\":\"...\"} (web+file read), {\"type\":\"transform\",\"prompt\":\"...\"}, {\"type\":\"synthesize\",\"prompt\":\"...\"} (read-only writeup), {\"type\":\"report\",\"prompt\":\"...\"} (final writeup that SAVES a file via write_file), {\"type\":\"gate\"} (pure routing; conditions on edges), {\"type\":\"fanout\",\"worker_prompt\":\"... {task} ...\",\"converge\":\"<nid>\"} (optional \"plan_prompt\" customizes the task planner; workers get web_search/web_fetch/read_file). There are no tools/handler/model fields — capability is fixed per kind. Execution walks a SINGLE path: each non-fanout node hands off to exactly ONE next node. Routing from a node with several outgoing edges: the executor takes a matching `condition` edge, and if none match (or several tie) it falls through to the lowest target id — it never stops. So put `condition`s on the branch edges AND include exactly one unconditional default edge as the catch-all. The ONLY parallelism is `fanout` — it runs workers then continues at `converge` (which also needs an edge into it). Do NOT author diamond fan-ins (e.g. a→c and b→c expecting both a and b to finish first) — only one path runs. Examples: (1) linear research→report — {\"id\":\"demo\",\"nodes\":[{\"id\":\"research\",\"kind\":{\"type\":\"research\",\"prompt\":\"Research the topic; list 5 key facts each with a source URL\"}},{\"id\":\"report\",\"kind\":{\"type\":\"report\",\"prompt\":\"Write a cited report from the findings and save it with write_file\"}}],\"edges\":[{\"source\":\"research\",\"target\":\"report\"}]}. (2) parallel fan-out — {\"id\":\"demo2\",\"nodes\":[{\"id\":\"plan\",\"kind\":{\"type\":\"research\",\"prompt\":\"Identify the sub-topics to cover\"}},{\"id\":\"work\",\"kind\":{\"type\":\"fanout\",\"worker_prompt\":\"Investigate {task}\",\"converge\":\"final\"}},{\"id\":\"final\",\"kind\":{\"type\":\"report\",\"prompt\":\"Synthesize the findings into a report and save it with write_file\"}}],\"edges\":[{\"source\":\"plan\",\"target\":\"work\"},{\"source\":\"work\",\"target\":\"final\"}]}."
             });
             schema["required"] = serde_json::json!(["input"]);
         }
@@ -705,10 +788,32 @@ impl Tool for RunPipelineTool {
                 .map_err(|e| format!("IR validation failed:\n{}", e.feedback_lines().join("\n")));
             }
         }
-        let dot_content = self
-            .resolve_with_fallback(&input.pipeline)
-            .await
-            .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
+        // Free-form inline DOT is rejected (unsafe legacy surface) — surface the
+        // same actionable message the run path returns, synchronously, so the
+        // LLM sees it in the foreground turn rather than as a spawn_only failure.
+        if looks_like_inline_dot(&input.pipeline) {
+            return Err(INLINE_DOT_REJECTION.to_string());
+        }
+        let dot_content = match self.resolve_named(&input.pipeline).await {
+            Ok(ResolvedPipeline::Ir(ir)) => {
+                // A bundled IR is validated by compose() itself — return its
+                // structured feedback synchronously.
+                return crate::compose::compose(
+                    &ir,
+                    &crate::profile::ValidationProfile::l2_default(),
+                    &input.variables,
+                )
+                .map(|_| ())
+                .map_err(|e| {
+                    format!(
+                        "bundled pipeline IR failed to compose:\n{}",
+                        e.feedback_lines().join("\n")
+                    )
+                });
+            }
+            Ok(ResolvedPipeline::Dot(dot)) => dot,
+            Err(e) => return Err(format!("failed to resolve pipeline: {e}")),
+        };
         let graph = crate::parser::parse_dot(&dot_content)
             .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
         let validation_context = crate::validate::ValidationContext::default()
@@ -744,13 +849,27 @@ impl Tool for RunPipelineTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid run_pipeline input")?;
 
-        let is_inline = input.pipeline.trim().starts_with("digraph ");
+        let using_ir =
+            self.ir_enabled && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+        // Free-form inline DOT is no longer an agent-authorable surface. Reject
+        // it up front with an actionable message (mirrors the IR compose-error
+        // path) rather than letting it reach the parser. When IR is in use the
+        // `pipeline` field is ignored, so only guard the DOT path.
+        if !using_ir && looks_like_inline_dot(&input.pipeline) {
+            return Ok(ToolResult {
+                success: false,
+                output: INLINE_DOT_REJECTION.to_string(),
+                ..Default::default()
+            });
+        }
+
         tracing::info!(
-            inline = is_inline,
-            pipeline_arg = if is_inline {
-                "(inline DOT)"
+            using_ir,
+            pipeline_arg = if using_ir {
+                "(ir)"
             } else {
-                &input.pipeline
+                input.pipeline.as_str()
             },
             "run_pipeline invoked"
         );
@@ -766,9 +885,7 @@ impl Tool for RunPipelineTool {
         // (compiled + capability-locked) or a named/inline DOT pipeline. The
         // entire downstream (config, timeout, summary, files_to_send, spawn_only
         // delivery) is graph-agnostic, so only acquisition differs.
-        let (graph, graph_id): (crate::graph::PipelineGraph, String) = if self.ir_enabled
-            && input.ir.as_deref().is_some_and(|s| !s.trim().is_empty())
-        {
+        let (graph, graph_id): (crate::graph::PipelineGraph, String) = if using_ir {
             let ir = input.ir.as_deref().unwrap_or_default();
             match crate::compose::compose(
                 ir,
@@ -791,11 +908,44 @@ impl Tool for RunPipelineTool {
                 }
             }
         } else {
-            let dot_content = self.resolve_with_fallback(&input.pipeline).await?;
-            let graph =
-                crate::parser::parse_dot(&dot_content).wrap_err("failed to parse pipeline DOT")?;
-            let id = graph_id_from_dot(&dot_content);
-            (graph, id)
+            // A named pipeline resolves to a bundled IR (composed via the safe
+            // palette) or a DOT graph; the canonical sanctioned pipelines (e.g.
+            // `deep_research`) now ship as IR and run the audited palette.
+            match self.resolve_named(&input.pipeline).await {
+                Ok(ResolvedPipeline::Ir(ir)) => match crate::compose::compose(
+                    &ir,
+                    &crate::profile::ValidationProfile::l2_default(),
+                    &input.variables,
+                ) {
+                    Ok(g) => {
+                        let id = g.id.clone();
+                        (g, id)
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: format!(
+                                "bundled pipeline IR failed to compose:\n{}",
+                                e.feedback_lines().join("\n")
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                },
+                Ok(ResolvedPipeline::Dot(dot)) => {
+                    let graph = crate::parser::parse_dot(&dot)
+                        .wrap_err("failed to parse pipeline DOT")?;
+                    let id = graph_id_from_dot(&dot);
+                    (graph, id)
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: e.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
         };
 
         let status_bridge = self
@@ -1537,41 +1687,6 @@ fn node_costs_metadata(rows: &[crate::executor::NodeCost]) -> Option<serde_json:
             "node_costs": rows,
         }))
     }
-}
-
-/// Sanitize common LLM DOT mistakes that would cause parse failures.
-fn sanitize_dot(dot: &str) -> String {
-    let mut result = dot.to_string();
-
-    // Fix: digraph{ → digraph {
-    if result.contains("digraph{") {
-        result = result.replace("digraph{", "digraph pipeline {");
-    }
-
-    // Fix: digraph { (no name) → digraph pipeline {
-    // The parser now handles this, but belt-and-suspenders
-    if result.starts_with("digraph {") || result.starts_with("digraph  {") {
-        result = result.replacen("digraph", "digraph pipeline", 1);
-    }
-
-    // Fix: markdown code fences around DOT
-    if result.starts_with("```") {
-        // Strip ```dot or ```graphviz or ``` prefix/suffix
-        let lines: Vec<&str> = result.lines().collect();
-        let start = if lines.first().map(|l| l.starts_with("```")).unwrap_or(false) {
-            1
-        } else {
-            0
-        };
-        let end = if lines.last().map(|l| l.trim() == "```").unwrap_or(false) {
-            lines.len() - 1
-        } else {
-            lines.len()
-        };
-        result = lines[start..end].join("\n");
-    }
-
-    result
 }
 
 /// Max ERROR diagnostics included in a `pre_flight_validate` failure message,
