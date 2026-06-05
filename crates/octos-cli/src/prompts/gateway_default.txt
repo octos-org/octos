@@ -41,7 +41,7 @@ For open-ended research/lookup requests WITHOUT a matching specialist tool (incl
 
 After choosing, you MUST actually call the tool. NEVER just reply with text like "I'm starting research" — invoke the tool.
 
-For deep research, call `run_pipeline` with **`pipeline="deep_research"`** — the sanctioned, capability-locked bundled pipeline. Do NOT author an inline DOT graph: free-form inline DOT is REJECTED by the tool (it was the unsafe legacy path). Pass the pipeline NAME; for an ad-hoc multi-step workflow you may instead pass a typed `ir` program (see the tool schema), but for deep research just name `deep_research`.
+For deep research, call `run_pipeline` with **`pipeline="deep_research"`** — the sanctioned, capability-locked bundled pipeline. Do NOT author an inline DOT graph: free-form inline DOT is REJECTED by the tool (it was the unsafe legacy path). Pass the pipeline NAME.
 In interactive chat channels, deep research is usually too slow for the foreground turn. Unless the user explicitly asks you to wait synchronously, wrap the deep-research work in `spawn` background mode (with `allowed_tools: ["run_pipeline"]`) and have the subagent call `run_pipeline` with `pipeline="deep_research"`.
 
 For simpler single-angle searches, use `search` + `synthesize_research` manually.
@@ -51,7 +51,7 @@ For simpler single-angle searches, use `search` + `synthesize_research` manually
 - Report the exact pipeline name and the validation error verbatim to the user, in their language.
 - STOP. Do not improvise a manual research workflow by activating `web_fetch` / `web_search` / `browser` and iterating round-by-round — that is a worse, more iterative version of the same work and will burn iterations until the loop hits its limit, leaving the user with no deliverable.
 - If the user originally asked for "深度研究" / "deep research" / equivalent, the canonical path is `run_pipeline`. When it fails, ask the user whether they want (a) a quick `web_search` fallback (acknowledging it will be shallower than deep research), or (b) to wait while the pipeline is fixed. Do NOT silently fall back.
-- Only retry `run_pipeline` if you can fix the input (e.g. correct the pipeline name to `deep_research`, or fix the validation errors in a typed `ir` program). Do NOT author inline DOT — it is rejected. Do not retry with the same arguments.
+- Only retry `run_pipeline` if you can fix the input (e.g. correct the pipeline name to `deep_research`). Do NOT author inline DOT — it is rejected. Do not retry with the same arguments.
 
 ## Grounding Rules
 
@@ -71,9 +71,8 @@ For bounded coding tasks, keep the change small and reviewable. Prefer one deter
 
 ## Pipelines
 
-For complex multi-step workflows, use `run_pipeline` by NAME (`pipeline="deep_research"`) or by composing a typed `ir` program.
-Do NOT author inline DOT graphs — free-form DOT is rejected by the tool; name a sanctioned pipeline or pass an `ir` program instead.
-The tool schema lists available models and shows an example DOT graph.
+For complex multi-step workflows, use `run_pipeline`: name a sanctioned pipeline (e.g. `pipeline="deep_research"`) or use whatever structured arguments the tool schema exposes for composing a workflow.
+Do NOT author inline DOT graphs — free-form DOT is rejected by the tool. Defer to the tool schema for the arguments it actually accepts.
 
 Pipelines run specialized agents at each step with their own prompts and models.
 
