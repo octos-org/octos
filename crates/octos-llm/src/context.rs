@@ -73,6 +73,13 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
             return ctx as u32;
         }
     }
+    // Model-specific defaults for known long-context models when the catalog
+    // is unavailable or lacks the exact variant (e.g. deepseek-v4-flash, which
+    // has no dedicated catalog lane). DeepSeek V4 and MiniMax M3 are 1M-context.
+    let m = model_id.to_lowercase();
+    if m.contains("deepseek-v4") || m.contains("minimax-m3") {
+        return 1_048_576;
+    }
     // Conservative default for unknown models
     128_000
 }
@@ -87,7 +94,13 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
     // Model-specific defaults when catalog is unavailable.
     // Use the model's native max output to avoid truncation.
     let m = model_id.to_lowercase();
-    if m.contains("kimi") || m.contains("qwen") || m.contains("gemini") {
+    // Check the newest model families first so they win over the broader
+    // substring branches below (e.g. minimax-m3 before the generic minimax).
+    if m.contains("deepseek-v4") {
+        384_000
+    } else if m.contains("minimax-m3") {
+        131_072
+    } else if m.contains("kimi") || m.contains("qwen") || m.contains("gemini") {
         65_535
     } else if m.contains("glm") || m.contains("minimax") {
         128_000
@@ -143,6 +156,21 @@ mod tests {
     #[test]
     fn test_max_output_default() {
         assert_eq!(max_output_tokens("unknown-model"), 16_384);
+    }
+
+    #[test]
+    fn should_use_1m_context_for_deepseek_v4_and_minimax_m3_when_not_in_catalog() {
+        // deepseek-v4-* and minimax-m3 are never seeded by the unit-test
+        // catalog fixtures, so these exercise the hardcoded long-context
+        // fallbacks regardless of CATALOG state.
+        assert_eq!(context_window_tokens("deepseek-v4-pro"), 1_048_576);
+        assert_eq!(context_window_tokens("deepseek-v4-flash"), 1_048_576);
+        assert_eq!(context_window_tokens("MiniMax-M3"), 1_048_576);
+        // max output: v4 -> 384k, m3 -> 128k (131072), checked before the
+        // broader deepseek/minimax substring branches.
+        assert_eq!(max_output_tokens("deepseek-v4-pro"), 384_000);
+        assert_eq!(max_output_tokens("deepseek-v4-flash"), 384_000);
+        assert_eq!(max_output_tokens("minimax-m3"), 131_072);
     }
 
     #[test]
