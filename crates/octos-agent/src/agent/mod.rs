@@ -77,6 +77,9 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Reasoning effort for thinking models. Flows into `ChatConfig::reasoning_effort`;
+    /// providers translate it per model (no-op for models without a reasoning style).
+    pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
     /// Suppress the generic auto-send loop for tool `files_to_send`.
     /// Background spawned workers rely on their outer workflow/session runtime
     /// to persist terminal results exactly once.
@@ -157,6 +160,7 @@ impl Default for AgentConfig {
                 DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS,
             ),
             chat_max_tokens: None,
+            reasoning_effort: None,
             suppress_auto_send_files: false,
             llm_first_token_grace: env_secs_or(
                 "OCTOS_LLM_FIRST_TOKEN_GRACE_SECS",

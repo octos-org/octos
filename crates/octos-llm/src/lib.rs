@@ -48,7 +48,7 @@ pub use adaptive::{
     with_router_context,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
-pub use config::{ChatConfig, ResponseFormat, ToolChoice};
+pub use config::{ChatConfig, ReasoningEffort, ResponseFormat, ToolChoice};
 pub use content_classifier::{
     ClassificationDecision, ContentClassifier, HarnessRoutingDecisionPayload, ModelTier,
     RoutingConfig,

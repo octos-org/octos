@@ -41,6 +41,12 @@ pub struct ModelHints {
     /// Merge consecutive system messages into one (some providers reject multiples).
     #[serde(default = "default_true")]
     pub merge_system_messages: bool,
+
+    /// How this model accepts a reasoning/thinking control on the chat path.
+    /// Translates `ChatConfig::reasoning_effort` into request fields; `None`
+    /// (default) emits nothing, so it is a no-op for non-thinking models.
+    #[serde(default)]
+    pub reasoning_style: ReasoningStyle,
 }
 
 fn default_true() -> bool {
@@ -54,6 +60,7 @@ impl Default for ModelHints {
             fixed_temperature: false,
             lacks_vision: false,
             merge_system_messages: true,
+            reasoning_style: ReasoningStyle::None,
         }
     }
 }
@@ -92,13 +99,50 @@ impl ModelHints {
         // auto-asserted from the model name.
         let lacks_vision = false;
 
+        // Reasoning-control style on the chat/completions path. DeepSeek V4
+        // (incl. `deepseek-reasoner`, a V4-Flash thinking alias) wants
+        // `reasoning_effort` + a `thinking` toggle; OpenAI reasoning models and
+        // grok-4.x take a plain `reasoning_effort`. Everything else emits nothing.
+        // Effort/thinking is only EMITTED when an operator sets `reasoning_effort`
+        // (opt-in), and the style is config-overridable per route — important
+        // because the same `deepseek-v4` name fronts endpoints that differ
+        // (api.deepseek.com accepts it; nvidia/vllm may not), same caveat as
+        // `lacks_vision`. `grok` is narrowed to `grok-4` since older Grok
+        // families can reject `reasoning_effort`.
+        let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
+            ReasoningStyle::EffortAndThinkingToggle
+        } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
+            ReasoningStyle::Effort
+        } else {
+            ReasoningStyle::None
+        };
+
         Self {
             uses_completion_tokens,
             fixed_temperature,
             lacks_vision,
             merge_system_messages: true,
+            reasoning_style,
         }
     }
+}
+
+/// How a model on the OpenAI-compatible chat/completions path accepts a
+/// reasoning/thinking control. Used to translate the provider-agnostic
+/// [`ChatConfig::reasoning_effort`](crate::config::ChatConfig) into the right
+/// request fields. The SAME model name can front endpoints with different
+/// support (cf. `lacks_vision`), so this is config-overridable via `ModelHints`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningStyle {
+    /// No reasoning control emitted on the chat path (default — backward compatible).
+    #[default]
+    None,
+    /// Top-level `reasoning_effort: "low"|"medium"|"high"` — OpenAI chat-completions
+    /// reasoning models (o-series / gpt-5) and xAI Grok.
+    Effort,
+    /// `reasoning_effort` plus `thinking: {"type": "enabled"}` — DeepSeek V4.
+    EffortAndThinkingToggle,
 }
 
 /// OpenAI GPT provider.
@@ -163,6 +207,16 @@ impl OpenAIProvider {
                     self.provider_label = format!("{}@{}", self.provider_label, short);
                 }
             }
+        }
+        // The DeepSeek `thinking` toggle is specific to DeepSeek's official API.
+        // The same `deepseek-v4` model name fronted by other endpoints
+        // (nvidia/vllm/wisemodel) uses different — or no — reasoning controls, so
+        // don't emit DeepSeek-specific fields there by default. Operators opt in
+        // per route via `model_hints` (with_hints, applied after this, still wins).
+        if self.hints.reasoning_style == ReasoningStyle::EffortAndThinkingToggle
+            && !url.contains("api.deepseek.com")
+        {
+            self.hints.reasoning_style = ReasoningStyle::None;
         }
         self.base_url = url;
         self
@@ -282,6 +336,11 @@ impl OpenAIProvider {
                 // is missing in assistant tool call message".
                 // Only synthesize a stub for models that actually need it (detected
                 // via fixed_temperature + model name containing "kimi-k2").
+                // NOTE: deepseek-v4's official API was verified NOT to enforce this
+                // (multi-round-with-tools returns 200 without reasoning_content), and
+                // a "." stub could break non-official deepseek-v4 endpoints
+                // (nvidia/vllm) that don't expect the field — so it is NOT stubbed.
+                // Real reasoning_content the model returns is still round-tripped below.
                 let needs_reasoning_stub =
                     self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
                 let reasoning = match m.reasoning_content.as_deref() {
@@ -353,6 +412,28 @@ impl OpenAIProvider {
             }
         });
 
+        // Translate the provider-agnostic `reasoning_effort` into the chat-path
+        // request fields the model's ReasoningStyle expects. Emitted only when
+        // an effort is configured AND the model declares a non-None style, so
+        // it stays a no-op for models/endpoints that don't accept it.
+        let (reasoning_effort, thinking) =
+            match (config.reasoning_effort, self.hints.reasoning_style) {
+                (Some(effort), style) if style != ReasoningStyle::None => {
+                    let effort_str = match effort {
+                        crate::config::ReasoningEffort::Low => "low",
+                        crate::config::ReasoningEffort::Medium => "medium",
+                        crate::config::ReasoningEffort::High => "high",
+                    };
+                    let thinking = if style == ReasoningStyle::EffortAndThinkingToggle {
+                        Some(serde_json::json!({ "type": "enabled" }))
+                    } else {
+                        None
+                    };
+                    (Some(effort_str), thinking)
+                }
+                _ => (None, None),
+            };
+
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
@@ -369,6 +450,8 @@ impl OpenAIProvider {
             temperature,
             tools: openai_tools,
             response_format,
+            reasoning_effort,
+            thinking,
         }
     }
 }
@@ -589,6 +672,13 @@ struct OpenAIRequest<'a> {
     tools: Option<Vec<OpenAITool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
+    /// Reasoning effort ("low"|"medium"|"high"), emitted only for models whose
+    /// `ReasoningStyle` accepts it (OpenAI reasoning models, Grok, DeepSeek V4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    /// DeepSeek V4 thinking toggle (`{"type": "enabled"}`); other styles omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1104,6 +1194,7 @@ mod tests {
             fixed_temperature: false,
             lacks_vision: true,
             merge_system_messages: false,
+            reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
         };
         let json = serde_json::to_string(&hints).unwrap();
         let parsed: ModelHints = serde_json::from_str(&json).unwrap();
@@ -1118,6 +1209,150 @@ mod tests {
         assert!(!h.fixed_temperature);
         assert!(!h.lacks_vision);
         assert!(h.merge_system_messages);
+        assert_eq!(h.reasoning_style, ReasoningStyle::None);
+    }
+
+    #[test]
+    fn detect_reasoning_style_per_model_family() {
+        // DeepSeek V4 (pro + flash, incl. provider-prefixed) -> effort + thinking toggle.
+        assert_eq!(
+            ModelHints::detect("deepseek-v4-pro").reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        assert_eq!(
+            ModelHints::detect("deepseek-ai/deepseek-v4-flash").reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        // deepseek-reasoner is a V4-Flash thinking alias.
+        assert_eq!(
+            ModelHints::detect("deepseek-reasoner").reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        // grok-4.x + OpenAI reasoning models -> plain reasoning_effort.
+        assert_eq!(
+            ModelHints::detect("grok-4.3").reasoning_style,
+            ReasoningStyle::Effort
+        );
+        assert_eq!(
+            ModelHints::detect("gpt-5.3-codex").reasoning_style,
+            ReasoningStyle::Effort
+        );
+        // Non-thinking / unknown-control models emit nothing. grok-3 is
+        // excluded (only grok-4.x is known to accept reasoning_effort).
+        for m in [
+            "deepseek-chat",
+            "MiniMax-M3",
+            "kimi-k2.6",
+            "gpt-4o",
+            "grok-3",
+        ] {
+            assert_eq!(
+                ModelHints::detect(m).reasoning_style,
+                ReasoningStyle::None,
+                "{m} should not declare a reasoning style"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_style_downgraded_off_official_endpoint() {
+        // Official endpoint keeps the DeepSeek-specific thinking toggle.
+        let official = OpenAIProvider::new("k", "deepseek-v4-pro")
+            .with_base_url("https://api.deepseek.com/v1");
+        assert_eq!(
+            official.hints.reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        // The same model name on a non-DeepSeek endpoint must not inherit it.
+        let nvidia = OpenAIProvider::new("k", "deepseek-ai/deepseek-v4-pro")
+            .with_base_url("https://integrate.api.nvidia.com/v1");
+        assert_eq!(nvidia.hints.reasoning_style, ReasoningStyle::None);
+        // Explicit config override still wins (with_hints runs after with_base_url).
+        let overridden = OpenAIProvider::new("k", "deepseek-ai/deepseek-v4-pro")
+            .with_base_url("https://integrate.api.nvidia.com/v1")
+            .with_hints(ModelHints {
+                reasoning_style: ReasoningStyle::Effort,
+                ..Default::default()
+            });
+        assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::Effort);
+    }
+
+    #[test]
+    fn build_request_emits_effort_and_thinking_for_deepseek_v4() {
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
+        assert_eq!(v["thinking"], serde_json::json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn build_request_emits_only_effort_for_grok() {
+        let p = OpenAIProvider::new("key", "grok-4.3");
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["reasoning_effort"], "low");
+        assert!(
+            v.get("thinking").is_none(),
+            "grok must not emit a thinking toggle"
+        );
+    }
+
+    #[test]
+    fn build_request_omits_reasoning_when_unset_or_unsupported() {
+        let msgs = [msg("hi")];
+        // Effort configured but the model has no reasoning control -> nothing.
+        let p = OpenAIProvider::new("key", "deepseek-chat");
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert!(v.get("reasoning_effort").is_none());
+        assert!(v.get("thinking").is_none());
+
+        // Supported model but no effort configured -> nothing.
+        let p2 = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let cfg2 = ChatConfig {
+            reasoning_effort: None,
+            ..Default::default()
+        };
+        let v2 = serde_json::to_value(p2.build_request(&msgs, &[], &cfg2, false)).unwrap();
+        assert!(v2.get("reasoning_effort").is_none());
+        assert!(v2.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_does_not_stub_reasoning_content_for_deepseek_v4() {
+        // deepseek-v4's official API was verified live NOT to require
+        // reasoning_content on assistant tool-call messages (multi-round returns
+        // 200 without it), and a "." stub could break non-official endpoints
+        // (nvidia/vllm). So no stub — only kimi-k2 gets one. Real
+        // reasoning_content the model returns is still round-tripped.
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert!(
+            a.get("reasoning_content").is_none(),
+            "deepseek-v4 assistant message must not get a reasoning_content stub"
+        );
     }
 
     #[test]
@@ -1127,6 +1362,7 @@ mod tests {
             fixed_temperature: true,
             lacks_vision: true,
             merge_system_messages: false,
+            reasoning_style: ReasoningStyle::None,
         });
         assert!(p.hints.uses_completion_tokens);
         assert!(p.hints.fixed_temperature);

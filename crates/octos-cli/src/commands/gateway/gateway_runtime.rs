@@ -1098,6 +1098,7 @@ impl GatewayRuntime {
             // can run up to 30 minutes without the agent loop aborting early.
             max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
             chat_max_tokens: gw_config.max_output_tokens,
+            reasoning_effort: gw_config.reasoning_effort,
             ..Default::default()
         };
 
