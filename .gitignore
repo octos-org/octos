@@ -16,6 +16,11 @@
 .DS_Store
 Thumbs.db
 
+# Claude Code agent worktrees (Agent-tool isolation creates these as nested
+# git checkouts). They must never be tracked — committed as gitlinks they
+# break every git consumer of this repo (e.g. cargo git dependencies).
+.claude/worktrees/
+
 # Octos runtime state (keep config, ignore runtime data)
 .octos/*
 !.octos/AGENTS.md
