@@ -115,9 +115,10 @@
   "deepseek": {
     "env": "DEEPSEEK_API_KEY",
     "models": [
-      { "id": "deepseek-chat", "input": 0.27, "output": 1.1, "max_output": 8192 },
-      { "id": "deepseek-reasoner", "input": 0.55, "output": 2.19, "max_output": 8192 },
-      { "id": "deepseek-v3.2", "input": 0.25, "output": 0.4, "max_output": 8192, "endpoints": [
+      { "id": "deepseek-v4-pro", "input": 0.28, "output": 0.42, "max_output": 8192, "endpoints": [
+        { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
+      ] },
+      { "id": "deepseek-v4-flash", "input": 0.14, "output": 0.28, "max_output": 8192, "endpoints": [
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] }
     ]
@@ -140,14 +141,7 @@
         { "id": "moonshot", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
-      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 },
-      { "id": "kimi-k2-thinking", "input": 0.6, "output": 2.4, "max_output": 65535 },
-      { "id": "kimi-k2-thinking-turbo", "input": 0.6, "output": 2.4, "max_output": 65535 },
-      { "id": "kimi-k2-turbo-preview", "input": 0.6, "output": 2.4, "max_output": 65535 },
-      { "id": "kimi-k2-preview", "input": 0.6, "output": 2.4, "max_output": 65535 },
-      { "id": "moonshot-v1-128k", "input": 0.6, "output": 2.4, "max_output": 8192 },
-      { "id": "moonshot-v1-32k", "input": 0.3, "output": 1.2, "max_output": 8192 },
-      { "id": "moonshot-v1-8k", "input": 0.15, "output": 0.6, "max_output": 4096 }
+      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 }
     ]
   },
   "dashscope": {
@@ -167,6 +161,7 @@
   "minimax": {
     "env": "MINIMAX_API_KEY",
     "models": [
+      { "id": "MiniMax-M3", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2.7", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2.5", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2.5-highspeed", "input": 0.5, "output": 2.0, "max_output": 16384, "endpoints": [
