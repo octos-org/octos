@@ -1658,6 +1658,25 @@ pub struct TurnStartParams {
     /// Absent on regular sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite_for: Option<String>,
+    /// Per-turn reasoning/thinking effort override for thinking-capable models
+    /// (DeepSeek V4, OpenAI reasoning models, Grok-4). Set by the TUI `/thinking`
+    /// command and attached to every turn for the rest of the session. `None`
+    /// (absent) falls back to the gateway/profile default; otherwise the server
+    /// overrides the turn's effort. No-op for models without a reasoning style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortLevel>,
+}
+
+/// Reasoning/thinking effort level carried on the wire (octos-core cannot depend
+/// on octos-llm's `ReasoningEffort`, so the serve maps between them). Snake-case
+/// on the wire: `"low" | "medium" | "high" | "max"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5778,6 +5797,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reasoning_effort_level_wire_shape() {
+        // Snake-case wire strings, incl. the DeepSeek "max" tier.
+        assert_eq!(
+            serde_json::to_value(ReasoningEffortLevel::Max).unwrap(),
+            json!("max")
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningEffortLevel::High).unwrap(),
+            json!("high")
+        );
+        assert_eq!(
+            serde_json::from_value::<ReasoningEffortLevel>(json!("low")).unwrap(),
+            ReasoningEffortLevel::Low
+        );
+        // Absent on turn/start is the common case; present round-trips.
+        let params = TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId::new(),
+            input: vec![],
+            media: vec![],
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: Some(ReasoningEffortLevel::Max),
+        };
+        let wire = serde_json::to_value(&params).unwrap();
+        assert_eq!(wire["reasoning_effort"], json!("max"));
+        let back: TurnStartParams = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffortLevel::Max));
+        // Omitted field deserializes to None (backward compatible).
+        let legacy = json!({
+            "session_id": "local:demo",
+            "turn_id": "00000000-0000-0000-0000-000000000001",
+            "input": []
+        });
+        let parsed: TurnStartParams = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.reasoning_effort, None);
+    }
+
+    #[test]
     fn ui_command_method_matches_expected_transport_name() {
         let cmd = UiCommand::TurnInterrupt(TurnInterruptParams {
             session_id: SessionKey("local:demo".into()),
@@ -6499,6 +6557,7 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
         })
         .into_rpc_request("req-turn-start")
         .expect("serialize turn/start");
@@ -7173,6 +7232,7 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
         });
 
         let request = command
@@ -7238,6 +7298,7 @@ mod tests {
             ],
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
         });
 
         let wire = serde_json::to_value(
@@ -7277,6 +7338,7 @@ mod tests {
             media: Vec::new(),
             topic: Some("slides".into()),
             rewrite_for: None,
+            reasoning_effort: None,
         });
 
         let wire = serde_json::to_value(
@@ -7316,6 +7378,7 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: Some("cmid-queued-original".into()),
+            reasoning_effort: None,
         });
 
         let wire = serde_json::to_value(
@@ -7360,6 +7423,7 @@ mod tests {
             }],
             topic: Some("research".into()),
             rewrite_for: Some("cmid-original".into()),
+            reasoning_effort: None,
         });
 
         let wire = serde_json::to_value(

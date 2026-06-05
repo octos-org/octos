@@ -409,7 +409,8 @@ fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig
         let budget = match effort {
             ReasoningEffort::Low => Some(1024),
             ReasoningEffort::Medium => Some(8192),
-            ReasoningEffort::High => None, // let model decide
+            // High and Max both let the model decide (unbounded thinking budget).
+            ReasoningEffort::High | ReasoningEffort::Max => None,
         };
         GeminiThinkingConfig {
             thinking_budget: budget,

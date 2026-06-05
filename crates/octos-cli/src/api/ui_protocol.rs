@@ -9972,6 +9972,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         media: Vec::new(),
         topic: None,
         rewrite_for: None,
+        reasoning_effort: None,
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
     let routed_profile_id = Some(profile_id.clone());
@@ -16108,6 +16109,20 @@ fn appui_loop_assistant_reply_for_self_paced(
     }
 }
 
+/// Map the wire-level reasoning effort (octos-core) to octos-llm's enum.
+fn reasoning_effort_from_wire(
+    level: octos_core::ui_protocol::ReasoningEffortLevel,
+) -> octos_llm::ReasoningEffort {
+    use octos_core::ui_protocol::ReasoningEffortLevel as L;
+    use octos_llm::ReasoningEffort as E;
+    match level {
+        L::Low => E::Low,
+        L::Medium => E::Medium,
+        L::High => E::High,
+        L::Max => E::Max,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -16332,7 +16347,14 @@ async fn run_standalone_turn(
     let workspace_root: Option<PathBuf> = Some(session_runtime.workspace_root.clone());
     let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
-    let agent_config = session_runtime.agent.agent_config();
+    let mut agent_config = session_runtime.agent.agent_config();
+    // Per-turn reasoning/thinking effort override (TUI `/thinking`). When the
+    // client attaches `reasoning_effort` to turn/start it wins over the
+    // gateway/profile default for this turn; providers translate it per model
+    // (no-op for models without a reasoning style).
+    if let Some(level) = params.reasoning_effort {
+        agent_config.reasoning_effort = Some(reasoning_effort_from_wire(level));
+    }
     // Per-session system prompt override. Gateway path reads
     // `data_dir/session_prompts/<topic>.md` for structured-template
     // sessions (`/new slides X`, `/new site X`) and CONCATENATES the
@@ -23687,6 +23709,7 @@ ignore = []
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
         })
         .into_rpc_request("1")
         .expect("request");
@@ -30508,6 +30531,7 @@ ignore = []
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
         };
         let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
