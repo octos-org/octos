@@ -66,6 +66,10 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    /// Maximum reasoning. DeepSeek V4 accepts `reasoning_effort:"max"`; providers
+    /// without a distinct max tier (OpenAI/Grok) clamp this to `high`, and Gemini
+    /// maps it to an unbounded thinking budget.
+    Max,
 }
 
 impl Default for ChatConfig {

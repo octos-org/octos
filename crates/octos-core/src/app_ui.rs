@@ -274,6 +274,7 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
         });
 
         assert_eq!(command.method(), methods::TURN_START);

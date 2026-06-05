@@ -419,10 +419,15 @@ impl OpenAIProvider {
         let (reasoning_effort, thinking) =
             match (config.reasoning_effort, self.hints.reasoning_style) {
                 (Some(effort), style) if style != ReasoningStyle::None => {
-                    let effort_str = match effort {
-                        crate::config::ReasoningEffort::Low => "low",
-                        crate::config::ReasoningEffort::Medium => "medium",
-                        crate::config::ReasoningEffort::High => "high",
+                    use crate::config::ReasoningEffort as RE;
+                    let effort_str = match (effort, style) {
+                        (RE::Low, _) => "low",
+                        (RE::Medium, _) => "medium",
+                        (RE::High, _) => "high",
+                        // DeepSeek V4 accepts "max"; Effort-style providers
+                        // (OpenAI/Grok) have no max tier, so clamp to "high".
+                        (RE::Max, ReasoningStyle::EffortAndThinkingToggle) => "max",
+                        (RE::Max, _) => "high",
                     };
                     let thinking = if style == ReasoningStyle::EffortAndThinkingToggle {
                         Some(serde_json::json!({ "type": "enabled" }))
@@ -1288,6 +1293,23 @@ mod tests {
         let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
         assert_eq!(v["reasoning_effort"], "high");
         assert_eq!(v["thinking"], serde_json::json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn build_request_maps_max_effort_by_style() {
+        let msgs = [msg("hi")];
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::Max),
+            ..Default::default()
+        };
+        // deepseek (EffortAndThinkingToggle) emits DeepSeek's real "max".
+        let ds = OpenAIProvider::new("k", "deepseek-v4-pro");
+        let v = serde_json::to_value(ds.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["reasoning_effort"], "max");
+        // Effort-style providers (grok) have no max tier -> clamp to "high".
+        let grok = OpenAIProvider::new("k", "grok-4.3");
+        let v2 = serde_json::to_value(grok.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v2["reasoning_effort"], "high");
     }
 
     #[test]

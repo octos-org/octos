@@ -88,6 +88,8 @@ impl OpenAIResponsesProvider {
                 crate::config::ReasoningEffort::Low => "low",
                 crate::config::ReasoningEffort::Medium => "medium",
                 crate::config::ReasoningEffort::High => "high",
+                // The Responses API reasoning.effort has no "max"; clamp to high.
+                crate::config::ReasoningEffort::Max => "high",
             };
             body["reasoning"] = serde_json::json!({
                 "effort": effort_str,
