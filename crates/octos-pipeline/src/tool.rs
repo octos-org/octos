@@ -617,22 +617,39 @@ impl Tool for RunPipelineTool {
     fn description(&self) -> &str {
         if self.ir_enabled {
             "Run a multi-step pipeline, either by NAME or by composing one. \
-             (a) Name a sanctioned pipeline (`deep_research`) in `pipeline` when \
-             one fits. (b) For an ad-hoc multi-step task, compose your own \
-             workflow as a typed-IR program in `ir`: a closed, capability-safe \
-             palette of node kinds (research, transform, synthesize, report, \
-             gate, fanout). You choose the kinds, their prompts, and how \
-             they connect — capability (tools/model) is fixed per kind, so you \
-             never request shell or tools directly. Use `ir` to offload \
-             research→synthesize or parallel fan-out→converge work to the \
-             harness. If composition is invalid the tool returns the exact \
-             errors — fix the `ir` and call again."
+             (a) Name a sanctioned pipeline (`deep_research`) in `pipeline`. \
+             ALWAYS use `deep_research` for an in-depth / comprehensive / \
+             multi-source research request — e.g. \"deep research X\", \"research \
+             and write a report on Y\", \"thoroughly investigate Z\". Do NOT \
+             answer such a request with a single inline `web_search`/`web_fetch`: \
+             that is a shallow one-angle pass; `deep_research` fans out PARALLEL \
+             searches across multiple distinct angles and synthesizes a cited \
+             report. Reserve inline `web_search` for a quick single-fact lookup. \
+             `deep_research` is WEB-ONLY: it has no access to your repository, so \
+             NEVER use it for code review, local-codebase analysis, or debugging \
+             (\"investigate this test failure\", \"audit this code\") — answer \
+             those directly with the local file/shell tools (`read_file`, \
+             `grep`, `glob`, `list_dir`, `shell`). \
+             (b) For an ad-hoc multi-step task, compose your own workflow as a \
+             typed-IR program in `ir`: a closed, capability-safe palette of node \
+             kinds (research, transform, synthesize, report, gate, fanout). You \
+             choose the kinds, their prompts, and how they connect — capability \
+             (tools/model) is fixed per kind, so you never request shell or tools \
+             directly. Use `ir` to offload research→synthesize or parallel \
+             fan-out→converge work to the harness. If composition is invalid the \
+             tool returns the exact errors — fix the `ir` and call again."
         } else {
             "Run a sanctioned multi-step pipeline by NAME. The only currently \
              sanctioned pipeline is `deep_research`, which performs MULTI-SOURCE \
-             WEB-RESEARCH SYNTHESIS: it fans out parallel web-search workers and \
-             synthesizes a source-citing report. Use it ONLY when the user asks \
-             for in-depth, multi-source research drawn from the open web. \
+             WEB-RESEARCH SYNTHESIS: it fans out PARALLEL web-search workers \
+             across distinct angles and synthesizes a source-citing report. \
+             ALWAYS use `deep_research` for an in-depth / comprehensive / \
+             multi-source research request — e.g. \"deep research X\", \"research \
+             and write a report on Y\", \"investigate Z thoroughly\". Do NOT \
+             answer such a request with a single inline `web_search`/`web_fetch`: \
+             that is a shallow one-angle pass that misses the parallel-angle \
+             coverage + synthesis the pipeline provides. Reserve inline \
+             `web_search` for a quick single-fact lookup. \
              deep_research MUST NOT be used for code review, local-codebase \
              analysis, debugging, or anything answerable from the files already \
              in the working directory — it has no access to your repository and \
@@ -656,7 +673,14 @@ impl Tool for RunPipelineTool {
         let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
              sanctioned name is `deep_research`, which is for MULTI-SOURCE \
              WEB-RESEARCH SYNTHESIS ONLY (parallel web-search workers + a \
-             cited synthesis). `deep_research` MUST NOT be selected for code \
+             cited synthesis). PREFER `deep_research` over a single inline \
+             `web_search`/`web_fetch` for any in-depth, comprehensive, or \
+             multi-source research request (\"deep research X\", \"research and \
+             write a report on Y\", \"investigate Z thoroughly\") — one inline \
+             search is a shallow one-angle pass, whereas the pipeline fans out \
+             parallel angles and synthesizes a cited report; reserve inline \
+             search for a quick single-fact lookup. `deep_research` MUST NOT be \
+             selected for code \
              review, local-codebase analysis, debugging, or any task \
              answerable from the working directory — those are NOT web \
              research; answer them directly with the local file/shell tools \
