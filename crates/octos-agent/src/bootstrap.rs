@@ -131,6 +131,26 @@ fn sha256_file(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+/// Resolve a bundled skill's source binary that sits beside the octos
+/// executable. Tries the bare `binary_name` first, then `binary_name.exe` on
+/// Windows — release bundles ship `weather.exe`, `news_fetch.exe`, … so a
+/// bare-name-only lookup would falsely report every skill missing on Windows
+/// (and never bootstrap them). Returns the first existing path, or `None`.
+fn resolve_sibling_binary(exe_dir: &Path, binary_name: &str) -> Option<std::path::PathBuf> {
+    let bare = exe_dir.join(binary_name);
+    if bare.exists() {
+        return Some(bare);
+    }
+    #[cfg(windows)]
+    {
+        let exe = exe_dir.join(format!("{binary_name}.exe"));
+        if exe.exists() {
+            return Some(exe);
+        }
+    }
+    None
+}
+
 /// Bootstrap skill entries into the given directory.
 fn bootstrap_entries(skills_dir: &Path, entries: &[(&str, &str, &str, &str)]) -> usize {
     let exe_dir = match std::env::current_exe()
@@ -174,7 +194,10 @@ fn bootstrap_entries_in(
         // bare-binary deploy without the bundle); the preflight detector
         // (`missing_bundled_skill_binaries`) reports it loudly elsewhere, so
         // here we simply skip — there is nothing to copy.
-        let src_binary = exe_dir.join(binary_name);
+        let src_binary = match resolve_sibling_binary(exe_dir, binary_name) {
+            Some(p) => p,
+            None => continue,
+        };
         let src_hash = match sha256_file(&src_binary) {
             Some(h) => h,
             None => continue,
@@ -236,7 +259,7 @@ fn bootstrap_entries_in(
 fn missing_sibling_skill_binaries_in(exe_dir: &Path) -> Vec<&'static str> {
     BUNDLED_APP_SKILLS
         .iter()
-        .filter(|&&(_, binary_name, _, _)| !exe_dir.join(binary_name).exists())
+        .filter(|&&(_, binary_name, _, _)| resolve_sibling_binary(exe_dir, binary_name).is_none())
         .map(|&(_, binary_name, _, _)| binary_name)
         .collect()
 }
@@ -292,10 +315,10 @@ pub fn bootstrap_single_skill(octos_home: &Path, name: &str) -> bool {
     let skill_dir = octos_home.join(subdir).join(dir_name);
     let main_path = skill_dir.join("main");
 
-    let src_binary = exe_dir.join(binary_name);
-    if !src_binary.exists() {
-        return false;
-    }
+    let src_binary = match resolve_sibling_binary(&exe_dir, binary_name) {
+        Some(p) => p,
+        None => return false,
+    };
 
     if std::fs::create_dir_all(&skill_dir).is_err() {
         return false;
