@@ -7,10 +7,21 @@
 //! 4. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
 //! 5. You.com (`YDC_API_KEY`) — rich JSON results with snippets
 //! 6. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
+//! 7. Headless-Chrome (CDP) Bing — **last resort**, `browser` feature only
 //!
 //! Each provider is tried in order. If a provider returns no results or fails,
-//! the next one is attempted. Perplexity is last because it costs the most but
-//! gives the best answers (AI-synthesized with citations).
+//! the next one is attempted. Perplexity is last among the HTTP providers
+//! because it costs the most but gives the best answers (AI-synthesized with
+//! citations).
+//!
+//! The headless-Chrome (CDP) provider runs only when the whole HTTP chain
+//! yields nothing — the common keyless-box case where DuckDuckGo HTTP-403s as a
+//! bot. It drives a Bing SERP through the same in-process `chromiumoxide`
+//! headless browser the `browser` tool uses (no external `deep_crawl` binary),
+//! and is gated behind the default-on `browser` cargo feature. On any box with
+//! no Chrome/Chromium it degrades to a fast, clean miss (detected up-front via
+//! `chromiumoxide::detection::default_executable`, never a launch attempt), so
+//! the search terminates instead of hanging.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -485,6 +496,44 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Headless-Chrome (CDP) fallback — last resort. Only meaningful when the
+        // HTTP chain produced nothing usable (e.g. keyless box where DuckDuckGo
+        // bot-403s). Drives Bing through the in-process headless browser. On a
+        // box with no Chrome this is a fast, clean miss (see
+        // `browser_cdp_search`), so the search terminates instead of hanging.
+        #[cfg(feature = "browser")]
+        {
+            let http_chain_empty = ddg_result
+                .as_ref()
+                .map(|r| !r.success || r.output.contains("No results found"))
+                .unwrap_or(true);
+            if http_chain_empty {
+                // Bound a touch above the per-action browser default headroom so
+                // launch + Bing nav fit, but a wedged Chrome can't block forever.
+                let cdp = self
+                    .browser_cdp_search(&input.query, count, Duration::from_secs(45))
+                    .await;
+                if let Ok(ref r) = cdp {
+                    if r.success && !r.output.contains("No results found") {
+                        info!(
+                            provider = "bing_cdp",
+                            used_provider = "bing_cdp",
+                            query = %input.query,
+                            "web_search"
+                        );
+                        return cdp;
+                    }
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "bing_cdp",
+                        fallback_reason = if r.success { "empty" } else { "miss" },
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                }
+            }
+        }
+
         info!(
             provider = "duckduckgo (fallback)",
             used_provider = "duckduckgo (fallback)",
@@ -854,6 +903,201 @@ impl WebSearchTool {
             ..Default::default()
         })
     }
+
+    // --- Headless-Chrome (CDP) fallback ---------------------------------------
+    //
+    // Last-resort provider used only when every HTTP provider above has yielded
+    // nothing (typically a keyless box where DuckDuckGo HTTP-403s as a bot). It
+    // drives a Bing SERP through the same in-process `chromiumoxide` headless
+    // browser that powers the `browser` tool — no external `deep_crawl` binary —
+    // and reuses `BLOCKED_ENV_VARS` sanitisation and a bounded launch/nav.
+    //
+    // Graceful no-browser degradation is the whole point: most environments (CI,
+    // fleet minis, bare boxes) have no Chrome. We detect that BEFORE any launch
+    // via `chromiumoxide::detection::default_executable` (the same `which`/known-
+    // path probe the browser tool relies on) and return a fast, clean miss. The
+    // launch + navigation are additionally wrapped in `bound` so a wedged Chrome
+    // can never block the agent.
+
+    /// Public entry point: resolve a usable Chrome/Chromium executable, then run
+    /// the CDP-backed Bing search. Always returns a `ToolResult` (never panics /
+    /// hangs); a non-success result means "skip me, try the next thing".
+    #[cfg(feature = "browser")]
+    pub(crate) async fn browser_cdp_search(
+        &self,
+        query: &str,
+        count: u8,
+        bound: Duration,
+    ) -> Result<ToolResult> {
+        let executable = detect_browser_executable();
+        self.browser_cdp_search_with_executable(query, count, bound, executable)
+            .await
+    }
+
+    /// Inner implementation with the resolved executable injected so the
+    /// no-browser path is unit-testable without touching process env / global
+    /// state. `executable == None` is the "no Chrome on this host" case and
+    /// short-circuits to a fast, clean miss with no launch attempt.
+    #[cfg(feature = "browser")]
+    pub(crate) async fn browser_cdp_search_with_executable(
+        &self,
+        query: &str,
+        count: u8,
+        bound: Duration,
+        executable: Option<std::path::PathBuf>,
+    ) -> Result<ToolResult> {
+        let Some(executable) = executable else {
+            // No usable browser: skip cleanly. Caller proceeds (and, with every
+            // provider exhausted, the search terminates rather than hanging).
+            warn!(
+                provider = "bing_cdp",
+                fallback_reason = "no_browser",
+                "web_search: no Chrome/Chromium found; skipping headless fallback"
+            );
+            return Ok(ToolResult {
+                output: "browser unavailable: no Chrome/Chromium executable detected".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        };
+
+        // Bound the entire launch + navigation + extraction so a stuck Chrome
+        // cannot block the agent. On timeout the session future is dropped,
+        // whose `Drop`/`shutdown` kills the child process (see browser.rs).
+        let fut = render_and_parse_bing(executable, query, count);
+        match tokio::time::timeout(bound, fut).await {
+            Ok(Ok(results)) => {
+                if results.is_empty() {
+                    return Ok(ToolResult {
+                        output: format!("No results found for: {query}"),
+                        success: true,
+                        ..Default::default()
+                    });
+                }
+                let mut output = format!("Results for: {query}\n\n");
+                for (i, (title, url, snippet)) in results.iter().enumerate() {
+                    output.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
+                    if !snippet.is_empty() {
+                        output.push_str(&format!("   {snippet}\n"));
+                    }
+                    output.push('\n');
+                }
+                Ok(ToolResult {
+                    output,
+                    success: true,
+                    ..Default::default()
+                })
+            }
+            Ok(Err(e)) => {
+                let snippet = octos_core::truncated_utf8(&e.to_string(), 200, "...");
+                warn!(
+                    provider = "bing_cdp",
+                    fallback_reason = "launch_error",
+                    error = %snippet,
+                    "web_search: headless Chrome search failed"
+                );
+                Ok(ToolResult {
+                    output: format!("browser search failed: {snippet}"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+            Err(_) => {
+                warn!(
+                    provider = "bing_cdp",
+                    fallback_reason = "timeout",
+                    timeout_ms = bound.as_millis() as u64,
+                    "web_search: headless Chrome search timed out"
+                );
+                Ok(ToolResult {
+                    output: format!("browser search timed out after {}s", bound.as_secs().max(1)),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
+/// Detect a usable Chrome/Chromium/Edge executable using the exact same probe
+/// the `browser` tool relies on (env `CHROME`, `which`, well-known install
+/// paths). Returns `None` when no browser exists so callers degrade cleanly
+/// instead of attempting (and blocking on) a doomed launch.
+#[cfg(feature = "browser")]
+fn detect_browser_executable() -> Option<std::path::PathBuf> {
+    chromiumoxide::detection::default_executable(
+        chromiumoxide::detection::DetectionOptions::default(),
+    )
+    .ok()
+}
+
+/// Launch headless Chrome, navigate to a Bing SERP for `query`, pull the
+/// rendered HTML, and parse out result rows. Kept separate from
+/// `WebSearchTool` so the bounded-timeout wrapper owns the future and Chrome is
+/// reliably torn down on cancellation.
+#[cfg(feature = "browser")]
+async fn render_and_parse_bing(
+    executable: std::path::PathBuf,
+    query: &str,
+    count: u8,
+) -> Result<Vec<(String, String, String)>> {
+    use chromiumoxide::browser::{Browser, BrowserConfig};
+    use futures::StreamExt;
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("octos-websearch-cdp-")
+        .tempdir()
+        .wrap_err("failed to create temp dir for Chrome")?;
+
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable(&executable)
+        .user_data_dir(temp_dir.path())
+        .arg("--headless=new")
+        .arg("--disable-dev-shm-usage")
+        .arg("--disable-extensions")
+        .arg("--disable-background-networking");
+
+    // Sanitize environment: blank out the shared blocked vars (LD_PRELOAD, etc).
+    for var in crate::sandbox::BLOCKED_ENV_VARS {
+        builder = builder.env(*var, "");
+    }
+
+    let config = builder
+        .build()
+        .map_err(|e| eyre::eyre!("failed to build browser config: {e}"))?;
+
+    let (mut browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|e| eyre::eyre!("failed to launch Chrome: {e}"))?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    // Bing is far more lenient than Google with headless-Chrome scraping
+    // (Google CAPTCHAs datacenter IPs). `count` is advisory.
+    let search_url = format!(
+        "https://www.bing.com/search?q={}&count={}",
+        urlencoded(query),
+        count.min(10),
+    );
+
+    let outcome = async {
+        let page = browser
+            .new_page(search_url.as_str())
+            .await
+            .map_err(|e| eyre::eyre!("failed to open Bing page: {e}"))?;
+        let _ = page.wait_for_navigation().await;
+        let html = page
+            .content()
+            .await
+            .map_err(|e| eyre::eyre!("failed to read Bing HTML: {e}"))?;
+        Ok::<_, eyre::Report>(parse_bing_results(&html, count as usize))
+    }
+    .await;
+
+    // Best-effort teardown; the temp dir drops with this scope.
+    let _ = browser.close().await;
+    handler_task.abort();
+
+    outcome
 }
 
 /// Simple URL encoding for query parameters.
@@ -945,6 +1189,77 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<(String, String, String)> {
         };
 
         results.push((title, url, snippet));
+    }
+
+    results
+}
+
+/// Parse a Bing SERP into `(title, url, snippet)` tuples.
+///
+/// Bing organic results are `<li class="b_algo"> … <h2><a href="URL">TITLE</a>
+/// </h2> … <p>SNIPPET</p> … </li>`. We scan `class="b_algo"` anchors only, which
+/// naturally skips ad blocks (`b_ad`), people-also-ask, and related-search rows.
+/// Same string-scan style as [`parse_ddg_results`] — no HTML-parser dependency.
+#[cfg(feature = "browser")]
+fn parse_bing_results(html: &str, max: usize) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
+    let marker = "class=\"b_algo\"";
+
+    let mut search_from = 0;
+    while results.len() < max {
+        let li_pos = match html[search_from..].find(marker) {
+            Some(p) => search_from + p + marker.len(),
+            None => break,
+        };
+        // Bound this result's chunk to the next b_algo so a missing field in
+        // one row can't borrow the next row's title/snippet.
+        let rest = &html[li_pos..];
+        let chunk_end = rest.find(marker).unwrap_or(rest.len());
+        let chunk = &rest[..chunk_end];
+        search_from = li_pos;
+
+        // Title + URL: first <a href="..."> after the b_algo marker (the <h2>).
+        let href = match extract_attr(chunk, "href=\"") {
+            Some(h) => h,
+            None => continue,
+        };
+        if !href.starts_with("http") {
+            continue;
+        }
+
+        // Title text is between the anchor's '>' and its '</a>'.
+        let anchor_open = match chunk.find("href=\"") {
+            Some(h) => match chunk[h..].find('>') {
+                Some(gt) => h + gt + 1,
+                None => continue,
+            },
+            None => continue,
+        };
+        let title = match chunk[anchor_open..].find("</a>") {
+            Some(end) => strip_tags(&chunk[anchor_open..anchor_open + end]),
+            None => continue,
+        };
+        if title.is_empty() {
+            continue;
+        }
+
+        // Snippet: first <p>…</p> in the result chunk (Bing's caption text).
+        let snippet = if let Some(p) = chunk.find("<p") {
+            match chunk[p..].find('>') {
+                Some(gt) => {
+                    let body = &chunk[p + gt + 1..];
+                    match body.find("</p>") {
+                        Some(end) => strip_tags(&body[..end]),
+                        None => String::new(),
+                    }
+                }
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        results.push((title, href, snippet));
     }
 
     results
@@ -1193,6 +1508,117 @@ mod tests {
         assert!(is_quota_or_rate_limit_error(&err_result(
             "code: rate-limit-exceeded"
         )));
+    }
+
+    // --- Browser-backed (headless Chrome / CDP) fallback provider ---
+
+    /// RED→GREEN: parse a Bing SERP HTML fixture into (title, url, snippet)
+    /// tuples without needing a real browser. The CDP provider renders Bing in
+    /// headless Chrome and feeds the resulting HTML through this same parser, so
+    /// exercising it on a static fixture pins the extraction contract.
+    #[cfg(feature = "browser")]
+    #[test]
+    fn parse_bing_results_extracts_title_url_snippet() {
+        let html = r#"
+            <ol id="b_results">
+              <li class="b_algo">
+                <h2><a href="https://www.rust-lang.org/">Rust Programming Language</a></h2>
+                <div class="b_caption"><p>A language empowering everyone to build reliable and efficient software.</p></div>
+              </li>
+              <li class="b_algo">
+                <h2><a href="https://doc.rust-lang.org/book/">The Rust Programming Language - Book</a></h2>
+                <div class="b_caption"><p>The official Rust book, free online.</p></div>
+              </li>
+              <li class="b_ad"><h2><a href="https://ad.example.com/promo">Sponsored</a></h2></li>
+            </ol>
+        "#;
+        let results = parse_bing_results(html, 5);
+        assert_eq!(results.len(), 2, "should skip the b_ad block");
+        assert_eq!(results[0].0, "Rust Programming Language");
+        assert_eq!(results[0].1, "https://www.rust-lang.org/");
+        assert!(
+            results[0].2.contains("empowering everyone"),
+            "snippet missing: {:?}",
+            results[0].2
+        );
+        assert_eq!(results[1].1, "https://doc.rust-lang.org/book/");
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn parse_bing_results_respects_max_and_handles_empty() {
+        let html = r#"
+            <li class="b_algo"><h2><a href="https://a.example/">A</a></h2></li>
+            <li class="b_algo"><h2><a href="https://b.example/">B</a></h2></li>
+            <li class="b_algo"><h2><a href="https://c.example/">C</a></h2></li>
+        "#;
+        assert_eq!(parse_bing_results(html, 2).len(), 2);
+        assert!(parse_bing_results("", 5).is_empty());
+        assert!(parse_bing_results("<html>nothing here</html>", 5).is_empty());
+    }
+
+    /// CRITICAL no-browser degradation: when no Chrome/Chromium is installed the
+    /// CDP provider MUST return a clean, fast miss (a non-success `ToolResult`
+    /// with an empty result, NEVER a hang or panic) and MUST honour the supplied
+    /// bound. The no-browser branch is driven by passing `None` for the resolved
+    /// executable (the value `detect_browser_executable()` yields on a box with
+    /// no Chrome), so the test never touches process env / global state and runs
+    /// with no real Chrome present. An outer watchdog guarantees we assert on a
+    /// fast miss rather than blocking the suite forever.
+    #[cfg(feature = "browser")]
+    #[tokio::test]
+    async fn browser_cdp_search_is_fast_clean_miss_without_browser() {
+        let tool = WebSearchTool::new();
+        let bound = Duration::from_secs(2);
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            tool.browser_cdp_search_with_executable("rust language", 5, bound, None),
+        )
+        .await;
+
+        let result = outcome.expect("browser_cdp_search hung past the watchdog");
+        let result = result.expect("browser_cdp_search must not error out, returns a clean miss");
+        assert!(
+            !result.success,
+            "no-browser path must be a non-success miss, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.is_empty()
+                || result.output.to_lowercase().contains("browser")
+                || result.output.to_lowercase().contains("chrome"),
+            "miss message should reference the missing browser: {}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no-browser path must be fast (no launch attempt), took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The public entry point also stays a clean miss when detection finds no
+    /// executable on the host (the common CI / fleet-mini / bare-box case). This
+    /// runs on a machine that may or may not have Chrome; either way the call
+    /// must return a `ToolResult` (never panic/hang) inside the watchdog.
+    #[cfg(feature = "browser")]
+    #[tokio::test]
+    async fn browser_cdp_search_public_entrypoint_never_hangs() {
+        let tool = WebSearchTool::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            tool.browser_cdp_search("octos web search cdp probe", 3, Duration::from_secs(8)),
+        )
+        .await;
+        let result = outcome.expect("public browser_cdp_search hung past the watchdog");
+        // Whether or not a browser is present, we must get a ToolResult, not an Err.
+        assert!(
+            result.is_ok(),
+            "browser_cdp_search must surface a ToolResult, got Err: {:?}",
+            result.err()
+        );
     }
 
     /// Structural invariant for the rotation order in `execute`:
