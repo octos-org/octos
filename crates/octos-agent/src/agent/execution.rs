@@ -695,6 +695,18 @@ impl Agent {
                 // completion: the body's own terminal mark wins; Drop no-ops.
                 let terminal_guard = TaskTerminalGuard::new(bg_supervisor.clone(), task_id.clone());
                 let task_id_for_handle = task_id.clone();
+                // Esc/`/stop`/`turn/interrupt` cancellation: acquire the
+                // supervisor's per-task cancel token in the FOREGROUND (so it
+                // exists before any `supervisor.cancel(task_id)` race) and move
+                // it into the detached worker. Without this the spawn_only
+                // background task — a `run_pipeline` / `deep_research` fan-out —
+                // runs to completion regardless of a turn interrupt: aborting
+                // the foreground agent loop never touches this independent
+                // `tokio::spawn`, and the body never polled a cancel signal. We
+                // race the tool future against `cancel_token.cancelled()` below
+                // so the in-flight pipeline/LLM/web_search await is DROPPED at
+                // the next poll and the worker terminates promptly.
+                let cancel_token = bg_supervisor.cancel_token(&task_id);
                 tokio::spawn(async move {
                     let _terminal_guard = terminal_guard;
                     bg_supervisor.mark_running(&task_id);
@@ -775,12 +787,50 @@ impl Agent {
                     // `file_state_cache` through to the tool. The TOOL_CTX
                     // scope still wraps the call so plugin/MCP tools that
                     // read the task-local see the same fields.
-                    let mut result = TOOL_CTX
-                        .scope(
+                    let mut result = {
+                        // Bind the inner ctx to a `let` so the `&exec_ctx`
+                        // borrow lives across the `select!` (the previous
+                        // inline `&make_ctx()` temporary was freed at the end
+                        // of the statement, which the longer-lived `exec`
+                        // future would outlive).
+                        let exec_ctx = make_ctx();
+                        let exec = TOOL_CTX.scope(
                             make_ctx(),
-                            bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
-                        )
-                        .await;
+                            bg_tools.execute_with_context(&exec_ctx, &bg_name, &bg_args),
+                        );
+                        tokio::select! {
+                            biased;
+                            // Interrupt won the race: a `turn/interrupt` (or any
+                            // `supervisor.cancel(task_id)`) fired the token while
+                            // the tool was mid-await. Drop `exec` (the pipeline /
+                            // LLM / web_search future) on the spot and short-
+                            // circuit the worker so a hung pipeline stops promptly
+                            // instead of running to completion.
+                            _ = cancel_token.cancelled() => {
+                                tracing::info!(
+                                    tool = %bg_name,
+                                    task_id = %task_id,
+                                    "spawn_only background tool cancelled (turn interrupt)"
+                                );
+                                // `supervisor.cancel` already transitioned the
+                                // record to `Cancelled`; mark again defensively
+                                // for the path where the token fires without a
+                                // supervisor transition (idempotent — the
+                                // terminal guard inside `mark_*` no-ops on an
+                                // already-terminal task).
+                                bg_supervisor.mark_failed(&task_id, "cancelled by turn interrupt".to_string());
+                                if let Some(ref router) = bg_output_router {
+                                    let _ = router.append(
+                                        bg_session_id_for_watcher.as_str(),
+                                        task_id.as_str(),
+                                        b"[cancelled] turn interrupted by client\n",
+                                    );
+                                }
+                                return;
+                            }
+                            res = exec => res,
+                        }
+                    };
 
                     // M8.7 (item 4): route the tool's textual output to
                     // the router so it lands on disk for the dashboard
@@ -808,13 +858,38 @@ impl Agent {
                                 || r.output.contains("connection refused"))
                         {
                             tracing::warn!(tool = %bg_name, "spawn_only tool failed (transient), retrying in 5s");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            result = TOOL_CTX
-                                .scope(
-                                    make_ctx(),
-                                    bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
-                                )
-                                .await;
+                            // Cancel-aware backoff + retry: a `turn/interrupt`
+                            // during the 5s wait or the retried execute must
+                            // still abort the worker rather than soldier on.
+                            let retry = async {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                TOOL_CTX
+                                    .scope(
+                                        make_ctx(),
+                                        bg_tools.execute_with_context(
+                                            &make_ctx(),
+                                            &bg_name,
+                                            &bg_args,
+                                        ),
+                                    )
+                                    .await
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = cancel_token.cancelled() => {
+                                    tracing::info!(
+                                        tool = %bg_name,
+                                        task_id = %task_id,
+                                        "spawn_only background tool cancelled during retry (turn interrupt)"
+                                    );
+                                    bg_supervisor
+                                        .mark_failed(&task_id, "cancelled by turn interrupt".to_string());
+                                    return;
+                                }
+                                res = retry => {
+                                    result = res;
+                                }
+                            }
                         }
                     }
 
