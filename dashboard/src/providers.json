@@ -132,8 +132,6 @@
       { "id": "llama-3.1-8b-instant", "input": 0.05, "output": 0.08, "max_output": 8192 },
       { "id": "meta-llama/llama-4-scout-17b-16e-instruct", "input": 0.11, "output": 0.34, "max_output": 16384 },
       { "id": "gemma2-9b-it", "input": 0.2, "output": 0.2, "max_output": 8192 },
-      { "id": "deepseek-v4-pro", "input": 0.28, "output": 0.42, "max_output": 384000 },
-      { "id": "deepseek-v4-flash", "input": 0.14, "output": 0.28, "max_output": 384000 },
       { "id": "qwen/qwen3-32b", "input": 0.29, "output": 0.39, "max_output": 8192 }
     ]
   },
