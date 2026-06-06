@@ -135,6 +135,76 @@ normalize_path() {
 PREFIX="$(normalize_path "$PREFIX")"
 DATA_DIR="$(normalize_path "$DATA_DIR")"
 
+# ── Config home resolver (bash mirror of resolve_config_context in Rust) ──
+# Keep this EXACTLY consistent with crates/octos-cli/src/config_context.rs.
+#
+#   config_home = $OCTOS_CONFIG_DIR                       (if set, non-empty)
+#               | $DATA_DIR                               (if explicit: an
+#                                                          OCTOS_HOME override
+#                                                          != $HOME/.octos)
+#               | XDG default                             (otherwise)
+#
+# XDG default:
+#   macOS → $HOME/Library/Application Support/octos
+#   Linux → ${XDG_CONFIG_HOME:-$HOME/.config}/octos
+#           NOTE: a RELATIVE $XDG_CONFIG_HOME is ignored (matching Rust's
+#           dirs::config_dir(), which per the XDG spec only honours absolute
+#           values) — we fall back to $HOME/.config in that case.
+#
+# Empty-string env vars are treated as unset (matching env_nonempty in Rust).
+xdg_config_home() {
+    case "$(uname -s)" in
+        Darwin) printf '%s/Library/Application Support/octos\n' "$HOME" ;;
+        *)
+            # Honour XDG_CONFIG_HOME only when it is an ABSOLUTE path.
+            if [ -n "${XDG_CONFIG_HOME:-}" ] && [ "${XDG_CONFIG_HOME#/}" != "$XDG_CONFIG_HOME" ]; then
+                printf '%s/octos\n' "$XDG_CONFIG_HOME"
+            else
+                printf '%s/octos\n' "$HOME/.config"
+            fi
+            ;;
+    esac
+}
+
+# Resolve symlinks/. /.. best-effort so the OCTOS_HOME-vs-default comparison
+# matches Rust's canonicalize() (which resolves symlinks when the path exists).
+# Prefer python3's os.path.realpath (consistent across macOS/Linux, handles
+# non-existent paths), then GNU `realpath -m`, then BSD `realpath`, finally the
+# lexical path stripped of any trailing slash.
+canonicalize_path() {
+    local p="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        OCTOS_CANON_IN="$p" python3 -c 'import os; print(os.path.realpath(os.environ["OCTOS_CANON_IN"]))' 2>/dev/null && return 0
+    fi
+    if command -v realpath >/dev/null 2>&1; then
+        # GNU realpath supports -m (no existence requirement); BSD does not.
+        realpath -m "$p" 2>/dev/null && return 0
+        realpath "$p" 2>/dev/null && return 0
+    fi
+    # Lexical fallback: drop a trailing slash so "X/" == "X".
+    case "$p" in
+        */) printf '%s\n' "${p%/}" ;;
+        *)  printf '%s\n' "$p" ;;
+    esac
+}
+
+compute_config_home() {
+    if [ -n "${OCTOS_CONFIG_DIR:-}" ]; then
+        normalize_path "$OCTOS_CONFIG_DIR"
+        return 0
+    fi
+    # Explicit when DATA_DIR (from OCTOS_HOME) is a non-default override.
+    # Compare CANONICALIZED paths so symlinked / trailing-slash variants of
+    # ~/.octos still resolve to the default (mirrors normalize_for_compare).
+    if [ "$(canonicalize_path "$DATA_DIR")" != "$(canonicalize_path "$HOME/.octos")" ]; then
+        printf '%s\n' "$DATA_DIR"
+        return 0
+    fi
+    xdg_config_home
+}
+
+CONFIG_HOME="$(compute_config_home)"
+
 validate() {
     local name="$1" value="$2" pattern="$3"
     if ! printf '%s' "$value" | grep -qE "^${pattern}\$"; then
@@ -158,6 +228,11 @@ validate_inputs() {
     [ -n "$VERSION" ] && [ "$VERSION" != "latest" ] && validate "version" "$VERSION" '[a-zA-Z0-9._-]+'
     [ -n "$PREFIX" ]        && validate "prefix"      "$PREFIX"      '/[a-zA-Z0-9/._~-]*'
     [ -n "$DATA_DIR" ]      && validate "data-dir"    "$DATA_DIR"    '/[a-zA-Z0-9/._~-]*'
+    # CONFIG_HOME may legitimately contain a space (macOS XDG default is
+    # ".../Library/Application Support/octos"). It is only ever used with the
+    # shell tools below (quoted), never interpolated into TOML/plist/systemd
+    # units, so the space-tolerant pattern is safe here.
+    [ -n "${CONFIG_HOME:-}" ] && validate "config-home" "$CONFIG_HOME" '/[a-zA-Z0-9 /._~-]*'
     return 0
 }
 
@@ -588,6 +663,8 @@ write_octos_service() {
         <string>$HOME</string>
         <key>OCTOS_DATA_DIR</key>
         <string>$DATA_DIR</string>
+        <key>OCTOS_HOME</key>
+        <string>$DATA_DIR</string>
     <key>OCTOS_AUTH_TOKEN</key>
     <string>$AUTH_TOKEN</string>
 $(launchd_env_var_xml "FRPS_TOKEN" "${FRPS_TOKEN:-}")
@@ -771,15 +848,27 @@ if [ "$RUN_DOCTOR" = true ]; then
 
     if [ -d "$DATA_DIR" ]; then
         ok "found: $DATA_DIR"
-        if [ -f "$DATA_DIR/config.json" ]; then
-            ok "config.json exists"
-        else
-            warn "config.json missing"
-            hint "Run: octos init"
-        fi
     else
         err "$DATA_DIR does not exist"
         hint "Run: octos init --defaults"
+    fi
+
+    # ── Config ────────────────────────────────────────────────────────
+    # Report the ACTUAL resolved config_home (XDG by default), with the legacy
+    # ~/.octos/config.json honoured as a back-compat fallback for default
+    # installs (matches the Rust resolver precedence).
+    section "Config"
+
+    _DOCTOR_LEGACY_CONFIG="$HOME/.octos/config.json"
+    if [ -f "$CONFIG_HOME/config.json" ]; then
+        ok "config.json: $CONFIG_HOME/config.json"
+    elif [ "$CONFIG_HOME" = "$(xdg_config_home)" ] && [ -z "${OCTOS_CONFIG_DIR:-}" ] \
+         && [ -f "$_DOCTOR_LEGACY_CONFIG" ]; then
+        ok "config.json (legacy): $_DOCTOR_LEGACY_CONFIG"
+        hint "Run 'octos init' to migrate it to $CONFIG_HOME"
+    else
+        warn "config.json missing (expected at $CONFIG_HOME/config.json)"
+        hint "Run: octos init"
     fi
 
     # ── octos serve process ──────────────────────────────────────────
@@ -1500,8 +1589,33 @@ fi
 
 # Ensure required subdirectories, config, and bootstrap files exist.
 # These match what `octos init --defaults` creates (see init.rs).
+#
+# Runtime STATE (profiles/sessions/skills/...) lives under $DATA_DIR. The
+# starter config.json is written to $CONFIG_HOME — the bash mirror of the Rust
+# resolver (XDG for a default install; the state dir for an explicit
+# OCTOS_HOME; OCTOS_CONFIG_DIR when set).
 mkdir -p "$DATA_DIR"/{profiles,memory,sessions,skills,logs,research,history}
-if [ ! -f "$DATA_DIR/config.json" ]; then
+
+# Legacy config for the default case: never shadow an existing legacy config.
+_LEGACY_CONFIG="$HOME/.octos/config.json"
+_CONFIG_FILE="$CONFIG_HOME/config.json"
+
+# Decide whether to write the starter config:
+#   - skip if $CONFIG_HOME/config.json already exists, and
+#   - for the DEFAULT install (CONFIG_HOME == XDG default, i.e. not an explicit
+#     override), also skip if the legacy ~/.octos/config.json exists so the
+#     resolver's back-compat path keeps loading it (no shadowing).
+_WRITE_CONFIG=true
+if [ -f "$_CONFIG_FILE" ]; then
+    _WRITE_CONFIG=false
+elif [ "$CONFIG_HOME" = "$(xdg_config_home)" ] && [ -z "${OCTOS_CONFIG_DIR:-}" ] \
+     && [ -f "$_LEGACY_CONFIG" ]; then
+    # Default install with an existing legacy config — do not shadow it.
+    _WRITE_CONFIG=false
+    ok "existing legacy config kept: $_LEGACY_CONFIG (not shadowed)"
+fi
+
+if [ "$_WRITE_CONFIG" = true ]; then
     # Auto-detect provider from available API keys
     if [ -n "${OPENAI_API_KEY:-}" ]; then
         _PROV="openai"; _MODEL="gpt-4.1-mini"; _ENV="OPENAI_API_KEY"
@@ -1532,7 +1646,8 @@ if [ ! -f "$DATA_DIR/config.json" ]; then
 INITEOF
 )
     fi
-    cat > "$DATA_DIR/config.json" << INITEOF
+    mkdir -p "$CONFIG_HOME"
+    cat > "$_CONFIG_FILE" << INITEOF
 {
   "provider": "$_PROV",
   "model": "$_MODEL",
@@ -1540,8 +1655,9 @@ INITEOF
   "mode": "$_MODE"$_EXTRA_CONFIG
 }
 INITEOF
-    chmod 600 "$DATA_DIR/config.json"
+    chmod 600 "$_CONFIG_FILE"
     ok "auto-detected provider: $_PROV ($_ENV)"
+    ok "wrote config: $_CONFIG_FILE"
 fi
 [ ! -f "$DATA_DIR/.gitignore" ] && cat > "$DATA_DIR/.gitignore" << 'INITEOF'
 # Ignore task state and database files
@@ -1875,7 +1991,7 @@ section "Installation complete!"
 echo ""
 echo "    Binary:     $PREFIX/octos"
 echo "    Data dir:   $DATA_DIR"
-echo "    Config:     $DATA_DIR/config.json"
+echo "    Config:     $CONFIG_HOME/config.json"
 echo "    Auth token: $AUTH_TOKEN"
 echo "    Logs:       tail -f $DATA_DIR/logs/serve.\$(date +%F).log"
 echo ""

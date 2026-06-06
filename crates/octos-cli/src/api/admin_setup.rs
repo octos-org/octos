@@ -263,14 +263,25 @@ fn require_config_path(state: &AppState) -> Result<PathBuf, (StatusCode, Json<Er
     match &state.config_path {
         Some(p) => Ok(p.clone()),
         None => {
-            let data_dir = data_dir_from_state(state).ok_or((
+            // Confirm the server has a resolvable data dir (else it cannot
+            // safely write anything) before computing the config target.
+            data_dir_from_state(state).ok_or((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorBody {
                     code: "no_data_dir",
                     message: "server has no resolvable data directory".into(),
                 }),
             ))?;
-            Ok(crate::config::Config::data_dir_config_path(&data_dir))
+            // Resolve the canonical config_home (NOT data_dir) so admin writes
+            // land where the resolver READS config. The daemon carries its
+            // OCTOS_HOME / OCTOS_CONFIG_DIR in the environment, so resolving
+            // with no override reproduces serve's own config_home: XDG for a
+            // default install, the state dir for an explicit OCTOS_HOME, the
+            // tenant dir for OCTOS_CONFIG_DIR. This closes the leak where the
+            // old `data_dir/config.json` fallback could write the host's
+            // `~/.octos/config.json` under an OCTOS_CONFIG_DIR tenant.
+            let ctx = crate::config_context::resolve_config_context(None);
+            Ok(ctx.config_home.join("config.json"))
         }
     }
 }

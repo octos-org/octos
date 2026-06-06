@@ -105,16 +105,17 @@ impl McpServeCommand {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
-        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
+        let ctx = super::resolve_command_context(self.data_dir.clone())?;
+        let data_dir = ctx.data_dir.clone();
 
         // Load config — same precedence as chat/gateway: project-local
-        // `.octos/config.json` wins over data-dir `config.json`. Missing
+        // `.octos/config.json` wins over the resolved config_home. Missing
         // config is fine for stdio mode; the LLM factory will fail later
         // if no provider is configured.
         let config = if let Some(ref config_path) = self.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd, &data_dir)?
+            Config::load_with_context(&cwd, &ctx)?
         };
 
         let factory = AgentLlmFactory::from_config(config)

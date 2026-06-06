@@ -8,7 +8,20 @@ use eyre::Result;
 
 use super::Executable;
 use crate::auth::{AuthStore, keychain, oauth, token};
+use crate::config_context::{resolve_config_context, run_migrations};
 use crate::profiles::ProfileStore;
+
+/// Open the global auth store for the `auth login/logout/status` commands.
+///
+/// Auth is GLOBAL: it lives under the resolver's `auth_home` (OCTOS_CONFIG_DIR
+/// if set, else the XDG default), independent of `--data-dir`. We run the
+/// migrations first so a legacy `~/.octos/auth.json` is copied into the XDG
+/// location (0600, legacy left intact) before the store opens.
+fn open_global_auth_store() -> Result<AuthStore> {
+    let ctx = resolve_config_context(None);
+    run_migrations(&ctx);
+    AuthStore::open(&ctx)
+}
 
 /// Manage authentication for LLM providers.
 #[derive(Debug, Args)]
@@ -121,7 +134,7 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
         _ => token::paste_token_flow(provider)?,
     };
 
-    let mut store = AuthStore::load()?;
+    let mut store = open_global_auth_store()?;
     store.set(provider, cred)?;
 
     println!(
@@ -133,7 +146,7 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
 }
 
 fn logout(provider: &str) -> Result<()> {
-    let mut store = AuthStore::load()?;
+    let mut store = open_global_auth_store()?;
     if store.remove(provider)? {
         println!("{} Logged out from {}", "OK".green().bold(), provider);
     } else {
@@ -143,7 +156,7 @@ fn logout(provider: &str) -> Result<()> {
 }
 
 fn status() -> Result<()> {
-    let store = AuthStore::load()?;
+    let store = open_global_auth_store()?;
     let creds: Vec<_> = store.list().collect();
 
     if creds.is_empty() {

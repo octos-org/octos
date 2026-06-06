@@ -47,8 +47,8 @@ impl Executable for ChannelsCommand {
 }
 
 fn cmd_status(cwd: &std::path::Path) -> Result<()> {
-    let data_dir = super::resolve_data_dir(None)?;
-    let config = Config::load(cwd, &data_dir)?;
+    let ctx = super::resolve_command_context(None)?;
+    let config = Config::load_with_context(cwd, &ctx)?;
 
     let channels = match &config.gateway {
         Some(gw) => &gw.channels,

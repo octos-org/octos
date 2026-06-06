@@ -97,14 +97,16 @@ impl ChatCommand {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = super::resolve_data_dir(self.data_dir)?;
+        // Resolve the canonical config context (data_dir, config_home,
+        // auth_home, is_default) once and run migrations.
+        let ctx = super::resolve_command_context(self.data_dir)?;
+        let data_dir = ctx.data_dir.clone();
 
         // Load config
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd, &data_dir)?
+            Config::load_with_context(&cwd, &ctx)?
         };
 
         let model = self.model.or(config.model.clone());
