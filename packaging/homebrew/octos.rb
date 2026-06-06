@@ -31,10 +31,18 @@ class Octos < Formula
     # voice, clock, weather). At `octos serve` startup, bootstrap discovers
     # those skills as SIBLINGS of the resolved `octos` executable
     # (current_exe().parent()). Keep all of them together in libexec and
-    # expose only `octos` on PATH via a symlink — the symlink resolves so
-    # current_exe().parent() == libexec and sibling discovery still works.
+    # expose only `octos` on PATH.
     libexec.install Dir["*"]
-    bin.install_symlink libexec/"octos"
+    # Use an exec WRAPPER, not bin.install_symlink: on macOS,
+    # std::env::current_exe() returns the *symlink* path (Darwin
+    # _NSGetExecutablePath), so a bin/octos symlink would put exe_dir at bin/
+    # and the sibling skills (in libexec) would not be found -> plugin_count=0.
+    # `exec` replaces the process image, so current_exe() == libexec/octos and
+    # exe_dir == libexec, where the skill binaries live.
+    (bin/"octos").write <<~SH
+      #!/bin/bash
+      exec "#{libexec}/octos" "$@"
+    SH
   end
 
   test do

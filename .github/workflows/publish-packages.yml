@@ -35,14 +35,26 @@ jobs:
       - name: Download unix bundles for the tag
         run: |
           mkdir -p bundles
-          for triple in \
-            aarch64-apple-darwin \
-            x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu; do
-            gh release download "$TAG" \
-              --repo "${{ github.repository }}" \
-              --pattern "octos-bundle-${triple}.tar.gz" \
-              --dir bundles
+          triples="aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
+          # `release: published` can fire before release.yml's action-gh-release
+          # step has uploaded every asset. Poll until all expected bundles exist
+          # (up to ~5 min) so we never render a formula from a partial asset set.
+          for attempt in $(seq 1 30); do
+            missing=0
+            for triple in $triples; do
+              asset="octos-bundle-${triple}.tar.gz"
+              [ -f "bundles/$asset" ] && continue
+              gh release download "$TAG" --repo "${{ github.repository }}" \
+                --pattern "$asset" --dir bundles 2>/dev/null || true
+              [ -f "bundles/$asset" ] || missing=1
+            done
+            [ "$missing" = 0 ] && break
+            echo "attempt $attempt: waiting for all bundle assets to publish..."
+            sleep 10
+          done
+          for triple in $triples; do
+            test -f "bundles/octos-bundle-${triple}.tar.gz" \
+              || { echo "::error::missing octos-bundle-${triple}.tar.gz after wait"; exit 1; }
           done
           ls -la bundles
 

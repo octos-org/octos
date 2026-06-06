@@ -120,46 +120,30 @@ function download(urlStr, destFile, redirects, cb) {
   }
 
   // file:// override — copy locally (used by tests / offline installs).
+  // Use fileURLToPath so Windows `file:///C:/...` maps correctly (pathname
+  // would yield `/C:/...`).
   if (url.protocol === "file:") {
     try {
-      fs.copyFileSync(decodeURIComponent(url.pathname), destFile);
+      fs.copyFileSync(require("url").fileURLToPath(url), destFile);
       return cb(null);
     } catch (e) {
       return cb(new Error("could not read " + urlStr + ": " + e.message));
     }
   }
 
-  const isHttps = url.protocol === "https:";
-  const transport = isHttps ? https : http;
-  const proxy =
-    process.env.HTTPS_PROXY ||
-    process.env.https_proxy ||
-    process.env.HTTP_PROXY ||
-    process.env.http_proxy;
-
-  let requestOptions;
-  if (proxy && isHttps) {
-    // CONNECT-tunnel-free path: route the absolute URL through the proxy.
-    // Most proxies accept an absolute-form request line for plain GETs;
-    // for HTTPS we fall back to a direct request if no CONNECT helper is
-    // available (Node core has no built-in CONNECT). Keep it simple and
-    // direct unless a plain-HTTP proxy is configured.
-    const proxyUrl = new URL(proxy);
-    requestOptions = {
-      host: proxyUrl.hostname,
-      port: proxyUrl.port || (proxyUrl.protocol === "https:" ? 443 : 80),
-      path: urlStr,
-      headers: { Host: url.host, "User-Agent": "octos-npm-installer" },
-    };
-  } else {
-    requestOptions = {
-      protocol: url.protocol,
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname + url.search,
-      headers: { "User-Agent": "octos-npm-installer" },
-    };
-  }
+  // Direct request only. Corporate HTTP/HTTPS proxies are NOT supported here
+  // (Node core has no CONNECT helper, and absolute-form GET to an HTTP proxy
+  // fails for https targets). Behind a proxy: pre-download the bundle and point
+  // the installer at it with OCTOS_BUNDLE_URL=file:///path, or set
+  // OCTOS_SKIP_DOWNLOAD=1 and place the binaries under vendor/ yourself.
+  const transport = url.protocol === "https:" ? https : http;
+  const requestOptions = {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port,
+    path: url.pathname + url.search,
+    headers: { "User-Agent": "octos-npm-installer" },
+  };
 
   transport
     .get(requestOptions, (res) => {
