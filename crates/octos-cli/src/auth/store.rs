@@ -257,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn at_tightens_loose_permissions_on_open() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = TempDir::new().unwrap();
