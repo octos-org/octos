@@ -398,6 +398,17 @@ impl ServeCommand {
         // per-profile loop free of redundant disk writes.
         octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
         octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+        // Preflight: if the sibling app-skill binaries are missing beside the
+        // running `octos` executable, bootstrap silently skipped them and the
+        // affected tools (get_weather, etc.) will NOT register. Warn loudly so
+        // a bare-binary deploy is diagnosable instead of a silent plugin_count=0.
+        let missing = octos_agent::bootstrap::missing_bundled_skill_binaries();
+        if !missing.is_empty() {
+            tracing::warn!(
+                missing = ?missing,
+                "bundled skill binaries missing beside the octos executable — this looks like a bare-binary install; app-skill tools (get_weather, etc.) will NOT register. Deploy the full bundle (scripts/build-local-bundle.sh / scripts/install.sh), not just the octos binary."
+            );
+        }
         // Gap 4.1: bundle generic pipelines (deep_research) into the
         // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
         // always discovers them even when the `mofa-research` skill carrying
