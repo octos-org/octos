@@ -1,0 +1,111 @@
+name: Publish Packages
+# Additive package publishers for the SERVER bundle. Wraps the per-triple
+# archives produced by release.yml (which this workflow does NOT modify) and
+# publishes a Homebrew formula + an npm wrapper.
+#
+# Gated behind the repo variable PUBLISH_PACKAGES so it no-ops until the
+# maintainer opts in (avoids failing on missing tokens). To go live, set:
+#   - repo variable PUBLISH_PACKAGES = true
+#   - secret HOMEBREW_TAP_TOKEN  (PAT with push to octos-org/homebrew-tap)
+#   - secret NPM_TOKEN           (npm automation token for @octos-org)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.1.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew:
+    if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download unix bundles for the tag
+        run: |
+          mkdir -p bundles
+          for triple in \
+            aarch64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu; do
+            gh release download "$TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern "octos-bundle-${triple}.tar.gz" \
+              --dir bundles
+          done
+          ls -la bundles
+
+      - name: Render formula from template
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          sha_darwin_arm=$(sha256sum bundles/octos-bundle-aarch64-apple-darwin.tar.gz | awk '{print $1}')
+          sha_linux_x64=$(sha256sum bundles/octos-bundle-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+          sha_linux_arm=$(sha256sum bundles/octos-bundle-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+
+          cp packaging/homebrew/octos.rb octos.rb
+          sed -i "s|__VERSION__|${version}|g" octos.rb
+          sed -i "s|__TAG__|${TAG}|g" octos.rb
+          sed -i "s|__SHA_DARWIN_ARM__|${sha_darwin_arm}|g" octos.rb
+          sed -i "s|__SHA_LINUX_X64__|${sha_linux_x64}|g" octos.rb
+          sed -i "s|__SHA_LINUX_ARM__|${sha_linux_arm}|g" octos.rb
+
+          echo "----- rendered Formula/octos.rb -----"
+          cat octos.rb
+
+      - name: Push formula to homebrew-tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/octos-org/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp octos.rb tap/Formula/octos.rb
+          cd tap
+          git config user.name "octos-release-bot"
+          git config user.email "151983+ymote@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Formula/octos.rb unchanged; nothing to push."
+            exit 0
+          fi
+          git add Formula/octos.rb
+          git commit -m "octos ${TAG}"
+          git push origin HEAD
+
+  npm:
+    if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Set package version to the tag
+        working-directory: packaging/npm
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+          echo "Publishing @octos-org/octos@${version}"
+
+      - name: Publish to npm
+        working-directory: packaging/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

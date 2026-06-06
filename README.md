@@ -88,6 +88,18 @@ irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | ie
 
 This installs the binary, sets up `octos serve` as a service, and starts the local dashboard at `http://localhost:8080/admin/`.
 
+Alternatively, install just the binaries (the `octos` server plus its bundled skills) via a package manager:
+
+```bash
+# Homebrew (macOS Apple Silicon, Linux x86_64/ARM64)
+brew install octos-org/tap/octos
+
+# npm (macOS Apple Silicon, Linux x86_64/ARM64, Windows x64)
+npm install -g @octos-org/octos
+```
+
+Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `voice`, `clock`, `weather`) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
+
 Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
 
 Choose this path if you want:
