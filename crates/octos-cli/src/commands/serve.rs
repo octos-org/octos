@@ -639,7 +639,13 @@ impl ServeCommand {
             allowlist_store: Some(allowlist_store),
             auth_manager,
             http_client: reqwest::Client::new(),
-            config_path: resolved_config_path,
+            // If a config file was loaded, admin edits target that exact file.
+            // If none existed at startup, fall back to THIS serve's resolved
+            // config_home (which already accounts for the `--data-dir` FLAG —
+            // not just env), so admin writes under `serve --data-dir T` land in
+            // `T/config.json`, not a recomputed XDG path. (admin_setup's own
+            // None branch can't see the CLI flag; this closes that leak.)
+            config_path: resolved_config_path.or_else(|| Some(ctx.config_home.join("config.json"))),
             watchdog_enabled: watchdog_flag.clone(),
             alerts_enabled: alerts_flag.clone(),
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),

@@ -69,6 +69,24 @@ fn normalize_for_compare(path: &Path) -> PathBuf {
     std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
+/// Normalize a path for RETURN (config_home / auth_home / data_dir): expand a
+/// leading `~` and make it absolute, but do NOT `canonicalize`. Canonicalize is
+/// reserved for the `is_default` *comparison* — applying it to returned paths
+/// would resolve symlinks (e.g. macOS `/var`→`/private/var`), require the path
+/// to already exist, and surprise callers/tests with a rewritten prefix. We
+/// only need to guarantee no literal `~`/relative segment leaks into a file
+/// path.
+fn normalize_for_return(path: &Path) -> PathBuf {
+    let expanded = expand_tilde(path);
+    if expanded.is_absolute() {
+        expanded
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(&expanded)
+    } else {
+        expanded
+    }
+}
+
 /// Expand a leading `~` or `~/` against `$HOME`.
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -139,10 +157,14 @@ pub fn resolve_config_context(cli_data_dir: Option<&Path>) -> ConfigContext {
     // auth_home is GLOBAL: OCTOS_CONFIG_DIR if set, else XDG. NEVER data_dir.
     let auth_home = octos_config_dir.clone().unwrap_or_else(xdg_config_home);
 
+    // Normalize the RETURNED paths (expand a leading `~`, make absolute,
+    // canonicalize-if-it-exists). Without this, an env value like
+    // `OCTOS_HOME=~/x` or a relative `--data-dir foo` would propagate a literal
+    // `~`/relative segment into the config/auth/state file paths.
     ConfigContext {
-        config_home,
-        auth_home,
-        data_dir,
+        config_home: normalize_for_return(&config_home),
+        auth_home: normalize_for_return(&auth_home),
+        data_dir: normalize_for_return(&data_dir),
         is_default,
     }
 }

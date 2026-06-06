@@ -55,7 +55,11 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
 
     // Config location — report the ACTUAL resolved config_home, not the data
     // dir, so the operator sees where config really lives (XDG by default).
-    if config_path.exists() {
+    // Project-local `cwd/.octos/config.json` is only honored by the loader in a
+    // DEFAULT context (`load_resolved` skips it for explicit/tenant), so only
+    // surface it when `ctx.is_default` — else status would claim a project-local
+    // config that the loader will not read.
+    if ctx.is_default && config_path.exists() {
         println!(
             "{}: {} {}",
             "Config".green(),

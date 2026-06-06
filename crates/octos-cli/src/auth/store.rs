@@ -58,6 +58,20 @@ impl AuthStore {
     pub fn at(auth_home: &Path) -> Result<Self> {
         let path = auth_home.join("auth.json");
         let data = if path.exists() {
+            // Harden an existing store on open: a credential file created by an
+            // older octos (or copied in by hand) may be 0644. `save()` always
+            // writes 0600, but a file we only ever READ would stay world/group
+            // readable forever — tighten it best-effort whenever we open it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
             let content = std::fs::read_to_string(&path).wrap_err("failed to read auth store")?;
             serde_json::from_str(&content).wrap_err("failed to parse auth store")?
         } else {
@@ -240,6 +254,24 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn at_tightens_loose_permissions_on_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let auth_home = tmp.path().join("octos");
+        std::fs::create_dir_all(&auth_home).unwrap();
+        let path = auth_home.join("auth.json");
+        // Simulate a legacy / hand-copied store that is world-readable.
+        std::fs::write(&path, "{\"credentials\":{}}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Opening it must tighten the perms to 0600 (no plain-read leaving creds
+        // world/group readable).
+        let _store = AuthStore::at(&auth_home).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "at() must tighten a loose auth.json to 0600");
     }
 
     #[test]
