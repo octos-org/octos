@@ -252,13 +252,25 @@ fn bootstrap_entries_in(
     count
 }
 
-/// Returns the `binary_name`s of [`BUNDLED_APP_SKILLS`] whose sibling binary is
-/// absent from `exe_dir`.
+/// Bundled app-skills that are *declared* (so they still bootstrap when their
+/// binary happens to sit beside octos) but are NOT shipped by the standard
+/// release bundle (`scripts/build-local-bundle.sh`, `release.yml`). The
+/// bare-binary preflight must not flag these as "missing" — their absence is
+/// expected on a normal full-bundle install, so warning about them would make
+/// the guard cry wolf on every host. (`skill-evolve` is a key-gated meta-skill
+/// kept out of the public bundle; shipping it is a separate product decision.)
+const PREFLIGHT_OPTIONAL_SKILLS: &[&str] = &["skill-evolve"];
+
+/// Returns the `binary_name`s of [`BUNDLED_APP_SKILLS`] that the standard bundle
+/// is expected to ship but whose sibling binary is absent from `exe_dir` — i.e.
+/// the signal of a bare-binary deploy. Skills in [`PREFLIGHT_OPTIONAL_SKILLS`]
+/// are excluded so a normal full-bundle install never false-warns.
 ///
 /// Testable seam for [`missing_bundled_skill_binaries`].
 fn missing_sibling_skill_binaries_in(exe_dir: &Path) -> Vec<&'static str> {
     BUNDLED_APP_SKILLS
         .iter()
+        .filter(|&&(_, binary_name, _, _)| !PREFLIGHT_OPTIONAL_SKILLS.contains(&binary_name))
         .filter(|&&(_, binary_name, _, _)| resolve_sibling_binary(exe_dir, binary_name).is_none())
         .map(|&(_, binary_name, _, _)| binary_name)
         .collect()
@@ -428,6 +440,12 @@ mod tests {
         assert!(
             missing.contains(&"weather"),
             "the weather sibling binary should be reported missing, got: {missing:?}"
+        );
+        // Preflight-optional skills (not shipped by the standard bundle) must
+        // never be reported, even when absent, or the guard cries wolf.
+        assert!(
+            !missing.contains(&"skill-evolve"),
+            "preflight-optional skill-evolve must not be reported missing, got: {missing:?}"
         );
 
         // Touch every bundled binary beside the exe dir.
