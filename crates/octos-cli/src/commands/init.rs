@@ -154,9 +154,18 @@ impl Executable for InitCommand {
         println!("{}", "octos init".cyan().bold());
         println!();
 
+        // Where to write the starter config:
+        //   --cwd C        → C/.octos (explicit project-local request)
+        //   otherwise      → the resolver's config_home (OCTOS_CONFIG_DIR if
+        //                    set; the state dir for an explicit OCTOS_HOME /
+        //                    --data-dir; else the XDG default for a default
+        //                    install).
         let config_dir = match self.cwd {
             Some(cwd) => cwd.join(".octos"),
-            None => super::resolve_data_dir(None)?,
+            None => {
+                let ctx = super::resolve_command_context(None)?;
+                ctx.config_home
+            }
         };
         let config_path = config_dir.join("config.json");
 

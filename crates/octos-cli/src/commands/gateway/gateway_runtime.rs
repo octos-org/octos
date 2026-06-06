@@ -33,7 +33,7 @@ use super::profile_factory::{
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
-use crate::commands::{load_prompt, resolve_data_dir};
+use crate::commands::load_prompt;
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
@@ -153,7 +153,8 @@ impl GatewayRuntime {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
-        let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        let ctx = crate::commands::resolve_command_context(cmd.data_dir.clone())?;
+        let data_dir = ctx.data_dir.clone();
         #[cfg(feature = "api")]
         let metrics_handle = Some(crate::api::init_metrics());
         #[cfg(not(feature = "api"))]
@@ -214,7 +215,7 @@ impl GatewayRuntime {
         } else if let Some(config_path) = &cmd.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd, &data_dir)?
+            Config::load_with_context(&cwd, &ctx)?
         };
         // Section B (codex review round-5 P1.2): the `--profile` path
         // bypasses `Config::from_file`, so call the same env-var OR-merge
@@ -1339,9 +1340,9 @@ impl GatewayRuntime {
                 if local.exists() {
                     paths.push(local);
                 }
-                let data_dir_config = Config::data_dir_config_path(&data_dir);
-                if data_dir_config.exists() {
-                    paths.push(data_dir_config);
+                let config_home_config = ctx.config_home.join("config.json");
+                if config_home_config.exists() {
+                    paths.push(config_home_config);
                 }
             }
             paths

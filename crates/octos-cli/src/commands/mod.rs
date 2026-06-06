@@ -118,18 +118,28 @@ pub trait Executable {
 /// Resolve the data directory for episodes, memory, sessions, etc.
 ///
 /// Priority: `--data-dir` CLI flag > `OCTOS_HOME` env var > `~/.octos` default.
+/// Delegates to the canonical [`resolve_config_context`] so the `data_dir`
+/// computation (including empty-string env handling) never diverges from
+/// config/auth resolution.
 pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
-    let dir = if let Some(d) = cli_override {
-        d
-    } else if let Ok(env_dir) = std::env::var("OCTOS_HOME") {
-        PathBuf::from(env_dir)
-    } else {
-        dirs::home_dir()
-            .ok_or_else(|| eyre::eyre!("cannot determine home directory"))?
-            .join(".octos")
-    };
-    std::fs::create_dir_all(&dir).ok();
-    Ok(dir)
+    let ctx = crate::config_context::resolve_config_context(cli_override.as_deref());
+    std::fs::create_dir_all(&ctx.data_dir).ok();
+    Ok(ctx.data_dir)
+}
+
+/// Resolve the canonical [`ConfigContext`](crate::config_context::ConfigContext)
+/// for a command, create the data dir, and run the (idempotent, best-effort)
+/// config + auth migrations exactly once.
+///
+/// Every command that loads config should go through this so the resolver runs
+/// at a single shared entrypoint per invocation.
+pub fn resolve_command_context(
+    cli_override: Option<PathBuf>,
+) -> eyre::Result<crate::config_context::ConfigContext> {
+    let ctx = crate::config_context::resolve_config_context(cli_override.as_deref());
+    std::fs::create_dir_all(&ctx.data_dir).ok();
+    crate::config_context::run_migrations(&ctx);
+    Ok(ctx)
 }
 
 /// Load a prompt from `~/.octos/prompts/{name}.md` at runtime.

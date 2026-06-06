@@ -47,10 +47,14 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!();
 
     let config_path = cwd.join(".octos").join("config.json");
-    let data_dir = super::resolve_data_dir(None)?;
-    let data_dir_config = Config::data_dir_config_path(&data_dir);
+    let ctx = super::resolve_command_context(None)?;
+    let data_dir = ctx.data_dir.clone();
+    let config_home_config = ctx.config_home.join("config.json");
+    // Legacy back-compat location (default installs only).
+    let legacy_config = dirs::home_dir().map(|h| h.join(".octos").join("config.json"));
 
-    // Config location
+    // Config location — report the ACTUAL resolved config_home, not the data
+    // dir, so the operator sees where config really lives (XDG by default).
     if config_path.exists() {
         println!(
             "{}: {} {}",
@@ -58,12 +62,24 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
             config_path.display(),
             "(found)".green()
         );
-    } else if data_dir_config.exists() {
+    } else if config_home_config.exists() {
         println!(
             "{}: {} {}",
             "Config".green(),
-            data_dir_config.display(),
+            config_home_config.display(),
             "(found)".green()
+        );
+    } else if ctx.is_default
+        && legacy_config
+            .as_deref()
+            .map(|p| p != config_home_config && p.exists())
+            .unwrap_or(false)
+    {
+        println!(
+            "{}: {} {}",
+            "Config".green(),
+            legacy_config.as_deref().unwrap().display(),
+            "(legacy)".yellow()
         );
     } else {
         println!(
@@ -86,7 +102,7 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     }
 
     // Load config for provider/model info
-    let config = Config::load(cwd, &data_dir).unwrap_or_default();
+    let config = Config::load_with_context(cwd, &ctx).unwrap_or_default();
 
     let provider = config.provider.as_deref().unwrap_or("(not configured)");
     let model = config.model.as_deref().unwrap_or("(not configured)");

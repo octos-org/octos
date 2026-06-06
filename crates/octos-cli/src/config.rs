@@ -1019,41 +1019,82 @@ impl Config {
         data_dir.join("config.json")
     }
 
-    /// Load config from the current project plus the already-resolved data dir.
-    pub fn load(cwd: &Path, data_dir: &Path) -> Result<Self> {
-        Self::load_with_path(cwd, data_dir).map(|(config, _)| config)
+    /// Load config from the current project plus the canonical config context.
+    ///
+    /// This is the preferred entrypoint: it threads the single
+    /// [`ConfigContext`](crate::config_context::ConfigContext) so the precedence
+    /// is identical at every call site.
+    pub fn load_with_context(
+        cwd: &Path,
+        ctx: &crate::config_context::ConfigContext,
+    ) -> Result<Self> {
+        Self::load_with_context_path(cwd, ctx).map(|(config, _)| config)
     }
 
-    /// Load config and return the resolved config path when one exists.
-    pub fn load_with_path(cwd: &Path, data_dir: &Path) -> Result<(Self, Option<PathBuf>)> {
-        // Try project-local config first
-        let local_config = cwd.join(".octos").join("config.json");
-        if local_config.exists() {
-            tracing::info!(path = %local_config.display(), "loading config (project-local)");
-            return Ok((Self::from_file(&local_config)?, Some(local_config)));
-        }
+    /// Like [`Self::load_with_context`] but also returns the resolved config
+    /// path when one exists.
+    pub fn load_with_context_path(
+        cwd: &Path,
+        ctx: &crate::config_context::ConfigContext,
+    ) -> Result<(Self, Option<PathBuf>)> {
+        Self::load_resolved(cwd, &ctx.config_home, ctx.is_default)
+    }
 
-        // The caller resolves --data-dir > OCTOS_HOME > ~/.octos exactly once
-        // and passes the canonical data dir here.
-        let data_dir_config = Self::data_dir_config_path(data_dir);
-        if data_dir_config.exists() {
-            tracing::info!(path = %data_dir_config.display(), "loading config (data dir)");
-            return Ok((Self::from_file(&data_dir_config)?, Some(data_dir_config)));
-        }
-
-        // Try legacy platform config dir (~/Library/Application Support/octos/ or ~/.config/octos/)
-        if let Some(legacy_config) = dirs::config_dir().map(|d| d.join("octos").join("config.json"))
-        {
-            if legacy_config.exists() {
-                tracing::warn!(
-                    path = %legacy_config.display(),
-                    "loading config from legacy location — consider moving to ~/.octos/config.json"
-                );
-                return Ok((Self::from_file(&legacy_config)?, Some(legacy_config)));
+    /// Core loader. Precedence:
+    /// 1. (only when `is_default`) project-local `cwd/.octos/config.json`
+    /// 2. `config_home/config.json`
+    /// 3. (only when `is_default`) legacy `~/.octos/config.json`
+    /// 4. defaults (with `merge_env_plugin_policy`)
+    ///
+    /// Explicit / tenant contexts (`is_default == false`) read ONLY from
+    /// `config_home`. They MUST NOT read the ambient project-local
+    /// `cwd/.octos/config.json` either: a tenant/`serve` process whose `cwd`
+    /// happens to be `$HOME` would otherwise pick up the host's
+    /// `~/.octos/config.json` (and, in `serve`, expose it to admin writes via
+    /// `AppState.config_path`). That isolation is the whole point of this
+    /// resolver. The project-local convenience is reserved for default-context
+    /// `octos chat`/`gateway` invocations.
+    fn load_resolved(
+        cwd: &Path,
+        config_home: &Path,
+        is_default: bool,
+    ) -> Result<(Self, Option<PathBuf>)> {
+        // 1. Project-local config — DEFAULT context only. In explicit/tenant
+        //    contexts this is skipped so an ambient `cwd/.octos/config.json`
+        //    (e.g. the host's `~/.octos`) can never leak in.
+        if is_default {
+            let local_config = cwd.join(".octos").join("config.json");
+            if local_config.exists() {
+                tracing::info!(path = %local_config.display(), "loading config (project-local)");
+                return Ok((Self::from_file(&local_config)?, Some(local_config)));
             }
         }
 
-        // No config found, use defaults. Even on the no-file path, honour
+        // 2. The resolved config_home (XDG for default, data_dir/OCTOS_CONFIG_DIR
+        //    for explicit). Resolved exactly once by `resolve_config_context`.
+        let home_config = config_home.join("config.json");
+        if home_config.exists() {
+            tracing::info!(path = %home_config.display(), "loading config (config home)");
+            return Ok((Self::from_file(&home_config)?, Some(home_config)));
+        }
+
+        // 3. Legacy back-compat: only for default installs, and only when the
+        //    legacy path differs from config_home (so we don't double-check the
+        //    same file). Explicit/tenant contexts never reach here.
+        if is_default {
+            if let Some(home) = dirs::home_dir() {
+                let legacy_config = home.join(".octos").join("config.json");
+                if legacy_config != home_config && legacy_config.exists() {
+                    tracing::info!(
+                        path = %legacy_config.display(),
+                        "loading config (legacy ~/.octos — consider running `octos init` to migrate)"
+                    );
+                    return Ok((Self::from_file(&legacy_config)?, Some(legacy_config)));
+                }
+            }
+        }
+
+        // 4. No config found, use defaults. Even on the no-file path, honour
         // `OCTOS_PLUGINS_REQUIRE_SIGNED` so spawned gateways without a
         // config.json still inherit the host's strict-signing policy.
         tracing::info!("no config.json found, using defaults");
@@ -1157,8 +1198,13 @@ impl Config {
         });
         octos_agent::register_secret_env_names([env_var.as_str()]);
 
-        // Check auth store first.
-        if let Ok(store) = crate::auth::AuthStore::load() {
+        // Check auth store first. Auth is GLOBAL: it lives under the resolver's
+        // `auth_home` (OCTOS_CONFIG_DIR if set, else the XDG default). This is
+        // independent of `--data-dir`, so per-profile gateways keep the host's
+        // shared `octos auth login` credentials. We resolve the context with no
+        // cli_data_dir because auth_home never depends on it.
+        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+        if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
             if let Some(cred) = store.get(provider) {
                 if !cred.is_expired() {
                     return Ok(cred.access_token.clone());
@@ -1315,6 +1361,13 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crate-wide lock for EVERY test that pivots the global `HOME` /
+    /// `OCTOS_HOME` / `OCTOS_CONFIG_DIR` env vars. These are process-global, so
+    /// all such tests (here and in `config_context`) must serialize against the
+    /// SAME mutex — per-module locks would let env-mutating tests race across
+    /// modules (a flaky-failure source).
+    use crate::config_context::TEST_ENV_LOCK as HOME_ENV_LOCK;
 
     #[test]
     fn write_mutation_creates_file_with_pretty_json() {
@@ -1537,7 +1590,8 @@ mod tests {
         )
         .unwrap();
 
-        let (config, path) = Config::load_with_path(cwd.path(), data_dir.path()).unwrap();
+        // Explicit context: config_home == data_dir, is_default == false.
+        let (config, path) = Config::load_resolved(cwd.path(), data_dir.path(), false).unwrap();
         assert_eq!(config.provider.as_deref(), Some("openai"));
         assert_eq!(config.model.as_deref(), Some("gpt-4o"));
         assert_eq!(path.as_deref(), Some(data_dir_config.as_path()));
@@ -1563,9 +1617,223 @@ mod tests {
         )
         .unwrap();
 
-        let (config, path) = Config::load_with_path(cwd.path(), data_dir.path()).unwrap();
+        // Project-local precedence is a DEFAULT-context convenience.
+        let (config, path) = Config::load_resolved(cwd.path(), data_dir.path(), true).unwrap();
         assert_eq!(config.provider.as_deref(), Some("anthropic"));
         assert_eq!(path.as_deref(), Some(local_config.as_path()));
+    }
+
+    /// Explicit/tenant context MUST NOT read the ambient project-local
+    /// `cwd/.octos/config.json` — only `config_home`. This closes the codex P1
+    /// where a tenant `serve` with `cwd == $HOME` picked up the host's
+    /// `~/.octos/config.json` and exposed it to admin writes.
+    #[test]
+    fn load_explicit_ignores_project_local_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let local_dir = cwd.path().join(".octos");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        // Ambient project-local config that would leak if isolation broke.
+        std::fs::write(
+            local_dir.join("config.json"),
+            r#"{"provider":"anthropic","auth_token":"HOST_SECRET"}"#,
+        )
+        .unwrap();
+
+        // Explicit context (is_default == false), empty config_home.
+        let (config, path) = Config::load_resolved(cwd.path(), config_home.path(), false).unwrap();
+        assert!(
+            config.provider.is_none(),
+            "explicit context must NOT read cwd/.octos/config.json"
+        );
+        assert!(config.auth_token.is_none());
+        assert!(path.is_none());
+    }
+
+    /// Gate 1: default install + XDG config present + an intact legacy
+    /// ~/.octos/config.json → XDG wins (legacy is the lower-precedence
+    /// fallback, not consulted when config_home has a file).
+    #[test]
+    fn load_default_prefers_xdg_config_home_over_legacy() {
+        // config_home (XDG) holds a config; legacy is a *different* path that
+        // also holds one. With is_default == true, config_home must win.
+        let cwd = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let xdg_config = xdg.path().join("config.json");
+        std::fs::write(&xdg_config, r#"{"provider":"openai"}"#).unwrap();
+
+        let (config, path) = Config::load_resolved(cwd.path(), xdg.path(), true).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(path.as_deref(), Some(xdg_config.as_path()));
+    }
+
+    /// Gate 2 (back-compat): default install where config_home (XDG) has NO
+    /// config but the legacy ~/.octos/config.json does → legacy loads.
+    #[test]
+    #[allow(unsafe_code)]
+    fn load_default_falls_back_to_legacy_home_octos() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cwd = fake_home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Legacy ~/.octos/config.json present; XDG (config_home) empty.
+        let legacy = fake_home.join(".octos").join("config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"provider":"gemini"}"#).unwrap();
+
+        let empty_config_home = fake_home.join("empty-xdg");
+
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside LOCK; restored below.
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let result = Config::load_resolved(&cwd, &empty_config_home, true);
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let (config, path) = result.unwrap();
+        assert_eq!(config.provider.as_deref(), Some("gemini"));
+        assert_eq!(path.as_deref(), Some(legacy.as_path()));
+    }
+
+    /// Gate 2 (defaults): default install, neither XDG nor legacy → defaults.
+    #[test]
+    #[allow(unsafe_code)]
+    fn load_default_uses_defaults_when_no_config_anywhere() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cwd = fake_home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let empty_config_home = fake_home.join("empty-xdg");
+
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside LOCK; restored below.
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let result = Config::load_resolved(&cwd, &empty_config_home, true);
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let (config, path) = result.unwrap();
+        assert!(config.provider.is_none());
+        assert!(path.is_none());
+    }
+
+    /// Gate 3 (tenant isolation): explicit context (is_default == false) with
+    /// an empty config_home MUST NOT fall through to the host's legacy
+    /// ~/.octos/config.json — it loads defaults instead.
+    #[test]
+    #[allow(unsafe_code)]
+    fn load_explicit_never_reads_host_legacy_octos() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cwd = fake_home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Host legacy config is present and would leak if isolation broke.
+        let legacy = fake_home.join(".octos").join("config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"provider":"anthropic","auth_token":"SECRET"}"#).unwrap();
+
+        // Explicit tenant data dir, no config inside it.
+        let tenant = fake_home.join("tenant-data");
+
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside LOCK; restored below.
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let result = Config::load_resolved(&cwd, &tenant, false);
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let (config, path) = result.unwrap();
+        assert!(
+            config.provider.is_none(),
+            "explicit/tenant context must NOT read host ~/.octos/config.json"
+        );
+        assert!(config.auth_token.is_none());
+        assert!(path.is_none());
+    }
+
+    /// Gate 7 (end-to-end, the load-bearing "no per-profile login regression"):
+    /// `get_api_key` resolves the GLOBAL auth store (XDG `auth_home`), NOT a
+    /// per-profile `data_dir/auth.json`. We seed a credential at the XDG
+    /// location and prove the API-key lookup finds it. `OCTOS_CONFIG_DIR` must
+    /// be unset for the default/global case, so this test serializes on the
+    /// shared env lock and clears all three env vars.
+    #[test]
+    #[allow(unsafe_code)]
+    fn get_api_key_reads_global_xdg_auth_store() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+
+        let original_home = std::env::var_os("HOME");
+        let original_octos_home = std::env::var_os("OCTOS_HOME");
+        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", fake_home);
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+        }
+
+        // Resolve the GLOBAL auth_home (XDG) and seed a credential there.
+        let ctx = crate::config_context::resolve_config_context(None);
+        let mut store = crate::auth::AuthStore::open(&ctx).unwrap();
+        store
+            .set(
+                "anthropic",
+                crate::auth::AuthCredential {
+                    access_token: "global-xdg-token".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    provider: "anthropic".to_string(),
+                    auth_method: "paste_token".to_string(),
+                },
+            )
+            .unwrap();
+
+        // A default config — get_api_key should consult the GLOBAL auth store
+        // and return the seeded token (it does NOT look at any data_dir).
+        let config = Config::default();
+        let key = config.get_api_key("anthropic");
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match original_octos_home {
+            Some(v) => unsafe { std::env::set_var("OCTOS_HOME", v) },
+            None => unsafe { std::env::remove_var("OCTOS_HOME") },
+        }
+        match original_octos_config {
+            Some(v) => unsafe { std::env::set_var("OCTOS_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("OCTOS_CONFIG_DIR") },
+        }
+
+        assert_eq!(
+            key.unwrap(),
+            "global-xdg-token",
+            "get_api_key must read the GLOBAL XDG auth store (shared login)"
+        );
     }
 
     #[test]
@@ -1637,8 +1905,7 @@ mod tests {
     #[allow(unsafe_code)]
     fn plugin_dirs_from_project_drops_legacy_home_rooted_globals() {
         // Serialize env mutation so parallel tests don't fight over HOME.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::tempdir().unwrap();
         let fake_home = tmp.path();
@@ -1655,8 +1922,8 @@ mod tests {
         // Pivot HOME for the duration of this assertion. dirs::home_dir()
         // honors HOME on Unix; we restore the original after the check.
         let original_home = std::env::var_os("HOME");
-        // SAFETY: single-threaded inside the static LOCK above; restored on
-        // both the success and panic-unwind paths below.
+        // SAFETY: serialized by HOME_ENV_LOCK above; restored on both the
+        // success and panic-unwind paths below.
         unsafe { std::env::set_var("HOME", fake_home) };
 
         let scan = Config::plugin_dirs_from_project(&project_dir);

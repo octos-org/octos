@@ -13,6 +13,7 @@ pub mod cli_agent_adapter;
 pub mod commands;
 pub mod compaction;
 pub mod config;
+pub mod config_context;
 pub mod config_watcher;
 #[cfg(feature = "api")]
 pub mod content_catalog;

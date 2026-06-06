@@ -296,15 +296,17 @@ impl ServeCommand {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
-        // Resolve data directory once and treat it as the canonical home for
-        // runtime state and config unless an explicit --config path is given.
-        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
+        // Resolve the canonical config context once (data_dir for runtime
+        // state; config_home/is_default for config; auth_home for global auth)
+        // and run migrations.
+        let ctx = super::resolve_command_context(self.data_dir.clone())?;
+        let data_dir = ctx.data_dir.clone();
 
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
-            Config::load_with_path(&cwd, &data_dir)?
+            Config::load_with_context_path(&cwd, &ctx)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
         if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
