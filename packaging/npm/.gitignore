@@ -1,0 +1,3 @@
+# Downloaded by postinstall (install.js) — never commit prebuilt binaries.
+vendor/
+*.tgz
