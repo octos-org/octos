@@ -1563,23 +1563,26 @@ pub async fn delete_session(
                     "delete session from profile-scoped store failed"
                 );
             }
-            // `SessionManager::clear` removes only the chat JSONL. The
-            // per-session reasoning/thinking effort lives in a sidecar
-            // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
-            // `data_dir`. Without this unlink a deleted session's stale effort
-            // is resurrected on the next `session/open` of the same key. The
-            // helper reuses `reasoning_effort_path` so the encoding matches, and
-            // is best-effort/idempotent (missing file = `Ok(())`).
-            let data_dir = sess.data_dir();
-            if let Err(e) =
-                super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
-            {
-                tracing::warn!(
-                    session_key = %key,
-                    error = %e,
-                    "failed to clear per-session reasoning_effort sidecar on delete"
-                );
-            }
+        }
+        // `SessionManager::clear` removes only the chat JSONL. The
+        // per-session reasoning/thinking effort lives in a sidecar
+        // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
+        // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
+        // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
+        // that left it behind, or a `session/open` that wrote the sidecar for
+        // an otherwise-fresh key before any message was persisted. Without this
+        // unlink a deleted session's stale effort is resurrected on the next
+        // `session/open` of the same key. The helper reuses
+        // `reasoning_effort_path` so the encoding matches, and is
+        // best-effort/idempotent (missing file = `Ok(())`).
+        let data_dir = sess.data_dir();
+        if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
+        {
+            tracing::warn!(
+                session_key = %key,
+                error = %e,
+                "failed to clear per-session reasoning_effort sidecar on delete"
+            );
         }
     }
 
@@ -5355,6 +5358,63 @@ mod tests {
             read_reasoning_effort(&effort_data_dir, &topic_key),
             None,
             "stale reasoning effort must not be resurrected after delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_reasoning_effort_sidecar_without_jsonl() {
+        // Codex #1428 P2: a reasoning-effort sidecar can exist WITHOUT a chat
+        // JSONL — an older delete left it behind, or `session/open` wrote it for
+        // an otherwise-fresh key before any message was persisted. The unlink
+        // must run per candidate regardless of whether `sess.load` finds a
+        // JSONL, else the stale effort is resurrected on the next open.
+        use crate::api::ui_protocol_reasoning_effort::{
+            read_reasoning_effort, reasoning_effort_path, write_reasoning_effort,
+        };
+        use octos_core::ui_protocol::ReasoningEffortLevel;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let topic_key =
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web-topic", "research");
+
+        // Deliberately NO `add_message`: there is no chat JSONL for this key, so
+        // `sess.load(&key)` returns None and the old (nested) cleanup was skipped.
+        let effort_data_dir = sessions.lock().await.data_dir();
+        assert!(
+            sessions.lock().await.load(&topic_key).await.is_none(),
+            "precondition: no chat JSONL for this key"
+        );
+        write_reasoning_effort(&effort_data_dir, &topic_key, ReasoningEffortLevel::High)
+            .expect("seed reasoning effort sidecar");
+        let sidecar = reasoning_effort_path(&effort_data_dir, &topic_key);
+        assert!(sidecar.exists(), "sidecar should exist before delete");
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = delete_session(
+            State(state),
+            HeaderMap::new(),
+            None,
+            axum::extract::Path("web-topic#research".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            !sidecar.exists(),
+            "delete must unlink the sidecar even with no chat JSONL, at {}",
+            sidecar.display()
+        );
+        assert_eq!(
+            read_reasoning_effort(&effort_data_dir, &topic_key),
+            None,
+            "stale reasoning effort must not survive a JSONL-less delete"
         );
     }
 
