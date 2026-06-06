@@ -2576,11 +2576,13 @@ impl PipelineExecutor {
                     let guard_tid = tid.clone();
                     // Bound EVERY fan-out worker so a child whose future never
                     // resolves cannot wedge `join_all` (and with it the whole
-                    // pipeline) forever. The single-node path is already bounded
-                    // by `dispatch_node`'s timeout; this gives the fan-out path
-                    // the same fail-closed guarantee. See the deployed
-                    // `deep_research` wedge documented on `fanout_worker_deadline`.
-                    let worker_deadline = fanout_worker_deadline(&target_with_prompt);
+                    // pipeline) forever, while honoring the worker's configured
+                    // `deadline_action` (skip/retry/escalate) on a deadline
+                    // expiry — exactly like the single-node `dispatch_node`
+                    // path. `run_fanout_worker` keeps every timed attempt
+                    // bounded by `MAX_FANOUT_WORKER_SECS`, so the deployed
+                    // `deep_research` wedge cannot return.
+                    let hook_executor = self.config.hook_executor.clone();
                     futures.push(async move {
                         let _permit = sem.acquire().await.expect("semaphore closed");
                         // Arm the guard HERE — only once the future is actually
@@ -2593,31 +2595,14 @@ impl PipelineExecutor {
                             total_targets,
                         );
                         let start = Instant::now();
-                        let result = match tokio::time::timeout(
-                            worker_deadline,
-                            execute_with_retries_static(
-                                &handler,
-                                &target_with_prompt,
-                                &ctx,
-                                max_retries,
-                            ),
+                        let result = run_fanout_worker(
+                            &handler,
+                            &target_with_prompt,
+                            &ctx,
+                            max_retries,
+                            hook_executor.as_ref(),
                         )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_elapsed) => {
-                                warn!(
-                                    node = %target_with_prompt.id,
-                                    deadline_secs = worker_deadline.as_secs(),
-                                    "fan-out worker exceeded deadline; failing the branch"
-                                );
-                                Err(eyre::eyre!(
-                                    "fan-out worker '{}' exceeded deadline of {}s",
-                                    target_with_prompt.id,
-                                    worker_deadline.as_secs()
-                                ))
-                            }
-                        };
+                        .await;
                         let n = par_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let secs = start.elapsed().as_secs();
                         report_progress(&format!(
@@ -2678,18 +2663,22 @@ impl PipelineExecutor {
 
                 let fan_duration = fan_start.elapsed().as_millis() as u64;
 
-                // When EVERY worker failed (no pass), the fan-out produced
-                // nothing usable — surface a hard `Error` so the pipeline
-                // terminates instead of silently converging on empty content.
-                // This is the `search (0/3 nodes)` total-wedge case from
-                // production. A partial failure (≥1 pass) stays `Fail` so the
-                // fault-tolerant "synthesize from what worked" path is kept.
-                let fan_status = if !any_pass {
+                // When EVERY worker hard-ERRORED (≥1 error, no pass), the
+                // fan-out produced nothing usable — surface a hard `Error` so
+                // the pipeline terminates instead of silently converging on
+                // empty content. This is the `search (0/3 nodes)` total-wedge
+                // case from production. A partial failure (≥1 pass) stays
+                // `Fail` so the fault-tolerant "synthesize from what worked"
+                // path is kept. An all-`Skipped` fan-out (deadline_action=skip
+                // on every branch) is NOT a hard failure — it carries no error,
+                // so it stays `Fail` and convergence proceeds rather than
+                // aborting; the configured `skip` action must continue.
+                let fan_status = if any_error && !any_pass {
                     OutcomeStatus::Error
-                } else if any_error {
-                    OutcomeStatus::Fail
-                } else {
+                } else if any_pass && !any_error {
                     OutcomeStatus::Pass
+                } else {
+                    OutcomeStatus::Fail
                 };
 
                 info!(
@@ -2725,8 +2714,12 @@ impl PipelineExecutor {
 
                 // All workers failed → terminate the pipeline now rather than
                 // feeding empty merged content into the converge node. Mirrors
-                // the single-node `OutcomeStatus::Error` stop path below.
-                if fan_status == OutcomeStatus::Error {
+                // the single-node `OutcomeStatus::Error` stop path below —
+                // including its `continue_on_error` escape hatch: when the
+                // fan-out node opts in, the pipeline intentionally tolerates a
+                // fully-failed fan-out and lets the normal convergence/error
+                // routing handle the empty merged content instead of aborting.
+                if fan_status == OutcomeStatus::Error && !node.continue_on_error {
                     warn!(
                         node = %node.id,
                         "parallel fan-out: every worker failed, stopping pipeline"
@@ -3077,8 +3070,10 @@ impl PipelineExecutor {
                     // Bound EVERY dynamic_parallel worker (this is the
                     // `deep_research` fan-out path that wedged in production) so
                     // a child whose future never resolves cannot block
-                    // `join_all` forever. See `fanout_worker_deadline`.
-                    let worker_deadline = fanout_worker_deadline(&synth_node);
+                    // `join_all` forever, while honoring the worker's configured
+                    // `deadline_action`. `run_fanout_worker` keeps every timed
+                    // attempt bounded by `MAX_FANOUT_WORKER_SECS`.
+                    let hook_executor = self.config.hook_executor.clone();
                     futures.push(async move {
                         // Arm the guard HERE — only once the future is actually
                         // polled, guaranteeing a started/completed pair.
@@ -3090,26 +3085,14 @@ impl PipelineExecutor {
                             total_workers,
                         );
                         let start = Instant::now();
-                        let result = match tokio::time::timeout(
-                            worker_deadline,
-                            execute_with_retries_static(&handler, &synth_node, &ctx, max_retries),
+                        let result = run_fanout_worker(
+                            &handler,
+                            &synth_node,
+                            &ctx,
+                            max_retries,
+                            hook_executor.as_ref(),
                         )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_elapsed) => {
-                                warn!(
-                                    node = %synth_node.id,
-                                    deadline_secs = worker_deadline.as_secs(),
-                                    "dynamic_parallel worker exceeded deadline; failing the branch"
-                                );
-                                Err(eyre::eyre!(
-                                    "dynamic_parallel worker '{}' exceeded deadline of {}s",
-                                    synth_node.id,
-                                    worker_deadline.as_secs()
-                                ))
-                            }
-                        };
+                        .await;
                         let n = done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let secs = start.elapsed().as_secs();
                         report_progress(&format!(
@@ -3168,17 +3151,20 @@ impl PipelineExecutor {
                 ));
 
                 // Same all-failed rule as the static `parallel` branch: when
-                // EVERY worker failed (the production `search (0/3 nodes)`
-                // total-wedge case) the dynamic fan-out produced nothing
-                // usable, so surface a hard `Error` that terminates the
-                // pipeline rather than converging on empty content. A partial
-                // failure stays `Fail` (fault-tolerant synthesize-from-rest).
-                let fan_status = if !any_pass {
+                // EVERY worker hard-ERRORED (≥1 error, no pass — the production
+                // `search (0/3 nodes)` total-wedge case) the dynamic fan-out
+                // produced nothing usable, so surface a hard `Error` that
+                // terminates the pipeline rather than converging on empty
+                // content. A partial failure stays `Fail` (fault-tolerant
+                // synthesize-from-rest). An all-`Skipped` fan-out carries no
+                // error, so it stays `Fail` and convergence proceeds — the
+                // configured `deadline_action=skip` must continue.
+                let fan_status = if any_error && !any_pass {
                     OutcomeStatus::Error
-                } else if any_error {
-                    OutcomeStatus::Fail
-                } else {
+                } else if any_pass && !any_error {
                     OutcomeStatus::Pass
+                } else {
+                    OutcomeStatus::Fail
                 };
 
                 info!(
@@ -3213,8 +3199,11 @@ impl PipelineExecutor {
                 );
 
                 // All workers failed → terminate the pipeline instead of
-                // feeding empty merged content into the converge node.
-                if fan_status == OutcomeStatus::Error {
+                // feeding empty merged content into the converge node. Honors
+                // the same `continue_on_error` escape hatch as the static
+                // `parallel` branch: an opted-in node tolerates a fully-failed
+                // fan-out and lets normal convergence/error routing proceed.
+                if fan_status == OutcomeStatus::Error && !node.continue_on_error {
                     warn!(
                         node = %node.id,
                         "dynamic_parallel: every worker failed, stopping pipeline"
@@ -4569,6 +4558,138 @@ async fn execute_with_retries_static(
         tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
     }
     unreachable!()
+}
+
+/// Run a single fan-out worker, honoring its `deadline_action` on a deadline
+/// expiry while ALWAYS bounding each timed attempt so a genuinely-hung worker
+/// cannot wedge `join_all`.
+///
+/// This is the fan-out analogue of [`PipelineExecutor::dispatch_node`]: it
+/// routes a fan-out worker's deadline expiry through the SAME
+/// `deadline_action` machinery the single-node path uses, so a parallel /
+/// dynamic_parallel target that declares `deadline_secs` with
+/// `deadline_action = skip|retry|escalate` gets the configured behavior
+/// instead of an unconditional `Err`.
+///
+/// Bounding guarantee (the production wedge must NOT return): every timed
+/// attempt is wrapped in [`fanout_worker_deadline`], which is itself clamped
+/// to the absolute [`MAX_FANOUT_WORKER_SECS`] ceiling. So even with no
+/// per-node `deadline_secs`, a worker whose future never resolves is cut off
+/// at the ceiling. `Skip` stops after the first expiry (it never re-runs the
+/// hung future); `Retry` re-attempts at most `max_attempts` times, each
+/// attempt independently bounded — so the worker always terminates.
+///
+/// Returns:
+/// * `Ok(NodeOutcome)` with `OutcomeStatus::Skipped` when the deadline fired
+///   and `deadline_action == Skip` — `process_worker_results` treats a
+///   `Skipped` outcome as neither a usable pass nor a hard error, so the
+///   normal convergence routing handles it.
+/// * `Err` when the deadline fired and the action is `Abort` (default),
+///   `Escalate`, or `Retry` with all attempts exhausted; or when the
+///   underlying handler itself errors.
+async fn run_fanout_worker(
+    handler: &Arc<dyn crate::handler::Handler>,
+    node: &crate::graph::PipelineNode,
+    ctx: &HandlerContext,
+    max_retries: u32,
+    hook_executor: Option<&Arc<HookExecutor>>,
+) -> Result<NodeOutcome> {
+    // Effective per-attempt deadline, already clamped to MAX_FANOUT_WORKER_SECS
+    // so even an action that re-runs the worker (Retry) stays bounded and the
+    // hung-worker wedge cannot return.
+    let deadline = fanout_worker_deadline(node);
+    let action = node.deadline_action.unwrap_or(DeadlineAction::Abort);
+    let label = node.label.as_deref().unwrap_or(&node.id).to_string();
+
+    // For Retry, loop over attempts; every other action runs once.
+    let max_attempts = match action {
+        DeadlineAction::Retry { max_attempts } => max_attempts.max(1),
+        _ => 1,
+    };
+
+    let mut last_err: Option<eyre::Report> = None;
+    for attempt in 0..max_attempts {
+        let fut = execute_with_retries_static(handler, node, ctx, max_retries);
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(Ok(outcome)) => return Ok(outcome),
+            Ok(Err(e)) => {
+                // The handler itself errored (not a deadline expiry). Mirror the
+                // pre-existing behavior: surface the error to the worker result.
+                return Err(e);
+            }
+            Err(_timeout) => {
+                record_deadline_exceeded(&action);
+                warn!(
+                    node = %node.id,
+                    deadline_secs = deadline.as_secs(),
+                    attempt = attempt + 1,
+                    action = action.name(),
+                    "fan-out worker exceeded deadline"
+                );
+                match action {
+                    DeadlineAction::Abort => {
+                        return Err(eyre::eyre!(
+                            "fan-out worker '{}' exceeded deadline of {}s (action=abort)",
+                            node.id,
+                            deadline.as_secs()
+                        ));
+                    }
+                    DeadlineAction::Skip => {
+                        return Ok(NodeOutcome {
+                            node_id: node.id.clone(),
+                            status: OutcomeStatus::Skipped,
+                            content: format!("Node '{}' skipped (deadline exceeded)", node.id),
+                            token_usage: TokenUsage::default(),
+                            files_modified: vec![],
+                        });
+                    }
+                    DeadlineAction::Retry { .. } => {
+                        last_err = Some(eyre::eyre!(
+                            "fan-out worker '{}' exceeded deadline of {}s",
+                            node.id,
+                            deadline.as_secs()
+                        ));
+                        if attempt + 1 >= max_attempts {
+                            return Err(eyre::eyre!(
+                                "fan-out worker '{}' exceeded deadline on all {} retry attempt(s)",
+                                node.id,
+                                max_attempts
+                            ));
+                        }
+                        // else: fall through and try again (still bounded).
+                    }
+                    DeadlineAction::Escalate => {
+                        if let Some(hook) = hook_executor {
+                            let payload = HookPayload::on_spawn_failure(
+                                node.id.clone(),
+                                label.clone(),
+                                String::new(),
+                                String::new(),
+                                Some("pipeline"),
+                                Some(handler_kind_label(&node.handler)),
+                                format!(
+                                    "deadline_exceeded: fan-out worker '{}' deadline={}s",
+                                    node.id,
+                                    deadline.as_secs()
+                                ),
+                                Vec::new(),
+                                "deadline_exceeded",
+                                None::<&HookContext>,
+                            );
+                            let _ = hook.run(HookEvent::OnSpawnFailure, &payload).await;
+                        }
+                        return Err(eyre::eyre!(
+                            "fan-out worker '{}' exceeded deadline of {}s (action=escalate)",
+                            node.id,
+                            deadline.as_secs()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| eyre::eyre!("fan-out worker '{}' failed all retry attempts", node.id)))
 }
 
 /// Pick the edge with the highest weight, tie-break by lexicographic target.
