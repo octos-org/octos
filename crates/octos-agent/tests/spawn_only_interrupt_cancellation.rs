@@ -290,3 +290,131 @@ async fn supervisor_cancel_aborts_running_spawn_only_task() {
          interrupt). Status flipped to Cancelled but the work never stopped."
     );
 }
+
+/// Codex #1429 P2: when a `SubAgentOutputRouter` is configured, the cancel arm
+/// must run the SAME terminal teardown as the completion path
+/// (`router.mark_terminal`). On the unfixed cancel arm the worker `return`ed
+/// early, leaving the output handle stuck in the Running phase — so dashboards
+/// show the task running forever and `AgentSummaryGenerator` (which does NOT
+/// treat `Cancelled` as terminal) keeps polling an aborted task.
+#[tokio::test]
+async fn cancel_runs_terminal_teardown_for_routed_spawn_only_task() {
+    let memory_dir = TempDir::new().unwrap();
+    let router_dir = TempDir::new().unwrap();
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicBool::new(false));
+    let dropped_while_running = Arc::new(AtomicBool::new(false));
+    let probe = HangingTool {
+        name: "hang_bg",
+        entered: entered.clone(),
+        completed: completed.clone(),
+        dropped_while_running: dropped_while_running.clone(),
+        block_for: Duration::from_secs(30),
+    };
+
+    let mut tools = ToolRegistry::new();
+    tools.register(probe);
+    tools.mark_spawn_only("hang_bg", None);
+
+    let memory = open_memory(&memory_dir).await;
+    let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm::new(vec![
+        tool_use(vec![tc("call-hang", "hang_bg")]),
+        end_turn("kicked off the background pipeline"),
+    ]));
+
+    // The load-bearing addition vs. the abort test: a real output router, so
+    // the cancel arm actually has terminal teardown to run (or skip, pre-fix).
+    // The worker seeds a startup line via `router.append` before the tool runs,
+    // creating the handle in the Running phase.
+    let router = Arc::new(octos_agent::SubAgentOutputRouter::new(router_dir.path()));
+
+    let agent = Agent::new(AgentId::new("interrupt-teardown"), llm, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            suppress_auto_send_files: true,
+            ..Default::default()
+        })
+        .with_subagent_output_router(router.clone());
+
+    let supervisor = agent.tool_registry().supervisor();
+    let captured_id: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    {
+        let captured_id = captured_id.clone();
+        supervisor.set_on_change(move |task| {
+            if task.tool_name == "hang_bg" {
+                *captured_id.lock().unwrap() = Some(task.id.clone());
+            }
+        });
+    }
+
+    let _ = agent
+        .process_message("kick the hanging spawn_only pipeline", &[], vec![])
+        .await
+        .expect("agent loop should not error launching a spawn_only tool");
+
+    let mut waited = Duration::ZERO;
+    while !entered.load(Ordering::SeqCst) && waited < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += Duration::from_millis(10);
+    }
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "background spawn_only tool body never started"
+    );
+
+    let task_id = captured_id
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("supervisor must have registered the spawn_only task id");
+
+    // Precondition: the routed handle is Running (not terminal) before cancel.
+    assert!(
+        !router.is_terminal(&task_id),
+        "routed output handle should be Running before cancel"
+    );
+
+    supervisor
+        .cancel(&task_id)
+        .expect("cancel of a running task must succeed");
+
+    // Wait for terminal `Cancelled` status (bounded).
+    let mut waited = Duration::ZERO;
+    let deadline = Duration::from_secs(3);
+    loop {
+        let cancelled = supervisor
+            .get_task(&task_id)
+            .map(|t| matches!(t.status, octos_agent::TaskStatus::Cancelled))
+            .unwrap_or(false);
+        if cancelled {
+            break;
+        }
+        assert!(
+            waited < deadline,
+            "task did not reach terminal Cancelled within {deadline:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+    }
+
+    // THE P2 ASSERTION: the cancel arm must have run the terminal teardown, so
+    // the routed output handle is flagged Terminal. Pre-fix the cancel arm
+    // `return`ed before `router.mark_terminal`, leaving it stuck Running (the
+    // worker runs the teardown just after the token fires, so poll briefly).
+    let mut waited = Duration::ZERO;
+    while !router.is_terminal(&task_id) && waited < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+    }
+    assert!(
+        router.is_terminal(&task_id),
+        "cancelled spawn_only task left its output handle in the Running phase — \
+         the cancel arm skipped router.mark_terminal (codex #1429 P2)"
+    );
+    // The abort itself still holds (the tool body did not run to completion).
+    assert!(
+        !completed.load(Ordering::SeqCst),
+        "tool body ran to completion despite cancel"
+    );
+}

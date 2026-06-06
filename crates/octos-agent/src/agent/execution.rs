@@ -825,6 +825,16 @@ impl Agent {
                                         task_id.as_str(),
                                         b"[cancelled] turn interrupted by client\n",
                                     );
+                                    // Codex #1429 P2: a cancelled spawn_only task must run
+                                    // the same terminal teardown as the completion path.
+                                    // Otherwise the output handle stays in the running
+                                    // phase and the summary watcher keeps polling —
+                                    // AgentSummaryGenerator does NOT treat `Cancelled` as
+                                    // terminal, so it would re-summarise an aborted task.
+                                    router.mark_terminal(&task_id);
+                                }
+                                if let Some(ref summary_gen) = bg_summary_generator {
+                                    summary_gen.stop_watcher(&task_id);
                                 }
                                 return;
                             }
@@ -884,6 +894,16 @@ impl Agent {
                                     );
                                     bg_supervisor
                                         .mark_failed(&task_id, "cancelled by turn interrupt".to_string());
+                                    // Codex #1429 P2: same terminal teardown as the
+                                    // completion path so a task cancelled during the
+                                    // transient-retry wait doesn't leave its output
+                                    // handle running / summary watcher registered.
+                                    if let Some(ref router) = bg_output_router {
+                                        router.mark_terminal(&task_id);
+                                    }
+                                    if let Some(ref summary_gen) = bg_summary_generator {
+                                        summary_gen.stop_watcher(&task_id);
+                                    }
                                     return;
                                 }
                                 res = retry => {
