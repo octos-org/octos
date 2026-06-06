@@ -115,10 +115,12 @@
   "deepseek": {
     "env": "DEEPSEEK_API_KEY",
     "models": [
-      { "id": "deepseek-v4-pro", "input": 0.28, "output": 0.42, "max_output": 384000, "endpoints": [
+      { "id": "deepseek-v4-pro", "input": 0.42, "output": 0.83, "max_output": 384000, "endpoints": [
+        { "id": "deepseek", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
       { "id": "deepseek-v4-flash", "input": 0.14, "output": 0.28, "max_output": 384000, "endpoints": [
+        { "id": "deepseek", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] }
     ]
