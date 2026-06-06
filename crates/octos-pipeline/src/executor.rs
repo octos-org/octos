@@ -2937,6 +2937,14 @@ impl PipelineExecutor {
                             tools: node.tools.clone(),
                             timeout_secs: node.timeout_secs,
                             max_retries: node.max_retries,
+                            // Inherit the source node's deadline settings so
+                            // `run_fanout_worker` honors deadline_action/
+                            // deadline_secs on dynamic_parallel workers too
+                            // (not just the static fan-out path). Without this
+                            // a dynamic worker defaults to the 1h ceiling/Abort
+                            // and ignores a configured skip/retry. (codex #1427)
+                            deadline_secs: node.deadline_secs,
+                            deadline_action: node.deadline_action.clone(),
                             ..Default::default()
                         },
                     ));
