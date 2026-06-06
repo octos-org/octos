@@ -18256,6 +18256,19 @@ async fn run_standalone_turn(
     if interrupt_observed {
         // Stop the agent so any in-flight LLM/tool await unblocks promptly.
         agent_task.abort();
+        // Esc/`/stop`/`turn/interrupt` did not used to break a still-running
+        // `spawn_only` background task (e.g. `run_pipeline` / `deep_research`):
+        // those detach into their OWN `tokio::spawn` whose `JoinHandle` is
+        // dropped, not awaited, so `agent_task.abort()` above never touched
+        // them and a hung pipeline kept running for minutes after the user
+        // asked to stop. Cancel every non-terminal background task this
+        // session registered (turns are serialized per session, so the live
+        // ones belong to the turn being interrupted). `supervisor.cancel`
+        // fires the per-task cancel token the spawn_only worker now races
+        // against (`agent/execution.rs`), dropping the in-flight pipeline /
+        // LLM / web_search future at its next poll. Idempotent: already-
+        // terminal tasks return `AlreadyTerminal` and are skipped.
+        cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
         // FIX-04: also flush any accumulated drops before the lifecycle
         // terminal so the client knows the cursor is incomplete.
         flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -18627,6 +18640,32 @@ fn build_turn_session_result_from_done(event: &Value) -> Option<TurnSessionResul
         // picks up cmid naturally.
         client_message_id: None,
     })
+}
+
+/// Cancel every still-running `spawn_only` background task this session
+/// registered, on `turn/interrupt`.
+///
+/// Root cause this closes: a `spawn_only` tool (`run_pipeline` /
+/// `deep_research`) detaches into its OWN `tokio::spawn` whose `JoinHandle` is
+/// dropped, not awaited. The interrupt path's `agent_task.abort()` only stops
+/// the foreground agent loop, so a hung pipeline kept running for minutes
+/// after the user pressed Esc / `/stop`. `supervisor.cancel` fires each task's
+/// cancel token, which the spawn_only worker now races against
+/// (`octos-agent/src/agent/execution.rs`) and drops the in-flight pipeline /
+/// LLM / web_search future at its next poll.
+///
+/// Turns are serialized per session, so the live background tasks belong to
+/// the turn being interrupted. Already-terminal tasks are skipped
+/// (`cancel` would return `AlreadyTerminal`); the call is idempotent.
+fn cancel_session_spawn_only_tasks(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+) {
+    for task in supervisor.get_tasks_for_session(&session_id.to_string()) {
+        if !task.status.is_terminal() {
+            let _ = supervisor.cancel(&task.id);
+        }
+    }
 }
 
 /// Atomically transition the turn state to `Terminal(_)` exactly once.
@@ -29538,6 +29577,65 @@ ignore = []
         assert!(connection_turns.lock().await.is_empty());
         owned_handle.abort();
         newer_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_running_spawn_only_tasks_for_session() {
+        // Root-cause regression: `turn/interrupt` must cancel the session's
+        // still-running spawn_only background tasks (a hung `run_pipeline` /
+        // `deep_research`), not only abort the foreground agent loop. The
+        // interrupt path calls `cancel_session_spawn_only_tasks`, which fires
+        // each task's supervisor cancel token so the detached worker drops its
+        // in-flight pipeline future at the next poll.
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let session_id = SessionKey("api:profile/local:owned".into());
+        let session_key = session_id.to_string();
+
+        // Two live spawn_only tasks for THIS session and one for another
+        // session that must survive (turns are per-session; a sibling
+        // session's background work is unrelated to this interrupt).
+        let running_a = supervisor.register("run_pipeline", "tc-a", Some(&session_key));
+        let running_b = supervisor.register("deep_research", "tc-b", Some(&session_key));
+        supervisor.mark_running(&running_a);
+        supervisor.mark_running(&running_b);
+
+        let other_session = SessionKey("api:profile/local:other".into());
+        let other_running =
+            supervisor.register("run_pipeline", "tc-c", Some(&other_session.to_string()));
+        supervisor.mark_running(&other_running);
+
+        // An already-terminal task for this session: cancel must skip it
+        // (idempotent — `cancel` would otherwise return `AlreadyTerminal`).
+        let done = supervisor.register("run_pipeline", "tc-d", Some(&session_key));
+        supervisor.mark_completed(&done, vec![]);
+
+        cancel_session_spawn_only_tasks(&supervisor, &session_id);
+
+        // Both live tasks for this session are now terminal `Cancelled`,
+        // which fires their cancel tokens.
+        assert!(matches!(
+            supervisor.get_task(&running_a).map(|t| t.status),
+            Some(octos_agent::TaskStatus::Cancelled)
+        ));
+        assert!(supervisor.cancel_token(&running_a).is_cancelled());
+        assert!(matches!(
+            supervisor.get_task(&running_b).map(|t| t.status),
+            Some(octos_agent::TaskStatus::Cancelled)
+        ));
+        assert!(supervisor.cancel_token(&running_b).is_cancelled());
+
+        // The completed task is left intact (still `Completed`, not clobbered).
+        assert!(matches!(
+            supervisor.get_task(&done).map(|t| t.status),
+            Some(octos_agent::TaskStatus::Completed)
+        ));
+
+        // A different session's running task is untouched by this interrupt.
+        assert!(matches!(
+            supervisor.get_task(&other_running).map(|t| t.status),
+            Some(octos_agent::TaskStatus::Running)
+        ));
+        assert!(!supervisor.cancel_token(&other_running).is_cancelled());
     }
 
     /// Mirror of `handle_turn_interrupt`'s post-abort drain step. Used by
