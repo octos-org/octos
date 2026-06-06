@@ -65,6 +65,46 @@ const DEFAULT_PIPELINE_CONTRACT_ID: &str = "pipeline";
 /// with `max_parallel_workers = 8`.
 pub const MAX_PIPELINE_FANOUT_TOTAL: usize = 500;
 
+/// Absolute wall-clock ceiling for a single fan-out worker future, used when
+/// the worker node declares neither `deadline_secs` nor `timeout_secs`.
+///
+/// Fan-out workers are `join_all`-awaited, so a single worker future that
+/// never resolves wedges the WHOLE fan-out (the node never converges and the
+/// pipeline never terminates). The single-node path is already bounded by
+/// `dispatch_node`'s `tokio::time::timeout`; this constant gives the fan-out
+/// path the same fail-closed guarantee even when no per-node deadline is set.
+///
+/// Motivated by the deployed `deep_research` wedge: a `search` fan-out child
+/// whose `web_search` failed left its worker Agent stuck, re-emitting
+/// `ExecutingTool` every 5s while the task itself was already terminal
+/// `Failed`. `join_all` blocked forever, the heartbeat reported
+/// `search (0/3 nodes …)` for 25+ minutes, and every attached client hung.
+///
+/// One hour is generous enough that it never preempts a legitimately
+/// long-running worker, while still guaranteeing termination.
+pub const MAX_FANOUT_WORKER_SECS: u64 = 3600;
+
+/// Effective wall-clock deadline for a single fan-out worker, in priority
+/// order: the worker node's `deadline_secs`, then its `timeout_secs`, then the
+/// absolute [`MAX_FANOUT_WORKER_SECS`] ceiling. Never `None`: a fan-out worker
+/// must ALWAYS be bounded so a hung child cannot wedge `join_all` forever.
+fn fanout_worker_deadline(node: &PipelineNode) -> Duration {
+    if let Some(secs) = node.deadline_secs {
+        // `deadline_secs` is f64; clamp away non-finite / non-positive values
+        // so a malformed graph can't produce a zero/NaN deadline that fires
+        // instantly or panics in `Duration::from_secs_f64`.
+        if secs.is_finite() && secs > 0.0 {
+            return Duration::from_secs_f64(secs.min(MAX_FANOUT_WORKER_SECS as f64));
+        }
+    }
+    if let Some(secs) = node.timeout_secs {
+        if secs > 0 {
+            return Duration::from_secs(secs.min(MAX_FANOUT_WORKER_SECS));
+        }
+    }
+    Duration::from_secs(MAX_FANOUT_WORKER_SECS)
+}
+
 /// Structured pipeline-level error variants. Today only the cumulative
 /// fan-out cap surfaces this type; the rest of the executor still uses
 /// `eyre`-based errors. The enum is `Clone` so the cap-exceeded reason
@@ -1212,19 +1252,31 @@ fn cap_node_output_tokens_for_remaining_budget(
 }
 
 /// Process results from parallel worker execution, producing merged content and summaries.
+/// Aggregate outcome of a fan-out's worker futures.
+struct WorkerResults {
+    merged_content: String,
+    /// At least one worker returned an `Error` outcome (or its future failed,
+    /// e.g. exceeded the per-worker deadline).
+    any_error: bool,
+    /// At least one worker returned a `Pass` outcome. When this is `false`
+    /// EVERY worker failed — the fan-out produced nothing usable, so the
+    /// converged node must surface a hard `Error` that terminates the
+    /// pipeline (the production `search (0/3 nodes)` total-wedge case),
+    /// rather than silently converging on empty content.
+    any_pass: bool,
+    summaries: Vec<NodeSummary>,
+    tokens: TokenUsage,
+    outcomes: Vec<(String, NodeOutcome)>,
+}
+
 fn process_worker_results(
     results: Vec<(String, PipelineNode, Duration, Result<NodeOutcome>)>,
     bridge: Option<&PipelineStatusBridge>,
     working_dir: &std::path::Path,
-) -> (
-    String,
-    bool,
-    Vec<NodeSummary>,
-    TokenUsage,
-    Vec<(String, NodeOutcome)>,
-) {
+) -> WorkerResults {
     let mut merged_parts = Vec::new();
     let mut any_error = false;
+    let mut any_pass = false;
     let mut summaries = Vec::new();
     let mut total_tokens = TokenUsage::default();
     let mut outcomes = Vec::new();
@@ -1258,8 +1310,12 @@ fn process_worker_results(
                     success: outcome.status == OutcomeStatus::Pass,
                 });
 
-                if outcome.status == OutcomeStatus::Error {
-                    any_error = true;
+                match outcome.status {
+                    OutcomeStatus::Error => any_error = true,
+                    OutcomeStatus::Pass => any_pass = true,
+                    // `Fail` / `Skipped` count as neither a hard error nor a
+                    // usable pass for the all-failed determination.
+                    _ => {}
                 }
 
                 merged_parts.push(format!("## {label}\n\n{}", outcome.content));
@@ -1296,7 +1352,14 @@ fn process_worker_results(
     // content. This ensures the converge node gets actual data, not just paths.
     let merged_content = resolve_search_result_files(&merged_content, working_dir);
 
-    (merged_content, any_error, summaries, total_tokens, outcomes)
+    WorkerResults {
+        merged_content,
+        any_error,
+        any_pass,
+        summaries,
+        tokens: total_tokens,
+        outcomes,
+    }
 }
 
 /// Scan merged worker output for research directory paths and inline
@@ -2511,6 +2574,13 @@ impl PipelineExecutor {
                     let pipeline_id = graph.id.clone();
                     let guard_label = par_label.clone();
                     let guard_tid = tid.clone();
+                    // Bound EVERY fan-out worker so a child whose future never
+                    // resolves cannot wedge `join_all` (and with it the whole
+                    // pipeline) forever. The single-node path is already bounded
+                    // by `dispatch_node`'s timeout; this gives the fan-out path
+                    // the same fail-closed guarantee. See the deployed
+                    // `deep_research` wedge documented on `fanout_worker_deadline`.
+                    let worker_deadline = fanout_worker_deadline(&target_with_prompt);
                     futures.push(async move {
                         let _permit = sem.acquire().await.expect("semaphore closed");
                         // Arm the guard HERE — only once the future is actually
@@ -2523,13 +2593,31 @@ impl PipelineExecutor {
                             total_targets,
                         );
                         let start = Instant::now();
-                        let result = execute_with_retries_static(
-                            &handler,
-                            &target_with_prompt,
-                            &ctx,
-                            max_retries,
+                        let result = match tokio::time::timeout(
+                            worker_deadline,
+                            execute_with_retries_static(
+                                &handler,
+                                &target_with_prompt,
+                                &ctx,
+                                max_retries,
+                            ),
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                warn!(
+                                    node = %target_with_prompt.id,
+                                    deadline_secs = worker_deadline.as_secs(),
+                                    "fan-out worker exceeded deadline; failing the branch"
+                                );
+                                Err(eyre::eyre!(
+                                    "fan-out worker '{}' exceeded deadline of {}s",
+                                    target_with_prompt.id,
+                                    worker_deadline.as_secs()
+                                ))
+                            }
+                        };
                         let n = par_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let secs = start.elapsed().as_secs();
                         report_progress(&format!(
@@ -2567,12 +2655,18 @@ impl PipelineExecutor {
                 // budget projection.
                 drop(fanout_reservations);
 
-                let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
-                    process_worker_results(
-                        results,
-                        self.config.status_bridge.as_ref(),
-                        &self.config.working_dir,
-                    );
+                let WorkerResults {
+                    merged_content,
+                    any_error,
+                    any_pass,
+                    summaries: worker_summaries,
+                    tokens: worker_tokens,
+                    outcomes,
+                } = process_worker_results(
+                    results,
+                    self.config.status_bridge.as_ref(),
+                    &self.config.working_dir,
+                );
 
                 total_tokens.input_tokens += worker_tokens.input_tokens;
                 total_tokens.output_tokens += worker_tokens.output_tokens;
@@ -2584,11 +2678,27 @@ impl PipelineExecutor {
 
                 let fan_duration = fan_start.elapsed().as_millis() as u64;
 
+                // When EVERY worker failed (no pass), the fan-out produced
+                // nothing usable — surface a hard `Error` so the pipeline
+                // terminates instead of silently converging on empty content.
+                // This is the `search (0/3 nodes)` total-wedge case from
+                // production. A partial failure (≥1 pass) stays `Fail` so the
+                // fault-tolerant "synthesize from what worked" path is kept.
+                let fan_status = if !any_pass {
+                    OutcomeStatus::Error
+                } else if any_error {
+                    OutcomeStatus::Fail
+                } else {
+                    OutcomeStatus::Pass
+                };
+
                 info!(
                     node = %node.id,
                     duration_ms = fan_duration,
                     targets = targets.len(),
                     errors = any_error,
+                    any_pass,
+                    status = ?fan_status,
                     "parallel fan-out complete, converging to '{}'",
                     converge_id
                 );
@@ -2600,22 +2710,40 @@ impl PipelineExecutor {
                     model: None,
                     token_usage: TokenUsage::default(),
                     duration_ms: fan_duration,
-                    success: !any_error,
+                    success: fan_status == OutcomeStatus::Pass,
                 });
                 completed.insert(
                     current_node_id.clone(),
                     NodeOutcome {
                         node_id: node.id.clone(),
-                        status: if any_error {
-                            OutcomeStatus::Fail
-                        } else {
-                            OutcomeStatus::Pass
-                        },
+                        status: fan_status,
                         content: merged_content,
                         token_usage: TokenUsage::default(),
                         files_modified: vec![],
                     },
                 );
+
+                // All workers failed → terminate the pipeline now rather than
+                // feeding empty merged content into the converge node. Mirrors
+                // the single-node `OutcomeStatus::Error` stop path below.
+                if fan_status == OutcomeStatus::Error {
+                    warn!(
+                        node = %node.id,
+                        "parallel fan-out: every worker failed, stopping pipeline"
+                    );
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline failed at fan-out node '{}': all {} workers failed",
+                            node.id,
+                            targets.len()
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
 
                 // Update status words to show convergence node
                 if let Some(ref bridge) = self.config.status_bridge {
@@ -2946,6 +3074,11 @@ impl PipelineExecutor {
                     let pipeline_id = graph.id.clone();
                     let guard_label = worker_label.clone();
                     let guard_tid = task_id.clone();
+                    // Bound EVERY dynamic_parallel worker (this is the
+                    // `deep_research` fan-out path that wedged in production) so
+                    // a child whose future never resolves cannot block
+                    // `join_all` forever. See `fanout_worker_deadline`.
+                    let worker_deadline = fanout_worker_deadline(&synth_node);
                     futures.push(async move {
                         // Arm the guard HERE — only once the future is actually
                         // polled, guaranteeing a started/completed pair.
@@ -2957,9 +3090,26 @@ impl PipelineExecutor {
                             total_workers,
                         );
                         let start = Instant::now();
-                        let result =
-                            execute_with_retries_static(&handler, &synth_node, &ctx, max_retries)
-                                .await;
+                        let result = match tokio::time::timeout(
+                            worker_deadline,
+                            execute_with_retries_static(&handler, &synth_node, &ctx, max_retries),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                warn!(
+                                    node = %synth_node.id,
+                                    deadline_secs = worker_deadline.as_secs(),
+                                    "dynamic_parallel worker exceeded deadline; failing the branch"
+                                );
+                                Err(eyre::eyre!(
+                                    "dynamic_parallel worker '{}' exceeded deadline of {}s",
+                                    synth_node.id,
+                                    worker_deadline.as_secs()
+                                ))
+                            }
+                        };
                         let n = done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let secs = start.elapsed().as_secs();
                         report_progress(&format!(
@@ -2989,12 +3139,18 @@ impl PipelineExecutor {
                 let results = futures::future::join_all(futures).await;
                 drop(dp_reservations);
 
-                let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
-                    process_worker_results(
-                        results,
-                        self.config.status_bridge.as_ref(),
-                        &self.config.working_dir,
-                    );
+                let WorkerResults {
+                    merged_content,
+                    any_error,
+                    any_pass,
+                    summaries: worker_summaries,
+                    tokens: worker_tokens,
+                    outcomes,
+                } = process_worker_results(
+                    results,
+                    self.config.status_bridge.as_ref(),
+                    &self.config.working_dir,
+                );
 
                 total_tokens.input_tokens += worker_tokens.input_tokens;
                 total_tokens.output_tokens += worker_tokens.output_tokens;
@@ -3011,11 +3167,27 @@ impl PipelineExecutor {
                     fan_duration as f64 / 1000.0
                 ));
 
+                // Same all-failed rule as the static `parallel` branch: when
+                // EVERY worker failed (the production `search (0/3 nodes)`
+                // total-wedge case) the dynamic fan-out produced nothing
+                // usable, so surface a hard `Error` that terminates the
+                // pipeline rather than converging on empty content. A partial
+                // failure stays `Fail` (fault-tolerant synthesize-from-rest).
+                let fan_status = if !any_pass {
+                    OutcomeStatus::Error
+                } else if any_error {
+                    OutcomeStatus::Fail
+                } else {
+                    OutcomeStatus::Pass
+                };
+
                 info!(
                     node = %node.id,
                     duration_ms = fan_duration,
                     tasks = tasks.len(),
                     errors = any_error,
+                    any_pass,
+                    status = ?fan_status,
                     "dynamic_parallel complete, converging to '{}'",
                     converge_id
                 );
@@ -3027,22 +3199,39 @@ impl PipelineExecutor {
                     model: None,
                     token_usage: plan_usage.clone(),
                     duration_ms: fan_duration,
-                    success: !any_error,
+                    success: fan_status == OutcomeStatus::Pass,
                 });
                 completed.insert(
                     current_node_id.clone(),
                     NodeOutcome {
                         node_id: node.id.clone(),
-                        status: if any_error {
-                            OutcomeStatus::Fail
-                        } else {
-                            OutcomeStatus::Pass
-                        },
+                        status: fan_status,
                         content: merged_content,
                         token_usage: plan_usage,
                         files_modified: vec![],
                     },
                 );
+
+                // All workers failed → terminate the pipeline instead of
+                // feeding empty merged content into the converge node.
+                if fan_status == OutcomeStatus::Error {
+                    warn!(
+                        node = %node.id,
+                        "dynamic_parallel: every worker failed, stopping pipeline"
+                    );
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline failed at dynamic_parallel node '{}': all {} workers failed",
+                            node.id,
+                            tasks.len()
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
 
                 // Update status words to show convergence node
                 if let Some(ref bridge) = self.config.status_bridge {
@@ -4875,7 +5064,61 @@ fn dag_build_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{NodeOutcome, OutcomeStatus};
+    use crate::graph::{NodeOutcome, OutcomeStatus, PipelineNode};
+
+    #[test]
+    fn fanout_worker_deadline_priority_and_clamp() {
+        // No deadline/timeout → absolute ceiling (never `None`, so a worker can
+        // never hang forever).
+        let bare = PipelineNode {
+            id: "w".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fanout_worker_deadline(&bare),
+            Duration::from_secs(MAX_FANOUT_WORKER_SECS)
+        );
+
+        // `timeout_secs` is used when no `deadline_secs`.
+        let timed = PipelineNode {
+            id: "w".into(),
+            timeout_secs: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(fanout_worker_deadline(&timed), Duration::from_secs(42));
+
+        // `deadline_secs` WINS over `timeout_secs`.
+        let both = PipelineNode {
+            id: "w".into(),
+            deadline_secs: Some(7.5),
+            timeout_secs: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(fanout_worker_deadline(&both), Duration::from_secs_f64(7.5));
+
+        // Non-finite / non-positive deadline_secs falls through to timeout_secs.
+        let bad_deadline = PipelineNode {
+            id: "w".into(),
+            deadline_secs: Some(0.0),
+            timeout_secs: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(
+            fanout_worker_deadline(&bad_deadline),
+            Duration::from_secs(9)
+        );
+
+        // A pathological over-cap value is clamped to the absolute ceiling.
+        let over = PipelineNode {
+            id: "w".into(),
+            timeout_secs: Some(MAX_FANOUT_WORKER_SECS * 100),
+            ..Default::default()
+        };
+        assert_eq!(
+            fanout_worker_deadline(&over),
+            Duration::from_secs(MAX_FANOUT_WORKER_SECS)
+        );
+    }
 
     #[test]
     fn dag_schedulable_excludes_fanout_and_converge() {
