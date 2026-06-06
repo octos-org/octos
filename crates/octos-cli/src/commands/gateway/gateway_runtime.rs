@@ -1336,9 +1336,15 @@ impl GatewayRuntime {
             } else if let Some(ref p) = cmd.config {
                 paths.push(p.clone());
             } else {
-                let local = project_dir.join("config.json");
-                if local.exists() {
-                    paths.push(local);
+                // Project-local config is watched ONLY in the default context,
+                // mirroring `Config::load_resolved`'s `is_default` gate. In an
+                // explicit/tenant gateway we must not hot-reload an ambient
+                // `cwd/.octos/config.json` (e.g. the host's), only config_home.
+                if ctx.is_default {
+                    let local = project_dir.join("config.json");
+                    if local.exists() {
+                        paths.push(local);
+                    }
                 }
                 let config_home_config = ctx.config_home.join("config.json");
                 if config_home_config.exists() {
