@@ -19,9 +19,10 @@
 //!   (`OCTOS_HOME` set AND its normalized form != `~/.octos`).
 //!   `is_default = !is_explicit`.
 //! * `config_home` = `OCTOS_CONFIG_DIR` if set, else `data_dir` when explicit,
-//!   else the XDG default (`dirs::config_dir()/octos`).
-//! * `auth_home` = `OCTOS_CONFIG_DIR` if set, else the XDG default
-//!   (`dirs::config_dir()/octos`). **DECOUPLED from `data_dir`** so per-profile
+//!   else the XDG default (`${XDG_CONFIG_HOME:-~/.config}/octos` on macOS+Linux,
+//!   `%APPDATA%\octos` on Windows — see `xdg_config_home`).
+//! * `auth_home` = `OCTOS_CONFIG_DIR` if set, else the same XDG default.
+//!   **DECOUPLED from `data_dir`** so per-profile
 //!   gateways (which run with `--data-dir <profile-data>`) keep the host's
 //!   shared, global `octos auth login`.
 
@@ -109,14 +110,37 @@ fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".octos"))
 }
 
-/// The XDG config home for octos:
-/// `~/Library/Application Support/octos` (macOS) or
-/// `${XDG_CONFIG_HOME:-~/.config}/octos` (Linux). Falls back to the default
-/// `~/.octos` when the platform config dir cannot be determined.
+/// The default config home for octos:
+/// * Unix (macOS **and** Linux): `${XDG_CONFIG_HOME:-~/.config}/octos`. We use
+///   true XDG `~/.config` on macOS too — NOT Apple's `~/Library/Application
+///   Support` — because octos is a CLI and that's the prevailing CLI convention
+///   (gh, nvim, helix, …); it's discoverable and matches Linux for one mental
+///   model.
+/// * Windows: `%APPDATA%\octos` (via `dirs::config_dir()`), the correct per-user
+///   config home there (no `~/.config` convention on Windows).
+///
+/// Falls back to `~/.octos` only if the home/config dir can't be determined.
 fn xdg_config_home() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("octos"))
-        .unwrap_or_else(default_data_dir)
+    #[cfg(windows)]
+    {
+        return dirs::config_dir()
+            .map(|d| d.join("octos"))
+            .unwrap_or_else(default_data_dir);
+    }
+    #[cfg(not(windows))]
+    {
+        // $XDG_CONFIG_HOME wins when set to an ABSOLUTE path (the spec ignores
+        // relative values); else ~/.config.
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            let p = PathBuf::from(xdg);
+            if p.is_absolute() {
+                return p.join("octos");
+            }
+        }
+        return dirs::home_dir()
+            .map(|h| h.join(".config").join("octos"))
+            .unwrap_or_else(default_data_dir);
+    }
 }
 
 /// Resolve the canonical [`ConfigContext`] from the `--data-dir` flag plus the
@@ -365,6 +389,7 @@ mod tests {
         home: Option<std::ffi::OsString>,
         octos_home: Option<std::ffi::OsString>,
         octos_config_dir: Option<std::ffi::OsString>,
+        xdg_config_home: Option<std::ffi::OsString>,
     }
 
     impl EnvGuard {
@@ -374,12 +399,14 @@ mod tests {
                 home: std::env::var_os("HOME"),
                 octos_home: std::env::var_os("OCTOS_HOME"),
                 octos_config_dir: std::env::var_os("OCTOS_CONFIG_DIR"),
+                xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             };
             // SAFETY: callers hold ENV_LOCK; restored in Drop.
             unsafe {
                 std::env::set_var("HOME", home);
                 std::env::remove_var("OCTOS_HOME");
                 std::env::remove_var("OCTOS_CONFIG_DIR");
+                std::env::remove_var("XDG_CONFIG_HOME");
             }
             g
         }
@@ -393,6 +420,7 @@ mod tests {
                 restore("HOME", &self.home);
                 restore("OCTOS_HOME", &self.octos_home);
                 restore("OCTOS_CONFIG_DIR", &self.octos_config_dir);
+                restore("XDG_CONFIG_HOME", &self.xdg_config_home);
             }
         }
     }
@@ -443,6 +471,34 @@ mod tests {
         assert!(ctx.is_default);
         assert_eq!(ctx.data_dir, tmp.path().join(".octos"));
         assert_eq!(ctx.config_home, xdg_config_home());
+    }
+
+    /// Default config_home on unix is true XDG `~/.config/octos` — NOT Apple's
+    /// `~/Library/Application Support` — and honours an absolute $XDG_CONFIG_HOME.
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_default_config_home_is_dot_config_not_app_support() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::pivot(tmp.path()); // clears XDG_CONFIG_HOME
+
+        // No XDG_CONFIG_HOME → ~/.config/octos.
+        let ctx = resolve_config_context(None);
+        assert_eq!(ctx.config_home, tmp.path().join(".config").join("octos"));
+        assert_eq!(ctx.auth_home, tmp.path().join(".config").join("octos"));
+        assert!(
+            !ctx.config_home
+                .to_string_lossy()
+                .contains("Application Support"),
+            "config must not live in ~/Library/Application Support, got {}",
+            ctx.config_home.display()
+        );
+
+        // Absolute XDG_CONFIG_HOME wins.
+        let xdg = tmp.path().join("xdgcfg");
+        set_env("XDG_CONFIG_HOME", xdg.to_str().unwrap());
+        let ctx2 = resolve_config_context(None);
+        assert_eq!(ctx2.config_home, xdg.join("octos"));
     }
 
     /// Gate 5: non-default OCTOS_HOME → config_home == that state dir.

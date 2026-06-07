@@ -144,26 +144,23 @@ DATA_DIR="$(normalize_path "$DATA_DIR")"
 #                                                          != $HOME/.octos)
 #               | XDG default                             (otherwise)
 #
-# XDG default:
-#   macOS → $HOME/Library/Application Support/octos
-#   Linux → ${XDG_CONFIG_HOME:-$HOME/.config}/octos
-#           NOTE: a RELATIVE $XDG_CONFIG_HOME is ignored (matching Rust's
-#           dirs::config_dir(), which per the XDG spec only honours absolute
-#           values) — we fall back to $HOME/.config in that case.
+# XDG default (mirror of config_context::xdg_config_home in Rust):
+#   macOS + Linux → ${XDG_CONFIG_HOME:-$HOME/.config}/octos
+#       octos is a CLI, so it uses true XDG ~/.config on macOS too (not Apple's
+#       ~/Library/Application Support) — the prevailing CLI convention and
+#       consistent with Linux.
+#       NOTE: a RELATIVE $XDG_CONFIG_HOME is ignored (XDG spec only honours
+#       absolute values) — fall back to $HOME/.config in that case.
+#   (Windows uses %APPDATA%\octos in Rust; this installer is unix-only.)
 #
 # Empty-string env vars are treated as unset (matching env_nonempty in Rust).
 xdg_config_home() {
-    case "$(uname -s)" in
-        Darwin) printf '%s/Library/Application Support/octos\n' "$HOME" ;;
-        *)
-            # Honour XDG_CONFIG_HOME only when it is an ABSOLUTE path.
-            if [ -n "${XDG_CONFIG_HOME:-}" ] && [ "${XDG_CONFIG_HOME#/}" != "$XDG_CONFIG_HOME" ]; then
-                printf '%s/octos\n' "$XDG_CONFIG_HOME"
-            else
-                printf '%s/octos\n' "$HOME/.config"
-            fi
-            ;;
-    esac
+    # Honour XDG_CONFIG_HOME only when it is an ABSOLUTE path; else ~/.config.
+    if [ -n "${XDG_CONFIG_HOME:-}" ] && [ "${XDG_CONFIG_HOME#/}" != "$XDG_CONFIG_HOME" ]; then
+        printf '%s/octos\n' "$XDG_CONFIG_HOME"
+    else
+        printf '%s/octos\n' "$HOME/.config"
+    fi
 }
 
 # Resolve symlinks/. /.. best-effort so the OCTOS_HOME-vs-default comparison
