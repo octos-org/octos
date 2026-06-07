@@ -49,6 +49,14 @@ jobs:
       - name: Run cargo release
         run: cargo release ${{ inputs.bump }} --execute --no-confirm
 
+      - name: Build embedded SPAs (admin dashboard + octos-web)
+        # rust_embed bakes crates/octos-cli/static/{admin,web} into the binary at
+        # compile time, so both SPAs MUST be built before `cargo build`. Without
+        # this the published bundle serves a 503 at /admin and /app.
+        run: |
+          cd dashboard && npm ci && npm run build && cd ..
+          git submodule update --init octos-web && bash scripts/build-web-app.sh
+
       - name: Build octos CLI
         run: cargo build --release -p octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
