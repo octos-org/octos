@@ -54,8 +54,14 @@ jobs:
         # compile time, so both SPAs MUST be built before `cargo build`. Without
         # this the published bundle serves a 503 at /admin and /app.
         run: |
-          cd dashboard && npm ci && npm run build && cd ..
-          git submodule update --init octos-web && bash scripts/build-web-app.sh
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → a published binary missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
 
       - name: Build octos CLI
         run: cargo build --release -p octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"

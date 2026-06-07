@@ -38,7 +38,16 @@ jobs:
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Build dashboard
-        run: cd dashboard && npm ci && npm run build && cd .. && git submodule update --init octos-web && bash scripts/build-web-app.sh
+        run: |
+          # One command per line so `set -e` aborts on ANY failure — a chained
+          # `&&` can let an early failure slip and publish a binary missing the
+          # embedded /admin or /app SPA.
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
 
       - name: Build
         run: |
@@ -72,7 +81,16 @@ jobs:
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Build dashboard
-        run: cd dashboard && npm ci && npm run build && cd .. && git submodule update --init octos-web && bash scripts/build-web-app.sh
+        run: |
+          # One command per line so `set -e` aborts on ANY failure — a chained
+          # `&&` can let an early failure slip and publish a binary missing the
+          # embedded /admin or /app SPA.
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
 
       - name: Build
         run: |
@@ -108,7 +126,16 @@ jobs:
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Build dashboard
-        run: cd dashboard && npm ci && npm run build && cd .. && git submodule update --init octos-web && bash scripts/build-web-app.sh
+        run: |
+          # One command per line so `set -e` aborts on ANY failure — a chained
+          # `&&` can let an early failure slip and publish a binary missing the
+          # embedded /admin or /app SPA.
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
 
       - name: Build
         run: |
@@ -146,7 +173,16 @@ jobs:
 
       - name: Build dashboard
         shell: bash
-        run: cd dashboard && npm ci && npm run build && cd .. && git submodule update --init octos-web && bash scripts/build-web-app.sh
+        run: |
+          # One command per line so `set -e` aborts on ANY failure — a chained
+          # `&&` can let an early failure slip and publish a binary missing the
+          # embedded /admin or /app SPA.
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
 
       - name: Build
         run: |

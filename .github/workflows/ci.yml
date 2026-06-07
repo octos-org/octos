@@ -495,8 +495,14 @@ jobs:
         run: |
           # rust_embed bakes static/{admin,web} in at compile time → build both
           # SPAs before cargo so the bundle artifact serves /admin and /app.
-          cd dashboard && npm ci && npm run build && cd ..
-          git submodule update --init octos-web && bash scripts/build-web-app.sh
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
@@ -528,8 +534,14 @@ jobs:
         run: |
           # rust_embed bakes static/{admin,web} in at compile time → build both
           # SPAs before cargo so the bundle artifact serves /admin and /app.
-          cd dashboard && npm ci && npm run build && cd ..
-          git submodule update --init octos-web && bash scripts/build-web-app.sh
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
@@ -563,8 +575,14 @@ jobs:
         run: |
           # rust_embed bakes static/{admin,web} in at compile time → build both
           # SPAs before cargo so the bundle artifact serves /admin and /app.
-          cd dashboard && npm ci && npm run build && cd ..
-          git submodule update --init octos-web && bash scripts/build-web-app.sh
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
@@ -598,8 +616,14 @@ jobs:
         run: |
           # rust_embed bakes static/{admin,web} in at compile time → build both
           # SPAs before cargo so the bundle artifact serves /admin and /app.
-          cd dashboard && npm ci && npm run build && cd ..
-          git submodule update --init octos-web && bash scripts/build-web-app.sh
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
