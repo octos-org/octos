@@ -86,7 +86,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
 ```
 
-This installs the binary, sets up `octos serve` as a service, and starts the local dashboard at `http://localhost:8080/admin/`.
+This installs the binary, sets up `octos serve` as a service, and starts the local dashboard at `http://localhost:8080/admin/`. The end-user web app is served same-origin at `http://localhost:8080/app/` (embedded in the binary — no separate web server needed).
 
 Alternatively, install just the binaries (the `octos` server plus its bundled skills) via a package manager:
 

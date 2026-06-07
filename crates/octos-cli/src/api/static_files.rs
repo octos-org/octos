@@ -116,6 +116,34 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
             .into_response();
     }
 
+    // octos-web SPA: under /app/* with its own asset tree (built by
+    // scripts/build-web-app.sh into static/web/ with BASE_URL=/app/). Same
+    // pattern as the swarm branch: segment-match so `/application` etc. fall
+    // through to admin; serve the embedded asset, else the SPA index for
+    // client-side routes, else a 503 naming the build script when the bundle
+    // wasn't embedded. The app is same-origin (`API_BASE=""`) so it talks to
+    // this server's API/WS with no CORS.
+    if path == "app" || path.starts_with("app/") {
+        let web_path = format!("web/{}", path.trim_start_matches("app/"));
+        if let Some(data) = assets.get(&web_path) {
+            return serve_file(&web_path, &data);
+        }
+        if let Some(data) = assets.get("web/index.html") {
+            return serve_file("web/index.html", &data);
+        }
+        let body = serde_json::json!({
+            "error": "web_bundle_missing",
+            "message":
+                "Run ./scripts/build-web-app.sh + rebuild octos-cli to include the octos-web app.",
+        });
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response();
+    }
+
     // Try under admin/ prefix (e.g. /assets/foo.js → admin/assets/foo.js)
     let admin_path = format!("admin/{path}");
     if let Some(data) = assets.get(&admin_path) {

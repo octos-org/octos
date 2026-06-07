@@ -58,6 +58,9 @@ pub fn cors_allowlist_for_base_domain(base: Option<&str>) -> Vec<String> {
         format!("https://api.{base}"),
         "http://localhost:3000".to_string(),
         "http://localhost:5173".to_string(),
+        // octos-web Vite dev server (embedded same-origin at /app in prod, so
+        // CORS is only needed when running the web app from `vite dev`).
+        "http://localhost:5174".to_string(),
     ]
 }
 
