@@ -76,7 +76,12 @@ jobs:
           echo "----- rendered Formula/octos.rb -----"
           cat octos.rb
 
+      - name: Skip tap push for prereleases
+        if: ${{ contains(env.TAG, '-') }}
+        run: echo "::notice::${TAG} is a prerelease — formula rendered + validated above, but NOT pushed to the public tap (octos.rb tracks stable only)."
+
       - name: Push formula to homebrew-tap
+        if: ${{ !contains(env.TAG, '-') }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
@@ -120,4 +125,16 @@ jobs:
         working-directory: packaging/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # Prerelease versions (1.1.0-alpha.1, -rc.2, …) MUST NOT publish under
+          # the `latest` dist-tag, or `npm i -g @octos-org/octos` would install a
+          # prerelease. Derive the dist-tag from the prerelease label; stable →
+          # latest.
+          case "$version" in
+            *-*) dist_tag="${version#*-}"; dist_tag="${dist_tag%%.*}" ;;
+            *)   dist_tag="latest" ;;
+          esac
+          echo "npm publish @octos-org/octos@${version} --tag ${dist_tag}"
+          npm publish --access public --tag "$dist_tag"
