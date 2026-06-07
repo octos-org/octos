@@ -491,7 +491,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          cd dashboard && npm ci && npm run build && cd ..
+          git submodule update --init octos-web && bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
@@ -519,7 +524,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          cd dashboard && npm ci && npm run build && cd ..
+          git submodule update --init octos-web && bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
@@ -549,7 +559,12 @@ jobs:
           shared-key: arm64-release
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          cd dashboard && npm ci && npm run build && cd ..
+          git submodule update --init octos-web && bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 
@@ -579,7 +594,12 @@ jobs:
           shared-key: windows-release
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          cd dashboard && npm ci && npm run build && cd ..
+          git submodule update --init octos-web && bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
           cargo build --release ${{ env.SKILL_CRATES }}
 

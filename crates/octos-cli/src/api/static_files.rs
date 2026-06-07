@@ -124,6 +124,17 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     // wasn't embedded. The app is same-origin (`API_BASE=""`) so it talks to
     // this server's API/WS with no CORS.
     if path == "app" || path.starts_with("app/") {
+        // Bare `/app` (no trailing slash) must redirect to `/app/`: the SPA's
+        // `BrowserRouter basename="/app/"` does not match the pathname `/app`,
+        // so serving index.html directly renders blank. 307 preserves method.
+        if path == "app" {
+            return (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, "/app/")],
+                "",
+            )
+                .into_response();
+        }
         let web_path = format!("web/{}", path.trim_start_matches("app/"));
         if let Some(data) = assets.get(&web_path) {
             return serve_file(&web_path, &data);
