@@ -1788,11 +1788,15 @@ mod tests {
         let original_home = std::env::var_os("HOME");
         let original_octos_home = std::env::var_os("OCTOS_HOME");
         let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
+        // Must also clear XDG_CONFIG_HOME: auth_home derives from it, so an
+        // ambient absolute value would write auth.json outside the temp HOME.
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
         // SAFETY: serialized by HOME_ENV_LOCK; restored below.
         unsafe {
             std::env::set_var("HOME", fake_home);
             std::env::remove_var("OCTOS_HOME");
             std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
         }
 
         // Resolve the GLOBAL auth_home (XDG) and seed a credential there.
@@ -1827,6 +1831,10 @@ mod tests {
         match original_octos_config {
             Some(v) => unsafe { std::env::set_var("OCTOS_CONFIG_DIR", v) },
             None => unsafe { std::env::remove_var("OCTOS_CONFIG_DIR") },
+        }
+        match original_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
 
         assert_eq!(
