@@ -1,0 +1,3 @@
+[submodule "octos-web"]
+	path = octos-web
+	url = https://github.com/octos-org/octos-web.git

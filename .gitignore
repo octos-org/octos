@@ -44,6 +44,9 @@ crates/octos-cli/static/admin/
 # Swarm-app build output
 crates/octos-cli/static/swarm/
 
+# octos-web build output (scripts/build-web-app.sh; embedded at /app)
+crates/octos-cli/static/web/
+
 # Environment
 .env
 .env.local
