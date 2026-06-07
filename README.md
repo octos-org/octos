@@ -249,9 +249,20 @@ bash scripts/cloud-host-deploy.sh --uninstall
 bash scripts/cloud-host-deploy.sh --uninstall --purge
 ```
 
+### Where config lives
+
+User config + credentials live **outside** the install dir so reinstalls/upgrades never touch them:
+
+- **macOS + Linux:** `~/.config/octos/` (`config.json`, `auth.json`) — honours `$XDG_CONFIG_HOME`
+- **Windows:** `%APPDATA%\octos\`
+- **Override:** set `OCTOS_CONFIG_DIR` to put config/auth anywhere
+- `~/.octos/` holds only the **install + runtime state** (binaries, bundled skills, sessions, logs). The installer writes only there.
+
+An existing `~/.octos/config.json` from older versions is auto-migrated to `~/.config/octos/` on first run (copied, not moved — the original stays as a backup).
+
 ### Runtime deployment modes
 
-Octos uses `"mode"` in `~/.octos/config.json` to describe how a running node behaves:
+Octos uses `"mode"` in `config.json` (see *Where config lives* above) to describe how a running node behaves:
 
 - **`local`** — standalone machine
 - **`tenant`** — end-user machine with an optional public tunnel
@@ -304,7 +315,7 @@ For a repo-local tenant deploy (builds from source, sets up the same service + t
 What it does:
 
 1. Detects your host triple (mirrors `install.sh`'s platform mapping).
-2. Runs `scripts/build-dashboard.sh` so `rust_embed` bakes a complete SPA into the binary. Skip this and `/admin/` will 307-loop.
+2. Runs `scripts/build-dashboard.sh` (admin SPA → `/admin/`) and `scripts/build-web-app.sh` (the octos-web submodule → `/app/`) so `rust_embed` bakes both SPAs into the binary. Skip the dashboard build and `/admin/` will 307-loop; skip the web build and `/app/` returns `web_bundle_missing`.
 3. Delegates `cargo build --release` to `scripts/milestone-ci.sh release-bundle` (single source of truth for `FEATURES` / `SKILL_CRATES`).
 4. Tars binaries into `scripts/octos-bundle-<TRIPLE>.tar.gz`, which `install.sh` auto-detects via `file://`, skipping the GitHub download.
 5. With `--install`, chains into `install.sh` — copies binaries to `$PREFIX`, rewrites the service plist/unit, reloads the daemon.
