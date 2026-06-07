@@ -241,6 +241,12 @@ jobs:
     if: ${{ !failure() && !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
     needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows]
     runs-on: ubuntu-latest
+    # actions:write lets the post-release step dispatch publish-packages.yml — a
+    # release CREATED by GITHUB_TOKEN does NOT fire `release: published`, so we
+    # must trigger the package publishers explicitly.
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -271,7 +277,7 @@ jobs:
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          if echo "$TAG" | grep -qE '-(rc|alpha|beta|dev|preview|test|macos|linux|win)'; then
+          if echo "$TAG" | grep -qE '[-](rc|alpha|beta|dev|preview|test|macos|linux|win)'; then
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
@@ -283,3 +289,13 @@ jobs:
           prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
           files: release-assets/*
           body_path: RELEASE_NOTES.md
+
+      - name: Trigger package publishers
+        # A release created by GITHUB_TOKEN does NOT emit `release: published`,
+        # so publish-packages.yml never auto-fires. Dispatch it explicitly with
+        # the tag. It self-gates on `vars.PUBLISH_PACKAGES == 'true'`, so this is
+        # a no-op until packaging is opted in.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh workflow run publish-packages.yml --repo "${{ github.repository }}" -f tag="$TAG"
