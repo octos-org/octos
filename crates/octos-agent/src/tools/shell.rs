@@ -103,11 +103,40 @@ fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
 /// mentions it in a path). Splitting on shell separators means
 /// `cd sites/foo && quarto render` is detected via its `quarto render`
 /// segment.
+///
+/// A segment's leading `NAME=value` env-assignment prefixes are skipped
+/// before testing the command word, so `QUARTO_PROJECT_DIR=. quarto
+/// render` is still recognised — without this, the inline-env form left
+/// HOME unredirected and quarto's sass cache escaped the sandbox
+/// (`unable to open database file: …sass.kv`).
 fn command_invokes_quarto(command: &str) -> bool {
     command
         .split(['\n', ';', '&', '|'])
         .map(str::trim)
-        .any(|segment| segment == "quarto" || segment.starts_with("quarto "))
+        .any(segment_runs_quarto)
+}
+
+/// True when the first command word of a single shell segment is
+/// `quarto`, after skipping any leading `NAME=value` env assignments.
+fn segment_runs_quarto(segment: &str) -> bool {
+    segment
+        .split_whitespace()
+        .find(|token| !is_env_assignment(token))
+        == Some("quarto")
+}
+
+/// True for a `NAME=value` shell env-assignment token (the form that may
+/// legally precede a command word, e.g. `FOO=bar cmd`).
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+        }
+        None => false,
+    }
 }
 
 /// Directory used as `$HOME` for quarto invocations. Quarto writes its
@@ -581,6 +610,41 @@ mod tests {
             .and_then(|(_, v)| v)
             .map(PathBuf::from)
             .expect("HOME must be set for quarto commands");
+        assert!(
+            home.starts_with(&cwd),
+            "quarto HOME must live inside the workspace, got {home:?}"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn quarto_command_with_inline_env_prefix_redirects_home() {
+        // Regression (2026-06-08): the model invoked quarto with an inline
+        // env-var assignment prefix:
+        //   `cd sites/foo && QUARTO_PROJECT_DIR=. quarto render index.qmd --to html`
+        // `command_invokes_quarto` only matched a segment that *starts with*
+        // `quarto `, so the `QUARTO_PROJECT_DIR=. quarto …` segment was not
+        // recognised, HOME was left unredirected, and quarto's sass cache
+        // escaped to ~/Library/Caches/quarto/sass/sass.kv — denied by the
+        // sandbox, breaking theme/syntax-highlight CSS in the rendered page.
+        let cwd = std::env::temp_dir().join(format!("octos-quarto-envpfx-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        apply_quarto_tool_env(
+            &mut cmd,
+            "cd sites/foo && QUARTO_PROJECT_DIR=. quarto render index.qmd --to html 2>&1",
+            &cwd,
+        );
+
+        let home = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("HOME"))
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .expect("HOME must be set for quarto invoked with an env-var prefix");
         assert!(
             home.starts_with(&cwd),
             "quarto HOME must live inside the workspace, got {home:?}"
