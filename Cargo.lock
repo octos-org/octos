@@ -3837,6 +3837,7 @@ dependencies = [
  "octos-agent",
  "octos-bus",
  "octos-core",
+ "octos-diagnostics",
  "octos-llm",
  "octos-memory",
  "octos-pipeline",
@@ -3883,6 +3884,17 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "octos-diagnostics"
+version = "0.1.1"
+dependencies = [
+ "eyre",
+ "octos-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
