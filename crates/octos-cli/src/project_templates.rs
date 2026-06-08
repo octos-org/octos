@@ -929,7 +929,7 @@ fn run_site_bootstrap(
             .arg("--locale")
             .arg("en")
             .arg("--base-path")
-            .arg(&metadata.preview_base_path)
+            .arg(site_bootstrap_base_path(metadata))
             .status()
             .map_err(|e| format!("spawn site bootstrap failed: {e}"))?
     };
@@ -942,6 +942,13 @@ fn run_site_bootstrap(
     }
 
     Ok(())
+}
+
+fn site_bootstrap_base_path(metadata: &SiteProjectMetadata) -> &str {
+    match metadata.template.as_str() {
+        "react-vite" => "./",
+        _ => &metadata.preview_base_path,
+    }
 }
 
 pub fn scaffold_site_project(
@@ -1174,6 +1181,64 @@ mod tests {
             "/api/preview/dspfac/site-session-123/signal-atlas/index.html"
         );
         assert_eq!(metadata.build_output_dir, "dist");
+    }
+
+    #[test]
+    fn should_use_relative_asset_base_when_bootstrapping_react_vite_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-site");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(
+            scripts_dir.join("bootstrap_template.sh"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+OUT_DIR=""
+BASE_PATH=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out-dir)
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    --base-path)
+      BASE_PATH="$2"
+      shift 2
+      ;;
+    *)
+      shift 2
+      ;;
+  esac
+done
+
+mkdir -p "$OUT_DIR"
+printf '%s' "$BASE_PATH" >"$OUT_DIR/base_path.txt"
+"#,
+        )
+        .unwrap();
+
+        let project_dir = tmp.path().join("workspace").join("sites").join("react-lab");
+        let metadata = build_site_project_metadata(
+            "alan0x",
+            "site-1780910158184-af9jo2",
+            "site react",
+            tmp.path(),
+        )
+        .expect("react metadata");
+
+        assert_eq!(
+            metadata.preview_base_path,
+            "/api/preview/alan0x/site-1780910158184-af9jo2/react-lab"
+        );
+
+        run_site_bootstrap(&skill_dir, &project_dir, &metadata).expect("bootstrap runs");
+
+        assert_eq!(
+            std::fs::read_to_string(project_dir.join("base_path.txt")).unwrap(),
+            "./",
+            "React/Vite build assets must be relative so signed preview URLs load JS/CSS through /api/preview-signed/<token>/..."
+        );
     }
 
     #[test]
