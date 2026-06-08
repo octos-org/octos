@@ -81,9 +81,12 @@ pub fn plan(current: &str, latest: &str, method: &InstallMethod, spec: &ProductS
     if method.is_self_updating() {
         return UpdatePlan::SelfUpdateAllowed;
     }
-    match method.upgrade_hint(spec) {
-        Some(cmd) => UpdatePlan::DeferToPackageManager { cmd },
-        None => UpdatePlan::UpdateAvailable {
+    // Only genuinely package-manager/cargo-owned installs defer to a manager.
+    // `Unknown` (manual install) has an advisory installer hint but no owning
+    // manager, so it's a plain `UpdateAvailable` — not "package-manager owned".
+    match (method.is_package_managed(), method.upgrade_hint(spec)) {
+        (true, Some(cmd)) => UpdatePlan::DeferToPackageManager { cmd },
+        _ => UpdatePlan::UpdateAvailable {
             latest: latest.to_owned(),
         },
     }
@@ -178,6 +181,18 @@ mod tests {
         assert_eq!(
             plan("garbage", "1.1.0", &InstallMethod::Homebrew, &spec()),
             UpdatePlan::UpToDate
+        );
+    }
+
+    #[test]
+    fn plan_unknown_install_is_update_available_not_package_manager() {
+        // codex: a manual (Unknown) install has an advisory curl|sh hint but is
+        // NOT package-manager owned — it must be UpdateAvailable, not deferred.
+        assert_eq!(
+            plan("1.0.0", "1.1.0", &InstallMethod::Unknown, &spec()),
+            UpdatePlan::UpdateAvailable {
+                latest: "1.1.0".to_owned()
+            }
         );
     }
 }

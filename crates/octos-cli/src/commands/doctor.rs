@@ -109,10 +109,17 @@ fn build_report(cmd: &DoctorCommand) -> Result<Report> {
     report.push(Check::pass(CAT_BINARY, "install method", method.label()).with_value(method.id()));
     if let Some(hint) = method.upgrade_hint(&spec) {
         // Informational only in Stage 1 (no version comparison without the
-        // network); surface the per-method upgrade command as the value.
-        report.push(
-            Check::pass(CAT_BINARY, "upgrade path", "package-manager owned").with_value(hint),
-        );
+        // network); surface the per-method upgrade command as the value, and
+        // label the OWNERSHIP honestly — self-update vs package-manager vs a
+        // manual install whose hint is just an advisory reinstall line.
+        let detail = if method.is_self_updating() {
+            "self-updating (octos update)"
+        } else if method.is_package_managed() {
+            "package-manager owned"
+        } else {
+            "manual install — upgrade by reinstalling"
+        };
+        report.push(Check::pass(CAT_BINARY, "upgrade path", detail).with_value(hint));
     }
 
     let located = locate(&spec);

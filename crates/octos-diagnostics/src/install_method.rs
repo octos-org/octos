@@ -110,6 +110,20 @@ impl InstallMethod {
     pub fn is_self_updating(&self) -> bool {
         matches!(self, InstallMethod::CargoDistInstaller)
     }
+
+    /// Whether this install is owned by a package manager (or cargo) the user
+    /// upgrades through — as opposed to a manual install we can't drive.
+    /// `Unknown` is NOT package-managed: there's no owning manager to defer to,
+    /// even though `upgrade_hint` offers an advisory `curl | sh` reinstall line.
+    pub fn is_package_managed(&self) -> bool {
+        matches!(
+            self,
+            InstallMethod::Homebrew
+                | InstallMethod::Npm
+                | InstallMethod::CargoRegistry
+                | InstallMethod::CargoGit
+        )
+    }
 }
 
 /// Inputs to the pure path classifier. All prefixes are optional because they
