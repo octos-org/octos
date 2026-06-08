@@ -948,7 +948,7 @@ fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path)
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
     let expected = crate::project_templates::build_site_project_metadata(
         profile_id,
-        session_key.chat_id(),
+        crate::project_templates::preview_session_id(session_key),
         topic,
         user_workspace,
     )?;
@@ -3352,7 +3352,7 @@ impl ActorFactory {
             if let Err(error) = crate::project_templates::scaffold_site_project(
                 &user_workspace,
                 profile_id,
-                session_key.chat_id(),
+                crate::project_templates::preview_session_id(&session_key),
                 topic,
                 &self.data_dir,
             ) {
