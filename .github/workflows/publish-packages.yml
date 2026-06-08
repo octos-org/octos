@@ -92,11 +92,15 @@ jobs:
           cd tap
           git config user.name "octos-release-bot"
           git config user.email "151983+ymote@users.noreply.github.com"
-          if git diff --quiet; then
+          # `git add` FIRST, then check the STAGED diff: a brand-new untracked
+          # Formula/octos.rb is invisible to a plain `git diff --quiet` (that only
+          # inspects tracked files), so the first publish would silently skip the
+          # push. `git diff --cached --quiet` correctly sees the new staged file.
+          git add Formula/octos.rb
+          if git diff --cached --quiet; then
             echo "Formula/octos.rb unchanged; nothing to push."
             exit 0
           fi
-          git add Formula/octos.rb
           git commit -m "octos ${TAG}"
           git push origin HEAD
 
