@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/octos-core",
+    "crates/octos-diagnostics",
     "crates/octos-memory",
     "crates/octos-llm",
     "crates/octos-agent",
@@ -42,6 +43,7 @@ unsafe_code = "deny"
 [workspace.dependencies]
 # Internal crates
 octos-core = { path = "crates/octos-core" }
+octos-diagnostics = { path = "crates/octos-diagnostics" }
 octos-memory = { path = "crates/octos-memory" }
 octos-llm = { path = "crates/octos-llm" }
 octos-agent = { path = "crates/octos-agent" }

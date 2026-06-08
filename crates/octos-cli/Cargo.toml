@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 octos-core = { workspace = true }
+octos-diagnostics = { workspace = true }
 octos-agent = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }

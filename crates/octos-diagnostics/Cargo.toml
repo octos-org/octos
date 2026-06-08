@@ -1,0 +1,24 @@
+[package]
+name = "octos-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared, product-agnostic diagnostics + update-planning for octos binaries (doctor)"
+
+[dependencies]
+octos-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+
+[features]
+# Stage 1 is dependency-light: NO `github`/`update` features, NO reqwest,
+# NO axoupdater. GitHub reachability is Stage 2; self-update is Stage 3.
+default = []
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

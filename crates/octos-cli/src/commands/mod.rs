@@ -9,6 +9,7 @@ mod clean;
 mod completions;
 mod cron;
 mod docs;
+mod doctor;
 pub mod gateway;
 mod init;
 pub mod mcp_serve;
@@ -32,6 +33,7 @@ pub use clean::CleanCommand;
 pub use completions::CompletionsCommand;
 pub use cron::CronCommand;
 pub use docs::DocsCommand;
+pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
 pub use mcp_serve::McpServeCommand;
@@ -87,6 +89,8 @@ pub enum Command {
     Chat(ChatCommand),
     /// Manage scheduled cron jobs.
     Cron(CronCommand),
+    /// Run local environment diagnostics (flutter-doctor style).
+    Doctor(DoctorCommand),
     /// Generate documentation for tools and providers.
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
@@ -296,6 +300,7 @@ impl Executable for Command {
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
+            Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),

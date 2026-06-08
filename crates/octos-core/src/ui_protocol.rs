@@ -1489,6 +1489,80 @@ fn is_autonomy_optional_feature(feature: &str) -> bool {
     )
 }
 
+/// Result of comparing a server's advertised [`UiProtocolCapabilities`] against
+/// a caller-supplied required-feature set. This is the **pure** protocol
+/// semantics primitive: it has no dependency on any network/transport crate and
+/// reasons only over the protocol family string, the schema version, and the
+/// advertised `supported_features`.
+///
+/// `octos-diagnostics` wraps the result of [`compare_protocol`] into a
+/// `Check`/report line (the product-facing adapter); both the TUI and the
+/// server reuse this same comparator so the skew logic never forks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolCompat {
+    /// The server speaks the same protocol family, its schema version is at
+    /// least the client's, and every required feature is advertised.
+    Compatible,
+    /// The protocol family + schema are compatible, but the server does not
+    /// advertise one or more features the client requires. Carries the missing
+    /// feature names (in the order they were requested).
+    MissingFeatures(Vec<String>),
+    /// The server is on a different protocol family, or its schema version is
+    /// *older* than the client's compiled-in [`UI_PROTOCOL_SCHEMA_VERSION`] —
+    /// the two cannot interoperate regardless of features.
+    SchemaIncompatible { server: u32, client: u32 },
+}
+
+impl ProtocolCompat {
+    /// Whether the comparison found no problems at all.
+    pub fn is_compatible(&self) -> bool {
+        matches!(self, ProtocolCompat::Compatible)
+    }
+}
+
+/// Pure protocol-compatibility comparator (no new deps; reasons only over the
+/// existing protocol consts + the advertised capability payload).
+///
+/// Decision order (first wins), mirroring the client/server handshake contract:
+///
+/// 1. **Family mismatch** → [`ProtocolCompat::SchemaIncompatible`] with the
+///    server's schema vs the client's compiled-in [`UI_PROTOCOL_SCHEMA_VERSION`]
+///    (a different `protocol` string means the wire dialects differ — we report
+///    it as schema-incompatible because no feature negotiation can bridge it).
+/// 2. **Older server schema** (`server.version.schema_version <
+///    UI_PROTOCOL_SCHEMA_VERSION`) → [`ProtocolCompat::SchemaIncompatible`]. A
+///    server *newer* than the client is allowed (forward-compatible additive
+///    schema), so only an older server is rejected.
+/// 3. **Missing required features** → [`ProtocolCompat::MissingFeatures`],
+///    preserving the order in `required`.
+/// 4. Otherwise → [`ProtocolCompat::Compatible`].
+pub fn compare_protocol<I, S>(server: &UiProtocolCapabilities, required: I) -> ProtocolCompat
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if server.version.protocol != UI_PROTOCOL_V1
+        || server.version.schema_version < UI_PROTOCOL_SCHEMA_VERSION
+    {
+        return ProtocolCompat::SchemaIncompatible {
+            server: server.version.schema_version,
+            client: UI_PROTOCOL_SCHEMA_VERSION,
+        };
+    }
+
+    let missing: Vec<String> = required
+        .into_iter()
+        .filter(|feature| !server.supports_feature(feature.as_ref()))
+        .map(|feature| feature.as_ref().to_owned())
+        .collect();
+
+    if missing.is_empty() {
+        ProtocolCompat::Compatible
+    } else {
+        ProtocolCompat::MissingFeatures(missing)
+    }
+}
+
 fn string_list(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -5809,6 +5883,88 @@ impl UiNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compare_protocol_compatible_for_full_protocol_with_known_features() {
+        // The full-protocol capabilities advertise every known feature, so any
+        // subset (here: the whole known registry) is satisfied.
+        let server = UiProtocolCapabilities::full_protocol();
+        let required: Vec<&str> = vec![
+            UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+        ];
+        assert_eq!(
+            compare_protocol(&server, required),
+            ProtocolCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn compare_protocol_empty_required_is_always_compatible() {
+        let server = UiProtocolCapabilities::full_protocol();
+        let required: Vec<&str> = Vec::new();
+        assert_eq!(
+            compare_protocol(&server, required),
+            ProtocolCompat::Compatible
+        );
+        assert!(compare_protocol(&server, Vec::<&str>::new()).is_compatible());
+    }
+
+    #[test]
+    fn compare_protocol_reports_missing_features_in_request_order() {
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server
+            .supported_features
+            .retain(|f| f != UI_PROTOCOL_FEATURE_USER_QUESTION_V1);
+        let required = vec![
+            UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, // present
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,  // removed → missing
+        ];
+        assert_eq!(
+            compare_protocol(&server, required),
+            ProtocolCompat::MissingFeatures(vec![UI_PROTOCOL_FEATURE_USER_QUESTION_V1.to_owned()])
+        );
+    }
+
+    #[test]
+    fn compare_protocol_schema_incompatible_when_server_older() {
+        if UI_PROTOCOL_SCHEMA_VERSION == 0 {
+            return; // can't model an older schema below zero
+        }
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server.version.schema_version = UI_PROTOCOL_SCHEMA_VERSION - 1;
+        assert_eq!(
+            compare_protocol(&server, [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]),
+            ProtocolCompat::SchemaIncompatible {
+                server: UI_PROTOCOL_SCHEMA_VERSION - 1,
+                client: UI_PROTOCOL_SCHEMA_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn compare_protocol_allows_newer_server_schema() {
+        // A server ahead of the client (additive forward-compat) is fine.
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server.version.schema_version = UI_PROTOCOL_SCHEMA_VERSION + 5;
+        assert_eq!(
+            compare_protocol(&server, [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]),
+            ProtocolCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn compare_protocol_schema_incompatible_on_wrong_protocol_family() {
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server.version.protocol = "octos-ui/v2alpha".into();
+        // Even with a same/newer schema number, a different family can't bridge.
+        match compare_protocol(&server, [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]) {
+            ProtocolCompat::SchemaIncompatible { client, .. } => {
+                assert_eq!(client, UI_PROTOCOL_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaIncompatible, got {other:?}"),
+        }
+    }
 
     #[test]
     fn reasoning_effort_level_wire_shape() {
