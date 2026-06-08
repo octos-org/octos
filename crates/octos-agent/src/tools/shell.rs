@@ -99,6 +99,37 @@ fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
         .env("npm_config_cache", &cache_dir);
 }
 
+/// True when `command` runs the `quarto` CLI as a command (not merely
+/// mentions it in a path). Splitting on shell separators means
+/// `cd sites/foo && quarto render` is detected via its `quarto render`
+/// segment.
+fn command_invokes_quarto(command: &str) -> bool {
+    command
+        .split(['\n', ';', '&', '|'])
+        .map(str::trim)
+        .any(|segment| segment == "quarto" || segment.starts_with("quarto "))
+}
+
+/// Directory used as `$HOME` for quarto invocations. Quarto writes its
+/// sass cache to `$HOME/Library/Caches/quarto` and ignores
+/// `QUARTO_CACHE`/`XDG_CACHE_HOME` on macOS, so under the sandbox
+/// (writes confined to cwd) the default home cache is denied and
+/// `quarto render` fails with `unable to open database file: …sass.kv`.
+/// Pointing HOME at a dir inside the (writable) workspace keeps the
+/// cache contained without weakening sandbox isolation.
+fn quarto_home_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".octos-quarto-home")
+}
+
+fn apply_quarto_tool_env(cmd: &mut tokio::process::Command, command: &str, cwd: &Path) {
+    if !command_invokes_quarto(command) {
+        return;
+    }
+    let home = quarto_home_dir(cwd);
+    let _ = std::fs::create_dir_all(&home);
+    cmd.env("HOME", &home);
+}
+
 #[cfg(windows)]
 const NULL_DEVICE_PATH: &str = "NUL";
 #[cfg(not(windows))]
@@ -333,6 +364,7 @@ impl Tool for ShellTool {
         let mut cmd = self.sandbox.wrap_command(&input.command, effective_cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         apply_frontend_tool_env(&mut cmd, effective_cwd);
+        apply_quarto_tool_env(&mut cmd, &input.command, effective_cwd);
         apply_git_tool_env(&mut cmd, &input.command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
         apply_harness_event_sink_env(&mut cmd, ctx);
@@ -525,6 +557,51 @@ mod tests {
         assert!(!result.success);
         assert!(result.output.contains("approval_policy is never"));
         assert!(!result.output.contains("without interactive approval"));
+    }
+
+    #[test]
+    fn quarto_command_redirects_home_into_workspace() {
+        // Regression (2026-06-08): `quarto render` died under the sandbox
+        // with `unable to open database file:
+        // ~/Library/Caches/quarto/sass/sass.kv`. Quarto locates that cache
+        // via $HOME and ignores QUARTO_CACHE/XDG_CACHE_HOME on macOS, so we
+        // redirect HOME into the (sandbox-writable) workspace for quarto
+        // commands. No sandbox isolation is weakened — the cache lands
+        // inside cwd, which is already writable.
+        let cwd = std::env::temp_dir().join(format!("octos-quarto-env-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        apply_quarto_tool_env(&mut cmd, "cd sites/foo && quarto render", &cwd);
+
+        let home = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("HOME"))
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .expect("HOME must be set for quarto commands");
+        assert!(
+            home.starts_with(&cwd),
+            "quarto HOME must live inside the workspace, got {home:?}"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn non_quarto_command_does_not_redirect_home() {
+        // Least privilege: HOME is only redirected when quarto is invoked,
+        // so other tools keep their normal home.
+        let cwd = std::env::temp_dir();
+        let mut cmd = tokio::process::Command::new("sh");
+        apply_quarto_tool_env(&mut cmd, "echo hi && npm run build", &cwd);
+
+        let has_home = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k.to_str() == Some("HOME"));
+        assert!(!has_home, "non-quarto commands must not redirect HOME");
     }
 
     #[tokio::test]
