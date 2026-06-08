@@ -50,6 +50,11 @@ pub struct ProductSpec {
     pub current_version: String,
     /// `owner/repo` on GitHub, e.g. `octos-org/octos`.
     pub github_repo: String,
+    /// Env var holding an optional GitHub token to dodge the unauthenticated
+    /// rate limit, e.g. `OCTOS_GITHUB_TOKEN`. Optional auth — the GitHub client
+    /// (Stage 2, `github` feature) reads it only when this is `Some` and the var
+    /// is set & non-blank; a public repo never requires it.
+    pub github_token_env: Option<String>,
     /// Homebrew formula (tap-qualified), e.g. `octos-org/tap/octos`.
     pub brew_formula: Option<String>,
     /// npm package name, e.g. `@octos-org/octos`.
@@ -77,12 +82,19 @@ impl ProductSpec {
             package_name: package_name.into(),
             current_version: current_version.into(),
             github_repo: github_repo.into(),
+            github_token_env: None,
             brew_formula: None,
             npm_package: None,
             cargo_install: None,
             cargo_dist_app: None,
             asset_selector: AssetSelector::new(asset_prefix),
         }
+    }
+
+    /// Set the env var name holding an optional GitHub token (rate-limit auth).
+    pub fn with_github_token_env(mut self, env_var: impl Into<String>) -> Self {
+        self.github_token_env = Some(env_var.into());
+        self
     }
 
     pub fn with_brew_formula(mut self, formula: impl Into<String>) -> Self {

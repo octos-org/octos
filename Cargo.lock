@@ -3892,6 +3892,7 @@ version = "0.1.1"
 dependencies = [
  "eyre",
  "octos-core",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",

@@ -18,6 +18,7 @@ mod office;
 mod serve;
 pub mod skills;
 mod status;
+mod update;
 
 use std::path::PathBuf;
 
@@ -42,6 +43,7 @@ pub use office::OfficeCommand;
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
 pub use status::StatusCommand;
+pub use update::UpdateCommand;
 
 /// octos: Rust-native coding agent orchestration.
 #[derive(Debug, Parser)]
@@ -104,6 +106,8 @@ pub enum Command {
     Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),
+    /// Check for a newer octos release (`--check`); self-update is Stage 3.
+    Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
     /// Clean up stale state and cache files.
@@ -308,6 +312,7 @@ impl Executable for Command {
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
+            Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),

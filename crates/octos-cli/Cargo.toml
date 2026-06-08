@@ -12,7 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 octos-core = { workspace = true }
-octos-diagnostics = { workspace = true }
+# `github` feature on for Stage 2: enables the shared GitHub Releases client so
+# `octos update --check` + `octos doctor`'s Network category can reach the public
+# Releases API. Self-update mutation stays on the existing `updater.rs` (Stage 3).
+octos-diagnostics = { workspace = true, features = ["github"] }
 octos-agent = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }

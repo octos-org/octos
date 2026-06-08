@@ -8,11 +8,17 @@
 //! `--verbose` adds resolved paths/versions; `--strict` promotes warnings to
 //! failures.
 //!
-//! Stage 1 is **local checks only** — binary/install-method/on-path/shadow,
-//! terminal, config+data writability, and a structural protocol-skew check
-//! against the server's compiled-in capabilities. There is NO network (GitHub
-//! reachability + live WS capability probe are Stage 2) and NO update wiring
-//! (Stage 3); see the `// TODO Stage 2` markers below.
+//! Local checks (Stage 1): binary/install-method/on-path/shadow, terminal,
+//! config+data writability, and a structural protocol-skew check against the
+//! server's compiled-in capabilities.
+//!
+//! **Stage 2** adds a `Network` category (behind octos-diagnostics' `github`
+//! feature, which octos-cli enables): GitHub reachability via the shared
+//! `reachability()` and a best-effort newer-release check via `update_check`.
+//! Both are advisory — a network/API failure WARNs, never FAILs, so `doctor`
+//! works offline. There is still NO update mutation (Stage 3), and the LIVE-WS
+//! `config/capabilities/list` probe for protocol skew is left as a documented
+//! `// TODO Stage 2.5` (it needs a client WS connection).
 
 use std::path::PathBuf;
 
@@ -20,13 +26,15 @@ use clap::Args;
 use eyre::Result;
 use octos_core::ui_protocol::{UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1, UiProtocolCapabilities};
 use octos_diagnostics::{
-    Check, ProductSpec, Report, config_writability_check, data_writability_check, detect, locate,
-    on_path_check, protocol_skew_check, shadow_check, terminal_checks,
+    Check, InstallMethod, ProductSpec, Reachability, Report, UpdatePlan, config_writability_check,
+    data_writability_check, detect, locate, on_path_check, protocol_skew_check, reachability,
+    shadow_check, terminal_checks, update_check,
 };
 
 use super::Executable;
 
 const CAT_BINARY: &str = "Binary & version";
+const CAT_NETWORK: &str = "Network";
 
 /// Run local environment diagnostics for the octos server.
 #[derive(Debug, Args)]
@@ -55,6 +63,7 @@ fn octos_server_spec() -> ProductSpec {
         "octos-org/octos",         // github repo
         "octos-bundle",            // asset prefix → octos-bundle-<triple>
     )
+    .with_github_token_env("OCTOS_GITHUB_TOKEN")
     .with_brew_formula("octos-org/tap/octos")
     .with_npm_package("@octos-org/octos")
     .with_cargo_install("octos-cli")
@@ -63,7 +72,8 @@ fn octos_server_spec() -> ProductSpec {
 
 impl Executable for DoctorCommand {
     fn execute(self) -> Result<()> {
-        let report = build_report(&self)?;
+        // Network checks run for the real `octos doctor` invocation (Stage 2).
+        let report = build_report(&self, true)?;
         if self.json {
             let bundle = report.to_json(
                 self.strict,
@@ -80,9 +90,11 @@ impl Executable for DoctorCommand {
     }
 }
 
-/// Assemble the full local-checks report. Separated from `execute` so it does
-/// not call `process::exit` and can be exercised by tests.
-fn build_report(cmd: &DoctorCommand) -> Result<Report> {
+/// Assemble the full report. Separated from `execute` so it does not call
+/// `process::exit` and can be exercised by tests. `with_network` gates the
+/// Stage-2 Network category (GitHub reachability + newer-release check) so unit
+/// tests stay offline/deterministic; the real command always passes `true`.
+fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     let spec = octos_server_spec();
     let mut report = Report::default();
 
@@ -130,8 +142,16 @@ fn build_report(cmd: &DoctorCommand) -> Result<Report> {
         &spec,
     ));
     report.push(shadow_check(&located, &method, &spec));
-    // TODO Stage 2: GitHub latest-release reachability + "newer release
-    // available" check (needs the `github` feature / reqwest).
+
+    // --- Network (Stage 2: github feature) --------------------------------
+    // GitHub reachability + a best-effort "newer release available" check.
+    // Both are advisory: a network failure WARNs (never FAILs) so `doctor`
+    // works offline. The LIVE-WS `config/capabilities/list` probe for protocol
+    // skew is still TODO Stage 2.5 (it needs a client WS connection); the
+    // compiled-in `protocol_skew_check` from Stage 1 remains the skew check.
+    if with_network {
+        report.extend(network_checks(&spec, &method));
+    }
 
     // --- Terminal environment ---------------------------------------------
     report.extend(terminal_checks());
@@ -150,8 +170,10 @@ fn build_report(cmd: &DoctorCommand) -> Result<Report> {
     // full known-feature registry (what `octos serve` actually negotiates), so
     // comparing it against that same registry confirms the build's octos-core
     // matches the protocol it ships — a divergence would surface here.
-    // TODO Stage 2: replace the compiled-in caps with a LIVE WS
-    // `config/capabilities/list` probe against a configured/running server.
+    // TODO Stage 2.5: replace the compiled-in caps with a LIVE WS
+    // `config/capabilities/list` probe against a configured/running server (it
+    // needs a client WS connection, deliberately out of Stage 2 scope). Until
+    // then the compiled-in `protocol_skew_check` is authoritative.
     let server_caps = UiProtocolCapabilities::first_server_slice();
     report.push(protocol_skew_check(
         &server_caps,
@@ -159,6 +181,69 @@ fn build_report(cmd: &DoctorCommand) -> Result<Report> {
     ));
 
     Ok(report)
+}
+
+/// Network category (Stage 2, `github` feature): GitHub API reachability + a
+/// best-effort newer-release check. Both are advisory — a network/API failure
+/// produces a `[!]` WARN, never a `[✗]` FAIL, so `doctor` never blocks offline.
+fn network_checks(spec: &ProductSpec, method: &InstallMethod) -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    // GitHub reachability (shared probe) — called once, result reused below.
+    let reach = reachability(spec);
+    let reachable = matches!(reach, Reachability::Reachable);
+    match reach {
+        Reachability::Reachable => checks.push(
+            Check::pass(CAT_NETWORK, "GitHub reachable", "api.github.com responded")
+                .with_value("https://api.github.com".to_string()),
+        ),
+        Reachability::Unreachable { reason } => checks.push(Check::warn(
+            CAT_NETWORK,
+            "GitHub reachable",
+            format!("could not reach api.github.com: {reason}"),
+            "check network/proxy/DNS, or set OCTOS_GITHUB_TOKEN to dodge rate limits",
+        )),
+    }
+
+    // Best-effort "newer release available" via the shared planner. Only attempt
+    // when GitHub looked reachable; any failure is a WARN, never a FAIL.
+    if reachable {
+        match update_check(spec, method) {
+            Ok(UpdatePlan::UpToDate) => checks.push(Check::pass(
+                CAT_NETWORK,
+                "latest release",
+                format!("up to date (v{})", spec.current_version),
+            )),
+            Ok(UpdatePlan::UpdateAvailable { latest }) => checks.push(Check::warn(
+                CAT_NETWORK,
+                "latest release",
+                format!("a newer octos is available: v{latest}"),
+                method
+                    .upgrade_hint(spec)
+                    .unwrap_or_else(|| "run `octos update --check`".to_string()),
+            )),
+            Ok(UpdatePlan::DeferToPackageManager { cmd }) => checks.push(Check::warn(
+                CAT_NETWORK,
+                "latest release",
+                "a newer octos is available",
+                cmd,
+            )),
+            Ok(UpdatePlan::SelfUpdateAllowed) => checks.push(Check::warn(
+                CAT_NETWORK,
+                "latest release",
+                "a newer octos is available (this install can self-update in Stage 3)",
+                "run `octos update --check`",
+            )),
+            Err(err) => checks.push(Check::warn(
+                CAT_NETWORK,
+                "latest release",
+                format!("could not check for a newer release: {err}"),
+                "retry when online, or set OCTOS_GITHUB_TOKEN if rate-limited",
+            )),
+        }
+    }
+
+    checks
 }
 
 #[cfg(test)]
@@ -188,7 +273,7 @@ mod tests {
 
     #[test]
     fn report_includes_core_categories_and_protocol_skew_passes() {
-        let report = build_report(&cmd()).expect("report builds");
+        let report = build_report(&cmd(), false).expect("report builds");
         let text = report.render(false, false);
         assert!(text.contains("Binary & version"));
         assert!(text.contains("Terminal environment"));
