@@ -17483,7 +17483,7 @@ async fn run_standalone_turn(
         .iter()
         .map(|file_ref| file_ref.path.clone())
         .collect();
-    let turn_media_paths: Vec<String> = octos_bus::file_handle::materialize_turn_uploads(
+    let mut turn_media_paths: Vec<String> = octos_bus::file_handle::materialize_turn_uploads(
         &session_runtime.workspace_root,
         // #1377: bind to the session's OWNING TENANT so the materializer only
         // copies uploads owned by this tenant (cross-tenant handles dropped).
@@ -17539,6 +17539,12 @@ async fn run_standalone_turn(
         } else {
             format!("{}\n{}", prompt, joined)
         };
+        // The audio is now in the prompt as text. Drop it from the
+        // agent-visible media so the model answers the transcript directly
+        // instead of re-transcribing the workspace audio file — with the
+        // always-on voice skill present, an audio attachment otherwise lures
+        // the agent into calling `voice_transcribe` / exploring the workspace.
+        turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
     }
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
