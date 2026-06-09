@@ -9772,13 +9772,30 @@ async fn handle_turn_start(
         return;
     }
 
-    let Some(prompt) = prompt_text(&params.input) else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params("turn/start requires at least one text input item"),
-        );
-        return;
+    let prompt = match prompt_text(&params.input) {
+        Some(p) => p,
+        None => {
+            // Voice turns carry audio media and NO text item — the
+            // serve-path STT inside `run_standalone_turn` transcribes the
+            // audio into the prompt. Accept such a turn with an empty
+            // prompt; reject only when there is neither text nor audio to
+            // act on (the original "requires a text input item" contract
+            // for text-only clients).
+            if params
+                .media
+                .iter()
+                .any(|m| octos_bus::media::is_audio(&m.path))
+            {
+                String::new()
+            } else {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params("turn/start requires at least one text input item"),
+                );
+                return;
+            }
+        }
     };
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
