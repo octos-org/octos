@@ -17486,10 +17486,35 @@ async fn run_standalone_turn(
     // `session_runtime.profile` here. Plumbing a new runtime field is out of
     // scope for this task; pass `None` (auto-detect) until then.
     let asr_language: Option<String> = None;
+    // `materialize_turn_uploads` returns workspace-RELATIVE paths
+    // ("uploads/<name>"). That works for the agent's own tools (cwd =
+    // workspace_root), but ominix-api is a SEPARATE process that reads
+    // `audio_path` off disk under ITS own cwd — a relative path 404s there.
+    // Resolve to absolute against workspace_root before transcription.
+    let asr_media: Vec<String> = turn_media_paths
+        .iter()
+        .map(|p| {
+            let pb = std::path::Path::new(p);
+            if pb.is_absolute() {
+                p.clone()
+            } else {
+                session_runtime
+                    .workspace_root
+                    .join(pb)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })
+        .collect();
+    tracing::info!(media = ?asr_media, "voice_turn: STT input media");
     let voice_transcripts =
-        crate::api::voice_turn::transcribe_audio_media(&turn_media_paths, asr_language.as_deref())
-            .await;
+        crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
     let had_audio_input = !voice_transcripts.is_empty();
+    tracing::info!(
+        transcripts = voice_transcripts.len(),
+        had_audio_input,
+        "voice_turn: STT result"
+    );
     if had_audio_input {
         let joined = voice_transcripts.join("\n");
         prompt = if prompt.trim().is_empty() {
