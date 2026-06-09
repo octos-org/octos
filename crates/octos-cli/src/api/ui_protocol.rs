@@ -16142,7 +16142,9 @@ async fn run_standalone_turn(
     contracts: Arc<UiProtocolContractStores>,
     features: ConnectionUiFeatures,
     params: TurnStartParams,
-    prompt: String,
+    // Voice (语音轮): made `mut` so the serve/WS turn/start path can merge
+    // transcribed audio media into the prompt text before the agent runs.
+    mut prompt: String,
     routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
@@ -17475,6 +17477,29 @@ async fn run_standalone_turn(
         Some(session_runtime.profile.profile_id.as_str()),
         &raw_media,
     );
+    // ── 语音轮 STT（serve 路径）────────────────────────────────────
+    // 若 turn 媒体含音频，转写并并入 prompt；并记录"本轮含音频输入"，
+    // 供下方决定是否合成语音回复。
+    // TODO(voice): wire profile.voice.asr_language. `VoiceConfig.asr_language`
+    // exists on `crate::config::Config` but is not plumbed through to
+    // `ProfileRuntime` (the bootstrap drops it), so it is not reachable from
+    // `session_runtime.profile` here. Plumbing a new runtime field is out of
+    // scope for this task; pass `None` (auto-detect) until then.
+    let asr_language: Option<String> = None;
+    let voice_transcripts = crate::api::voice_turn::transcribe_audio_media(
+        &turn_media_paths,
+        asr_language.as_deref(),
+    )
+    .await;
+    let had_audio_input = !voice_transcripts.is_empty();
+    if had_audio_input {
+        let joined = voice_transcripts.join("\n");
+        prompt = if prompt.trim().is_empty() {
+            joined
+        } else {
+            format!("{}\n{}", prompt, joined)
+        };
+    }
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
