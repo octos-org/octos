@@ -4,9 +4,7 @@
 //! 收敛成两个无状态 async 函数，包住共享的 `OminixClient`。turn 状态机
 //! （见 `ui_protocol.rs`）只调用这里，不直接碰 ominix。
 
-use std::path::Path;
-#[allow(unused_imports)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use octos_llm::ominix::OminixClient;
 
@@ -55,9 +53,39 @@ pub(crate) async fn transcribe_audio_media(
     out
 }
 
+/// 合成 agent 文本回复为音频文件。空文本或合成失败返回 None（调用方据此跳过下发）。
+/// `out_dir` 用 turn 的工作目录（见 ui_protocol 钩子）。
+// TODO(later-tasks): remove dead_code allow once callers are wired up.
+#[allow(dead_code)]
+pub(crate) async fn synthesize_reply(
+    text: &str,
+    voice: &str,
+    out_dir: &Path,
+) -> Option<PathBuf> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
+    let client = OminixClient::new(&ominix_base_url());
+    match client.synthesize_to_file(text, voice, None, &out_path).await {
+        Ok(_) => Some(out_path),
+        Err(e) => {
+            tracing::warn!(error = %e, "voice_turn: synthesis failed");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn synthesize_reply_returns_none_for_blank_text() {
+        let dir = std::env::temp_dir();
+        let got = synthesize_reply("   ", "vivian", &dir).await;
+        assert!(got.is_none());
+    }
 
     #[test]
     fn audio_paths_filters_non_audio() {
