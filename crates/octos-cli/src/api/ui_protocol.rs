@@ -17486,11 +17486,9 @@ async fn run_standalone_turn(
     // `session_runtime.profile` here. Plumbing a new runtime field is out of
     // scope for this task; pass `None` (auto-detect) until then.
     let asr_language: Option<String> = None;
-    let voice_transcripts = crate::api::voice_turn::transcribe_audio_media(
-        &turn_media_paths,
-        asr_language.as_deref(),
-    )
-    .await;
+    let voice_transcripts =
+        crate::api::voice_turn::transcribe_audio_media(&turn_media_paths, asr_language.as_deref())
+            .await;
     let had_audio_input = !voice_transcripts.is_empty();
     if had_audio_input {
         let joined = voice_transcripts.join("\n");

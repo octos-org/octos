@@ -29,7 +29,6 @@ mod static_files;
 pub(crate) mod supervisor_store;
 pub mod swarm;
 pub(crate) mod ui_protocol;
-pub(crate) mod voice_turn;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha3_bridge;
 mod ui_protocol_alpha4_bridge;
@@ -45,6 +44,7 @@ mod ui_protocol_sanitize;
 mod ui_protocol_scope;
 mod ui_protocol_task_output;
 pub mod user_admin;
+pub(crate) mod voice_turn;
 pub mod webhook_proxy;
 pub mod ws_slash;
 

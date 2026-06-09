@@ -40,8 +40,8 @@ pub(crate) async fn transcribe_audio_media(
     if audios.is_empty() {
         return Vec::new();
     }
-    let client = OminixClient::new(&ominix_base_url())
-        .with_language(language.map(|s| s.to_string()));
+    let client =
+        OminixClient::new(&ominix_base_url()).with_language(language.map(|s| s.to_string()));
     let mut out = Vec::new();
     for path in audios {
         match client.transcribe(Path::new(&path)).await {
@@ -57,17 +57,16 @@ pub(crate) async fn transcribe_audio_media(
 /// `out_dir` 用 turn 的工作目录（见 ui_protocol 钩子）。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
 #[allow(dead_code)]
-pub(crate) async fn synthesize_reply(
-    text: &str,
-    voice: &str,
-    out_dir: &Path,
-) -> Option<PathBuf> {
+pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) -> Option<PathBuf> {
     if text.trim().is_empty() {
         return None;
     }
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
-    match client.synthesize_to_file(text, voice, None, &out_path).await {
+    match client
+        .synthesize_to_file(text, voice, None, &out_path)
+        .await
+    {
         Ok(_) => Some(out_path),
         Err(e) => {
             tracing::warn!(error = %e, "voice_turn: synthesis failed");
@@ -96,6 +95,9 @@ mod tests {
             "/tmp/a/clip.wav".to_string(),
         ];
         let got = audio_paths(&media);
-        assert_eq!(got, vec!["/tmp/a/note.ogg".to_string(), "/tmp/a/clip.wav".to_string()]);
+        assert_eq!(
+            got,
+            vec!["/tmp/a/note.ogg".to_string(), "/tmp/a/clip.wav".to_string()]
+        );
     }
 }
