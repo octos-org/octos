@@ -18522,18 +18522,22 @@ async fn run_standalone_turn(
             if let Some(audio_path) =
                 crate::api::voice_turn::synthesize_reply(reply, voice, reply_audio_dir).await
             {
-                // Deliver via the EXISTING file-attachment mechanism — the
-                // same `file/attached` carrier spawn_only/send_file artefacts
-                // use. `media` carries the absolute path as a String; the
-                // helper de-dupes, strips the topic suffix for routing, and
-                // emits one envelope per file. No `tool_call_id` (this is a
-                // server-initiated attach, not an agent tool result).
-                let audio_path_str = audio_path.to_string_lossy().into_owned();
+                // Deliver via the EXISTING file/attached carrier. Emit the
+                // WORKSPACE-RELATIVE filename, NOT the absolute path:
+                // `/api/files` (resolve_within_workspace) rejects absolute
+                // paths and serves only paths resolved inside the session
+                // workspace. The reply wav is written directly under
+                // workspace_root, so the relative form is just its file name.
+                // No `tool_call_id` (server-initiated attach, not a tool result).
+                let audio_rel = audio_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| audio_path.to_string_lossy().into_owned());
                 super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
                     &ledger,
                     &session_id,
                     &turn_id,
-                    std::slice::from_ref(&audio_path_str),
+                    std::slice::from_ref(&audio_rel),
                     &[],
                     None,
                 );
