@@ -53,8 +53,6 @@ pub(crate) async fn transcribe_audio_media(
     out
 }
 
-/// 合成 agent 文本回复为音频文件。空文本或合成失败返回 None（调用方据此跳过下发）。
-/// `out_dir` 用 turn 的工作目录（见 ui_protocol 钩子）。
 /// Strip Markdown / formatting noise so the TTS speaks clean prose instead of
 /// "swallowing" or mispronouncing symbols. Removes fenced + inline code, link
 /// URLs (keeping the visible text), emphasis/heading/list/quote markers, and
@@ -127,11 +125,107 @@ pub(crate) fn clean_for_tts(text: &str) -> String {
         .to_string()
 }
 
+/// Volcano Engine (ByteDance) cloud-TTS config, sourced from env. Returns
+/// `None` (→ fall back to on-device ominix) unless appid + token are set.
+/// Moving TTS to the cloud also stops ominix from thrashing ASR↔TTS model
+/// reloads under memory pressure, so on-device STT stays fast.
+struct VolcanoTts {
+    appid: String,
+    token: String,
+    cluster: String,
+    voice: String,
+    encoding: String,
+    endpoint: String,
+}
+
+fn volcano_from_env() -> Option<VolcanoTts> {
+    let appid = std::env::var("VOLC_TTS_APPID")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let token = std::env::var("VOLC_TTS_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some(VolcanoTts {
+        appid,
+        token,
+        cluster: std::env::var("VOLC_TTS_CLUSTER").unwrap_or_else(|_| "volcano_tts".to_string()),
+        voice: std::env::var("VOLC_TTS_VOICE").unwrap_or_else(|_| "BV001_streaming".to_string()),
+        encoding: std::env::var("VOLC_TTS_ENCODING").unwrap_or_else(|_| "mp3".to_string()),
+        endpoint: std::env::var("VOLC_TTS_ENDPOINT")
+            .unwrap_or_else(|_| "https://openspeech.bytedance.com/api/v1/tts".to_string()),
+    })
+}
+
+/// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
+/// returns base64 audio in JSON). Writes the decoded audio to `out_dir` and
+/// returns the path. `None` on any failure (caller falls back to ominix).
+async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Option<PathBuf> {
+    use base64::Engine;
+
+    let reqid = uuid::Uuid::now_v7().to_string();
+    let body = serde_json::json!({
+        "app": { "appid": cfg.appid, "token": cfg.token, "cluster": cfg.cluster },
+        "user": { "uid": "octos-voice" },
+        "audio": { "voice_type": cfg.voice, "encoding": cfg.encoding, "speed_ratio": 1.0 },
+        "request": { "reqid": reqid, "text": text, "operation": "query", "text_type": "plain" },
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&cfg.endpoint)
+        // Volcano's quirky scheme: literal "Bearer;" + token (semicolon, no space).
+        .header("Authorization", format!("Bearer;{}", cfg.token))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano TTS request failed"))
+        .ok()?;
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano TTS bad JSON"))
+        .ok()?;
+
+    // code 3000 == success per Volcano TTS API.
+    if json.get("code").and_then(|c| c.as_i64()) != Some(3000) {
+        tracing::warn!(resp = %json, "voice_turn: volcano TTS non-success code");
+        return None;
+    }
+    let b64 = json.get("data").and_then(|d| d.as_str())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano TTS base64 decode"))
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let ext = if cfg.encoding == "wav" { "wav" } else { "mp3" };
+    let out_path = out_dir.join(format!("reply-{reqid}.{ext}"));
+    tokio::fs::write(&out_path, &bytes)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano TTS write failed"))
+        .ok()?;
+    Some(out_path)
+}
+
 pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) -> Option<PathBuf> {
     let speak = clean_for_tts(text);
     if speak.trim().is_empty() {
         return None;
     }
+
+    // Prefer cloud TTS (Volcano) when configured — faster (no on-device model
+    // reload) and better voice quality. Fall back to on-device ominix.
+    if let Some(cfg) = volcano_from_env() {
+        if let Some(path) = synthesize_volcano(&cfg, &speak, out_dir).await {
+            return Some(path);
+        }
+        tracing::warn!("voice_turn: volcano TTS failed; falling back to ominix");
+    }
+
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
     match client
