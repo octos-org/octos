@@ -18460,6 +18460,42 @@ async fn run_standalone_turn(
     // `await` will not block.
     let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
 
+    // ── 语音轮 TTS（serve 路径）────────────────────────────────────
+    // 仅当本轮有音频输入（语音轮）时，把最终文本回复合成为音频并下发，
+    // 客户端据此自动播放。失败静默跳过，不影响文本回复。
+    //
+    // 下发复用既有 file/attached 机制（spawn_only / send_file 产物走的
+    // 同一条通路）：把合成出的 .wav 写到 turn 的 workspace_root 下，
+    // 再通过 `emit_files_attached_from_background` 发一个 file/attached
+    // 信封。SPA 把它折进当前 assistant 消息的 `files`，并经 buildFileUrl
+    // 拉取（workspace_root 即 spawn_only 产物的同一可达目录）。
+    if had_audio_input {
+        if let Some(reply) = final_response_content.as_deref() {
+            let voice = "vivian"; // TODO(voice): wire profile.voice.default_voice
+            let reply_audio_dir = session_runtime.workspace_root.as_path();
+            if let Some(audio_path) =
+                crate::api::voice_turn::synthesize_reply(reply, voice, reply_audio_dir).await
+            {
+                // Deliver via the EXISTING file-attachment mechanism — the
+                // same `file/attached` carrier spawn_only/send_file artefacts
+                // use. `media` carries the absolute path as a String; the
+                // helper de-dupes, strips the topic suffix for routing, and
+                // emits one envelope per file. No `tool_call_id` (this is a
+                // server-initiated attach, not an agent tool result).
+                let audio_path_str = audio_path.to_string_lossy().into_owned();
+                super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    std::slice::from_ref(&audio_path_str),
+                    &[],
+                    None,
+                );
+                tracing::info!(audio = %audio_path.display(), "voice_turn: synthesized reply audio");
+            }
+        }
+    }
+
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
     // AFTER the model reply has been persisted to the per-session
     // session manager. This is the AppUI parity for what
