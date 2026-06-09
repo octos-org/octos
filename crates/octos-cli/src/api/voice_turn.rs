@@ -55,16 +55,87 @@ pub(crate) async fn transcribe_audio_media(
 
 /// 合成 agent 文本回复为音频文件。空文本或合成失败返回 None（调用方据此跳过下发）。
 /// `out_dir` 用 turn 的工作目录（见 ui_protocol 钩子）。
-// TODO(later-tasks): remove dead_code allow once callers are wired up.
-#[allow(dead_code)]
+/// Strip Markdown / formatting noise so the TTS speaks clean prose instead of
+/// "swallowing" or mispronouncing symbols. Removes fenced + inline code, link
+/// URLs (keeping the visible text), emphasis/heading/list/quote markers, and
+/// collapses leftover whitespace.
+pub(crate) fn clean_for_tts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue; // drop code-block bodies entirely
+        }
+        // Strip leading list/quote/heading markers.
+        let mut s = trimmed.to_string();
+        while let Some(rest) = s
+            .strip_prefix("# ")
+            .or_else(|| s.strip_prefix("## "))
+            .or_else(|| s.strip_prefix("### "))
+            .or_else(|| s.strip_prefix("> "))
+            .or_else(|| s.strip_prefix("- "))
+            .or_else(|| s.strip_prefix("* "))
+            .or_else(|| s.strip_prefix("+ "))
+        {
+            s = rest.to_string();
+        }
+        out.push_str(&s);
+        out.push('\n');
+    }
+
+    // `[label](url)` -> `label`; bare emphasis/code chars dropped.
+    let mut result = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => {
+                // Capture label up to `]`, then skip an optional `(...)`.
+                let mut label = String::new();
+                for lc in chars.by_ref() {
+                    if lc == ']' {
+                        break;
+                    }
+                    label.push(lc);
+                }
+                if chars.peek() == Some(&'(') {
+                    for pc in chars.by_ref() {
+                        if pc == ')' {
+                            break;
+                        }
+                    }
+                }
+                result.push_str(&label);
+            }
+            '*' | '_' | '`' | '~' | '#' => {} // drop emphasis / code markers
+            other => result.push(other),
+        }
+    }
+
+    // Collapse runs of blank lines / spaces.
+    result
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) -> Option<PathBuf> {
-    if text.trim().is_empty() {
+    let speak = clean_for_tts(text);
+    if speak.trim().is_empty() {
         return None;
     }
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
     match client
-        .synthesize_to_file(text, voice, None, &out_path)
+        .synthesize_to_file(&speak, voice, None, &out_path)
         .await
     {
         Ok(_) => Some(out_path),
@@ -84,6 +155,24 @@ mod tests {
         let dir = std::env::temp_dir();
         let got = synthesize_reply("   ", "vivian", &dir).await;
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn clean_for_tts_strips_markdown_noise() {
+        let md = "# 标题\n\n这是**重点**和 `代码` 还有 [链接](https://x.com)。\n\n```rust\nfn main() {}\n```\n\n- 一项\n- 两项";
+        let got = clean_for_tts(md);
+        assert!(!got.contains('#'));
+        assert!(!got.contains('*'));
+        assert!(!got.contains('`'));
+        assert!(!got.contains("https://"));
+        assert!(!got.contains("fn main")); // code block dropped
+        assert!(got.contains("这是重点和 代码 还有 链接。"));
+        assert!(got.contains("一项"));
+    }
+
+    #[test]
+    fn clean_for_tts_blank_when_only_formatting() {
+        assert_eq!(clean_for_tts("```\ncode\n```").as_str(), "");
     }
 
     #[test]
