@@ -17523,11 +17523,11 @@ async fn run_standalone_turn(
             }
         })
         .collect();
-    tracing::info!(media = ?asr_media, "voice_turn: STT input media");
+    tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
     let voice_transcripts =
         crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
     let had_audio_input = !voice_transcripts.is_empty();
-    tracing::info!(
+    tracing::debug!(
         transcripts = voice_transcripts.len(),
         had_audio_input,
         "voice_turn: STT result"
