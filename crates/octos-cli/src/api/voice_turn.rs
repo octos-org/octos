@@ -42,6 +42,7 @@ pub(crate) async fn transcribe_audio_media(
     }
     let client =
         OminixClient::new(&ominix_base_url()).with_language(language.map(|s| s.to_string()));
+    let asr_t = std::time::Instant::now();
     let mut out = Vec::new();
     for path in audios {
         match client.transcribe(Path::new(&path)).await {
@@ -50,13 +51,37 @@ pub(crate) async fn transcribe_audio_media(
             Err(e) => tracing::warn!(audio = %path, error = %e, "voice_turn: transcription failed"),
         }
     }
+    eprintln!("[TIMING] ASR_done dur_ms={} epoch_ms={}", asr_t.elapsed().as_millis(), now_ms());
     out
+}
+
+/// Whether a char is safe to hand to TTS: letters/digits (incl. CJK),
+/// whitespace, and common sentence punctuation. Everything else — emoji,
+/// pictographs, math/misc symbols — is dropped, because some on-device engines
+/// (GPT-SoVITS) error out on unspeakable input instead of ignoring it.
+/// Wall-clock epoch milliseconds (for cross-stage timing in voice turns).
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn is_tts_safe(c: char) -> bool {
+    c.is_alphanumeric()
+        || c.is_whitespace()
+        || matches!(
+            c,
+            ',' | '.' | '!' | '?' | ';' | ':' | '\'' | '"' | '-' | '(' | ')'
+                | '，' | '。' | '！' | '？' | '；' | '：' | '、' | '…'
+                | '《' | '》' | '「' | '」' | '“' | '”' | '‘' | '’' | '%'
+        )
 }
 
 /// Strip Markdown / formatting noise so the TTS speaks clean prose instead of
 /// "swallowing" or mispronouncing symbols. Removes fenced + inline code, link
-/// URLs (keeping the visible text), emphasis/heading/list/quote markers, and
-/// collapses leftover whitespace.
+/// URLs (keeping the visible text), emphasis/heading/list/quote markers, emoji /
+/// pictographs / stray symbols, and collapses leftover whitespace.
 pub(crate) fn clean_for_tts(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_fence = false;
@@ -110,7 +135,11 @@ pub(crate) fn clean_for_tts(text: &str) -> String {
                 result.push_str(&label);
             }
             '*' | '_' | '`' | '~' | '#' => {} // drop emphasis / code markers
-            other => result.push(other),
+            other if is_tts_safe(other) => result.push(other),
+            // Drop emoji / pictographs / stray symbols (😄🌙×🐙 …). Some on-device
+            // TTS engines (e.g. GPT-SoVITS) abort synthesis on unspeakable chars
+            // rather than skipping them, which fails the whole turn.
+            _ => {}
         }
     }
 
@@ -216,6 +245,8 @@ pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) ->
     if speak.trim().is_empty() {
         return None;
     }
+    let tts_t = std::time::Instant::now();
+    eprintln!("[TIMING] TTS_start epoch_ms={}", now_ms());
 
     // Prefer cloud TTS (Volcano) when configured — faster (no on-device model
     // reload) and better voice quality. Fall back to on-device ominix.
@@ -232,7 +263,10 @@ pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) ->
         .synthesize_to_file(&speak, voice, None, &out_path)
         .await
     {
-        Ok(_) => Some(out_path),
+        Ok(_) => {
+            eprintln!("[TIMING] TTS_done dur_ms={} epoch_ms={}", tts_t.elapsed().as_millis(), now_ms());
+            Some(out_path)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "voice_turn: synthesis failed");
             None
@@ -267,6 +301,19 @@ mod tests {
     #[test]
     fn clean_for_tts_blank_when_only_formatting() {
         assert_eq!(clean_for_tts("```\ncode\n```").as_str(), "");
+    }
+
+    #[test]
+    fn clean_for_tts_strips_emoji_and_symbols() {
+        // GPT-SoVITS aborts synthesis on emoji/symbols; they must be dropped.
+        let got = clean_for_tts("晚上好呀！😄🌙 今天第 N 次×2 打招呼 😂🐙");
+        for bad in ['😄', '🌙', '😂', '🐙', '×'] {
+            assert!(!got.contains(bad), "should strip {bad:?}: got {got:?}");
+        }
+        // Speakable content + punctuation preserved.
+        assert!(got.contains("晚上好呀！"));
+        assert!(got.contains("今天第 N 次"));
+        assert!(got.contains("打招呼"));
     }
 
     #[test]

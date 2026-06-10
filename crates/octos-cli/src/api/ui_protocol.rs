@@ -17539,6 +17539,12 @@ async fn run_standalone_turn(
         } else {
             format!("{}\n{}", prompt, joined)
         };
+        // Voice-turn only (had_audio_input): replies are spoken aloud by TTS, so
+        // ask for short, speakable answers. Text chat (had_audio_input == false)
+        // keeps its normal detailed/formatted persona — this branch never runs there.
+        prompt = format!(
+            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。]"
+        );
         // The audio is now in the prompt as text. Drop it from the
         // agent-visible media so the model answers the transcript directly
         // instead of re-transcribing the workspace audio file — with the
