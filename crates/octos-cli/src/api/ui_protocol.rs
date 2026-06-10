@@ -18191,6 +18191,78 @@ async fn run_standalone_turn(
     // a once-write; using a mutable u64 keeps the wiring narrow and
     // avoids a second pass through `response.token_usage`.
     let mut final_tokens_consumed: u64 = 0;
+
+    // ── Voice turn: sentence-streamed TTS ─────────────────────────────
+    // For voice turns, synthesize the reply sentence-by-sentence AS the LLM
+    // streams `token` events, instead of waiting for the whole reply. A FIFO
+    // worker keeps the emitted audio ordered without blocking this loop. All
+    // gated on `had_audio_input`, so text chat is untouched.
+    fn drain_voice_sentences(buf: &mut String) -> Vec<String> {
+        // Strong boundaries always split; soft boundaries (commas) split only
+        // once the running segment is long enough, so a single comma-heavy
+        // sentence still streams without producing choppy 2-char fragments.
+        const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
+        const SOFT: &[char] = &['，', ',', '、'];
+        const SOFT_MIN_CHARS: usize = 8;
+        let mut out = Vec::new();
+        loop {
+            let mut cut = None;
+            for (count, (i, c)) in buf.char_indices().enumerate() {
+                if STRONG.contains(&c) || (SOFT.contains(&c) && count + 1 >= SOFT_MIN_CHARS) {
+                    cut = Some(i + c.len_utf8());
+                    break;
+                }
+            }
+            match cut {
+                Some(idx) => {
+                    let sentence = buf[..idx].trim().to_string();
+                    *buf = buf[idx..].to_string();
+                    if !sentence.is_empty() {
+                        out.push(sentence);
+                    }
+                }
+                None => break,
+            }
+        }
+        out
+    }
+    let mut voice_buf = String::new();
+    let mut voice_streamed_count: usize = 0;
+    let (voice_tx, voice_handle) = if had_audio_input {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let w_ledger = ledger.clone();
+        let w_session = session_id.clone();
+        let w_turn = turn_id.clone();
+        let w_dir = session_runtime.workspace_root.clone();
+        let w_voice = "vivian".to_string(); // TODO(voice): profile.voice.default_voice
+        let handle = tokio::spawn(async move {
+            let mut n: usize = 0;
+            while let Some(sentence) = rx.recv().await {
+                if let Some(path) =
+                    crate::api::voice_turn::synthesize_reply(&sentence, &w_voice, &w_dir).await
+                {
+                    let rel = path
+                        .file_name()
+                        .map(|x| x.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                        &w_ledger,
+                        &w_session,
+                        &w_turn,
+                        std::slice::from_ref(&rel),
+                        &[],
+                        None,
+                    );
+                    n += 1;
+                }
+            }
+            n
+        });
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
     loop {
         // Race progress events against the interrupt signal so an interrupt
         // can wake us out of `progress_rx.recv()` even if the agent task is
@@ -18315,6 +18387,21 @@ async fn run_standalone_turn(
                 break;
             }
             _ => {
+                // Voice turn: accumulate streamed `token` text and hand off
+                // each complete sentence to the FIFO TTS worker for immediate
+                // synthesis (overlaps with the rest of LLM generation).
+                if let Some(ref tx) = voice_tx {
+                    if event.get("type").and_then(Value::as_str) == Some("token") {
+                        if let Some(t) = event.get("text").and_then(Value::as_str) {
+                            voice_buf.push_str(t);
+                            for sentence in drain_voice_sentences(&mut voice_buf) {
+                                if tx.try_send(sentence).is_ok() {
+                                    voice_streamed_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 forward_progress_event(
                     &ws,
                     &ledger,
@@ -18327,6 +18414,21 @@ async fn run_standalone_turn(
                     &event,
                 );
             }
+        }
+    }
+
+    // Voice turn: flush the trailing partial sentence, close the channel, and
+    // wait for the FIFO TTS worker to finish emitting all sentence audio.
+    if let Some(tx) = voice_tx {
+        if !interrupt_observed {
+            let tail = voice_buf.trim().to_string();
+            if !tail.is_empty() && tx.try_send(tail).is_ok() {
+                voice_streamed_count += 1;
+            }
+        }
+        drop(tx);
+        if let Some(handle) = voice_handle {
+            voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
         }
     }
 
@@ -18521,7 +18623,9 @@ async fn run_standalone_turn(
     // 再通过 `emit_files_attached_from_background` 发一个 file/attached
     // 信封。SPA 把它折进当前 assistant 消息的 `files`，并经 buildFileUrl
     // 拉取（workspace_root 即 spawn_only 产物的同一可达目录）。
-    if had_audio_input {
+    // Fallback: only synthesize the whole reply at once if the sentence-streamed
+    // path above produced no audio (e.g. a reply with no sentence boundaries).
+    if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
             let voice = "vivian"; // TODO(voice): wire profile.voice.default_voice
             let reply_audio_dir = session_runtime.workspace_root.as_path();
