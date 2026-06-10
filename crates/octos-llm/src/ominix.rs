@@ -293,17 +293,18 @@ impl OminixClient {
         voice: &str,
         language: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let mut body = serde_json::json!({
+        // Route on-device TTS to GPT-SoVITS (~1.4GB, RTF ~0.4) instead of the
+        // Qwen3-TTS pool (/v1/audio/speech, ~5GB). The reference audio loaded on
+        // the server selects the voice; we omit `voice`/`language` to avoid
+        // voices.json registry mismatches when only a single ref is loaded.
+        let _ = (voice, language);
+        let body = serde_json::json!({
             "input": text,
-            "voice": voice,
         });
-        if let Some(lang) = language {
-            body["language"] = serde_json::Value::String(lang.to_string());
-        }
 
         let resp = self
             .client
-            .post(format!("{}/v1/audio/speech", self.base_url))
+            .post(format!("{}/v1/audio/tts/sovits", self.base_url))
             .json(&body)
             .timeout(std::time::Duration::from_secs(120))
             .send()
