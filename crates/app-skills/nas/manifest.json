@@ -1,0 +1,79 @@
+{
+  "name": "nas",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Browse, read and search files on a Synology NAS via the FileStation Web API. Requires environment variables NAS_URL (e.g. https://nas.example.com:5001), NAS_USER and NAS_PASS. Accounts with 2-step verification are not supported. Set NAS_VERIFY_TLS=false to accept self-signed HTTPS certificates.",
+  "timeout_secs": 60,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "nas_list_folder",
+      "description": "List the contents of a folder on the NAS. With no path (or '/') it lists the available shared folders. Otherwise pass a path that starts with a share, e.g. '/photo' or '/video/2024'.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Folder path starting with a share name, e.g. '/photo'. Omit or use '/' to list all shared folders."
+          }
+        },
+        "required": []
+      },
+      "env": [
+        "NAS_URL",
+        "NAS_USER",
+        "NAS_PASS",
+        "NAS_VERIFY_TLS"
+      ]
+    },
+    {
+      "name": "nas_read_file",
+      "description": "Read a text file from the NAS and return its contents. Refuses files larger than 1 MB or files that are not valid UTF-8 text.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full file path starting with a share name, e.g. '/photo/notes.txt'."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "env": [
+        "NAS_URL",
+        "NAS_USER",
+        "NAS_PASS",
+        "NAS_VERIFY_TLS"
+      ]
+    },
+    {
+      "name": "nas_search",
+      "description": "Recursively search a NAS folder for files whose name matches a glob pattern. Returns the matching file paths.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "folder": {
+            "type": "string",
+            "description": "Folder to search under, starting with a share name, e.g. '/photo'."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Filename glob pattern, e.g. '*.jpg' or 'report'."
+          }
+        },
+        "required": [
+          "folder",
+          "pattern"
+        ]
+      },
+      "env": [
+        "NAS_URL",
+        "NAS_USER",
+        "NAS_PASS",
+        "NAS_VERIFY_TLS"
+      ]
+    }
+  ]
+}

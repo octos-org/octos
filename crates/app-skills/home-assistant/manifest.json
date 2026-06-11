@@ -1,0 +1,83 @@
+{
+  "name": "home-assistant",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Control and query a Home Assistant smart home via its REST API. Requires two environment variables: HA_URL (base URL incl. scheme/host/port, e.g. https://ha.example.com:8123 — do NOT include /api) and HA_TOKEN (a Home Assistant long-lived access token). Lets the agent read entity states, list entities by domain, and call services to control devices (lights, switches, climate, etc.).",
+  "timeout_secs": 30,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "ha_get_states",
+      "description": "Read the current state of Home Assistant entities. With no argument returns all entities (capped). Pass an exact entity_id (e.g. 'light.kitchen') to fetch one, or any substring to filter entities by entity_id or friendly name (case-insensitive).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "description": "Optional. An exact entity_id (e.g. 'light.kitchen') to fetch a single entity, OR a substring to filter entities by entity_id and friendly name."
+          }
+        }
+      },
+      "env": [
+        "HA_URL",
+        "HA_TOKEN"
+      ]
+    },
+    {
+      "name": "ha_call_service",
+      "description": "Call a Home Assistant service to control a device, e.g. domain 'light' service 'turn_on'. Target via entity_id and pass any extra service parameters in 'data' (e.g. brightness_pct, temperature). Returns the entities whose state changed.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "Service domain, e.g. 'light', 'switch', 'climate', 'cover'."
+          },
+          "service": {
+            "type": "string",
+            "description": "Service name, e.g. 'turn_on', 'turn_off', 'toggle', 'set_temperature'."
+          },
+          "entity_id": {
+            "type": [
+              "string",
+              "array"
+            ],
+            "description": "Target entity id or array of entity ids, e.g. 'light.kitchen'.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "data": {
+            "type": "object",
+            "description": "Optional extra service parameters merged into the request body, e.g. {\"brightness_pct\": 60, \"color_name\": \"red\"}."
+          }
+        },
+        "required": [
+          "domain",
+          "service"
+        ]
+      },
+      "env": [
+        "HA_URL",
+        "HA_TOKEN"
+      ]
+    },
+    {
+      "name": "ha_list_entities",
+      "description": "List Home Assistant entities grouped by domain (the part before the first '.'), with a per-domain count and each entity's friendly name and state. Optionally filter to a single domain (e.g. 'light'). Good for a low-token overview of what's in the house.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "Optional domain filter, e.g. 'light', 'switch', 'sensor'."
+          }
+        }
+      },
+      "env": [
+        "HA_URL",
+        "HA_TOKEN"
+      ]
+    }
+  ]
+}

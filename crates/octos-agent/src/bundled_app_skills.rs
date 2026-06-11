@@ -61,6 +61,18 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/skill-evolve/SKILL.md"),
         include_str!("../../app-skills/skill-evolve/manifest.json"),
     ),
+    (
+        "home-assistant",
+        "ha_bridge",
+        include_str!("../../app-skills/home-assistant/SKILL.md"),
+        include_str!("../../app-skills/home-assistant/manifest.json"),
+    ),
+    (
+        "nas",
+        "nas_bridge",
+        include_str!("../../app-skills/nas/SKILL.md"),
+        include_str!("../../app-skills/nas/manifest.json"),
+    ),
 ];
 
 /// Platform skills: bootstrapped once by `octos serve` (admin bot) at startup,

@@ -15,6 +15,8 @@ members = [
     "crates/app-skills/account-manager",
     "crates/app-skills/time",
     "crates/app-skills/weather",
+    "crates/app-skills/home-assistant",
+    "crates/app-skills/nas",
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/skill-evolve",
     "crates/app-skills/harness-starter-generic",

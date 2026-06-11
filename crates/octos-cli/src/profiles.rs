@@ -144,6 +144,15 @@ pub struct ProfileConfig {
     /// **overrides**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
+    /// MCP (Model Context Protocol) servers exposed to this profile's
+    /// gateway / `serve` runtime. Empty (the default) preserves prior
+    /// behaviour — no MCP servers are started. Populated here, the
+    /// per-profile `ProfileRuntime` starts each server and registers
+    /// its tools (see `runtime/profile.rs`, step 12). This is the path
+    /// that lets the multi-tenant web ("octos serve") reach Home
+    /// Assistant's official HTTP MCP server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<octos_agent::McpServerConfig>,
 }
 
 /// Profile-owned review workflow configuration.
@@ -449,6 +458,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub hooks: Option<Vec<octos_agent::HookConfig>>,
     #[serde(default)]
+    pub mcp_servers: Option<Vec<octos_agent::McpServerConfig>>,
+    #[serde(default)]
     pub admin_mode: Option<bool>,
     #[serde(default)]
     pub sandbox: Option<octos_agent::SandboxConfig>,
@@ -682,6 +693,9 @@ impl ProfileConfig {
         }
         if let Some(hooks) = patch.hooks {
             self.hooks = hooks;
+        }
+        if let Some(mcp_servers) = patch.mcp_servers {
+            self.mcp_servers = mcp_servers;
         }
         if let Some(admin_mode) = patch.admin_mode {
             self.admin_mode = admin_mode;
@@ -1540,7 +1554,7 @@ pub(crate) fn config_from_profile(
         // Fields not configured through profiles — use defaults
         version: None,
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
-        mcp_servers: vec![],
+        mcp_servers: profile.config.mcp_servers.clone(),
         sandbox: profile.config.sandbox.clone(),
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
@@ -1851,6 +1865,13 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     // the stale plugin registry and apply the new gate.
     if oc.plugins != nc.plugins {
         restart_fields.push("plugins".into());
+    }
+    // MCP servers are only started during `ProfileRuntime` bootstrap
+    // (runtime/profile.rs step 12), so a change to the configured set
+    // cannot hot-reload — it must trigger a gateway restart, exactly
+    // like `hooks`, `channels`, and `plugins`.
+    if oc.mcp_servers != nc.mcp_servers {
+        restart_fields.push("mcp_servers".into());
     }
 
     if !restart_fields.is_empty() {
@@ -2826,6 +2847,104 @@ mod tests {
             }
             other => panic!("expected RestartRequired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_carry_mcp_servers_through_config_from_profile() {
+        let profile = UserProfile {
+            id: "mcp-carry".into(),
+            name: "MCP".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                mcp_servers: vec![octos_agent::McpServerConfig {
+                    command: None,
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    url: Some("https://ha.local/api/mcp".to_string()),
+                    headers: std::collections::HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer test".to_string(),
+                    )]),
+                    concurrency_class: None,
+                }],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let config = config_from_profile(&profile, None, None);
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(
+            config.mcp_servers[0].url.as_deref(),
+            Some("https://ha.local/api/mcp")
+        );
+        assert_eq!(
+            config.mcp_servers[0]
+                .headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer test")
+        );
+    }
+
+    #[test]
+    fn should_classify_mcp_servers_as_restart_required() {
+        let base = UserProfile {
+            id: "mcp-diff".into(),
+            name: "MCP".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.mcp_servers = vec![octos_agent::McpServerConfig {
+            command: None,
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            url: Some("https://ha.local/api/mcp".to_string()),
+            headers: std::collections::HashMap::new(),
+            concurrency_class: None,
+        }];
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                assert!(
+                    fields.iter().any(|f| f == "mcp_servers"),
+                    "expected `mcp_servers` in restart-required fields, got {fields:?}",
+                );
+            }
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_apply_mcp_servers_patch_without_rejecting_unknown_field() {
+        let raw = serde_json::json!({
+            "mcp_servers": [
+                { "url": "https://ha.local/api/mcp" }
+            ]
+        });
+        let patch: ProfileConfigPatch = serde_json::from_value(raw)
+            .expect("patch JSON containing mcp_servers must deserialize");
+
+        let mut config = ProfileConfig::default();
+        config.apply_patch(patch);
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(
+            config.mcp_servers[0].url.as_deref(),
+            Some("https://ha.local/api/mcp")
+        );
     }
 
     #[test]

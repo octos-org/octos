@@ -38,6 +38,14 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "GOOGLE_BASE_URL",
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
+    // Home Assistant skill (ha_bridge)
+    "HA_URL",
+    "HA_TOKEN",
+    // NAS skill (nas_bridge) — Synology FileStation
+    "NAS_URL",
+    "NAS_USER",
+    "NAS_PASS",
+    "NAS_VERIFY_TLS",
 ];
 
 pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
