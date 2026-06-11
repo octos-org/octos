@@ -13,6 +13,7 @@ use crate::provider::LlmProvider;
 // ── Provider sub-modules ────────────────────────────────────────────────────
 
 mod anthropic;
+mod atlascloud;
 mod dashscope;
 mod deepseek;
 mod gemini;
@@ -93,6 +94,7 @@ static ALL: &[ProviderEntry] = &[
     r9s::ENTRY,
     openrouter::ENTRY,
     deepseek::ENTRY,
+    atlascloud::ENTRY,
     groq::ENTRY,
     moonshot::ENTRY,
     dashscope::ENTRY,
@@ -163,6 +165,18 @@ mod tests {
     }
 
     #[test]
+    fn lookup_atlascloud() {
+        let e = lookup("atlascloud").unwrap();
+        assert_eq!(e.name, "atlascloud");
+
+        let e = lookup("atlas").unwrap();
+        assert_eq!(e.name, "atlascloud");
+
+        let e = lookup("atlas-cloud").unwrap();
+        assert_eq!(e.name, "atlascloud");
+    }
+
+    #[test]
     fn lookup_by_alias() {
         let e = lookup("google").unwrap();
         assert_eq!(e.name, "gemini");
@@ -203,7 +217,7 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 15);
+        assert_eq!(all_entries().len(), 16);
     }
 
     #[test]
