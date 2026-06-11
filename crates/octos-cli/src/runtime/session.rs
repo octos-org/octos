@@ -789,6 +789,7 @@ mod tests {
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 
@@ -1316,6 +1317,7 @@ mod tests {
             pipeline_factory: None,
             hook_executor: Some(executor),
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 
@@ -1369,6 +1371,7 @@ mod tests {
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         });
         let key = SessionKey::new("api", "activate-tools-probe");
         let rt = SessionRuntime::bootstrap(&profile, key, None)
@@ -1450,6 +1453,7 @@ mod tests {
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         });
 
         let rt_a = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-a"), None)

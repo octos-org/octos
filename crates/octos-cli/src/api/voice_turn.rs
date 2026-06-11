@@ -51,7 +51,11 @@ pub(crate) async fn transcribe_audio_media(
             Err(e) => tracing::warn!(audio = %path, error = %e, "voice_turn: transcription failed"),
         }
     }
-    eprintln!("[TIMING] ASR_done dur_ms={} epoch_ms={}", asr_t.elapsed().as_millis(), now_ms());
+    eprintln!(
+        "[TIMING] ASR_done dur_ms={} epoch_ms={}",
+        asr_t.elapsed().as_millis(),
+        now_ms()
+    );
     out
 }
 
@@ -72,9 +76,33 @@ fn is_tts_safe(c: char) -> bool {
         || c.is_whitespace()
         || matches!(
             c,
-            ',' | '.' | '!' | '?' | ';' | ':' | '\'' | '"' | '-' | '(' | ')'
-                | '，' | '。' | '！' | '？' | '；' | '：' | '、' | '…'
-                | '《' | '》' | '「' | '」' | '“' | '”' | '‘' | '’' | '%'
+            ',' | '.'
+                | '!'
+                | '?'
+                | ';'
+                | ':'
+                | '\''
+                | '"'
+                | '-'
+                | '('
+                | ')'
+                | '，'
+                | '。'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '、'
+                | '…'
+                | '《'
+                | '》'
+                | '「'
+                | '」'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '%'
         )
 }
 
@@ -240,7 +268,21 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
     Some(out_path)
 }
 
-pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) -> Option<PathBuf> {
+/// Synthesize a reply to an audio file, picking the TTS route from `provider`:
+/// - `"auto"`: cloud Volcano when `VOLC_TTS_*` env is configured, else
+///   on-device GPT-SoVITS.
+/// - `"volcano"`: force cloud Volcano; fall back to on-device sovits when the
+///   env is missing or the request fails.
+/// - `"sovits"` / `"qwen3"`: force the named on-device engine (no cloud).
+///
+/// `voice` is the on-device voice preset (voices.json); the cloud route uses
+/// its own `VOLC_TTS_VOICE` env instead. Returns `None` on failure.
+pub(crate) async fn synthesize_reply(
+    text: &str,
+    voice: &str,
+    provider: &str,
+    out_dir: &Path,
+) -> Option<PathBuf> {
     let speak = clean_for_tts(text);
     if speak.trim().is_empty() {
         return None;
@@ -248,23 +290,42 @@ pub(crate) async fn synthesize_reply(text: &str, voice: &str, out_dir: &Path) ->
     let tts_t = std::time::Instant::now();
     eprintln!("[TIMING] TTS_start epoch_ms={}", now_ms());
 
-    // Prefer cloud TTS (Volcano) when configured — faster (no on-device model
-    // reload) and better voice quality. Fall back to on-device ominix.
-    if let Some(cfg) = volcano_from_env() {
-        if let Some(path) = synthesize_volcano(&cfg, &speak, out_dir).await {
-            return Some(path);
+    // Cloud route. "auto" uses cloud only when env is present; "volcano" forces
+    // it (still falls back to on-device on failure). Cloud is faster (no
+    // on-device model reload) and higher quality when available.
+    let want_cloud = matches!(provider, "auto" | "volcano");
+    if want_cloud {
+        if let Some(cfg) = volcano_from_env() {
+            if let Some(path) = synthesize_volcano(&cfg, &speak, out_dir).await {
+                return Some(path);
+            }
+            tracing::warn!("voice_turn: volcano TTS failed; falling back to ominix");
+        } else if provider == "volcano" {
+            tracing::warn!(
+                "voice_turn: tts_provider=volcano but VOLC_TTS_* env missing; \
+                 falling back to on-device sovits"
+            );
         }
-        tracing::warn!("voice_turn: volcano TTS failed; falling back to ominix");
     }
 
+    // On-device route. Forced engine for "sovits"/"qwen3"; sovits otherwise.
+    let engine = if provider == "qwen3" {
+        "qwen3"
+    } else {
+        "sovits"
+    };
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
     match client
-        .synthesize_to_file(&speak, voice, None, &out_path)
+        .synthesize_to_file(&speak, voice, engine, None, &out_path)
         .await
     {
         Ok(_) => {
-            eprintln!("[TIMING] TTS_done dur_ms={} epoch_ms={}", tts_t.elapsed().as_millis(), now_ms());
+            eprintln!(
+                "[TIMING] TTS_done dur_ms={} epoch_ms={}",
+                tts_t.elapsed().as_millis(),
+                now_ms()
+            );
             Some(out_path)
         }
         Err(e) => {
@@ -281,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn synthesize_reply_returns_none_for_blank_text() {
         let dir = std::env::temp_dir();
-        let got = synthesize_reply("   ", "vivian", &dir).await;
+        let got = synthesize_reply("   ", "vivian", "auto", &dir).await;
         assert!(got.is_none());
     }
 

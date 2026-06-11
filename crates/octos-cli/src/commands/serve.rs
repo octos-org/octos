@@ -458,6 +458,7 @@ impl ServeCommand {
                 Some(&data_dir),
                 crate::runtime::BootstrapRole::Serve,
                 Some(&config.plugins),
+                config.voice.as_ref(),
             )
             .await
             {

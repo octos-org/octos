@@ -586,6 +586,7 @@ mod tests {
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 

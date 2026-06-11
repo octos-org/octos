@@ -162,6 +162,17 @@ pub struct CatalogRuntime {
     pub inference_engine: Option<String>,
 }
 
+/// Map an on-device TTS engine name to its ominix-api endpoint path.
+///
+/// Unknown values fall back to GPT-SoVITS — the lighter, default on-device
+/// engine — so a typo in config degrades gracefully instead of erroring.
+fn tts_endpoint(engine: &str) -> &'static str {
+    match engine {
+        "qwen3" => "/v1/audio/speech",
+        _ => "/v1/audio/tts/sovits",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OminixClient — async HTTP client for ominix-api
 // ---------------------------------------------------------------------------
@@ -287,24 +298,38 @@ impl OminixClient {
     }
 
     /// Synthesize text to speech, returning raw WAV bytes.
+    ///
+    /// `engine` selects the on-device TTS endpoint:
+    /// - `"sovits"` (default): GPT-SoVITS (~1.4GB, RTF ~0.4) at
+    ///   `/v1/audio/tts/sovits`.
+    /// - `"qwen3"`: the Qwen3-TTS pool at `/v1/audio/speech` (~5GB).
+    ///
+    /// Both endpoints accept the same `{ input, voice }` body. `voice` selects
+    /// the registered voice (voices.json) so the server uses its ref_audio +
+    /// ref_text → few-shot synthesis (far fewer filler artifacts than the
+    /// zero-shot startup ref). The voice name / its aliases must exist in
+    /// voices.json, else the server errors.
     pub async fn synthesize(
         &self,
         text: &str,
         voice: &str,
+        engine: &str,
         language: Option<&str>,
     ) -> Result<Vec<u8>> {
-        // Route on-device TTS to GPT-SoVITS (~1.4GB, RTF ~0.4) instead of the
-        // Qwen3-TTS pool (/v1/audio/speech, ~5GB). The reference audio loaded on
-        // the server selects the voice; we omit `voice`/`language` to avoid
-        // voices.json registry mismatches when only a single ref is loaded.
-        let _ = (voice, language);
+        // `language` is unused by the on-device few-shot path: the voice's
+        // ref_audio/ref_text already pin the language, so the engines ignore a
+        // separate language hint. Kept in the signature for cloud/future
+        // engines that do consume it.
+        let _ = language;
+        let endpoint = tts_endpoint(engine);
         let body = serde_json::json!({
             "input": text,
+            "voice": voice,
         });
 
         let resp = self
             .client
-            .post(format!("{}/v1/audio/tts/sovits", self.base_url))
+            .post(format!("{}{}", self.base_url, endpoint))
             .json(&body)
             .timeout(std::time::Duration::from_secs(120))
             .send()
@@ -328,10 +353,11 @@ impl OminixClient {
         &self,
         text: &str,
         voice: &str,
+        engine: &str,
         language: Option<&str>,
         path: &Path,
     ) -> Result<f64> {
-        let wav_bytes = self.synthesize(text, voice, language).await?;
+        let wav_bytes = self.synthesize(text, voice, engine, language).await?;
 
         if wav_bytes.len() < 44 {
             eyre::bail!("TTS returned invalid WAV data (too small)");
@@ -344,5 +370,25 @@ impl OminixClient {
         // 24kHz 16-bit mono = 48000 bytes/sec
         let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
         Ok(duration_secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tts_endpoint;
+
+    #[test]
+    fn sovits_is_the_default_endpoint() {
+        assert_eq!(tts_endpoint("sovits"), "/v1/audio/tts/sovits");
+    }
+
+    #[test]
+    fn qwen3_maps_to_speech_pool() {
+        assert_eq!(tts_endpoint("qwen3"), "/v1/audio/speech");
+    }
+
+    #[test]
+    fn unknown_engine_falls_back_to_sovits() {
+        assert_eq!(tts_endpoint("nonsense"), "/v1/audio/tts/sovits");
     }
 }

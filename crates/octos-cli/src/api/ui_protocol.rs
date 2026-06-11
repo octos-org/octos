@@ -17497,12 +17497,9 @@ async fn run_standalone_turn(
     // ── 语音轮 STT（serve 路径）────────────────────────────────────
     // 若 turn 媒体含音频，转写并并入 prompt；并记录"本轮含音频输入"，
     // 供下方决定是否合成语音回复。
-    // TODO(voice): wire profile.voice.asr_language. `VoiceConfig.asr_language`
-    // exists on `crate::config::Config` but is not plumbed through to
-    // `ProfileRuntime` (the bootstrap drops it), so it is not reachable from
-    // `session_runtime.profile` here. Plumbing a new runtime field is out of
-    // scope for this task; pass `None` (auto-detect) until then.
-    let asr_language: Option<String> = None;
+    // ASR language hint from the profile's resolved voice config (captured at
+    // bootstrap from the host config.json `voice` block). `None` → auto-detect.
+    let asr_language: Option<String> = session_runtime.profile.voice.asr_language.clone();
     // `materialize_turn_uploads` returns workspace-RELATIVE paths
     // ("uploads/<name>"). That works for the agent's own tools (cwd =
     // workspace_root), but ominix-api is a SEPARATE process that reads
@@ -18198,9 +18195,11 @@ async fn run_standalone_turn(
     // worker keeps the emitted audio ordered without blocking this loop. All
     // gated on `had_audio_input`, so text chat is untouched.
     fn drain_voice_sentences(buf: &mut String) -> Vec<String> {
-        // Strong boundaries always split; soft boundaries (commas) split only
-        // once the running segment is long enough, so a single comma-heavy
-        // sentence still streams without producing choppy 2-char fragments.
+        // Strong boundaries always split; commas (soft) split once the segment is
+        // long enough (>=8 chars) so the first audio comes out fast. Now that
+        // few-shot synthesis keeps comma-fragments free of the "啊/哦" filler
+        // (that was zero-shot, not chunking), comma-splitting buys ~1s lower
+        // first-audio latency vs whole-sentence without the artifacts.
         const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
         const SOFT: &[char] = &['，', ',', '、'];
         const SOFT_MIN_CHARS: usize = 8;
@@ -18234,12 +18233,18 @@ async fn run_standalone_turn(
         let w_session = session_id.clone();
         let w_turn = turn_id.clone();
         let w_dir = session_runtime.workspace_root.clone();
-        let w_voice = "vivian".to_string(); // TODO(voice): profile.voice.default_voice
+        let w_voice = session_runtime.profile.voice.default_voice.clone();
+        let w_provider = session_runtime.profile.voice.tts_provider.clone();
         let handle = tokio::spawn(async move {
             let mut n: usize = 0;
             while let Some(sentence) = rx.recv().await {
-                if let Some(path) =
-                    crate::api::voice_turn::synthesize_reply(&sentence, &w_voice, &w_dir).await
+                if let Some(path) = crate::api::voice_turn::synthesize_reply(
+                    &sentence,
+                    &w_voice,
+                    &w_provider,
+                    &w_dir,
+                )
+                .await
                 {
                     let rel = path
                         .file_name()
@@ -18627,10 +18632,12 @@ async fn run_standalone_turn(
     // path above produced no audio (e.g. a reply with no sentence boundaries).
     if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
-            let voice = "vivian"; // TODO(voice): wire profile.voice.default_voice
+            let voice = session_runtime.profile.voice.default_voice.as_str();
+            let provider = session_runtime.profile.voice.tts_provider.as_str();
             let reply_audio_dir = session_runtime.workspace_root.as_path();
             if let Some(audio_path) =
-                crate::api::voice_turn::synthesize_reply(reply, voice, reply_audio_dir).await
+                crate::api::voice_turn::synthesize_reply(reply, voice, provider, reply_audio_dir)
+                    .await
             {
                 // Deliver via the EXISTING file/attached carrier. Emit the
                 // WORKSPACE-RELATIVE filename, NOT the absolute path:
@@ -36064,6 +36071,7 @@ ignore = []
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 

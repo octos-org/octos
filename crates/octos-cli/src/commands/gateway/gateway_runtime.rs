@@ -316,6 +316,7 @@ impl GatewayRuntime {
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
                 Some(&config.plugins),
+                config.voice.as_ref(),
             )
             .await
             {
