@@ -219,7 +219,7 @@ impl GatewayDispatcher {
                     match crate::project_templates::scaffold_site_project(
                         &workspace_root,
                         &profile_id,
-                        session_key.chat_id(),
+                        crate::project_templates::preview_session_id(session_key),
                         name,
                         data_dir,
                     ) {

@@ -267,7 +267,7 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
         match crate::project_templates::scaffold_site_project(
             &workspace_root,
             &profile_id,
-            ctx.session_id.chat_id(),
+            crate::project_templates::preview_session_id(&ctx.session_id),
             topic,
             &ctx.data_dir,
         ) {
