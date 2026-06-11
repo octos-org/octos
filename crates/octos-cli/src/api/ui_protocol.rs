@@ -9772,13 +9772,30 @@ async fn handle_turn_start(
         return;
     }
 
-    let Some(prompt) = prompt_text(&params.input) else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params("turn/start requires at least one text input item"),
-        );
-        return;
+    let prompt = match prompt_text(&params.input) {
+        Some(p) => p,
+        None => {
+            // Voice turns carry audio media and NO text item — the
+            // serve-path STT inside `run_standalone_turn` transcribes the
+            // audio into the prompt. Accept such a turn with an empty
+            // prompt; reject only when there is neither text nor audio to
+            // act on (the original "requires a text input item" contract
+            // for text-only clients).
+            if params
+                .media
+                .iter()
+                .any(|m| octos_bus::media::is_audio(&m.path))
+            {
+                String::new()
+            } else {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params("turn/start requires at least one text input item"),
+                );
+                return;
+            }
+        }
     };
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
@@ -16142,7 +16159,9 @@ async fn run_standalone_turn(
     contracts: Arc<UiProtocolContractStores>,
     features: ConnectionUiFeatures,
     params: TurnStartParams,
-    prompt: String,
+    // Voice (语音轮): made `mut` so the serve/WS turn/start path can merge
+    // transcribed audio media into the prompt text before the agent runs.
+    mut prompt: String,
     routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
@@ -17464,7 +17483,7 @@ async fn run_standalone_turn(
         .iter()
         .map(|file_ref| file_ref.path.clone())
         .collect();
-    let turn_media_paths: Vec<String> = octos_bus::file_handle::materialize_turn_uploads(
+    let mut turn_media_paths: Vec<String> = octos_bus::file_handle::materialize_turn_uploads(
         &session_runtime.workspace_root,
         // #1377: bind to the session's OWNING TENANT so the materializer only
         // copies uploads owned by this tenant (cross-tenant handles dropped).
@@ -17475,6 +17494,61 @@ async fn run_standalone_turn(
         Some(session_runtime.profile.profile_id.as_str()),
         &raw_media,
     );
+    // ── 语音轮 STT（serve 路径）────────────────────────────────────
+    // 若 turn 媒体含音频，转写并并入 prompt；并记录"本轮含音频输入"，
+    // 供下方决定是否合成语音回复。
+    // ASR language hint from the profile's resolved voice config (captured at
+    // bootstrap from the host config.json `voice` block). `None` → auto-detect.
+    let asr_language: Option<String> = session_runtime.profile.voice.asr_language.clone();
+    // `materialize_turn_uploads` returns workspace-RELATIVE paths
+    // ("uploads/<name>"). That works for the agent's own tools (cwd =
+    // workspace_root), but ominix-api is a SEPARATE process that reads
+    // `audio_path` off disk under ITS own cwd — a relative path 404s there.
+    // Resolve to absolute against workspace_root before transcription.
+    let asr_media: Vec<String> = turn_media_paths
+        .iter()
+        .map(|p| {
+            let pb = std::path::Path::new(p);
+            if pb.is_absolute() {
+                p.clone()
+            } else {
+                session_runtime
+                    .workspace_root
+                    .join(pb)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })
+        .collect();
+    tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
+    let voice_transcripts =
+        crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
+    let had_audio_input = !voice_transcripts.is_empty();
+    tracing::debug!(
+        transcripts = voice_transcripts.len(),
+        had_audio_input,
+        "voice_turn: STT result"
+    );
+    if had_audio_input {
+        let joined = voice_transcripts.join("\n");
+        prompt = if prompt.trim().is_empty() {
+            joined
+        } else {
+            format!("{}\n{}", prompt, joined)
+        };
+        // Voice-turn only (had_audio_input): replies are spoken aloud by TTS, so
+        // ask for short, speakable answers. Text chat (had_audio_input == false)
+        // keeps its normal detailed/formatted persona — this branch never runs there.
+        prompt = format!(
+            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。]"
+        );
+        // The audio is now in the prompt as text. Drop it from the
+        // agent-visible media so the model answers the transcript directly
+        // instead of re-transcribing the workspace audio file — with the
+        // always-on voice skill present, an audio attachment otherwise lures
+        // the agent into calling `voice_transcribe` / exploring the workspace.
+        turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
+    }
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
@@ -18114,6 +18188,86 @@ async fn run_standalone_turn(
     // a once-write; using a mutable u64 keeps the wiring narrow and
     // avoids a second pass through `response.token_usage`.
     let mut final_tokens_consumed: u64 = 0;
+
+    // ── Voice turn: sentence-streamed TTS ─────────────────────────────
+    // For voice turns, synthesize the reply sentence-by-sentence AS the LLM
+    // streams `token` events, instead of waiting for the whole reply. A FIFO
+    // worker keeps the emitted audio ordered without blocking this loop. All
+    // gated on `had_audio_input`, so text chat is untouched.
+    fn drain_voice_sentences(buf: &mut String) -> Vec<String> {
+        // Strong boundaries always split; commas (soft) split once the segment is
+        // long enough (>=8 chars) so the first audio comes out fast. Now that
+        // few-shot synthesis keeps comma-fragments free of the "啊/哦" filler
+        // (that was zero-shot, not chunking), comma-splitting buys ~1s lower
+        // first-audio latency vs whole-sentence without the artifacts.
+        const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
+        const SOFT: &[char] = &['，', ',', '、'];
+        const SOFT_MIN_CHARS: usize = 8;
+        let mut out = Vec::new();
+        loop {
+            let mut cut = None;
+            for (count, (i, c)) in buf.char_indices().enumerate() {
+                if STRONG.contains(&c) || (SOFT.contains(&c) && count + 1 >= SOFT_MIN_CHARS) {
+                    cut = Some(i + c.len_utf8());
+                    break;
+                }
+            }
+            match cut {
+                Some(idx) => {
+                    let sentence = buf[..idx].trim().to_string();
+                    *buf = buf[idx..].to_string();
+                    if !sentence.is_empty() {
+                        out.push(sentence);
+                    }
+                }
+                None => break,
+            }
+        }
+        out
+    }
+    let mut voice_buf = String::new();
+    let mut voice_streamed_count: usize = 0;
+    let (voice_tx, voice_handle) = if had_audio_input {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let w_ledger = ledger.clone();
+        let w_session = session_id.clone();
+        let w_turn = turn_id.clone();
+        let w_dir = session_runtime.workspace_root.clone();
+        let w_voice = session_runtime.profile.voice.default_voice.clone();
+        let w_provider = session_runtime.profile.voice.tts_provider.clone();
+        let handle = tokio::spawn(async move {
+            let mut n: usize = 0;
+            while let Some(sentence) = rx.recv().await {
+                if let Some(path) = crate::api::voice_turn::synthesize_reply(
+                    &sentence,
+                    &w_voice,
+                    &w_provider,
+                    &w_dir,
+                )
+                .await
+                {
+                    let rel = path
+                        .file_name()
+                        .map(|x| x.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                        &w_ledger,
+                        &w_session,
+                        &w_turn,
+                        std::slice::from_ref(&rel),
+                        &[],
+                        None,
+                    );
+                    n += 1;
+                }
+            }
+            n
+        });
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
     loop {
         // Race progress events against the interrupt signal so an interrupt
         // can wake us out of `progress_rx.recv()` even if the agent task is
@@ -18238,6 +18392,21 @@ async fn run_standalone_turn(
                 break;
             }
             _ => {
+                // Voice turn: accumulate streamed `token` text and hand off
+                // each complete sentence to the FIFO TTS worker for immediate
+                // synthesis (overlaps with the rest of LLM generation).
+                if let Some(ref tx) = voice_tx {
+                    if event.get("type").and_then(Value::as_str) == Some("token") {
+                        if let Some(t) = event.get("text").and_then(Value::as_str) {
+                            voice_buf.push_str(t);
+                            for sentence in drain_voice_sentences(&mut voice_buf) {
+                                if tx.try_send(sentence).is_ok() {
+                                    voice_streamed_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 forward_progress_event(
                     &ws,
                     &ledger,
@@ -18250,6 +18419,21 @@ async fn run_standalone_turn(
                     &event,
                 );
             }
+        }
+    }
+
+    // Voice turn: flush the trailing partial sentence, close the channel, and
+    // wait for the FIFO TTS worker to finish emitting all sentence audio.
+    if let Some(tx) = voice_tx {
+        if !interrupt_observed {
+            let tail = voice_buf.trim().to_string();
+            if !tail.is_empty() && tx.try_send(tail).is_ok() {
+                voice_streamed_count += 1;
+            }
+        }
+        drop(tx);
+        if let Some(handle) = voice_handle {
+            voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
         }
     }
 
@@ -18434,6 +18618,50 @@ async fn run_standalone_turn(
     // half is guaranteed to be either delivered or dropped — this
     // `await` will not block.
     let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
+
+    // ── 语音轮 TTS（serve 路径）────────────────────────────────────
+    // 仅当本轮有音频输入（语音轮）时，把最终文本回复合成为音频并下发，
+    // 客户端据此自动播放。失败静默跳过，不影响文本回复。
+    //
+    // 下发复用既有 file/attached 机制（spawn_only / send_file 产物走的
+    // 同一条通路）：把合成出的 .wav 写到 turn 的 workspace_root 下，
+    // 再通过 `emit_files_attached_from_background` 发一个 file/attached
+    // 信封。SPA 把它折进当前 assistant 消息的 `files`，并经 buildFileUrl
+    // 拉取（workspace_root 即 spawn_only 产物的同一可达目录）。
+    // Fallback: only synthesize the whole reply at once if the sentence-streamed
+    // path above produced no audio (e.g. a reply with no sentence boundaries).
+    if had_audio_input && voice_streamed_count == 0 {
+        if let Some(reply) = final_response_content.as_deref() {
+            let voice = session_runtime.profile.voice.default_voice.as_str();
+            let provider = session_runtime.profile.voice.tts_provider.as_str();
+            let reply_audio_dir = session_runtime.workspace_root.as_path();
+            if let Some(audio_path) =
+                crate::api::voice_turn::synthesize_reply(reply, voice, provider, reply_audio_dir)
+                    .await
+            {
+                // Deliver via the EXISTING file/attached carrier. Emit the
+                // WORKSPACE-RELATIVE filename, NOT the absolute path:
+                // `/api/files` (resolve_within_workspace) rejects absolute
+                // paths and serves only paths resolved inside the session
+                // workspace. The reply wav is written directly under
+                // workspace_root, so the relative form is just its file name.
+                // No `tool_call_id` (server-initiated attach, not a tool result).
+                let audio_rel = audio_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| audio_path.to_string_lossy().into_owned());
+                super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    std::slice::from_ref(&audio_rel),
+                    &[],
+                    None,
+                );
+                tracing::info!(audio = %audio_path.display(), "voice_turn: synthesized reply audio");
+            }
+        }
+    }
 
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
     // AFTER the model reply has been persisted to the per-session
@@ -35843,6 +36071,7 @@ ignore = []
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 

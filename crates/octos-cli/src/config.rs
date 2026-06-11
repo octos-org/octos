@@ -459,6 +459,18 @@ pub struct VoiceConfig {
     /// Default ASR language hint. Default: None (auto-detect).
     #[serde(default)]
     pub asr_language: Option<String>,
+    /// Which TTS route to use for synthesized replies:
+    /// - `"auto"` (default): cloud Volcano when the `VOLC_TTS_*` env is
+    ///   configured, otherwise the on-device GPT-SoVITS engine.
+    /// - `"volcano"`: force cloud Volcano (falls back to on-device sovits
+    ///   when the env is missing or the request fails).
+    /// - `"sovits"`: force the on-device GPT-SoVITS engine.
+    /// - `"qwen3"`: force the on-device Qwen3-TTS pool.
+    ///
+    /// Cloud credentials always come from `VOLC_TTS_*` env vars (secrets are
+    /// never read from config); this switch only selects the *route*.
+    #[serde(default = "default_tts_provider")]
+    pub tts_provider: String,
 }
 
 impl Default for VoiceConfig {
@@ -469,6 +481,7 @@ impl Default for VoiceConfig {
             auto_tts: true,
             default_voice: default_voice_preset(),
             asr_language: None,
+            tts_provider: default_tts_provider(),
         }
     }
 }
@@ -478,6 +491,9 @@ fn voice_default_true() -> bool {
 }
 fn default_voice_preset() -> String {
     "vivian".to_string()
+}
+fn default_tts_provider() -> String {
+    "auto".to_string()
 }
 
 /// Adaptive routing mode (config-level, maps to `AdaptiveMode` at runtime).
@@ -2065,5 +2081,28 @@ mod tests {
         }"#;
         let cfg: AdaptiveRoutingConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.auto_escalation.enabled);
+    }
+
+    #[test]
+    fn voice_config_defaults_tts_provider_to_auto() {
+        let cfg = VoiceConfig::default();
+        assert_eq!(cfg.tts_provider, "auto");
+        assert_eq!(cfg.default_voice, "vivian");
+    }
+
+    #[test]
+    fn voice_config_tts_provider_defaults_when_omitted() {
+        // A profile that sets only some voice fields still gets a valid route.
+        let json = r#"{ "default_voice": "doubao" }"#;
+        let cfg: VoiceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tts_provider, "auto");
+        assert_eq!(cfg.default_voice, "doubao");
+    }
+
+    #[test]
+    fn voice_config_tts_provider_roundtrips() {
+        let json = r#"{ "tts_provider": "sovits" }"#;
+        let cfg: VoiceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tts_provider, "sovits");
     }
 }
