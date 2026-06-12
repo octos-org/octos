@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn bundled_app_skills_is_non_empty() {
-        assert!(!BUNDLED_APP_SKILLS.is_empty());
+        assert_ne!(BUNDLED_APP_SKILLS.len(), 0);
     }
 
     #[test]
@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn platform_skills_is_non_empty() {
-        assert!(!PLATFORM_SKILLS.is_empty());
+        assert_ne!(PLATFORM_SKILLS.len(), 0);
     }
 
     #[test]

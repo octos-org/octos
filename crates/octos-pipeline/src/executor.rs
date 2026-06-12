@@ -2944,7 +2944,7 @@ impl PipelineExecutor {
                             // a dynamic worker defaults to the 1h ceiling/Abort
                             // and ignores a configured skip/retry. (codex #1427)
                             deadline_secs: node.deadline_secs,
-                            deadline_action: node.deadline_action.clone(),
+                            deadline_action: node.deadline_action,
                             ..Default::default()
                         },
                     ));

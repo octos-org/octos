@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn bundled_pipelines_is_non_empty() {
-        assert!(!BUNDLED_PIPELINES.is_empty());
+        assert_ne!(BUNDLED_PIPELINES.len(), 0);
     }
 
     #[test]
