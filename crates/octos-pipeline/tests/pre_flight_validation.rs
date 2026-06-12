@@ -21,7 +21,7 @@ impl octos_llm::LlmProvider for MockProvider {
         _config: &octos_llm::ChatConfig,
     ) -> eyre::Result<octos_llm::ChatResponse> {
         Ok(octos_llm::ChatResponse {
-            content: Some("ok".into()),
+            content: Some("DOT_UI_SMOKE_OK".into()),
             tool_calls: vec![],
             stop_reason: octos_llm::StopReason::EndTurn,
             usage: octos_llm::TokenUsage::default(),
@@ -219,5 +219,45 @@ async fn pre_flight_rejects_malformed_json_args() {
     assert!(
         err.contains("invalid run_pipeline input"),
         "error must reference the input shape — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn text_only_ir_pipeline_synthesizes_report_under_working_dir() {
+    let (tool, working, _data) = make_tool().await;
+    let tool = tool.with_ir_enabled(true);
+    let args = serde_json::json!({
+        "input": "ignored",
+        "ir": r#"{"id":"dot_delivery_smoke","nodes":[{"id":"start","kind":{"type":"transform","prompt":"Return exactly DOT_UI_SMOKE_OK"}}],"edges":[]}"#,
+    });
+
+    let result = tool
+        .execute(&args)
+        .await
+        .expect("text-only IR pipeline should execute");
+
+    assert!(result.success, "pipeline should succeed: {}", result.output);
+    assert!(
+        result.output.contains("DOT_UI_SMOKE_OK"),
+        "pipeline stdout should be in tool output: {}",
+        result.output
+    );
+    assert_eq!(
+        result.files_to_send.len(),
+        1,
+        "text-only pipeline should synthesize one deliverable report"
+    );
+
+    let report = &result.files_to_send[0];
+    let expected_root = working.path().join("skill-output").join("run_pipeline");
+    assert!(
+        report.starts_with(&expected_root),
+        "synthetic report must live under the tool working dir so send_file can deliver it; got {}",
+        report.display()
+    );
+    assert!(
+        report.exists(),
+        "synthetic report path should exist: {}",
+        report.display()
     );
 }
