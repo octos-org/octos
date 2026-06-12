@@ -295,6 +295,7 @@ impl WeComChannel {
                 }
             }),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         })
     }
 

@@ -106,6 +106,7 @@ impl HeartbeatService {
                 "deliver_to_chat_id": "heartbeat",
             }),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         };
 
         if let Err(e) = self.inbound_tx.send(msg).await {

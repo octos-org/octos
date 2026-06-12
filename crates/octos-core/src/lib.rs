@@ -20,7 +20,7 @@ mod utils;
 
 pub use abort::{abort_response, is_abort_trigger};
 pub use error::{Error, ErrorKind, Result};
-pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, OutboundMessage};
+pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, MessageOrigin, OutboundMessage};
 pub use message::AgentMessage;
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,

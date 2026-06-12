@@ -136,6 +136,7 @@ impl EventHandler for Handler {
                 "guild_id": msg.guild_id.map(|g| g.to_string()),
             }),
             message_id: Some(msg.id.to_string()),
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if let Err(e) = self.inbound_tx.send(inbound).await {

@@ -254,6 +254,7 @@ impl Channel for WhatsAppChannel {
                                 }
                             }),
                             message_id: None,
+                            origin: octos_core::MessageOrigin::ExternalUser,
                         };
 
                         if inbound_tx.send(inbound).await.is_err() {

@@ -140,6 +140,7 @@ impl WeChatChannel {
             media: vec![],
             metadata,
             message_id,
+            origin: octos_core::MessageOrigin::ExternalUser,
         })
     }
 }
