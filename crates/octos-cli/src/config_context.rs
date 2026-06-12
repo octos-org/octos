@@ -137,9 +137,9 @@ fn xdg_config_home() -> PathBuf {
                 return p.join("octos");
             }
         }
-        return dirs::home_dir()
+        dirs::home_dir()
             .map(|h| h.join(".config").join("octos"))
-            .unwrap_or_else(default_data_dir);
+            .unwrap_or_else(default_data_dir)
     }
 }
 

@@ -6628,7 +6628,7 @@ mod tests {
                 "router/get_metrics",
             ]
         );
-        assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
+        assert_eq!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.len(), 0);
     }
 
     #[test]

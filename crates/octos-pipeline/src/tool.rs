@@ -988,7 +988,7 @@ impl Tool for RunPipelineTool {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
             memory: self.memory.clone(),
-            working_dir: effective_working_dir,
+            working_dir: effective_working_dir.clone(),
             provider_policy: self.provider_policy.clone(),
             plugin_dirs: self.plugin_dirs.clone(),
             plugin_require_signed: self.plugin_require_signed,
@@ -1166,8 +1166,12 @@ impl Tool for RunPipelineTool {
         // truncation marker then points at this report so nothing is lost and
         // the LLM/user knows where the full output is. When not truncated, the
         // prior spawn_only delivery path is unchanged (real `.md` wins; else
-        // synthesize a payload so `files_to_send` is non-empty).
-        let synthetic_dir = std::env::temp_dir().join("octos_pipeline_synthetic");
+        // synthesize a payload so `files_to_send` is non-empty). Keep the
+        // synthetic report under `working_dir` so the spawn_only send_file path
+        // can deliver it; system temp is outside that allowlist.
+        let synthetic_dir = effective_working_dir
+            .join("skill-output")
+            .join("run_pipeline");
         let delivery = resolve_report_delivery(
             &result.output,
             &result.files_modified,
@@ -1240,7 +1244,8 @@ pub(crate) struct ReportDelivery {
 ///   `ToolResult.output` already carries the whole result).
 ///
 /// `synthetic_dir` is injected so tests can use a tempdir; production passes
-/// `std::env::temp_dir().join("octos_pipeline_synthetic")`.
+/// `<working_dir>/skill-output/run_pipeline` so spawn_only delivery stays
+/// inside the `send_file` allowlist.
 pub(crate) fn resolve_report_delivery(
     full_output: &str,
     files_modified: &[PathBuf],
