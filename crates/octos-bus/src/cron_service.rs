@@ -438,6 +438,7 @@ impl CronService {
                 "deliver_to_chat_id": job.payload.chat_id,
             }),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if let Err(e) = self.inbound_tx.send(msg).await {

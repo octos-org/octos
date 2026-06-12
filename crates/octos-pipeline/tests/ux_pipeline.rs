@@ -795,6 +795,7 @@ async fn test_07_inbound_message_carries_media() {
         ],
         metadata: serde_json::json!({}),
         message_id: None,
+        origin: octos_core::MessageOrigin::ExternalUser,
     };
 
     assert_eq!(msg.media.len(), 2);
@@ -1617,6 +1618,7 @@ async fn test_22_inbound_media_to_agent_message() {
         media: vec!["/tmp/media/document.pdf".into()],
         metadata: serde_json::json!({}),
         message_id: Some("msg-123".into()),
+        origin: octos_core::MessageOrigin::ExternalUser,
     };
 
     // Verify the message carries all necessary info
@@ -1660,6 +1662,7 @@ async fn test_22_inbound_media_empty_content_gets_placeholder() {
         media: vec!["/tmp/media/photo.jpg".into()],
         metadata: serde_json::json!({}),
         message_id: None,
+        origin: octos_core::MessageOrigin::ExternalUser,
     };
 
     let content = if inbound.content.is_empty() && !inbound.media.is_empty() {

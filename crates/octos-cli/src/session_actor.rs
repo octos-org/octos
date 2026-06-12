@@ -943,6 +943,45 @@ fn inbound_is_master_continuation(inbound: &InboundMessage) -> bool {
         .unwrap_or(false)
 }
 
+/// Decide whether forced-workflow keyword detection may run on this turn.
+///
+/// #1455: detection must only see EXTERNAL user traffic. Synthetic
+/// self-messages (child-completion notices, master continuations, recovery
+/// turns) embed workflow labels in their text — a deep-research completion
+/// notice always contains "Deep research" — so running detection on them
+/// respawns the workflow they report on: an unbounded feedback loop that is
+/// independent of child success/failure.
+///
+/// The `_completion_review` metadata check predates `MessageOrigin` and
+/// stays as defense in depth; `origin` is the load-bearing gate because it
+/// covers every synthetic producer by construction instead of requiring
+/// each one to opt out by flag.
+fn forced_workflow_detection_allowed(
+    inbound: &InboundMessage,
+    actor_channel: &str,
+    image_media: &[String],
+    attachment_media: &[String],
+) -> bool {
+    if !image_media.is_empty() || !attachment_media.is_empty() {
+        return false;
+    }
+    if actor_channel == "system" {
+        return false;
+    }
+    if !inbound.is_external_user() {
+        return false;
+    }
+    if inbound
+        .metadata
+        .get("_completion_review")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
+}
+
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
     let topic = session_key.topic()?;
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
@@ -4352,6 +4391,7 @@ impl SessionActor {
             media: vec![],
             metadata: serde_json::Value::Object(metadata),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         }
     }
 
@@ -4385,6 +4425,7 @@ impl SessionActor {
             media: vec![],
             metadata: serde_json::Value::Object(metadata),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         }
     }
 
@@ -4413,6 +4454,7 @@ impl SessionActor {
             media: vec![],
             metadata: serde_json::Value::Object(metadata),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         }
     }
 
@@ -6079,22 +6121,7 @@ impl SessionActor {
         image_media: &[String],
         attachment_media: &[String],
     ) -> Option<WorkflowInstance> {
-        if !image_media.is_empty() || !attachment_media.is_empty() {
-            return None;
-        }
-        if self.channel == "system" {
-            return None;
-        }
-        // A completion-review turn is a system-internal prompt that EMBEDS the
-        // finished task's label (e.g. "Deep research"). Running forced-workflow
-        // detection on it would match that label and spawn a DUPLICATE workflow
-        // instead of reviewing the result — re-triggering on every completion up
-        // to the auto-turn cap. Never force a workflow from a review prompt.
-        if inbound
-            .metadata
-            .get("_completion_review")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        if !forced_workflow_detection_allowed(inbound, &self.channel, image_media, attachment_media)
         {
             return None;
         }
@@ -10313,6 +10340,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -10331,6 +10359,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![attachment_path.to_string()],
@@ -11092,6 +11121,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: Some("client-msg-bravo".to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -11584,6 +11614,7 @@ mod tests {
                     "client_message_id": "client-msg-overflow-test",
                 }),
                 message_id: Some("client-msg-overflow-test".to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -11708,6 +11739,7 @@ mod tests {
                     "client_message_id": primary_cmid,
                 }),
                 message_id: Some(primary_cmid.to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -11732,6 +11764,7 @@ mod tests {
                     "client_message_id": overflow_cmid,
                 }),
                 message_id: Some(overflow_cmid.to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -13569,6 +13602,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         registry
@@ -13612,6 +13646,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         registry
@@ -13656,6 +13691,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
         registry
             .dispatch(DispatchParams {
@@ -13683,6 +13719,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
         registry
             .dispatch(DispatchParams {
@@ -13733,6 +13770,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
         registry
             .dispatch(DispatchParams {
@@ -14016,6 +14054,85 @@ mod tests {
             ),
             Some(WorkflowKind::DeepResearch)
         );
+    }
+
+    /// The exact shape of the #1455 production loop: a ChildCompleted
+    /// master-continuation notice whose metadata embeds the child's own
+    /// nickname ("Deep research"). The notice text DOES match detection —
+    /// that is the trap — so the origin gate must refuse to run detection
+    /// on it.
+    #[test]
+    fn should_not_allow_forced_workflow_when_inbound_is_synthetic() {
+        let notice = "[system-internal]\nA supervised child agent finished.\n\n\
+            Child agent: task-dspfac-telegram-1#databricks-child-1\n\
+            Group: agent-group:dspfac:telegram:1#databricks:master\n\
+            Metadata:\n- nickname: Deep research deep_research\n- status: failed\n\
+            - summary: deep_research completed without required report terminal artifact\n\n\
+            Give the user a concise progress update.";
+        // Prove the trap exists: the notice itself matches detection.
+        assert_eq!(
+            WorkflowKind::detect_forced_background(notice),
+            Some(WorkflowKind::DeepResearch)
+        );
+        let inbound = InboundMessage {
+            channel: "telegram".to_string(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: "1".to_string(),
+            content: notice.to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({ "_master_continuation": true }),
+            message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
+        };
+        assert!(
+            !forced_workflow_detection_allowed(&inbound, "telegram", &[], &[]),
+            "synthetic self-message must never reach forced-workflow detection (#1455)"
+        );
+    }
+
+    /// Regression guard for the legitimate path: a real external user
+    /// research request must still be eligible for forced detection.
+    #[test]
+    fn should_allow_forced_workflow_for_external_user_research_request() {
+        let inbound = InboundMessage {
+            channel: "telegram".to_string(),
+            sender_id: "8516089817".to_string(),
+            chat_id: "8516089817".to_string(),
+            content: "深度搜索一下databricks业务模式被ai agent的影响".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        };
+        assert!(forced_workflow_detection_allowed(
+            &inbound,
+            "telegram",
+            &[],
+            &[]
+        ));
+        assert_eq!(
+            WorkflowKind::detect_forced_background(&inbound.content),
+            Some(WorkflowKind::DeepResearch)
+        );
+        // Media-bearing and completion-review turns stay excluded.
+        assert!(!forced_workflow_detection_allowed(
+            &inbound,
+            "telegram",
+            &["img.png".to_string()],
+            &[]
+        ));
+        let review = InboundMessage {
+            metadata: serde_json::json!({ "_completion_review": true }),
+            ..inbound.clone()
+        };
+        assert!(!forced_workflow_detection_allowed(
+            &review,
+            "telegram",
+            &[],
+            &[]
+        ));
     }
 
     #[test]
@@ -15798,6 +15915,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],

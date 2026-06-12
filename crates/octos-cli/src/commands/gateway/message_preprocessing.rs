@@ -308,6 +308,7 @@ mod tests {
             media: media.into_iter().map(|path| path.to_string()).collect(),
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         }
     }
 

@@ -3594,6 +3594,7 @@ impl Tool for SpawnTool {
                         "deliver_to_chat_id": origin_chat_id,
                     }),
                     message_id: None,
+                    origin: octos_core::MessageOrigin::Synthetic,
                 };
 
                 if let Err(e) = inbound_tx.send(announce).await {

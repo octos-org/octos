@@ -207,6 +207,7 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
             media: vec![],
             metadata: serde_json::json!({ "subject": subject }),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if tx.send(inbound).await.is_err() {

@@ -1232,6 +1232,7 @@ impl FeishuChannel {
                 }
             }),
             message_id: Some(message_id.to_string()),
+            origin: octos_core::MessageOrigin::ExternalUser,
         })
     }
 

@@ -1622,6 +1622,7 @@ async fn handle_chat(
                 serde_json::Value::Object(metadata)
             },
             message_id: Some(request_thread_id.clone()),
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if let Err(e) = state.inbound_tx.send(inbound).await {
