@@ -639,6 +639,19 @@ impl WsConnection {
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
                         Some(msg) => {
+                            // Mirror the stdio transport's evidence recording:
+                            // capture every server->client frame into the AppUI
+                            // evidence transcript when M15 UX capture is active.
+                            // Without this the WebSocket evidence transcript only
+                            // held client->server requests, so soak verifiers that
+                            // require backend `task/updated` / `agent/updated`
+                            // notifications could never pass over WS. The append
+                            // is a no-op unless OCTOS_TUI_M15_UX_OUTPUT_DIR is set.
+                            if let WsMessage::Text(text) = &msg {
+                                if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
+                                    append_appui_transcript_frame("server_to_client", frame);
+                                }
+                            }
                             if sink.send(msg).await.is_err() {
                                 break;
                             }
@@ -6212,16 +6225,43 @@ async fn tool_status_list_result(
         });
     let tool_names = model_visible_tool_names(registry);
     let registered_names = registered_tool_names(registry);
+    let deferred_names = deferred_model_tool_names(registry);
+    // Codex BLOCK (#1419 review): `deferred_model_tool_names` returns the RAW
+    // deferred set — `ToolRegistry::deferred_tool_names()` applies no
+    // provider-policy/context filter. A tool that is both deferred AND
+    // policy-denied can never be recovered by `activate_tools`
+    // (`is_tool_visible_post_activation` stays false), so it must NOT count as
+    // a recoverable "deferred" tool: keep it in the disabled set
+    // (`disabled_by_policy`) and drop it from the deferred listing the LLM
+    // sees. Mirrors the PR #865 standard ("the LLM never sees a name it can't
+    // actually call"). Only deferred names that WOULD become visible after
+    // activation are the genuine recoverable-deferred set.
+    let recoverable_deferred: Vec<String> = deferred_names
+        .iter()
+        .filter(|name| registry.is_some_and(|r| r.is_tool_visible_post_activation(name)))
+        .cloned()
+        .collect();
     let visible_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
+    let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
+    // A registered-but-not-visible tool is either disabled by the effective
+    // tool policy OR merely LRU-deferred (registered, filtered out of
+    // `specs()`, recoverable via `activate_tools`). The coding tool contract
+    // checks the disabled set before the deferred set, so the recoverable
+    // deferred names MUST be excluded here — otherwise the canonical P0
+    // runtime/subagent tools regress to `disabled_by_policy` and the contract
+    // drops to `status: incomplete` on a healthy solo session. A deferred tool
+    // that policy still denies is intentionally NOT excluded (it stays
+    // disabled_by_policy). #970 / M14-E.
     let disabled_tool_names = registered_names
         .iter()
-        .filter(|name| !visible_names.contains(name.as_str()))
+        .filter(|name| {
+            !visible_names.contains(name.as_str()) && !deferred_set.contains(name.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let deferred_names = deferred_model_tool_names(registry);
-    let deferred_name_refs: Vec<&str> = deferred_names.iter().map(String::as_str).collect();
+    let deferred_name_refs: Vec<&str> = recoverable_deferred.iter().map(String::as_str).collect();
     let permission_state = session_permission_profiles().get_state(session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
@@ -15558,6 +15598,21 @@ async fn run_m15_live_subagent_fixture_turn(
         .map(PathBuf::from)
         .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // The supervised subagent processes are spawned with `cwd(workdir)`.
+    // When the workdir is derived from the evidence dir (the default when
+    // OCTOS_TUI_M15_UX_WORKDIR is unset) it does not exist yet, so the
+    // process spawn fails with "No such file or directory (os error 2)"
+    // and every review agent reports `m15subagentfailed`. Materialize it
+    // up front so the fixture's child processes have a valid cwd.
+    if let Err(error) = std::fs::create_dir_all(&workdir) {
+        return M9FixtureOutcome::Errored {
+            code: "m15_workdir_failed",
+            message: format!(
+                "failed to create live subagent workdir {}: {error}",
+                workdir.display()
+            ),
+        };
+    }
     let evidence_dir = appui_evidence_dir().unwrap_or_else(|| workdir.join(".octos-m15-evidence"));
     let artifact_dir = evidence_dir.join("agent-artifacts");
     if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
@@ -25655,6 +25710,177 @@ ignore = []
         assert_ne!(
             exec_command["status"],
             json!(coding_tool_contract::TOOL_STATUS_MISSING)
+        );
+    }
+
+    #[test]
+    fn lru_deferred_required_tools_are_reported_deferred_not_disabled_by_policy() {
+        // Regression: the live `tool_status_list_result` path computes the
+        // disabled set as `registered ∧ ¬visible`, which subsumes the
+        // LRU-deferred set (deferred tools are registered but filtered out
+        // of `specs()`). The coding tool contract checks `disabled` before
+        // `deferred`, so without excluding the deferred names the canonical
+        // P0 runtime/subagent tools regress to `disabled_by_policy` and the
+        // contract reports `status: incomplete` on a healthy solo session.
+        // Mirror the exact live-path computation here so the call site stays
+        // honest. #970 / M14-E.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        // Auto-defer (not context-filter) the canonical runtime + subagent
+        // groups, exactly as the per-session LRU resolver does once a
+        // profile carries enough tools to trip the defer threshold.
+        registry.defer_group("group:runtime");
+        registry.defer_group("group:sessions");
+
+        let deferred = deferred_model_tool_names(Some(&registry));
+        assert!(
+            deferred.iter().any(|name| name == "exec_command"),
+            "test precondition: exec_command must be deferred, got {deferred:?}"
+        );
+
+        let visible = model_visible_tool_names(Some(&registry));
+        let registered = registered_tool_names(Some(&registry));
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        // Mirror the live path: only deferred tools that survive the effective
+        // policy post-activation are recoverable-deferred. No tool is denied
+        // here, so every deferred tool is recoverable.
+        let recoverable_deferred: Vec<String> = deferred
+            .iter()
+            .filter(|name| registry.is_tool_visible_post_activation(name))
+            .cloned()
+            .collect();
+        let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
+        // This is the production computation under test: disabled must NOT
+        // include deferred-but-recoverable tools.
+        let disabled = registered
+            .iter()
+            .filter(|name| {
+                !visible_set.contains(name.as_str()) && !deferred_set.contains(name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
+        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = recoverable_deferred.iter().map(String::as_str).collect::<Vec<_>>();
+        let payload = coding_tool_contract::tool_status_list_payload(
+            coding_tool_contract::ToolStatusListContext {
+                available_model_tools: &visible_refs,
+                disabled_model_tools: &disabled_refs,
+                deferred_model_tools: &deferred_refs,
+                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
+            },
+        );
+        let contract = &payload["coding_tool_contract"];
+        assert_eq!(
+            contract["status"],
+            json!("ready"),
+            "LRU-deferred P0 tools must keep the contract ready; missing={:?}",
+            contract["missing_required_tools"]
+        );
+        assert_eq!(contract["missing_required_tools"], json!([]));
+        let required = contract["required_tools"].as_array().expect("required");
+        let exec_command = required
+            .iter()
+            .find(|tool| tool["name"] == json!("exec_command"))
+            .expect("exec_command status");
+        assert_eq!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
+        );
+    }
+
+    #[test]
+    fn deferred_but_policy_denied_required_tool_stays_disabled_by_policy() {
+        // Codex BLOCK (#1419 review): excluding the RAW deferred set from the
+        // disabled set mislabels a tool that is both LRU-deferred AND
+        // policy-denied. Such a tool can never be recovered by `activate_tools`
+        // (`is_tool_visible_post_activation` stays false), so it MUST remain
+        // `disabled_by_policy` and MUST NOT be advertised as a recoverable
+        // `deferred` tool (the PR #865 standard). Mirror the live-path
+        // computation with a required tool that is BOTH deferred and denied,
+        // and pin the classification both at the set level and through the
+        // coding-tool contract payload.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        // Defer the canonical runtime + subagent groups (as the per-session LRU
+        // resolver does), then deny one required runtime tool via provider
+        // policy — the deferred + denied combination codex flagged.
+        registry.defer_group("group:runtime");
+        registry.defer_group("group:sessions");
+        let mut policy = octos_agent::ToolPolicy::default();
+        policy.deny.push("exec_command".to_string());
+        registry.set_provider_policy(policy);
+
+        let deferred = deferred_model_tool_names(Some(&registry));
+        assert!(
+            deferred.iter().any(|name| name == "exec_command"),
+            "precondition: exec_command must be deferred, got {deferred:?}"
+        );
+
+        // Production computation under test: only deferred tools that survive
+        // the effective policy post-activation are recoverable-deferred.
+        let recoverable_deferred: Vec<String> = deferred
+            .iter()
+            .filter(|name| registry.is_tool_visible_post_activation(name))
+            .cloned()
+            .collect();
+        assert!(
+            !recoverable_deferred.iter().any(|name| name == "exec_command"),
+            "denied+deferred exec_command must NOT be recoverable, got {recoverable_deferred:?}"
+        );
+        assert!(
+            !recoverable_deferred.is_empty(),
+            "other allowed+deferred tools must remain recoverable, got {recoverable_deferred:?}"
+        );
+
+        let visible = model_visible_tool_names(Some(&registry));
+        let registered = registered_tool_names(Some(&registry));
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        let recoverable_set: HashSet<&str> =
+            recoverable_deferred.iter().map(String::as_str).collect();
+        let disabled = registered
+            .iter()
+            .filter(|name| {
+                !visible_set.contains(name.as_str()) && !recoverable_set.contains(name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            disabled.iter().any(|name| name == "exec_command"),
+            "denied+deferred exec_command must be in the disabled set, got {disabled:?}"
+        );
+
+        // End-to-end through the contract: exec_command must report
+        // disabled_by_policy, NOT deferred (the bug would report it deferred).
+        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
+        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = recoverable_deferred
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let payload = coding_tool_contract::tool_status_list_payload(
+            coding_tool_contract::ToolStatusListContext {
+                available_model_tools: &visible_refs,
+                disabled_model_tools: &disabled_refs,
+                deferred_model_tools: &deferred_refs,
+                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
+            },
+        );
+        let contract = &payload["coding_tool_contract"];
+        let exec_command = contract["required_tools"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .find(|tool| tool["name"] == json!("exec_command"))
+            .expect("exec_command status");
+        assert_eq!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DISABLED_BY_POLICY),
+            "denied+deferred exec_command must be disabled_by_policy, not deferred"
+        );
+        assert_ne!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
         );
     }
 
