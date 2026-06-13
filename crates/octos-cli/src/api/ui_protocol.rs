@@ -148,6 +148,14 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
+/// Reason recorded when a pending APPROVAL entry is cancelled because the
+/// approval-requesting tool's waiting future was dropped (turn interrupt/abort,
+/// per-tool timeout, panic, connection close) before a client decision arrived
+/// — the approval-store analogue of [`USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED`].
+/// This is what gives a kept-pending approval (a `Closed`/`FatalClosed` direct
+/// send that waits for reconnect/replay, #1449) a guaranteed release path
+/// instead of hanging the turn forever when no client ever answers.
+const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 /// Reason recorded when a pending structured-USER-QUESTION entry is cancelled
 /// because the `ask_user_question` tool's waiting future was dropped (turn
 /// interrupt/abort, panic, connection close) — UPCR-2026-023 drop-guard. This
@@ -3180,31 +3188,68 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         }
 
         let response_rx = self.contracts.approvals.request_runtime(event.clone());
+
+        // #1449 drop-guard: arm a guard keyed to THIS pending approval the
+        // instant it is registered. If our future is dropped before a clean
+        // resolution (per-tool timeout, turn interrupt, panic, connection
+        // close), the guard's `Drop` cancels the entry — guaranteeing the
+        // kept-pending-on-`Closed` wait below can never hang the turn forever
+        // on an approval no client will answer. Disarmed on every clean exit.
+        let mut waiter_guard = PendingApprovalWaiterGuard::new(
+            self.contracts.clone(),
+            self.session_id.clone(),
+            approval_id.clone(),
+            self.turn_id.clone(),
+        );
+
         // Approvals are durable: if the WS drop strands the request, the
-        // ledger still records it and the client can rehydrate; we still
-        // deny here to avoid tools running without confirmation.
+        // ledger still records it and the client can rehydrate.
         if let Err(err) = send_notification_durable(
             &self.ws,
             &self.ledger,
             UiNotification::ApprovalRequested(event),
         ) {
-            cancel_approval_after_request_send_failure(
-                self.contracts.as_ref(),
-                &self.ws,
-                &self.ledger,
-                &self.session_id,
-                &approval_id,
-                &self.turn_id,
-            );
-            tracing::warn!(
-                target: "octos::ui_protocol::ws",
-                error = ?err,
-                "approval/requested notification not delivered; denying"
-            );
-            return ToolApprovalDecision::Deny;
+            match err {
+                SendError::Closed | SendError::FatalClosed => {
+                    // Keep the approval pending: a reconnecting client replays
+                    // the ledger and can still answer. `waiter_guard` is the
+                    // backstop that releases the wait if it never reconnects.
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        error = ?err,
+                        "approval/requested direct delivery failed; waiting for reconnect/replay"
+                    );
+                }
+                other => {
+                    cancel_approval_after_request_send_failure(
+                        self.contracts.as_ref(),
+                        &self.ws,
+                        &self.ledger,
+                        &self.session_id,
+                        &approval_id,
+                        &self.turn_id,
+                    );
+                    // Explicit cancel already ran; disarm so `Drop` does not
+                    // re-cancel (a no-op on a now-cancelled entry, but cleaner).
+                    waiter_guard.disarm();
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        error = ?other,
+                        "approval/requested notification not delivered; denying"
+                    );
+                    return ToolApprovalDecision::Deny;
+                }
+            }
         }
 
-        match response_rx.await.unwrap_or(ApprovalDecision::Deny) {
+        // Await boundary: the turn stays paused until the client decides
+        // (resolves the oneshot) or the entry is cancelled (sender dropped →
+        // Err → Deny). If OUR future is dropped here, `waiter_guard` cancels
+        // the entry so this can never block indefinitely.
+        let decision = response_rx.await.unwrap_or(ApprovalDecision::Deny);
+        // Clean resolution — disarm so the guard does not re-cancel.
+        waiter_guard.disarm();
+        match decision {
             ApprovalDecision::Approve => ToolApprovalDecision::Approve,
             ApprovalDecision::Deny => ToolApprovalDecision::Deny,
             // FIX-01 added Unknown(_) for forward-compat. Treat any
@@ -3243,6 +3288,80 @@ fn cancel_approval_after_request_send_failure(
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
         }),
     );
+}
+
+/// RAII drop-guard around the approval requester's wait on `response_rx`
+/// (#1449) — the approval-store analogue of [`PendingQuestionWaiterGuard`].
+///
+/// #1449 keeps an approval PENDING when the direct `approval/requested` send
+/// fails with `Closed`/`FatalClosed` (betting on a reconnect + ledger replay to
+/// redeliver it), instead of failing closed with an immediate deny. That is the
+/// right call for a transient disconnect, but it removes the one thing that
+/// previously guaranteed the waiting tool future could not block forever. If
+/// the client never reconnects AND the turn is autonomous (so it outlives the
+/// connection and the `cancel_pending_for_turn` drain never fires),
+/// `response_rx.await` would otherwise park indefinitely on an approval no
+/// client can answer.
+///
+/// This guard ties cleanup to the lifetime of the waiting future itself: if the
+/// future is dropped before a clean resolution — a per-tool timeout firing, a
+/// turn interrupt aborting the task, a panic unwinding, or the connection
+/// closing — `Drop` CANCELS the matching pending approval. Cancellation drops
+/// the entry's runtime sender, so `response_rx.await` resolves to `Err` and the
+/// tool fails closed (`Deny`) rather than hanging. It also closes the same
+/// cancel-on-interrupt race the question guard does (an approval inserted after
+/// the turn-interrupt drain would otherwise leak).
+///
+/// DISARMED on a clean resolution (a decision arrived, or an explicit
+/// send-failure cancel already ran). `cancel_pending_approval` only acts on a
+/// still-`Pending` entry, so an armed drop after a clean resolution is harmless.
+struct PendingApprovalWaiterGuard {
+    contracts: Arc<UiProtocolContractStores>,
+    session_id: SessionKey,
+    approval_id: ApprovalId,
+    turn_id: TurnId,
+    armed: bool,
+}
+
+impl PendingApprovalWaiterGuard {
+    fn new(
+        contracts: Arc<UiProtocolContractStores>,
+        session_id: SessionKey,
+        approval_id: ApprovalId,
+        turn_id: TurnId,
+    ) -> Self {
+        Self {
+            contracts,
+            session_id,
+            approval_id,
+            turn_id,
+            armed: true,
+        }
+    }
+
+    /// Mark the wait as resolved cleanly so the guard does not cancel on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalWaiterGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Resolve the waiter by cancelling the still-pending entry (drops its
+        // runtime sender → `response_rx` errs → Deny). Best-effort and without
+        // a wire notification here: on a dropped future the connection is
+        // typically gone, and the turn-interrupt path emits `approval/cancelled`
+        // wherever a live client still exists.
+        self.contracts.approvals.cancel_pending_approval(
+            &self.session_id,
+            &self.approval_id,
+            &self.turn_id,
+            APPROVAL_CANCELLED_REASON_WAITER_DROPPED,
+        );
+    }
 }
 
 /// UPCR-2026-023 bridge: implements the agent's [`UserQuestionRequester`]
@@ -32080,6 +32199,154 @@ ignore = []
                 if event.approval_id == approval_id
                     && event.reason == APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED
         )));
+    }
+
+    #[tokio::test]
+    async fn approval_request_closed_ws_keeps_pending_runtime_waiter() {
+        let (ws, rx) = ws_connection_for_test(8);
+        drop(rx);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_id = SessionKey("local:test#site learning".into());
+        let turn_id = TurnId::new();
+        let requester = UiProtocolApprovalRequester {
+            ws,
+            ledger: Arc::clone(&ledger),
+            contracts: Arc::clone(&contracts),
+            state,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            features: ConnectionUiFeatures::default(),
+        };
+
+        let approval_task = tokio::spawn(async move {
+            <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+                &requester,
+                ToolApprovalRequest {
+                    tool_id: "shell-1".into(),
+                    tool_name: "shell".into(),
+                    title: "Run command".into(),
+                    body: "cargo test".into(),
+                    command: Some("cargo test".into()),
+                    cwd: None,
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !approval_task.is_finished(),
+            "closed direct send should leave approval pending for reconnect/replay"
+        );
+
+        let pending = contracts.approvals.pending_for_session(&session_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].turn_id, turn_id);
+        let approval_id = pending[0].approval_id.clone();
+
+        contracts
+            .approvals
+            .respond_with_context(ApprovalRespondParams::new(
+                session_id.clone(),
+                approval_id.clone(),
+                ApprovalDecision::Approve,
+            ))
+            .expect("approval/respond should resolve pending approval");
+
+        assert_eq!(
+            approval_task.await.expect("approval task"),
+            ToolApprovalDecision::Approve
+        );
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay after start cursor");
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(event))
+                if event.approval_id == approval_id
+        )));
+        assert!(!replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(event))
+                if event.approval_id == approval_id
+        )));
+    }
+
+    /// #1449 codex BLOCK: keeping an approval pending on a `Closed`/`FatalClosed`
+    /// direct send (waiting for reconnect/replay) removes the fail-closed deny
+    /// that previously guaranteed the waiting tool future could not hang. If the
+    /// client never reconnects and the turn is autonomous (so the turn-interrupt
+    /// drain never fires), the wait would park forever. The
+    /// `PendingApprovalWaiterGuard` closes that gap: when the requester's future
+    /// is dropped (turn interrupt / per-tool timeout / connection teardown), its
+    /// `Drop` MUST cancel the still-pending approval so the runtime is released.
+    #[tokio::test]
+    async fn dropped_approval_waiter_cancels_pending_entry() {
+        let (ws, rx) = ws_connection_for_test(8);
+        drop(rx); // closed write side → direct send fails Closed → kept pending
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_id = SessionKey("local:test#drop guard".into());
+        let turn_id = TurnId::new();
+        let requester = UiProtocolApprovalRequester {
+            ws,
+            ledger: Arc::clone(&ledger),
+            contracts: Arc::clone(&contracts),
+            state,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            features: ConnectionUiFeatures::default(),
+        };
+
+        let approval_task = tokio::spawn(async move {
+            <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+                &requester,
+                ToolApprovalRequest {
+                    tool_id: "shell-1".into(),
+                    tool_name: "shell".into(),
+                    title: "Run command".into(),
+                    body: "cargo test".into(),
+                    command: Some("cargo test".into()),
+                    cwd: None,
+                },
+            )
+            .await
+        });
+
+        // Let the requester register the pending entry and park on the decision.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            contracts.approvals.pending_for_session(&session_id).len(),
+            1,
+            "closed direct send should leave the approval pending before the drop"
+        );
+
+        // Drop the waiting future (models a turn interrupt / per-tool timeout /
+        // connection teardown aborting the task). The guard's Drop must cancel
+        // the entry rather than leaking it.
+        approval_task.abort();
+        let _ = approval_task.await; // JoinError::Cancelled; future already dropped
+        tokio::task::yield_now().await;
+
+        let pending_after = contracts.approvals.pending_for_session(&session_id);
+        assert!(
+            pending_after.is_empty(),
+            "dropped approval waiter must cancel the pending entry, still pending: {:?}",
+            pending_after
+                .iter()
+                .map(|event| event.approval_id.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
