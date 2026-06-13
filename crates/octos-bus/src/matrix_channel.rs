@@ -14,6 +14,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, put};
 use chrono::Utc;
 use eyre::{Result, WrapErr};
@@ -21,7 +22,8 @@ use octos_core::{InboundMessage, METADATA_SENDER_USER_ID, OutboundMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use std::convert::Infallible;
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::channel::{Channel, ChannelHealth};
@@ -49,6 +51,12 @@ const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
 const MAX_EVENT_SENDER_CACHE: usize = 4;
+
+const SSE_BROADCAST_CAPACITY: usize = 256;
+
+/// Per-turn SSE stream state: (sender, accumulated_content).
+/// Keyed by thread_id so late subscribers receive the current snapshot.
+type SseMap = Arc<RwLock<HashMap<String, (broadcast::Sender<String>, String)>>>;
 
 // ── Bot Manager trait ────────────────────────────────────────────────────────
 
@@ -463,6 +471,8 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
+    sse_streams: SseMap,
+    port: u16,
 }
 
 fn error_json_response(
@@ -510,6 +520,7 @@ pub struct MatrixChannel {
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
+    sse_streams: SseMap,
 }
 
 impl MatrixChannel {
@@ -544,6 +555,7 @@ impl MatrixChannel {
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
+            sse_streams: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1399,6 +1411,59 @@ async fn send_text_to_room_as(
     Ok(())
 }
 
+// ── SSE streaming handler ────────────────────────────────────────────────────
+
+/// GET /sse/{thread_id}
+///
+/// Streams agent progress events for a single turn as Server-Sent Events.
+/// The message body sent to Matrix includes a `!SSE|url|` marker pointing here,
+/// following the robrix2 convention so Matrix clients can open the live stream.
+///
+/// On connect: immediately emits the current accumulated content as the first
+/// event (snapshot for late subscribers), then forwards every subsequent
+/// `edit_message_bound` / `finish_stream_bound` call as SSE events.
+/// The stream closes when `finish_stream_bound` drops the broadcast sender.
+///
+/// Each event data is a JSON object: `{"content": "...", "status": "streaming"|"complete"}`.
+async fn handle_sse(
+    State(state): State<AppserviceState>,
+    Path(thread_id): Path<String>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let (rx, current) = {
+        let streams = state.sse_streams.read().await;
+        if let Some((sender, content)) = streams.get(&thread_id) {
+            (Some(sender.subscribe()), content.clone())
+        } else {
+            (None, String::new())
+        }
+    };
+
+    let initial = if !current.is_empty() {
+        Some(serde_json::json!({"content": current, "status": "streaming"}).to_string())
+    } else {
+        None
+    };
+
+    let stream = futures::stream::unfold(
+        (initial, rx),
+        |(initial, rx)| async move {
+            if let Some(data) = initial {
+                return Some((Ok(Event::default().data(data)), (None, rx)));
+            }
+            let mut rx = rx?;
+            loop {
+                match rx.recv().await {
+                    Ok(data) => return Some((Ok(Event::default().data(data)), (None, Some(rx)))),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 // ── User / Room query handlers ──────────────────────────────────────────────
 
 /// GET /_matrix/app/v1/users/{user_id}
@@ -1531,6 +1596,8 @@ impl Channel for MatrixChannel {
             dedup: self.dedup.clone(),
             bot_router: self.bot_router.clone(),
             bot_manager: self.bot_manager.get().cloned(),
+            sse_streams: self.sse_streams.clone(),
+            port: self.port,
         };
 
         let app = Router::new()
@@ -1545,6 +1612,7 @@ impl Channel for MatrixChannel {
                 "/_octos/reload-bots",
                 axum::routing::post(handle_reload_bots),
             )
+            .route("/sse/{thread_id}", get(handle_sse))
             .with_state(state);
 
         let addr = default_appservice_bind_addr(self.port);
@@ -1589,10 +1657,38 @@ impl Channel for MatrixChannel {
             .get("streaming")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        let thread_id = msg
+            .metadata
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // When a live stream starts with a known thread_id, create the SSE
+        // broadcast channel and prepend the !SSE|url| marker (robrix2 convention)
+        // so Matrix clients can open the event stream from the same appservice port.
+        let content = if live {
+            if let Some(ref tid) = thread_id {
+                let (tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
+                self.sse_streams
+                    .write()
+                    .await
+                    .insert(tid.clone(), (tx, msg.content.clone()));
+                format!(
+                    "!SSE|http://localhost:{}/sse/{tid}|\n{}",
+                    self.port, msg.content
+                )
+            } else {
+                msg.content.clone()
+            }
+        } else {
+            msg.content.clone()
+        };
+
         let event_id = self
             .send_matrix_message(
                 &msg.chat_id,
-                &msg.content,
+                &content,
                 sender_user_id,
                 live,
                 &msg.metadata,
@@ -1625,6 +1721,45 @@ impl Channel for MatrixChannel {
         message_id: &str,
         final_content: &str,
     ) -> Result<()> {
+        self.send_replace_event(chat_id, message_id, final_content, false)
+            .await
+    }
+
+    async fn edit_message_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(tid) = thread_id {
+            let mut streams = self.sse_streams.write().await;
+            if let Some((sender, content)) = streams.get_mut(tid) {
+                *content = new_content.to_string();
+                let data =
+                    serde_json::json!({"content": new_content, "status": "streaming"}).to_string();
+                let _ = sender.send(data);
+            }
+        }
+        self.send_replace_event(chat_id, message_id, new_content, true)
+            .await
+    }
+
+    async fn finish_stream_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(tid) = thread_id {
+            if let Some((sender, _)) = self.sse_streams.write().await.remove(tid) {
+                let data =
+                    serde_json::json!({"content": final_content, "status": "complete"}).to_string();
+                let _ = sender.send(data);
+                // Dropping sender closes all receivers, ending the SSE stream.
+            }
+        }
         self.send_replace_event(chat_id, message_id, final_content, false)
             .await
     }
@@ -2860,6 +2995,8 @@ mod tests {
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: None,
+            sse_streams: Arc::new(RwLock::new(HashMap::new())),
+            port: 9880,
         }
     }
 
@@ -2954,6 +3091,9 @@ mod tests {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        // Yield to the Tokio runtime so the spawned axum task enters its
+        // accept loop before the test makes any HTTP requests.
+        tokio::task::yield_now().await;
         (format!("http://{}", addr), requests, handle)
     }
 
@@ -3003,6 +3143,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        tokio::task::yield_now().await;
         (format!("http://{}", addr), requests, handle)
     }
 
@@ -5916,5 +6057,235 @@ mod tests {
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
         }
+    }
+
+    // ── SSE streaming tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_embed_sse_url_in_initial_streaming_message() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let port = unused_local_port();
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            port,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "thinking...".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({"streaming": true, "thread_id": "cmid-abc"}),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs.iter().find(|r| r.path.contains("/send/")).unwrap();
+        let body_text = req.body["body"].as_str().unwrap();
+        assert!(
+            body_text.starts_with(&format!("!SSE|http://localhost:{port}/sse/cmid-abc|")),
+            "body must start with SSE marker, got: {body_text}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_not_embed_sse_url_without_streaming_flag() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "hello".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({"thread_id": "cmid-abc"}),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs.iter().find(|r| r.path.contains("/send/")).unwrap();
+        let body_text = req.body["body"].as_str().unwrap();
+        assert!(
+            !body_text.contains("!SSE|"),
+            "non-streaming message must not have SSE marker, got: {body_text}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_broadcast_content_to_sse_stream_on_edit() {
+        let (homeserver, _requests, hs_handle) = spawn_mock_homeserver().await;
+        let port = unused_local_port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ch = Arc::new(MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            port,
+            shutdown,
+        ));
+        let (inbound_tx, _rx) = mpsc::channel::<InboundMessage>(16);
+        let ch_task = {
+            let ch = ch.clone();
+            tokio::spawn(async move { ch.start(inbound_tx).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "initial".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({"streaming": true, "thread_id": "sse-t1"}),
+        };
+        let event_id = ch.send_with_id(&msg).await.unwrap().unwrap();
+
+        let client = reqwest::Client::new();
+        let sse_resp = client
+            .get(format!("http://127.0.0.1:{port}/sse/sse-t1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        assert!(
+            sse_resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("text/event-stream"))
+                .unwrap_or(false),
+            "SSE endpoint must return text/event-stream"
+        );
+
+        let chunk_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stream = sse_resp;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                match stream.chunk().await {
+                    Ok(Some(bytes)) => {
+                        buf.extend_from_slice(&bytes);
+                        if String::from_utf8_lossy(&buf).contains("chunk one") {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ch.edit_message_bound("!room:localhost", &event_id, "chunk one", Some("sse-t1"))
+            .await
+            .unwrap();
+
+        let received = chunk_task.await.unwrap();
+        assert!(
+            received.contains("chunk one"),
+            "SSE stream should carry edit content, got: {received}"
+        );
+
+        ch.stop().await.unwrap();
+        ch_task.await.unwrap();
+        hs_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_close_sse_stream_and_emit_complete_on_finish_stream_bound() {
+        let (homeserver, _requests, hs_handle) = spawn_mock_homeserver().await;
+        let port = unused_local_port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ch = Arc::new(MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            port,
+            shutdown,
+        ));
+        let (inbound_tx, _rx) = mpsc::channel::<InboundMessage>(16);
+        let ch_task = {
+            let ch = ch.clone();
+            tokio::spawn(async move { ch.start(inbound_tx).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "streaming...".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({"streaming": true, "thread_id": "sse-t2"}),
+        };
+        let event_id = ch.send_with_id(&msg).await.unwrap().unwrap();
+
+        let client = reqwest::Client::new();
+        let sse_resp = client
+            .get(format!("http://127.0.0.1:{port}/sse/sse-t2"))
+            .send()
+            .await
+            .unwrap();
+
+        let chunk_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stream = sse_resp;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                match stream.chunk().await {
+                    Ok(Some(bytes)) => buf.extend_from_slice(&bytes),
+                    _ => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ch.finish_stream_bound("!room:localhost", &event_id, "final answer", Some("sse-t2"))
+            .await
+            .unwrap();
+
+        let received = chunk_task.await.unwrap();
+        assert!(
+            received.contains("complete"),
+            "finish_stream_bound should emit a complete status, got: {received}"
+        );
+        assert!(
+            received.contains("final answer"),
+            "final content should appear in SSE stream, got: {received}"
+        );
+
+        ch.stop().await.unwrap();
+        ch_task.await.unwrap();
+        hs_handle.abort();
     }
 }
