@@ -174,6 +174,92 @@ fn tts_endpoint(engine: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Voice registry — ~/.OminiX/models/voices.json
+// ---------------------------------------------------------------------------
+
+/// A single registered voice in ominix-api's `voices.json`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceEntry {
+    /// Reference audio path, relative to [`VoicesRegistry::models_base_path`].
+    #[serde(default)]
+    pub ref_audio: String,
+    /// Verbatim transcription of `ref_audio` (drives few-shot synthesis).
+    #[serde(default)]
+    pub ref_text: String,
+    /// Alternative names that also resolve to this voice.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// ominix-api's voice registry (`~/.OminiX/models/voices.json`). A `BTreeMap`
+/// keeps the listing order deterministic (sorted by id) regardless of file
+/// ordering.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoicesRegistry {
+    #[serde(default)]
+    pub default_voice: String,
+    #[serde(default)]
+    pub models_base_path: String,
+    #[serde(default)]
+    pub voices: std::collections::BTreeMap<String, VoiceEntry>,
+}
+
+/// A voice exposed to clients: the canonical id plus its aliases.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VoiceInfo {
+    pub id: String,
+    pub aliases: Vec<String>,
+}
+
+impl VoicesRegistry {
+    /// Parse a `voices.json` body.
+    pub fn parse(json: &str) -> Result<Self> {
+        serde_json::from_str(json).wrap_err("failed to parse voices.json")
+    }
+
+    /// Load and parse `voices.json` from disk.
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        Self::parse(&data)
+    }
+
+    /// Whether a voice entry's reference audio actually exists on disk (= the
+    /// engine can synthesize it).
+    fn ref_exists(&self, entry: &VoiceEntry) -> bool {
+        !entry.ref_audio.is_empty()
+            && Path::new(&self.models_base_path)
+                .join(&entry.ref_audio)
+                .exists()
+    }
+
+    /// Voices the engine can actually synthesize (ref audio present), sorted by
+    /// id for a stable client-facing list.
+    pub fn synthesizable(&self) -> Vec<VoiceInfo> {
+        self.voices
+            .iter()
+            .filter(|(_, e)| self.ref_exists(e))
+            .map(|(id, e)| VoiceInfo {
+                id: id.clone(),
+                aliases: e.aliases.clone(),
+            })
+            .collect()
+    }
+
+    /// Resolve a user-supplied name (canonical id or alias) to its canonical
+    /// id, but only when the voice is synthesizable. `None` for unknown names
+    /// or entries whose ref audio is missing.
+    pub fn resolve(&self, name: &str) -> Option<String> {
+        self.voices
+            .iter()
+            .find(|(id, e)| {
+                (id.as_str() == name || e.aliases.iter().any(|a| a == name)) && self.ref_exists(e)
+            })
+            .map(|(id, _)| id.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OminixClient — async HTTP client for ominix-api
 // ---------------------------------------------------------------------------
 
@@ -390,5 +476,56 @@ mod tests {
     #[test]
     fn unknown_engine_falls_back_to_sovits() {
         assert_eq!(tts_endpoint("nonsense"), "/v1/audio/tts/sovits");
+    }
+}
+
+#[cfg(test)]
+mod voices_tests {
+    use super::{VoiceInfo, VoicesRegistry};
+
+    /// Write a registry JSON whose `models_base_path` is `base`, plus create the
+    /// listed ref files under it so existence checks pass.
+    fn registry_with(base: &std::path::Path, present: &[&str]) -> VoicesRegistry {
+        for f in present {
+            let p = base.join("ref_audios").join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"fake").unwrap();
+        }
+        let json = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": {base:?},
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav",  "ref_text": "y", "aliases": [] }}
+              }}
+            }}"#,
+            base = base.to_string_lossy()
+        );
+        VoicesRegistry::parse(&json).unwrap()
+    }
+
+    #[test]
+    fn synthesizable_lists_only_entries_whose_ref_audio_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only doubao's ref file exists; ghost's is missing.
+        let reg = registry_with(dir.path(), &["doubao_ref.wav"]);
+        assert_eq!(
+            reg.synthesizable(),
+            vec![VoiceInfo {
+                id: "doubao".to_string(),
+                aliases: vec!["vivian".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_id_and_alias_but_only_when_ref_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(dir.path(), &["doubao_ref.wav"]);
+        assert_eq!(reg.resolve("doubao").as_deref(), Some("doubao"));
+        assert_eq!(reg.resolve("vivian").as_deref(), Some("doubao")); // alias → id
+        assert_eq!(reg.resolve("ghost"), None); // ref missing
+        assert_eq!(reg.resolve("nope"), None); // unknown
     }
 }

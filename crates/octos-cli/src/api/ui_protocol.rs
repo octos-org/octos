@@ -18433,7 +18433,12 @@ async fn run_standalone_turn(
         let w_session = session_id.clone();
         let w_turn = turn_id.clone();
         let w_dir = session_runtime.workspace_root.clone();
-        let w_voice = session_runtime.profile.voice.default_voice.clone();
+        // Per-tenant reply voice: live override (set via PUT /api/my/voice) wins,
+        // else the profile's bootstrapped default.
+        let w_voice = crate::api::voices::resolve_reply_voice(
+            &session_runtime.profile.profile_id,
+            &session_runtime.profile.voice.default_voice,
+        );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
         let handle = tokio::spawn(async move {
             let mut n: usize = 0;
@@ -18832,11 +18837,15 @@ async fn run_standalone_turn(
     // path above produced no audio (e.g. a reply with no sentence boundaries).
     if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
-            let voice = session_runtime.profile.voice.default_voice.as_str();
+            // Per-tenant reply voice: live override wins, else profile default.
+            let voice = crate::api::voices::resolve_reply_voice(
+                &session_runtime.profile.profile_id,
+                &session_runtime.profile.voice.default_voice,
+            );
             let provider = session_runtime.profile.voice.tts_provider.as_str();
             let reply_audio_dir = session_runtime.workspace_root.as_path();
             if let Some(audio_path) =
-                crate::api::voice_turn::synthesize_reply(reply, voice, provider, reply_audio_dir)
+                crate::api::voice_turn::synthesize_reply(reply, &voice, provider, reply_audio_dir)
                     .await
             {
                 // Deliver via the EXISTING file/attached carrier. Emit the
@@ -25880,7 +25889,10 @@ ignore = []
             .collect::<Vec<_>>();
         let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
         let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
-        let deferred_refs = recoverable_deferred.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = recoverable_deferred
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let payload = coding_tool_contract::tool_status_list_payload(
             coding_tool_contract::ToolStatusListContext {
                 available_model_tools: &visible_refs,
@@ -25944,7 +25956,9 @@ ignore = []
             .cloned()
             .collect();
         assert!(
-            !recoverable_deferred.iter().any(|name| name == "exec_command"),
+            !recoverable_deferred
+                .iter()
+                .any(|name| name == "exec_command"),
             "denied+deferred exec_command must NOT be recoverable, got {recoverable_deferred:?}"
         );
         assert!(

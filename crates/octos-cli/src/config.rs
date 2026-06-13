@@ -486,6 +486,22 @@ impl Default for VoiceConfig {
     }
 }
 
+impl VoiceConfig {
+    /// Apply a per-profile timbre choice: replaces `default_voice` when
+    /// `override_voice` is a non-empty per-user selection, leaving the
+    /// platform-level route/ASR settings untouched. Used at profile bootstrap
+    /// so each tenant remembers their own reply voice on top of the shared
+    /// serve-level voice config.
+    pub fn with_default_voice_override(mut self, override_voice: Option<&str>) -> Self {
+        if let Some(v) = override_voice {
+            if !v.is_empty() {
+                self.default_voice = v.to_string();
+            }
+        }
+        self
+    }
+}
+
 fn voice_default_true() -> bool {
     true
 }
@@ -2104,5 +2120,36 @@ mod tests {
         let json = r#"{ "tts_provider": "sovits" }"#;
         let cfg: VoiceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.tts_provider, "sovits");
+    }
+
+    #[test]
+    fn per_profile_override_replaces_only_the_default_voice() {
+        // A per-user timbre choice overrides default_voice but leaves the
+        // platform-level route/ASR settings intact.
+        let base = VoiceConfig {
+            tts_provider: "sovits".into(),
+            asr_language: Some("zh".into()),
+            ..VoiceConfig::default()
+        };
+        let got = base.with_default_voice_override(Some("yangmi"));
+        assert_eq!(got.default_voice, "yangmi");
+        assert_eq!(got.tts_provider, "sovits"); // platform setting preserved
+        assert_eq!(got.asr_language.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn per_profile_override_ignores_empty_or_absent_choice() {
+        let base = VoiceConfig {
+            default_voice: "doubao".into(),
+            ..VoiceConfig::default()
+        };
+        assert_eq!(
+            base.clone().with_default_voice_override(None).default_voice,
+            "doubao"
+        );
+        assert_eq!(
+            base.with_default_voice_override(Some("")).default_voice,
+            "doubao"
+        );
     }
 }
