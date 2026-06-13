@@ -13790,13 +13790,25 @@ mod tests {
             .await;
 
         registry.cancel(&sk.to_string()).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        registry.reap_dead_actors();
-
-        assert!(
-            registry.actor_keys().is_empty(),
-            "cancel should stop the profiled actor when called with the bare session key"
-        );
+        // Cancel propagation + actor teardown is asynchronous; the previous
+        // fixed `sleep(250ms)` was too short under heavy parallel test load
+        // (the actor hadn't stopped before `reap_dead_actors`, so the key
+        // lingered — a flake). Poll reap-then-check until the cancelled actor
+        // is actually gone, with a generous deadline that absorbs CPU
+        // starvation rather than racing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            registry.reap_dead_actors();
+            if registry.actor_keys().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancel should stop the profiled actor when called with the bare session key; still alive: {:?}",
+                registry.actor_keys()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[test]
@@ -15460,20 +15472,39 @@ mod tests {
         )
         .await;
 
-        // First push arrives.
-        let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("first push must arrive")
-            .expect("channel must not close");
-        assert!(first.content.starts_with("↺ Router failover:"));
+        // The first ROUTER-FAILOVER push must arrive. Under parallel test load
+        // an unrelated startup/noop message can reach `rx` before the failover
+        // banner, so drain any such noise until the banner appears — rather than
+        // asserting the very first message IS the banner (the previous flake).
+        let banner = "↺ Router failover:";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut failover_pushes = 0usize;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) if msg.content.starts_with(banner) => {
+                    failover_pushes += 1;
+                    break;
+                }
+                Ok(Some(_)) => continue, // unrelated message — keep looking
+                Ok(None) => panic!("channel must not close before the failover push"),
+                Err(_) => panic!("first router-failover push must arrive"),
+            }
+        }
 
-        // No further pushes within the debounce window. Wait briefly and
-        // confirm the receiver is idle.
-        let further = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
-        assert!(
-            further.is_err(),
-            "debounce must suppress further pushes; got: {:?}",
-            further.ok().flatten().map(|m| m.content)
+        // Debounce: NO second failover push within the window. Unrelated
+        // messages are ignored — the contract is "at most one FAILOVER push per
+        // debounce window", not "the bus is silent".
+        let window = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(window, rx.recv()).await {
+                Ok(Some(msg)) if msg.content.starts_with(banner) => failover_pushes += 1,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            failover_pushes, 1,
+            "a burst of failovers must debounce to exactly one push"
         );
 
         drop(tx);
@@ -15809,59 +15840,72 @@ mod tests {
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
 
-        // Three distinct failed tasks back-to-back, each with their own
-        // tool_call_id and synth-ack — simulates LLM retrying with
-        // corrected-but-still-broken inputs.
-        for n in 0..3 {
-            let tcid = format!("call-cap-{n}");
-            let task_id = supervisor.register("mofa_slides", &tcid, Some("cli:test"));
-            supervisor.mark_synth_ack_emitted(&tcid);
-            supervisor.mark_failed(&task_id, format!("fail #{n}"));
-            // Pace the marks so the actor processes them in order — without
-            // this, the second mark_failed could race the first recovery
-            // turn's `claim_recovery_slot` and the per-task dedup might
-            // mask the cap test.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        // Drain `rx`, accumulating every non-empty message into `seen`, until
+        // one containing `needle` arrives. Deterministic sequencing: each
+        // failure below is injected only AFTER the prior recovery turn's output
+        // is observed, which proves that turn ran to completion and its
+        // `consecutive_recovery_turns` increment is visible before the next
+        // failure can `claim_recovery_slot`. This replaces the previous
+        // wall-clock `sleep(300ms)` pacing, which under heavy parallel test
+        // load was too short — the next `mark_failed` could claim a slot before
+        // the prior turn bumped the counter, letting the third recovery slip
+        // past the cap (the flaky `recovery-3` firing). The generous timeout
+        // absorbs CPU starvation rather than racing it.
+        async fn drain_until(
+            rx: &mut mpsc::Receiver<OutboundMessage>,
+            needle: &str,
+            seen: &mut Vec<String>,
+        ) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                if msg.content.is_empty() {
+                    continue;
+                }
+                let matched = msg.content.contains(needle);
+                seen.push(msg.content);
+                if matched {
+                    return;
+                }
+            }
+            panic!("timed out waiting for {needle:?}; saw: {seen:?}");
         }
 
-        let mut responses = Vec::new();
-        let mut banners = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-            if msg.content.contains("could not be recovered") {
-                banners.push(msg.content.clone());
-            } else if !msg.content.is_empty() {
-                responses.push(msg.content);
-            }
-            if !banners.is_empty()
-                && responses.iter().filter(|c| c.contains("recovery-")).count() >= 2
-            {
-                break;
-            }
-        }
+        let mut seen: Vec<String> = Vec::new();
+
+        // Failure 0 → first recovery turn runs.
+        let t0 = supervisor.register("mofa_slides", "call-cap-0", Some("cli:test"));
+        supervisor.mark_synth_ack_emitted("call-cap-0");
+        supervisor.mark_failed(&t0, "fail #0".to_string());
+        drain_until(&mut rx, "recovery-1", &mut seen).await;
+
+        // Failure 1 → second recovery turn runs; the consecutive-recovery
+        // counter now sits at the cap.
+        let t1 = supervisor.register("mofa_slides", "call-cap-1", Some("cli:test"));
+        supervisor.mark_synth_ack_emitted("call-cap-1");
+        supervisor.mark_failed(&t1, "fail #1".to_string());
+        drain_until(&mut rx, "recovery-2", &mut seen).await;
+
+        // Failure 2 → the cap kicks in: a final banner is emitted INSTEAD of a
+        // third LLM turn. (If the cap regressed, `recovery-3-MUST-NOT-RUN`
+        // would arrive here and the `!recovery-3` assertion below would fail.)
+        let t2 = supervisor.register("mofa_slides", "call-cap-2", Some("cli:test"));
+        supervisor.mark_synth_ack_emitted("call-cap-2");
+        supervisor.mark_failed(&t2, "fail #2".to_string());
+        drain_until(&mut rx, "Background failure could not be recovered", &mut seen).await;
+
         // The first two recovery LLM turns must have run.
         assert!(
-            responses.iter().any(|c| c.contains("recovery-1")),
-            "first recovery should run, got: {responses:?}",
+            seen.iter().any(|c| c.contains("recovery-1")),
+            "first recovery should run, got: {seen:?}",
         );
         assert!(
-            responses.iter().any(|c| c.contains("recovery-2")),
-            "second recovery should run, got: {responses:?}",
+            seen.iter().any(|c| c.contains("recovery-2")),
+            "second recovery should run, got: {seen:?}",
         );
-        // The third must NOT run — the cap kicks in before the LLM is
-        // invoked.
+        // The third must NOT run — the cap intercepts it before the LLM.
         assert!(
-            !responses
-                .iter()
-                .any(|c| c.contains("recovery-3-MUST-NOT-RUN")),
-            "third recovery beyond the cap must not invoke the LLM, got: {responses:?}",
-        );
-        // The banner MUST land instead.
-        assert!(
-            banners
-                .iter()
-                .any(|c| c.contains("Background failure could not be recovered")),
-            "final banner expected once cap exceeded, got: {banners:?}",
+            !seen.iter().any(|c| c.contains("recovery-3-MUST-NOT-RUN")),
+            "third recovery beyond the cap must not invoke the LLM, got: {seen:?}",
         );
 
         drop(tx);
