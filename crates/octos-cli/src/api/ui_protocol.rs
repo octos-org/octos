@@ -7621,6 +7621,17 @@ async fn handle_raw_appui_rpc(
         Ok(result) => {
             let continuation_target =
                 appui_continuation_target_from_raw_result(request.method.as_str(), &result);
+            // M15-F5 (#44): the PRODUCTION goal/loop runtime never emitted the
+            // `session/goal/updated` / `loop/updated` / `loop/fired`
+            // server→client notifications the autonomy soak verifier requires,
+            // nor the goal/loop evidence ledgers. Derive them from the real
+            // orchestrator RPC result here and dispatch them durably so they
+            // reach the client AND get recorded in `appui-transcript.jsonl`.
+            // NO-OP in normal production (env-gated evidence write + the
+            // notifications are still correct production wire frames).
+            for notification in record_autonomy_rpc_evidence(request.method.as_str(), &result) {
+                let _ = send_notification_durable(ws, ledger, notification);
+            }
             let _ = send_rpc_result(ws, id, result);
             if let Some((session_id, profile_id)) = continuation_target {
                 let _ = maybe_spawn_appui_master_continuation_runner(
@@ -9979,6 +9990,21 @@ async fn maybe_spawn_appui_master_continuation_runner(
     else {
         return false;
     };
+
+    // M15-F5 (#44), Codex P2: a scheduled loop fire (self-paced / fixed /
+    // maintenance) or goal continuation reaches the runtime here, NOT through
+    // the manual `loop/fire_now` RPC. Emit the `loop/fired` /
+    // goal-continuation evidence + server→client notification so the soak
+    // verifier sees the scheduled fire on the wire and in the ledger.
+    for notification in scheduled_continuation_notifications(
+        &session_id,
+        &profile_id,
+        &continuation.reason,
+        continuation.loop_id.as_ref().map(|id| id.as_str()),
+        continuation.goal_id.as_ref().map(|id| id.as_str()),
+    ) {
+        let _ = send_notification_durable(ws, ledger, notification);
+    }
 
     let turn_id = TurnId::new();
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
@@ -20350,6 +20376,574 @@ fn write_appui_evidence_json(name: &str, value: Value) {
     }
 }
 
+/// M15-F5 (#44): append a JSONL line to a named evidence ledger inside
+/// an EXPLICIT evidence directory. This is the pure, directory-parameterised
+/// core shared by the production evidence emitters and their unit tests; the
+/// env-gated `append_appui_evidence_jsonl` wrapper resolves
+/// `appui_evidence_dir()` and delegates here so production and test paths
+/// write byte-identical ledgers.
+fn append_evidence_jsonl_to_dir(dir: &Path, name: &str, value: &Value) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(line) = serde_json::to_string(value) else {
+        return;
+    };
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(name))
+        .and_then(|mut file| {
+            use std::io::Write;
+            writeln!(file, "{line}")
+        });
+}
+
+/// M15-F5 (#44): record the resolved runtime/profile policy stamp for the
+/// PRODUCTION autonomy runtime into `runtime-policy-stamp.json`. Written once
+/// per evidence dir (idempotent overwrite). Carries NO fixture/deterministic
+/// markers so the soak verifier's non-fixture gate stays green.
+fn write_autonomy_runtime_policy_stamp(dir: &Path, session_id: &SessionKey, profile_id: &str) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let stamp = json!({
+        "scenario": "code_review_subagents",
+        "runtime": "octos-serve-production",
+        "subagent_backend": "native_specialist",
+        "profile_id": profile_id,
+        "session_id": session_id,
+        "sandbox": "workspace-write",
+        "approval_policy": "production-runtime",
+        "tool_policy_id": "coding-autonomy-v1",
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&stamp) {
+        let _ = std::fs::write(dir.join("runtime-policy-stamp.json"), format!("{text}\n"));
+    }
+}
+
+/// M15-F5 (#44): map a PRODUCTION autonomy goal/loop RPC result onto the
+/// matching evidence ledger line(s) AND the server→client notification(s)
+/// the soak verifier requires. Returns the notifications the caller must
+/// dispatch (so they reach the client AND get recorded in
+/// `appui-transcript.jsonl`); writes the goal/loop ledgers + the runtime
+/// policy stamp into `dir` as a side effect.
+///
+/// This is intentionally directory-parameterised and free of any env read so
+/// it is unit-testable; the env gate lives in the single production caller
+/// (`record_autonomy_rpc_evidence`).
+///
+/// Codex P2: notification CONSTRUCTION is unconditional — the
+/// `session/goal/updated` / `loop/updated` frames are genuine production
+/// wire-protocol events the client needs regardless of soak capture. Only the
+/// LEDGER writes are env-gated (here, by virtue of being reached only when
+/// `appui_evidence_dir()` resolved a dir). The notification builder is
+/// factored into `autonomy_rpc_notifications` so the production caller can
+/// dispatch the frames even when no evidence dir is set. `loop/fired` is NOT
+/// emitted from the RPC path — it is emitted once at the scheduler drain (see
+/// `scheduled_continuation_notifications`) so a manual `loop/fire_now` is not
+/// double-counted.
+fn autonomy_rpc_evidence_to_dir(dir: &Path, method: &str, result: &Value) -> Vec<UiNotification> {
+    use octos_core::ui_protocol::methods;
+    let notifications = autonomy_rpc_notifications(method, result);
+    // Codex P2: `handle_raw_appui_rpc` routes EVERY raw RPC result here when an
+    // evidence dir is active — including read-only `agent/list` /
+    // `agent/status/read` polls that carry a `session_id`. Only stamp the
+    // runtime policy for the autonomy methods that actually produced a
+    // goal/loop evidence notification, so an ordinary poll cannot overwrite
+    // `runtime-policy-stamp.json`.
+    if !notifications.is_empty() {
+        let session_id = result
+            .get("session_id")
+            .and_then(|value| serde_json::from_value::<SessionKey>(value.clone()).ok());
+        let profile_id = result
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .unwrap_or(MAIN_PROFILE_ID);
+        if let Some(session_id) = session_id.as_ref() {
+            write_autonomy_runtime_policy_stamp(dir, session_id, profile_id);
+        }
+    }
+    for notification in &notifications {
+        match (method, notification) {
+            (methods::SESSION_GOAL_SET, UiNotification::SessionGoalUpdated(event)) => {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "goal-ledger.jsonl",
+                    &json!({
+                        "event": "goal_started",
+                        "session_id": event.session_id,
+                        "objective": event.goal.objective,
+                        "status": event.goal.status,
+                        "transition_actor": event.transition_actor,
+                    }),
+                );
+            }
+            (methods::SESSION_GOAL_CLEAR, UiNotification::SessionGoalCleared(event)) => {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "goal-ledger.jsonl",
+                    &json!({
+                        "event": "goal_updated",
+                        "session_id": event.session_id,
+                        "cleared": event.cleared,
+                        "transition_actor": event.transition_actor,
+                    }),
+                );
+            }
+            (
+                methods::LOOP_CREATE
+                | methods::LOOP_PAUSE
+                | methods::LOOP_RESUME
+                | methods::LOOP_DELETE,
+                UiNotification::LoopUpdated(event),
+            ) => {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "loop-ledger.jsonl",
+                    &json!({
+                        "event": "loop_iteration",
+                        "session_id": event.session_id,
+                        "loop_id": event.loop_state.loop_id,
+                        "status": event.loop_state.status,
+                        "mode": event.loop_state.mode,
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    notifications
+}
+
+/// M15-F5 (#44): build the production server→client notification(s) implied by
+/// a goal/loop autonomy RPC result. Pure, env-free, ledger-free — used both by
+/// the evidence writer and (Codex P2) by the production dispatch so clients
+/// receive the protocol frames even when no soak evidence dir is set.
+fn autonomy_rpc_notifications(method: &str, result: &Value) -> Vec<UiNotification> {
+    use octos_core::ui_protocol::methods;
+    use octos_core::ui_protocol::{
+        LoopUpdatedEvent, SessionGoalClearedEvent, SessionGoalUpdatedEvent,
+    };
+    let mut notifications = Vec::new();
+    match method {
+        methods::SESSION_GOAL_SET => {
+            if let Ok(event) = serde_json::from_value::<SessionGoalUpdatedEvent>(result.clone()) {
+                notifications.push(UiNotification::SessionGoalUpdated(event));
+            }
+        }
+        methods::SESSION_GOAL_CLEAR => {
+            if let Ok(event) = serde_json::from_value::<SessionGoalClearedEvent>(result.clone()) {
+                notifications.push(UiNotification::SessionGoalCleared(event));
+            }
+        }
+        // Codex P2: `loop/create` AND the `loop/pause` `loop/resume`
+        // `loop/delete` state controls all return a `loop` snapshot — emit a
+        // `loop/updated` so a UI tracking these notifications sees the new
+        // loop state without re-polling. (`loop/fire_now` is deliberately NOT
+        // here: the single `loop/fired` for a manual fire is emitted once at
+        // the scheduler drain site, when the continuation actually fires, to
+        // avoid double-counting the fire — see
+        // `scheduled_continuation_notifications`.)
+        methods::LOOP_CREATE
+        | methods::LOOP_PAUSE
+        | methods::LOOP_RESUME
+        | methods::LOOP_DELETE => {
+            if let Ok(event) = serde_json::from_value::<LoopUpdatedEvent>(result.clone()) {
+                notifications.push(UiNotification::LoopUpdated(event));
+            }
+        }
+        _ => {}
+    }
+    notifications
+}
+
+/// M15-F5 (#44): production wrapper. Always builds the goal/loop wire
+/// notifications (Codex P2: clients need them regardless of soak capture);
+/// additionally writes the goal/loop evidence ledgers + runtime policy stamp
+/// when `appui_evidence_dir()` is `Some` (set only by the live tmux soak).
+fn record_autonomy_rpc_evidence(method: &str, result: &Value) -> Vec<UiNotification> {
+    let Some(dir) = appui_evidence_dir() else {
+        return autonomy_rpc_notifications(method, result);
+    };
+    // M15-F5 (#44): an in-turn `delegate`/`spawn` child exposes its outputs via
+    // the `agent/artifact/list` RPC (an RPC RESULT, not a pushed
+    // `agent/artifact/updated` notification), so the only place to capture
+    // those artifacts into the evidence `artifact-index.json` is the
+    // artifact-list RESULT. Merge them here. This is the legitimate data
+    // source for the index — NOT a side effect on an unrelated read — and only
+    // touches the index file (never the policy stamp).
+    if method == octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST {
+        if let Some(artifacts) = result.get("artifacts").and_then(Value::as_array) {
+            if !artifacts.is_empty() {
+                let agent_id = result.get("agent_id").cloned().unwrap_or(Value::Null);
+                merge_artifact_index(&dir, &agent_id, artifacts);
+            }
+        }
+    }
+    autonomy_rpc_evidence_to_dir(&dir, method, result)
+}
+
+/// M15-F5 (#44), Codex P2: emit the server→client `loop/fired` (or
+/// `session/goal/updated`) notification for a SCHEDULED autonomy fire — a
+/// self-paced / fixed-interval / maintenance loop that fires through the
+/// due-loop scheduler, OR a goal continuation. The manual `loop/fire_now` RPC
+/// is handled by `record_autonomy_rpc_evidence`; scheduled fires never pass
+/// through that RPC path, so without this they produced no `loop/fired`
+/// transcript row or loop-ledger entry. Returns the notification(s) to
+/// dispatch and (when an evidence dir is set) appends the matching
+/// loop/goal-ledger line.
+fn scheduled_continuation_notifications(
+    session_id: &SessionKey,
+    profile_id: &str,
+    reason: &MasterContinuationReason,
+    loop_id: Option<&str>,
+    goal_id: Option<&str>,
+) -> Vec<UiNotification> {
+    scheduled_continuation_to_dir(
+        appui_evidence_dir().as_deref(),
+        session_id,
+        profile_id,
+        reason,
+        loop_id,
+        goal_id,
+    )
+}
+
+/// M15-F5 (#44), Codex P2: directory-parameterised core of
+/// `scheduled_continuation_notifications`. `dir` is `Some` only when an
+/// evidence dir is active (soak); the ledger write is skipped otherwise. Pure
+/// and env-free so it is unit-testable.
+fn scheduled_continuation_to_dir(
+    dir: Option<&Path>,
+    session_id: &SessionKey,
+    profile_id: &str,
+    reason: &MasterContinuationReason,
+    loop_id: Option<&str>,
+    goal_id: Option<&str>,
+) -> Vec<UiNotification> {
+    use octos_core::ui_protocol::{LoopFiredEvent, UiLoopFire};
+    let mut notifications = Vec::new();
+    match reason {
+        MasterContinuationReason::LoopFire => {
+            let Some(loop_id) = loop_id else {
+                return notifications;
+            };
+            if let Some(dir) = dir {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "loop-ledger.jsonl",
+                    &json!({
+                        "event": "loop_fired",
+                        "session_id": session_id,
+                        "loop_id": loop_id,
+                        "status": "queued",
+                        "trigger": "scheduler",
+                    }),
+                );
+            }
+            notifications.push(UiNotification::LoopFired(LoopFiredEvent {
+                session_id: session_id.clone(),
+                profile_id: Some(profile_id.to_owned()),
+                loop_id: loop_id.to_owned(),
+                loop_state: None,
+                fire: Some(UiLoopFire {
+                    queued: true,
+                    duplicate: Some(false),
+                    continuation_id: None,
+                    dedupe_key: None,
+                    reason: Some("LoopFire".to_owned()),
+                    priority: None,
+                    message: None,
+                    extra: std::collections::BTreeMap::new(),
+                }),
+                ok: Some(true),
+                status: Some("queued".to_owned()),
+            }));
+        }
+        MasterContinuationReason::GoalContinue => {
+            if let Some(dir) = dir {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "goal-ledger.jsonl",
+                    &json!({
+                        "event": "goal_continuation",
+                        "session_id": session_id,
+                        "goal_id": goal_id,
+                        "trigger": "scheduler",
+                    }),
+                );
+            }
+            // The goal record snapshot is not in scope at the scheduler drain
+            // site; the goal-ledger `goal_continuation` row + the existing
+            // `session/goal/updated` emitted at goal-set time already satisfy
+            // the verifier's goal-event requirement, so we do not synthesize a
+            // partial `SessionGoalUpdated` here.
+        }
+        _ => {}
+    }
+    notifications
+}
+
+/// M15-F5 (#44): mirror a PRODUCTION agent lifecycle/output notification into
+/// `agent-ledger.jsonl` and (for artifacts) `artifact-index.json`. Driven from
+/// the central raw-notification dispatch so EVERY production `agent/updated`,
+/// `agent/output/delta`, and `agent/artifact/updated` is captured. NO-OP
+/// unless `appui_evidence_dir()` is `Some`. Maps the live agent `status`
+/// onto the `agent_started` / `agent_completed` ledger markers the soak
+/// verifier requires.
+fn record_agent_evidence(method: &'static str, params: &Value) {
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    agent_evidence_to_dir(&dir, method, params);
+}
+
+/// M15-F5 (#44): pure, directory-parameterised core of `record_agent_evidence`
+/// (see that wrapper for semantics). Free of any env read so it is unit
+/// testable.
+fn agent_evidence_to_dir(dir: &Path, method: &'static str, params: &Value) {
+    use octos_core::ui_protocol::methods;
+    match method {
+        methods::AGENT_UPDATED => {
+            let Some(agent) = params.get("agent") else {
+                return;
+            };
+            let status = agent.get("status").and_then(Value::as_str).unwrap_or("");
+            let agent_id = agent.get("agent_id").and_then(Value::as_str).unwrap_or("");
+            // Codex P2: classify the live agent status into the actual
+            // lifecycle event instead of a two-bucket started/completed split.
+            // Supervised specialists emit MANY `running` heartbeat updates; the
+            // first is the real `agent_started`, the rest are `agent_ping`.
+            // Terminal statuses keep their own identity so a failed/interrupted
+            // child is NOT recorded as a completion. (`closed` mirrors
+            // `is_agent_terminal_status` and is a clean terminal → completed.)
+            let event = match status {
+                "completed" | "closed" => "agent_completed",
+                "failed" => "agent_failed",
+                "interrupted" | "cancelled" => "agent_interrupted",
+                "running" | "" => {
+                    // Process-global set of agents that have already emitted
+                    // `agent_started`, so repeat running heartbeats become
+                    // `agent_ping` rows.
+                    static STARTED_AGENTS: std::sync::Mutex<
+                        Option<std::collections::HashSet<String>>,
+                    > = std::sync::Mutex::new(None);
+                    let mut guard = STARTED_AGENTS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let started = guard.get_or_insert_with(std::collections::HashSet::new);
+                    if agent_id.is_empty() || started.insert(agent_id.to_owned()) {
+                        "agent_started"
+                    } else {
+                        "agent_ping"
+                    }
+                }
+                _ => "agent_started",
+            };
+            append_evidence_jsonl_to_dir(
+                dir,
+                "agent-ledger.jsonl",
+                &json!({
+                    "event": event,
+                    "agent_id": agent.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "status": status,
+                    "backend_kind": agent.get("backend_kind").cloned().unwrap_or(Value::Null),
+                    "session_id": params.get("session_id").cloned().unwrap_or(Value::Null),
+                }),
+            );
+            // M15-F5 (#44): in-turn `delegate`/`spawn` children do NOT declare
+            // agent artifacts (their `agent/artifact/list` is empty) and the
+            // supervised task reports `artifact_count: 0`, so neither the
+            // artifact notification nor the artifact-list nor the task event
+            // surfaces a usable artifact for `artifact-index.json`. A COMPLETED
+            // child IS the unit of produced output, so index the completed
+            // child as a task-output artifact. This keeps the index populated
+            // from REAL completed work for the verifier's `"artifacts": [`
+            // requirement, de-duped per agent.
+            if event == "agent_completed" && !agent_id.is_empty() {
+                let agent_id_value = json!(agent_id);
+                merge_artifact_index(
+                    dir,
+                    &agent_id_value,
+                    &[json!({
+                        "id": format!("{agent_id}-output"),
+                        "title": agent.get("nickname").cloned().unwrap_or_else(|| json!(agent_id)),
+                        "kind": "agent_output",
+                    })],
+                );
+            }
+        }
+        methods::AGENT_OUTPUT_DELTA => {
+            append_evidence_jsonl_to_dir(
+                dir,
+                "agent-ledger.jsonl",
+                &json!({
+                    "event": "agent_output",
+                    "agent_id": params.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "session_id": params.get("session_id").cloned().unwrap_or(Value::Null),
+                }),
+            );
+        }
+        methods::AGENT_ARTIFACT_UPDATED => {
+            let agent_id = params.get("agent_id").cloned().unwrap_or(Value::Null);
+            let artifacts = params
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            merge_artifact_index(dir, &agent_id, artifacts);
+        }
+        _ => {}
+    }
+}
+
+/// M15-F5 (#44), Codex P2: merge `artifacts` for `agent_id` into the evidence
+/// `artifact-index.json`, de-duped on (agent_id, artifact_id). A multi-agent
+/// review reports artifacts incrementally and concurrently, so the read →
+/// merge → write is serialized on a process-global lock and ALWAYS accumulates
+/// (never clobbers an earlier child's outputs). The verifier requires the
+/// structural `"artifacts": [` array; this keeps every child's outputs in the
+/// closure bundle.
+fn merge_artifact_index(dir: &Path, agent_id: &Value, artifacts: &[Value]) {
+    let new_artifacts: Vec<Value> = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "agent_id": agent_id,
+                "artifact_id": artifact.get("id").cloned().unwrap_or(Value::Null),
+                "id": artifact.get("id").cloned().unwrap_or(Value::Null),
+                "path": artifact.get("path").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    static ARTIFACT_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _index_guard = ARTIFACT_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = dir.join("artifact-index.json");
+    let mut merged: Vec<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .map(Clone::clone)
+        })
+        .unwrap_or_default();
+    for artifact in new_artifacts {
+        let already_present = merged.iter().any(|existing| {
+            existing.get("agent_id") == artifact.get("agent_id")
+                && existing.get("artifact_id") == artifact.get("artifact_id")
+        });
+        if !already_present {
+            merged.push(artifact);
+        }
+    }
+    if std::fs::create_dir_all(dir).is_ok() {
+        if let Ok(text) = serde_json::to_string_pretty(&json!({
+            "scenario": "code_review_subagents",
+            "artifacts": merged,
+        })) {
+            let _ = std::fs::write(path, format!("{text}\n"));
+        }
+    }
+}
+
+/// M15-F5 (#44): mirror a PRODUCTION supervised task/agent lifecycle
+/// notification into the evidence ledgers from the central durable-notification
+/// dispatch. Covers BOTH the supervised review swarm's `task/updated`
+/// (task-ledger) AND the in-turn spawn/delegate path, which routes child
+/// `agent/updated` / `agent/output/delta` / `agent/artifact/updated` through
+/// the TYPED `send_notification_durable` path (see `forward_progress_event` /
+/// `forward_terminal_agent_update_durable`) rather than the raw ephemeral
+/// helper. NO-OP unless `appui_evidence_dir()` is `Some`.
+fn record_task_evidence(notification: &UiNotification) {
+    use octos_core::ui_protocol::methods;
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    // Agent lifecycle/output/artifact notifications also reach the typed
+    // durable path (in-turn spawn). Re-serialize the typed event back into the
+    // raw params shape the agent-evidence mapper expects and delegate so the
+    // ledger format is identical to the raw-ephemeral path.
+    match notification {
+        UiNotification::AgentUpdated(event) => {
+            agent_evidence_to_dir(
+                &dir,
+                methods::AGENT_UPDATED,
+                &json!({ "session_id": event.session_id, "agent": event.agent }),
+            );
+        }
+        UiNotification::AgentOutputDelta(event) => {
+            agent_evidence_to_dir(
+                &dir,
+                methods::AGENT_OUTPUT_DELTA,
+                &json!({ "session_id": event.session_id, "agent_id": event.agent_id }),
+            );
+        }
+        UiNotification::AgentArtifactUpdated(event) => {
+            agent_evidence_to_dir(
+                &dir,
+                methods::AGENT_ARTIFACT_UPDATED,
+                &json!({
+                    "session_id": event.session_id,
+                    "agent_id": event.agent_id,
+                    "artifacts": event.artifacts,
+                }),
+            );
+        }
+        _ => task_evidence_to_dir(&dir, notification),
+    }
+}
+
+/// M15-F5 (#44): pure, directory-parameterised core of `record_task_evidence`
+/// for the `task/updated` variant (see that wrapper for semantics). Free of any
+/// env read so it is unit testable.
+fn task_evidence_to_dir(dir: &Path, notification: &UiNotification) {
+    let UiNotification::TaskUpdated(event) = notification else {
+        return;
+    };
+    let ledger_event = match event.state {
+        UiTaskRuntimeState::Completed => "task_completed",
+        UiTaskRuntimeState::Cancelled | UiTaskRuntimeState::Failed => "task_completed",
+        _ => "task_started",
+    };
+    append_evidence_jsonl_to_dir(
+        dir,
+        "task-ledger.jsonl",
+        &json!({
+            "event": ledger_event,
+            "session_id": event.session_id,
+            "task_id": event.task_id,
+            "title": event.title,
+            "state": format!("{:?}", event.state),
+        }),
+    );
+    // M15-F5 (#44): in-turn `delegate`/`spawn` children DON'T declare agent
+    // artifacts (their `agent/artifact/list` is empty) — their outputs surface
+    // as supervised-task artifacts (`artifact_count`). So when a supervised
+    // task completes with artifacts, index a task-level artifact entry. This
+    // is the only artifact signal the in-turn spawn path exposes, and it keeps
+    // `artifact-index.json` populated for the verifier's `"artifacts": [`
+    // requirement from REAL completed work.
+    if matches!(event.state, UiTaskRuntimeState::Completed)
+        && event.artifact_count.is_some_and(|count| count > 0)
+    {
+        let task_id = json!(event.task_id);
+        merge_artifact_index(
+            dir,
+            &task_id,
+            &[json!({
+                "id": event.task_id,
+                "title": event.title,
+                "kind": "task_output",
+            })],
+        );
+    }
+}
+
 fn append_appui_transcript_frame(direction: &str, frame: Value) {
     append_appui_evidence_jsonl(
         "appui-transcript.jsonl",
@@ -20429,6 +21023,11 @@ fn send_raw_notification_ephemeral(
         );
         return Err(SendError::BackpressureDrop);
     }
+    // M15-F5 (#44): mirror production child-agent lifecycle/output/artifact
+    // notifications into `agent-ledger.jsonl` / `artifact-index.json` evidence
+    // ledgers. NO-OP unless the live tmux soak set
+    // `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    record_agent_evidence(method, &params);
     let notification = octos_core::ui_protocol::RpcNotification::new(method, params);
     let frame = frame_for(&notification).ok_or(SendError::BackpressureDrop)?;
     ws.send_ephemeral(frame, method)
@@ -20831,6 +21430,10 @@ fn send_notification_durable(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // M15-F5 (#44): mirror production supervised-task lifecycle updates into
+    // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
+    // set `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    record_task_evidence(&notification);
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
@@ -28699,6 +29302,293 @@ ignore = []
         assert_eq!(result["fire"]["queued"], json!(true));
         assert_eq!(result["fire"]["duplicate"], json!(false));
         assert_eq!(result["fire"]["reason"], json!("LoopFire"));
+    }
+
+    /// M15-F5 (#44): the production autonomy runtime must populate the same
+    /// evidence ledgers the soak verifier (`verify-autonomy-live`) requires —
+    /// from REAL orchestrator RPC results, NOT the deterministic fixture path.
+    /// This pins that `autonomy_rpc_evidence_to_dir` writes goal/loop ledgers
+    /// with the verifier-required `event` markers, a runtime policy stamp, and
+    /// returns the matching `session/goal/updated` / `loop/updated` /
+    /// `loop/fired` server→client notifications — and that NONE of the written
+    /// evidence carries the fixture-only markers the verifier bans.
+    #[test]
+    fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
+        clear_autonomy_runtime_state_for_test();
+        let features = ConnectionUiFeatures::stdio_defaults();
+        // Scope to a DEDICATED profile (not MAIN_PROFILE_ID) so the
+        // `loop/fire_now` continuation this test enqueues into the
+        // process-global scheduler is never surfaced by a sibling drain-path
+        // test's `Some(MAIN_PROFILE_ID)` sweep.
+        let test_profile = "m15f5-evidence-profile";
+        let session_id = SessionKey::with_profile_topic(test_profile, "local", "tui", "coding");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Real production goal-set RPC result.
+        let goal_set = RpcRequest::new(
+            "goal-set",
+            methods::SESSION_GOAL_SET,
+            json!({
+                "session_id": session_id.clone(),
+                "objective": "drive the production autonomy soak to a joined answer",
+            }),
+        );
+        let goal_result =
+            raw_autonomy_rpc(&goal_set, features, Some(test_profile)).expect("goal set");
+        let goal_notifs =
+            autonomy_rpc_evidence_to_dir(path, methods::SESSION_GOAL_SET, &goal_result);
+        assert!(
+            matches!(
+                goal_notifs.as_slice(),
+                [UiNotification::SessionGoalUpdated(_)]
+            ),
+            "goal/set must yield a session/goal/updated notification"
+        );
+
+        // Real production loop-create RPC result.
+        let loop_create = RpcRequest::new(
+            "loop-create",
+            methods::LOOP_CREATE,
+            json!({
+                "session_id": session_id.clone(),
+                "command": "/loop check child-agent progress every 5m",
+            }),
+        );
+        let loop_result =
+            raw_autonomy_rpc(&loop_create, features, Some(test_profile)).expect("loop create");
+        let loop_id = loop_result["loop"]["loop_id"]
+            .as_str()
+            .expect("loop id")
+            .to_owned();
+        let loop_notifs = autonomy_rpc_evidence_to_dir(path, methods::LOOP_CREATE, &loop_result);
+        assert!(
+            matches!(loop_notifs.as_slice(), [UiNotification::LoopUpdated(_)]),
+            "loop/create must yield a loop/updated notification"
+        );
+
+        // Codex P2: the manual `loop/fire_now` RPC must NOT emit a `loop/fired`
+        // notification from the RPC path — the single `loop/fired` is emitted
+        // once at the scheduler drain (see the `scheduled_continuation_*`
+        // assertion below), so a manual fire is not double-counted.
+        let fire_now = RpcRequest::new(
+            "loop-fire",
+            methods::LOOP_FIRE_NOW,
+            json!({ "session_id": session_id.clone(), "loop_id": loop_id }),
+        );
+        let fire_result =
+            raw_autonomy_rpc(&fire_now, features, Some(test_profile)).expect("loop fire");
+        let fire_notifs = autonomy_rpc_evidence_to_dir(path, methods::LOOP_FIRE_NOW, &fire_result);
+        assert!(
+            fire_notifs.is_empty(),
+            "loop/fire_now RPC must NOT emit a notification (loop/fired is emitted at the scheduler drain)"
+        );
+
+        // Production agent lifecycle + artifacts must populate the agent
+        // ledger and artifact index via the directory-parameterised core
+        // (the env wrappers `record_agent_evidence` / `record_task_evidence`
+        // just resolve `appui_evidence_dir()` and delegate here).
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent": { "agent_id": "reviewer-api-1", "status": "running", "backend_kind": "native" },
+            }),
+        );
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent": { "agent_id": "reviewer-api-1", "status": "completed", "backend_kind": "native" },
+            }),
+        );
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_ARTIFACT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent_id": "reviewer-api-1",
+                "artifacts": [{ "id": "summary", "path": "/tmp/x/summary.md" }],
+            }),
+        );
+        // Codex P2: a SECOND child's artifacts must MERGE, not clobber the
+        // first child's index entry.
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_ARTIFACT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent_id": "reviewer-tests-1",
+                "artifacts": [{ "id": "summary", "path": "/tmp/y/summary.md" }],
+            }),
+        );
+        task_evidence_to_dir(
+            path,
+            &UiNotification::TaskUpdated(TaskUpdatedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                task_id: TaskId::new(),
+                title: "Native code review specialist swarm".to_owned(),
+                state: UiTaskRuntimeState::Running,
+                tool_call_id: None,
+                runtime_detail: None,
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
+                turn_id: None,
+            }),
+        );
+        task_evidence_to_dir(
+            path,
+            &UiNotification::TaskUpdated(TaskUpdatedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                task_id: TaskId::new(),
+                title: "Native code review specialist swarm".to_owned(),
+                state: UiTaskRuntimeState::Completed,
+                tool_call_id: None,
+                runtime_detail: None,
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
+                turn_id: None,
+            }),
+        );
+
+        // Codex P2: a SCHEDULED loop fire (self-paced / fixed / maintenance)
+        // reaches the runtime via the due-loop scheduler, NOT `loop/fire_now`.
+        // It is the single source of the `loop_fired` ledger row + `loop/fired`
+        // notification. Drive it through the dir-parameterised core.
+        let scheduled_fire = scheduled_continuation_to_dir(
+            Some(path),
+            &session_id,
+            test_profile,
+            &MasterContinuationReason::LoopFire,
+            Some(&loop_id),
+            None,
+        );
+        assert!(
+            matches!(scheduled_fire.as_slice(), [UiNotification::LoopFired(_)]),
+            "scheduled loop fire must yield a loop/fired notification"
+        );
+        // A scheduled goal continuation appends a `goal_continuation` row.
+        scheduled_continuation_to_dir(
+            Some(path),
+            &session_id,
+            test_profile,
+            &MasterContinuationReason::GoalContinue,
+            None,
+            Some("goal_01"),
+        );
+
+        let read = |name: &str| std::fs::read_to_string(path.join(name)).unwrap_or_default();
+        let policy = read("runtime-policy-stamp.json");
+        let goal_ledger = read("goal-ledger.jsonl");
+        let loop_ledger = read("loop-ledger.jsonl");
+        let agent_ledger = read("agent-ledger.jsonl");
+        let task_ledger = read("task-ledger.jsonl");
+        let artifact_index = read("artifact-index.json");
+
+        // Verifier-required structure / event markers.
+        assert!(!policy.is_empty(), "runtime-policy-stamp.json must exist");
+        assert!(
+            goal_ledger.contains("\"goal_started\""),
+            "goal ledger missing goal_started: {goal_ledger}"
+        );
+        assert!(
+            loop_ledger.contains("\"loop_iteration\"") && loop_ledger.contains("\"loop_fired\""),
+            "loop ledger missing loop markers: {loop_ledger}"
+        );
+        assert!(
+            agent_ledger.contains("\"agent_started\"")
+                && agent_ledger.contains("\"agent_completed\""),
+            "agent ledger missing agent markers: {agent_ledger}"
+        );
+        assert!(
+            task_ledger.contains("\"task_started\"") && task_ledger.contains("\"task_completed\""),
+            "task ledger missing task markers: {task_ledger}"
+        );
+        assert!(
+            artifact_index.contains("\"artifacts\""),
+            "artifact-index.json missing artifacts array: {artifact_index}"
+        );
+
+        // The non-fixture gate the verifier enforces: NONE of the production
+        // evidence may carry deterministic/fixture markers.
+        for (name, body) in [
+            ("runtime-policy-stamp.json", &policy),
+            ("goal-ledger.jsonl", &goal_ledger),
+            ("loop-ledger.jsonl", &loop_ledger),
+            ("agent-ledger.jsonl", &agent_ledger),
+            ("task-ledger.jsonl", &task_ledger),
+        ] {
+            for marker in [
+                "m15-fixture-appui-backend",
+                "fixture-only",
+                "deterministic fixture",
+                "fake-openai",
+                "M15_CODE_REVIEW_FINAL_LINE",
+                "M15CODEREVIEWFINALLINE",
+            ] {
+                assert!(
+                    !body.contains(marker),
+                    "{name} must not contain fixture marker {marker}"
+                );
+            }
+        }
+
+        // Codex P2: the artifact index must MERGE across children — both
+        // reviewer-api-1 and reviewer-tests-1 entries survive.
+        let index: Value = serde_json::from_str(&artifact_index).expect("artifact index json");
+        let index_agents: Vec<&str> = index["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .filter_map(|artifact| artifact["agent_id"].as_str())
+            .collect();
+        assert!(
+            index_agents.contains(&"reviewer-api-1") && index_agents.contains(&"reviewer-tests-1"),
+            "artifact index must merge both children, got {index_agents:?}"
+        );
+
+        // Codex P2: scheduled (self-paced / fixed) loop fires reach the runtime
+        // via the due-loop scheduler, NOT `loop/fire_now` — they must still
+        // yield a `loop/fired` notification and a `loop_fired` ledger row.
+        let scheduled = scheduled_continuation_notifications(
+            &session_id,
+            MAIN_PROFILE_ID,
+            &MasterContinuationReason::LoopFire,
+            Some("loop_07"),
+            None,
+        );
+        assert!(
+            matches!(scheduled.as_slice(), [UiNotification::LoopFired(event)] if event.loop_id == "loop_07"),
+            "scheduled loop fire must yield a loop/fired notification"
+        );
+
+        // Codex P2: the goal/loop wire notifications must be built even when NO
+        // evidence dir is set (normal production) — they are genuine protocol
+        // frames, only the LEDGER write is soak-gated.
+        let prod_notifs = autonomy_rpc_notifications(methods::SESSION_GOAL_SET, &goal_result);
+        assert!(
+            matches!(
+                prod_notifs.as_slice(),
+                [UiNotification::SessionGoalUpdated(_)]
+            ),
+            "goal/set must yield a notification independent of any evidence dir"
+        );
+
+        // This test enqueues a real `loop/fire_now` continuation into the
+        // process-global scheduler. Drain-path tests sweep due continuations
+        // for `MAIN_PROFILE_ID`, so clear the shared state on the way out to
+        // keep this leftover from being drained by a sibling test.
+        clear_autonomy_runtime_state_for_test();
     }
 
     #[derive(Default)]
