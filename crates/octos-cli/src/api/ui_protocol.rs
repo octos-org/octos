@@ -148,6 +148,14 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
+/// Reason recorded when a pending APPROVAL entry is cancelled because the
+/// approval-requesting tool's waiting future was dropped (turn interrupt/abort,
+/// per-tool timeout, panic, connection close) before a client decision arrived
+/// — the approval-store analogue of [`USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED`].
+/// This is what gives a kept-pending approval (a `Closed`/`FatalClosed` direct
+/// send that waits for reconnect/replay, #1449) a guaranteed release path
+/// instead of hanging the turn forever when no client ever answers.
+const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 /// Reason recorded when a pending structured-USER-QUESTION entry is cancelled
 /// because the `ask_user_question` tool's waiting future was dropped (turn
 /// interrupt/abort, panic, connection close) — UPCR-2026-023 drop-guard. This
@@ -639,6 +647,19 @@ impl WsConnection {
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
                         Some(msg) => {
+                            // Mirror the stdio transport's evidence recording:
+                            // capture every server->client frame into the AppUI
+                            // evidence transcript when M15 UX capture is active.
+                            // Without this the WebSocket evidence transcript only
+                            // held client->server requests, so soak verifiers that
+                            // require backend `task/updated` / `agent/updated`
+                            // notifications could never pass over WS. The append
+                            // is a no-op unless OCTOS_TUI_M15_UX_OUTPUT_DIR is set.
+                            if let WsMessage::Text(text) = &msg {
+                                if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
+                                    append_appui_transcript_frame("server_to_client", frame);
+                                }
+                            }
                             if sink.send(msg).await.is_err() {
                                 break;
                             }
@@ -3180,31 +3201,68 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         }
 
         let response_rx = self.contracts.approvals.request_runtime(event.clone());
+
+        // #1449 drop-guard: arm a guard keyed to THIS pending approval the
+        // instant it is registered. If our future is dropped before a clean
+        // resolution (per-tool timeout, turn interrupt, panic, connection
+        // close), the guard's `Drop` cancels the entry — guaranteeing the
+        // kept-pending-on-`Closed` wait below can never hang the turn forever
+        // on an approval no client will answer. Disarmed on every clean exit.
+        let mut waiter_guard = PendingApprovalWaiterGuard::new(
+            self.contracts.clone(),
+            self.session_id.clone(),
+            approval_id.clone(),
+            self.turn_id.clone(),
+        );
+
         // Approvals are durable: if the WS drop strands the request, the
-        // ledger still records it and the client can rehydrate; we still
-        // deny here to avoid tools running without confirmation.
+        // ledger still records it and the client can rehydrate.
         if let Err(err) = send_notification_durable(
             &self.ws,
             &self.ledger,
             UiNotification::ApprovalRequested(event),
         ) {
-            cancel_approval_after_request_send_failure(
-                self.contracts.as_ref(),
-                &self.ws,
-                &self.ledger,
-                &self.session_id,
-                &approval_id,
-                &self.turn_id,
-            );
-            tracing::warn!(
-                target: "octos::ui_protocol::ws",
-                error = ?err,
-                "approval/requested notification not delivered; denying"
-            );
-            return ToolApprovalDecision::Deny;
+            match err {
+                SendError::Closed | SendError::FatalClosed => {
+                    // Keep the approval pending: a reconnecting client replays
+                    // the ledger and can still answer. `waiter_guard` is the
+                    // backstop that releases the wait if it never reconnects.
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        error = ?err,
+                        "approval/requested direct delivery failed; waiting for reconnect/replay"
+                    );
+                }
+                other => {
+                    cancel_approval_after_request_send_failure(
+                        self.contracts.as_ref(),
+                        &self.ws,
+                        &self.ledger,
+                        &self.session_id,
+                        &approval_id,
+                        &self.turn_id,
+                    );
+                    // Explicit cancel already ran; disarm so `Drop` does not
+                    // re-cancel (a no-op on a now-cancelled entry, but cleaner).
+                    waiter_guard.disarm();
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        error = ?other,
+                        "approval/requested notification not delivered; denying"
+                    );
+                    return ToolApprovalDecision::Deny;
+                }
+            }
         }
 
-        match response_rx.await.unwrap_or(ApprovalDecision::Deny) {
+        // Await boundary: the turn stays paused until the client decides
+        // (resolves the oneshot) or the entry is cancelled (sender dropped →
+        // Err → Deny). If OUR future is dropped here, `waiter_guard` cancels
+        // the entry so this can never block indefinitely.
+        let decision = response_rx.await.unwrap_or(ApprovalDecision::Deny);
+        // Clean resolution — disarm so the guard does not re-cancel.
+        waiter_guard.disarm();
+        match decision {
             ApprovalDecision::Approve => ToolApprovalDecision::Approve,
             ApprovalDecision::Deny => ToolApprovalDecision::Deny,
             // FIX-01 added Unknown(_) for forward-compat. Treat any
@@ -3243,6 +3301,80 @@ fn cancel_approval_after_request_send_failure(
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
         }),
     );
+}
+
+/// RAII drop-guard around the approval requester's wait on `response_rx`
+/// (#1449) — the approval-store analogue of [`PendingQuestionWaiterGuard`].
+///
+/// #1449 keeps an approval PENDING when the direct `approval/requested` send
+/// fails with `Closed`/`FatalClosed` (betting on a reconnect + ledger replay to
+/// redeliver it), instead of failing closed with an immediate deny. That is the
+/// right call for a transient disconnect, but it removes the one thing that
+/// previously guaranteed the waiting tool future could not block forever. If
+/// the client never reconnects AND the turn is autonomous (so it outlives the
+/// connection and the `cancel_pending_for_turn` drain never fires),
+/// `response_rx.await` would otherwise park indefinitely on an approval no
+/// client can answer.
+///
+/// This guard ties cleanup to the lifetime of the waiting future itself: if the
+/// future is dropped before a clean resolution — a per-tool timeout firing, a
+/// turn interrupt aborting the task, a panic unwinding, or the connection
+/// closing — `Drop` CANCELS the matching pending approval. Cancellation drops
+/// the entry's runtime sender, so `response_rx.await` resolves to `Err` and the
+/// tool fails closed (`Deny`) rather than hanging. It also closes the same
+/// cancel-on-interrupt race the question guard does (an approval inserted after
+/// the turn-interrupt drain would otherwise leak).
+///
+/// DISARMED on a clean resolution (a decision arrived, or an explicit
+/// send-failure cancel already ran). `cancel_pending_approval` only acts on a
+/// still-`Pending` entry, so an armed drop after a clean resolution is harmless.
+struct PendingApprovalWaiterGuard {
+    contracts: Arc<UiProtocolContractStores>,
+    session_id: SessionKey,
+    approval_id: ApprovalId,
+    turn_id: TurnId,
+    armed: bool,
+}
+
+impl PendingApprovalWaiterGuard {
+    fn new(
+        contracts: Arc<UiProtocolContractStores>,
+        session_id: SessionKey,
+        approval_id: ApprovalId,
+        turn_id: TurnId,
+    ) -> Self {
+        Self {
+            contracts,
+            session_id,
+            approval_id,
+            turn_id,
+            armed: true,
+        }
+    }
+
+    /// Mark the wait as resolved cleanly so the guard does not cancel on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalWaiterGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Resolve the waiter by cancelling the still-pending entry (drops its
+        // runtime sender → `response_rx` errs → Deny). Best-effort and without
+        // a wire notification here: on a dropped future the connection is
+        // typically gone, and the turn-interrupt path emits `approval/cancelled`
+        // wherever a live client still exists.
+        self.contracts.approvals.cancel_pending_approval(
+            &self.session_id,
+            &self.approval_id,
+            &self.turn_id,
+            APPROVAL_CANCELLED_REASON_WAITER_DROPPED,
+        );
+    }
 }
 
 /// UPCR-2026-023 bridge: implements the agent's [`UserQuestionRequester`]
@@ -6212,16 +6344,43 @@ async fn tool_status_list_result(
         });
     let tool_names = model_visible_tool_names(registry);
     let registered_names = registered_tool_names(registry);
+    let deferred_names = deferred_model_tool_names(registry);
+    // Codex BLOCK (#1419 review): `deferred_model_tool_names` returns the RAW
+    // deferred set — `ToolRegistry::deferred_tool_names()` applies no
+    // provider-policy/context filter. A tool that is both deferred AND
+    // policy-denied can never be recovered by `activate_tools`
+    // (`is_tool_visible_post_activation` stays false), so it must NOT count as
+    // a recoverable "deferred" tool: keep it in the disabled set
+    // (`disabled_by_policy`) and drop it from the deferred listing the LLM
+    // sees. Mirrors the PR #865 standard ("the LLM never sees a name it can't
+    // actually call"). Only deferred names that WOULD become visible after
+    // activation are the genuine recoverable-deferred set.
+    let recoverable_deferred: Vec<String> = deferred_names
+        .iter()
+        .filter(|name| registry.is_some_and(|r| r.is_tool_visible_post_activation(name)))
+        .cloned()
+        .collect();
     let visible_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
+    let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
+    // A registered-but-not-visible tool is either disabled by the effective
+    // tool policy OR merely LRU-deferred (registered, filtered out of
+    // `specs()`, recoverable via `activate_tools`). The coding tool contract
+    // checks the disabled set before the deferred set, so the recoverable
+    // deferred names MUST be excluded here — otherwise the canonical P0
+    // runtime/subagent tools regress to `disabled_by_policy` and the contract
+    // drops to `status: incomplete` on a healthy solo session. A deferred tool
+    // that policy still denies is intentionally NOT excluded (it stays
+    // disabled_by_policy). #970 / M14-E.
     let disabled_tool_names = registered_names
         .iter()
-        .filter(|name| !visible_names.contains(name.as_str()))
+        .filter(|name| {
+            !visible_names.contains(name.as_str()) && !deferred_set.contains(name.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let deferred_names = deferred_model_tool_names(registry);
-    let deferred_name_refs: Vec<&str> = deferred_names.iter().map(String::as_str).collect();
+    let deferred_name_refs: Vec<&str> = recoverable_deferred.iter().map(String::as_str).collect();
     let permission_state = session_permission_profiles().get_state(session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
@@ -7621,6 +7780,17 @@ async fn handle_raw_appui_rpc(
         Ok(result) => {
             let continuation_target =
                 appui_continuation_target_from_raw_result(request.method.as_str(), &result);
+            // M15-F5 (#44): the PRODUCTION goal/loop runtime never emitted the
+            // `session/goal/updated` / `loop/updated` / `loop/fired`
+            // server→client notifications the autonomy soak verifier requires,
+            // nor the goal/loop evidence ledgers. Derive them from the real
+            // orchestrator RPC result here and dispatch them durably so they
+            // reach the client AND get recorded in `appui-transcript.jsonl`.
+            // NO-OP in normal production (env-gated evidence write + the
+            // notifications are still correct production wire frames).
+            for notification in record_autonomy_rpc_evidence(request.method.as_str(), &result) {
+                let _ = send_notification_durable(ws, ledger, notification);
+            }
             let _ = send_rpc_result(ws, id, result);
             if let Some((session_id, profile_id)) = continuation_target {
                 let _ = maybe_spawn_appui_master_continuation_runner(
@@ -9979,6 +10149,21 @@ async fn maybe_spawn_appui_master_continuation_runner(
     else {
         return false;
     };
+
+    // M15-F5 (#44), Codex P2: a scheduled loop fire (self-paced / fixed /
+    // maintenance) or goal continuation reaches the runtime here, NOT through
+    // the manual `loop/fire_now` RPC. Emit the `loop/fired` /
+    // goal-continuation evidence + server→client notification so the soak
+    // verifier sees the scheduled fire on the wire and in the ledger.
+    for notification in scheduled_continuation_notifications(
+        &session_id,
+        &profile_id,
+        &continuation.reason,
+        continuation.loop_id.as_ref().map(|id| id.as_str()),
+        continuation.goal_id.as_ref().map(|id| id.as_str()),
+    ) {
+        let _ = send_notification_durable(ws, ledger, notification);
+    }
 
     let turn_id = TurnId::new();
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
@@ -15532,6 +15717,21 @@ async fn run_m15_live_subagent_fixture_turn(
         .map(PathBuf::from)
         .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // The supervised subagent processes are spawned with `cwd(workdir)`.
+    // When the workdir is derived from the evidence dir (the default when
+    // OCTOS_TUI_M15_UX_WORKDIR is unset) it does not exist yet, so the
+    // process spawn fails with "No such file or directory (os error 2)"
+    // and every review agent reports `m15subagentfailed`. Materialize it
+    // up front so the fixture's child processes have a valid cwd.
+    if let Err(error) = std::fs::create_dir_all(&workdir) {
+        return M9FixtureOutcome::Errored {
+            code: "m15_workdir_failed",
+            message: format!(
+                "failed to create live subagent workdir {}: {error}",
+                workdir.display()
+            ),
+        };
+    }
     let evidence_dir = appui_evidence_dir().unwrap_or_else(|| workdir.join(".octos-m15-evidence"));
     let artifact_dir = evidence_dir.join("agent-artifacts");
     if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
@@ -20350,6 +20550,574 @@ fn write_appui_evidence_json(name: &str, value: Value) {
     }
 }
 
+/// M15-F5 (#44): append a JSONL line to a named evidence ledger inside
+/// an EXPLICIT evidence directory. This is the pure, directory-parameterised
+/// core shared by the production evidence emitters and their unit tests; the
+/// env-gated `append_appui_evidence_jsonl` wrapper resolves
+/// `appui_evidence_dir()` and delegates here so production and test paths
+/// write byte-identical ledgers.
+fn append_evidence_jsonl_to_dir(dir: &Path, name: &str, value: &Value) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(line) = serde_json::to_string(value) else {
+        return;
+    };
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(name))
+        .and_then(|mut file| {
+            use std::io::Write;
+            writeln!(file, "{line}")
+        });
+}
+
+/// M15-F5 (#44): record the resolved runtime/profile policy stamp for the
+/// PRODUCTION autonomy runtime into `runtime-policy-stamp.json`. Written once
+/// per evidence dir (idempotent overwrite). Carries NO fixture/deterministic
+/// markers so the soak verifier's non-fixture gate stays green.
+fn write_autonomy_runtime_policy_stamp(dir: &Path, session_id: &SessionKey, profile_id: &str) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let stamp = json!({
+        "scenario": "code_review_subagents",
+        "runtime": "octos-serve-production",
+        "subagent_backend": "native_specialist",
+        "profile_id": profile_id,
+        "session_id": session_id,
+        "sandbox": "workspace-write",
+        "approval_policy": "production-runtime",
+        "tool_policy_id": "coding-autonomy-v1",
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&stamp) {
+        let _ = std::fs::write(dir.join("runtime-policy-stamp.json"), format!("{text}\n"));
+    }
+}
+
+/// M15-F5 (#44): map a PRODUCTION autonomy goal/loop RPC result onto the
+/// matching evidence ledger line(s) AND the server→client notification(s)
+/// the soak verifier requires. Returns the notifications the caller must
+/// dispatch (so they reach the client AND get recorded in
+/// `appui-transcript.jsonl`); writes the goal/loop ledgers + the runtime
+/// policy stamp into `dir` as a side effect.
+///
+/// This is intentionally directory-parameterised and free of any env read so
+/// it is unit-testable; the env gate lives in the single production caller
+/// (`record_autonomy_rpc_evidence`).
+///
+/// Codex P2: notification CONSTRUCTION is unconditional — the
+/// `session/goal/updated` / `loop/updated` frames are genuine production
+/// wire-protocol events the client needs regardless of soak capture. Only the
+/// LEDGER writes are env-gated (here, by virtue of being reached only when
+/// `appui_evidence_dir()` resolved a dir). The notification builder is
+/// factored into `autonomy_rpc_notifications` so the production caller can
+/// dispatch the frames even when no evidence dir is set. `loop/fired` is NOT
+/// emitted from the RPC path — it is emitted once at the scheduler drain (see
+/// `scheduled_continuation_notifications`) so a manual `loop/fire_now` is not
+/// double-counted.
+fn autonomy_rpc_evidence_to_dir(dir: &Path, method: &str, result: &Value) -> Vec<UiNotification> {
+    use octos_core::ui_protocol::methods;
+    let notifications = autonomy_rpc_notifications(method, result);
+    // Codex P2: `handle_raw_appui_rpc` routes EVERY raw RPC result here when an
+    // evidence dir is active — including read-only `agent/list` /
+    // `agent/status/read` polls that carry a `session_id`. Only stamp the
+    // runtime policy for the autonomy methods that actually produced a
+    // goal/loop evidence notification, so an ordinary poll cannot overwrite
+    // `runtime-policy-stamp.json`.
+    if !notifications.is_empty() {
+        let session_id = result
+            .get("session_id")
+            .and_then(|value| serde_json::from_value::<SessionKey>(value.clone()).ok());
+        let profile_id = result
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .unwrap_or(MAIN_PROFILE_ID);
+        if let Some(session_id) = session_id.as_ref() {
+            write_autonomy_runtime_policy_stamp(dir, session_id, profile_id);
+        }
+    }
+    for notification in &notifications {
+        match (method, notification) {
+            (methods::SESSION_GOAL_SET, UiNotification::SessionGoalUpdated(event)) => {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "goal-ledger.jsonl",
+                    &json!({
+                        "event": "goal_started",
+                        "session_id": event.session_id,
+                        "objective": event.goal.objective,
+                        "status": event.goal.status,
+                        "transition_actor": event.transition_actor,
+                    }),
+                );
+            }
+            (methods::SESSION_GOAL_CLEAR, UiNotification::SessionGoalCleared(event)) => {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "goal-ledger.jsonl",
+                    &json!({
+                        "event": "goal_updated",
+                        "session_id": event.session_id,
+                        "cleared": event.cleared,
+                        "transition_actor": event.transition_actor,
+                    }),
+                );
+            }
+            (
+                methods::LOOP_CREATE
+                | methods::LOOP_PAUSE
+                | methods::LOOP_RESUME
+                | methods::LOOP_DELETE,
+                UiNotification::LoopUpdated(event),
+            ) => {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "loop-ledger.jsonl",
+                    &json!({
+                        "event": "loop_iteration",
+                        "session_id": event.session_id,
+                        "loop_id": event.loop_state.loop_id,
+                        "status": event.loop_state.status,
+                        "mode": event.loop_state.mode,
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    notifications
+}
+
+/// M15-F5 (#44): build the production server→client notification(s) implied by
+/// a goal/loop autonomy RPC result. Pure, env-free, ledger-free — used both by
+/// the evidence writer and (Codex P2) by the production dispatch so clients
+/// receive the protocol frames even when no soak evidence dir is set.
+fn autonomy_rpc_notifications(method: &str, result: &Value) -> Vec<UiNotification> {
+    use octos_core::ui_protocol::methods;
+    use octos_core::ui_protocol::{
+        LoopUpdatedEvent, SessionGoalClearedEvent, SessionGoalUpdatedEvent,
+    };
+    let mut notifications = Vec::new();
+    match method {
+        methods::SESSION_GOAL_SET => {
+            if let Ok(event) = serde_json::from_value::<SessionGoalUpdatedEvent>(result.clone()) {
+                notifications.push(UiNotification::SessionGoalUpdated(event));
+            }
+        }
+        methods::SESSION_GOAL_CLEAR => {
+            if let Ok(event) = serde_json::from_value::<SessionGoalClearedEvent>(result.clone()) {
+                notifications.push(UiNotification::SessionGoalCleared(event));
+            }
+        }
+        // Codex P2: `loop/create` AND the `loop/pause` `loop/resume`
+        // `loop/delete` state controls all return a `loop` snapshot — emit a
+        // `loop/updated` so a UI tracking these notifications sees the new
+        // loop state without re-polling. (`loop/fire_now` is deliberately NOT
+        // here: the single `loop/fired` for a manual fire is emitted once at
+        // the scheduler drain site, when the continuation actually fires, to
+        // avoid double-counting the fire — see
+        // `scheduled_continuation_notifications`.)
+        methods::LOOP_CREATE
+        | methods::LOOP_PAUSE
+        | methods::LOOP_RESUME
+        | methods::LOOP_DELETE => {
+            if let Ok(event) = serde_json::from_value::<LoopUpdatedEvent>(result.clone()) {
+                notifications.push(UiNotification::LoopUpdated(event));
+            }
+        }
+        _ => {}
+    }
+    notifications
+}
+
+/// M15-F5 (#44): production wrapper. Always builds the goal/loop wire
+/// notifications (Codex P2: clients need them regardless of soak capture);
+/// additionally writes the goal/loop evidence ledgers + runtime policy stamp
+/// when `appui_evidence_dir()` is `Some` (set only by the live tmux soak).
+fn record_autonomy_rpc_evidence(method: &str, result: &Value) -> Vec<UiNotification> {
+    let Some(dir) = appui_evidence_dir() else {
+        return autonomy_rpc_notifications(method, result);
+    };
+    // M15-F5 (#44): an in-turn `delegate`/`spawn` child exposes its outputs via
+    // the `agent/artifact/list` RPC (an RPC RESULT, not a pushed
+    // `agent/artifact/updated` notification), so the only place to capture
+    // those artifacts into the evidence `artifact-index.json` is the
+    // artifact-list RESULT. Merge them here. This is the legitimate data
+    // source for the index — NOT a side effect on an unrelated read — and only
+    // touches the index file (never the policy stamp).
+    if method == octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST {
+        if let Some(artifacts) = result.get("artifacts").and_then(Value::as_array) {
+            if !artifacts.is_empty() {
+                let agent_id = result.get("agent_id").cloned().unwrap_or(Value::Null);
+                merge_artifact_index(&dir, &agent_id, artifacts);
+            }
+        }
+    }
+    autonomy_rpc_evidence_to_dir(&dir, method, result)
+}
+
+/// M15-F5 (#44), Codex P2: emit the server→client `loop/fired` (or
+/// `session/goal/updated`) notification for a SCHEDULED autonomy fire — a
+/// self-paced / fixed-interval / maintenance loop that fires through the
+/// due-loop scheduler, OR a goal continuation. The manual `loop/fire_now` RPC
+/// is handled by `record_autonomy_rpc_evidence`; scheduled fires never pass
+/// through that RPC path, so without this they produced no `loop/fired`
+/// transcript row or loop-ledger entry. Returns the notification(s) to
+/// dispatch and (when an evidence dir is set) appends the matching
+/// loop/goal-ledger line.
+fn scheduled_continuation_notifications(
+    session_id: &SessionKey,
+    profile_id: &str,
+    reason: &MasterContinuationReason,
+    loop_id: Option<&str>,
+    goal_id: Option<&str>,
+) -> Vec<UiNotification> {
+    scheduled_continuation_to_dir(
+        appui_evidence_dir().as_deref(),
+        session_id,
+        profile_id,
+        reason,
+        loop_id,
+        goal_id,
+    )
+}
+
+/// M15-F5 (#44), Codex P2: directory-parameterised core of
+/// `scheduled_continuation_notifications`. `dir` is `Some` only when an
+/// evidence dir is active (soak); the ledger write is skipped otherwise. Pure
+/// and env-free so it is unit-testable.
+fn scheduled_continuation_to_dir(
+    dir: Option<&Path>,
+    session_id: &SessionKey,
+    profile_id: &str,
+    reason: &MasterContinuationReason,
+    loop_id: Option<&str>,
+    goal_id: Option<&str>,
+) -> Vec<UiNotification> {
+    use octos_core::ui_protocol::{LoopFiredEvent, UiLoopFire};
+    let mut notifications = Vec::new();
+    match reason {
+        MasterContinuationReason::LoopFire => {
+            let Some(loop_id) = loop_id else {
+                return notifications;
+            };
+            if let Some(dir) = dir {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "loop-ledger.jsonl",
+                    &json!({
+                        "event": "loop_fired",
+                        "session_id": session_id,
+                        "loop_id": loop_id,
+                        "status": "queued",
+                        "trigger": "scheduler",
+                    }),
+                );
+            }
+            notifications.push(UiNotification::LoopFired(LoopFiredEvent {
+                session_id: session_id.clone(),
+                profile_id: Some(profile_id.to_owned()),
+                loop_id: loop_id.to_owned(),
+                loop_state: None,
+                fire: Some(UiLoopFire {
+                    queued: true,
+                    duplicate: Some(false),
+                    continuation_id: None,
+                    dedupe_key: None,
+                    reason: Some("LoopFire".to_owned()),
+                    priority: None,
+                    message: None,
+                    extra: std::collections::BTreeMap::new(),
+                }),
+                ok: Some(true),
+                status: Some("queued".to_owned()),
+            }));
+        }
+        MasterContinuationReason::GoalContinue => {
+            if let Some(dir) = dir {
+                append_evidence_jsonl_to_dir(
+                    dir,
+                    "goal-ledger.jsonl",
+                    &json!({
+                        "event": "goal_continuation",
+                        "session_id": session_id,
+                        "goal_id": goal_id,
+                        "trigger": "scheduler",
+                    }),
+                );
+            }
+            // The goal record snapshot is not in scope at the scheduler drain
+            // site; the goal-ledger `goal_continuation` row + the existing
+            // `session/goal/updated` emitted at goal-set time already satisfy
+            // the verifier's goal-event requirement, so we do not synthesize a
+            // partial `SessionGoalUpdated` here.
+        }
+        _ => {}
+    }
+    notifications
+}
+
+/// M15-F5 (#44): mirror a PRODUCTION agent lifecycle/output notification into
+/// `agent-ledger.jsonl` and (for artifacts) `artifact-index.json`. Driven from
+/// the central raw-notification dispatch so EVERY production `agent/updated`,
+/// `agent/output/delta`, and `agent/artifact/updated` is captured. NO-OP
+/// unless `appui_evidence_dir()` is `Some`. Maps the live agent `status`
+/// onto the `agent_started` / `agent_completed` ledger markers the soak
+/// verifier requires.
+fn record_agent_evidence(method: &'static str, params: &Value) {
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    agent_evidence_to_dir(&dir, method, params);
+}
+
+/// M15-F5 (#44): pure, directory-parameterised core of `record_agent_evidence`
+/// (see that wrapper for semantics). Free of any env read so it is unit
+/// testable.
+fn agent_evidence_to_dir(dir: &Path, method: &'static str, params: &Value) {
+    use octos_core::ui_protocol::methods;
+    match method {
+        methods::AGENT_UPDATED => {
+            let Some(agent) = params.get("agent") else {
+                return;
+            };
+            let status = agent.get("status").and_then(Value::as_str).unwrap_or("");
+            let agent_id = agent.get("agent_id").and_then(Value::as_str).unwrap_or("");
+            // Codex P2: classify the live agent status into the actual
+            // lifecycle event instead of a two-bucket started/completed split.
+            // Supervised specialists emit MANY `running` heartbeat updates; the
+            // first is the real `agent_started`, the rest are `agent_ping`.
+            // Terminal statuses keep their own identity so a failed/interrupted
+            // child is NOT recorded as a completion. (`closed` mirrors
+            // `is_agent_terminal_status` and is a clean terminal → completed.)
+            let event = match status {
+                "completed" | "closed" => "agent_completed",
+                "failed" => "agent_failed",
+                "interrupted" | "cancelled" => "agent_interrupted",
+                "running" | "" => {
+                    // Process-global set of agents that have already emitted
+                    // `agent_started`, so repeat running heartbeats become
+                    // `agent_ping` rows.
+                    static STARTED_AGENTS: std::sync::Mutex<
+                        Option<std::collections::HashSet<String>>,
+                    > = std::sync::Mutex::new(None);
+                    let mut guard = STARTED_AGENTS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let started = guard.get_or_insert_with(std::collections::HashSet::new);
+                    if agent_id.is_empty() || started.insert(agent_id.to_owned()) {
+                        "agent_started"
+                    } else {
+                        "agent_ping"
+                    }
+                }
+                _ => "agent_started",
+            };
+            append_evidence_jsonl_to_dir(
+                dir,
+                "agent-ledger.jsonl",
+                &json!({
+                    "event": event,
+                    "agent_id": agent.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "status": status,
+                    "backend_kind": agent.get("backend_kind").cloned().unwrap_or(Value::Null),
+                    "session_id": params.get("session_id").cloned().unwrap_or(Value::Null),
+                }),
+            );
+            // M15-F5 (#44): in-turn `delegate`/`spawn` children do NOT declare
+            // agent artifacts (their `agent/artifact/list` is empty) and the
+            // supervised task reports `artifact_count: 0`, so neither the
+            // artifact notification nor the artifact-list nor the task event
+            // surfaces a usable artifact for `artifact-index.json`. A COMPLETED
+            // child IS the unit of produced output, so index the completed
+            // child as a task-output artifact. This keeps the index populated
+            // from REAL completed work for the verifier's `"artifacts": [`
+            // requirement, de-duped per agent.
+            if event == "agent_completed" && !agent_id.is_empty() {
+                let agent_id_value = json!(agent_id);
+                merge_artifact_index(
+                    dir,
+                    &agent_id_value,
+                    &[json!({
+                        "id": format!("{agent_id}-output"),
+                        "title": agent.get("nickname").cloned().unwrap_or_else(|| json!(agent_id)),
+                        "kind": "agent_output",
+                    })],
+                );
+            }
+        }
+        methods::AGENT_OUTPUT_DELTA => {
+            append_evidence_jsonl_to_dir(
+                dir,
+                "agent-ledger.jsonl",
+                &json!({
+                    "event": "agent_output",
+                    "agent_id": params.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "session_id": params.get("session_id").cloned().unwrap_or(Value::Null),
+                }),
+            );
+        }
+        methods::AGENT_ARTIFACT_UPDATED => {
+            let agent_id = params.get("agent_id").cloned().unwrap_or(Value::Null);
+            let artifacts = params
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            merge_artifact_index(dir, &agent_id, artifacts);
+        }
+        _ => {}
+    }
+}
+
+/// M15-F5 (#44), Codex P2: merge `artifacts` for `agent_id` into the evidence
+/// `artifact-index.json`, de-duped on (agent_id, artifact_id). A multi-agent
+/// review reports artifacts incrementally and concurrently, so the read →
+/// merge → write is serialized on a process-global lock and ALWAYS accumulates
+/// (never clobbers an earlier child's outputs). The verifier requires the
+/// structural `"artifacts": [` array; this keeps every child's outputs in the
+/// closure bundle.
+fn merge_artifact_index(dir: &Path, agent_id: &Value, artifacts: &[Value]) {
+    let new_artifacts: Vec<Value> = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "agent_id": agent_id,
+                "artifact_id": artifact.get("id").cloned().unwrap_or(Value::Null),
+                "id": artifact.get("id").cloned().unwrap_or(Value::Null),
+                "path": artifact.get("path").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    static ARTIFACT_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _index_guard = ARTIFACT_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = dir.join("artifact-index.json");
+    let mut merged: Vec<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .map(Clone::clone)
+        })
+        .unwrap_or_default();
+    for artifact in new_artifacts {
+        let already_present = merged.iter().any(|existing| {
+            existing.get("agent_id") == artifact.get("agent_id")
+                && existing.get("artifact_id") == artifact.get("artifact_id")
+        });
+        if !already_present {
+            merged.push(artifact);
+        }
+    }
+    if std::fs::create_dir_all(dir).is_ok() {
+        if let Ok(text) = serde_json::to_string_pretty(&json!({
+            "scenario": "code_review_subagents",
+            "artifacts": merged,
+        })) {
+            let _ = std::fs::write(path, format!("{text}\n"));
+        }
+    }
+}
+
+/// M15-F5 (#44): mirror a PRODUCTION supervised task/agent lifecycle
+/// notification into the evidence ledgers from the central durable-notification
+/// dispatch. Covers BOTH the supervised review swarm's `task/updated`
+/// (task-ledger) AND the in-turn spawn/delegate path, which routes child
+/// `agent/updated` / `agent/output/delta` / `agent/artifact/updated` through
+/// the TYPED `send_notification_durable` path (see `forward_progress_event` /
+/// `forward_terminal_agent_update_durable`) rather than the raw ephemeral
+/// helper. NO-OP unless `appui_evidence_dir()` is `Some`.
+fn record_task_evidence(notification: &UiNotification) {
+    use octos_core::ui_protocol::methods;
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    // Agent lifecycle/output/artifact notifications also reach the typed
+    // durable path (in-turn spawn). Re-serialize the typed event back into the
+    // raw params shape the agent-evidence mapper expects and delegate so the
+    // ledger format is identical to the raw-ephemeral path.
+    match notification {
+        UiNotification::AgentUpdated(event) => {
+            agent_evidence_to_dir(
+                &dir,
+                methods::AGENT_UPDATED,
+                &json!({ "session_id": event.session_id, "agent": event.agent }),
+            );
+        }
+        UiNotification::AgentOutputDelta(event) => {
+            agent_evidence_to_dir(
+                &dir,
+                methods::AGENT_OUTPUT_DELTA,
+                &json!({ "session_id": event.session_id, "agent_id": event.agent_id }),
+            );
+        }
+        UiNotification::AgentArtifactUpdated(event) => {
+            agent_evidence_to_dir(
+                &dir,
+                methods::AGENT_ARTIFACT_UPDATED,
+                &json!({
+                    "session_id": event.session_id,
+                    "agent_id": event.agent_id,
+                    "artifacts": event.artifacts,
+                }),
+            );
+        }
+        _ => task_evidence_to_dir(&dir, notification),
+    }
+}
+
+/// M15-F5 (#44): pure, directory-parameterised core of `record_task_evidence`
+/// for the `task/updated` variant (see that wrapper for semantics). Free of any
+/// env read so it is unit testable.
+fn task_evidence_to_dir(dir: &Path, notification: &UiNotification) {
+    let UiNotification::TaskUpdated(event) = notification else {
+        return;
+    };
+    let ledger_event = match event.state {
+        UiTaskRuntimeState::Completed => "task_completed",
+        UiTaskRuntimeState::Cancelled | UiTaskRuntimeState::Failed => "task_completed",
+        _ => "task_started",
+    };
+    append_evidence_jsonl_to_dir(
+        dir,
+        "task-ledger.jsonl",
+        &json!({
+            "event": ledger_event,
+            "session_id": event.session_id,
+            "task_id": event.task_id,
+            "title": event.title,
+            "state": format!("{:?}", event.state),
+        }),
+    );
+    // M15-F5 (#44): in-turn `delegate`/`spawn` children DON'T declare agent
+    // artifacts (their `agent/artifact/list` is empty) — their outputs surface
+    // as supervised-task artifacts (`artifact_count`). So when a supervised
+    // task completes with artifacts, index a task-level artifact entry. This
+    // is the only artifact signal the in-turn spawn path exposes, and it keeps
+    // `artifact-index.json` populated for the verifier's `"artifacts": [`
+    // requirement from REAL completed work.
+    if matches!(event.state, UiTaskRuntimeState::Completed)
+        && event.artifact_count.is_some_and(|count| count > 0)
+    {
+        let task_id = json!(event.task_id);
+        merge_artifact_index(
+            dir,
+            &task_id,
+            &[json!({
+                "id": event.task_id,
+                "title": event.title,
+                "kind": "task_output",
+            })],
+        );
+    }
+}
+
 fn append_appui_transcript_frame(direction: &str, frame: Value) {
     append_appui_evidence_jsonl(
         "appui-transcript.jsonl",
@@ -20429,6 +21197,11 @@ fn send_raw_notification_ephemeral(
         );
         return Err(SendError::BackpressureDrop);
     }
+    // M15-F5 (#44): mirror production child-agent lifecycle/output/artifact
+    // notifications into `agent-ledger.jsonl` / `artifact-index.json` evidence
+    // ledgers. NO-OP unless the live tmux soak set
+    // `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    record_agent_evidence(method, &params);
     let notification = octos_core::ui_protocol::RpcNotification::new(method, params);
     let frame = frame_for(&notification).ok_or(SendError::BackpressureDrop)?;
     ws.send_ephemeral(frame, method)
@@ -20831,6 +21604,10 @@ fn send_notification_durable(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // M15-F5 (#44): mirror production supervised-task lifecycle updates into
+    // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
+    // set `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    record_task_evidence(&notification);
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
@@ -25056,6 +25833,177 @@ ignore = []
     }
 
     #[test]
+    fn lru_deferred_required_tools_are_reported_deferred_not_disabled_by_policy() {
+        // Regression: the live `tool_status_list_result` path computes the
+        // disabled set as `registered ∧ ¬visible`, which subsumes the
+        // LRU-deferred set (deferred tools are registered but filtered out
+        // of `specs()`). The coding tool contract checks `disabled` before
+        // `deferred`, so without excluding the deferred names the canonical
+        // P0 runtime/subagent tools regress to `disabled_by_policy` and the
+        // contract reports `status: incomplete` on a healthy solo session.
+        // Mirror the exact live-path computation here so the call site stays
+        // honest. #970 / M14-E.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        // Auto-defer (not context-filter) the canonical runtime + subagent
+        // groups, exactly as the per-session LRU resolver does once a
+        // profile carries enough tools to trip the defer threshold.
+        registry.defer_group("group:runtime");
+        registry.defer_group("group:sessions");
+
+        let deferred = deferred_model_tool_names(Some(&registry));
+        assert!(
+            deferred.iter().any(|name| name == "exec_command"),
+            "test precondition: exec_command must be deferred, got {deferred:?}"
+        );
+
+        let visible = model_visible_tool_names(Some(&registry));
+        let registered = registered_tool_names(Some(&registry));
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        // Mirror the live path: only deferred tools that survive the effective
+        // policy post-activation are recoverable-deferred. No tool is denied
+        // here, so every deferred tool is recoverable.
+        let recoverable_deferred: Vec<String> = deferred
+            .iter()
+            .filter(|name| registry.is_tool_visible_post_activation(name))
+            .cloned()
+            .collect();
+        let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
+        // This is the production computation under test: disabled must NOT
+        // include deferred-but-recoverable tools.
+        let disabled = registered
+            .iter()
+            .filter(|name| {
+                !visible_set.contains(name.as_str()) && !deferred_set.contains(name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
+        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = recoverable_deferred.iter().map(String::as_str).collect::<Vec<_>>();
+        let payload = coding_tool_contract::tool_status_list_payload(
+            coding_tool_contract::ToolStatusListContext {
+                available_model_tools: &visible_refs,
+                disabled_model_tools: &disabled_refs,
+                deferred_model_tools: &deferred_refs,
+                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
+            },
+        );
+        let contract = &payload["coding_tool_contract"];
+        assert_eq!(
+            contract["status"],
+            json!("ready"),
+            "LRU-deferred P0 tools must keep the contract ready; missing={:?}",
+            contract["missing_required_tools"]
+        );
+        assert_eq!(contract["missing_required_tools"], json!([]));
+        let required = contract["required_tools"].as_array().expect("required");
+        let exec_command = required
+            .iter()
+            .find(|tool| tool["name"] == json!("exec_command"))
+            .expect("exec_command status");
+        assert_eq!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
+        );
+    }
+
+    #[test]
+    fn deferred_but_policy_denied_required_tool_stays_disabled_by_policy() {
+        // Codex BLOCK (#1419 review): excluding the RAW deferred set from the
+        // disabled set mislabels a tool that is both LRU-deferred AND
+        // policy-denied. Such a tool can never be recovered by `activate_tools`
+        // (`is_tool_visible_post_activation` stays false), so it MUST remain
+        // `disabled_by_policy` and MUST NOT be advertised as a recoverable
+        // `deferred` tool (the PR #865 standard). Mirror the live-path
+        // computation with a required tool that is BOTH deferred and denied,
+        // and pin the classification both at the set level and through the
+        // coding-tool contract payload.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        // Defer the canonical runtime + subagent groups (as the per-session LRU
+        // resolver does), then deny one required runtime tool via provider
+        // policy — the deferred + denied combination codex flagged.
+        registry.defer_group("group:runtime");
+        registry.defer_group("group:sessions");
+        let mut policy = octos_agent::ToolPolicy::default();
+        policy.deny.push("exec_command".to_string());
+        registry.set_provider_policy(policy);
+
+        let deferred = deferred_model_tool_names(Some(&registry));
+        assert!(
+            deferred.iter().any(|name| name == "exec_command"),
+            "precondition: exec_command must be deferred, got {deferred:?}"
+        );
+
+        // Production computation under test: only deferred tools that survive
+        // the effective policy post-activation are recoverable-deferred.
+        let recoverable_deferred: Vec<String> = deferred
+            .iter()
+            .filter(|name| registry.is_tool_visible_post_activation(name))
+            .cloned()
+            .collect();
+        assert!(
+            !recoverable_deferred.iter().any(|name| name == "exec_command"),
+            "denied+deferred exec_command must NOT be recoverable, got {recoverable_deferred:?}"
+        );
+        assert!(
+            !recoverable_deferred.is_empty(),
+            "other allowed+deferred tools must remain recoverable, got {recoverable_deferred:?}"
+        );
+
+        let visible = model_visible_tool_names(Some(&registry));
+        let registered = registered_tool_names(Some(&registry));
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        let recoverable_set: HashSet<&str> =
+            recoverable_deferred.iter().map(String::as_str).collect();
+        let disabled = registered
+            .iter()
+            .filter(|name| {
+                !visible_set.contains(name.as_str()) && !recoverable_set.contains(name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            disabled.iter().any(|name| name == "exec_command"),
+            "denied+deferred exec_command must be in the disabled set, got {disabled:?}"
+        );
+
+        // End-to-end through the contract: exec_command must report
+        // disabled_by_policy, NOT deferred (the bug would report it deferred).
+        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
+        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = recoverable_deferred
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let payload = coding_tool_contract::tool_status_list_payload(
+            coding_tool_contract::ToolStatusListContext {
+                available_model_tools: &visible_refs,
+                disabled_model_tools: &disabled_refs,
+                deferred_model_tools: &deferred_refs,
+                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
+            },
+        );
+        let contract = &payload["coding_tool_contract"];
+        let exec_command = contract["required_tools"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .find(|tool| tool["name"] == json!("exec_command"))
+            .expect("exec_command status");
+        assert_eq!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DISABLED_BY_POLICY),
+            "denied+deferred exec_command must be disabled_by_policy, not deferred"
+        );
+        assert_ne!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
+        );
+    }
+
+    #[test]
     fn typed_approval_feature_is_negotiated_by_header() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -28701,6 +29649,293 @@ ignore = []
         assert_eq!(result["fire"]["reason"], json!("LoopFire"));
     }
 
+    /// M15-F5 (#44): the production autonomy runtime must populate the same
+    /// evidence ledgers the soak verifier (`verify-autonomy-live`) requires —
+    /// from REAL orchestrator RPC results, NOT the deterministic fixture path.
+    /// This pins that `autonomy_rpc_evidence_to_dir` writes goal/loop ledgers
+    /// with the verifier-required `event` markers, a runtime policy stamp, and
+    /// returns the matching `session/goal/updated` / `loop/updated` /
+    /// `loop/fired` server→client notifications — and that NONE of the written
+    /// evidence carries the fixture-only markers the verifier bans.
+    #[test]
+    fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
+        clear_autonomy_runtime_state_for_test();
+        let features = ConnectionUiFeatures::stdio_defaults();
+        // Scope to a DEDICATED profile (not MAIN_PROFILE_ID) so the
+        // `loop/fire_now` continuation this test enqueues into the
+        // process-global scheduler is never surfaced by a sibling drain-path
+        // test's `Some(MAIN_PROFILE_ID)` sweep.
+        let test_profile = "m15f5-evidence-profile";
+        let session_id = SessionKey::with_profile_topic(test_profile, "local", "tui", "coding");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Real production goal-set RPC result.
+        let goal_set = RpcRequest::new(
+            "goal-set",
+            methods::SESSION_GOAL_SET,
+            json!({
+                "session_id": session_id.clone(),
+                "objective": "drive the production autonomy soak to a joined answer",
+            }),
+        );
+        let goal_result =
+            raw_autonomy_rpc(&goal_set, features, Some(test_profile)).expect("goal set");
+        let goal_notifs =
+            autonomy_rpc_evidence_to_dir(path, methods::SESSION_GOAL_SET, &goal_result);
+        assert!(
+            matches!(
+                goal_notifs.as_slice(),
+                [UiNotification::SessionGoalUpdated(_)]
+            ),
+            "goal/set must yield a session/goal/updated notification"
+        );
+
+        // Real production loop-create RPC result.
+        let loop_create = RpcRequest::new(
+            "loop-create",
+            methods::LOOP_CREATE,
+            json!({
+                "session_id": session_id.clone(),
+                "command": "/loop check child-agent progress every 5m",
+            }),
+        );
+        let loop_result =
+            raw_autonomy_rpc(&loop_create, features, Some(test_profile)).expect("loop create");
+        let loop_id = loop_result["loop"]["loop_id"]
+            .as_str()
+            .expect("loop id")
+            .to_owned();
+        let loop_notifs = autonomy_rpc_evidence_to_dir(path, methods::LOOP_CREATE, &loop_result);
+        assert!(
+            matches!(loop_notifs.as_slice(), [UiNotification::LoopUpdated(_)]),
+            "loop/create must yield a loop/updated notification"
+        );
+
+        // Codex P2: the manual `loop/fire_now` RPC must NOT emit a `loop/fired`
+        // notification from the RPC path — the single `loop/fired` is emitted
+        // once at the scheduler drain (see the `scheduled_continuation_*`
+        // assertion below), so a manual fire is not double-counted.
+        let fire_now = RpcRequest::new(
+            "loop-fire",
+            methods::LOOP_FIRE_NOW,
+            json!({ "session_id": session_id.clone(), "loop_id": loop_id }),
+        );
+        let fire_result =
+            raw_autonomy_rpc(&fire_now, features, Some(test_profile)).expect("loop fire");
+        let fire_notifs = autonomy_rpc_evidence_to_dir(path, methods::LOOP_FIRE_NOW, &fire_result);
+        assert!(
+            fire_notifs.is_empty(),
+            "loop/fire_now RPC must NOT emit a notification (loop/fired is emitted at the scheduler drain)"
+        );
+
+        // Production agent lifecycle + artifacts must populate the agent
+        // ledger and artifact index via the directory-parameterised core
+        // (the env wrappers `record_agent_evidence` / `record_task_evidence`
+        // just resolve `appui_evidence_dir()` and delegate here).
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent": { "agent_id": "reviewer-api-1", "status": "running", "backend_kind": "native" },
+            }),
+        );
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent": { "agent_id": "reviewer-api-1", "status": "completed", "backend_kind": "native" },
+            }),
+        );
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_ARTIFACT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent_id": "reviewer-api-1",
+                "artifacts": [{ "id": "summary", "path": "/tmp/x/summary.md" }],
+            }),
+        );
+        // Codex P2: a SECOND child's artifacts must MERGE, not clobber the
+        // first child's index entry.
+        agent_evidence_to_dir(
+            path,
+            methods::AGENT_ARTIFACT_UPDATED,
+            &json!({
+                "session_id": session_id.clone(),
+                "agent_id": "reviewer-tests-1",
+                "artifacts": [{ "id": "summary", "path": "/tmp/y/summary.md" }],
+            }),
+        );
+        task_evidence_to_dir(
+            path,
+            &UiNotification::TaskUpdated(TaskUpdatedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                task_id: TaskId::new(),
+                title: "Native code review specialist swarm".to_owned(),
+                state: UiTaskRuntimeState::Running,
+                tool_call_id: None,
+                runtime_detail: None,
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
+                turn_id: None,
+            }),
+        );
+        task_evidence_to_dir(
+            path,
+            &UiNotification::TaskUpdated(TaskUpdatedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                task_id: TaskId::new(),
+                title: "Native code review specialist swarm".to_owned(),
+                state: UiTaskRuntimeState::Completed,
+                tool_call_id: None,
+                runtime_detail: None,
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
+                turn_id: None,
+            }),
+        );
+
+        // Codex P2: a SCHEDULED loop fire (self-paced / fixed / maintenance)
+        // reaches the runtime via the due-loop scheduler, NOT `loop/fire_now`.
+        // It is the single source of the `loop_fired` ledger row + `loop/fired`
+        // notification. Drive it through the dir-parameterised core.
+        let scheduled_fire = scheduled_continuation_to_dir(
+            Some(path),
+            &session_id,
+            test_profile,
+            &MasterContinuationReason::LoopFire,
+            Some(&loop_id),
+            None,
+        );
+        assert!(
+            matches!(scheduled_fire.as_slice(), [UiNotification::LoopFired(_)]),
+            "scheduled loop fire must yield a loop/fired notification"
+        );
+        // A scheduled goal continuation appends a `goal_continuation` row.
+        scheduled_continuation_to_dir(
+            Some(path),
+            &session_id,
+            test_profile,
+            &MasterContinuationReason::GoalContinue,
+            None,
+            Some("goal_01"),
+        );
+
+        let read = |name: &str| std::fs::read_to_string(path.join(name)).unwrap_or_default();
+        let policy = read("runtime-policy-stamp.json");
+        let goal_ledger = read("goal-ledger.jsonl");
+        let loop_ledger = read("loop-ledger.jsonl");
+        let agent_ledger = read("agent-ledger.jsonl");
+        let task_ledger = read("task-ledger.jsonl");
+        let artifact_index = read("artifact-index.json");
+
+        // Verifier-required structure / event markers.
+        assert!(!policy.is_empty(), "runtime-policy-stamp.json must exist");
+        assert!(
+            goal_ledger.contains("\"goal_started\""),
+            "goal ledger missing goal_started: {goal_ledger}"
+        );
+        assert!(
+            loop_ledger.contains("\"loop_iteration\"") && loop_ledger.contains("\"loop_fired\""),
+            "loop ledger missing loop markers: {loop_ledger}"
+        );
+        assert!(
+            agent_ledger.contains("\"agent_started\"")
+                && agent_ledger.contains("\"agent_completed\""),
+            "agent ledger missing agent markers: {agent_ledger}"
+        );
+        assert!(
+            task_ledger.contains("\"task_started\"") && task_ledger.contains("\"task_completed\""),
+            "task ledger missing task markers: {task_ledger}"
+        );
+        assert!(
+            artifact_index.contains("\"artifacts\""),
+            "artifact-index.json missing artifacts array: {artifact_index}"
+        );
+
+        // The non-fixture gate the verifier enforces: NONE of the production
+        // evidence may carry deterministic/fixture markers.
+        for (name, body) in [
+            ("runtime-policy-stamp.json", &policy),
+            ("goal-ledger.jsonl", &goal_ledger),
+            ("loop-ledger.jsonl", &loop_ledger),
+            ("agent-ledger.jsonl", &agent_ledger),
+            ("task-ledger.jsonl", &task_ledger),
+        ] {
+            for marker in [
+                "m15-fixture-appui-backend",
+                "fixture-only",
+                "deterministic fixture",
+                "fake-openai",
+                "M15_CODE_REVIEW_FINAL_LINE",
+                "M15CODEREVIEWFINALLINE",
+            ] {
+                assert!(
+                    !body.contains(marker),
+                    "{name} must not contain fixture marker {marker}"
+                );
+            }
+        }
+
+        // Codex P2: the artifact index must MERGE across children — both
+        // reviewer-api-1 and reviewer-tests-1 entries survive.
+        let index: Value = serde_json::from_str(&artifact_index).expect("artifact index json");
+        let index_agents: Vec<&str> = index["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .filter_map(|artifact| artifact["agent_id"].as_str())
+            .collect();
+        assert!(
+            index_agents.contains(&"reviewer-api-1") && index_agents.contains(&"reviewer-tests-1"),
+            "artifact index must merge both children, got {index_agents:?}"
+        );
+
+        // Codex P2: scheduled (self-paced / fixed) loop fires reach the runtime
+        // via the due-loop scheduler, NOT `loop/fire_now` — they must still
+        // yield a `loop/fired` notification and a `loop_fired` ledger row.
+        let scheduled = scheduled_continuation_notifications(
+            &session_id,
+            MAIN_PROFILE_ID,
+            &MasterContinuationReason::LoopFire,
+            Some("loop_07"),
+            None,
+        );
+        assert!(
+            matches!(scheduled.as_slice(), [UiNotification::LoopFired(event)] if event.loop_id == "loop_07"),
+            "scheduled loop fire must yield a loop/fired notification"
+        );
+
+        // Codex P2: the goal/loop wire notifications must be built even when NO
+        // evidence dir is set (normal production) — they are genuine protocol
+        // frames, only the LEDGER write is soak-gated.
+        let prod_notifs = autonomy_rpc_notifications(methods::SESSION_GOAL_SET, &goal_result);
+        assert!(
+            matches!(
+                prod_notifs.as_slice(),
+                [UiNotification::SessionGoalUpdated(_)]
+            ),
+            "goal/set must yield a notification independent of any evidence dir"
+        );
+
+        // This test enqueues a real `loop/fire_now` continuation into the
+        // process-global scheduler. Drain-path tests sweep due continuations
+        // for `MAIN_PROFILE_ID`, so clear the shared state on the way out to
+        // keep this leftover from being drained by a sibling test.
+        clear_autonomy_runtime_state_for_test();
+    }
+
     #[derive(Default)]
     struct RecordingOrchestrator {
         calls: std::sync::Mutex<Vec<String>>,
@@ -31190,6 +32425,154 @@ ignore = []
                 if event.approval_id == approval_id
                     && event.reason == APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED
         )));
+    }
+
+    #[tokio::test]
+    async fn approval_request_closed_ws_keeps_pending_runtime_waiter() {
+        let (ws, rx) = ws_connection_for_test(8);
+        drop(rx);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_id = SessionKey("local:test#site learning".into());
+        let turn_id = TurnId::new();
+        let requester = UiProtocolApprovalRequester {
+            ws,
+            ledger: Arc::clone(&ledger),
+            contracts: Arc::clone(&contracts),
+            state,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            features: ConnectionUiFeatures::default(),
+        };
+
+        let approval_task = tokio::spawn(async move {
+            <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+                &requester,
+                ToolApprovalRequest {
+                    tool_id: "shell-1".into(),
+                    tool_name: "shell".into(),
+                    title: "Run command".into(),
+                    body: "cargo test".into(),
+                    command: Some("cargo test".into()),
+                    cwd: None,
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !approval_task.is_finished(),
+            "closed direct send should leave approval pending for reconnect/replay"
+        );
+
+        let pending = contracts.approvals.pending_for_session(&session_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].turn_id, turn_id);
+        let approval_id = pending[0].approval_id.clone();
+
+        contracts
+            .approvals
+            .respond_with_context(ApprovalRespondParams::new(
+                session_id.clone(),
+                approval_id.clone(),
+                ApprovalDecision::Approve,
+            ))
+            .expect("approval/respond should resolve pending approval");
+
+        assert_eq!(
+            approval_task.await.expect("approval task"),
+            ToolApprovalDecision::Approve
+        );
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay after start cursor");
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(event))
+                if event.approval_id == approval_id
+        )));
+        assert!(!replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(event))
+                if event.approval_id == approval_id
+        )));
+    }
+
+    /// #1449 codex BLOCK: keeping an approval pending on a `Closed`/`FatalClosed`
+    /// direct send (waiting for reconnect/replay) removes the fail-closed deny
+    /// that previously guaranteed the waiting tool future could not hang. If the
+    /// client never reconnects and the turn is autonomous (so the turn-interrupt
+    /// drain never fires), the wait would park forever. The
+    /// `PendingApprovalWaiterGuard` closes that gap: when the requester's future
+    /// is dropped (turn interrupt / per-tool timeout / connection teardown), its
+    /// `Drop` MUST cancel the still-pending approval so the runtime is released.
+    #[tokio::test]
+    async fn dropped_approval_waiter_cancels_pending_entry() {
+        let (ws, rx) = ws_connection_for_test(8);
+        drop(rx); // closed write side → direct send fails Closed → kept pending
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_id = SessionKey("local:test#drop guard".into());
+        let turn_id = TurnId::new();
+        let requester = UiProtocolApprovalRequester {
+            ws,
+            ledger: Arc::clone(&ledger),
+            contracts: Arc::clone(&contracts),
+            state,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            features: ConnectionUiFeatures::default(),
+        };
+
+        let approval_task = tokio::spawn(async move {
+            <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+                &requester,
+                ToolApprovalRequest {
+                    tool_id: "shell-1".into(),
+                    tool_name: "shell".into(),
+                    title: "Run command".into(),
+                    body: "cargo test".into(),
+                    command: Some("cargo test".into()),
+                    cwd: None,
+                },
+            )
+            .await
+        });
+
+        // Let the requester register the pending entry and park on the decision.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            contracts.approvals.pending_for_session(&session_id).len(),
+            1,
+            "closed direct send should leave the approval pending before the drop"
+        );
+
+        // Drop the waiting future (models a turn interrupt / per-tool timeout /
+        // connection teardown aborting the task). The guard's Drop must cancel
+        // the entry rather than leaking it.
+        approval_task.abort();
+        let _ = approval_task.await; // JoinError::Cancelled; future already dropped
+        tokio::task::yield_now().await;
+
+        let pending_after = contracts.approvals.pending_for_session(&session_id);
+        assert!(
+            pending_after.is_empty(),
+            "dropped approval waiter must cancel the pending entry, still pending: {:?}",
+            pending_after
+                .iter()
+                .map(|event| event.approval_id.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
