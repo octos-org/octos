@@ -1110,6 +1110,139 @@ pub async fn update_my_profile(
     }))
 }
 
+// ── Voice selection endpoints ────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct VoicesResponse {
+    /// Voices the engine can actually synthesize (ref audio present).
+    pub voices: Vec<octos_llm::ominix::VoiceInfo>,
+    /// This user's currently effective reply voice (live override > persisted
+    /// per-profile default > serve default).
+    pub current: String,
+}
+
+/// GET /api/voices — list synthesizable voices + this user's current choice.
+///
+/// Reads the platform registry (`~/.OminiX/models/voices.json`). A missing or
+/// unreadable registry degrades to a single-entry list of the current voice
+/// rather than failing the request.
+pub async fn list_voices(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<VoicesResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
+    let profile_id = profile.id.clone();
+
+    let registry_path = crate::api::voices::registry_path();
+    let (mut voices, registry_default) =
+        match octos_llm::ominix::VoicesRegistry::load(&registry_path) {
+            Ok(reg) => (reg.synthesizable(), reg.default_voice),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %registry_path.display(),
+                    "voices.json unavailable; returning current default only"
+                );
+                (Vec::new(), String::new())
+            }
+        };
+
+    // Fallback chain for the "current" voice when no live override is set: the
+    // bootstrapped per-profile default (already overlays the serve default),
+    // then the registry default, then the first listed voice.
+    let runtime_default = state
+        .profiles
+        .get(&profile_id)
+        .map(|r| r.voice.default_voice.clone())
+        .filter(|s| !s.is_empty());
+    let fallback = runtime_default
+        .or_else(|| {
+            profile
+                .config
+                .voice_default
+                .clone()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| Some(registry_default).filter(|s| !s.is_empty()))
+        .or_else(|| voices.first().map(|v| v.id.clone()))
+        .unwrap_or_default();
+    let current = crate::api::voices::resolve_reply_voice(&profile_id, &fallback);
+
+    // Degrade gracefully: an unreadable registry still shows the current voice.
+    if voices.is_empty() && !current.is_empty() {
+        voices.push(octos_llm::ominix::VoiceInfo {
+            id: current.clone(),
+            aliases: Vec::new(),
+        });
+    }
+
+    Ok(Json(VoicesResponse { voices, current }))
+}
+
+#[derive(Deserialize)]
+pub struct SetVoiceRequest {
+    pub voice: String,
+}
+
+#[derive(Serialize)]
+pub struct SetVoiceResponse {
+    pub ok: bool,
+    pub voice: String,
+}
+
+/// PUT /api/my/voice — set this user's sticky reply-voice default.
+///
+/// Validates the voice against the registry, persists the canonical id to the
+/// profile (sticky across restarts), and records a live override so the switch
+/// takes effect on the next turn without a runtime reload.
+pub async fn set_my_voice(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<SetVoiceRequest>,
+) -> Result<Json<SetVoiceResponse>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let mut profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+
+    // Validate + canonicalise (id or alias → canonical id) against the registry.
+    let registry_path = crate::api::voices::registry_path();
+    let registry = octos_llm::ominix::VoicesRegistry::load(&registry_path).map_err(|e| {
+        tracing::warn!(error = %e, path = %registry_path.display(), "voice registry unavailable");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "voice registry unavailable".into(),
+        )
+    })?;
+    let canonical = registry.resolve(req.voice.trim()).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("unknown voice: {}", req.voice),
+    ))?;
+
+    // Persist (sticky per-user) then set the live override (instant effect).
+    profile.config.voice_default = Some(canonical.clone());
+    profile.updated_at = chrono::Utc::now();
+    ps.save_with_merge(&mut profile).map_err(|e| {
+        tracing::error!(profile = %profile.id, error = %e, "failed to persist voice choice");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    crate::api::voices::set_override(&profile.id, &canonical);
+
+    tracing::info!(profile = %profile.id, voice = %canonical, "reply voice updated");
+    Ok(Json(SetVoiceResponse {
+        ok: true,
+        voice: canonical,
+    }))
+}
+
 // ── Soul endpoints ───────────────────────────────────────────────────
 
 #[derive(Serialize)]

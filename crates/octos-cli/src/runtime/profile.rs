@@ -998,15 +998,19 @@ impl ProfileRuntime {
             pipeline_factory,
             hook_executor,
             lane_routing: profile.config.lane_routing.clone(),
-            // Voice (ASR/TTS) is a serve-level platform setting living on the
-            // top-level config.json, not on per-profile JSON. `config_from_profile`
-            // drops it, so the caller (serve/gateway) passes the host's
-            // `config.voice` here; fall back to defaults when absent.
+            // Voice (ASR/TTS) route/ASR settings are a serve-level platform
+            // setting living on the top-level config.json, not on per-profile
+            // JSON. `config_from_profile` drops it, so the caller (serve/gateway)
+            // passes the host's `config.voice` here; fall back to defaults when
+            // absent. The *timbre* (`default_voice`), however, is per-tenant:
+            // overlay the profile's `voice_default` on top so each user keeps
+            // their own reply voice (set via `PUT /api/my/voice`).
             voice: config
                 .voice
                 .clone()
                 .or_else(|| host_voice.cloned())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .with_default_voice_override(profile.config.voice_default.as_deref()),
         }))
     }
 }

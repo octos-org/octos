@@ -46,6 +46,7 @@ mod ui_protocol_scope;
 mod ui_protocol_task_output;
 pub mod user_admin;
 pub(crate) mod voice_turn;
+pub mod voices;
 pub mod webhook_proxy;
 pub mod ws_slash;
 
