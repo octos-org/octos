@@ -25880,7 +25880,10 @@ ignore = []
             .collect::<Vec<_>>();
         let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
         let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
-        let deferred_refs = recoverable_deferred.iter().map(String::as_str).collect::<Vec<_>>();
+        let deferred_refs = recoverable_deferred
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let payload = coding_tool_contract::tool_status_list_payload(
             coding_tool_contract::ToolStatusListContext {
                 available_model_tools: &visible_refs,
@@ -25944,7 +25947,9 @@ ignore = []
             .cloned()
             .collect();
         assert!(
-            !recoverable_deferred.iter().any(|name| name == "exec_command"),
+            !recoverable_deferred
+                .iter()
+                .any(|name| name == "exec_command"),
             "denied+deferred exec_command must NOT be recoverable, got {recoverable_deferred:?}"
         );
         assert!(

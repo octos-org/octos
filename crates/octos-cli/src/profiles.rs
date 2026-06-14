@@ -4,7 +4,7 @@
 //! channel credentials, and gateway settings. Profiles are stored as individual
 //! JSON files in `~/.octos/profiles/`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -72,6 +72,10 @@ pub struct ProfileConfig {
     /// Robotics runtime configuration (heartbeat + sensor context injection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub robot: Option<RobotConfig>,
+    /// Home dashboard user-facing state. This is the canonical cross-device
+    /// store for the touch dashboard; web localStorage is only a migration cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<HomeConfig>,
     /// Channel configurations.
     #[serde(default)]
     pub channels: Vec<ChannelCredentials>,
@@ -144,6 +148,69 @@ pub struct ProfileConfig {
     /// **overrides**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
+}
+
+/// Home dashboard configuration persisted inside a profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<HomeSettingsConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<HomeCalendarEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub photos: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widgets: Vec<HomeWidgetConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metro_layout: BTreeMap<String, HomeTileLayout>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeSettingsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub night_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub news_feed_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeCalendarEvent {
+    pub id: String,
+    pub title: String,
+    pub time: String,
+    pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeWidgetConfig {
+    pub r#type: String,
+    pub enabled: bool,
+    pub order: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeTileLayout {
+    pub col: u32,
+    pub row: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// Profile-owned review workflow configuration.
@@ -439,6 +506,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub robot: PatchField<RobotConfig>,
     #[serde(default)]
+    pub home: PatchField<HomeConfig>,
+    #[serde(default)]
     pub channels: Option<Vec<ChannelCredentials>>,
     #[serde(default)]
     pub gateway: Option<GatewaySettingsPatch>,
@@ -665,6 +734,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.robot = None,
             PatchField::Value(robot) => self.robot = Some(robot),
+        }
+        match patch.home {
+            PatchField::Absent => {}
+            PatchField::Clear => self.home = None,
+            PatchField::Value(home) => self.home = Some(home),
         }
         if let Some(channels) = patch.channels {
             self.channels = channels;
@@ -2311,6 +2385,40 @@ mod tests {
                     default_theme: Some("crew".into()),
                 }),
             }),
+            home: PatchField::Value(HomeConfig {
+                settings: Some(HomeSettingsConfig {
+                    city: Some("Tokyo".into()),
+                    temp_unit: Some("C".into()),
+                    clock_format: Some("24h".into()),
+                    idle_seconds: Some(45),
+                    night_mode: Some("auto".into()),
+                    lang: Some("zh".into()),
+                    news_feed_url: Some("https://example.test/feed.xml".into()),
+                }),
+                events: vec![HomeCalendarEvent {
+                    id: "evt-1".into(),
+                    title: "Breakfast".into(),
+                    time: "08:00".into(),
+                    date: "2026-06-14".into(),
+                    recurring: Some("daily".into()),
+                }],
+                photos: vec!["https://example.test/home.jpg".into()],
+                widgets: vec![HomeWidgetConfig {
+                    r#type: "calendar".into(),
+                    enabled: true,
+                    order: 6,
+                }],
+                metro_layout: [(
+                    "clock".into(),
+                    HomeTileLayout {
+                        col: 1,
+                        row: 1,
+                        w: 4,
+                        h: 2,
+                    },
+                )]
+                .into(),
+            }),
             ..Default::default()
         });
 
@@ -2339,6 +2447,20 @@ mod tests {
                 .and_then(|slides| slides.default_theme.as_deref()),
             Some("crew")
         );
+        let home = config
+            .home
+            .as_ref()
+            .expect("home config should be preserved");
+        assert_eq!(
+            home.settings
+                .as_ref()
+                .and_then(|settings| settings.city.as_deref()),
+            Some("Tokyo")
+        );
+        assert_eq!(home.events[0].title, "Breakfast");
+        assert_eq!(home.photos, vec!["https://example.test/home.jpg"]);
+        assert_eq!(home.widgets[0].r#type, "calendar");
+        assert_eq!(home.metro_layout["clock"].w, 4);
     }
 
     #[test]
@@ -3317,6 +3439,19 @@ mod tests {
         .expect_err("unknown deep_crawl field should be rejected");
 
         assert!(err.to_string().contains("unknown field `max_chrs`"));
+    }
+
+    #[test]
+    fn test_profile_config_patch_rejects_unknown_home_field() {
+        let err = serde_json::from_value::<ProfileConfigPatch>(serde_json::json!({
+            "home": {
+                "settings": { "city": "Tokyo" },
+                "bogus": true
+            }
+        }))
+        .expect_err("unknown home field should be rejected");
+
+        assert!(err.to_string().contains("unknown field `bogus`"));
     }
 
     #[test]

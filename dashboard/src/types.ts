@@ -122,11 +122,51 @@ export interface AppsConfig {
   slides?: SlidesAppConfig | null
 }
 
+export interface HomeSettingsConfig {
+  city?: string | null
+  temp_unit?: string | null
+  clock_format?: string | null
+  idle_seconds?: number | null
+  night_mode?: string | null
+  lang?: string | null
+  news_feed_url?: string | null
+}
+
+export interface HomeCalendarEvent {
+  id: string
+  title: string
+  time: string
+  date: string
+  recurring?: string | null
+}
+
+export interface HomeWidgetConfig {
+  type: string
+  enabled: boolean
+  order: number
+}
+
+export interface HomeTileLayout {
+  col: number
+  row: number
+  w: number
+  h: number
+}
+
+export interface HomeConfig {
+  settings?: HomeSettingsConfig | null
+  events?: HomeCalendarEvent[]
+  photos?: string[]
+  widgets?: HomeWidgetConfig[]
+  metro_layout?: Record<string, HomeTileLayout>
+}
+
 export interface ProfileConfig {
   llm?: LlmProfileConfig | null
   search?: SearchConfig | null
   deep_crawl?: DeepCrawlConfig | null
   apps?: AppsConfig | null
+  home?: HomeConfig | null
   channels: ChannelCredentials[]
   gateway: GatewaySettings
   email?: EmailSettings | null

@@ -15891,7 +15891,12 @@ mod tests {
         let t2 = supervisor.register("mofa_slides", "call-cap-2", Some("cli:test"));
         supervisor.mark_synth_ack_emitted("call-cap-2");
         supervisor.mark_failed(&t2, "fail #2".to_string());
-        drain_until(&mut rx, "Background failure could not be recovered", &mut seen).await;
+        drain_until(
+            &mut rx,
+            "Background failure could not be recovered",
+            &mut seen,
+        )
+        .await;
 
         // The first two recovery LLM turns must have run.
         assert!(
