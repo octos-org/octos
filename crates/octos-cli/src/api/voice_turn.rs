@@ -59,6 +59,39 @@ pub(crate) async fn transcribe_audio_media(
     out
 }
 
+/// Tools kept active during a voice turn; everything else is deferred.
+///
+/// A spoken turn is almost always a single-iteration conversational reply that
+/// calls no tools, yet the full registry (50+ specs in a skill-rich profile)
+/// otherwise dominates the prompt's prefill — measured as the single largest
+/// contributor to voice-turn latency (≈half of a 34k-token input). Deferring
+/// keeps the tools *recoverable* via `activate_tools`, so a voice query that
+/// genuinely needs one pays a single extra round-trip instead of taxing every
+/// turn. We keep `activate_tools` itself so that recovery path stays reachable.
+const VOICE_TURN_KEEP_TOOLS: &[&str] = &["activate_tools"];
+
+/// Pure core of [`defer_tools_for_voice_turn`]: every registered name that is
+/// not on the keep-list. Split out so it is unit-testable without standing up
+/// a real `ToolRegistry`.
+fn voice_turn_deferred_names(all: &[String], keep: &[&str]) -> Vec<String> {
+    all.iter()
+        .filter(|name| !keep.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Defer every tool except the voice-turn keep-list on a per-turn registry
+/// snapshot, so the spoken turn's first LLM call carries a lean tool set.
+/// Returns the number of tools deferred. Safe on any registry: `defer` only
+/// acts on names that are actually registered. Call on the mutable per-turn
+/// snapshot BEFORE it is wrapped in `Arc`.
+pub(crate) fn defer_tools_for_voice_turn(registry: &mut octos_agent::ToolRegistry) -> usize {
+    let to_defer = voice_turn_deferred_names(&registry.tool_names(), VOICE_TURN_KEEP_TOOLS);
+    let count = to_defer.len();
+    registry.defer(to_defer);
+    count
+}
+
 /// Whether a char is safe to hand to TTS: letters/digits (incl. CJK),
 /// whitespace, and common sentence punctuation. Everything else — emoji,
 /// pictographs, math/misc symbols — is dropped, because some on-device engines
@@ -375,6 +408,39 @@ mod tests {
         assert!(got.contains("晚上好呀！"));
         assert!(got.contains("今天第 N 次"));
         assert!(got.contains("打招呼"));
+    }
+
+    #[test]
+    fn voice_turn_defers_everything_but_the_keep_list() {
+        // A spoken turn keeps only the recovery tool; every other registered
+        // tool is deferred so the first LLM call is not taxed by the full set.
+        let all = vec![
+            "read_file".to_string(),
+            "shell".to_string(),
+            "web_search".to_string(),
+            "activate_tools".to_string(),
+            "spawn".to_string(),
+        ];
+        let deferred = voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS);
+        assert_eq!(
+            deferred,
+            vec![
+                "read_file".to_string(),
+                "shell".to_string(),
+                "web_search".to_string(),
+                "spawn".to_string(),
+            ]
+        );
+        assert!(
+            !deferred.contains(&"activate_tools".to_string()),
+            "activate_tools must stay active so deferred tools remain recoverable"
+        );
+    }
+
+    #[test]
+    fn voice_turn_defer_is_noop_when_only_keep_tools_present() {
+        let all = vec!["activate_tools".to_string()];
+        assert!(voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS).is_empty());
     }
 
     #[test]
