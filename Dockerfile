@@ -25,6 +25,16 @@ COPY crates/app-skills/account-manager/Cargo.toml crates/app-skills/account-mana
 COPY crates/app-skills/time/Cargo.toml crates/app-skills/time/Cargo.toml
 COPY crates/app-skills/weather/Cargo.toml crates/app-skills/weather/Cargo.toml
 COPY crates/platform-skills/voice/Cargo.toml crates/platform-skills/voice/Cargo.toml
+COPY crates/octos-diagnostics/Cargo.toml crates/octos-diagnostics/Cargo.toml
+COPY crates/octos-dora-mcp/Cargo.toml crates/octos-dora-mcp/Cargo.toml
+COPY crates/octos-sandbox/Cargo.toml crates/octos-sandbox/Cargo.toml
+COPY crates/octos-swarm/Cargo.toml crates/octos-swarm/Cargo.toml
+COPY crates/app-skills/wechat-bridge/Cargo.toml crates/app-skills/wechat-bridge/Cargo.toml
+COPY crates/app-skills/skill-evolve/Cargo.toml crates/app-skills/skill-evolve/Cargo.toml
+COPY crates/app-skills/harness-starter-generic/Cargo.toml crates/app-skills/harness-starter-generic/Cargo.toml
+COPY crates/app-skills/harness-starter-report/Cargo.toml crates/app-skills/harness-starter-report/Cargo.toml
+COPY crates/app-skills/harness-starter-audio/Cargo.toml crates/app-skills/harness-starter-audio/Cargo.toml
+COPY crates/app-skills/harness-starter-coding/Cargo.toml crates/app-skills/harness-starter-coding/Cargo.toml
 
 # Create stub source files for dependency caching
 # Library crates get lib.rs, binary crates get main.rs
@@ -43,7 +53,17 @@ RUN mkdir -p crates/octos-core/src && echo "" > crates/octos-core/src/lib.rs && 
     mkdir -p crates/app-skills/account-manager/src && echo "fn main() {}" > crates/app-skills/account-manager/src/main.rs && \
     mkdir -p crates/app-skills/time/src && echo "fn main() {}" > crates/app-skills/time/src/main.rs && \
     mkdir -p crates/app-skills/weather/src && echo "fn main() {}" > crates/app-skills/weather/src/main.rs && \
-    mkdir -p crates/platform-skills/voice/src && echo "fn main() {}" > crates/platform-skills/voice/src/main.rs
+    mkdir -p crates/platform-skills/voice/src && echo "fn main() {}" > crates/platform-skills/voice/src/main.rs && \
+    mkdir -p crates/octos-diagnostics/src && echo "" > crates/octos-diagnostics/src/lib.rs && \
+    mkdir -p crates/octos-dora-mcp/src && echo "" > crates/octos-dora-mcp/src/lib.rs && \
+    mkdir -p crates/octos-sandbox/src && echo "fn main() {}" > crates/octos-sandbox/src/main.rs && \
+    mkdir -p crates/octos-swarm/src && echo "" > crates/octos-swarm/src/lib.rs && \
+    mkdir -p crates/app-skills/wechat-bridge/src && echo "fn main() {}" > crates/app-skills/wechat-bridge/src/main.rs && \
+    mkdir -p crates/app-skills/skill-evolve/src && echo "fn main() {}" > crates/app-skills/skill-evolve/src/main.rs && \
+    mkdir -p crates/app-skills/harness-starter-generic/src && echo "" > crates/app-skills/harness-starter-generic/src/lib.rs && echo "fn main() {}" > crates/app-skills/harness-starter-generic/src/main.rs && \
+    mkdir -p crates/app-skills/harness-starter-report/src && echo "" > crates/app-skills/harness-starter-report/src/lib.rs && echo "fn main() {}" > crates/app-skills/harness-starter-report/src/main.rs && \
+    mkdir -p crates/app-skills/harness-starter-audio/src && echo "" > crates/app-skills/harness-starter-audio/src/lib.rs && echo "fn main() {}" > crates/app-skills/harness-starter-audio/src/main.rs && \
+    mkdir -p crates/app-skills/harness-starter-coding/src && echo "" > crates/app-skills/harness-starter-coding/src/lib.rs && echo "fn main() {}" > crates/app-skills/harness-starter-coding/src/main.rs
 
 RUN cargo build --release --bin octos \
       -p octos-cli \
