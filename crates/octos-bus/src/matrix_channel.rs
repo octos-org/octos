@@ -547,7 +547,7 @@ impl MatrixChannel {
             bot_user_id,
             port,
             shutdown,
-            http: reqwest::Client::new(),
+            http: make_http_client(),
             registered_users: Arc::new(RwLock::new(HashSet::new())),
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
@@ -733,6 +733,19 @@ impl MatrixChannel {
         }
         Ok(path)
     }
+}
+
+/// Build the reqwest HTTP client used for Matrix API calls.
+///
+/// Bypasses system proxy settings — an appservice connects directly to its
+/// homeserver (typically co-located or same network), so routing through a
+/// local VPN/proxy (e.g. HTTP_PROXY=localhost:7890) is incorrect and would
+/// cause 502 errors when homeserver or test mock servers are on 127.0.0.1.
+fn make_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_default()
 }
 
 /// Percent-encode a string for use in URL path segments.
@@ -1762,6 +1775,21 @@ impl Channel for MatrixChannel {
         }
         self.send_replace_event(chat_id, message_id, final_content, false)
             .await
+    }
+
+    async fn send_raw_sse_bound(
+        &self,
+        _chat_id: &str,
+        json: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(tid) = thread_id {
+            let streams = self.sse_streams.read().await;
+            if let Some((sender, _)) = streams.get(tid) {
+                let _ = sender.send(json.to_string());
+            }
+        }
+        Ok(())
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<()> {
@@ -2990,7 +3018,7 @@ mod tests {
             bot_user_id: "@octos_bot:localhost".to_string(),
             server_name: "localhost".to_string(),
             user_prefix: "octos_".to_string(),
-            http: reqwest::Client::new(),
+            http: make_http_client(),
             registered_users: Arc::new(RwLock::new(registered)),
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
@@ -3625,7 +3653,7 @@ mod tests {
         };
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let client = reqwest::Client::new();
+        let client = make_http_client();
         let resp = client
             .get(format!(
                 "http://127.0.0.1:{appservice_port}/_matrix/app/v1/rooms/%23alias%3Alocalhost"
@@ -3675,7 +3703,7 @@ mod tests {
             }]
         });
 
-        let client = reqwest::Client::new();
+        let client = make_http_client();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let http_resp = client
@@ -6166,7 +6194,7 @@ mod tests {
         };
         let event_id = ch.send_with_id(&msg).await.unwrap().unwrap();
 
-        let client = reqwest::Client::new();
+        let client = make_http_client();
         let sse_resp = client
             .get(format!("http://127.0.0.1:{port}/sse/sse-t1"))
             .send()
@@ -6249,7 +6277,7 @@ mod tests {
         };
         let event_id = ch.send_with_id(&msg).await.unwrap().unwrap();
 
-        let client = reqwest::Client::new();
+        let client = make_http_client();
         let sse_resp = client
             .get(format!("http://127.0.0.1:{port}/sse/sse-t2"))
             .send()
