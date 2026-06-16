@@ -69,6 +69,10 @@ pub struct ProfileConfig {
     /// First-party app configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<AppsConfig>,
+    /// Home dashboard UI configuration. The backend stores this as opaque JSON
+    /// because Home is a web-owned surface; typed validation lives in octos-web.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<serde_json::Value>,
     /// Robotics runtime configuration (heartbeat + sensor context injection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub robot: Option<RobotConfig>,
@@ -437,6 +441,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub apps: PatchField<AppsConfig>,
     #[serde(default)]
+    pub home: PatchField<serde_json::Value>,
+    #[serde(default)]
     pub robot: PatchField<RobotConfig>,
     #[serde(default)]
     pub channels: Option<Vec<ChannelCredentials>>,
@@ -462,6 +468,10 @@ pub struct ProfileConfigPatch {
     pub content_routing: PatchField<octos_llm::RoutingConfig>,
     #[serde(default)]
     pub credential_pool: PatchField<CredentialPoolConfig>,
+    #[serde(default)]
+    pub plugins: Option<crate::config::PluginsConfig>,
+    #[serde(default)]
+    pub lane_routing: PatchField<octos_llm::LaneRoutingConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -661,6 +671,11 @@ impl ProfileConfig {
             PatchField::Clear => self.apps = None,
             PatchField::Value(apps) => self.apps = Some(apps),
         }
+        match patch.home {
+            PatchField::Absent => {}
+            PatchField::Clear => self.home = None,
+            PatchField::Value(home) => self.home = Some(home),
+        }
         match patch.robot {
             PatchField::Absent => {}
             PatchField::Clear => self.robot = None,
@@ -713,6 +728,14 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.credential_pool = None,
             PatchField::Value(credential_pool) => self.credential_pool = Some(credential_pool),
+        }
+        if let Some(plugins) = patch.plugins {
+            self.plugins = plugins;
+        }
+        match patch.lane_routing {
+            PatchField::Absent => {}
+            PatchField::Clear => self.lane_routing = None,
+            PatchField::Value(lane_routing) => self.lane_routing = Some(lane_routing),
         }
 
         self.normalize_llm_contract();
@@ -1798,8 +1821,8 @@ pub enum ProfileChange {
 
 /// Compare two profiles and classify the nature of changes.
 ///
-/// Restart-required: llm, review, search, deep_crawl, apps, channels,
-///   env_vars, email, hooks, credential_pool.
+/// Restart-required: llm, review, search, deep_crawl, apps, robot, channels,
+///   env_vars, email, hooks, sandbox, routing, credential_pool, plugins.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -1842,6 +1865,24 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     if oc.hooks != nc.hooks {
         restart_fields.push("hooks".into());
     }
+    if oc.admin_mode != nc.admin_mode {
+        restart_fields.push("admin_mode".into());
+    }
+    if oc.sandbox != nc.sandbox {
+        restart_fields.push("sandbox".into());
+    }
+    if oc.adaptive_routing != nc.adaptive_routing {
+        restart_fields.push("adaptive_routing".into());
+    }
+    if oc.cost_budget != nc.cost_budget {
+        restart_fields.push("cost_budget".into());
+    }
+    if oc.matrix != nc.matrix {
+        restart_fields.push("matrix".into());
+    }
+    if oc.content_routing != nc.content_routing {
+        restart_fields.push("content_routing".into());
+    }
     if oc.credential_pool != nc.credential_pool {
         restart_fields.push("credential_pool".into());
     }
@@ -1851,6 +1892,9 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     // the stale plugin registry and apply the new gate.
     if oc.plugins != nc.plugins {
         restart_fields.push("plugins".into());
+    }
+    if oc.lane_routing != nc.lane_routing {
+        restart_fields.push("lane_routing".into());
     }
 
     if !restart_fields.is_empty() {
@@ -2342,6 +2386,65 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_config_patch_persists_home_dashboard_json() {
+        let mut config = ProfileConfig::default();
+        let home = serde_json::json!({
+            "settings": {
+                "city": "Tokyo",
+                "clock_format": "24h",
+                "idle_seconds": 45
+            },
+            "events": [
+                { "id": "dinner", "title": "Dinner", "date": "2026-06-16", "time": "19:30" }
+            ],
+            "metro_layout": {
+                "clock": { "col": 1, "row": 1, "w": 4, "h": 2 }
+            }
+        });
+
+        config.apply_patch(ProfileConfigPatch {
+            home: PatchField::Value(home.clone()),
+            ..Default::default()
+        });
+
+        assert_eq!(config.home.as_ref(), Some(&home));
+
+        config.apply_patch(ProfileConfigPatch {
+            home: PatchField::Clear,
+            ..Default::default()
+        });
+
+        assert!(config.home.is_none());
+    }
+
+    #[test]
+    fn test_profile_config_patch_updates_plugin_and_lane_policy() {
+        let mut config = ProfileConfig::default();
+        let mut lane_routing = octos_llm::LaneRoutingConfig::default();
+        lane_routing
+            .topic_lanes
+            .insert("code".into(), octos_llm::Lane::CodeCapable);
+
+        config.apply_patch(ProfileConfigPatch {
+            plugins: Some(crate::config::PluginsConfig {
+                require_signed: true,
+            }),
+            lane_routing: PatchField::Value(lane_routing.clone()),
+            ..Default::default()
+        });
+
+        assert!(config.plugins.require_signed);
+        assert_eq!(config.lane_routing.as_ref(), Some(&lane_routing));
+
+        config.apply_patch(ProfileConfigPatch {
+            lane_routing: PatchField::Clear,
+            ..Default::default()
+        });
+
+        assert!(config.lane_routing.is_none());
+    }
+
+    #[test]
     fn test_profile_config_patch_replaces_review_contract() {
         let mut config = ProfileConfig::default();
 
@@ -2823,6 +2926,59 @@ mod tests {
                     fields.iter().any(|f| f == "credential_pool"),
                     "expected `credential_pool` in restart-required fields, got {fields:?}",
                 );
+            }
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_classify_runtime_policy_config_as_restart_required() {
+        let base = UserProfile {
+            id: "runtime-policy-diff".into(),
+            name: "Runtime Policy".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut lane_routing = octos_llm::LaneRoutingConfig::default();
+        lane_routing
+            .topic_lanes
+            .insert("code".into(), octos_llm::Lane::CodeCapable);
+
+        let mut changed = base.clone();
+        changed.config.admin_mode = true;
+        changed.config.sandbox.allow_network = true;
+        changed.config.adaptive_routing = Some(crate::config::AdaptiveRoutingConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        changed.config.content_routing = Some(octos_llm::RoutingConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        changed.config.plugins.require_signed = true;
+        changed.config.lane_routing = Some(lane_routing);
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                for field in [
+                    "admin_mode",
+                    "sandbox",
+                    "adaptive_routing",
+                    "content_routing",
+                    "plugins",
+                    "lane_routing",
+                ] {
+                    assert!(
+                        fields.iter().any(|candidate| candidate == field),
+                        "expected `{field}` in restart-required fields, got {fields:?}",
+                    );
+                }
             }
             other => panic!("expected RestartRequired, got {other:?}"),
         }
