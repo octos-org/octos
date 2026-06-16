@@ -32,6 +32,51 @@ const MAX_TOKENS_CONTINUATION_LIMIT: usize = 2;
 const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the token limit. Continue directly from where you stopped. Do not repeat or summarize what you already wrote.";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
+/// Prepended to the user content on a live video-call turn so the model treats
+/// the attached image as the user's real-time camera view rather than a file
+/// they uploaded.
+const VIDEO_CALL_NOTE: &str =
+    "[Live video call — the attached image is the user's current camera frame.]";
+
+/// Compose the user message content for a turn.
+///
+/// - `is_video_call` (the turn carries both an audio attachment AND an image)
+///   prepends [`VIDEO_CALL_NOTE`] so a real-time camera frame isn't mistaken
+///   for an uploaded file — applied whether or not the spoken turn was
+///   transcribed into non-empty text.
+/// - With empty `user_content` and media present (but not a video call), the
+///   legacy `[User sent an image]` placeholder is kept.
+/// - Any per-turn `prompt_summary` is appended, mirroring the previous
+///   behaviour.
+///
+/// Pure (no task-locals) so it is unit-testable in isolation.
+fn compose_turn_user_content(
+    user_content: &str,
+    has_media: bool,
+    is_video_call: bool,
+    prompt_summary: Option<&str>,
+) -> String {
+    let base_content = if user_content.is_empty() {
+        if is_video_call {
+            VIDEO_CALL_NOTE.to_string()
+        } else if has_media {
+            "[User sent an image]".to_string()
+        } else {
+            String::new()
+        }
+    } else if is_video_call {
+        format!("{VIDEO_CALL_NOTE}\n\n{user_content}")
+    } else {
+        user_content.to_string()
+    };
+
+    match prompt_summary {
+        Some(summary) if base_content.trim().is_empty() => summary.to_string(),
+        Some(summary) => format!("{base_content}\n\n{summary}"),
+        None => base_content,
+    }
+}
+
 /// Audit Gap-8 helper: consult the workspace-contract layer at EndTurn time
 /// and return a human-readable summary of failing validators when the
 /// contract is NOT ready. Returns `None` when the workspace has no
@@ -715,24 +760,28 @@ impl Agent {
 
                 messages.extend_from_slice(history);
 
-                let base_content = if user_content.is_empty() && !media.is_empty() {
-                    "[User sent an image]".to_string()
-                } else {
-                    user_content.to_string()
-                };
-                let content = if let Some(summary) = TURN_ATTACHMENT_CTX
+                // A turn carrying BOTH an audio attachment (a spoken/voice turn)
+                // and an image is a live video call: the image is the user's
+                // current camera frame, not an uploaded file. Tell the model so
+                // it treats the picture as a real-time view. `had_audio` comes
+                // from the per-turn attachment context (the audio is already
+                // transcribed into `user_content` by this point), and image
+                // detection looks at the outgoing `media`.
+                let has_image = media.iter().any(|p| octos_llm::vision::is_image(p));
+                let had_audio = TURN_ATTACHMENT_CTX
+                    .try_with(|ctx| !ctx.audio_attachment_paths.is_empty())
+                    .ok()
+                    .unwrap_or(false);
+                let summary = TURN_ATTACHMENT_CTX
                     .try_with(|ctx| ctx.prompt_summary.clone())
                     .ok()
-                    .flatten()
-                {
-                    if base_content.trim().is_empty() {
-                        summary
-                    } else {
-                        format!("{base_content}\n\n{summary}")
-                    }
-                } else {
-                    base_content
-                };
+                    .flatten();
+                let content = compose_turn_user_content(
+                    user_content,
+                    !media.is_empty(),
+                    had_audio && has_image,
+                    summary.as_deref(),
+                );
 
                 let current_user = Message {
                     role: MessageRole::User,
@@ -2857,6 +2906,49 @@ mod tests {
 
     use async_trait::async_trait;
     use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
+
+    // --- compose_turn_user_content (video-call context hint) ---
+
+    #[test]
+    fn should_use_video_call_hint_when_turn_has_audio_and_image() {
+        let out = compose_turn_user_content("what am I holding", true, true, None);
+        assert!(out.starts_with(VIDEO_CALL_NOTE), "got: {out}");
+        assert!(out.contains("what am I holding"));
+    }
+
+    #[test]
+    fn should_use_video_call_hint_even_when_transcript_empty() {
+        let out = compose_turn_user_content("", true, true, None);
+        assert_eq!(out, VIDEO_CALL_NOTE);
+    }
+
+    #[test]
+    fn should_keep_uploaded_image_hint_when_image_only() {
+        // No audio attachment → not a video call → legacy placeholder kept.
+        let out = compose_turn_user_content("", true, false, None);
+        assert_eq!(out, "[User sent an image]");
+    }
+
+    #[test]
+    fn should_not_add_hint_when_audio_only() {
+        // Audio but no image → not a video call; plain transcript passes through.
+        let out = compose_turn_user_content("hello there", false, false, None);
+        assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn should_append_prompt_summary_unchanged_for_non_video_turn() {
+        let out = compose_turn_user_content("hi", true, false, Some("SUMMARY"));
+        assert_eq!(out, "hi\n\nSUMMARY");
+    }
+
+    #[test]
+    fn should_combine_video_hint_and_summary() {
+        let out = compose_turn_user_content("look", true, true, Some("SUMMARY"));
+        assert!(out.starts_with(VIDEO_CALL_NOTE));
+        assert!(out.contains("look"));
+        assert!(out.ends_with("SUMMARY"));
+    }
     use octos_llm::{
         ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
         ToolChoice,
