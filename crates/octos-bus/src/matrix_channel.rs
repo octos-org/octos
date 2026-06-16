@@ -506,6 +506,7 @@ pub struct MatrixChannel {
     user_prefix: String,
     bot_user_id: String,
     port: u16,
+    public_ip: String,
     shutdown: Arc<AtomicBool>,
     http: reqwest::Client,
     registered_users: Arc<RwLock<HashSet<String>>>,
@@ -546,6 +547,7 @@ impl MatrixChannel {
             user_prefix: user_prefix.to_string(),
             bot_user_id,
             port,
+            public_ip: std::env::var("PUBLIC_IP").unwrap_or_else(|_| "localhost".to_string()),
             shutdown,
             http: make_http_client(),
             registered_users: Arc::new(RwLock::new(HashSet::new())),
@@ -1213,6 +1215,14 @@ async fn handle_transaction(
             }
         }
 
+        // Stamp the Matrix event_id as client_message_id so the session actor
+        // binds it as thread_id for SSE streaming. Without this the stream
+        // reporter has thread_id=None and the matrix channel never embeds the
+        // !SSE|url| marker in the initial streaming reply.
+        if let Some(ref eid) = event_id {
+            metadata["client_message_id"] = json!(eid);
+        }
+
         let inbound = InboundMessage {
             channel: CHANNEL_NAME.into(),
             sender_id: sender.to_string(),
@@ -1575,6 +1585,10 @@ impl Channel for MatrixChannel {
         true
     }
 
+    fn supports_direct_sse_chunks(&self) -> bool {
+        true
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         info!(
             port = self.port,
@@ -1688,8 +1702,8 @@ impl Channel for MatrixChannel {
                     .await
                     .insert(tid.clone(), (tx, msg.content.clone()));
                 format!(
-                    "!SSE|http://localhost:{}/sse/{tid}|\n{}",
-                    self.port, msg.content
+                    "!SSE|http://{}:{}/sse/{tid}|\n{}",
+                    self.public_ip, self.port, msg.content
                 )
             } else {
                 msg.content.clone()

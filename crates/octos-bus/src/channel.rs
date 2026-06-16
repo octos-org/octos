@@ -75,6 +75,18 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Whether the stream forwarder should forward each raw LLM token chunk
+    /// directly to this channel's SSE broadcast (bypassing the edit throttle).
+    ///
+    /// Channels that return `true` receive `send_raw_sse_bound` calls for every
+    /// `StreamChunk` event immediately as it arrives from the LLM, in addition
+    /// to the throttled `edit_message_bound` calls that update the channel message.
+    /// The default is `false`; only channels with a live SSE endpoint (Matrix)
+    /// should override this.
+    fn supports_direct_sse_chunks(&self) -> bool {
+        false
+    }
+
     /// Send a message and return its platform message ID (for later editing/deletion).
     /// Default: delegates to `send()` and returns None.
     async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {

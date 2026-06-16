@@ -385,6 +385,21 @@ pub async fn run_stream_forwarder(
 
                 buffer.push_str(&text);
 
+                // Forward each raw token chunk directly to channels that have a
+                // live SSE endpoint (Matrix). Bypasses the 1-second edit throttle
+                // so SSE consumers see per-token updates from the LLM chatStream.
+                // The SSE channel is keyed by thread_id; if it doesn't exist yet
+                // (first chunk arrives before the throttle fires the initial
+                // send_with_id), send_raw_sse_bound silently drops it — the
+                // accumulated snapshot sent on the first flush covers the gap.
+                if channel.supports_direct_sse_chunks() {
+                    if let Some(tid) = thread_id.as_deref().filter(|s| !s.is_empty()) {
+                        let json =
+                            serde_json::json!({"type": "token", "text": &text}).to_string();
+                        let _ = channel.send_raw_sse_bound(&chat_id, &json, Some(tid)).await;
+                    }
+                }
+
                 // Throttled edit — strip <think> blocks before showing to user
                 if !no_edit_support && last_edit.elapsed() >= EDIT_THROTTLE && !buffer.is_empty() {
                     if !is_session_active(&session_key, &active_sessions).await {
