@@ -841,6 +841,20 @@ pub(crate) fn merge_profile_config_from_body(config: &mut ProfileConfig, body: &
         if config_patch.is_object() {
             let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
             json_merge(&mut existing, config_patch);
+            // `env_vars` is a complete map the client owns: the dashboard sends
+            // the full desired set (including `{}` to clear). The RFC-7396
+            // deep-merge above can only add/overwrite keys, never remove them,
+            // so a recursive merge makes it impossible to clear a secret or drop
+            // a key. When the patch provides `env_vars`, treat it as
+            // authoritative and replace the map wholesale. Masked/empty display
+            // values are still restored per-key downstream by
+            // `ProfileStore::save_with_merge`, so round-tripping masked secrets
+            // through the UI does not lose them.
+            if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
+                if let Some(existing_obj) = existing.as_object_mut() {
+                    existing_obj.insert("env_vars".to_string(), env_vars.clone());
+                }
+            }
             if let Ok(merged) = serde_json::from_value(existing) {
                 *config = merged;
             }
