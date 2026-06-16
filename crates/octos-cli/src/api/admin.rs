@@ -336,23 +336,7 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    // Merge config: parse the raw JSON "config" object and overlay only the
-    // keys that are explicitly present, preserving all other existing fields.
-    // This lets the admin tool send `{"config":{"model":"x"}}` without wiping
-    // channels/env_vars, while the dashboard can still send a full config object.
-    {
-        let raw: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        if let Some(config_patch) = raw.get("config") {
-            if config_patch.is_object() {
-                let mut existing =
-                    serde_json::to_value(&profile.config).unwrap_or(serde_json::json!({}));
-                json_merge(&mut existing, config_patch);
-                if let Ok(merged) = serde_json::from_value(existing) {
-                    profile.config = merged;
-                }
-            }
-        }
-    }
+    merge_profile_config_from_body(&mut profile.config, &body);
     profile.updated_at = Utc::now();
 
     store.save_with_merge(&mut profile).map_err(|e| {
@@ -844,6 +828,24 @@ pub(crate) async fn fetch_provider_models(
         ids.sort();
         ids
     })
+}
+
+/// Merge a request body's `config` object into an existing profile config.
+///
+/// Only keys present in `config` are overwritten; absent keys are preserved.
+/// This lets callers send `{"config":{"model":"x"}}` without wiping
+/// channels/env_vars, while dashboards can still send a full config object.
+pub(crate) fn merge_profile_config_from_body(config: &mut ProfileConfig, body: &str) {
+    let raw: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    if let Some(config_patch) = raw.get("config") {
+        if config_patch.is_object() {
+            let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
+            json_merge(&mut existing, config_patch);
+            if let Ok(merged) = serde_json::from_value(existing) {
+                *config = merged;
+            }
+        }
+    }
 }
 
 /// Recursively merge `patch` into `target` (RFC 7396 JSON Merge Patch).
