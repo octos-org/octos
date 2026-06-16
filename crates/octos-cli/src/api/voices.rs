@@ -1,7 +1,7 @@
 //! Reply-voice selection: where the registry lives + the sticky-with-live
 //! override mechanism that lets a user switch voices mid-conversation.
 //!
-//! The persisted source of truth is `profile.config.voice.default_voice`
+//! The persisted source of truth is `profile.config.voice_default`
 //! (survives restarts). On top of it we keep a process-wide live override
 //! keyed by profile id, set by `PUT /api/my/voice`, so a switch takes effect
 //! on the *next* turn without rebuilding the cached profile/session runtimes.
@@ -59,6 +59,34 @@ fn registry_path_under(home: &Path) -> PathBuf {
     home.join("models").join("voices.json")
 }
 
+/// The profile that owns the voice whose reference audio is `ref_audio`, if it
+/// is a per-profile clone. The fleet registration writes each tenant's clone
+/// into the global `voices.json` with the absolute clone path as `ref_audio`
+/// (`.../profiles/<id>/data/voice_profiles/<name>.wav`), so the owning profile
+/// is the path segment after `profiles/` — but only when a later
+/// `voice_profiles` segment confirms it's actually a voice-clone path. A shared
+/// preset (ref audio not under any profile's clone dir) returns `None`.
+fn owning_profile_of(ref_audio: &str) -> Option<&str> {
+    let comps: Vec<&str> = ref_audio.split('/').filter(|s| !s.is_empty()).collect();
+    let profiles_idx = comps.iter().position(|&c| c == "profiles")?;
+    let owner = *comps.get(profiles_idx + 1)?;
+    comps
+        .get(profiles_idx + 2..)?
+        .contains(&"voice_profiles")
+        .then_some(owner)
+}
+
+/// Whether the voice whose reference audio is `ref_audio` may be listed/selected
+/// by `profile_id`: a shared preset is visible to everyone; a per-profile clone
+/// is visible only to the profile that owns it. This is the cross-tenant
+/// boundary for `GET /api/voices` and `PUT /api/my/voice`.
+pub fn voice_visible_to(profile_id: &str, ref_audio: &str) -> bool {
+    match owning_profile_of(ref_audio) {
+        Some(owner) => owner == profile_id,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +112,33 @@ mod tests {
         assert_eq!(
             registry_path_under(Path::new("/x/.OminiX")),
             Path::new("/x/.OminiX/models/voices.json")
+        );
+    }
+
+    #[test]
+    fn owning_profile_parsed_only_from_voice_clone_paths() {
+        assert_eq!(
+            owning_profile_of("/Users/cloud/.octos/profiles/alice/data/voice_profiles/clone.wav"),
+            Some("alice")
+        );
+        // Shared preset: relative path, no profile segment.
+        assert_eq!(owning_profile_of("ref_audios/doubao_ref.wav"), None);
+        // A `profiles/` segment without a later `voice_profiles` is not a clone.
+        assert_eq!(owning_profile_of("/srv/profiles/alice/models/x.wav"), None);
+    }
+
+    #[test]
+    fn voice_visible_only_to_owner_but_presets_visible_to_all() {
+        let clone = "/Users/cloud/.octos/profiles/alice/data/voice_profiles/clone.wav";
+        assert!(voice_visible_to("alice", clone), "owner sees own clone");
+        assert!(
+            !voice_visible_to("bob", clone),
+            "another tenant must not see alice's clone"
+        );
+        let preset = "ref_audios/doubao_ref.wav";
+        assert!(
+            voice_visible_to("bob", preset),
+            "shared preset visible to all"
         );
     }
 }

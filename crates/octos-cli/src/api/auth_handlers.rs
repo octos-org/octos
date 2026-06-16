@@ -1141,7 +1141,14 @@ pub async fn list_voices(
     let registry_path = crate::api::voices::registry_path();
     let (mut voices, registry_default) =
         match octos_llm::ominix::VoicesRegistry::load(&registry_path) {
-            Ok(reg) => (reg.synthesizable(), reg.default_voice),
+            // Scope the listing to this tenant: shared presets + voices this
+            // profile owns. A clone cloned by another tenant must not appear.
+            Ok(reg) => (
+                reg.synthesizable_visible(|ref_audio| {
+                    crate::api::voices::voice_visible_to(&profile_id, ref_audio)
+                }),
+                reg.default_voice,
+            ),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -1222,10 +1229,16 @@ pub async fn set_my_voice(
             "voice registry unavailable".into(),
         )
     })?;
-    let canonical = registry.resolve(req.voice.trim()).ok_or((
-        StatusCode::BAD_REQUEST,
-        format!("unknown voice: {}", req.voice),
-    ))?;
+    // Resolve only within this tenant's visible set (shared presets + voices it
+    // owns), so a tenant can't select a voice cloned by another profile.
+    let canonical = registry
+        .resolve_visible(req.voice.trim(), |ref_audio| {
+            crate::api::voices::voice_visible_to(&profile.id, ref_audio)
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("unknown voice: {}", req.voice),
+        ))?;
 
     // Persist (sticky per-user) then set the live override (instant effect).
     profile.config.voice_default = Some(canonical.clone());
