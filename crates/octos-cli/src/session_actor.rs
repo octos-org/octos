@@ -10367,6 +10367,27 @@ mod tests {
         }
     }
 
+    /// Per-test session key derived from the test's unique `TempDir` path.
+    ///
+    /// These actor tests previously all shared `test_session_key(dir.path())`.
+    /// `SessionActor::drain_master_continuations` drains
+    /// `default_agent_orchestrator()` (a process-global singleton) FOR ITS OWN
+    /// `session_key`, so a shared key let one test's actor drain a continuation
+    /// queued under "cli:test" by a concurrent test — surfacing as a spurious
+    /// extra recovery/review turn and flaking the suite ~1/8 of full parallel
+    /// runs. Deriving the key from `dir.path()` (each test gets a unique temp
+    /// dir) makes every test's actor session globally distinct, so the
+    /// per-session drain is isolated WITHOUT a process-global clear (which would
+    /// itself race under parallel execution). Stable within a test (same dir),
+    /// unique across concurrent tests.
+    fn test_session_key(dir: &std::path::Path) -> SessionKey {
+        let tag = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("test");
+        SessionKey::new("cli", tag)
+    }
+
     /// Build a SessionActor with configurable queue mode and optional adaptive router.
     ///
     /// Generic setup used by queue mode, auto-escalation, and other tests.
@@ -10408,7 +10429,7 @@ mod tests {
         }
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -10418,7 +10439,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -10442,7 +10463,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -10480,7 +10501,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(64);
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -10490,7 +10511,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -10514,7 +10535,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -10535,7 +10556,7 @@ mod tests {
         ));
         let (tx, _out_rx, handle, _session_mgr) =
             setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
-        let session_id = SessionKey::new("cli", "test");
+        let session_id = test_session_key(dir.path());
 
         crate::api::agent_orchestrator::default_agent_orchestrator().upsert_agent(
             crate::api::agent_orchestrator::AgentUpsert {
@@ -10630,7 +10651,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -10643,7 +10664,7 @@ mod tests {
             }),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -10667,7 +10688,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -10755,7 +10776,7 @@ mod tests {
         });
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -10768,7 +10789,7 @@ mod tests {
             }),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -10792,7 +10813,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -10879,7 +10900,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(64);
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -10889,7 +10910,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -10913,7 +10934,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: Some(cron_tool),
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -10972,7 +10993,7 @@ mod tests {
         // For the test, the slow call takes 15s, so 15s > 10s triggers overflow.
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -10982,7 +11003,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11006,7 +11027,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11383,7 +11404,7 @@ mod tests {
         // ── Phase 4: Verify history is sorted by timestamp ──
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let messages = &session.messages;
             assert!(
@@ -12339,7 +12360,7 @@ mod tests {
         // Verify background result is in session history
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let report_messages: Vec<_> = session
                 .messages
@@ -12413,7 +12434,7 @@ mod tests {
             responses
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let report_messages: Vec<_> = session
             .messages
@@ -12484,7 +12505,7 @@ mod tests {
             vec![media_path.to_string_lossy().to_string()]
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let persisted = session.messages.iter().any(|message| {
             message.role == MessageRole::Assistant
@@ -12608,7 +12629,7 @@ mod tests {
     async fn late_background_result_persists_with_originating_thread_id_not_derived_from_latest_user()
      {
         let dir = tempfile::TempDir::new().unwrap();
-        let session_key = SessionKey::new("cli", "test");
+        let session_key = test_session_key(dir.path());
 
         // Pre-seed three user messages, each with its own client_message_id,
         // through the canonical persist path so the JSONL has the same
@@ -12799,7 +12820,7 @@ mod tests {
             "background report should still count as persisted when live fanout is unavailable"
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         assert!(
             session
@@ -12891,7 +12912,7 @@ mod tests {
             .expect("outbound timeout message");
         assert_eq!(outbound.content, "Processing timed out. Please try again.");
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         assert!(
             session
@@ -12927,7 +12948,7 @@ mod tests {
             .expect("outbound error message");
         assert_eq!(outbound.content, "Error: scripted failure");
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         assert!(
             session
@@ -12974,7 +12995,7 @@ mod tests {
             .expect("response timeout")
             .expect("channel closed");
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let contents = session
             .messages
@@ -13054,7 +13075,7 @@ mod tests {
         // Verify session history: second user message should contain batched content
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
@@ -13134,7 +13155,7 @@ mod tests {
         // Verify session history: "second message" should NOT appear as a user message
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
@@ -13202,7 +13223,7 @@ mod tests {
         // All 3 user messages should be in history individually
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
@@ -14466,7 +14487,7 @@ mod tests {
         );
 
         // Verify the synthetic recovery prompt actually landed in history.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_user_msgs: Vec<_> = session
             .messages
@@ -14666,7 +14687,7 @@ mod tests {
         let task_id = supervisor.register_with_input(
             "fm_tts",
             "call-int-1",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
         );
         // Synth-ack gate (feat/spawn-only-failure-feedback-loop): mark
@@ -14695,7 +14716,7 @@ mod tests {
             responses
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let prompt_present = session.messages.iter().any(|m| {
             m.role == MessageRole::User
@@ -14761,7 +14782,7 @@ mod tests {
         let task_id = supervisor.register_with_input_and_cmid(
             "deep_research",
             "call-738",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"query": "rust news"})),
             Some(ORIGINATING_CMID.to_string()),
         );
@@ -14788,7 +14809,7 @@ mod tests {
         // minted server UUIDv7. Pre-fix this was None or a fresh UUID
         // because synthetic_recovery_inbound only stamped
         // `_recovery_turn` and `process_inbound` had nothing to read.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_msg = session
             .messages
@@ -15399,7 +15420,7 @@ mod tests {
         // around `process_inbound`; the test mirrors that.
         octos_llm::with_router_context(
             octos_llm::RouterContext {
-                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                session_id: Some(test_session_key(dir.path()).to_string()),
                 turn_id: None,
             },
             async {
@@ -15456,7 +15477,7 @@ mod tests {
         // window — must produce at most one push.
         octos_llm::with_router_context(
             octos_llm::RouterContext {
-                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                session_id: Some(test_session_key(dir.path()).to_string()),
                 turn_id: None,
             },
             async {
@@ -15554,7 +15575,7 @@ mod tests {
         // Then a same-session failover MUST get through.
         octos_llm::with_router_context(
             octos_llm::RouterContext {
-                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                session_id: Some(test_session_key(dir.path()).to_string()),
                 turn_id: None,
             },
             async {
@@ -15627,7 +15648,7 @@ mod tests {
         let task_id = supervisor.register_with_input(
             "mofa_slides",
             "call-spawn-fb-1",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"topic": "rust"})),
         );
         supervisor.mark_synth_ack_emitted("call-spawn-fb-1");
@@ -15651,7 +15672,7 @@ mod tests {
 
         // The synthetic user message MUST land in persisted history so
         // the LLM has it on its next turn — Design A constraint.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_prompts: Vec<_> = session
             .messages
@@ -15692,7 +15713,7 @@ mod tests {
         let task_id = supervisor.register_with_input(
             "mofa_slides",
             "call-spawn-fb-2",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"topic": "rust"})),
         );
         // Deliberately omit `mark_synth_ack_emitted` — simulates the
@@ -15714,7 +15735,7 @@ mod tests {
         );
 
         // History must not contain a recovery prompt either.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_present = session
             .messages
@@ -15744,7 +15765,11 @@ mod tests {
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
-        let task_id = supervisor.register("mofa_slides", "call-spawn-fb-3", Some("cli:test"));
+        let task_id = supervisor.register(
+            "mofa_slides",
+            "call-spawn-fb-3",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-spawn-fb-3");
         supervisor.mark_running(&task_id);
         supervisor.mark_completed(&task_id, vec!["/tmp/deck.pptx".to_string()]);
@@ -15786,7 +15811,11 @@ mod tests {
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
-        let task_id = supervisor.register("mofa_slides", "call-spawn-fb-4", Some("cli:test"));
+        let task_id = supervisor.register(
+            "mofa_slides",
+            "call-spawn-fb-4",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-spawn-fb-4");
         supervisor.mark_failed(&task_id, "first fail".to_string());
         // Second mark_failed must not re-fire the signal — supervisor guard.
@@ -15873,14 +15902,22 @@ mod tests {
         let mut seen: Vec<String> = Vec::new();
 
         // Failure 0 → first recovery turn runs.
-        let t0 = supervisor.register("mofa_slides", "call-cap-0", Some("cli:test"));
+        let t0 = supervisor.register(
+            "mofa_slides",
+            "call-cap-0",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-cap-0");
         supervisor.mark_failed(&t0, "fail #0".to_string());
         drain_until(&mut rx, "recovery-1", &mut seen).await;
 
         // Failure 1 → second recovery turn runs; the consecutive-recovery
         // counter now sits at the cap.
-        let t1 = supervisor.register("mofa_slides", "call-cap-1", Some("cli:test"));
+        let t1 = supervisor.register(
+            "mofa_slides",
+            "call-cap-1",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-cap-1");
         supervisor.mark_failed(&t1, "fail #1".to_string());
         drain_until(&mut rx, "recovery-2", &mut seen).await;
@@ -15888,7 +15925,11 @@ mod tests {
         // Failure 2 → the cap kicks in: a final banner is emitted INSTEAD of a
         // third LLM turn. (If the cap regressed, `recovery-3-MUST-NOT-RUN`
         // would arrive here and the `!recovery-3` assertion below would fail.)
-        let t2 = supervisor.register("mofa_slides", "call-cap-2", Some("cli:test"));
+        let t2 = supervisor.register(
+            "mofa_slides",
+            "call-cap-2",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-cap-2");
         supervisor.mark_failed(&t2, "fail #2".to_string());
         drain_until(
@@ -15935,7 +15976,11 @@ mod tests {
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
-        let task_id = supervisor.register("mofa_slides", "call-reset-1", Some("cli:test"));
+        let task_id = supervisor.register(
+            "mofa_slides",
+            "call-reset-1",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-reset-1");
         supervisor.mark_failed(&task_id, "boom".to_string());
 
