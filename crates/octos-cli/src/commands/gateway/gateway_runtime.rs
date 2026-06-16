@@ -130,7 +130,10 @@ pub(super) struct GatewayRuntime {
     heartbeat_service: Arc<HeartbeatService>,
     cron_service: Arc<CronService>,
 
-    // Session delete events from API handlers
+    // Session delete events from API handlers.
+    // The _tx must be kept alive here so the channel is never closed while
+    // the runtime runs (dropping it would close the channel and spin the loop).
+    _session_delete_tx: tokio::sync::mpsc::UnboundedSender<String>,
     session_delete_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 
     // Matrix (feature-gated)
@@ -1610,6 +1613,7 @@ impl GatewayRuntime {
             persona_service,
             heartbeat_service,
             cron_service,
+            _session_delete_tx: session_delete_tx,
             session_delete_rx,
             #[cfg(feature = "matrix")]
             matrix_channel,
@@ -1641,9 +1645,17 @@ impl GatewayRuntime {
                     continue;
                 }
                 session_id = self.session_delete_rx.recv() => {
-                    if let Some(id) = session_id {
-                        tracing::debug!(session = %id, "stopping actor for deleted session");
-                        self.actor_registry.remove_session(&id);
+                    match session_id {
+                        Some(id) => {
+                            tracing::debug!(session = %id, "stopping actor for deleted session");
+                            self.actor_registry.remove_session(&id);
+                        }
+                        None => {
+                            // All senders dropped — should not happen while _session_delete_tx
+                            // is held in the struct, but break defensively to avoid spinning.
+                            tracing::warn!("session_delete_rx closed unexpectedly; exiting gateway loop");
+                            break;
+                        }
                     }
                     continue;
                 }
