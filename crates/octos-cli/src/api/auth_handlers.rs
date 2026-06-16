@@ -1083,9 +1083,7 @@ pub async fn update_my_profile(
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
     }
-    if let Some(config) = req.config {
-        profile.config = config;
-    }
+    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true);
     profile.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut profile).map_err(|e| {
@@ -1864,9 +1862,7 @@ pub async fn update_my_sub_account(
     if let Some(enabled) = req.enabled {
         sub.enabled = enabled;
     }
-    if let Some(config) = req.config {
-        sub.config = config;
-    }
+    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true);
     sub.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut sub)
@@ -2839,6 +2835,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn my_profile_config_patch_preserves_existing_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        profile.config.home = Some(serde_json::json!({
+            "settings": {
+                "city": "Tokyo",
+                "clock_format": "24h"
+            },
+            "events": [
+                { "id": "dinner", "title": "Dinner" }
+            ]
+        }));
+        profile_store.save(&profile).unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "home": {
+                        "settings": {
+                            "city": "Osaka"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.profile.config.plugins.require_signed);
+        let home = resp.profile.config.home.expect("home config");
+        assert_eq!(home["settings"]["city"], "Osaka");
+        assert_eq!(home["settings"]["clock_format"], "24h");
+        assert_eq!(home["events"][0]["title"], "Dinner");
+    }
+
+    // The config merge preserves sections the client omits (above), but a
+    // provided `env_vars` map must still be able to DROP keys and clear the set
+    // — otherwise secrets could never be removed via self-service. `env_vars` is
+    // replaced wholesale when provided (see `merge_profile_config_from_body`).
+    #[tokio::test]
+    async fn my_profile_env_vars_can_drop_keys_and_clear() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = Arc::new(state);
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.env_vars.insert("KEEP".into(), "old".into());
+        profile.config.env_vars.insert("DROP".into(), "gone".into());
+        profile_store.save(&profile).unwrap();
+
+        // A smaller map: KEEP updated, DROP omitted → removed. (Assert on the
+        // persisted profile: the API response masks secret values.)
+        update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({ "config": { "env_vars": { "KEEP": "new" } } }).to_string(),
+        )
+        .await
+        .unwrap();
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert_eq!(
+            stored.config.env_vars.get("KEEP").map(String::as_str),
+            Some("new")
+        );
+        assert!(
+            !stored.config.env_vars.contains_key("DROP"),
+            "a key omitted from the provided env_vars map must be removed"
+        );
+
+        // An explicit empty map clears everything.
+        update_my_profile(
+            State(state),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({ "config": { "env_vars": {} } }).to_string(),
+        )
+        .await
+        .unwrap();
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert!(
+            stored.config.env_vars.is_empty(),
+            "an explicit empty env_vars map must clear all entries"
+        );
+    }
+
+    // Replacing `env_vars` wholesale must NOT clobber a real secret when the UI
+    // round-trips it masked: `save_with_merge` restores masked/empty values
+    // per-key from the stored profile. Sections absent from the patch are still
+    // preserved.
+    #[tokio::test]
+    async fn my_profile_env_vars_replace_preserves_masked_and_other_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile
+            .config
+            .env_vars
+            .insert("SECRET".into(), "realval".into());
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        profile_store.save(&profile).unwrap();
+
+        update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({ "config": { "env_vars": { "SECRET": "***" } } }).to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Assert on the persisted profile (the response masks secret values).
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert_eq!(
+            stored.config.env_vars.get("SECRET").map(String::as_str),
+            Some("realval"),
+            "a masked value round-tripped by the UI must not overwrite the real secret"
+        );
+        assert!(
+            stored.config.plugins.require_signed,
+            "sections omitted from the patch must still be preserved"
+        );
+    }
+
+    #[tokio::test]
     async fn sub_account_cannot_change_own_public_subdomain() {
         let (_dir, state, _user_store, profile_store) = temp_app_state();
         profile_store
@@ -2873,6 +3012,64 @@ mod tests {
             err.1,
             "sub-accounts cannot change their own public subdomain"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_sub_account_config_patch_preserves_existing_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        child.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        child.config.home = Some(serde_json::json!({
+            "settings": {
+                "city": "Tokyo",
+                "clock_format": "24h"
+            },
+            "events": [
+                { "id": "school", "title": "School pickup" }
+            ]
+        }));
+        profile_store.save(&child).unwrap();
+
+        let Json(resp) = update_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            Path("tenant--assistant".into()),
+            serde_json::json!({
+                "config": {
+                    "home": {
+                        "settings": {
+                            "city": "Kyoto"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.profile.config.plugins.require_signed);
+        let home = resp.profile.config.home.expect("home config");
+        assert_eq!(home["settings"]["city"], "Kyoto");
+        assert_eq!(home["settings"]["clock_format"], "24h");
+        assert_eq!(home["events"][0]["title"], "School pickup");
     }
 
     #[tokio::test]

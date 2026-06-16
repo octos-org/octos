@@ -73,6 +73,7 @@ async fn should_emit_session_result_metadata_for_overflow_reply() {
         media: vec![],
         metadata: serde_json::json!({
             "_history_persisted": true,
+            "thread_id": "client-msg-bravo",
             "_session_result": {
                 "seq": 42,
                 "role": "assistant",
@@ -80,6 +81,7 @@ async fn should_emit_session_result_metadata_for_overflow_reply() {
                 "timestamp": "2026-04-23T17:30:00Z",
                 "media": [],
                 "response_to_client_message_id": "client-msg-bravo",
+                "thread_id": "client-msg-bravo",
             }
         }),
     };
@@ -116,5 +118,13 @@ async fn should_emit_session_result_metadata_for_overflow_reply() {
     assert_eq!(
         event["message"]["response_to_client_message_id"], "client-msg-bravo",
         "correlation id must survive for reducer-layer bubble routing"
+    );
+    assert_eq!(
+        event["thread_id"], "client-msg-bravo",
+        "wire event must carry the originating thread_id"
+    );
+    assert_eq!(
+        event["message"]["thread_id"], "client-msg-bravo",
+        "message body must carry the originating thread_id"
     );
 }

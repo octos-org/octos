@@ -1143,6 +1143,39 @@ impl ServeCommand {
 mod tests {
     use super::*;
 
+    fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: dashboard SMTP env tests hold `dashboard_smtp_test_env_lock`,
+            // serializing mutation of process-wide environment variables.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: callers keep the env lock for the full guard lifetime.
+            match self.previous.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn deployment_mode_is_explicit_and_ignores_tunnel_settings() {
         let config = Config {
@@ -1220,6 +1253,8 @@ mod tests {
 
     #[test]
     fn dashboard_smtp_password_prefers_matching_admin_profile_email_tool() {
+        let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
         let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
         store
@@ -1257,7 +1292,7 @@ mod tests {
                 host: "smtp.example.com".into(),
                 port: 465,
                 username: "admin@example.com".into(),
-                password_env: "SMTP_PASSWORD".into(),
+                password_env: "OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD".into(),
                 from_address: "admin@example.com".into(),
             }),
             session_expiry_hours: 24,
@@ -1342,6 +1377,8 @@ mod tests {
 
     #[test]
     fn dashboard_smtp_password_prefers_matching_non_admin_profile_email_tool() {
+        let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
         let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
         store
@@ -1383,7 +1420,7 @@ mod tests {
                 host: "smtp.gmail.com".into(),
                 port: 465,
                 username: "dspfac@gmail.com".into(),
-                password_env: "SMTP_PASSWORD".into(),
+                password_env: "OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD".into(),
                 from_address: "dspfac@gmail.com".into(),
             }),
             session_expiry_hours: 24,
