@@ -46,6 +46,7 @@ const CONTENT_APP: &str = "org.octos.app";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
+const CONTENT_SPLASH_CARD: &str = "org.octos.splash_card";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
@@ -1889,6 +1890,63 @@ impl MatrixChannel {
         Ok(())
     }
 
+    /// Extract the content of the first runsplash fenced block from `text`.
+    ///
+    /// Matches both ` ```runsplash ` (inline) and ` ``` `\n`runsplash` (language
+    /// tag on its own line, which is what most LLMs emit). Returns the raw Splash
+    /// script without the fence markers.
+    fn extract_runsplash_block(text: &str) -> Option<String> {
+        // Find the opening ``` fence.
+        let fence_pos = text.find("```")?;
+        let after_fence = fence_pos + 3;
+
+        // Determine where the script body starts by consuming the language tag.
+        // Accepted shapes:
+        //   ```runsplash\n...    (language tag on same line as fence)
+        //   ```\nrunsplash\n...  (language tag on next line, common LLM output)
+        let start = {
+            let rest = &text[after_fence..];
+            if rest.starts_with("runsplash") {
+                // inline: skip "runsplash" and optional trailing whitespace/newline
+                let after_tag = after_fence + "runsplash".len();
+                let rest2 = &text[after_tag..];
+                // skip trailing space or newline after the tag
+                if rest2.starts_with('\n') {
+                    after_tag + 1
+                } else if rest2.starts_with(" \n") {
+                    after_tag + 2
+                } else {
+                    after_tag
+                }
+            } else if rest.starts_with('\n') {
+                // language tag is on the next line — consume the newline and
+                // then the "runsplash" word (with optional trailing whitespace)
+                let line_start = after_fence + 1;
+                let line = &text[line_start..];
+                let tag = "runsplash";
+                if line.starts_with(tag) {
+                    let after_tag = line_start + tag.len();
+                    // skip optional trailing space/newline after the tag
+                    let rest2 = &text[after_tag..];
+                    if rest2.starts_with('\n') {
+                        after_tag + 1
+                    } else if rest2.starts_with(" \n") {
+                        after_tag + 2
+                    } else {
+                        after_tag
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        };
+
+        let close = text[start..].find("```")?;
+        Some(text[start..start + close].trim_end_matches('\n').to_string())
+    }
+
     /// Send a message to a Matrix room and return the event_id.
     ///
     /// If `sender_user_id` is `Some`, the request uses that user for identity
@@ -1930,6 +1988,11 @@ impl MatrixChannel {
         }
         if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
             body[CONTENT_ACTION_RESPONSE] = action_response.clone();
+        }
+        if let Some(splash_card) = metadata.get(CONTENT_SPLASH_CARD) {
+            body[CONTENT_SPLASH_CARD] = splash_card.clone();
+        } else if let Some(splash_code) = Self::extract_runsplash_block(content) {
+            body[CONTENT_SPLASH_CARD] = json!(splash_code);
         }
 
         let resp = self
@@ -2017,6 +2080,10 @@ impl MatrixChannel {
         if live {
             body[LIVE_MARKER] = json!({});
             body["m.new_content"][LIVE_MARKER] = json!({});
+        }
+        if let Some(splash_code) = Self::extract_runsplash_block(new_content) {
+            body[CONTENT_SPLASH_CARD] = json!(splash_code.clone());
+            body["m.new_content"][CONTENT_SPLASH_CARD] = json!(splash_code);
         }
 
         let resp = self
