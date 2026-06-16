@@ -1083,7 +1083,7 @@ pub async fn update_my_profile(
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
     }
-    super::admin::merge_profile_config_from_body(&mut profile.config, &body);
+    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true);
     profile.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut profile).map_err(|e| {
@@ -1862,7 +1862,7 @@ pub async fn update_my_sub_account(
     if let Some(enabled) = req.enabled {
         sub.enabled = enabled;
     }
-    super::admin::merge_profile_config_from_body(&mut sub.config, &body);
+    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true);
     sub.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut sub)

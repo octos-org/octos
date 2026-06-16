@@ -336,7 +336,7 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    merge_profile_config_from_body(&mut profile.config, &body);
+    merge_profile_config_from_body(&mut profile.config, &body, false);
     profile.updated_at = Utc::now();
 
     store.save_with_merge(&mut profile).map_err(|e| {
@@ -835,24 +835,35 @@ pub(crate) async fn fetch_provider_models(
 /// Only keys present in `config` are overwritten; absent keys are preserved.
 /// This lets callers send `{"config":{"model":"x"}}` without wiping
 /// channels/env_vars, while dashboards can still send a full config object.
-pub(crate) fn merge_profile_config_from_body(config: &mut ProfileConfig, body: &str) {
+/// Merge a `{ "config": {...} }` request body into `config`. RFC-7396 semantics:
+/// keys the client omits are preserved. `env_vars_authoritative` selects how a
+/// provided `env_vars` map is treated:
+/// - `true` — self-service `/api/my/*`, where the dashboard sends the COMPLETE
+///   desired map (including `{}` to clear): replace `env_vars` wholesale so the
+///   client can drop keys / clear secrets (a deep-merge can only add, never
+///   remove).
+/// - `false` — admin tool `admin_update_profile`, which sends only the keys the
+///   operator supplied: deep-merge `env_vars` so a partial update never deletes
+///   unrelated secrets.
+///
+/// Either way, masked/empty display values are restored per-key downstream by
+/// `ProfileStore::save_with_merge`, so round-tripping masked secrets does not
+/// lose them.
+pub(crate) fn merge_profile_config_from_body(
+    config: &mut ProfileConfig,
+    body: &str,
+    env_vars_authoritative: bool,
+) {
     let raw: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
     if let Some(config_patch) = raw.get("config") {
         if config_patch.is_object() {
             let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
             json_merge(&mut existing, config_patch);
-            // `env_vars` is a complete map the client owns: the dashboard sends
-            // the full desired set (including `{}` to clear). The RFC-7396
-            // deep-merge above can only add/overwrite keys, never remove them,
-            // so a recursive merge makes it impossible to clear a secret or drop
-            // a key. When the patch provides `env_vars`, treat it as
-            // authoritative and replace the map wholesale. Masked/empty display
-            // values are still restored per-key downstream by
-            // `ProfileStore::save_with_merge`, so round-tripping masked secrets
-            // through the UI does not lose them.
-            if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
-                if let Some(existing_obj) = existing.as_object_mut() {
-                    existing_obj.insert("env_vars".to_string(), env_vars.clone());
+            if env_vars_authoritative {
+                if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
+                    if let Some(existing_obj) = existing.as_object_mut() {
+                        existing_obj.insert("env_vars".to_string(), env_vars.clone());
+                    }
                 }
             }
             if let Ok(merged) = serde_json::from_value(existing) {
@@ -4667,6 +4678,56 @@ mod tests {
         assert_eq!(req.command, "echo hello");
         assert!(req.cwd.is_none());
         assert!(req.timeout_secs.is_none());
+    }
+
+    // The admin tool (`admin_update_profile`) sends only the keys the operator
+    // supplied, so its path must NOT be authoritative — a partial env_vars
+    // update must merge and preserve omitted secrets, never delete them.
+    #[test]
+    fn merge_config_admin_path_preserves_omitted_env_vars() {
+        let mut config = ProfileConfig::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".into(), "sk-real".into());
+        config.env_vars.insert("SMTP_PASSWORD".into(), "old".into());
+
+        merge_profile_config_from_body(
+            &mut config,
+            r#"{"config":{"env_vars":{"SMTP_PASSWORD":"new"}}}"#,
+            false,
+        );
+
+        assert_eq!(
+            config.env_vars.get("SMTP_PASSWORD").map(String::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            config.env_vars.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-real"),
+            "a partial admin update must not delete env vars it didn't mention"
+        );
+    }
+
+    // Self-service `/api/my/*` sends the complete desired map, so its path is
+    // authoritative: an omitted key is dropped and `{}` clears everything.
+    #[test]
+    fn merge_config_self_service_replaces_env_vars() {
+        let mut config = ProfileConfig::default();
+        config.env_vars.insert("A".into(), "a".into());
+        config.env_vars.insert("B".into(), "b".into());
+
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true);
+        assert_eq!(config.env_vars.get("A").map(String::as_str), Some("a2"));
+        assert!(
+            !config.env_vars.contains_key("B"),
+            "authoritative replace drops omitted keys"
+        );
+
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true);
+        assert!(
+            config.env_vars.is_empty(),
+            "an explicit empty map clears all entries"
+        );
     }
 
     #[test]
