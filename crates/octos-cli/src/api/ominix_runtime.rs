@@ -1,16 +1,33 @@
 //! OMiniX runtime discovery, repair, and launchd control.
 
 use std::fs;
+use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flate2::read::GzDecoder;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tar::Archive;
 use tokio::process::Command;
 
 pub(crate) const OMINIX_LABEL: &str = "io.ominix.ominix-api";
 const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8081";
+const DEFAULT_RELEASE_REPO: &str = "OminiX-ai/OminiX-API";
 const PREFERRED_PORTS: &[u16] = &[8081, 9090, 8080];
+const INSTALL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const INSTALL_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SERVER_CONFIG: &str = r#"{
+  "allowed_models": {
+    "llm": ["*"],
+    "image": ["flux-8bit", "zimage"],
+    "asr": ["qwen3-asr", "paraformer"],
+    "tts": ["qwen3-tts", "qwen3-tts-base"],
+    "vlm": ["*"]
+  }
+}
+"#;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OminixRuntimeConfig {
@@ -19,6 +36,11 @@ pub(crate) struct OminixRuntimeConfig {
     metallib_path: PathBuf,
     models_dir: PathBuf,
     skip_launchctl: bool,
+    require_metallib: bool,
+    skip_platform_check: bool,
+    release_repo: String,
+    release_version: Option<String>,
+    release_base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -143,6 +165,25 @@ impl OminixRuntimeConfig {
         let skip_launchctl = std::env::var("OCTOS_OMINIX_SKIP_LAUNCHCTL")
             .map(|v| is_truthy(&v))
             .unwrap_or(false);
+        let require_metallib = std::env::var("OCTOS_OMINIX_REQUIRE_METALLIB")
+            .map(|v| is_truthy(&v))
+            .unwrap_or(false);
+        let skip_platform_check = std::env::var("OCTOS_OMINIX_SKIP_PLATFORM_CHECK")
+            .map(|v| is_truthy(&v))
+            .unwrap_or(false);
+        let release_repo = std::env::var("OCTOS_OMINIX_RELEASE_REPO")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_RELEASE_REPO.to_string());
+        let release_version = std::env::var("OCTOS_OMINIX_VERSION")
+            .ok()
+            .map(|v| v.trim().trim_start_matches('v').to_string())
+            .filter(|v| !v.is_empty());
+        let release_base_url = std::env::var("OCTOS_OMINIX_RELEASE_BASE_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
 
         Self {
             home_dir,
@@ -150,6 +191,11 @@ impl OminixRuntimeConfig {
             metallib_path,
             models_dir,
             skip_launchctl,
+            require_metallib,
+            skip_platform_check,
+            release_repo,
+            release_version,
+            release_base_url,
         }
     }
 
@@ -184,6 +230,22 @@ impl OminixRuntimeConfig {
 
     fn err_log_path(&self) -> PathBuf {
         self.ominix_dir().join("api.err.log")
+    }
+
+    fn release_base_url(&self) -> String {
+        if let Some(url) = &self.release_base_url {
+            return url.clone();
+        }
+        if let Some(version) = &self.release_version {
+            return format!(
+                "https://github.com/{}/releases/download/v{}",
+                self.release_repo, version
+            );
+        }
+        format!(
+            "https://github.com/{}/releases/latest/download",
+            self.release_repo
+        )
     }
 
     fn configured_url(&self) -> (String, String) {
@@ -224,6 +286,13 @@ pub(crate) async fn repair_runtime(
 ) -> Result<OminixRepairResponse, String> {
     let config = OminixRuntimeConfig::from_env();
     repair_runtime_with_config(&config, client).await
+}
+
+pub(crate) async fn install_runtime(
+    client: &reqwest::Client,
+) -> Result<OminixRepairResponse, String> {
+    let config = OminixRuntimeConfig::from_env();
+    install_runtime_with_config(&config, client).await
 }
 
 pub(crate) async fn service_start(
@@ -277,7 +346,7 @@ async fn runtime_status_with_config(
             false,
         ));
     }
-    if !metallib_installed {
+    if config.require_metallib && !metallib_installed {
         issues.push(issue(
             "missing_metallib",
             "error",
@@ -322,7 +391,7 @@ async fn runtime_status_with_config(
             "api_unreachable",
             "error",
             format!("OMiniX API is not healthy at {url}"),
-            binary_installed && metallib_installed,
+            binary_installed && (!config.require_metallib || metallib_installed),
         ));
     }
     if !service.registered && !config.skip_launchctl {
@@ -347,7 +416,8 @@ async fn runtime_status_with_config(
     }
 
     let hard_blocked = issues.iter().any(|i| i.severity == "error" && !i.fixable);
-    let can_repair = binary_installed && metallib_installed && !hard_blocked;
+    let can_repair =
+        binary_installed && (!config.require_metallib || metallib_installed) && !hard_blocked;
     let state = if health.healthy {
         "healthy"
     } else if can_repair {
@@ -397,7 +467,7 @@ async fn repair_runtime_with_config(
 ) -> Result<OminixRepairResponse, String> {
     let before = runtime_status_with_config(config, client).await;
     let mut actions = Vec::new();
-    if !before.binary_installed || !before.metallib_installed {
+    if !before.binary_installed || (config.require_metallib && !before.metallib_installed) {
         return Ok(OminixRepairResponse {
             ok: false,
             message: "OMiniX API binary or MLX runtime file is missing".to_string(),
@@ -460,6 +530,180 @@ async fn repair_runtime_with_config(
         actions,
         status,
     })
+}
+
+async fn install_runtime_with_config(
+    config: &OminixRuntimeConfig,
+    client: &reqwest::Client,
+) -> Result<OminixRepairResponse, String> {
+    let before = runtime_status_with_config(config, client).await;
+    let mut actions = Vec::new();
+
+    if !before.binary_installed {
+        validate_install_platform(config)?;
+        install_ominix_binary(config, client, &mut actions).await?;
+    } else {
+        actions.push(format!("kept existing {}", config.binary_path.display()));
+    }
+
+    fs::create_dir_all(&config.models_dir).map_err(|e| e.to_string())?;
+    actions.push(format!("ensured {}", config.models_dir.display()));
+    fs::create_dir_all(config.ominix_dir()).map_err(|e| e.to_string())?;
+    actions.push(format!("ensured {}", config.ominix_dir().display()));
+
+    let server_config_path = config.alternate_ominix_dir().join("server_config.json");
+    let server_config_changed =
+        write_if_missing(&server_config_path, DEFAULT_SERVER_CONFIG).map_err(|e| e.to_string())?;
+    actions.push(format!(
+        "{} {}",
+        if server_config_changed {
+            "wrote"
+        } else {
+            "kept"
+        },
+        server_config_path.display()
+    ));
+
+    let mut repaired = repair_runtime_with_config(config, client).await?;
+    actions.append(&mut repaired.actions);
+    repaired.actions = actions;
+    Ok(repaired)
+}
+
+fn validate_install_platform(config: &OminixRuntimeConfig) -> Result<(), String> {
+    if config.skip_platform_check {
+        return Ok(());
+    }
+    if std::env::consts::OS != "macos" {
+        return Err(format!(
+            "OminiX API install requires macOS Apple Silicon; detected {}",
+            std::env::consts::OS
+        ));
+    }
+    if std::env::consts::ARCH != "aarch64" && std::env::consts::ARCH != "arm64" {
+        return Err(format!(
+            "OminiX API install requires Apple Silicon arm64; detected {}",
+            std::env::consts::ARCH
+        ));
+    }
+    Ok(())
+}
+
+async fn install_ominix_binary(
+    config: &OminixRuntimeConfig,
+    client: &reqwest::Client,
+    actions: &mut Vec<String>,
+) -> Result<(), String> {
+    let base_url = config.release_base_url();
+    let checksums_url = format!("{base_url}/checksums.txt");
+    let checksums = fetch_text(client, &checksums_url, INSTALL_METADATA_TIMEOUT).await?;
+    actions.push(format!("downloaded {checksums_url}"));
+
+    let (archive_name, expected_sha) = select_release_archive(&checksums)
+        .ok_or_else(|| "checksums.txt did not list a darwin-aarch64 OMiniX archive".to_string())?;
+    let archive_url = format!("{base_url}/{archive_name}");
+    let archive_bytes = fetch_bytes(client, &archive_url, INSTALL_DOWNLOAD_TIMEOUT).await?;
+    actions.push(format!("downloaded {archive_url}"));
+
+    verify_sha256(&archive_bytes, &expected_sha)?;
+    actions.push(format!("verified sha256 for {archive_name}"));
+
+    let binary_bytes = extract_ominix_binary(&archive_bytes)?;
+    write_executable_atomic(&config.binary_path, &binary_bytes).map_err(|e| e.to_string())?;
+    actions.push(format!("installed {}", config.binary_path.display()));
+    Ok(())
+}
+
+async fn fetch_text(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("failed to download {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("failed to download {url}: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("failed to read {url}: {e}"))
+}
+
+async fn fetch_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let bytes = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("failed to download {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("failed to download {url}: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read {url}: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
+fn select_release_archive(checksums: &str) -> Option<(String, String)> {
+    checksums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let sha = parts.next()?.trim().to_ascii_lowercase();
+        let name = parts.next()?.trim_start_matches('*').to_string();
+        if sha.len() == 64
+            && sha.chars().all(|c| c.is_ascii_hexdigit())
+            && name.starts_with("ominix-api-")
+            && name.ends_with("-darwin-aarch64.tar.gz")
+        {
+            Some((name, sha))
+        } else {
+            None
+        }
+    })
+}
+
+fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "checksum mismatch for OMiniX archive: expected {expected}, actual {actual}"
+        ))
+    }
+}
+
+fn extract_ominix_binary(archive_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let mut archive = Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("failed to read OMiniX archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("failed to read OMiniX archive entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("failed to read OMiniX archive path: {e}"))?;
+        if entry.header().entry_type().is_file()
+            && path.file_name().and_then(|v| v.to_str()) == Some("ominix-api")
+        {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("failed to extract ominix-api: {e}"))?;
+            if bytes.is_empty() {
+                return Err("ominix-api archive entry is empty".to_string());
+            }
+            return Ok(bytes);
+        }
+    }
+    Err("OMiniX archive did not contain ominix-api".to_string())
 }
 
 enum ServiceAction {
@@ -788,6 +1032,46 @@ fn write_if_changed(path: &Path, content: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
+fn write_if_missing(path: &Path, content: &str) -> std::io::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(true)
+}
+
+fn write_executable_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("ominix-api");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn port_is_available(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
@@ -893,6 +1177,10 @@ fn first_nonempty_line(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::net::TcpListener as StdTcpListener;
+    use std::thread;
+    use tar::{Builder, Header};
 
     fn test_config(root: &Path) -> OminixRuntimeConfig {
         let bin_dir = root.join(".local/bin");
@@ -909,6 +1197,11 @@ mod tests {
             metallib_path,
             models_dir,
             skip_launchctl: true,
+            require_metallib: false,
+            skip_platform_check: true,
+            release_repo: DEFAULT_RELEASE_REPO.to_string(),
+            release_version: None,
+            release_base_url: None,
         }
     }
 
@@ -946,6 +1239,11 @@ mod tests {
             metallib_path: dir.path().join(".local/bin/mlx.metallib"),
             models_dir: dir.path().join(".OminiX/models"),
             skip_launchctl: true,
+            require_metallib: false,
+            skip_platform_check: true,
+            release_repo: DEFAULT_RELEASE_REPO.to_string(),
+            release_version: None,
+            release_base_url: None,
         };
         let client = reqwest::Client::new();
         let status = runtime_status_with_config(&config, &client).await;
@@ -974,5 +1272,90 @@ mod tests {
             .expect("repair");
         assert!(response.ok);
         assert_ne!(response.status.port, Some(8080));
+    }
+
+    #[tokio::test]
+    async fn install_downloads_archive_and_writes_runtime_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = fixture_archive(b"#!/bin/sh\necho ominix\n");
+        let release_base_url = spawn_release_fixture(archive);
+        let config = OminixRuntimeConfig {
+            home_dir: dir.path().to_path_buf(),
+            binary_path: dir.path().join(".local/bin/ominix-api"),
+            metallib_path: dir.path().join(".local/bin/mlx.metallib"),
+            models_dir: dir.path().join(".OminiX/models"),
+            skip_launchctl: true,
+            require_metallib: false,
+            skip_platform_check: true,
+            release_repo: DEFAULT_RELEASE_REPO.to_string(),
+            release_version: None,
+            release_base_url: Some(release_base_url),
+        };
+        let client = reqwest::Client::new();
+        let response = install_runtime_with_config(&config, &client)
+            .await
+            .expect("install");
+
+        assert!(response.ok);
+        assert!(response.dry_run);
+        assert!(config.binary_path.exists());
+        assert!(config.plist_path().exists());
+        assert!(config.discovery_path().exists());
+        assert!(
+            config
+                .alternate_ominix_dir()
+                .join("server_config.json")
+                .exists()
+        );
+        let installed = fs::read(&config.binary_path).unwrap();
+        assert_eq!(installed, b"#!/bin/sh\necho ominix\n");
+        assert!(
+            response
+                .actions
+                .iter()
+                .any(|action| action.contains("verified sha256"))
+        );
+    }
+
+    fn fixture_archive(binary: &[u8]) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+        let mut header = Header::new_gnu();
+        header.set_path("ominix-api").unwrap();
+        header.set_size(binary.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append(&header, binary).unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn spawn_release_fixture(archive: Vec<u8>) -> String {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sha = format!("{:x}", Sha256::digest(&archive));
+        let checksums = format!("{sha}  ominix-api-9.9.9-darwin-aarch64.tar.gz\n");
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0_u8; 1024];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]);
+                let (content_type, body): (&str, Vec<u8>) = if request.contains("/checksums.txt") {
+                    ("text/plain", checksums.as_bytes().to_vec())
+                } else {
+                    ("application/gzip", archive.clone())
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        format!("http://{addr}")
     }
 }

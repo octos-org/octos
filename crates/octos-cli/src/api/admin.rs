@@ -2281,6 +2281,16 @@ pub async fn platform_runtime_repair(
     Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
+/// POST /api/admin/platform-skills/ominix-api/install — install or repair local OMiniX runtime.
+pub async fn platform_runtime_install(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::install_runtime(&state.http_client)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
+}
+
 /// POST /api/admin/platform-skills/:name/install — install/update a platform skill.
 pub async fn install_platform_skill(
     State(state): State<Arc<AppState>>,
