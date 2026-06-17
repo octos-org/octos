@@ -29,6 +29,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 redb = { workspace = true }
 metrics = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [lints]
 workspace = true

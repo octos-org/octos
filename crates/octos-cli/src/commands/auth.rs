@@ -191,6 +191,28 @@ fn open_profile_store() -> Result<ProfileStore> {
     ProfileStore::open(&home.join(".octos"))
 }
 
+/// Whether storing `secret` under `name` must be scoped per profile: a declared
+/// keychain-backed var, OR any value that is a service-account JSON (detected by
+/// content, so the same protection applies under a custom env name such as the
+/// dashboard "Custom" provider's `VERTEX_API_KEY`). Mirrors the API-side
+/// `keychain::needs_keychain_relocation` contract.
+fn should_scope(name: &str, secret: &str) -> bool {
+    keychain::KEYCHAIN_BACKED_ENV_VARS.contains(&name) || keychain::is_service_account_json(secret)
+}
+
+/// The keychain account and the profile-config marker to persist for `name` in
+/// `profile_id`. Scoped creds get a per-profile account + scoped marker; other
+/// keys keep the bare account + bare marker.
+fn keychain_target(name: &str, profile_id: &str, secret: &str) -> (String, String) {
+    if should_scope(name, secret) {
+        let account = keychain::scoped_account(name, profile_id);
+        let marker = keychain::marker_for(&account);
+        (account, marker)
+    } else {
+        (name.to_string(), keychain::KEYCHAIN_MARKER.to_string())
+    }
+}
+
 fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Result<()> {
     // Get the secret value: from argument or interactive prompt
     let secret = match value {
@@ -208,20 +230,30 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
         }
     };
 
-    // Store in keychain
-    keychain::set_secret(name, &secret)?;
+    // Keychain-backed credentials (e.g. a Vertex SA JSON, even under a custom
+    // env name) are stored under a PER-PROFILE account so distinct profiles
+    // never share — and overwrite — one keychain item. Other keys keep a single
+    // shared account.
+    let scoped = should_scope(name, &secret);
 
-    // Update profile(s) to use keychain marker
+    // Shared keys: store once up front (also covers the orphan / no-profile
+    // case). Scoped keys are stored per profile in the loop below.
+    if !scoped {
+        keychain::set_secret(name, &secret)?;
+    }
+
+    // Update profile(s) to use the keychain marker
     let store = open_profile_store()?;
     let profiles = get_profiles(&store, profile_id)?;
 
     let mut updated_count = 0;
     for mut profile in profiles {
         if profile.config.env_vars.contains_key(name) {
-            profile
-                .config
-                .env_vars
-                .insert(name.to_string(), keychain::KEYCHAIN_MARKER.to_string());
+            let (account, marker) = keychain_target(name, &profile.id, &secret);
+            if scoped {
+                keychain::set_secret(&account, &secret)?;
+            }
+            profile.config.env_vars.insert(name.to_string(), marker);
             profile.updated_at = chrono::Utc::now();
             store.save(&profile)?;
             updated_count += 1;
@@ -231,6 +263,18 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
                 profile.id.cyan()
             );
         }
+    }
+
+    // A scoped key is only ever written inside the per-profile loop, so if no
+    // profile referenced it nothing was stored — don't claim otherwise.
+    if scoped && updated_count == 0 {
+        println!(
+            "{} No profile references {}; nothing stored. Add the key to a profile \
+             (or save it via the dashboard) first.",
+            "!".yellow().bold(),
+            name.cyan(),
+        );
+        return Ok(());
     }
 
     println!(
@@ -250,14 +294,21 @@ fn list_keys(profile_id: Option<&str>) -> Result<()> {
     let store = open_profile_store()?;
     let profiles = get_profiles(&store, profile_id)?;
 
-    // Collect all unique env var names and their storage type
-    let mut keychain_keys = std::collections::BTreeSet::new();
+    // Collect DISTINCT (env var, keychain account) pairs — the account is
+    // resolved from the marker, so a profile-scoped key has one entry per
+    // account and we never collapse two profiles' distinct accounts into one
+    // (which would hide a missing/broken entry for one of them).
+    let mut keychain_keys: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
     let mut plain_keys = std::collections::BTreeSet::new();
 
     for profile in &profiles {
         for (key, value) in &profile.config.env_vars {
-            if value == keychain::KEYCHAIN_MARKER {
-                keychain_keys.insert(key.clone());
+            if keychain::is_marker(value) {
+                keychain_keys.insert((
+                    key.clone(),
+                    keychain::marker_account(value, key).to_string(),
+                ));
             } else if !value.is_empty() {
                 plain_keys.insert(key.clone());
             }
@@ -271,13 +322,18 @@ fn list_keys(profile_id: Option<&str>) -> Result<()> {
 
     if !keychain_keys.is_empty() {
         println!("{}", "Keychain-stored keys:".bold());
-        for key in &keychain_keys {
-            let status = match keychain::get_secret(key) {
+        for (key, account) in &keychain_keys {
+            let status = match keychain::get_secret(account) {
                 Ok(Some(_)) => "available".green().to_string(),
                 Ok(None) => "missing from keychain!".red().to_string(),
                 Err(_) => "keychain error".yellow().to_string(),
             };
-            println!("  {key}: {status}");
+            // Show the scoped account when it differs from the bare env-var name.
+            if account == key {
+                println!("  {key}: {status}");
+            } else {
+                println!("  {key} ({account}): {status}");
+            }
         }
     }
 
@@ -294,18 +350,95 @@ fn list_keys(profile_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// What a `remove-key` invocation should do, computed purely (no keychain or
+/// store I/O) so it's unit-testable.
+struct RemovalPlan {
+    /// Profile ids to drop the env var from.
+    profiles_to_update: Vec<String>,
+    /// Keychain accounts that are safe to delete.
+    accounts_to_delete: Vec<String>,
+}
+
+/// Plan a `remove-key name` over `entries` — `(profile_id, stored value for
+/// name)` for EVERY profile that has the key. `is_target` selects the profiles
+/// being removed from.
+///
+/// The subtle case: a **bare** account (`VERTEX_SA_JSON`) can be shared by many
+/// legacy profiles, so it is only deleted when no *non-target* profile still
+/// references it. A **scoped** account (`VERTEX_SA_JSON::<id>`) is unique to one
+/// profile and always safe to delete.
+fn plan_removal(
+    entries: &[(String, String)],
+    name: &str,
+    is_target: impl Fn(&str) -> bool,
+) -> RemovalPlan {
+    let bare_shared_by_other = entries.iter().any(|(pid, value)| {
+        !is_target(pid)
+            && keychain::is_marker(value)
+            && keychain::marker_account(value, name) == name
+    });
+
+    let mut profiles_to_update = Vec::new();
+    let mut accounts_to_delete = Vec::new();
+    for (pid, value) in entries {
+        if !is_target(pid) || !keychain::is_marker(value) {
+            continue;
+        }
+        profiles_to_update.push(pid.clone());
+        let account = keychain::marker_account(value, name);
+        let shared_bare = account == name && bare_shared_by_other;
+        if !shared_bare {
+            accounts_to_delete.push(account.to_string());
+        }
+    }
+    accounts_to_delete.sort();
+    accounts_to_delete.dedup();
+    RemovalPlan {
+        profiles_to_update,
+        accounts_to_delete,
+    }
+}
+
 fn remove_key(name: &str, profile_id: Option<&str>) -> Result<()> {
-    // Remove from keychain
-    let deleted = keychain::delete_secret(name)?;
-
-    // Remove env_var entry from profile(s) that use keychain marker
     let store = open_profile_store()?;
-    let profiles = get_profiles(&store, profile_id)?;
+    // Load ALL profiles (not just the target) so we can tell whether a shared
+    // bare keychain account is still referenced by a profile we're NOT removing.
+    let all_profiles = store.list()?;
+    if let Some(id) = profile_id {
+        if !all_profiles.iter().any(|p| p.id == id) {
+            eyre::bail!("profile '{id}' not found");
+        }
+    }
 
+    let entries: Vec<(String, String)> = all_profiles
+        .iter()
+        .filter_map(|p| {
+            p.config
+                .env_vars
+                .get(name)
+                .map(|v| (p.id.clone(), v.clone()))
+        })
+        .collect();
+    let plan = plan_removal(&entries, name, |pid| match profile_id {
+        Some(id) => pid == id,
+        None => true,
+    });
+
+    let mut deleted = false;
+    for account in &plan.accounts_to_delete {
+        deleted |= keychain::delete_secret(account).unwrap_or(false);
+    }
+    // A global removal (no `--profile`) also cleans up a legacy/orphan bare
+    // account not referenced by any profile.
+    if profile_id.is_none() {
+        deleted |= keychain::delete_secret(name).unwrap_or(false);
+    }
+
+    let to_update: std::collections::HashSet<&str> =
+        plan.profiles_to_update.iter().map(String::as_str).collect();
     let mut updated_count = 0;
-    for mut profile in profiles {
-        if profile.config.env_vars.get(name).map(|v| v.as_str()) == Some(keychain::KEYCHAIN_MARKER)
-        {
+    for mut profile in all_profiles {
+        if to_update.contains(profile.id.as_str()) {
             profile.config.env_vars.remove(name);
             profile.updated_at = chrono::Utc::now();
             store.save(&profile)?;
@@ -313,17 +446,22 @@ fn remove_key(name: &str, profile_id: Option<&str>) -> Result<()> {
         }
     }
 
-    if deleted {
+    if updated_count == 0 && !deleted {
+        println!("No {} key found to remove.", name.cyan());
+    } else {
+        // Distinguish "deleted the keychain account" from "removed the env var
+        // but kept a shared account another profile still uses".
+        let keychain_note = if deleted {
+            "keychain account removed".to_string()
+        } else {
+            "shared keychain account kept (still used by another profile)".to_string()
+        };
         println!(
-            "{} Removed {} from keychain ({} profile(s) updated)",
+            "{} Removed {} from {} profile(s); {}",
             "OK".green().bold(),
             name.cyan(),
-            updated_count
-        );
-    } else {
-        println!(
-            "No keychain entry found for {} ({} profile(s) updated)",
-            name, updated_count
+            updated_count,
+            keychain_note
         );
     }
     Ok(())
@@ -368,5 +506,105 @@ fn get_profiles(
         }
     } else {
         store.list()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_target_scopes_by_name_and_by_content() {
+        let sa = r#"{"type":"service_account","private_key":"x"}"#;
+        // Declared keychain-backed name → per-profile scoped account.
+        let (account, marker) = keychain_target("VERTEX_SA_JSON", "alice", sa);
+        assert_eq!(account, "VERTEX_SA_JSON::alice");
+        assert_eq!(marker, "keychain:VERTEX_SA_JSON::alice");
+
+        // SA JSON under a CUSTOM env name (the dashboard "Custom" bypass) is
+        // ALSO scoped — by content — so CLI saves can't collide cross-profile.
+        let (account, marker) = keychain_target("VERTEX_API_KEY", "alice", sa);
+        assert_eq!(account, "VERTEX_API_KEY::alice");
+        assert_eq!(marker, "keychain:VERTEX_API_KEY::alice");
+        assert_ne!(
+            keychain_target("VERTEX_API_KEY", "alice", sa).0,
+            keychain_target("VERTEX_API_KEY", "bob", sa).0,
+            "distinct profiles must get distinct accounts"
+        );
+
+        // An ordinary (non-SA) key keeps the single bare account + bare marker.
+        let (account, marker) = keychain_target("OPENAI_API_KEY", "alice", "sk-plain");
+        assert_eq!(account, "OPENAI_API_KEY");
+        assert_eq!(marker, keychain::KEYCHAIN_MARKER);
+    }
+
+    const NAME: &str = "VERTEX_SA_JSON";
+
+    fn entry(pid: &str, value: &str) -> (String, String) {
+        (pid.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn remove_plan_keeps_shared_bare_account_when_another_profile_uses_it() {
+        // The codex scenario: alice and bob are BOTH on the legacy bare marker
+        // (shared account). Removing only alice must drop alice's env var but
+        // NOT delete the shared keychain account bob still depends on.
+        let entries = vec![entry("alice", "keychain:"), entry("bob", "keychain:")];
+        let plan = plan_removal(&entries, NAME, |pid| pid == "alice");
+        assert_eq!(plan.profiles_to_update, vec!["alice"]);
+        assert!(
+            plan.accounts_to_delete.is_empty(),
+            "must NOT delete the shared bare account while bob still uses it"
+        );
+    }
+
+    #[test]
+    fn remove_plan_deletes_sole_bare_account() {
+        // Only alice references the bare account → safe to delete it.
+        let entries = vec![entry("alice", "keychain:")];
+        let plan = plan_removal(&entries, NAME, |pid| pid == "alice");
+        assert_eq!(plan.profiles_to_update, vec!["alice"]);
+        assert_eq!(plan.accounts_to_delete, vec![NAME.to_string()]);
+    }
+
+    #[test]
+    fn remove_plan_deletes_scoped_account_only_for_target() {
+        // alice is scoped, bob is bare. Removing alice deletes alice's unique
+        // scoped account and leaves bob's bare account intact.
+        let entries = vec![
+            entry("alice", "keychain:VERTEX_SA_JSON::alice"),
+            entry("bob", "keychain:"),
+        ];
+        let plan = plan_removal(&entries, NAME, |pid| pid == "alice");
+        assert_eq!(plan.profiles_to_update, vec!["alice"]);
+        assert_eq!(
+            plan.accounts_to_delete,
+            vec!["VERTEX_SA_JSON::alice".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_plan_global_deletes_every_referenced_account() {
+        let entries = vec![
+            entry("alice", "keychain:VERTEX_SA_JSON::alice"),
+            entry("bob", "keychain:"),
+        ];
+        let plan = plan_removal(&entries, NAME, |_| true);
+        assert_eq!(plan.profiles_to_update.len(), 2);
+        assert!(
+            plan.accounts_to_delete
+                .contains(&"VERTEX_SA_JSON::alice".to_string())
+        );
+        assert!(plan.accounts_to_delete.contains(&NAME.to_string()));
+    }
+
+    #[test]
+    fn remove_plan_ignores_plaintext_values() {
+        // A plaintext (non-marker) value isn't keychain-backed; remove-key
+        // leaves it alone (no env removal, no keychain delete).
+        let entries = vec![entry("alice", "sk-plaintext")];
+        let plan = plan_removal(&entries, NAME, |_| true);
+        assert!(plan.profiles_to_update.is_empty());
+        assert!(plan.accounts_to_delete.is_empty());
     }
 }

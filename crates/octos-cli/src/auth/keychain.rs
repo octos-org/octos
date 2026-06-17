@@ -15,9 +15,68 @@ use std::collections::HashMap;
 
 use eyre::{Result, WrapErr};
 
-/// Sentinel value stored in profile `env_vars` to indicate
-/// that the real secret lives in the macOS Keychain.
+/// Sentinel prefix stored in profile `env_vars` to indicate that the real
+/// secret lives in the macOS Keychain.
+///
+/// Two forms exist:
+/// - **bare** `"keychain:"` — legacy / single-account: the keychain account is
+///   the env-var name itself. Still read for backward compatibility.
+/// - **scoped** `"keychain:<account>"` — the suffix is the exact keychain
+///   account to read, which lets per-profile secrets (e.g. each tenant's Vertex
+///   service account) live under distinct accounts so saves can't collide.
 pub const KEYCHAIN_MARKER: &str = "keychain:";
+
+/// Env-var credentials that must live in the OS keychain, never in plaintext
+/// profile config (each carries a private key — e.g. the Vertex service-account
+/// JSON). Stored under per-profile [`scoped_account`]s so tenants can't collide.
+///
+/// Lives here (not in the `api`-gated module) so non-API CLI commands
+/// (`octos auth set-key/keys/remove-key`) can scope the same set consistently.
+pub const KEYCHAIN_BACKED_ENV_VARS: &[&str] = &["VERTEX_SA_JSON"];
+
+/// Whether `value` is a raw Google service-account JSON (i.e. carries a private
+/// key). Detected by **content**, not by the env-var name, so the credential is
+/// protected even when stored under a non-whitelisted name (e.g. a dashboard
+/// "Custom" provider that derives `VERTEX_API_KEY`).
+pub fn is_service_account_json(value: &str) -> bool {
+    let v = value.trim_start();
+    v.starts_with('{') && value.contains("\"private_key\"") && value.contains("service_account")
+}
+
+/// Whether the stored env var (`key` = `value`) holds a raw secret that must be
+/// relocated into the keychain before persisting: a declared keychain-backed var
+/// holding a raw value, OR any var whose value is a service-account JSON. The
+/// content check closes the bypass of saving the SA key under a custom name.
+pub fn needs_keychain_relocation(key: &str, value: &str) -> bool {
+    is_service_account_json(value)
+        || (KEYCHAIN_BACKED_ENV_VARS.contains(&key) && value.trim_start().starts_with('{'))
+}
+
+/// Whether `value` is any keychain marker (bare or scoped).
+pub fn is_marker(value: &str) -> bool {
+    value.starts_with(KEYCHAIN_MARKER)
+}
+
+/// The keychain account name for `env_var` scoped to `profile_id`. Distinct
+/// profiles get distinct accounts, so two profiles saving different secrets
+/// under the same env var no longer overwrite a single shared keychain item.
+pub fn scoped_account(env_var: &str, profile_id: &str) -> String {
+    format!("{env_var}::{profile_id}")
+}
+
+/// Build the marker stored in profile config for a given keychain `account`.
+pub fn marker_for(account: &str) -> String {
+    format!("{KEYCHAIN_MARKER}{account}")
+}
+
+/// The keychain account a marker `value` points at: the scoped suffix when
+/// present, else `fallback_name` (the env-var name) for a legacy bare marker.
+pub fn marker_account<'a>(value: &'a str, fallback_name: &'a str) -> &'a str {
+    value
+        .strip_prefix(KEYCHAIN_MARKER)
+        .filter(|account| !account.is_empty())
+        .unwrap_or(fallback_name)
+}
 
 /// The service name used for all octos keychain entries.
 const SERVICE: &str = "octos";
@@ -84,6 +143,32 @@ pub fn set_secret(name: &str, secret: &str) -> Result<()> {
     Ok(())
 }
 
+/// `security find-generic-password -w` prints the password as a **hex string**
+/// (no marker) whenever it contains non-printable bytes — notably the newlines
+/// in a service-account JSON. Decode that back to text.
+///
+/// Decoding is deliberately scoped to the multi-line case: we only decode when
+/// the whole string is even-length ASCII hex, the bytes are valid UTF-8, AND
+/// the decoded text contains a newline. `security` hex-encodes a stored secret
+/// *only* when it can't emit it verbatim on one line (i.e. it has newlines), so
+/// a single-line secret that happens to be valid even-length ASCII hex (e.g.
+/// `41424344`) was returned as-is and must NOT be decoded — doing so would
+/// silently corrupt it into `ABCD`. Requiring a newline removes that ambiguity.
+fn decode_security_hex(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.len() < 2 || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect();
+    let decoded = String::from_utf8(bytes?).ok()?;
+    // Only a genuinely multi-line secret would have been hex-encoded by
+    // `security`; refuse single-line values to avoid corrupting hex-shaped keys.
+    decoded.contains('\n').then_some(decoded)
+}
+
 /// Retrieve a secret from the macOS Keychain.
 ///
 /// Returns `Ok(Some(secret))` on success, `Ok(None)` if not found,
@@ -113,7 +198,8 @@ pub fn get_secret(name: &str) -> Result<Option<String>> {
             if secret.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(secret))
+                // `security` may have hex-encoded a multi-line secret (e.g. SA JSON).
+                Ok(Some(decode_security_hex(&secret).unwrap_or(secret)))
             }
         }
         Ok(Ok(out)) => {
@@ -195,14 +281,18 @@ pub fn is_accessible() -> bool {
 ///
 /// On keychain failure, logs a warning and returns `None`.
 pub fn resolve_value(name: &str, value: &str) -> Option<String> {
-    if value != KEYCHAIN_MARKER {
+    if !is_marker(value) {
         return Some(value.to_string());
     }
-    match get_secret(name) {
+    // Scoped markers carry the account in the suffix; bare ones fall back to the
+    // env-var name. This keeps existing single-account entries working.
+    let account = marker_account(value, name);
+    match get_secret(account) {
         Ok(Some(secret)) => Some(secret),
         Ok(None) => {
             tracing::warn!(
                 var = %name,
+                account = %account,
                 "keychain marker found but no secret stored in keychain"
             );
             None
@@ -210,6 +300,7 @@ pub fn resolve_value(name: &str, value: &str) -> Option<String> {
         Err(e) => {
             tracing::warn!(
                 var = %name,
+                account = %account,
                 error = %e,
                 "failed to read secret from keychain, skipping"
             );
@@ -237,6 +328,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_hex_password_emitted_by_security_for_multiline_secret() {
+        // `security -w` hex-encodes a value containing newlines (e.g. SA JSON).
+        let json = "{\n  \"type\": \"service_account\",\n  \"project_id\": \"p\"\n}";
+        let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(decode_security_hex(&hex).as_deref(), Some(json));
+    }
+
+    #[test]
+    fn leaves_ordinary_api_key_untouched() {
+        // Contains non-hex characters → not decoded.
+        assert!(decode_security_hex("sk-proj-abc123XYZ").is_none());
+    }
+
+    #[test]
+    fn leaves_odd_length_or_non_hex_untouched() {
+        assert!(decode_security_hex("abc").is_none()); // odd length
+        assert!(decode_security_hex("zzzz").is_none()); // non-hex chars
+    }
+
+    #[test]
+    fn leaves_binary_hex_untouched_when_not_utf8() {
+        // Pure hex that decodes to non-UTF-8 bytes is left as-is.
+        assert!(decode_security_hex("deadbeef").is_none());
+    }
+
+    #[test]
+    fn leaves_single_line_ascii_hex_secret_untouched() {
+        // A real secret that is even-length ASCII hex and valid UTF-8 but
+        // single-line (e.g. "41424344") was returned verbatim by `security`,
+        // never hex-encoded — decoding it would corrupt it into "ABCD".
+        assert_eq!(decode_security_hex("41424344"), None);
+    }
+
+    #[test]
     fn test_resolve_value_passthrough() {
         // Non-marker values pass through unchanged
         assert_eq!(resolve_value("FOO", "bar"), Some("bar".to_string()));
@@ -262,6 +387,87 @@ mod tests {
     #[test]
     fn test_keychain_marker_constant() {
         assert_eq!(KEYCHAIN_MARKER, "keychain:");
+    }
+
+    #[test]
+    fn scoped_account_and_marker_roundtrip() {
+        let acct = scoped_account("VERTEX_SA_JSON", "alice");
+        assert_eq!(acct, "VERTEX_SA_JSON::alice");
+        assert_eq!(marker_for(&acct), "keychain:VERTEX_SA_JSON::alice");
+        assert!(is_marker(&marker_for(&acct)));
+        assert!(is_marker("keychain:")); // legacy bare marker
+        assert!(!is_marker("sk-proj-abc123"));
+    }
+
+    #[test]
+    fn detects_service_account_json_by_content_regardless_of_name() {
+        let sa = r#"{"type":"service_account","private_key":"x","project_id":"p"}"#;
+        assert!(is_service_account_json(sa));
+        // Leading whitespace is tolerated.
+        assert!(is_service_account_json(&format!("  \n{sa}")));
+        // Ordinary API keys / non-SA JSON are not flagged.
+        assert!(!is_service_account_json("sk-proj-abc123"));
+        assert!(!is_service_account_json(r#"{"model":"x","temperature":1}"#));
+        assert!(!is_service_account_json(""));
+    }
+
+    #[test]
+    fn needs_relocation_closes_custom_env_name_bypass() {
+        let sa = r#"{"type":"service_account","private_key":"x"}"#;
+        // The declared name with a raw value → relocate.
+        assert!(needs_keychain_relocation("VERTEX_SA_JSON", sa));
+        // SA JSON under a CUSTOM name (the dashboard bypass) → still relocate.
+        assert!(needs_keychain_relocation("VERTEX_API_KEY", sa));
+        assert!(needs_keychain_relocation("ANYTHING", sa));
+        // A plain key, or a non-SA JSON under a non-whitelisted name → leave it.
+        assert!(!needs_keychain_relocation("VERTEX_API_KEY", "sk-plain"));
+        assert!(!needs_keychain_relocation("OPENAI_API_KEY", r#"{"a":1}"#));
+        // An already-relocated marker is not a raw value → no relocation.
+        assert!(!needs_keychain_relocation(
+            "VERTEX_SA_JSON",
+            "keychain:VERTEX_SA_JSON::alice"
+        ));
+    }
+
+    #[test]
+    fn marker_account_prefers_scope_else_falls_back_to_name() {
+        // Scoped marker → account taken from the suffix (per-profile isolation).
+        assert_eq!(
+            marker_account("keychain:VERTEX_SA_JSON::alice", "VERTEX_SA_JSON"),
+            "VERTEX_SA_JSON::alice"
+        );
+        // Bare legacy marker → the env-var name (backward compatible).
+        assert_eq!(
+            marker_account("keychain:", "VERTEX_SA_JSON"),
+            "VERTEX_SA_JSON"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires macOS Keychain access"]
+    fn keychain_integration_scoped_accounts_dont_collide() {
+        // Real-keychain proof of the P1 fix: two profiles' scoped accounts are
+        // independent — writing/deleting one never affects the other.
+        let alice = scoped_account("VERTEX_SA_JSON", "alice-itest");
+        let bob = scoped_account("VERTEX_SA_JSON", "bob-itest");
+        let _ = delete_secret(&alice);
+        let _ = delete_secret(&bob);
+
+        set_secret(&alice, "alice-key").unwrap();
+        set_secret(&bob, "bob-key").unwrap();
+        assert_eq!(get_secret(&alice).unwrap().as_deref(), Some("alice-key"));
+        assert_eq!(
+            get_secret(&bob).unwrap().as_deref(),
+            Some("bob-key"),
+            "bob's account must not be overwritten by alice's"
+        );
+
+        // Deleting alice's account leaves bob's intact.
+        delete_secret(&alice).unwrap();
+        assert!(get_secret(&alice).unwrap().is_none());
+        assert_eq!(get_secret(&bob).unwrap().as_deref(), Some("bob-key"));
+
+        delete_secret(&bob).unwrap();
     }
 
     // Integration tests that require a real Keychain session.

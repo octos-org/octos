@@ -226,6 +226,38 @@ pub async fn get_profile(
     ))
 }
 
+/// Move any keychain-backed secrets (e.g. the Vertex service-account JSON, which
+/// carries a private key) out of plaintext profile config and into the OS
+/// keychain. Shared by every profile/sub-account create/update save path so they
+/// all uphold the same keychain-only contract as `PUT /api/my/profile`. A raw
+/// secret on a non-macOS host is rejected rather than silently persisted.
+///
+/// Detection is by **content** (a raw service-account JSON), not just the
+/// declared `VERTEX_SA_JSON` name — so a private key pasted under a custom env
+/// var (e.g. a dashboard "Custom" provider deriving `VERTEX_API_KEY`) can't slip
+/// past into plaintext config.
+pub(crate) fn relocate_keychain_backed_secrets(
+    env_vars: &mut std::collections::HashMap<String, String>,
+    profile_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let keys: Vec<String> = env_vars
+        .iter()
+        .filter(|(key, value)| crate::auth::keychain::needs_keychain_relocation(key, value))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        super::auth_handlers::relocate_secret_to_keychain(
+            env_vars,
+            &key,
+            profile_id,
+            cfg!(target_os = "macos"),
+            crate::auth::keychain::set_secret,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+    Ok(())
+}
+
 /// POST /api/admin/profiles
 pub async fn create_profile(
     State(state): State<Arc<AppState>>,
@@ -253,7 +285,7 @@ pub async fn create_profile(
     }
 
     let now = Utc::now();
-    let profile = UserProfile {
+    let mut profile = UserProfile {
         id: req.id,
         name: req.name,
         public_subdomain: req
@@ -267,6 +299,12 @@ pub async fn create_profile(
         created_at: now,
         updated_at: now,
     };
+
+    // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
+    // JSON, which carries a private key) out of plaintext config and into the
+    // OS keychain before persisting — same contract as `PUT /api/my/profile`.
+    let profile_id = profile.id.clone();
+    relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)?;
 
     store.save(&profile).map_err(|e| {
         tracing::error!(profile = %profile.id, error = %e, "failed to create profile");
@@ -337,6 +375,10 @@ pub async fn update_profile(
         profile.data_dir = data_dir;
     }
     merge_profile_config_from_body(&mut profile.config, &body, false);
+    // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
+    // JSON) into the OS keychain before persisting, so an admin edit can't
+    // write a private key into plaintext profile config.
+    relocate_keychain_backed_secrets(&mut profile.config.env_vars, &id)?;
     profile.updated_at = Utc::now();
 
     store.save_with_merge(&mut profile).map_err(|e| {
@@ -724,7 +766,11 @@ pub async fn test_provider(
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
     // so 16 tokens is too small — they return empty content.  Use 128 for
     // Gemini and keep 16 for everyone else (fast, cheap connectivity check).
-    let max_tokens = if req.provider == "gemini" { 128 } else { 16 };
+    let max_tokens = if req.provider == "gemini" || req.provider == "vertex" {
+        128
+    } else {
+        16
+    };
     let config = ChatConfig {
         max_tokens: Some(max_tokens),
         temperature: Some(0.0),
@@ -931,12 +977,15 @@ fn resolve_saved_key(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "profile not found".into()))?;
 
-    Ok(profile
+    let raw = profile
         .config
         .env_vars
         .get(env_name)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // Resolve a `keychain:` marker to the real secret (e.g. a Vertex SA JSON
+    // stored in the OS keychain); plain values pass through unchanged.
+    Ok(crate::auth::keychain::resolve_value(env_name, &raw).unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -1404,6 +1453,10 @@ pub async fn create_sub_account(
     // Set channel-specific env vars if provided
     if !req.env_vars.is_empty() {
         sub.config.env_vars = req.env_vars;
+        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
+        // persisting so a sub-account never writes a private key to disk.
+        let sub_id = sub.id.clone();
+        relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
         sub.updated_at = Utc::now();
         store
             .save(&sub)
@@ -4670,6 +4723,51 @@ mod register_flow_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
+        // The shared helper used by every profile/sub-account save path must
+        // refuse a raw SA JSON on a non-macOS host (where keychain storage
+        // isn't available) rather than let it fall through to plaintext config.
+        // On macOS it would relocate to the keychain instead, so only assert on
+        // the non-macOS path (the one CI runs and the plaintext risk lives on).
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "VERTEX_SA_JSON".to_string(),
+            r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
+        );
+        let res = relocate_keychain_backed_secrets(&mut env, "sub-account-1");
+        assert!(
+            res.is_err(),
+            "raw VERTEX_SA_JSON must be rejected off macOS, never saved as plaintext"
+        );
+        // The raw value is left untouched (the caller bails before saving).
+        assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
+    }
+
+    #[test]
+    fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
+        // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
+        // (not the whitelisted name) must still be caught by content detection
+        // and rejected off macOS — never written to plaintext config.
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "VERTEX_API_KEY".to_string(),
+            r#"{"type":"service_account","private_key":"x"}"#.to_string(),
+        );
+        let res = relocate_keychain_backed_secrets(&mut env, "tenant-1");
+        assert!(
+            res.is_err(),
+            "SA JSON under a custom env name must be rejected off macOS"
+        );
+        assert!(env.get("VERTEX_API_KEY").unwrap().starts_with('{'));
+    }
 
     #[test]
     fn shell_request_deserialize_minimal() {
