@@ -209,14 +209,27 @@ pub struct VoicesRegistry {
     registry_dir: Option<PathBuf>,
 }
 
-/// Expand a leading `~` / `~/` against `$HOME`. Other forms are returned as-is.
+/// The user's home directory: `$HOME`, falling back to `%USERPROFILE%` (set on
+/// native Windows where `HOME` often isn't). Keeps `~/.OminiX/models` resolvable
+/// on every platform without pulling in an extra dependency.
+fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+}
+
+/// Expand a leading `~` / `~/` / `~\` against the home directory. Other forms
+/// are returned as-is.
 fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_with(path, home_dir())
+}
+
+/// Testable core of [`expand_tilde`] with the home directory injected.
+fn expand_tilde_with(path: &str, home: Option<std::ffi::OsString>) -> PathBuf {
     if path == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = home {
             return PathBuf::from(home);
         }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home {
             return Path::new(&home).join(rest);
         }
     }
@@ -643,19 +656,37 @@ mod voices_tests {
     }
 
     #[test]
-    fn expand_tilde_expands_home_prefix_only() {
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(
-                super::expand_tilde("~/.OminiX/models"),
-                std::path::Path::new(&home).join(".OminiX/models")
-            );
-        }
+    fn expand_tilde_with_injected_home_is_platform_agnostic() {
+        use std::ffi::OsString;
+        let home = || Some(OsString::from("/Users/cloud"));
+        // `~/...` and bare `~` expand against the provided home (which is
+        // `$HOME` or `%USERPROFILE%` in production — the Windows fallback).
         assert_eq!(
-            super::expand_tilde("/abs/path"),
+            super::expand_tilde_with("~/.OminiX/models", home()),
+            std::path::Path::new("/Users/cloud/.OminiX/models")
+        );
+        assert_eq!(
+            super::expand_tilde_with("~", home()),
+            std::path::PathBuf::from("/Users/cloud")
+        );
+        // Windows-style tilde separator is accepted too.
+        let win = Some(OsString::from("C:\\Users\\cloud"));
+        assert_eq!(
+            super::expand_tilde_with("~\\.OminiX", win),
+            std::path::Path::new("C:\\Users\\cloud").join(".OminiX")
+        );
+        // No home available → returned verbatim (no panic, no bogus expansion).
+        assert_eq!(
+            super::expand_tilde_with("~/x", None),
+            std::path::PathBuf::from("~/x")
+        );
+        // Absolute / relative paths are untouched.
+        assert_eq!(
+            super::expand_tilde_with("/abs/path", home()),
             std::path::PathBuf::from("/abs/path")
         );
         assert_eq!(
-            super::expand_tilde("rel/path"),
+            super::expand_tilde_with("rel/path", home()),
             std::path::PathBuf::from("rel/path")
         );
     }

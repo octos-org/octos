@@ -66,8 +66,14 @@ fn registry_path_under(home: &Path) -> PathBuf {
 /// is the path segment after `profiles/` — but only when a later
 /// `voice_profiles` segment confirms it's actually a voice-clone path. A shared
 /// preset (ref audio not under any profile's clone dir) returns `None`.
+///
+/// Splits on both `/` and `\` so a Windows-style clone path can't be
+/// mis-classified as a shared preset (which would re-open the cross-tenant leak).
 fn owning_profile_of(ref_audio: &str) -> Option<&str> {
-    let comps: Vec<&str> = ref_audio.split('/').filter(|s| !s.is_empty()).collect();
+    let comps: Vec<&str> = ref_audio
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .collect();
     let profiles_idx = comps.iter().position(|&c| c == "profiles")?;
     let owner = *comps.get(profiles_idx + 1)?;
     comps
@@ -119,6 +125,14 @@ mod tests {
     fn owning_profile_parsed_only_from_voice_clone_paths() {
         assert_eq!(
             owning_profile_of("/Users/cloud/.octos/profiles/alice/data/voice_profiles/clone.wav"),
+            Some("alice")
+        );
+        // Windows-style clone path (backslash separators) must resolve too,
+        // otherwise it would be treated as a shared preset (cross-tenant leak).
+        assert_eq!(
+            owning_profile_of(
+                "C:\\Users\\cloud\\.octos\\profiles\\alice\\data\\voice_profiles\\clone.wav"
+            ),
             Some("alice")
         );
         // Shared preset: relative path, no profile segment.
