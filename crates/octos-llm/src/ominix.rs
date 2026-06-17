@@ -174,6 +174,171 @@ fn tts_endpoint(engine: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Voice registry — ~/.OminiX/models/voices.json
+// ---------------------------------------------------------------------------
+
+/// A single registered voice in ominix-api's `voices.json`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceEntry {
+    /// Reference audio path, relative to [`VoicesRegistry::models_base_path`].
+    #[serde(default)]
+    pub ref_audio: String,
+    /// Verbatim transcription of `ref_audio` (drives few-shot synthesis).
+    #[serde(default)]
+    pub ref_text: String,
+    /// Alternative names that also resolve to this voice.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// ominix-api's voice registry (`~/.OminiX/models/voices.json`). A `BTreeMap`
+/// keeps the listing order deterministic (sorted by id) regardless of file
+/// ordering.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoicesRegistry {
+    #[serde(default)]
+    pub default_voice: String,
+    #[serde(default)]
+    pub models_base_path: String,
+    #[serde(default)]
+    pub voices: std::collections::BTreeMap<String, VoiceEntry>,
+    /// Directory the registry was loaded from (the `voices.json` parent). Used
+    /// to resolve a relative `ref_audio` when `models_base_path` is empty or
+    /// itself relative. Not part of the JSON; set by [`VoicesRegistry::load`].
+    #[serde(skip)]
+    registry_dir: Option<PathBuf>,
+}
+
+/// The user's home directory: `$HOME`, falling back to `%USERPROFILE%` (set on
+/// native Windows where `HOME` often isn't). Keeps `~/.OminiX/models` resolvable
+/// on every platform without pulling in an extra dependency.
+fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+}
+
+/// Expand a leading `~` / `~/` / `~\` against the home directory. Other forms
+/// are returned as-is.
+fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_with(path, home_dir())
+}
+
+/// Testable core of [`expand_tilde`] with the home directory injected.
+fn expand_tilde_with(path: &str, home: Option<std::ffi::OsString>) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = home {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home {
+            return Path::new(&home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// A voice exposed to clients: the canonical id plus its aliases.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VoiceInfo {
+    pub id: String,
+    pub aliases: Vec<String>,
+}
+
+impl VoicesRegistry {
+    /// Parse a `voices.json` body.
+    pub fn parse(json: &str) -> Result<Self> {
+        serde_json::from_str(json).wrap_err("failed to parse voices.json")
+    }
+
+    /// Load and parse `voices.json` from disk.
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        let mut reg = Self::parse(&data)?;
+        reg.registry_dir = path.parent().map(Path::to_path_buf);
+        Ok(reg)
+    }
+
+    /// Resolve a voice entry's `ref_audio` to an absolute filesystem path.
+    ///
+    /// Handles the real-world registry shapes: an **absolute** `ref_audio` (the
+    /// per-profile clones the fleet script writes) is used verbatim; a
+    /// **relative** one is joined onto `models_base_path` (with a leading `~`
+    /// expanded — the script stores a literal `~/.OminiX/models`), falling back
+    /// to the `voices.json` parent dir when the base is empty or relative.
+    fn resolved_ref_path(&self, ref_audio: &str) -> Option<PathBuf> {
+        if ref_audio.is_empty() {
+            return None;
+        }
+        let ra = expand_tilde(ref_audio);
+        if ra.is_absolute() {
+            return Some(ra);
+        }
+        let base = if self.models_base_path.is_empty() {
+            self.registry_dir.clone()?
+        } else {
+            let b = expand_tilde(&self.models_base_path);
+            if b.is_absolute() {
+                b
+            } else {
+                // A relative base resolves against the registry dir when known.
+                self.registry_dir.as_ref().map(|d| d.join(&b)).unwrap_or(b)
+            }
+        };
+        Some(base.join(ra))
+    }
+
+    /// Whether a voice entry's reference audio actually exists on disk (= the
+    /// engine can synthesize it).
+    fn ref_exists(&self, entry: &VoiceEntry) -> bool {
+        self.resolved_ref_path(&entry.ref_audio)
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+
+    /// Voices the engine can actually synthesize (ref audio present), sorted by
+    /// id for a stable client-facing list.
+    pub fn synthesizable(&self) -> Vec<VoiceInfo> {
+        self.synthesizable_visible(|_| true)
+    }
+
+    /// Like [`synthesizable`](Self::synthesizable), but only voices whose
+    /// `ref_audio` path satisfies `is_visible`. Callers use this to scope the
+    /// listing to a single tenant (shared presets + that tenant's own clones)
+    /// so cloned voices never leak across profiles.
+    pub fn synthesizable_visible(&self, is_visible: impl Fn(&str) -> bool) -> Vec<VoiceInfo> {
+        self.voices
+            .iter()
+            .filter(|(_, e)| self.ref_exists(e) && is_visible(&e.ref_audio))
+            .map(|(id, e)| VoiceInfo {
+                id: id.clone(),
+                aliases: e.aliases.clone(),
+            })
+            .collect()
+    }
+
+    /// Resolve a user-supplied name (canonical id or alias) to its canonical
+    /// id, but only when the voice is synthesizable. `None` for unknown names
+    /// or entries whose ref audio is missing.
+    pub fn resolve(&self, name: &str) -> Option<String> {
+        self.resolve_visible(name, |_| true)
+    }
+
+    /// Like [`resolve`](Self::resolve), but only matches voices whose
+    /// `ref_audio` path satisfies `is_visible`, so a tenant can't select a
+    /// voice cloned by (and owned by) another profile.
+    pub fn resolve_visible(&self, name: &str, is_visible: impl Fn(&str) -> bool) -> Option<String> {
+        self.voices
+            .iter()
+            .find(|(id, e)| {
+                (id.as_str() == name || e.aliases.iter().any(|a| a == name))
+                    && self.ref_exists(e)
+                    && is_visible(&e.ref_audio)
+            })
+            .map(|(id, _)| id.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OminixClient — async HTTP client for ominix-api
 // ---------------------------------------------------------------------------
 
@@ -390,5 +555,139 @@ mod tests {
     #[test]
     fn unknown_engine_falls_back_to_sovits() {
         assert_eq!(tts_endpoint("nonsense"), "/v1/audio/tts/sovits");
+    }
+}
+
+#[cfg(test)]
+mod voices_tests {
+    use super::{VoiceInfo, VoicesRegistry};
+
+    /// Write a registry JSON whose `models_base_path` is `base`, plus create the
+    /// listed ref files under it so existence checks pass.
+    fn registry_with(base: &std::path::Path, present: &[&str]) -> VoicesRegistry {
+        for f in present {
+            let p = base.join("ref_audios").join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"fake").unwrap();
+        }
+        let json = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": {base:?},
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav",  "ref_text": "y", "aliases": [] }}
+              }}
+            }}"#,
+            base = base.to_string_lossy()
+        );
+        VoicesRegistry::parse(&json).unwrap()
+    }
+
+    #[test]
+    fn synthesizable_lists_only_entries_whose_ref_audio_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only doubao's ref file exists; ghost's is missing.
+        let reg = registry_with(dir.path(), &["doubao_ref.wav"]);
+        assert_eq!(
+            reg.synthesizable(),
+            vec![VoiceInfo {
+                id: "doubao".to_string(),
+                aliases: vec!["vivian".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_id_and_alias_but_only_when_ref_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(dir.path(), &["doubao_ref.wav"]);
+        assert_eq!(reg.resolve("doubao").as_deref(), Some("doubao"));
+        assert_eq!(reg.resolve("vivian").as_deref(), Some("doubao")); // alias → id
+        assert_eq!(reg.resolve("ghost"), None); // ref missing
+        assert_eq!(reg.resolve("nope"), None); // unknown
+    }
+
+    #[test]
+    fn ref_exists_resolves_relative_audio_against_voices_json_dir_when_base_empty() {
+        // A registry with an empty `models_base_path` must resolve a relative
+        // `ref_audio` against the voices.json parent dir, not the process CWD.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("doubao_ref.wav"), b"fake").unwrap();
+        let json = r#"{
+          "default_voice": "doubao",
+          "models_base_path": "",
+          "voices": { "doubao": { "ref_audio": "doubao_ref.wav" } }
+        }"#;
+        let path = dir.path().join("voices.json");
+        std::fs::write(&path, json).unwrap();
+
+        let reg = super::VoicesRegistry::load(&path).unwrap();
+        assert_eq!(
+            reg.synthesizable()
+                .iter()
+                .map(|v| v.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["doubao"],
+            "relative ref_audio should resolve against the voices.json dir"
+        );
+    }
+
+    #[test]
+    fn synthesizable_visible_and_resolve_visible_apply_ownership_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both refs exist on disk, but the predicate hides "ghost".
+        let reg = registry_with(dir.path(), &["doubao_ref.wav", "ghost_ref.wav"]);
+        let visible = |ref_audio: &str| !ref_audio.contains("ghost");
+
+        assert_eq!(
+            reg.synthesizable_visible(visible)
+                .iter()
+                .map(|v| v.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["doubao"]
+        );
+        assert_eq!(
+            reg.resolve_visible("doubao", visible).as_deref(),
+            Some("doubao")
+        );
+        // Hidden by the predicate even though its ref audio exists.
+        assert_eq!(reg.resolve_visible("ghost", visible), None);
+    }
+
+    #[test]
+    fn expand_tilde_with_injected_home_is_platform_agnostic() {
+        use std::ffi::OsString;
+        let home = || Some(OsString::from("/Users/cloud"));
+        // `~/...` and bare `~` expand against the provided home (which is
+        // `$HOME` or `%USERPROFILE%` in production — the Windows fallback).
+        assert_eq!(
+            super::expand_tilde_with("~/.OminiX/models", home()),
+            std::path::Path::new("/Users/cloud/.OminiX/models")
+        );
+        assert_eq!(
+            super::expand_tilde_with("~", home()),
+            std::path::PathBuf::from("/Users/cloud")
+        );
+        // Windows-style tilde separator is accepted too.
+        let win = Some(OsString::from("C:\\Users\\cloud"));
+        assert_eq!(
+            super::expand_tilde_with("~\\.OminiX", win),
+            std::path::Path::new("C:\\Users\\cloud").join(".OminiX")
+        );
+        // No home available → returned verbatim (no panic, no bogus expansion).
+        assert_eq!(
+            super::expand_tilde_with("~/x", None),
+            std::path::PathBuf::from("~/x")
+        );
+        // Absolute / relative paths are untouched.
+        assert_eq!(
+            super::expand_tilde_with("/abs/path", home()),
+            std::path::PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            super::expand_tilde_with("rel/path", home()),
+            std::path::PathBuf::from("rel/path")
+        );
     }
 }

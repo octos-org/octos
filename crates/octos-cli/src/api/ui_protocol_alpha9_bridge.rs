@@ -149,6 +149,35 @@ pub(super) fn emit_turn_completed_full(
 /// runs inside a tool execution (rare; reserved for background-result
 /// futures). `mime` is also optional — clients fall back to extension
 /// sniffing when absent.
+/// Best-effort artefact size for a `file/attached` envelope (spec § 14.5
+/// mandates a value; clients fall back to extension/decode when it is 0).
+///
+/// The `path` here is the WORKSPACE-RELATIVE artefact name (e.g. a voice reply
+/// `reply-<id>.wav`); the SPA resolves it through `/api/files?session=…` at
+/// fetch time. Statting a relative path against the server's *process* CWD is
+/// therefore meaningless and was producing a steady stream of spurious
+/// "fs::metadata failed" warnings (#voice). So:
+/// - relative path  → report 0 silently (cannot resolve the workspace here);
+/// - absolute path  → stat it, and warn only on a genuine miss (file deleted
+///   between tool-end and emit, permissions, …) — that is a real signal.
+fn artifact_size_bytes(path: &str) -> u64 {
+    if !std::path::Path::new(path).is_absolute() {
+        return 0;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            tracing::warn!(
+                target: "octos::ui_protocol::envelope",
+                path = %path,
+                ?error,
+                "file/attached envelope: fs::metadata failed; emitting size_bytes=0",
+            );
+            0
+        }
+    }
+}
+
 pub(super) fn emit_file_attached(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -173,22 +202,8 @@ pub(super) fn emit_file_attached(
 
     // UPCR-2026-014 M9-γ dual-emit: parallel canonical
     // `file_attached` envelope. `mime` defaults to
-    // `application/octet-stream` (spec § 14.5 mandates a value); a
-    // warning is logged on metadata read failure so soak monitoring
-    // can surface broken artefact deliveries (file deleted between
-    // tool-end and emit, permissions, etc.).
-    let size_bytes = match std::fs::metadata(&path) {
-        Ok(meta) => meta.len(),
-        Err(error) => {
-            tracing::warn!(
-                target: "octos::ui_protocol::envelope",
-                path = %path,
-                ?error,
-                "file/attached envelope: fs::metadata failed; emitting size_bytes=0",
-            );
-            0
-        }
-    };
+    // `application/octet-stream` (spec § 14.5 mandates a value).
+    let size_bytes = artifact_size_bytes(&path);
     let envelope_mime = mime
         .as_deref()
         .filter(|m| !m.trim().is_empty())
@@ -398,6 +413,27 @@ mod tests {
     use super::*;
     use octos_core::ui_protocol::methods;
     use serde_json::json;
+
+    #[test]
+    fn artifact_size_skips_metadata_for_workspace_relative_paths() {
+        // Voice reply WAVs (and other artefacts) are emitted as workspace-
+        // relative paths and resolved by `/api/files` at fetch time. Statting
+        // them against the process CWD is wrong, so report 0 without a spurious
+        // "fs::metadata failed" warning.
+        assert_eq!(artifact_size_bytes("reply-abc.wav"), 0);
+        assert_eq!(artifact_size_bytes("sub/dir/clip.wav"), 0);
+    }
+
+    #[test]
+    fn artifact_size_reads_metadata_for_absolute_paths() {
+        let f = std::env::temp_dir().join(format!("octos-a9-size-{}.bin", std::process::id()));
+        std::fs::write(&f, b"1234567").unwrap();
+        assert_eq!(artifact_size_bytes(f.to_str().unwrap()), 7);
+        let _ = std::fs::remove_file(&f);
+        // Absolute but missing → 0 (this is the genuine-problem path that warns).
+        let missing = std::env::temp_dir().join("octos-a9-size-does-not-exist.bin");
+        assert_eq!(artifact_size_bytes(missing.to_str().unwrap()), 0);
+    }
 
     /// α-9 acceptance gate (1) — `topic` lands on `turn/started`.
     #[test]

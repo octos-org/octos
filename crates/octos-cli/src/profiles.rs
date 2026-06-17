@@ -54,6 +54,13 @@ pub struct ProfileConfig {
     /// First-class structured LLM selection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProfileConfig>,
+    /// Per-tenant reply-voice (TTS timbre) choice. Voice route/ASR settings stay
+    /// platform-level on the serve config; only the chosen timbre is per-user.
+    /// Applied at profile bootstrap over the shared `VoiceConfig.default_voice`
+    /// (see `VoiceConfig::with_default_voice_override`). `None` → inherit the
+    /// serve default. Set by `PUT /api/my/voice`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_default: Option<String>,
     /// Coding review specialist template. When omitted, `/review`
     /// uses the server's built-in default specialists. Operators may
     /// configure this per profile to change the native reviewer fanout

@@ -182,6 +182,44 @@ pub(crate) fn clean_for_tts(text: &str) -> String {
         .to_string()
 }
 
+/// Ensure the text ends on a *strong* terminal boundary so the TTS engine
+/// fully renders the final syllable.
+///
+/// On-device GPT-SoVITS (and similar) clips the last character when the input
+/// ends on a soft pause mark (comma / 顿号 / 分号 / 冒号) or a bare content
+/// char: it reads the trailing pause as "more is coming" and stops generating
+/// mid-syllable, so e.g. `"…往下跳，"` comes back as audio that cuts off just
+/// as `跳` begins. The streamed-reply chunker (`drain_voice_sentences`) emits
+/// comma-terminated fragments, and the reply's trailing fragment often has no
+/// punctuation at all — both hit this. Normalising the tail to a full stop
+/// gives a clean sentence-final boundary the engine renders in full.
+///
+/// Strong terminals already present (`。！？!?…`) are left untouched.
+fn ensure_terminal_punctuation(text: &str) -> String {
+    const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '.'];
+    const SOFT: &[char] = &['，', ',', '、', '；', ';', '：', ':'];
+
+    let mut s = text.trim_end().to_string();
+    if s.is_empty() {
+        return s;
+    }
+    match s.chars().next_back() {
+        Some(c) if STRONG.contains(&c) => return s,
+        _ => {}
+    }
+    // Drop any trailing run of soft pause marks / whitespace, then append one
+    // full stop so a comma-ended (or bare) fragment gets a real boundary.
+    while let Some(c) = s.chars().next_back() {
+        if SOFT.contains(&c) || c.is_whitespace() {
+            s.pop();
+        } else {
+            break;
+        }
+    }
+    s.push('。');
+    s
+}
+
 /// Volcano Engine (ByteDance) cloud-TTS config, sourced from env. Returns
 /// `None` (→ fall back to on-device ominix) unless appid + token are set.
 /// Moving TTS to the cloud also stops ominix from thrashing ASR↔TTS model
@@ -287,6 +325,9 @@ pub(crate) async fn synthesize_reply(
     if speak.trim().is_empty() {
         return None;
     }
+    // Normalise the tail to a strong terminal so engines (notably on-device
+    // GPT-SoVITS) don't clip the final syllable of comma-ended / bare fragments.
+    let speak = ensure_terminal_punctuation(&speak);
     let tts_t = std::time::Instant::now();
     eprintln!("[TIMING] TTS_start epoch_ms={}", now_ms());
 
@@ -344,6 +385,42 @@ mod tests {
         let dir = std::env::temp_dir();
         let got = synthesize_reply("   ", "vivian", "auto", &dir).await;
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn trailing_comma_becomes_full_stop_so_final_syllable_is_not_clipped() {
+        // GPT-SoVITS clips the last syllable when a chunk ends on a soft comma
+        // (it reads the trailing pause as "more coming" and stops generating
+        // mid-syllable). Normalising to a full stop gives a clean sentence-final
+        // boundary so the engine renders the whole last character.
+        assert_eq!(
+            ensure_terminal_punctuation("就每天背着壳爬到山顶往下跳，"),
+            "就每天背着壳爬到山顶往下跳。"
+        );
+    }
+
+    #[test]
+    fn bare_ending_gets_terminal_punctuation() {
+        // The reply's trailing fragment often has no punctuation at all; a bare
+        // content char is just as prone to clipping as a trailing comma.
+        assert_eq!(
+            ensure_terminal_punctuation("好的我知道了"),
+            "好的我知道了。"
+        );
+    }
+
+    #[test]
+    fn strong_terminal_is_left_unchanged() {
+        assert_eq!(ensure_terminal_punctuation("你好！"), "你好！");
+        assert_eq!(ensure_terminal_punctuation("真的吗？"), "真的吗？");
+        assert_eq!(ensure_terminal_punctuation("等等…"), "等等…");
+        assert_eq!(ensure_terminal_punctuation("Okay."), "Okay.");
+    }
+
+    #[test]
+    fn trailing_soft_marks_and_whitespace_collapse_to_one_full_stop() {
+        assert_eq!(ensure_terminal_punctuation("走吧， "), "走吧。");
+        assert_eq!(ensure_terminal_punctuation("等一下；"), "等一下。");
     }
 
     #[test]
