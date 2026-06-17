@@ -1041,7 +1041,48 @@ pub async fn remove_my_profile_skill(
     }))
 }
 
-/// PUT /api/my/profile
+/// Move a freshly-entered keychain-backed secret out of `env_vars` and into the
+/// OS keychain, replacing the stored value with the keychain marker so the
+/// secret never lands in the profile config on disk.
+///
+/// Only a raw, freshly-entered value (JSON object, i.e. starts with `{`) is
+/// relocated. A keychain marker, a masked display value, or an empty string all
+/// mean "unchanged" and are left untouched. Keychain-backed config is
+/// macOS-only: a raw secret on another OS is rejected rather than silently
+/// persisted in plaintext.
+///
+/// The secret is stored under a **profile-scoped** keychain account
+/// (`<key>::<profile_id>`) and the stored marker carries that account, so two
+/// profiles saving different secrets under the same env var never overwrite a
+/// single shared keychain item (each profile reads back its own credential).
+///
+/// `is_macos` and `set_secret` are injected for testability.
+pub(crate) fn relocate_secret_to_keychain(
+    env_vars: &mut HashMap<String, String>,
+    key: &str,
+    profile_id: &str,
+    is_macos: bool,
+    set_secret: impl Fn(&str, &str) -> eyre::Result<()>,
+) -> Result<(), String> {
+    let Some(value) = env_vars.get(key) else {
+        return Ok(());
+    };
+    let value = value.trim().to_string();
+    // Markers / masked / empty values mean "leave as configured".
+    if !value.starts_with('{') {
+        return Ok(());
+    }
+    if !is_macos {
+        return Err(format!(
+            "{key}: keychain-backed credential storage is only supported on macOS"
+        ));
+    }
+    let account = crate::auth::keychain::scoped_account(key, profile_id);
+    set_secret(&account, &value).map_err(|e| format!("failed to store {key} in keychain: {e}"))?;
+    env_vars.insert(key.to_string(), crate::auth::keychain::marker_for(&account));
+    Ok(())
+}
+
 pub async fn update_my_profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1084,6 +1125,12 @@ pub async fn update_my_profile(
         profile.enabled = enabled;
     }
     super::admin::merge_profile_config_from_body(&mut profile.config, &body, true);
+    // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA JSON,
+    // including a private key pasted under a custom env name) into the OS
+    // keychain before persisting. Uses the shared content-detecting helper so
+    // this path can't diverge from the others.
+    let profile_id = profile.id.clone();
+    super::admin::relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)?;
     profile.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut profile).map_err(|e| {
@@ -1770,6 +1817,10 @@ pub async fn create_my_sub_account(
 
     if !req.env_vars.is_empty() {
         sub.config.env_vars = req.env_vars;
+        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
+        // persisting so a sub-account never writes a private key to disk.
+        let sub_id = sub.id.clone();
+        super::admin::relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
         sub.updated_at = chrono::Utc::now();
         ps.save(&sub)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1863,6 +1914,10 @@ pub async fn update_my_sub_account(
         sub.enabled = enabled;
     }
     super::admin::merge_profile_config_from_body(&mut sub.config, &body, true);
+    // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
+    // persisting so a sub-account never writes a private key to disk.
+    let sub_id = sub.id.clone();
+    super::admin::relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
     sub.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut sub)
@@ -2342,6 +2397,124 @@ mod tests {
     use crate::user_store::UserStore;
     use axum::http::HeaderMap;
     use axum::http::Request;
+
+    // --- relocate_secret_to_keychain ---
+
+    use std::cell::RefCell;
+
+    fn env_with(key: &str, val: &str) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(key.to_string(), val.to_string());
+        m
+    }
+
+    #[test]
+    fn relocates_raw_json_to_keychain_on_macos() {
+        let mut env = env_with("VERTEX_SA_JSON", r#"{"private_key":"x","project_id":"p"}"#);
+        let stored: RefCell<Vec<(String, String)>> = RefCell::new(vec![]);
+        let res = relocate_secret_to_keychain(&mut env, "VERTEX_SA_JSON", "alice", true, |n, s| {
+            stored.borrow_mut().push((n.to_string(), s.to_string()));
+            Ok(())
+        });
+        assert!(res.is_ok());
+        // value replaced with a profile-scoped marker; raw JSON went to the
+        // keychain under a profile-scoped account.
+        assert_eq!(
+            env.get("VERTEX_SA_JSON").unwrap(),
+            "keychain:VERTEX_SA_JSON::alice"
+        );
+        assert_eq!(stored.borrow().len(), 1);
+        assert_eq!(stored.borrow()[0].0, "VERTEX_SA_JSON::alice");
+        assert!(stored.borrow()[0].1.contains("private_key"));
+    }
+
+    #[test]
+    fn two_profiles_get_distinct_keychain_accounts() {
+        // The core of the fix: two profiles saving a Vertex SA under the same
+        // env var must land in DISTINCT keychain accounts (and persist distinct
+        // markers), so neither overwrites nor resolves the other's private key.
+        let json = r#"{"private_key":"x"}"#;
+        let stored: RefCell<Vec<(String, String)>> = RefCell::new(vec![]);
+        let mut alice = env_with("VERTEX_SA_JSON", json);
+        let mut bob = env_with("VERTEX_SA_JSON", json);
+        relocate_secret_to_keychain(&mut alice, "VERTEX_SA_JSON", "alice", true, |n, s| {
+            stored.borrow_mut().push((n.to_string(), s.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        relocate_secret_to_keychain(&mut bob, "VERTEX_SA_JSON", "bob", true, |n, s| {
+            stored.borrow_mut().push((n.to_string(), s.to_string()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(stored.borrow()[0].0, "VERTEX_SA_JSON::alice");
+        assert_eq!(stored.borrow()[1].0, "VERTEX_SA_JSON::bob");
+        assert_eq!(
+            alice.get("VERTEX_SA_JSON").unwrap(),
+            "keychain:VERTEX_SA_JSON::alice"
+        );
+        assert_eq!(
+            bob.get("VERTEX_SA_JSON").unwrap(),
+            "keychain:VERTEX_SA_JSON::bob"
+        );
+        assert_ne!(alice.get("VERTEX_SA_JSON"), bob.get("VERTEX_SA_JSON"));
+    }
+
+    #[test]
+    fn rejects_raw_json_on_non_macos() {
+        let mut env = env_with("VERTEX_SA_JSON", r#"{"private_key":"x"}"#);
+        let called = RefCell::new(false);
+        let res =
+            relocate_secret_to_keychain(&mut env, "VERTEX_SA_JSON", "alice", false, |_, _| {
+                *called.borrow_mut() = true;
+                Ok(())
+            });
+        assert!(res.is_err());
+        assert!(!*called.borrow(), "must not write keychain off macOS");
+        // value left untouched (not persisted plaintext silently).
+        assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
+    }
+
+    #[test]
+    fn leaves_keychain_marker_untouched() {
+        let mut env = env_with("VERTEX_SA_JSON", crate::auth::KEYCHAIN_MARKER);
+        let called = RefCell::new(false);
+        let res = relocate_secret_to_keychain(&mut env, "VERTEX_SA_JSON", "alice", true, |_, _| {
+            *called.borrow_mut() = true;
+            Ok(())
+        });
+        assert!(res.is_ok());
+        assert!(
+            !*called.borrow(),
+            "marker means unchanged — no keychain write"
+        );
+        assert_eq!(
+            env.get("VERTEX_SA_JSON").unwrap(),
+            crate::auth::KEYCHAIN_MARKER
+        );
+    }
+
+    #[test]
+    fn is_noop_when_key_absent_or_masked() {
+        // absent key
+        let mut empty = HashMap::new();
+        assert!(
+            relocate_secret_to_keychain(&mut empty, "VERTEX_SA_JSON", "alice", true, |_, _| Ok(()))
+                .is_ok()
+        );
+        // masked / non-JSON value is treated as "unchanged"
+        let mut masked = env_with("VERTEX_SA_JSON", "abcd***xyz");
+        let called = RefCell::new(false);
+        let res =
+            relocate_secret_to_keychain(&mut masked, "VERTEX_SA_JSON", "alice", true, |_, _| {
+                *called.borrow_mut() = true;
+                Ok(())
+            });
+        assert!(res.is_ok());
+        assert!(!*called.borrow());
+        assert_eq!(masked.get("VERTEX_SA_JSON").unwrap(), "abcd***xyz");
+    }
 
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -2932,6 +3105,48 @@ mod tests {
         assert!(
             stored.config.env_vars.is_empty(),
             "an explicit empty env_vars map must clear all entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn my_profile_rejects_service_account_json_under_custom_env_off_macos() {
+        // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON
+        // pasted under a CUSTOM env name (VERTEX_API_KEY, not the whitelisted
+        // VERTEX_SA_JSON) via PUT /api/my/profile must never reach plaintext
+        // config. Off macOS it's rejected; on macOS it would be relocated to the
+        // keychain instead (skip — that hits the real keychain).
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let res = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": { "env_vars": {
+                    "VERTEX_API_KEY": "{\"type\":\"service_account\",\"private_key\":\"x\"}"
+                } }
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "raw SA JSON under a custom env name must be rejected off macOS"
+        );
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert!(
+            !stored.config.env_vars.contains_key("VERTEX_API_KEY"),
+            "the private key must never be persisted to plaintext config"
         );
     }
 

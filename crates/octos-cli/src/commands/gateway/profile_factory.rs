@@ -332,11 +332,18 @@ pub(crate) fn build_plugin_env(
             env.push(("OPENAI_API_KEY".to_string(), api_key));
         } else {
             let key_var = match provider_name {
-                "gemini" | "google" => "GEMINI_API_KEY",
-                "dashscope" | "qwen" => "DASHSCOPE_API_KEY",
-                _ => "OPENAI_API_KEY",
+                "gemini" | "google" => Some("GEMINI_API_KEY"),
+                "dashscope" | "qwen" => Some("DASHSCOPE_API_KEY"),
+                // Vertex authenticates with a service-account JSON, not an API
+                // key. It is not a usable credential for any plugin, and must
+                // never be forwarded under the wrong `OPENAI_API_KEY` name —
+                // so inject nothing for it.
+                "vertex" | "vertex-ai" | "vertexai" => None,
+                _ => Some("OPENAI_API_KEY"),
             };
-            env.push((key_var.to_string(), api_key));
+            if let Some(key_var) = key_var {
+                env.push((key_var.to_string(), api_key));
+            }
         }
     }
 
@@ -1102,6 +1109,30 @@ mod tests {
         if let Some(v) = prev_key {
             unsafe { std::env::set_var("OPENAI_API_KEY", v) };
         }
+    }
+
+    #[test]
+    fn build_plugin_env_does_not_forward_vertex_sa_json_as_api_key() {
+        // A Vertex service-account JSON is not an API key. It must never be
+        // injected into plugin env under any `*_API_KEY` name (the catch-all
+        // arm would otherwise hand it to plugins as a bogus OPENAI_API_KEY).
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert(
+            "VERTEX_SA_JSON".to_string(),
+            "{\"type\":\"service_account\",\"project_id\":\"p\"}".to_string(),
+        );
+        let config = crate::config::Config {
+            provider: Some("vertex".to_string()),
+            env_vars,
+            ..Default::default()
+        };
+
+        let env = build_plugin_env(&config, "vertex");
+
+        assert!(
+            !env.iter().any(|(k, _)| k.ends_with("_API_KEY")),
+            "Vertex SA JSON must not be forwarded to plugins as an API key: {env:?}"
+        );
     }
 
     /// Gap 4.1 BLOCKER 1 (standalone gateway child-profile uses the wrong

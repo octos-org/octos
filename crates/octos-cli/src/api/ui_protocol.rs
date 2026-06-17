@@ -6877,6 +6877,11 @@ async fn raw_profile_llm_upsert(
         upsert_llm_fallback(&mut llm.fallbacks, selection);
     }
     profile.config.llm = Some(llm);
+    // Relocate keychain-backed secrets (e.g. a Vertex SA JSON supplied as the
+    // route api_key) into the OS keychain before persisting, so this RPC can't
+    // write a private key to plaintext profile config.
+    crate::api::admin::relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)
+        .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
     profile.updated_at = Utc::now();
     store
         .save_with_merge(&mut profile)
@@ -6966,10 +6971,12 @@ async fn raw_profile_llm_test(
     };
 
     let Some(api_key) = secret_from_value(params.api_key).or_else(|| {
-        route
-            .api_key_env
-            .as_ref()
-            .and_then(|env_name| profile.as_ref()?.config.env_vars.get(env_name).cloned())
+        route.api_key_env.as_ref().and_then(|env_name| {
+            // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
+            // SA JSON); plain values pass through unchanged.
+            let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
+            crate::auth::keychain::resolve_value(env_name, raw)
+        })
     }) else {
         return Ok(profile_llm_test_result(
             state,
@@ -7094,9 +7101,12 @@ async fn raw_profile_llm_fetch_models(
         .or_else(|| dashboard_family_api_key_env(&family_id));
 
     let api_key = secret_from_value(params.api_key).or_else(|| {
-        api_key_env
-            .as_ref()
-            .and_then(|env_name| profile.as_ref()?.config.env_vars.get(env_name).cloned())
+        api_key_env.as_ref().and_then(|env_name| {
+            // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
+            // SA JSON); plain values pass through unchanged.
+            let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
+            crate::auth::keychain::resolve_value(env_name, raw)
+        })
     });
 
     let Some(api_key) = api_key else {

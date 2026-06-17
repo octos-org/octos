@@ -1417,7 +1417,9 @@ fn validate_public_subdomain(slug: &str) -> Result<()> {
 pub fn mask_secrets(profile: &UserProfile) -> UserProfile {
     let mut masked = profile.clone();
     for value in masked.config.env_vars.values_mut() {
-        if value == crate::auth::KEYCHAIN_MARKER {
+        // Any keychain marker (bare or profile-scoped) shows the indicator,
+        // never a mangled mask of the marker string itself.
+        if crate::auth::keychain::is_marker(value) {
             *value = KEYCHAIN_DISPLAY.to_string();
         } else {
             *value = mask_value(value);

@@ -39,6 +39,7 @@ pub mod openai;
 pub mod openai_responses;
 pub mod openrouter;
 pub mod registry;
+pub mod vertex_auth;
 
 pub use adaptive::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, AutoEscalationCallback,
