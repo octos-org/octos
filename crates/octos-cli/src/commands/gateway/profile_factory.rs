@@ -124,14 +124,24 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
 }
 
 fn discover_ominix_url() -> Option<String> {
-    std::env::var("OMINIX_API_URL").ok().or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-        std::fs::read_to_string(discovery)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+    std::env::var("OMINIX_API_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            for dir in [".ominix", ".OminiX"] {
+                let discovery = std::path::Path::new(&home).join(dir).join("api_url");
+                if let Some(url) = std::fs::read_to_string(discovery)
+                    .ok()
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(url);
+                }
+            }
+            None
+        })
 }
 
 fn push_runtime_plugin_env(

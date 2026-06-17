@@ -14,8 +14,8 @@ use octos_llm::ominix::OminixClient;
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
 #[allow(dead_code)]
 fn ominix_base_url() -> String {
-    const DEFAULT: &str = "http://localhost:8080";
-    std::env::var("OMINIX_API_URL").unwrap_or_else(|_| DEFAULT.to_string())
+    crate::skills_scope::discover_ominix_url()
+        .unwrap_or_else(|| "http://127.0.0.1:8081".to_string())
 }
 
 /// 从混合媒体路径里挑出音频文件，保持原顺序。

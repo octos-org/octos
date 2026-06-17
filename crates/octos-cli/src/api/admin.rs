@@ -11,8 +11,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
 use super::router::AuthIdentity;
+use super::{AppState, ominix_runtime};
 use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
 
 /// Basic email format validation.
@@ -2192,21 +2192,11 @@ pub async fn remove_profile_skill(
 // ── Platform Skills ──────────────────────────────────────────────────
 
 fn ominix_api_url() -> String {
-    std::env::var("OMINIX_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
+    ominix_runtime::configured_api_url()
 }
 
 fn models_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(std::env::var("OMINIX_MODELS_DIR").unwrap_or_else(|_| {
-        // Try both common locations
-        let p1 = format!("{home}/.ominix/models");
-        let p2 = format!("{home}/.OminiX/models");
-        if std::path::Path::new(&p1).exists() {
-            p1
-        } else {
-            p2
-        }
-    }))
+    ominix_runtime::models_dir()
 }
 
 /// GET /api/admin/platform-skills — list platform skills and their status.
@@ -2217,30 +2207,17 @@ pub async fn list_platform_skills(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let skills_dir = store.octos_home_dir().join("skills");
+    let skills_dir = store
+        .octos_home_dir()
+        .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
 
     // List installed platform skills
     let installed = crate::commands::skills::list_skills(&skills_dir).unwrap_or_default();
 
-    // Check ominix-api health
-    let ominix_url = ominix_api_url();
-    let health_url = format!("{}/health", ominix_url.trim_end_matches('/'));
-    let ominix_healthy = state
-        .http_client
-        .get(&health_url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    // Check launchd service status
-    let service_status = tokio::process::Command::new("launchctl")
-        .args(["list", "io.ominix.ominix-api"])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let ominix_runtime = ominix_runtime::runtime_status(&state.http_client).await;
+    let ominix_url = ominix_runtime.url.clone();
+    let ominix_healthy = ominix_runtime.health.healthy;
+    let service_status = ominix_runtime.service_registered;
 
     // Check models against platform allowlist
     let mdir = models_dir();
@@ -2276,6 +2253,7 @@ pub async fn list_platform_skills(
             "url": ominix_url,
             "healthy": ominix_healthy,
             "service_registered": service_status,
+            "runtime": ominix_runtime,
         },
         "models": {
             "dir": mdir.display().to_string(),
@@ -2283,6 +2261,24 @@ pub async fn list_platform_skills(
             "tts": tts_models,
         }
     })))
+}
+
+/// GET /api/admin/platform-skills/ominix-api/runtime — detailed runtime status.
+pub async fn platform_runtime_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let status = ominix_runtime::runtime_status(&state.http_client).await;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+/// POST /api/admin/platform-skills/ominix-api/repair — repair local OMiniX runtime.
+pub async fn platform_runtime_repair(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::repair_runtime(&state.http_client)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// POST /api/admin/platform-skills/:name/install — install/update a platform skill.
@@ -2318,7 +2314,9 @@ pub async fn remove_platform_skill(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let skills_dir = store.octos_home_dir().join("skills");
+    let skills_dir = store
+        .octos_home_dir()
+        .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
 
     // Defer to spawn_blocking so remove_skill's internal current-thread
     // tokio runtime doesn't try to construct inside the axum runtime
@@ -2344,32 +2342,21 @@ pub async fn platform_skill_health(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match name.as_str() {
         "voice" | "asr" | "ominix-api" => {
-            let url = ominix_api_url();
-            let health_url = format!("{}/health", url.trim_end_matches('/'));
-            let result = state
-                .http_client
-                .get(&health_url)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await;
-
-            let (status, detail) = match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    ("healthy", body)
-                }
-                Ok(resp) => (
-                    "error",
-                    serde_json::json!({"http_status": resp.status().as_u16()}),
-                ),
-                Err(e) => ("unreachable", serde_json::json!({"error": e.to_string()})),
+            let runtime = ominix_runtime::runtime_status(&state.http_client).await;
+            let status = if runtime.health.healthy {
+                "healthy"
+            } else if runtime.can_repair {
+                "repairable"
+            } else {
+                "unreachable"
             };
 
             Ok(Json(serde_json::json!({
                 "name": name,
                 "status": status,
-                "url": url,
-                "detail": detail,
+                "url": runtime.url,
+                "detail": runtime.health,
+                "runtime": runtime,
             })))
         }
         _ => Err((
@@ -2379,93 +2366,34 @@ pub async fn platform_skill_health(
     }
 }
 
-const OMINIX_PLIST: &str = "io.ominix.ominix-api";
-
 /// POST /api/admin/platform-skills/ominix-api/start
-pub async fn platform_service_start() -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    let output = tokio::process::Command::new("launchctl")
-        .args(["load", &plist_path])
-        .output()
+pub async fn platform_service_start(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::service_start(&state.http_client)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if output.status.success() {
-        Ok(Json(ActionResponse {
-            ok: true,
-            message: Some("ominix-api service started".into()),
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(format!("launchctl load failed: {stderr}")),
-        }))
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// POST /api/admin/platform-skills/ominix-api/stop
-pub async fn platform_service_stop() -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    let output = tokio::process::Command::new("launchctl")
-        .args(["unload", &plist_path])
-        .output()
+pub async fn platform_service_stop(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::service_stop(&state.http_client)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if output.status.success() {
-        Ok(Json(ActionResponse {
-            ok: true,
-            message: Some("ominix-api service stopped".into()),
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(format!("launchctl unload failed: {stderr}")),
-        }))
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// POST /api/admin/platform-skills/ominix-api/restart
-pub async fn platform_service_restart() -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    // Unload
-    let _ = tokio::process::Command::new("launchctl")
-        .args(["unload", &plist_path])
-        .output()
-        .await;
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // Load
-    let output = tokio::process::Command::new("launchctl")
-        .args(["load", &plist_path])
-        .output()
+pub async fn platform_service_restart(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::service_restart(&state.http_client)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if output.status.success() {
-        Ok(Json(ActionResponse {
-            ok: true,
-            message: Some("ominix-api service restarted".into()),
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(format!("Restart failed: {stderr}")),
-        }))
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// GET /api/admin/platform-skills/ominix-api/logs

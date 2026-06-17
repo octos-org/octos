@@ -329,8 +329,8 @@ impl ProcessManager {
         }
 
         // Inject OminiX API URL for all gateways (platform-wide, not per-profile)
-        let ominix_url =
-            std::env::var("OMINIX_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let ominix_url = crate::skills_scope::discover_ominix_url()
+            .unwrap_or_else(|| "http://127.0.0.1:8081".to_string());
         cmd.env("OMINIX_API_URL", &ominix_url);
 
         // Admin mode: inject OCTOS_SERVE_URL and OCTOS_ADMIN_TOKEN
