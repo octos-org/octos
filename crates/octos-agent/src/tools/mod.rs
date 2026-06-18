@@ -406,6 +406,13 @@ pub struct TurnAttachmentContext {
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
     pub prompt_summary: Option<String>,
+    /// Explicit live-video signal for this turn, set by the ingress from the
+    /// client (`InboundMessage.metadata.live_video`) — NOT inferred from
+    /// attachment types. True only when the turn is a real-time video call
+    /// whose attached image is the user's current camera frame; drives the
+    /// agent loop's video-call note. Defaults false (no auto-detection): a
+    /// voice note plus an uploaded image is not a camera frame.
+    pub live_video: bool,
 }
 
 tokio::task_local! {
