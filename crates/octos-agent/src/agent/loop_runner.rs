@@ -768,8 +768,15 @@ impl Agent {
                 // transcribed into `user_content` by this point), and image
                 // detection looks at the outgoing `media`.
                 let has_image = media.iter().any(|p| octos_llm::vision::is_image(p));
-                let had_audio = TURN_ATTACHMENT_CTX
-                    .try_with(|ctx| !ctx.audio_attachment_paths.is_empty())
+                // Live-video is an EXPLICIT per-turn signal carried on the turn
+                // context (set by the ingress from `inbound.metadata.live_video`),
+                // not inferred from attachments: a spoken note plus an uploaded
+                // image is not a camera frame, and the AppUI voice path strips
+                // the audio attachment before this point — so an `audio && image`
+                // heuristic both mis-fires and misses the real voice+image path.
+                // Only treat the image as a live camera frame when the client said so.
+                let live_video = TURN_ATTACHMENT_CTX
+                    .try_with(|ctx| ctx.live_video)
                     .ok()
                     .unwrap_or(false);
                 let summary = TURN_ATTACHMENT_CTX
@@ -779,7 +786,7 @@ impl Agent {
                 let content = compose_turn_user_content(
                     user_content,
                     !media.is_empty(),
-                    had_audio && has_image,
+                    live_video && has_image,
                     summary.as_deref(),
                 );
 
@@ -2910,7 +2917,10 @@ mod tests {
     // --- compose_turn_user_content (video-call context hint) ---
 
     #[test]
-    fn should_use_video_call_hint_when_turn_has_audio_and_image() {
+    fn should_use_video_call_hint_when_turn_is_flagged_live_video() {
+        // `is_video_call` is now the EXPLICIT live-video signal (set from the
+        // turn ingress via `inbound.metadata.live_video`), no longer inferred
+        // from audio+image attachments.
         let out = compose_turn_user_content("what am I holding", true, true, None);
         assert!(out.starts_with(VIDEO_CALL_NOTE), "got: {out}");
         assert!(out.contains("what am I holding"));
@@ -2923,15 +2933,17 @@ mod tests {
     }
 
     #[test]
-    fn should_keep_uploaded_image_hint_when_image_only() {
-        // No audio attachment → not a video call → legacy placeholder kept.
+    fn should_keep_uploaded_image_hint_when_not_flagged_video() {
+        // Image present but the turn is NOT flagged a live video call → legacy
+        // placeholder kept. (A voice note + uploaded image lands here: it must
+        // NOT be treated as a camera frame.)
         let out = compose_turn_user_content("", true, false, None);
         assert_eq!(out, "[User sent an image]");
     }
 
     #[test]
-    fn should_not_add_hint_when_audio_only() {
-        // Audio but no image → not a video call; plain transcript passes through.
+    fn should_not_add_hint_when_no_image() {
+        // No image and not flagged → plain transcript passes through.
         let out = compose_turn_user_content("hello there", false, false, None);
         assert_eq!(out, "hello there");
     }
@@ -4121,6 +4133,7 @@ printf '{"output":"voice saved","success":true}\n'
                     audio_attachment_paths: vec![first_audio.clone()],
                     file_attachment_paths: vec![],
                     prompt_summary: Some("[Attached audio files]\n- yangmi_ref2.wav".to_string()),
+                    live_video: false,
                 },
             )
             .await
@@ -4137,6 +4150,7 @@ printf '{"output":"voice saved","success":true}\n'
                     audio_attachment_paths: vec![second_audio.clone()],
                     file_attachment_paths: vec![],
                     prompt_summary: Some("[Attached audio files]\n- douwentao.wav".to_string()),
+                    live_video: false,
                 },
             )
             .await

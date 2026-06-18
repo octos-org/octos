@@ -6082,6 +6082,7 @@ impl SessionActor {
         &self,
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
+        live_video: bool,
     ) -> TurnAttachmentContext {
         let mut audio_attachment_paths = Vec::new();
         let mut file_attachment_paths = Vec::new();
@@ -6098,7 +6099,20 @@ impl SessionActor {
             audio_attachment_paths,
             file_attachment_paths,
             prompt_summary: attachment_prompt,
+            live_video,
         }
+    }
+
+    /// Whether this turn is an explicit live video call — the client signals it
+    /// by setting `metadata.live_video = true` on the inbound (e.g. a turn/start
+    /// from a video-call surface). Defaults false; never inferred from
+    /// attachment types (a voice note + uploaded image is not a camera frame).
+    fn inbound_live_video(inbound: &octos_core::InboundMessage) -> bool {
+        inbound
+            .metadata
+            .get("live_video")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     }
 
     fn persisted_user_content(
@@ -6596,7 +6610,11 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let content = inbound.content.clone();
         let media = image_media;
-        let attachments = self.build_turn_attachment_context(attachment_media, attachment_prompt);
+        let attachments = self.build_turn_attachment_context(
+            attachment_media,
+            attachment_prompt,
+            Self::inbound_live_video(&inbound),
+        );
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
         // Wave-4 B3.4 — stamp session_id / turn_id into the task-local
@@ -8189,7 +8207,11 @@ impl SessionActor {
                     &inbound.content,
                     &history,
                     image_media,
-                    self.build_turn_attachment_context(attachment_media, attachment_prompt),
+                    self.build_turn_attachment_context(
+                        attachment_media,
+                        attachment_prompt,
+                        Self::inbound_live_video(&inbound),
+                    ),
                     &token_tracker,
                 ),
             ),
@@ -8727,6 +8749,45 @@ mod tests {
 
     fn test_context_manager(key: &SessionKey) -> Arc<StdMutex<ContextManager>> {
         Arc::new(StdMutex::new(context_manager_from_history(key, &[])))
+    }
+
+    fn inbound_with(metadata: serde_json::Value, media: Vec<String>) -> octos_core::InboundMessage {
+        octos_core::InboundMessage {
+            channel: "appui".into(),
+            sender_id: "user".into(),
+            chat_id: "c".into(),
+            content: "look".into(),
+            timestamp: chrono::Utc::now(),
+            media,
+            metadata,
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        }
+    }
+
+    #[test]
+    fn inbound_live_video_reads_explicit_flag_not_attachments() {
+        // Explicit client signal → live video call.
+        assert!(SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({ "live_video": true }),
+            vec![],
+        )));
+        // Explicit false / absent → not a video call.
+        assert!(!SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({ "live_video": false }),
+            vec![],
+        )));
+        assert!(!SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({}),
+            vec![],
+        )));
+        // Regression (the codex P2): a voice note + uploaded image — audio AND
+        // image attachments but NO explicit flag — must NOT be treated as a
+        // live camera frame.
+        assert!(!SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({}),
+            vec!["/tmp/note.ogg".into(), "/tmp/photo.png".into()],
+        )));
     }
 
     fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
