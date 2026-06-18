@@ -519,6 +519,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/ominix/install",
             post(admin::platform_runtime_install),
         )
+        .route(
+            "/api/admin/ominix/bootstrap",
+            post(admin::platform_runtime_bootstrap),
+        )
         // Platform skills management
         .route(
             "/api/admin/platform-skills",
@@ -564,6 +568,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/platform-skills/ominix-api/install",
             post(admin::platform_runtime_install),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/bootstrap",
+            post(admin::platform_runtime_bootstrap),
         )
         // Model management (proxy to ominix-api)
         .route(

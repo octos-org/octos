@@ -29,6 +29,23 @@ pub(crate) fn validate_email(email: &str) -> Result<(), String> {
 
 // ── Request / Response types ──────────────────────────────────────────
 
+const MODEL_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 2);
+const MODEL_BOOTSTRAP_SPACE_MARGIN_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+struct OminixModelBootstrapResult {
+    id: String,
+    role: String,
+    ready: bool,
+    action: String,
+    status_before: String,
+    status_after: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct CreateProfileRequest {
     pub id: String,
@@ -2291,6 +2308,107 @@ pub async fn platform_runtime_install(
     Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
+/// POST /api/admin/platform-skills/ominix-api/bootstrap — install API and prepare core voice models.
+pub async fn platform_runtime_bootstrap(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let octos_home = store.octos_home_dir();
+    let mut actions = Vec::new();
+
+    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(&octos_home);
+    for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
+        if allowlist.find(model_id).is_none() {
+            allowlist
+                .platform_models
+                .push(octos_llm::ominix::PlatformModel {
+                    id: (*model_id).to_string(),
+                    role: (*role).to_string(),
+                });
+            actions.push(format!("enabled {model_id} for {role}"));
+        }
+    }
+    allowlist.save(&octos_home).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save platform model allowlist: {e}"),
+        )
+    })?;
+
+    let install_response = ominix_runtime::install_runtime(&state.http_client)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    actions.extend(install_response.actions.iter().cloned());
+
+    if !install_response.status.health.healthy {
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "message": "OMiniX API could not be started; voice models were not downloaded",
+            "status": install_response.status,
+            "runtime": install_response,
+            "actions": actions,
+            "models": [],
+        })));
+    }
+
+    let catalog = fetch_ominix_catalog()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let bytes_needed = missing_default_model_bytes(&catalog);
+    if bytes_needed > 0 {
+        if let Some(free) = available_space_bytes(&models_dir()) {
+            let required = bytes_needed.saturating_add(MODEL_BOOTSTRAP_SPACE_MARGIN_BYTES);
+            if free < required {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "message": format!(
+                        "Not enough disk space for core voice models: need about {}, available {}",
+                        human_bytes(required),
+                        human_bytes(free)
+                    ),
+                    "status": install_response.status,
+                    "runtime": install_response,
+                    "actions": actions,
+                    "models": [],
+                })));
+            }
+        }
+    }
+
+    let mut model_results = Vec::new();
+    for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
+        let result = bootstrap_voice_model(&state, model_id, role)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+        actions.push(format!(
+            "{} {} ({}) -> {}",
+            result.action, result.id, result.role, result.status_after
+        ));
+        model_results.push(result);
+    }
+
+    let final_status = ominix_runtime::runtime_status(&state.http_client).await;
+    let models_ready = model_results.iter().all(|model| model.ready);
+    let ok = final_status.health.healthy && models_ready;
+    let message = if ok {
+        "OMiniX API and core voice models are ready".to_string()
+    } else {
+        "OMiniX API bootstrap completed, but some voice models are not ready".to_string()
+    };
+
+    Ok(Json(serde_json::json!({
+        "ok": ok,
+        "message": message,
+        "actions": actions,
+        "status": final_status,
+        "models_ready": models_ready,
+        "models": model_results,
+    })))
+}
+
 /// POST /api/admin/platform-skills/:name/install — install/update a platform skill.
 pub async fn install_platform_skill(
     State(state): State<Arc<AppState>>,
@@ -2451,6 +2569,150 @@ pub async fn platform_service_logs(
 
 // ── Model Management (proxy to ominix-api) ─────────────────────────
 
+async fn fetch_ominix_catalog() -> Result<Vec<octos_llm::ominix::CatalogModel>, String> {
+    octos_llm::ominix::OminixClient::new(&ominix_api_url())
+        .fetch_catalog()
+        .await
+        .map_err(|e| format!("Failed to fetch ominix-api catalog: {e}"))
+}
+
+fn catalog_model<'a>(
+    catalog: &'a [octos_llm::ominix::CatalogModel],
+    model_id: &str,
+) -> Option<&'a octos_llm::ominix::CatalogModel> {
+    catalog.iter().find(|model| model.id == model_id)
+}
+
+fn catalog_status(catalog: &[octos_llm::ominix::CatalogModel], model_id: &str) -> String {
+    catalog_model(catalog, model_id)
+        .map(|model| model.status.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn missing_default_model_bytes(catalog: &[octos_llm::ominix::CatalogModel]) -> u64 {
+    ominix_runtime::DEFAULT_VOICE_MODELS
+        .iter()
+        .filter_map(|(model_id, _)| {
+            let model = catalog_model(catalog, model_id)?;
+            if ominix_runtime::is_ready_model_status(&model.status) {
+                None
+            } else {
+                model.storage.total_size_bytes
+            }
+        })
+        .sum()
+}
+
+async fn bootstrap_voice_model(
+    state: &Arc<AppState>,
+    model_id: &str,
+    role: &str,
+) -> Result<OminixModelBootstrapResult, String> {
+    let catalog = fetch_ominix_catalog().await?;
+    let before_status = catalog_status(&catalog, model_id);
+    let size = catalog_model(&catalog, model_id)
+        .and_then(|model| model.storage.total_size_display.clone());
+
+    if ominix_runtime::is_ready_model_status(&before_status) {
+        return Ok(OminixModelBootstrapResult {
+            id: model_id.to_string(),
+            role: role.to_string(),
+            ready: true,
+            action: "kept".to_string(),
+            status_before: before_status.clone(),
+            status_after: before_status,
+            size,
+            message: Some("already ready".to_string()),
+        });
+    }
+
+    let url = format!(
+        "{}/v1/models/download",
+        ominix_api_url().trim_end_matches('/')
+    );
+    let response = state
+        .http_client
+        .post(&url)
+        .json(&serde_json::json!({ "model_id": model_id }))
+        .timeout(MODEL_BOOTSTRAP_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("ominix-api download request failed for {model_id}: {e}"))?;
+
+    let status = response.status();
+    let response_text = response.text().await.unwrap_or_default();
+    let mut message = if response_text.trim().is_empty() {
+        None
+    } else {
+        Some(response_text.clone())
+    };
+    if !(status.is_success() || status == StatusCode::CONFLICT) {
+        return Ok(OminixModelBootstrapResult {
+            id: model_id.to_string(),
+            role: role.to_string(),
+            ready: false,
+            action: "download_failed".to_string(),
+            status_before: before_status,
+            status_after: "unknown".to_string(),
+            size,
+            message,
+        });
+    }
+    if status == StatusCode::CONFLICT && message.is_none() {
+        message = Some("already downloaded".to_string());
+    }
+
+    let refreshed = fetch_ominix_catalog().await?;
+    let after_status = catalog_status(&refreshed, model_id);
+    let ready = ominix_runtime::is_ready_model_status(&after_status);
+    Ok(OminixModelBootstrapResult {
+        id: model_id.to_string(),
+        role: role.to_string(),
+        ready,
+        action: if ready {
+            "downloaded".to_string()
+        } else {
+            "download_requested".to_string()
+        },
+        status_before: before_status,
+        status_after: after_status,
+        size,
+        message,
+    })
+}
+
+fn available_space_bytes(path: &std::path::Path) -> Option<u64> {
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or_else(|| std::path::Path::new("/"))
+    };
+    let output = std::process::Command::new("df")
+        .args(["-Pk", &target.display().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().nth(1)?;
+    let available_kib = line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+    Some(available_kib.saturating_mul(1024))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.0} MiB", bytes_f / MIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// GET /api/admin/platform-skills/ominix-api/models — list platform models
 ///
 /// Fetches the full catalog from ominix-api, filters to models listed in
@@ -2545,7 +2807,7 @@ pub async fn platform_models_download(
         .http_client
         .post(&url)
         .json(&download_body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(MODEL_BOOTSTRAP_TIMEOUT)
         .send()
         .await
         .map_err(|e| {

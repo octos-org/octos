@@ -13,6 +13,8 @@ use tar::Archive;
 use tokio::process::Command;
 
 pub(crate) const OMINIX_LABEL: &str = "io.ominix.ominix-api";
+pub(crate) const DEFAULT_VOICE_MODELS: &[(&str, &str)] =
+    &[("qwen3-asr-1.7b", "asr"), ("qwen3-tts", "tts")];
 const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RELEASE_REPO: &str = "OminiX-ai/OminiX-API";
 const PREFERRED_PORTS: &[u16] = &[8081, 9090, 8080];
@@ -71,6 +73,18 @@ pub(crate) struct OminixServiceProbe {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub(crate) struct OminixVoiceModelStatus {
+    pub id: String,
+    pub role: String,
+    pub status: String,
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub(crate) struct OminixRuntimeStatus {
     pub state: String,
     pub url: String,
@@ -96,6 +110,8 @@ pub(crate) struct OminixRuntimeStatus {
     pub service_running: bool,
     pub launchctl_skipped: bool,
     pub health: OminixHealthProbe,
+    pub voice_models_ready: bool,
+    pub voice_models: Vec<OminixVoiceModelStatus>,
     pub issues: Vec<OminixRuntimeIssue>,
     pub can_repair: bool,
     pub suggested_action: String,
@@ -322,6 +338,9 @@ async fn runtime_status_with_config(
 ) -> OminixRuntimeStatus {
     let (url, url_source) = config.configured_url();
     let health = probe_health(client, &url).await;
+    let voice_models = probe_voice_models(client, &url, health.healthy).await;
+    let voice_models_ready =
+        !voice_models.is_empty() && voice_models.iter().all(|model| model.ready);
     let service = service_status(config).await;
     let plist_path = config.plist_path();
     let discovery_path = config.discovery_path();
@@ -394,6 +413,29 @@ async fn runtime_status_with_config(
             binary_installed && (!config.require_metallib || metallib_installed),
         ));
     }
+    if health.healthy && !voice_models_ready {
+        for model in &voice_models {
+            if !model.ready {
+                issues.push(issue(
+                    "missing_voice_model",
+                    "warning",
+                    format!(
+                        "Voice model {} ({}) is not ready: {}",
+                        model.id, model.role, model.status
+                    ),
+                    true,
+                ));
+            }
+        }
+        if voice_models.is_empty() {
+            issues.push(issue(
+                "model_catalog_unavailable",
+                "warning",
+                "OMiniX model catalog could not be checked".to_string(),
+                true,
+            ));
+        }
+    }
     if !service.registered && !config.skip_launchctl {
         issues.push(issue(
             "service_unregistered",
@@ -418,15 +460,19 @@ async fn runtime_status_with_config(
     let hard_blocked = issues.iter().any(|i| i.severity == "error" && !i.fixable);
     let can_repair =
         binary_installed && (!config.require_metallib || metallib_installed) && !hard_blocked;
-    let state = if health.healthy {
+    let state = if health.healthy && voice_models_ready {
         "healthy"
+    } else if health.healthy {
+        "models_missing"
     } else if can_repair {
         "repairable"
     } else {
         "missing"
     };
-    let suggested_action = if health.healthy {
+    let suggested_action = if health.healthy && voice_models_ready {
         "ready"
+    } else if health.healthy {
+        "bootstrap_voice_models"
     } else if can_repair {
         "repair"
     } else {
@@ -455,6 +501,8 @@ async fn runtime_status_with_config(
         service_running: service.running,
         launchctl_skipped: config.skip_launchctl || !cfg!(target_os = "macos"),
         health,
+        voice_models_ready,
+        voice_models,
         issues,
         can_repair,
         suggested_action: suggested_action.to_string(),
@@ -823,6 +871,89 @@ async fn probe_health(client: &reqwest::Client, base_url: &str) -> OminixHealthP
             detail: None,
         },
     }
+}
+
+async fn probe_voice_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    health_ready: bool,
+) -> Vec<OminixVoiceModelStatus> {
+    if !health_ready {
+        return DEFAULT_VOICE_MODELS
+            .iter()
+            .map(|(id, role)| OminixVoiceModelStatus {
+                id: (*id).to_string(),
+                role: (*role).to_string(),
+                status: "unchecked".to_string(),
+                ready: false,
+                name: None,
+                size: None,
+            })
+            .collect();
+    }
+
+    let url = format!("{}/v1/models/catalog", base_url.trim_end_matches('/'));
+    let catalog = match client
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    };
+
+    DEFAULT_VOICE_MODELS
+        .iter()
+        .map(|(id, role)| voice_model_status_from_catalog(id, role, catalog.as_ref()))
+        .collect()
+}
+
+fn voice_model_status_from_catalog(
+    id: &str,
+    role: &str,
+    catalog: Option<&serde_json::Value>,
+) -> OminixVoiceModelStatus {
+    let model = catalog.and_then(catalog_models_array).and_then(|models| {
+        models
+            .iter()
+            .find(|model| model.get("id").and_then(|v| v.as_str()) == Some(id))
+    });
+    let status = model
+        .and_then(|model| model.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("unknown")
+        .to_string();
+    let ready = is_ready_model_status(&status);
+    OminixVoiceModelStatus {
+        id: id.to_string(),
+        role: role.to_string(),
+        status,
+        ready,
+        name: model
+            .and_then(|model| model.get("name").and_then(|v| v.as_str()))
+            .map(|v| v.to_string()),
+        size: model
+            .and_then(|model| {
+                model
+                    .get("storage")
+                    .and_then(|storage| storage.get("total_size_display"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|v| v.to_string()),
+    }
+}
+
+pub(crate) fn is_ready_model_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "ready" | "downloaded" | "installed"
+    )
+}
+
+fn catalog_models_array(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    value
+        .as_array()
+        .or_else(|| value.get("models").and_then(|models| models.as_array()))
 }
 
 async fn service_status(config: &OminixRuntimeConfig) -> OminixServiceProbe {
