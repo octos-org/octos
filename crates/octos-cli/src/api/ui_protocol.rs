@@ -10196,6 +10196,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        live_video: false,
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
     let routed_profile_id = Some(profile_id.clone());
@@ -17828,7 +17829,21 @@ async fn run_standalone_turn(
         // connection negotiated `user_question.v1` (`user_question_requester`
         // is `Some`); otherwise the agent's `ask_user_question` tool sees no
         // requester and degrades to its structured-metadata fallback.
-        let message_future = request_agent.process_message(&prompt, &history, turn_media_paths);
+        // #1478: thread the explicit live-video signal into the turn so the
+        // agent loop's video-call note (and the rich-output camera-frame
+        // grounding) fire only when the client says this is a live camera turn
+        // — never inferred from attachment types. Other attachment-context
+        // fields stay at their serve-path defaults.
+        let turn_attachments = octos_agent::TurnAttachmentContext {
+            live_video: params.live_video,
+            ..Default::default()
+        };
+        let message_future = request_agent.process_message_with_attachments(
+            &prompt,
+            &history,
+            turn_media_paths,
+            turn_attachments,
+        );
         let scoped_message_future: std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = eyre::Result<octos_agent::ConversationResponse>>
@@ -24807,6 +24822,7 @@ ignore = []
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         })
         .into_rpc_request("1")
         .expect("request");
@@ -32152,6 +32168,7 @@ ignore = []
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         };
         let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);

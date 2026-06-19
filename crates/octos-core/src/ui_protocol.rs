@@ -1718,7 +1718,6 @@ pub struct TurnStartParams {
     /// UPCR-2026-015 (M9-β-1): optional sub-topic suffix that scopes
     /// this send to a per-topic session bucket (`<session>#<topic>`
     /// shape). Mirrors the legacy SSE `topic` query/body field. The
-    /// server folds this into the resolved `SessionKey` before
     /// validating scope and looking up history. Empty / absent for
     /// the default-topic case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1739,6 +1738,14 @@ pub struct TurnStartParams {
     /// overrides the turn's effort. No-op for models without a reasoning style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortLevel>,
+    /// Explicit "this turn is a live video call" signal — the attached image
+    /// (if any) is the user's current camera frame, not an uploaded file. Set
+    /// by video-call surfaces (the voice screen with the camera on). The server
+    /// folds it into `inbound.metadata["live_video"]`; consumers read it from
+    /// `TurnAttachmentContext.live_video` and NEVER infer it from attachment
+    /// types. Defaults false; omitted on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_video: bool,
 }
 
 /// Reasoning/thinking effort level carried on the wire (octos-core cannot depend
@@ -5990,12 +5997,14 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: Some(ReasoningEffortLevel::Max),
+            live_video: false,
         };
         let wire = serde_json::to_value(&params).unwrap();
         assert_eq!(wire["reasoning_effort"], json!("max"));
         let back: TurnStartParams = serde_json::from_value(wire).unwrap();
         assert_eq!(back.reasoning_effort, Some(ReasoningEffortLevel::Max));
-        // Omitted field deserializes to None (backward compatible).
+        // Omitted optional fields deserialize to their defaults (backward
+        // compatible): no reasoning_effort, and `live_video` false.
         let legacy = json!({
             "session_id": "local:demo",
             "turn_id": "00000000-0000-0000-0000-000000000001",
@@ -6003,6 +6012,33 @@ mod tests {
         });
         let parsed: TurnStartParams = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.reasoning_effort, None);
+        assert!(!parsed.live_video);
+    }
+
+    #[test]
+    fn turn_start_live_video_roundtrips_and_is_omitted_when_false() {
+        // Explicit true is carried on the wire and read back.
+        let on = json!({
+            "session_id": "local:demo",
+            "turn_id": "00000000-0000-0000-0000-000000000001",
+            "input": [],
+            "live_video": true
+        });
+        let parsed: TurnStartParams = serde_json::from_value(on).unwrap();
+        assert!(parsed.live_video);
+        // Default false is omitted from the serialized form (no wire bloat).
+        let params = TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId(Uuid::from_u128(1)),
+            input: vec![],
+            media: vec![],
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
+        };
+        let wire = serde_json::to_value(&params).unwrap();
+        assert!(wire.get("live_video").is_none());
     }
 
     #[test]
@@ -6774,6 +6810,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         })
         .into_rpc_request("req-turn-start")
         .expect("serialize turn/start");
@@ -7449,6 +7486,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         });
 
         let request = command
@@ -7515,6 +7553,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -7555,6 +7594,7 @@ mod tests {
             topic: Some("slides".into()),
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -7595,6 +7635,7 @@ mod tests {
             topic: None,
             rewrite_for: Some("cmid-queued-original".into()),
             reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -7640,6 +7681,7 @@ mod tests {
             topic: Some("research".into()),
             rewrite_for: Some("cmid-original".into()),
             reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
