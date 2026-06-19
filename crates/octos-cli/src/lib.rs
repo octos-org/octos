@@ -8,6 +8,7 @@
 pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
+pub mod approvals_audit;
 pub mod auth;
 pub mod cli_agent_adapter;
 pub mod commands;

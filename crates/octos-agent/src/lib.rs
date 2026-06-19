@@ -10,6 +10,7 @@
 pub mod abi_schema;
 mod agent;
 pub mod agents;
+pub mod approval;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
@@ -84,6 +85,12 @@ pub use agent::{
         AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
         VerifierVerdict,
     },
+};
+pub use approval::{
+    ApprovalDecision, ApprovalRequestEnvelope, ApprovalRequestSpec, ApprovalResponsePayload,
+    ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior, ApprovalValidationError,
+    HumanApprovalRules, PendingApproval, PendingApprovalDraft,
+    PendingApprovalStore as HumanPendingApprovalStore, digest_tool_args,
 };
 pub use compaction_tiered::{
     ApiMicroCompactionConfig, DEFAULT_TIER1_MAX_AGE_TURNS, DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,
@@ -165,10 +172,10 @@ pub use tools::{
     DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
     GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, ManageSkillsTool, McpAgentBackend,
     McpAgentBackendConfig, MessageTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
-    RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendFileTool, SharedBackend, ShellTool,
-    SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool, ToolApprovalDecision,
-    ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy, ToolRegistry,
-    ToolResult, TurnAttachmentContext, UserQuestionOutcome, UserQuestionRequest,
+    RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool,
+    SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
+    ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy,
+    ToolRegistry, ToolResult, TurnAttachmentContext, UserQuestionOutcome, UserQuestionRequest,
     UserQuestionRequester, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     build_backend_from_config, build_delegated_child_policy, build_dispatch_event_payload,

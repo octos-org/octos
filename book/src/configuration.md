@@ -160,6 +160,40 @@ The complete configuration structure with all available fields:
 }
 ```
 
+## Human Approval Rules
+
+Tool calls matching a configured rule suspend the turn until an authorized
+human approves or denies them on the channel (Matrix first; capable clients
+like Robrix render native Approve/Deny buttons, others show a text fallback):
+
+```json
+{
+  "approval_policy": {
+    "default": "allow",
+    "rules": [{
+      "tools": ["shell", "write_file"],
+      "require_approval": true,
+      "risk_level": "critical",
+      "authorized_approvers": ["@alice:example.org"],
+      "expires_in_secs": 600,
+      "on_timeout": "notify"
+    }]
+  }
+}
+```
+
+- Rules match by exact tool name; the first matching rule wins.
+- Approvals are bound to the exact tool arguments (SHA-256 digest), the
+  originating room, and the `authorized_approvers` list; each request can be
+  consumed once.
+- `expires_in_secs` bounds how long a request stays answerable; on expiry the
+  chat receives a notice (`on_timeout: "notify"`).
+- Pending approvals are in-memory: a gateway restart drops them (the request
+  card stays in chat but answering it reports the request as unknown).
+- Decisions are appended to the JSONL audit log under `<data_dir>/audit/`
+  (`OCTOS_APPROVALS_AUDIT_*` env vars control rotation/retention).
+- Also available per-profile via `profile.config.approval_policy`.
+
 ## Environment Variables
 
 ### LLM Providers

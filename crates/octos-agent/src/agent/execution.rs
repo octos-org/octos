@@ -39,8 +39,9 @@ use crate::progress::ProgressEvent;
 use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{
-    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalRequester,
-    ToolContext, USER_QUESTION_CTX, UserQuestionRequester,
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprovalRequester, ToolContext, USER_QUESTION_CTX,
+    UserQuestionRequester,
 };
 use crate::workspace_contract::{
     SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
@@ -306,7 +307,123 @@ pub(super) fn compose_system_prompt(agent: &Agent) -> String {
     content
 }
 
+/// Auto-approves the in-tool approval gate when re-running a tool whose human
+/// approval was already granted through the gateway approval flow
+/// (`docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). Scoped only around
+/// [`Agent::execute_approved_tool`], so it can never auto-approve an ordinary
+/// turn — that path never installs this requester.
+struct ApprovedToolAutoApprover;
+
+#[async_trait::async_trait]
+impl ToolApprovalRequester for ApprovedToolAutoApprover {
+    async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+        ToolApprovalDecision::Approve
+    }
+}
+
 impl Agent {
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): re-check a pending
+    /// human approval just before executing it. Policies may have changed
+    /// while the approval waited (config hot-reload, hook edits), so the
+    /// approver list is re-checked and `before_tool_call` hooks are re-run
+    /// against the original arguments. A hook that now denies — or modifies
+    /// the arguments away from the digest the human approved — invalidates
+    /// the approval.
+    pub async fn revalidate_pending_approval(
+        &self,
+        pending: &crate::approval::PendingApproval,
+        sender_user_id: &str,
+    ) -> std::result::Result<(), String> {
+        if !pending
+            .request
+            .authorized_approvers
+            .iter()
+            .any(|approver| approver == sender_user_id)
+        {
+            return Err("approver is not authorized".to_string());
+        }
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::before_tool(
+                &pending.request.tool_name,
+                pending.tool_args.clone(),
+                &pending.tool_id,
+                self.hook_ctx().as_ref(),
+            );
+            match hooks.run(HookEvent::BeforeToolCall, &payload).await {
+                HookResult::Allow => Ok(()),
+                HookResult::Modified(new_args) => {
+                    if crate::approval::digest_tool_args(&new_args)
+                        == pending.request.tool_args_digest
+                    {
+                        Ok(())
+                    } else {
+                        Err("tool arguments changed since approval request was created".to_string())
+                    }
+                }
+                HookResult::Deny(reason) => {
+                    if reason.is_empty() {
+                        Err("current policy denied the approved tool call".to_string())
+                    } else {
+                        Err(reason)
+                    }
+                }
+                HookResult::Error(err) => Err(err),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): execute a tool call
+    /// whose human approval was granted. Runs the tool directly with the
+    /// digest-bound arguments — no LLM round trip — and fires the
+    /// `after_tool_call` hooks. The caller is responsible for validating and
+    /// consuming the pending approval first
+    /// (`PendingApprovalStore::consume` + [`Agent::revalidate_pending_approval`]).
+    pub async fn execute_approved_tool(
+        &self,
+        pending: &crate::approval::PendingApproval,
+    ) -> Result<crate::tools::ToolResult> {
+        let tool_start = Instant::now();
+        let ctx = ToolContext {
+            tool_id: pending.tool_id.clone(),
+            ..ToolContext::zero()
+        };
+        // The human already approved this exact (digest-bound) call through the
+        // gateway approval flow. Some tools (e.g. `shell` on a SafePolicy
+        // `Decision::Ask` command — sudo / rm -rf / git push --force) run a
+        // SECOND, in-tool approval gate that reads `TOOL_APPROVAL_CTX` and
+        // denies when absent. Scope an auto-approving requester so the
+        // already-approved call is not re-denied by that inner gate.
+        let approver: std::sync::Arc<dyn ToolApprovalRequester> =
+            std::sync::Arc::new(ApprovedToolAutoApprover);
+        let result = TOOL_APPROVAL_CTX
+            .scope(
+                approver,
+                TOOL_CTX.scope(
+                    ctx,
+                    self.tools
+                        .execute(&pending.request.tool_name, &pending.tool_args),
+                ),
+            )
+            .await?;
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::after_tool(
+                &pending.request.tool_name,
+                &pending.tool_id,
+                octos_core::truncated_utf8(&result.output, 500, "..."),
+                result.success,
+                tool_start.elapsed().as_millis() as u64,
+                self.hook_ctx().as_ref(),
+            );
+            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+        }
+
+        Ok(result)
+    }
+
     /// Spawn a single tool call as a detached `tokio::spawn` task.
     ///
     /// The returned [`JoinHandle`] yields the per-call [`ToolCallResult`]:

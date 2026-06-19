@@ -103,6 +103,10 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
+    /// Human-approval rules for tool calls requiring a human decision
+    /// (per-profile; see `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<crate::config::ApprovalPolicyConfig>,
     /// Admin mode: when true, gateway registers only admin management tools
     /// (no shell, file, web, browser tools). Used for the admin bot profile.
     #[serde(default)]
@@ -1578,6 +1582,7 @@ pub(crate) fn config_from_profile(
         tool_policy_by_provider: Default::default(),
         embedding: None,
         hooks: profile.config.hooks.clone(),
+        approval_policy: profile.config.approval_policy.clone(),
         context_filter: vec![],
         sub_providers: vec![],
         email: profile

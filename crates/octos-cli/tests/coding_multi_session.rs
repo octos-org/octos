@@ -212,6 +212,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         plugin_prompt_fragments: Vec::new(),
         plugin_hooks: Vec::new(),
         review_config: None,
+        human_approval_rules: None,
         system_prompt: "test-system-prompt".to_string(),
         voice: octos_cli::config::VoiceConfig::default(),
         memory,

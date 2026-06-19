@@ -35,7 +35,10 @@ mod ui_protocol_alpha3_bridge;
 mod ui_protocol_alpha4_bridge;
 mod ui_protocol_alpha9_bridge;
 mod ui_protocol_approvals;
-mod ui_protocol_audit;
+// Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
+// gateway approval path can write the same audit log without the `api`
+// feature; re-exported here so api-internal paths keep working.
+pub(crate) use crate::approvals_audit as ui_protocol_audit;
 mod ui_protocol_diff;
 mod ui_protocol_ledger;
 pub(crate) mod ui_protocol_progress;

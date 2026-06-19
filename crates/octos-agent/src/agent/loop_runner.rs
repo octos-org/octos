@@ -869,6 +869,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                     }
@@ -1067,6 +1068,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                         StopReason::ToolUse => {
@@ -1160,6 +1162,7 @@ impl Agent {
                                             messages: turn_output_log.clone(),
                                             tool_results: tool_structured_metadata.clone(),
                                             synthesized_from_spawn_only: false,
+                                pending_approval: None,
                                         });
                                     }
                                     // Two-stage loop-detector recovery:
@@ -1221,6 +1224,7 @@ impl Agent {
                                                 messages: turn_output_log.clone(),
                                                 tool_results: tool_structured_metadata.clone(),
                                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                                             });
                                         }
                                     }
@@ -1244,6 +1248,9 @@ impl Agent {
                             // duplicate) — and the content-fallback in the
                             // gate also keys on the original id, so it
                             // misses too. See doc on `handle_tool_use`.
+                            let mut iter_pending_approval: Option<
+                                crate::approval::PendingApprovalDraft,
+                            > = None;
                             let sanitized_response = match self
                                 .handle_tool_use(
                                     &response,
@@ -1258,6 +1265,7 @@ impl Agent {
                                     Some(&mut turn_output_log),
                                     &mut loop_detector,
                                     turn_ledger.as_mut(),
+                                    Some(&mut iter_pending_approval),
                                 )
                                 .await
                             {
@@ -1274,6 +1282,34 @@ impl Agent {
                                     }
                                 }
                             };
+
+                            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md):
+                            // a tool call matched a human-approval rule —
+                            // suspend the turn. The host (session actor)
+                            // projects the request to the channel, stores
+                            // the pending approval, and resumes via
+                            // `Agent::execute_approved_tool` when an
+                            // authorized human answers.
+                            if let Some(draft) = iter_pending_approval {
+                                self.emit_cost_update(turn.total_usage(), &sanitized_response);
+                                return Ok(ConversationResponse {
+                                    content: String::new(),
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(
+                                            sanitized_response.provider_index,
+                                        ),
+                                    ),
+                                    token_usage: turn.total_usage().clone(),
+                                    files_modified,
+                                    files_to_send,
+                                    streamed,
+                                    messages: turn_output_log.clone(),
+                                    tool_results: tool_structured_metadata.clone(),
+                                    synthesized_from_spawn_only: false,
+                                    pending_approval: Some(draft),
+                                });
+                            }
 
                             if let Err(e) = self
                                 .maybe_run_verifier_after_tool_batch(
@@ -1361,6 +1397,7 @@ impl Agent {
                                     messages: turn_output_log.clone(),
                                     tool_results: tool_structured_metadata.clone(),
                                     synthesized_from_spawn_only: false,
+                                pending_approval: None,
                                 });
                             }
 
@@ -1545,6 +1582,7 @@ impl Agent {
                                         // the capability) still see the ack as
                                         // an assistant row — backward-compatible.
                                         synthesized_from_spawn_only: true,
+                                pending_approval: None,
                                     });
                                 }
                             }
@@ -1564,6 +1602,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                         StopReason::ContentFiltered => {
@@ -1588,6 +1627,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                     }
@@ -1904,6 +1944,10 @@ impl Agent {
                                 None,
                                 &mut loop_detector,
                                 turn_ledger.as_mut(),
+                                // Background task loop: no resume host —
+                                // rule-matched tools are denied, not
+                                // suspended (see handle_tool_use doc).
+                                None,
                             )
                             .await
                         {
@@ -2087,6 +2131,17 @@ impl Agent {
         // conversation continues.
         loop_detector: &mut LoopDetector,
         turn_ledger: Option<&mut TurnLedger>,
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): out-parameter
+        // for the suspend-and-resume human-approval flow. When a tool call
+        // matches a configured `human_approval_rules` rule:
+        // - `Some(slot)` (conversation loop): the slot receives the pending
+        //   draft, placeholder tool-results are recorded, and NO tool in the
+        //   batch executes — the caller suspends the turn so the host can
+        //   project the request to the channel and resume later.
+        // - `None` (background/task loop): there is no resume host, so the
+        //   matched call is denied with an "approval not available" tool
+        //   result instead of being silently bypassed.
+        pending_approval_out: Option<&mut Option<crate::approval::PendingApprovalDraft>>,
     ) -> Result<ChatResponse> {
         // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
         // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
@@ -2122,6 +2177,122 @@ impl Agent {
         }
         let assistant_msg = self.response_to_message(&response);
         messages.push(assistant_msg.clone());
+
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): human-approval
+        // interception. When any callable tool call in this batch matches a
+        // configured rule, no tool in the batch executes — every call gets a
+        // placeholder tool-result so the LLM history stays consistent, and
+        // the turn suspends with the first matching call's approval draft.
+        // This intentionally deviates from the PR #345 reference (which
+        // executed non-matching peers): not executing anything around a
+        // gated call is simpler and strictly safer.
+        if let Some(rules) = self.config.human_approval_rules.as_ref() {
+            let matched = response
+                .tool_calls
+                .iter()
+                .find(|tc| {
+                    self.tools.get(&tc.name).is_some() && rules.matching_rule(&tc.name).is_some()
+                })
+                .map(|tc| (tc.name.clone(), tc.id.clone(), tc.arguments.clone()));
+            if let Some((matched_name, matched_id, matched_args)) = matched {
+                let has_resume_host = pending_approval_out.is_some();
+                let outcome = rules.draft_for_tool_call(
+                    &matched_name,
+                    &matched_id,
+                    matched_args,
+                    chrono::Utc::now(),
+                );
+                let tool_placeholder = |tc_id: &str, content: String| Message {
+                    role: MessageRole::Tool,
+                    content,
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: Some(tc_id.to_string()),
+                    reasoning_content: None,
+                    client_message_id: None,
+                    thread_id: None,
+                    timestamp: chrono::Utc::now(),
+                };
+                match outcome {
+                    Ok(Some(draft)) => {
+                        let placeholders: Vec<Message> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                let content = if tc.id == matched_id {
+                                    if has_resume_host {
+                                        format!(
+                                            "[APPROVAL REQUESTED] Tool '{}' is waiting for human \
+                                             approval (request {}).",
+                                            tc.name, draft.request.request_id
+                                        )
+                                    } else {
+                                        format!(
+                                            "[APPROVAL REQUIRED] Tool '{}' requires human \
+                                             approval, which is not available in this background \
+                                             context. Do not retry.",
+                                            tc.name
+                                        )
+                                    }
+                                } else {
+                                    format!(
+                                        "[SKIPPED] Tool call suspended: this batch is waiting \
+                                         for human approval of '{matched_name}'."
+                                    )
+                                };
+                                tool_placeholder(&tc.id, content)
+                            })
+                            .collect();
+                        if let Some(log) = turn_output_log {
+                            log.push(assistant_msg);
+                            log.extend(placeholders.iter().cloned());
+                        }
+                        messages.extend(placeholders);
+                        if let Some(slot) = pending_approval_out {
+                            tracing::info!(
+                                tool = %matched_name,
+                                request_id = %draft.request.request_id,
+                                "suspending turn pending human approval"
+                            );
+                            *slot = Some(draft);
+                        } else {
+                            tracing::warn!(
+                                tool = %matched_name,
+                                "human-approval rule matched in a context without a resume \
+                                 host; denying instead of suspending"
+                            );
+                        }
+                        return Ok(response);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        // Rule produced an invalid spec (config validation
+                        // should prevent this). Fail the batch visibly
+                        // without suspending.
+                        let placeholders: Vec<Message> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                tool_placeholder(
+                                    &tc.id,
+                                    format!(
+                                        "[APPROVAL POLICY ERROR] Tool '{matched_name}' matched \
+                                         an invalid approval rule: {err}"
+                                    ),
+                                )
+                            })
+                            .collect();
+                        if let Some(log) = turn_output_log {
+                            log.push(assistant_msg);
+                            log.extend(placeholders.iter().cloned());
+                        }
+                        messages.extend(placeholders);
+                        return Ok(response);
+                    }
+                }
+            }
+        }
+
         let (limited_response, blocked_messages) =
             self.enforce_session_limits_on_tool_calls(&response);
         let tool_batches = split_tool_calls(
@@ -7462,6 +7633,247 @@ printf '{"output":"voice saved","success":true}\n'
             result.success,
             "ready workspace must keep Success (got {:?})",
             result.output
+        );
+    }
+
+    // ── Phase 4: human-approval suspend-and-resume (ROBRIX-PHASE4 ADR) ──────
+
+    struct AlphaToolThenEndProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlphaToolThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_alpha".to_string(),
+                        name: "alpha".to_string(),
+                        arguments: serde_json::json!({"value": "x"}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn human_approval_rules_for(tool: &str) -> crate::approval::HumanApprovalRules {
+        crate::approval::HumanApprovalRules::new(vec![crate::approval::ApprovalRule {
+            tools: vec![tool.to_string()],
+            risk_level: crate::approval::ApprovalRiskLevel::Critical,
+            authorized_approvers: vec!["@alice:example.org".to_string()],
+            expires_in_secs: 300,
+            on_timeout: crate::approval::ApprovalTimeoutBehavior::Notify,
+        }])
+    }
+
+    #[tokio::test]
+    async fn should_suspend_turn_when_tool_matches_human_approval_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory).with_config(
+            AgentConfig {
+                human_approval_rules: Some(human_approval_rules_for("alpha")),
+                ..AgentConfig::default()
+            },
+        );
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+        let pending = result
+            .pending_approval
+            .expect("turn should suspend with a pending approval draft");
+        assert_eq!(pending.request.tool_name, "alpha");
+        assert_eq!(
+            pending.request.authorized_approvers,
+            vec!["@alice:example.org".to_string()]
+        );
+        assert!(result.content.is_empty());
+        // The tool must NOT have executed.
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("alpha ok")),
+            "gated tool must not execute before approval"
+        );
+        // The placeholder tool result keeps the LLM history consistent.
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.role == MessageRole::Tool && m.content.contains("[APPROVAL REQUESTED]")),
+            "history should carry the approval placeholder: {:?}",
+            result.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn should_execute_normally_when_no_human_approval_rule_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory).with_config(
+            AgentConfig {
+                human_approval_rules: Some(human_approval_rules_for("beta")),
+                ..AgentConfig::default()
+            },
+        );
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+        assert!(result.pending_approval.is_none());
+        assert_eq!(result.content, "done");
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("alpha ok")),
+            "non-matching tool should run normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_run_tool_directly_when_executing_approved_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory);
+
+        let pending = human_approval_rules_for("alpha")
+            .draft_for_tool_call(
+                "alpha",
+                "call_alpha",
+                serde_json::json!({"value": "x"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let result = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "alpha ok");
+    }
+
+    #[tokio::test]
+    async fn should_not_re_deny_approved_shell_command_tripping_safepolicy_ask() {
+        // Codex/mempal review #1: an approved `shell` command that ALSO trips
+        // SafePolicy's Decision::Ask (sudo / rm -rf / git push --force) must
+        // not be re-denied by the in-tool approval gate. `execute_approved_tool`
+        // scopes an auto-approver so the already-human-approved call runs.
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-shell"), provider, tools, memory);
+
+        // `git push --force` trips SafePolicy::Ask; with no remote it fails
+        // fast and harmlessly — we only assert the approval gate was passed.
+        let pending = human_approval_rules_for("shell")
+            .draft_for_tool_call(
+                "shell",
+                "call_shell",
+                serde_json::json!({"command": "git push --force"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let result = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(
+            !result.output.contains("requires approval"),
+            "approved shell command must not be re-denied by the in-tool gate: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_revalidation_when_sender_not_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory);
+
+        let pending = human_approval_rules_for("alpha")
+            .draft_for_tool_call(
+                "alpha",
+                "call_alpha",
+                serde_json::json!({"value": "x"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let err = agent
+            .revalidate_pending_approval(&pending, "@mallory:example.org")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not authorized"));
+
+        assert!(
+            agent
+                .revalidate_pending_approval(&pending, "@alice:example.org")
+                .await
+                .is_ok()
         );
     }
 }

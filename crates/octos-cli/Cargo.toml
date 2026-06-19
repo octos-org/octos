@@ -36,6 +36,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 colored = { workspace = true }
 chrono = { workspace = true }
+iana-time-zone = { workspace = true }
 tokio = { workspace = true }
 eyre = { workspace = true }
 uuid = { workspace = true }

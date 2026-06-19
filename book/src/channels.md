@@ -417,6 +417,21 @@ octos cron enable <job-id> --disable     # Disable a job
 
 Jobs support an optional `timezone` field with IANA timezone names (e.g., `"America/New_York"`, `"Asia/Shanghai"`). When omitted, UTC is used.
 
+When running Matrix through a management bot (for example, a BotFather-style profile), the same cron capability can also be reached through chat commands:
+
+```text
+/schedule 20秒之后提醒我看天气
+/schedule 每天早上 9 点提醒我看天气
+/schedules
+/unschedule <job-id>
+```
+
+These commands are scoped to the current chat context. `/schedules` only shows jobs created for the current room/DM, and `/unschedule` only removes jobs visible in that same chat context. Daily/weekly schedules are stored with the server's local IANA timezone so wall-clock times survive DST changes.
+
+In a BotFather management room, `/allbots <message>` broadcasts a command to the room's bound child bots (at most 8 per broadcast). Stale bindings are skipped, and private bots only accept broadcasts from their owner.
+
+When `approval_policy` rules are configured (see Configuration → Human Approval Rules), tool calls matching a rule pause the turn and post an approval card to the room. Robrix renders native Approve/Deny buttons; the decision is only accepted from the rule's `authorized_approvers`, in the originating room, before expiry.
+
 ---
 
 ## Message Coalescing

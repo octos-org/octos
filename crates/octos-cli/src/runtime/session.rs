@@ -460,6 +460,8 @@ impl SessionRuntime {
             // background tasks that need more iterations.
             max_iterations: resolve_session_max_iterations(profile.max_iterations),
             save_episodes: true,
+            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
+            human_approval_rules: profile.human_approval_rules.clone(),
             ..Default::default()
         })
         // M11-F regression fix (#891): propagate the pre-assembled
@@ -781,6 +783,7 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt,
             memory,
             memory_store,
@@ -1309,6 +1312,7 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
@@ -1363,6 +1367,7 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
@@ -1445,6 +1450,7 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,

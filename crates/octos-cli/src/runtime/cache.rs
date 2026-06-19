@@ -578,6 +578,7 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,

@@ -180,10 +180,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::sync::{Mutex, RwLock, mpsc};
 
+    fn test_cron_service(dir: &std::path::Path) -> Arc<CronService> {
+        let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);
+        Arc::new(CronService::new(dir.join("cron"), cron_in_tx))
+    }
+
     fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {
             id: id.to_string(),
             name: id.to_string(),
+            public_subdomain: None,
             enabled: false,
             data_dir: None,
             parent_id: None,
@@ -214,15 +220,19 @@ mod tests {
         let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
 
         let mut parent = make_profile("botfather", Some("admin parent"));
-        parent.config.provider = Some("openai".into());
-        parent.config.model = Some("gpt-4o-mini".into());
-        parent.config.api_key_env = Some("OPENAI_API_KEY".into());
-        parent.config.fallback_models = vec![crate::profiles::FallbackModelConfig {
-            provider: "openai".into(),
-            model: Some("gpt-4o".into()),
-            api_key_env: Some("OPENAI_API_KEY".into()),
+        parent.config.llm = Some(crate::profiles::LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("openai".into()),
+                model_id: Some("gpt-4o-mini".into()),
+                ..Default::default()
+            }),
+            fallbacks: vec![crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("openai".into()),
+                model_id: Some("gpt-4o".into()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        });
         parent.config.admin_mode = true;
         store.save(&parent).unwrap();
 
@@ -526,6 +536,7 @@ mod tests {
             store: store.clone(),
             channel: channel.clone(),
             parent_profile_id: parent.id.clone(),
+            cron_service: test_cron_service(dir.path()),
         };
 
         let result = manager
@@ -602,6 +613,7 @@ mod tests {
             store: store.clone(),
             channel: channel.clone(),
             parent_profile_id: parent.id.clone(),
+            cron_service: test_cron_service(dir.path()),
         };
 
         let result = manager
@@ -675,6 +687,7 @@ mod tests {
             store: store.clone(),
             channel: channel.clone(),
             parent_profile_id: parent.id.clone(),
+            cron_service: test_cron_service(dir.path()),
         };
 
         let result = manager

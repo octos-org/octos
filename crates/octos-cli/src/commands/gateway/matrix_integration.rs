@@ -6,6 +6,9 @@ use eyre::{Result, WrapErr};
 use octos_bus::ChannelManager;
 use tracing::warn;
 
+#[cfg(feature = "matrix")]
+use crate::cron_tool::CronTool;
+
 use super::prompt::settings_str;
 
 #[cfg(all(feature = "matrix", test))]
@@ -112,6 +115,7 @@ impl MatrixChannelSettings {
                 shutdown,
             )
             .with_admin_allowed_senders(self.allowed_senders.clone())
+            .with_media_dir(data_dir.join("media"))
             .with_bot_router(data_dir),
         )
     }
@@ -155,6 +159,7 @@ pub(super) struct GatewayBotManager {
     pub(super) store: Arc<crate::profiles::ProfileStore>,
     pub(super) channel: Arc<octos_bus::MatrixChannel>,
     pub(super) parent_profile_id: String,
+    pub(super) cron_service: Arc<octos_bus::CronService>,
 }
 
 #[cfg(feature = "matrix")]
@@ -374,5 +379,33 @@ impl octos_bus::BotManager for GatewayBotManager {
         }
 
         Ok(output.join("\n"))
+    }
+
+    async fn schedule_bot_task(
+        &self,
+        request: &str,
+        _sender: &str,
+        room_id: &str,
+    ) -> eyre::Result<String> {
+        Ok(CronTool::add_natural_language_for_context(
+            &self.cron_service,
+            "matrix",
+            room_id,
+            request,
+        )?
+        .output)
+    }
+
+    async fn list_schedules(&self, _sender: &str, room_id: &str) -> eyre::Result<String> {
+        Ok(CronTool::list_jobs_for_context(self.cron_service.as_ref(), "matrix", room_id).output)
+    }
+
+    async fn unschedule_bot_task(
+        &self,
+        job_id: &str,
+        _sender: &str,
+        room_id: &str,
+    ) -> eyre::Result<String> {
+        Ok(CronTool::remove_job_for_context(&self.cron_service, "matrix", room_id, job_id).output)
     }
 }

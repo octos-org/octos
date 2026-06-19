@@ -185,6 +185,17 @@ octos cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00
 
 Cron expressions use standard syntax. Jobs support an optional `timezone` field with IANA timezone names (e.g., `"America/New_York"`, `"Asia/Shanghai"`). When omitted, UTC is used.
 
+When Matrix is fronted by a BotFather-style management bot, the same cron runtime is also available through natural-language chat commands:
+
+```text
+/schedule 20秒之后提醒我看天气
+/schedule 每天早上 9 点提醒我看天气
+/schedules
+/unschedule <job-id>
+```
+
+These commands create, list, and remove jobs scoped to the current Matrix room or DM instead of exposing raw `cron` syntax to end users.
+
 ---
 
 ## `octos channels`

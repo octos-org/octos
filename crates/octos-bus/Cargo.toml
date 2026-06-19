@@ -65,6 +65,7 @@ mailparse = { workspace = true, optional = true }
 workspace = true
 
 [dev-dependencies]
+axum = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }

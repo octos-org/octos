@@ -695,6 +695,15 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// Return the names of tools that advertise a given tag.
+    pub fn names_with_tag(&self, tag: &str) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|(_, tool)| tool.tags().contains(&tag))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Number of registered tools.
     pub fn len(&self) -> usize {
         self.tools.len()
@@ -1703,6 +1712,23 @@ mod estimate_tests {
         // Inner array: 2 + 1 + 1 + 1 comma = 5
         // Total: 2 + 4 + 5 = 11
         assert_eq!(estimate_json_size(&v), 11);
+    }
+}
+
+#[cfg(test)]
+mod tag_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn should_return_app_reply_tool_names_when_tag_matches() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::tools::SendAppCardTool::new(tx.clone()));
+        registry.register(crate::tools::MessageTool::new(tx));
+
+        let names = registry.names_with_tag("app_reply");
+        assert_eq!(names, vec!["send_app_card".to_string()]);
+        assert!(registry.names_with_tag("no_such_tag").is_empty());
     }
 }
 

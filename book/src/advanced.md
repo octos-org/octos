@@ -597,6 +597,17 @@ octos cron enable <job-id>
 octos cron enable <job-id> --disable
 ```
 
+When the agent is exposed through a Matrix management bot, the same scheduling capability can be presented as BotFather-style chat commands:
+
+```text
+/schedule 20秒之后提醒我看天气
+/schedule 每天早上 9 点提醒我看天气
+/schedules
+/unschedule <job-id>
+```
+
+These commands stay bound to the current room/DM context. They do not expose raw cron syntax to end users, but still reuse the same cron store and delivery pipeline internally.
+
 ---
 
 ## Web Dashboard

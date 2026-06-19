@@ -760,6 +760,7 @@ pub mod read_task_output;
 pub mod recall_memory;
 pub mod research_utils;
 pub mod save_memory;
+pub mod send_app_card;
 pub mod send_file;
 pub mod shell;
 #[allow(dead_code)]
@@ -815,6 +816,7 @@ pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
+pub use send_app_card::SendAppCardTool;
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
 pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};

@@ -98,6 +98,13 @@ pub struct AgentConfig {
     /// every <idle> seconds forever still terminates. Default 1200s (20 min);
     /// env override `OCTOS_LLM_CALL_MAX_SECS`.
     pub llm_call_max: std::time::Duration,
+    /// Config-driven human-approval rules for the suspend-and-resume flow
+    /// (see `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). When a tool call
+    /// matches a rule, the conversation loop returns early with
+    /// [`ConversationResponse::pending_approval`] instead of executing the
+    /// tool; the host projects the request to the channel and resumes via
+    /// [`Agent::execute_approved_tool`]. `None` disables the flow.
+    pub human_approval_rules: Option<crate::approval::HumanApprovalRules>,
 }
 
 /// Default time-to-first-token grace for streaming LLM calls (180s).
@@ -171,6 +178,7 @@ impl Default for AgentConfig {
                 DEFAULT_LLM_STREAM_IDLE_SECS,
             ),
             llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
+            human_approval_rules: None,
         }
     }
 }
@@ -208,6 +216,13 @@ pub struct ConversationResponse {
     /// "two bubbles per turn" shape into a single preamble row.
     /// Defaults to `false`; only set in the spawn_only synthesis path.
     pub synthesized_from_spawn_only: bool,
+    /// Set when a tool call matched a [`AgentConfig::human_approval_rules`]
+    /// rule: the turn was suspended before executing that tool and the host
+    /// must project this request to the channel, await a human decision, and
+    /// resume via [`Agent::execute_approved_tool`]
+    /// (`docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). `content` is empty in
+    /// that case. `None` for every ordinary turn.
+    pub pending_approval: Option<crate::approval::PendingApprovalDraft>,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
