@@ -275,6 +275,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            live_video: false,
         });
 
         assert_eq!(command.method(), methods::TURN_START);
