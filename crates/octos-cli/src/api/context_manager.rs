@@ -1669,6 +1669,19 @@ fn first_removable_prompt_group(entries: &[PromptMessageEntry]) -> Option<(usize
     let mut end = start + 1;
 
     if matches!(entries[start].message.role, MessageRole::User) {
+        // Never trim away the most recent user turn: it is the current request
+        // the model must answer. When no later user message exists, this group
+        // IS that request (plus any in-turn tool-recovery replies), so it stays
+        // even under a tight cap — `max_prompt_token_estimate` is a soft latency
+        // target, and dropping the live request (e.g. a voice turn whose
+        // protected compaction summary already fills the budget) would leave the
+        // model answering nothing. See `voice_cap_keeps_current_request_*`.
+        let has_later_user = entries[start + 1..]
+            .iter()
+            .any(|entry| matches!(entry.message.role, MessageRole::User));
+        if !has_later_user {
+            return None;
+        }
         while end < entries.len()
             && !entries[end].protected
             && !matches!(entries[end].message.role, MessageRole::User)
@@ -2596,6 +2609,45 @@ mod tests {
         assert!(
             frame.report.truncated_item_ids.contains(&tool_item_id),
             "context-pressure truncation should report the affected tool output item"
+        );
+    }
+
+    #[test]
+    fn voice_cap_keeps_current_request_even_when_protected_context_fills_budget() {
+        // Regression (#1464 P1): a voice turn caps the outgoing projection, but a
+        // protected compaction summary / context injection can alone meet or
+        // exceed that cap. The trim must still keep the CURRENT user request —
+        // otherwise the model receives only the summary and answers nothing.
+        let mut manager = ContextManager::new("s", None);
+        // A context injection is emitted as a protected entry, standing in for a
+        // large protected compaction summary that already fills the budget.
+        manager.record_item(
+            TranscriptItemKind::ContextInjection {
+                label: "summary".into(),
+                content: "older context ".repeat(300),
+            },
+            TranscriptItemSource::AgentLoop,
+        );
+        manager.record_message(&Message::user("what is my current question's answer"));
+
+        let frame = manager.for_prompt(&PromptBuildPolicy {
+            // Tighter than the protected injection on its own.
+            max_prompt_token_estimate: Some(20),
+            ..PromptBuildPolicy::default()
+        });
+
+        assert!(
+            frame
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::User
+                    && message.content.contains("current question")),
+            "the current user request must survive the voice cap, got: {:?}",
+            frame
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
         );
     }
 
