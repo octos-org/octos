@@ -26,6 +26,7 @@
     "ux:tmux:validate": "node scripts/ux-tmux-validate.mjs",
     "soak:m14:codex-tool-parity": "node scripts/m14-codex-tool-parity-soak.mjs",
     "soak:m18:appui-transport-parity": "node scripts/m18-appui-transport-parity-soak.mjs",
+    "soak:m11:post-eviction-replay": "bash scripts/m11-post-eviction-replay-local.sh",
     "matrix": "node matrix/run.mjs",
     "ux:scenario:list": "node scripts/ux-scenario-list.mjs",
     "ux:scenario:list:test": "node --test tests/ux/scenario-list.test.mjs",
