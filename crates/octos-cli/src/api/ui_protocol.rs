@@ -17818,7 +17818,18 @@ async fn run_standalone_turn(
         // ask for short, speakable answers. Text chat (had_audio_input == false)
         // keeps its normal detailed/formatted persona — this branch never runs there.
         prompt = format!(
-            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。]"
+            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。\
+             \n若(且仅若)可视化更能帮助用户理解——例如他想『看到/画出/演示/直观理解』某个结构性、空间性或图示性的东西(电路、波形、数学曲线、流程、UI 草图等)——\
+             在口播正文之后【另起一行】追加一个标记:[[VISUAL:kind|brief]]。\
+             按【用户的认知需求】选 kind:\
+             html=纯动态/可调交互、靠动手玩参数理解、不需要看实物的样子(电路、波形、数学曲线、流程、算法);\
+             illustrated=既要看清实物真实样子、又要交互讲解/标注的结构性内容(细胞、器官、动植物、解剖、天体、机械构造等)——系统会先生成写实插图再叠加交互标注;\
+             image=只要一张写实或艺术单图(某物长什么样、画作);\
+             infographic=多段并列要点/步骤的信息图。\
+             brief 是给生成器的一句话简述。\
+             普通问答/闲聊/事实回答【不要】加标记。\
+             示例1:用户说『我想直观看到负反馈电路如何负反馈』→ 口播『我给你画一个可调增益的负反馈电路,你可以拖滑块看输出怎么被拉回来。』,然后另起一行:[[VISUAL:html|可调增益的负反馈电路交互演示,滑块调增益,实时显示反馈如何稳定输出]]\
+             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]]"
         );
         // The audio is now in the prompt as text. Drop it from the
         // agent-visible media so the model answers the transcript directly
@@ -18486,38 +18497,17 @@ async fn run_standalone_turn(
     // streams `token` events, instead of waiting for the whole reply. A FIFO
     // worker keeps the emitted audio ordered without blocking this loop. All
     // gated on `had_audio_input`, so text chat is untouched.
-    fn drain_voice_sentences(buf: &mut String) -> Vec<String> {
-        // Strong boundaries always split; commas (soft) split once the segment is
-        // long enough (>=8 chars) so the first audio comes out fast. Now that
-        // few-shot synthesis keeps comma-fragments free of the "啊/哦" filler
-        // (that was zero-shot, not chunking), comma-splitting buys ~1s lower
-        // first-audio latency vs whole-sentence without the artifacts.
-        const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
-        const SOFT: &[char] = &['，', ',', '、'];
-        const SOFT_MIN_CHARS: usize = 8;
-        let mut out = Vec::new();
-        loop {
-            let mut cut = None;
-            for (count, (i, c)) in buf.char_indices().enumerate() {
-                if STRONG.contains(&c) || (SOFT.contains(&c) && count + 1 >= SOFT_MIN_CHARS) {
-                    cut = Some(i + c.len_utf8());
-                    break;
-                }
-            }
-            match cut {
-                Some(idx) => {
-                    let sentence = buf[..idx].trim().to_string();
-                    *buf = buf[idx..].to_string();
-                    if !sentence.is_empty() {
-                        out.push(sentence);
-                    }
-                }
-                None => break,
-            }
-        }
-        out
-    }
-    let mut voice_buf = String::new();
+    // Voice turn: a `VoiceReplySplitter` feeds complete sentences to the TTS
+    // worker AS tokens stream, while holding back any trailing in-band
+    // `[[VISUAL:kind|brief]]` marker so it never reaches TTS. Sentence-splitting
+    // lives in `voice_turn::VoiceReplySplitter` (unit-tested). The rich-output
+    // directive is parsed later from the authoritative final reply (not the
+    // splitter), so it is robust whether or not the reply was streamed.
+    let mut voice_splitter = if had_audio_input {
+        Some(crate::api::voice_turn::VoiceReplySplitter::new())
+    } else {
+        None
+    };
     let mut voice_streamed_count: usize = 0;
     let (voice_tx, voice_handle) = if had_audio_input {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -18692,11 +18682,10 @@ async fn run_standalone_turn(
                 // Voice turn: accumulate streamed `token` text and hand off
                 // each complete sentence to the FIFO TTS worker for immediate
                 // synthesis (overlaps with the rest of LLM generation).
-                if let Some(ref tx) = voice_tx {
+                if let (Some(tx), Some(sp)) = (voice_tx.as_ref(), voice_splitter.as_mut()) {
                     if event.get("type").and_then(Value::as_str) == Some("token") {
                         if let Some(t) = event.get("text").and_then(Value::as_str) {
-                            voice_buf.push_str(t);
-                            for sentence in drain_voice_sentences(&mut voice_buf) {
+                            for sentence in sp.push(t) {
                                 if tx.try_send(sentence).is_ok() {
                                     voice_streamed_count += 1;
                                 }
@@ -18719,13 +18708,17 @@ async fn run_standalone_turn(
         }
     }
 
-    // Voice turn: flush the trailing partial sentence, close the channel, and
-    // wait for the FIFO TTS worker to finish emitting all sentence audio.
+    // Voice turn: flush the trailing partial sentence (marker already held back
+    // by the splitter), close the channel, and wait for the FIFO TTS worker.
     if let Some(tx) = voice_tx {
-        if !interrupt_observed {
-            let tail = voice_buf.trim().to_string();
-            if !tail.is_empty() && tx.try_send(tail).is_ok() {
-                voice_streamed_count += 1;
+        if let Some(sp) = voice_splitter.take() {
+            let (tail, _directive) = sp.finish();
+            if !interrupt_observed {
+                if let Some(t) = tail {
+                    if tx.try_send(t).is_ok() {
+                        voice_streamed_count += 1;
+                    }
+                }
             }
         }
         drop(tx);
@@ -18916,6 +18909,146 @@ async fn run_standalone_turn(
     // `await` will not block.
     let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
 
+    // Voice rich output: dispatch the in-band [[VISUAL]] directive parsed from
+    // the AUTHORITATIVE final reply (robust whether or not it was streamed).
+    // HTML → a focused tool-less LLM call (rich_output); image-class → a
+    // backend-orchestrated mofa skill. Fire-and-forget: the artifact arrives
+    // async via the same `files_attached` channel as the reply audio, so the
+    // turn completes while the client shows a "generating" state. The model
+    // emits no tool call, so the Gemini-3 thought_signature path never arises.
+    if had_audio_input && !interrupt_observed {
+        if let Some(directive) = final_response_content
+            .as_deref()
+            .and_then(crate::api::voice_turn::parse_visual_marker)
+        {
+            use crate::api::voice_turn::VisualKind;
+            let r_ledger = ledger.clone();
+            let r_session = session_id.clone();
+            let r_turn = turn_id.clone();
+            let r_dir = session_runtime.workspace_root.clone();
+            let r_provider = llm_provider.clone();
+            let r_registry = tool_registry.clone();
+            let r_transcript = voice_transcripts.join("\n");
+            let r_spoken = final_response_content
+                .as_deref()
+                .map(|r| crate::api::voice_turn::strip_visual_marker(r).to_string())
+                .unwrap_or_default();
+            // This turn's camera frame(s) → forwarded to the Illustrated path as
+            // reference images so the generated illustration depicts the real
+            // subject in front of the camera. Gated on the EXPLICIT live-video
+            // signal (#1478), consistent with the loop_runner video-call note —
+            // never inferred from "there's an image attached" (a voice note +
+            // uploaded image is not a live camera frame).
+            let r_ref_images: Vec<String> = if params.live_video {
+                asr_media
+                    .iter()
+                    .filter(|p| octos_bus::media::is_image(p))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            tracing::info!(
+                kind = ?directive.kind,
+                brief = %directive.brief,
+                "voice rich: dispatching visual directive"
+            );
+            tokio::spawn(async move {
+                let rels: Vec<String> = match directive.kind {
+                    VisualKind::Html => {
+                        let ctx = octos_agent::rich_output::RichHtmlContext {
+                            transcript: r_transcript,
+                            spoken_reply: r_spoken,
+                            brief: directive.brief,
+                            illustration: false,
+                        };
+                        match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx).await
+                        {
+                            Ok(html) => {
+                                let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                match tokio::fs::write(r_dir.join(&name), html).await {
+                                    Ok(()) => vec![name],
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "voice rich: html write failed");
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "voice rich: author_html failed");
+                                Vec::new()
+                            }
+                        }
+                    }
+                    VisualKind::Illustrated => {
+                        // Stage 1: generate a realistic illustration PNG.
+                        let png_bytes = match crate::api::voice_turn::run_illustration_image(
+                            &r_registry,
+                            &directive.brief,
+                            &r_dir,
+                            &r_ref_images,
+                        )
+                        .await
+                        {
+                            Some(p) => tokio::fs::read(&p).await.ok(),
+                            None => None,
+                        };
+                        // Stage 2: author HTML that embeds it (model uses the
+                        // placeholder src), then inline the PNG as a data URI so
+                        // the artifact is a single self-contained file. If image
+                        // gen failed, fall back to a no-illustration document.
+                        let ctx = octos_agent::rich_output::RichHtmlContext {
+                            transcript: r_transcript,
+                            spoken_reply: r_spoken,
+                            brief: directive.brief,
+                            illustration: png_bytes.is_some(),
+                        };
+                        match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx).await
+                        {
+                            Ok(html) => {
+                                let html = match png_bytes {
+                                    Some(bytes) => {
+                                        octos_agent::rich_output::inline_illustration(&html, &bytes)
+                                    }
+                                    None => html,
+                                };
+                                let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                match tokio::fs::write(r_dir.join(&name), html).await {
+                                    Ok(()) => vec![name],
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "voice rich: html write failed");
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "voice rich: author_html (illustrated) failed");
+                                Vec::new()
+                            }
+                        }
+                    }
+                    VisualKind::Image | VisualKind::Infographic => {
+                        crate::api::voice_turn::run_image_skill(&r_registry, &directive, &r_dir)
+                            .await
+                    }
+                };
+                if rels.is_empty() {
+                    tracing::warn!("voice rich: produced no artifact to deliver");
+                } else {
+                    tracing::info!(files = ?rels, "voice rich: delivering artifact(s)");
+                    super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                        &r_ledger,
+                        &r_session,
+                        &r_turn,
+                        &rels,
+                        &[],
+                        None,
+                    );
+                }
+            });
+        }
+    }
+
     // ── 语音轮 TTS（serve 路径）────────────────────────────────────
     // 仅当本轮有音频输入（语音轮）时，把最终文本回复合成为音频并下发，
     // 客户端据此自动播放。失败静默跳过，不影响文本回复。
@@ -18929,6 +19062,10 @@ async fn run_standalone_turn(
     // path above produced no audio (e.g. a reply with no sentence boundaries).
     if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
+            // Strip any in-band [[VISUAL:...]] marker so the fallback synth does
+            // not read the marker aloud (the streamed path's splitter already
+            // does this; this is the no-sentence-boundary fallback).
+            let reply = crate::api::voice_turn::strip_visual_marker(reply);
             // Per-tenant reply voice: live override wins, else profile default.
             let voice = crate::api::voices::resolve_reply_voice(
                 &session_runtime.profile.profile_id,

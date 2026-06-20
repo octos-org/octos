@@ -81,6 +81,7 @@ pub use agent::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
+    rich_output,
     verifier::{
         AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
         VerifierVerdict,

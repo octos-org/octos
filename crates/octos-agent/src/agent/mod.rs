@@ -12,6 +12,7 @@ pub mod loop_state;
 pub mod memory;
 mod message_repair;
 pub mod realtime;
+pub mod rich_output;
 mod streaming;
 mod turn_state;
 pub mod verifier;
