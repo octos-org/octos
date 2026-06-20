@@ -18,7 +18,9 @@ pub const MAX_FILES: usize = 50;
 
 /// Read all source .md files from a research directory.
 ///
-/// Skips `_`-prefixed files (e.g. `_search_results.md`, `_report.md`).
+/// Skips `_`-prefixed sidecars (e.g. `_search_results.md`, `_report.md`) and
+/// generated topic report files (e.g. `ai-agents_report.md`,
+/// `ai-agents_report-2.md`).
 /// Returns `(filename, content)` pairs sorted by filename.
 pub async fn read_sources(dir: &Path) -> Result<Vec<(String, String)>> {
     let mut entries = tokio::fs::read_dir(dir)
@@ -38,7 +40,7 @@ pub async fn read_sources(dir: &Path) -> Result<Vec<(String, String)>> {
         if !name.ends_with(".md") {
             continue;
         }
-        if name.starts_with('_') {
+        if name.starts_with('_') || is_generated_report_file(&name) {
             continue;
         }
 
@@ -61,6 +63,30 @@ pub async fn read_sources(dir: &Path) -> Result<Vec<(String, String)>> {
     // Sort by filename for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
+}
+
+fn is_generated_report_file(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    if stem == "_report" {
+        return true;
+    }
+
+    let report_stem = stem
+        .rsplit_once('-')
+        .and_then(|(base, suffix)| {
+            suffix
+                .parse::<u32>()
+                .ok()
+                .filter(|index| *index >= 2)
+                .map(|_| base)
+        })
+        .unwrap_or(stem);
+
+    report_stem
+        .strip_suffix("_report")
+        .is_some_and(|topic| !topic.is_empty())
 }
 
 /// Partition files into batches that fit within the char limit.
@@ -359,6 +385,27 @@ mod tests {
         let files: Vec<(String, String)> = vec![];
         let batches = partition_batches(&files);
         assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_sources_skips_topic_named_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("01_source.md"), "source").unwrap();
+        std::fs::write(dir.path().join("_search_results.md"), "index").unwrap();
+        std::fs::write(dir.path().join("_report.md"), "legacy").unwrap();
+        std::fs::write(dir.path().join("新能源汽车走势分析_report.md"), "report").unwrap();
+        std::fs::write(
+            dir.path().join("新能源汽车走势分析_report-2.md"),
+            "report 2",
+        )
+        .unwrap();
+
+        let sources = read_sources(dir.path()).await.unwrap();
+
+        assert_eq!(
+            sources,
+            vec![("01_source.md".to_string(), "source".to_string())]
+        );
     }
 
     #[test]

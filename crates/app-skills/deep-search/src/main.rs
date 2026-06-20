@@ -81,9 +81,9 @@ struct Output {
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<ResultCost>,
     /// Files the host should auto-deliver to chat. Mirrors v1
-    /// behavior; we name the synthesized topic-named report (`_<slug>.md`,
-    /// see `report_filename`) here so the chat UI shows the canonical
-    /// report file, not the search-engine dump.
+    /// behavior; we name the synthesized topic-named report
+    /// (`<slug>_report.md`, see `report_filename`) here so the chat UI
+    /// shows the canonical report file, not the search-engine dump.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     files_to_send: Vec<String>,
 }
@@ -613,14 +613,11 @@ async fn run_deep_search(
         Some(0.95),
     );
 
-    // Issue #897: canonical report filename derives from the topic slug with `_` prefix
-    // (`_<slug>.md`) instead of the hardcoded `_report.md`. The wrapper
-    // directory is unchanged; intermediate sidecars (`_search_results.md`,
-    // `01_*.md`, …) keep their existing shapes. The topic-named filename
-    // gives the chat UI a self-describing attachment and gives the LLM a
-    // stable name to reference on follow-up turns (sister issue #896).
-    let report_filename_str = report_filename(&slug);
-    let report_path = dir.join(&report_filename_str);
+    // Issue #261: canonical report filename derives from the topic slug
+    // (`<slug>_report.md`) instead of the hardcoded `_report.md`. Repeated
+    // same-topic runs pick a numbered suffix so earlier reports remain
+    // available in the media panel.
+    let report_path = unique_report_path(&dir, &slug);
     let report = build_report(
         query,
         synthesis.as_ref(),
@@ -2364,19 +2361,18 @@ fn research_dir(slug: &str) -> PathBuf {
     base.join("research").join(slug)
 }
 
-/// Issue #897: derive the canonical report filename from the topic slug
+/// Issue #261: derive the canonical report filename from the topic slug
 /// so each research run produces a topic-named markdown file rather than
 /// the legacy hardcoded `_report.md`. The wrapper directory still keeps
 /// the slug, and intermediate sidecars (`_search_results.md`,
 /// `01_*.md`, …) keep their leading-`_`/index prefix shapes so a
 /// directory listing groups by run.
 ///
-/// **The leading `_` prefix is load-bearing** —
-/// `octos_agent::tools::research_utils::read_sources` excludes
-/// `_`-prefixed files when collecting "source" inputs for the
-/// `synthesize_research` map-reduce. Without the prefix, the new
+/// `octos_agent::tools::research_utils::read_sources` excludes files with
+/// this report suffix when collecting "source" inputs for the
+/// `synthesize_research` map-reduce. Without that companion skip, the new
 /// topic-named report would be re-ingested as a source on the next
-/// synthesis run (codex review on PR #898).
+/// synthesis run.
 ///
 /// Falls back to `_report.md` only if the slug is empty (degenerate
 /// query). Keeps the file extension uniformly `.md`.
@@ -2385,8 +2381,25 @@ fn report_filename(slug: &str) -> String {
     if trimmed.is_empty() {
         "_report.md".to_string()
     } else {
-        format!("_{trimmed}.md")
+        format!("{trimmed}_report.md")
     }
+}
+
+fn unique_report_path(dir: &Path, slug: &str) -> PathBuf {
+    let base = report_filename(slug);
+    let first = dir.join(&base);
+    if !first.exists() {
+        return first;
+    }
+
+    let stem = base.strip_suffix(".md").unwrap_or(&base);
+    for index in 2.. {
+        let candidate = dir.join(format!("{stem}-{index}.md"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search must find an unused report path")
 }
 
 // ---------------------------------------------------------------------------
@@ -3144,32 +3157,26 @@ mod tests {
 
     #[test]
     fn should_save_report_with_topic_named_filename() {
-        // Issue #897: deep_search no longer hardcodes `_report.md`. The
+        // Issue #261: deep_search no longer hardcodes `_report.md`. The
         // canonical report file inside `research/<slug>/` is named after
         // the topic slug so it is self-describing when downloaded or
         // attached, and so the LLM has a stable name to read back on the
-        // next turn (sister issue #896).
-        //
-        // The leading `_` prefix is preserved (load-bearing — keeps the
-        // file out of `read_sources`' source-ingestion path; see the
-        // doc comment on `report_filename` for the full rationale).
+        // next turn.
         assert_eq!(
             report_filename("rust-async-runtimes-2026"),
-            "_rust-async-runtimes-2026.md"
+            "rust-async-runtimes-2026_report.md"
         );
         assert_eq!(
             report_filename("top-AI-startups-2025"),
-            "_top-AI-startups-2025.md"
+            "top-AI-startups-2025_report.md"
         );
         // CJK preserved (slugify keeps unicode > U+007F).
-        assert_eq!(report_filename("中美关系-的影响"), "_中美关系-的影响.md");
-        // The `_`-prefix invariant: every real slug yields a filename
-        // that `research_utils::read_sources` will skip. This guard
-        // catches the regression codex flagged on PR #898 — without
-        // the prefix, the report would be re-ingested as a source on
-        // the next `synthesize_research` run.
-        assert!(report_filename("foo-bar").starts_with('_'));
-        assert!(report_filename("中美关系").starts_with('_'));
+        assert_eq!(
+            report_filename("新能源汽车走势分析"),
+            "新能源汽车走势分析_report.md"
+        );
+        assert!(report_filename("foo-bar").ends_with("_report.md"));
+        assert!(report_filename("中美关系").ends_with("_report.md"));
     }
 
     #[test]
@@ -3179,6 +3186,29 @@ mod tests {
         // a zero-name `.md` file.
         assert_eq!(report_filename(""), "_report.md");
         assert_eq!(report_filename("---"), "_report.md");
+    }
+
+    #[test]
+    fn unique_report_path_adds_suffix_on_collision() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "deep-search-report-collision-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("topic_report.md"), "first").unwrap();
+        std::fs::write(dir.join("topic_report-2.md"), "second").unwrap();
+
+        let candidate = unique_report_path(&dir, "topic");
+        assert_eq!(
+            candidate.file_name().and_then(|name| name.to_str()),
+            Some("topic_report-3.md")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3772,7 +3802,7 @@ A second paragraph elaborates on alternatives [2]."
             usd: Some(0.0009),
         };
         let dir = std::path::PathBuf::from("/tmp/research/topic");
-        // Issue #897: canonical report filename now derives from the
+        // Issue #261: canonical report filename now derives from the
         // topic slug, not the literal `_report.md`.
         let report_path = dir.join(report_filename("topic"));
         let report = build_report(
@@ -3808,9 +3838,9 @@ A second paragraph elaborates on alternatives [2]."
             "synthesis fallback leaked into successful path"
         );
         // Trailer with report path stays for v1 host compatibility,
-        // but now references the topic-named filename (issue #897).
+        // but now references the topic-named filename (issue #261).
         assert!(
-            report.contains("Report saved to: /tmp/research/topic/_topic.md"),
+            report.contains("Report saved to: /tmp/research/topic/topic_report.md"),
             "expected topic-named report path in trailer: {report}"
         );
         // Belt-and-suspenders: the legacy literal must NOT leak back in.
@@ -3837,7 +3867,7 @@ A second paragraph elaborates on alternatives [2]."
         )];
         let queries = vec!["topic".to_string()];
         let dir = std::path::PathBuf::from("/tmp/research/topic");
-        // Issue #897: topic-named filename, no longer `_report.md`.
+        // Issue #261: topic-named filename, no longer `_report.md`.
         let report_path = dir.join(report_filename("topic"));
         let report = build_report(
             "topic",
@@ -3855,7 +3885,7 @@ A second paragraph elaborates on alternatives [2]."
         assert!(!report.contains("## Synthesis"));
         // Trailer must reference the topic-named file.
         assert!(
-            report.contains("Report saved to: /tmp/research/topic/_topic.md"),
+            report.contains("Report saved to: /tmp/research/topic/topic_report.md"),
             "expected topic-named trailer: {report}"
         );
     }
@@ -3875,7 +3905,7 @@ A second paragraph elaborates on alternatives [2]."
             tokens_out: 0,
             usd: None,
         };
-        // Issue #897: even in the degenerate-synthesis fallback the
+        // Issue #261: even in the degenerate-synthesis fallback the
         // file is named after the topic slug.
         let topic_report = format!("/tmp/{}", report_filename("topic"));
         let report = build_report(
@@ -3892,7 +3922,7 @@ A second paragraph elaborates on alternatives [2]."
         assert!(report.contains("raw initial"));
         // Trailer references the topic-named filename.
         assert!(
-            report.contains("Report saved to: /tmp/_topic.md"),
+            report.contains("Report saved to: /tmp/topic_report.md"),
             "expected topic-named trailer in fallback path: {report}"
         );
     }
