@@ -45,7 +45,7 @@ Other invocations:
 
 ```bash
 npm run matrix -- --pack onboarding --tier local     # placeholder scenarios (skipped)
-npm run matrix -- --pack onboarding --tier release   # placeholder scenarios (skipped)
+npm run matrix -- --pack onboarding --tier release   # fails while required release placeholders remain
 ```
 
 Environment knobs:
@@ -62,7 +62,7 @@ Environment knobs:
 | --------- | --------------------- | --------- | ----------------------- | -------------- |
 | `fast`    | No                    | No        | < 30 s per scenario     | Active         |
 | `local`   | Yes (local provider)  | Optional  | < 5 min per scenario    | Placeholder    |
-| `release` | Yes (release lane)    | Yes       | Bounded by gating CI    | Placeholder    |
+| `release` | Yes (release lane)    | Yes       | Bounded by gating CI    | Required placeholder; fails until wired |
 
 `tier=fast` scenarios MUST be mock-or-deterministic. The runner does not
 expose any provider configuration knobs in this PR — the only entry points
@@ -76,7 +76,7 @@ for the full schema. The runner today understands:
 
 - `[pack]` metadata: `name`, `contract`, `issue`.
 - `[[scenarios]]` with: `name`, `tier`, `transport`, `description`,
-  optional `skip_reason`, `validators`, `artifacts`.
+  optional `required`, `skip_reason`, `validators`, `artifacts`.
 - `[[scenarios.steps]]` with: `id`, `rpc`, `params`, optional `expect`.
 
 `expect` supports three light, shape-only checks that the runner enforces
@@ -107,6 +107,13 @@ Inside `params`, the runner substitutes:
 - The TOML parser in `run.mjs` is intentionally minimal: it covers the
   manifest's needs and rejects everything else with a parse error so a
   scenario authoring mistake surfaces immediately.
+
+## Required Scenario Skips
+
+Required scenarios are allowed to carry `skip_reason` while the manifest is
+being built out, but they fail the run instead of reporting `skipped`. This
+keeps release-facing commands from returning green when every required lane is
+still a placeholder.
 
 ## Follow-ups (not in this PR)
 

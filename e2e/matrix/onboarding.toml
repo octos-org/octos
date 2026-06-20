@@ -20,8 +20,10 @@
 #                           when validators + tier-local arrive.
 #   description (string)    Single-line human-readable summary.
 #   skip_reason (string)    Optional. When set, scenario is reported as
-#                           "skipped" with this reason. Required when a
-#                           release-tier scenario is intentionally inert.
+#                           "skipped" with this reason unless `required=true`.
+#   required    (bool)      Optional. Required scenarios fail the run when
+#                           skipped, so release gates cannot pass with only
+#                           placeholders.
 #
 # Per-step keys (each entry in `steps`):
 #
@@ -272,9 +274,8 @@ expect = { result_has = ["requested_path", "exists"] }
 # tier-local / tier-release placeholders.
 #
 # These declare the *intent* so the next PR can grep for them, but they are
-# currently skipped with explicit reasons. The runner respects `skip_reason`
-# on every tier (no enforcement yet on release tier — release-gate
-# enforcement lands with the validators PR).
+# currently skipped with explicit reasons. Required placeholders fail the run
+# rather than producing a green release gate.
 # ---------------------------------------------------------------------------
 
 [[scenarios]]
@@ -292,6 +293,7 @@ name = "release-gate-no-otp"
 tier = "release"
 transport = "stdio"
 description = "Release gate: full onboarding flow must avoid auth/send_code and auth/verify (placeholder)."
+required = true
 validators = ["no_otp_emitted", "no_secret_leak_in_transcripts"]
 artifacts = ["rpc-transcript.jsonl", "redaction-report.json"]
 skip_reason = "tier-release gate enforced once validators ship (PR #2)."
