@@ -1055,21 +1055,22 @@ impl WorkspacePolicy {
             })],
         };
 
-        // mofa_cards writes PNGs into a `card_dir` (required input arg).
-        // The contract uses a recursive PNG glob so any layout under that
-        // directory is covered without hard-coding a single output path.
+        // mofa_cards writes one PNG per card into a `card_dir` and now
+        // reports every generated PNG via `files_to_send` (octos #1041).
+        // Consume that explicit list so stale PNGs elsewhere in the
+        // workspace cannot satisfy a failed card run.
         let mofa_cards_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("image_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:Card generation failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                glob: "**/*.png".into(),
+                glob: String::new(),
                 format: MagicByteKind::Png,
-                source: ValidatorFileSource::Glob,
-                extension: None,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("png".into()),
             })],
         };
 
@@ -2532,14 +2533,8 @@ ignore = []
         // skill surfaces auxiliary files (intermediate panel PNGs,
         // layout previews, etc.) via `files_to_send`.
         //
-        // `mofa_cards` is intentionally NOT in this sweep — the plugin
-        // does not yet emit `files_to_send` (it returns `card_dir` not
-        // `out`, and its success text `"Generated N card(s) in <dir>"`
-        // does not match the `Generated:` / `Generated PPTX:` markers
-        // that `PluginTool::detect_output_file` auto-detects). Tracked
-        // by a separate plugin-fix issue.
         let policy = WorkspacePolicy::for_session();
-        for tool in ["mofa_comic", "mofa_infographic", "mofa_frame"] {
+        for tool in ["mofa_cards", "mofa_comic", "mofa_infographic", "mofa_frame"] {
             let entry = policy
                 .spawn_tasks
                 .get(tool)
@@ -2580,18 +2575,11 @@ ignore = []
     }
 
     #[test]
-    fn session_policy_mofa_cards_keeps_glob_until_plugin_emits_files_to_send_octos_1041() {
-        // octos #1041 (audit #1040 follow-up): `mofa_cards` cannot yet
-        // sweep to `spawn_only_files` because the plugin does not emit
-        // `files_to_send` and `PluginTool::detect_output_file` does not
-        // auto-populate it (no `out` arg, success text uses an
-        // unrecognised `Generated N card(s) in <dir>` prefix).
-        //
-        // This test pins the current behaviour so a future contributor
-        // doesn't sweep `mofa_cards` without first fixing the plugin
-        // emission — that would regress to the empty-files-to-send
-        // failure mode that #1037 caught for `voice_synthesize` and
-        // tracked as #1038.
+    fn session_policy_mofa_cards_consumes_spawn_only_files_for_octos_1041() {
+        // octos #1041: the deployed mofa_cards plugin emits all generated
+        // PNGs via files_to_send, so the contract must consume that list
+        // instead of a recursive workspace glob that could match stale
+        // PNGs from a previous turn.
         let policy = WorkspacePolicy::for_session();
         let cards = policy
             .spawn_tasks
@@ -2609,18 +2597,23 @@ ignore = []
             _ => None,
         });
 
-        let (format, source, _extension, glob) = magic.expect(
+        let (format, source, extension, glob) = magic.expect(
             "mofa_cards contract must declare MagicBytes(Png) — see workspace_policy.rs:1043",
         );
         assert_eq!(format, MagicByteKind::Png);
         assert_eq!(
             source,
-            ValidatorFileSource::Glob,
-            "mofa_cards must keep `Glob` until octos #1041 lands the plugin-emission fix"
+            ValidatorFileSource::SpawnOnlyFiles,
+            "mofa_cards MagicBytes must opt into spawn_only_files (octos #1041)"
+        );
+        assert_eq!(
+            extension.as_deref(),
+            Some("png"),
+            "mofa_cards MagicBytes must filter to png outputs"
         );
         assert!(
-            glob.contains("**/*.png"),
-            "mofa_cards Glob source must keep the recursive PNG pattern; got: {glob}"
+            !glob.contains("**/*.png"),
+            "mofa_cards must not pin a recursive PNG glob; got: {glob}"
         );
     }
 

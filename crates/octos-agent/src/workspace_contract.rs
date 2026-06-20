@@ -1468,18 +1468,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mofa_cards_contract_satisfies_when_png_files_match_recursive_glob() {
-        // P1-5: mofa_cards emits PNGs under a per-task card_dir.
+    async fn mofa_cards_contract_satisfies_reported_pngs_at_arbitrary_depth_octos_1041() {
+        // octos #1041: mofa_cards emits PNGs under a caller-supplied
+        // card_dir and reports every generated image via files_to_send.
+        // The contract must accept those exact reported paths even when
+        // they live under an arbitrary nested card_dir.
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
-        let card_dir = temp.path().join("cards/abc");
+        let card_dir = temp.path().join("skill-output/cards/abc/deep/layout");
         std::fs::create_dir_all(&card_dir).unwrap();
-        std::fs::write(card_dir.join("a.png"), PNG_1X1).unwrap();
+        let card = card_dir.join("a.png");
+        std::fs::write(&card, PNG_1X1).unwrap();
 
         let result = enforce_spawn_task_contract_with_args(
             &ToolRegistry::with_builtins(temp.path()),
             "mofa_cards",
             "tool-call-cards",
+            std::slice::from_ref(&card),
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"card_dir": "skill-output/cards/abc/deep/layout"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert!(
+                    output_files.iter().any(|p| p.ends_with("a.png")),
+                    "satisfied result must surface the reported card PNG, got {output_files:?}"
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_cards_contract_does_not_pass_on_stale_unrelated_png_octos_1041() {
+        // octos #1041: mofa_cards must consume files_to_send, not a
+        // workspace `**/*.png` glob. A stale valid PNG in the workspace
+        // must not satisfy a run where the plugin reported no files.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        let stale = temp.path().join("stale-card.png");
+        std::fs::write(&stale, PNG_1X1).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_cards",
+            "tool-call-cards-stale",
             &[],
             UNIX_EPOCH,
             None,
@@ -1488,8 +1525,14 @@ mod tests {
         .await;
 
         match result {
-            SpawnTaskContractResult::Satisfied { .. } => {}
-            other => panic!("expected success, got {other:?}"),
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert_eq!(notify_user.as_deref(), Some("Card generation failed"));
+                assert!(
+                    error.contains("files_to_send") || error.contains("spawn_only_files"),
+                    "expected missing files_to_send/spawn_only_files failure, got: {error}"
+                );
+            }
+            other => panic!("expected failure for missing card files_to_send, got {other:?}"),
         }
     }
 
