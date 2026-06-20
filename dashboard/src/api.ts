@@ -28,16 +28,48 @@ const BASE = '/api/admin'
 /// common "auth failed, hand back to the login flow" branch.
 export class ApiError extends Error {
   public readonly status: number
+  public readonly code?: string
+  public readonly details?: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string, details?: unknown) {
     super(message || `HTTP ${status}`)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
+    this.details = details
   }
 
   static isAuthError(err: unknown): boolean {
     return err instanceof ApiError && (err.status === 401 || err.status === 403)
   }
+}
+
+type ErrorBody = {
+  code?: unknown
+  message?: unknown
+  error?: unknown
+  details?: unknown
+}
+
+async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  const text = await res.text()
+  if (text.trim()) {
+    try {
+      const body = JSON.parse(text) as ErrorBody
+      if (body && typeof body === 'object') {
+        const message = typeof body.message === 'string'
+          ? body.message
+          : typeof body.error === 'string'
+            ? body.error
+            : text
+        const code = typeof body.code === 'string' ? body.code : undefined
+        return new ApiError(res.status, message, code, body.details)
+      }
+    } catch {
+      // Fall through to the raw response body for legacy text errors.
+    }
+  }
+  return new ApiError(res.status, text)
 }
 
 export interface SkillRegistryPackage {
@@ -69,8 +101,7 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
@@ -81,8 +112,7 @@ async function requestNoContent(path: string, opts?: RequestInit): Promise<void>
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
 }
 
@@ -92,8 +122,7 @@ async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
@@ -104,8 +133,7 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
