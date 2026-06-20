@@ -581,7 +581,7 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
 
     if [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Enter the per-tenant tunnel token issued by your cloud operator"
+        echo "    Enter the shared frps auth token from your operator or cloud host"
         echo "    (registered in the cloud node's tenant store; written to metadatas.token):"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
