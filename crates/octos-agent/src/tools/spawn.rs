@@ -2647,20 +2647,27 @@ impl Tool for SpawnTool {
             .as_ref()
             .map(|worktree| worktree.path.clone())
             .unwrap_or_else(|| self.working_dir.clone());
-        let child_session_scope = match scoped_child_session_scope(
-            ctx.session_scope.as_ref(),
-            &child_working_dir,
-        ) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "Status: FAILED\nfailed to inherit session scope for worker worktree: {error}"
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
+        // Only rebind the session scope when this spawn gets its OWN git
+        // worktree. A shared spawn runs in the parent's workspace, so rebasing
+        // the scope onto `self.working_dir` — which in gateway/session-actor
+        // wiring is the factory cwd, outside the per-profile scope root — would
+        // wrongly fail the default (shared) spawn. Shared keeps the parent scope.
+        let child_session_scope = match worker_worktree.as_ref() {
+            Some(worktree) => {
+                match scoped_child_session_scope(ctx.session_scope.as_ref(), &worktree.path) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            output: format!(
+                                "Status: FAILED\nfailed to inherit session scope for worker worktree: {error}"
+                            ),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                }
             }
+            None => ctx.session_scope.clone(),
         };
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
