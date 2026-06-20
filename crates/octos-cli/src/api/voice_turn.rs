@@ -439,7 +439,7 @@ fn image_skill_call(
         VisualKind::Infographic => Some((
             "mofa_infographic",
             serde_json::json!({
-                "sections": [{ "text": d.brief }],
+                "sections": [{ "prompt": d.brief }],
                 "out": format!("{out}/infographic.png"),
             }),
         )),
