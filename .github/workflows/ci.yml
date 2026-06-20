@@ -88,6 +88,52 @@ jobs:
       - uses: actions/checkout@v6
       - uses: crate-ci/typos@v1.33.1
 
+  windows-deploy-script:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Windows deploy dry run
+        shell: pwsh
+        run: |
+          $deploy = & .\scripts\deploy.ps1 `
+            -HostName win.example.invalid `
+            -User deploy `
+            -Port 2222 `
+            -Version v0.0.0-test `
+            -RemoteRoot 'C:\octos-ci' `
+            -ServiceName OctosServeTest `
+            -ServePort 50080 `
+            -AuthToken test-token `
+            -DryRun 2>&1
+          $deployText = $deploy | Out-String
+          Write-Host $deployText
+          if ($deployText -notmatch '\$nssmExe install') {
+            throw 'deploy dry run did not include NSSM service registration'
+          }
+          if ($deployText -notmatch 'C:\\octos-ci') {
+            throw 'deploy dry run did not include the requested remote root'
+          }
+          if ($deployText -notmatch 'ssh -p 2222') {
+            throw 'deploy dry run did not include SSH port handling'
+          }
+
+          $uninstall = & .\scripts\deploy.ps1 `
+            -HostName win.example.invalid `
+            -RemoteRoot 'C:\octos-ci' `
+            -ServiceName OctosServeTest `
+            -Uninstall `
+            -Purge `
+            -DryRun 2>&1
+          $uninstallText = $uninstall | Out-String
+          Write-Host $uninstallText
+          if ($uninstallText -notmatch 'sc\.exe delete') {
+            throw 'uninstall dry run did not include sc.exe fallback'
+          }
+          if ($uninstallText -notmatch 'Remove-Item -Recurse -Force') {
+            throw 'uninstall dry run did not include purge behavior'
+          }
+
   check:
     runs-on: ubuntu-latest
     env:
