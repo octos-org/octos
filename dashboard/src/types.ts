@@ -12,6 +12,8 @@ export interface GatewaySettings {
   max_concurrent_sessions?: number | null
   browser_timeout_secs?: number | null
   max_output_tokens?: number | null
+  watchdog_enabled?: boolean | null
+  alerts_enabled?: boolean | null
 }
 
 export interface ChannelCredentials {
@@ -371,6 +373,17 @@ export interface AdminBotConfig {
 export interface MonitorStatus {
   watchdog_enabled: boolean
   alerts_enabled: boolean
+  profiles: MonitorProfileStatus[]
+}
+
+export interface MonitorProfileStatus {
+  id: string
+  name: string
+  enabled: boolean
+  watchdog_enabled: boolean
+  watchdog_override: boolean | null
+  alerts_enabled: boolean
+  alerts_override: boolean | null
 }
 
 // ── System Metrics ─────────────────────────────────────────────────
