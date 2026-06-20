@@ -93,7 +93,7 @@ export WECOM_BOT_SECRET="your_secret"
 
 | 问题 | 解决方案 |
 |---------|----------|
-| 仪表板无法访问 | 检查端口：`octos serve --port 8080`，打开 `http://localhost:8080/admin/` |
+| 仪表板无法访问 | 检查端口：`octos serve --port 50080`，打开 `http://localhost:50080/admin/` |
 | WSL2 端口未转发 | 重启 WSL：`wsl --shutdown` 然后重新打开终端 |
 | 服务无法启动 | 查看日志：`tail -f ~/.octos/serve.log`（macOS）或 `journalctl --user -u octos-serve`（Linux） |
 | Windows: 找不到 `octos` | 确保 `%USERPROFILE%\.cargo\bin` 在 PATH 中 |

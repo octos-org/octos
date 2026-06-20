@@ -307,7 +307,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # 安装到指定配置文件
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 安装程序会优先从技能注册表下载预编译二进制文件（SHA-256 校验），如有 `Cargo.toml` 则回退到 `cargo build --release`，如有 `package.json` 则运行 `npm install`。
@@ -325,16 +325,14 @@ octos skills search "web scraping"   # 搜索在线注册表
 
 ### 技能解析顺序
 
-技能按以下目录加载（优先级从高到低）：
+配置文件 gateway 按以下优先级加载技能：
 
-1. `.octos/plugins/`（旧版兼容）
-2. `.octos/skills/`（用户安装的自定义技能）
-3. `.octos/bundled-app-skills/`（预装应用技能）
-4. `.octos/platform-skills/`（平台技能：ASR/TTS）
-5. `~/.octos/plugins/`（全局旧版兼容）
-6. `~/.octos/skills/`（全局自定义技能）
+1. `~/.octos/profiles/<profile>/data/skills/`（配置文件作用域的自定义技能）
+2. `<octos_home>/bundled-app-skills/`（预装应用技能）
+3. `<octos_home>/platform-skills/`（管理员加载的平台技能）
 
-用户安装的技能会覆盖同名的预装技能。
+独立项目运行还可以加载 `<project>/.octos/plugins/` 和
+`<project>/.octos/skills/`。旧的 HOME 全局目录仅用于迁移，不再属于常规扫描路径。
 
 ---
 

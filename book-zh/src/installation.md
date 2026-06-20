@@ -200,7 +200,7 @@ wsl --install -d Ubuntu
 # 2. 打开 Ubuntu 终端，然后按照上方 Linux (Ubuntu) 的步骤操作
 ```
 
-在 WSL2 中运行 `octos serve` 时，可以通过 Windows 浏览器访问 `http://localhost:8080`（WSL2 自动转发端口）。
+在 WSL2 中运行 `octos serve` 时，可以通过 Windows 浏览器访问 `http://localhost:50080`（WSL2 自动转发端口）。
 
 ## Docker
 
@@ -296,7 +296,7 @@ sudo systemctl restart octos-serve
 | `octos: command not found` | 将 `~/.cargo/bin` 加入 PATH：`export PATH="$HOME/.cargo/bin:$PATH"` |
 | Linux 上编译失败 | 安装 `build-essential pkg-config libssl-dev` |
 | macOS 代码签名警告 | 执行：`codesign -s - ~/.cargo/bin/octos` |
-| 无法访问仪表板 | 检查端口：`octos serve --port 8080`，打开 `http://localhost:8080` |
+| 无法访问仪表板 | 检查端口：`octos serve --port 50080`，打开 `http://localhost:50080` |
 | WSL2 端口未转发 | 重启 WSL：`wsl --shutdown`，然后重新打开终端 |
 | 服务无法启动 | 检查日志：`tail -f ~/.octos/serve.log` 或 `journalctl --user -u octos-serve` |
 | 找不到 API 密钥 | 确保环境变量在服务环境中已设置，而不仅仅在你的 Shell 中 |

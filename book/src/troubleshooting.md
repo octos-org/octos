@@ -93,7 +93,7 @@ Messages over 4096 characters are automatically split into multiple chunks by oc
 
 | Problem | Solution |
 |---------|----------|
-| Dashboard not accessible | Check port: `octos serve --port 8080`, open `http://localhost:8080/admin/` |
+| Dashboard not accessible | Check port: `octos serve --port 50080`, open `http://localhost:50080/admin/` |
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
 | Service will not start | Check logs: `tail -f ~/.octos/serve.log` (macOS) or `journalctl --user -u octos-serve` (Linux) |
 | Windows: `octos` not found | Ensure `%USERPROFILE%\.cargo\bin` is in your PATH |

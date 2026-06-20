@@ -206,7 +206,7 @@ console.log(JSON.stringify({ output: result, success: true }));
 | `CostEvent` | `{step, provider, model, input_tokens, output_tokens, usd}` | 单步 LLM 成本，由 `cost_ledger.rs` 汇总 |
 | `ArtifactEvent` | `{name, path, mime}` | 产出物指针（文件路径或 URL） |
 
-宿主把 phase/progress 事件以 `tool_progress` SSE 形式转发给仪表盘/客户端，把 `CostEvent` 累加到父级单轮成本汇总；解析失败的行视为普通日志（按 `info` 级别记入 `LogEvent`）。
+宿主通过 UI Protocol 的任务/进度事件流把 phase/progress 事件转发给仪表盘/客户端，把 `CostEvent` 累加到父级单轮成本汇总；解析失败的行视为普通日志（按 `info` 级别记入 `LogEvent`）。
 
 合成式技能（`deep-search`、`deep-crawl`）在 `manifest.json` 声明 `synthesis_config` 与 `x-octos-host-config-keys`，宿主据此为合成调用注入正确的 LLM provider/model 并转发 API key 等环境变量。合同测试位于 `crates/octos-plugin/tests/lifecycle_sandbox.rs`。
 
@@ -281,7 +281,7 @@ manage_skills(action="search", query="comic")
 1. `<profile-data>/skills/` — 配置文件级（最高优先级）
 2. `<project-dir>/skills/` — 项目本地
 3. `<project-dir>/bundled-app-skills/` — 内置应用技能（常量 `BUNDLED_APP_SKILLS_DIR`，位于 `octos-agent/src/bootstrap.rs`，由 `Config::plugin_dirs_from_project` 扫描）
-4. `~/.octos/skills/` — 全局（最低优先级）
+4. `~/.octos/skills/` — 旧版全局目录，仅用于迁移
 
 ### 发布到注册中心
 
