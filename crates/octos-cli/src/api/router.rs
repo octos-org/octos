@@ -240,6 +240,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/my/profile/status",
             get(auth_handlers::my_gateway_status),
         )
+        .route(
+            "/api/my/profile/matrix/invites",
+            get(auth_handlers::my_matrix_invites),
+        )
+        .route(
+            "/api/my/profile/matrix/test",
+            post(auth_handlers::test_my_matrix_connection),
+        )
+        .route(
+            "/api/my/profile/matrix/invites/{room_id}/accept",
+            post(auth_handlers::accept_my_matrix_invite),
+        )
+        .route(
+            "/api/my/profile/matrix/invites/{room_id}/reject",
+            post(auth_handlers::reject_my_matrix_invite),
+        )
+        .route(
+            "/api/my/profile/matrix/invites/{room_id}/dismiss",
+            post(auth_handlers::dismiss_my_matrix_invite),
+        )
         .route("/api/my/profile/logs", get(auth_handlers::my_gateway_logs))
         .route(
             "/api/my/profile/whatsapp/qr",

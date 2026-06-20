@@ -105,7 +105,10 @@ pub fn register_all(
     entries: &[ChannelEntry],
     ctx: &mut ChannelRegistrationCtx<'_>,
 ) -> eyre::Result<()> {
-    for entry in entries {
+    for (channel_index, entry) in entries.iter().enumerate() {
+        // `channel_index` is only consumed by the matrix arm below.
+        #[cfg(not(feature = "matrix"))]
+        let _ = channel_index;
         match entry.channel_type.as_str() {
             "cli" => cli::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "telegram")]
@@ -147,6 +150,7 @@ pub fn register_all(
                 channel_mgr,
                 ctx.matrix_channel,
                 entry,
+                channel_index,
                 ctx.shutdown,
                 ctx.data_dir,
             )?,

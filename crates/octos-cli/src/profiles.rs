@@ -843,6 +843,9 @@ impl LlmModelSelectionConfig {
 }
 
 /// Channel-specific credentials (tagged by type).
+// The Matrix variant carries many user-mode fields; boxing a serde
+// `tag`-serialized struct variant isn't worth the (de)serialization churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ChannelCredentials {
@@ -921,9 +924,16 @@ pub enum ChannelCredentials {
         secret_env: String,
     },
     Matrix {
+        #[serde(default)]
         homeserver: String,
+        // Appservice-mode tokens. Optional so a user-mode entry (which has no
+        // appservice registration) still deserializes; emptiness is enforced
+        // downstream only for appservice mode.
+        #[serde(default)]
         as_token: String,
+        #[serde(default)]
         hs_token: String,
+        #[serde(default)]
         server_name: String,
         #[serde(default = "default_matrix_sender_localpart")]
         sender_localpart: String,
@@ -933,6 +943,36 @@ pub enum ChannelCredentials {
         port: u16,
         #[serde(default)]
         allowed_senders: Vec<String>,
+        /// Channel mode: "appservice" (default) or "user" (regular account login).
+        #[serde(default)]
+        mode: String,
+        /// User-mode: Matrix user ID, e.g. "@bot:matrix.org".
+        #[serde(default)]
+        user_id: String,
+        /// User-mode: access token (alternative to password login).
+        #[serde(default)]
+        access_token: String,
+        /// User-mode: account password (alternative to access token).
+        #[serde(default)]
+        password: String,
+        /// User-mode: device display name created at login.
+        #[serde(default)]
+        device_name: String,
+        /// User-mode: room allowlist used when group_policy is "allowlist".
+        #[serde(default)]
+        rooms: Vec<String>,
+        /// User-mode: invite auto-join policy: "off", "allowlist", or "always".
+        #[serde(default = "default_matrix_auto_join")]
+        auto_join: String,
+        /// User-mode: invite allowlist used when auto_join is "allowlist".
+        #[serde(default)]
+        auto_join_allowlist: Vec<String>,
+        /// User-mode: room/group policy: "open", "allowlist", or "disabled".
+        #[serde(default = "default_matrix_group_policy")]
+        group_policy: String,
+        /// User-mode: require an explicit bot mention or slash command in allowed rooms.
+        #[serde(default = "crate::config::default_true")]
+        require_mention: bool,
     },
     #[serde(rename = "qq-bot")]
     QQBot {
@@ -1020,6 +1060,12 @@ fn default_matrix_user_prefix() -> String {
 }
 fn default_matrix_port() -> u16 {
     8009
+}
+fn default_matrix_auto_join() -> String {
+    "off".into()
+}
+fn default_matrix_group_policy() -> String {
+    "allowlist".into()
 }
 fn default_qq_bot_secret_env() -> String {
     "QQ_BOT_CLIENT_SECRET".into()
@@ -1175,15 +1221,28 @@ impl ProfileStore {
     pub fn save_with_merge(&self, profile: &mut UserProfile) -> Result<()> {
         if let Some(existing) = self.get(&profile.id)? {
             for (key, new_val) in profile.config.env_vars.iter_mut() {
-                let is_masked = new_val.contains("***")
-                    || new_val.contains(KEYCHAIN_DISPLAY)
-                    || new_val.is_empty();
+                let is_masked = is_display_secret_value(new_val) || new_val.is_empty();
                 // Never overwrite the real stored value with a display artifact,
                 // but DO allow explicit "keychain:" marker (it's the real value).
                 if is_masked && new_val != crate::auth::KEYCHAIN_MARKER {
                     if let Some(old_val) = existing.config.env_vars.get(key) {
                         *new_val = old_val.clone();
                     }
+                }
+            }
+            for (idx, new_channel) in profile.config.channels.iter_mut().enumerate() {
+                let old_channel = existing
+                    .config
+                    .channels
+                    .iter()
+                    .find(|old_channel| channel_secret_identity_matches(new_channel, old_channel))
+                    .or_else(|| {
+                        existing.config.channels.get(idx).filter(|old_channel| {
+                            same_secret_channel_variant(new_channel, old_channel)
+                        })
+                    });
+                if let Some(old_channel) = old_channel {
+                    restore_masked_channel_secrets(new_channel, old_channel);
                 }
             }
         }
@@ -1436,12 +1495,19 @@ pub fn mask_secrets(profile: &UserProfile) -> UserProfile {
             *value = mask_value(value);
         }
     }
+    for channel in &mut masked.config.channels {
+        mask_channel_secrets(channel);
+    }
     masked.config.normalize_llm_contract();
     masked
 }
 
 /// Display string for keychain-backed values in API responses.
 const KEYCHAIN_DISPLAY: &str = "\u{1f511} (keychain)";
+
+pub(crate) fn is_display_secret_value(value: &str) -> bool {
+    value.contains("***") || value.contains(KEYCHAIN_DISPLAY)
+}
 
 fn mask_value(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -1454,6 +1520,153 @@ fn mask_value(s: &str) -> String {
         "***".into()
     } else {
         String::new()
+    }
+}
+
+fn mask_channel_secrets(channel: &mut ChannelCredentials) {
+    match channel {
+        ChannelCredentials::Api {
+            auth_token: Some(token),
+            ..
+        } => {
+            *token = mask_value(token);
+        }
+        ChannelCredentials::Matrix {
+            as_token,
+            hs_token,
+            access_token,
+            password,
+            ..
+        } => {
+            *as_token = mask_value(as_token);
+            *hs_token = mask_value(hs_token);
+            *access_token = mask_value(access_token);
+            *password = mask_value(password);
+        }
+        _ => {}
+    }
+}
+
+fn restore_masked_channel_secrets(
+    new_channel: &mut ChannelCredentials,
+    old_channel: &ChannelCredentials,
+) {
+    match (new_channel, old_channel) {
+        (
+            ChannelCredentials::Api {
+                auth_token: new_token,
+                ..
+            },
+            ChannelCredentials::Api {
+                auth_token: old_token,
+                ..
+            },
+        ) => restore_masked_optional_secret(new_token, old_token),
+        (
+            ChannelCredentials::Matrix {
+                as_token: new_as_token,
+                hs_token: new_hs_token,
+                access_token: new_access_token,
+                password: new_password,
+                ..
+            },
+            ChannelCredentials::Matrix {
+                as_token: old_as_token,
+                hs_token: old_hs_token,
+                access_token: old_access_token,
+                password: old_password,
+                ..
+            },
+        ) => {
+            restore_masked_secret(new_as_token, old_as_token);
+            restore_masked_secret(new_hs_token, old_hs_token);
+            restore_masked_secret(new_access_token, old_access_token);
+            restore_masked_secret(new_password, old_password);
+        }
+        _ => {}
+    }
+}
+
+fn same_secret_channel_variant(
+    new_channel: &ChannelCredentials,
+    old_channel: &ChannelCredentials,
+) -> bool {
+    matches!(
+        (new_channel, old_channel),
+        (
+            ChannelCredentials::Api { .. },
+            ChannelCredentials::Api { .. }
+        ) | (
+            ChannelCredentials::Matrix { .. },
+            ChannelCredentials::Matrix { .. }
+        )
+    )
+}
+
+fn channel_secret_identity_matches(
+    new_channel: &ChannelCredentials,
+    old_channel: &ChannelCredentials,
+) -> bool {
+    match (new_channel, old_channel) {
+        (
+            ChannelCredentials::Api { port: new_port, .. },
+            ChannelCredentials::Api { port: old_port, .. },
+        ) => new_port == old_port,
+        (
+            ChannelCredentials::Matrix {
+                homeserver: new_homeserver,
+                mode: new_mode,
+                user_id: new_user_id,
+                server_name: new_server_name,
+                sender_localpart: new_sender_localpart,
+                user_prefix: new_user_prefix,
+                port: new_port,
+                ..
+            },
+            ChannelCredentials::Matrix {
+                homeserver: old_homeserver,
+                mode: old_mode,
+                user_id: old_user_id,
+                server_name: old_server_name,
+                sender_localpart: old_sender_localpart,
+                user_prefix: old_user_prefix,
+                port: old_port,
+                ..
+            },
+        ) => {
+            if !new_mode.eq_ignore_ascii_case(old_mode) {
+                return false;
+            }
+            let same_homeserver = !new_homeserver.trim().is_empty()
+                && new_homeserver.trim_end_matches('/') == old_homeserver.trim_end_matches('/');
+            if new_mode.eq_ignore_ascii_case("user") {
+                same_homeserver && !new_user_id.trim().is_empty() && new_user_id == old_user_id
+            } else {
+                same_homeserver
+                    && new_port == old_port
+                    && !new_server_name.trim().is_empty()
+                    && new_server_name == old_server_name
+                    && new_sender_localpart == old_sender_localpart
+                    && new_user_prefix == old_user_prefix
+            }
+        }
+        _ => false,
+    }
+}
+
+fn restore_masked_secret(new_value: &mut String, old_value: &str) {
+    if is_display_secret_value(new_value) {
+        *new_value = old_value.to_string();
+    }
+}
+
+fn restore_masked_optional_secret(new_value: &mut Option<String>, old_value: &Option<String>) {
+    let should_restore = new_value
+        .as_deref()
+        .map(is_display_secret_value)
+        .unwrap_or(false);
+    if should_restore {
+        *new_value = old_value.clone();
     }
 }
 
@@ -1756,19 +1969,58 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             user_prefix,
             port,
             allowed_senders,
-        } => serde_json::json!({
-            "type": "matrix",
-            "allowed_senders": allowed_senders,
-            "settings": {
-                "homeserver": homeserver,
-                "as_token": as_token,
-                "hs_token": hs_token,
-                "server_name": server_name,
-                "sender_localpart": sender_localpart,
-                "user_prefix": user_prefix,
-                "port": port,
+            mode,
+            user_id,
+            access_token,
+            password,
+            device_name,
+            rooms,
+            auto_join,
+            auto_join_allowlist,
+            group_policy,
+            require_mention,
+        } => {
+            let mut settings = serde_json::json!({ "homeserver": homeserver });
+            if mode.eq_ignore_ascii_case("user") {
+                // User-account (client) mode: log in as a regular Matrix user
+                // and long-poll `/sync`. Only emit the credentials that are set.
+                settings["mode"] = serde_json::json!("user");
+                settings["auto_join"] = serde_json::json!(auto_join);
+                settings["group_policy"] = serde_json::json!(group_policy);
+                settings["require_mention"] = serde_json::json!(require_mention);
+                if !user_id.is_empty() {
+                    settings["user_id"] = serde_json::json!(user_id);
+                }
+                if !access_token.is_empty() {
+                    settings["access_token"] = serde_json::json!(access_token);
+                }
+                if !password.is_empty() {
+                    settings["password"] = serde_json::json!(password);
+                }
+                if !device_name.is_empty() {
+                    settings["device_name"] = serde_json::json!(device_name);
+                }
+                if !rooms.is_empty() {
+                    settings["rooms"] = serde_json::json!(rooms);
+                }
+                if !auto_join_allowlist.is_empty() {
+                    settings["auto_join_allowlist"] = serde_json::json!(auto_join_allowlist);
+                }
+            } else {
+                // Appservice mode (default): homeserver-side registration.
+                settings["as_token"] = serde_json::json!(as_token);
+                settings["hs_token"] = serde_json::json!(hs_token);
+                settings["server_name"] = serde_json::json!(server_name);
+                settings["sender_localpart"] = serde_json::json!(sender_localpart);
+                settings["user_prefix"] = serde_json::json!(user_prefix);
+                settings["port"] = serde_json::json!(port);
             }
-        }),
+            serde_json::json!({
+                "type": "matrix",
+                "allowed_senders": allowed_senders,
+                "settings": settings,
+            })
+        }
         ChannelCredentials::QQBot {
             app_id,
             client_secret_env,
@@ -2613,6 +2865,32 @@ mod tests {
                     ("SHORT".into(), "abc".into()),
                 ]
                 .into(),
+                channels: vec![
+                    ChannelCredentials::Api {
+                        port: 9911,
+                        auth_token: Some("api-token-secret".into()),
+                    },
+                    ChannelCredentials::Matrix {
+                        homeserver: "https://matrix.example.org".into(),
+                        as_token: "as-token-secret".into(),
+                        hs_token: "hs-token-secret".into(),
+                        server_name: "example.org".into(),
+                        sender_localpart: "octos".into(),
+                        user_prefix: "octos_".into(),
+                        port: 8009,
+                        allowed_senders: Vec::new(),
+                        mode: "user".into(),
+                        user_id: "@bot:example.org".into(),
+                        access_token: "syt_access_token_secret".into(),
+                        password: "matrix-password".into(),
+                        device_name: "octos".into(),
+                        rooms: Vec::new(),
+                        auto_join: "off".into(),
+                        auto_join_allowlist: Vec::new(),
+                        group_policy: "allowlist".into(),
+                        require_mention: true,
+                    },
+                ],
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -2622,6 +2900,24 @@ mod tests {
         let masked = mask_secrets(&profile);
         assert_eq!(masked.config.env_vars["API_KEY"], "sk-1***def");
         assert_eq!(masked.config.env_vars["SHORT"], "***");
+        let ChannelCredentials::Api { auth_token, .. } = &masked.config.channels[0] else {
+            panic!("expected api channel");
+        };
+        assert_eq!(auth_token.as_deref(), Some("api-***ret"));
+        let ChannelCredentials::Matrix {
+            as_token,
+            hs_token,
+            access_token,
+            password,
+            ..
+        } = &masked.config.channels[1]
+        else {
+            panic!("expected matrix channel");
+        };
+        assert_eq!(as_token, "as-t***ret");
+        assert_eq!(hs_token, "hs-t***ret");
+        assert_eq!(access_token, "syt_***ret");
+        assert_eq!(password, "matr***ord");
     }
 
     #[test]
@@ -2701,6 +2997,236 @@ mod tests {
         assert_eq!(loaded.config.env_vars["API_KEY"], "sk-real-secret-key");
         assert_eq!(loaded.config.env_vars["OTHER"], "new-value");
         assert_eq!(loaded.config.env_vars["NEW_KEY"], "brand-new");
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_masked_channel_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let original = UserProfile {
+            id: "channel-merge".into(),
+            name: "Channel Merge".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                channels: vec![
+                    ChannelCredentials::Api {
+                        port: 9911,
+                        auth_token: Some("api-real-token".into()),
+                    },
+                    ChannelCredentials::Matrix {
+                        homeserver: "https://old.example.org".into(),
+                        as_token: "as-real-token".into(),
+                        hs_token: "hs-real-token".into(),
+                        server_name: "old.example.org".into(),
+                        sender_localpart: "octos".into(),
+                        user_prefix: "octos_".into(),
+                        port: 8009,
+                        allowed_senders: Vec::new(),
+                        mode: "user".into(),
+                        user_id: "@bot:old.example.org".into(),
+                        access_token: "syt_real_access_token".into(),
+                        password: "real-password".into(),
+                        device_name: "old-device".into(),
+                        rooms: Vec::new(),
+                        auto_join: "off".into(),
+                        auto_join_allowlist: Vec::new(),
+                        group_policy: "allowlist".into(),
+                        require_mention: true,
+                    },
+                ],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        let mut updated = original.clone();
+        let ChannelCredentials::Api { auth_token, .. } = &mut updated.config.channels[0] else {
+            panic!("expected api channel");
+        };
+        *auth_token = Some("api-***ken".into());
+        let ChannelCredentials::Matrix {
+            homeserver,
+            as_token,
+            hs_token,
+            access_token,
+            password,
+            device_name,
+            ..
+        } = &mut updated.config.channels[1]
+        else {
+            panic!("expected matrix channel");
+        };
+        *homeserver = "https://new.example.org".into();
+        *as_token = "as-r***ken".into();
+        *hs_token = "hs-r***ken".into();
+        *access_token = "syt_***ken".into();
+        *password = "***".into();
+        *device_name = "new-device".into();
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("channel-merge").unwrap().unwrap();
+        let ChannelCredentials::Api { auth_token, .. } = &loaded.config.channels[0] else {
+            panic!("expected api channel");
+        };
+        assert_eq!(auth_token.as_deref(), Some("api-real-token"));
+        let ChannelCredentials::Matrix {
+            homeserver,
+            as_token,
+            hs_token,
+            access_token,
+            password,
+            device_name,
+            ..
+        } = &loaded.config.channels[1]
+        else {
+            panic!("expected matrix channel");
+        };
+        assert_eq!(homeserver, "https://new.example.org");
+        assert_eq!(as_token, "as-real-token");
+        assert_eq!(hs_token, "hs-real-token");
+        assert_eq!(access_token, "syt_real_access_token");
+        assert_eq!(password, "real-password");
+        assert_eq!(device_name, "new-device");
+    }
+
+    #[test]
+    fn test_save_with_merge_allows_clearing_channel_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let original = UserProfile {
+            id: "channel-clear".into(),
+            name: "Channel Clear".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                channels: vec![ChannelCredentials::Matrix {
+                    homeserver: "https://matrix.example.org".into(),
+                    as_token: String::new(),
+                    hs_token: String::new(),
+                    server_name: String::new(),
+                    sender_localpart: "octos".into(),
+                    user_prefix: "octos_".into(),
+                    port: 8009,
+                    allowed_senders: Vec::new(),
+                    mode: "user".into(),
+                    user_id: "@bot:example.org".into(),
+                    access_token: "syt_old_access_token".into(),
+                    password: "old-password".into(),
+                    device_name: "octos".into(),
+                    rooms: Vec::new(),
+                    auto_join: "off".into(),
+                    auto_join_allowlist: Vec::new(),
+                    group_policy: "allowlist".into(),
+                    require_mention: true,
+                }],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        let mut updated = original.clone();
+        let ChannelCredentials::Matrix {
+            access_token,
+            password,
+            ..
+        } = &mut updated.config.channels[0]
+        else {
+            panic!("expected matrix channel");
+        };
+        *access_token = String::new();
+        *password = "new-password".into();
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("channel-clear").unwrap().unwrap();
+        let ChannelCredentials::Matrix {
+            access_token,
+            password,
+            ..
+        } = &loaded.config.channels[0]
+        else {
+            panic!("expected matrix channel");
+        };
+        assert_eq!(access_token, "");
+        assert_eq!(password, "new-password");
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_channel_secret_after_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let matrix_channel = |user_id: &str, token: &str| ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: user_id.into(),
+            access_token: token.into(),
+            password: String::new(),
+            device_name: "octos".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        };
+
+        let original = UserProfile {
+            id: "channel-delete".into(),
+            name: "Channel Delete".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                channels: vec![
+                    matrix_channel("@first:example.org", "syt_first_token"),
+                    matrix_channel("@second:example.org", "syt_second_token"),
+                ],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        let mut updated = original.clone();
+        updated.config.channels.remove(0);
+        let ChannelCredentials::Matrix { access_token, .. } = &mut updated.config.channels[0]
+        else {
+            panic!("expected matrix channel");
+        };
+        *access_token = "syt_***ken".into();
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("channel-delete").unwrap().unwrap();
+        assert_eq!(loaded.config.channels.len(), 1);
+        let ChannelCredentials::Matrix {
+            user_id,
+            access_token,
+            ..
+        } = &loaded.config.channels[0]
+        else {
+            panic!("expected matrix channel");
+        };
+        assert_eq!(user_id, "@second:example.org");
+        assert_eq!(access_token, "syt_second_token");
     }
 
     #[test]
@@ -3684,5 +4210,58 @@ mod tests {
         assert_eq!(json["sender_localpart"], "bot");
         assert_eq!(json["user_prefix"], "bot_");
         assert_eq!(json["port"], 8009);
+    }
+
+    #[test]
+    fn test_matrix_user_mode_channel_to_entry_emits_account_settings() {
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "mode": "user",
+            "homeserver": "https://matrix.org",
+            "access_token": "syt_token",
+            "rooms": ["!a:matrix.org", "!b:matrix.org"],
+            "auto_join": "allowlist",
+            "auto_join_allowlist": ["!a:matrix.org"],
+            "group_policy": "allowlist",
+            "require_mention": true,
+        }))
+        .unwrap();
+
+        let entry = channel_to_entry(&channel);
+        assert_eq!(entry["type"], "matrix");
+        let settings = &entry["settings"];
+        assert_eq!(settings["mode"], "user");
+        assert_eq!(settings["homeserver"], "https://matrix.org");
+        assert_eq!(settings["access_token"], "syt_token");
+        assert_eq!(settings["rooms"][0], "!a:matrix.org");
+        assert_eq!(settings["auto_join"], "allowlist");
+        assert_eq!(settings["auto_join_allowlist"][0], "!a:matrix.org");
+        assert_eq!(settings["group_policy"], "allowlist");
+        assert_eq!(settings["require_mention"], true);
+        // Appservice-only keys must not leak into a user-mode entry.
+        assert!(settings.get("as_token").is_none());
+        assert!(settings.get("hs_token").is_none());
+        assert!(settings.get("port").is_none());
+    }
+
+    #[test]
+    fn test_matrix_user_mode_password_login_deserializes_without_appservice_tokens() {
+        // A user-mode entry omits as_token/hs_token entirely; this must still
+        // deserialize (regression guard for the now-optional appservice fields).
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "mode": "user",
+            "homeserver": "https://matrix.org",
+            "user_id": "@bot:matrix.org",
+            "password": "secret",
+            "device_name": "octos-gw",
+        }))
+        .unwrap();
+
+        let entry = channel_to_entry(&channel);
+        let settings = &entry["settings"];
+        assert_eq!(settings["user_id"], "@bot:matrix.org");
+        assert_eq!(settings["password"], "secret");
+        assert_eq!(settings["device_name"], "octos-gw");
     }
 }

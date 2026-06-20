@@ -10,11 +10,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::AppState;
 use super::admin::ProfileResponse;
 use super::handlers::response_path_for_profile_file;
-use crate::profiles::mask_secrets;
+use crate::profiles::{ChannelCredentials, UserProfile, is_display_secret_value, mask_secrets};
 use crate::user_store::{User, UserRole};
 
 use super::router::AuthIdentity;
@@ -1301,6 +1302,855 @@ pub async fn set_my_voice(
         ok: true,
         voice: canonical,
     }))
+}
+
+// ── Matrix invite review endpoints ────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct MatrixUserChannelConfig {
+    homeserver: String,
+    user_id: Option<String>,
+    access_token: Option<String>,
+    password: Option<String>,
+    device_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MatrixResolvedLogin {
+    access_token: String,
+    user_id: String,
+    device_id: Option<String>,
+    logout_after: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MatrixSyncProbe {
+    joined_rooms: usize,
+    pending_invites: usize,
+    has_next_batch: bool,
+    pending_invite_details: Vec<MatrixSyncInviteSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MatrixSyncInviteSummary {
+    room_id: String,
+    room_name: Option<String>,
+    canonical_alias: Option<String>,
+    inviter: Option<String>,
+    membership_event_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MatrixInviteActionRequest {
+    #[serde(default)]
+    pub channel_index: Option<usize>,
+    #[serde(default)]
+    pub add_to_allowed_rooms: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MatrixTestConnectionRequest {
+    #[serde(default)]
+    pub channel_index: Option<usize>,
+    #[serde(default)]
+    pub channel: Option<MatrixTestChannelDraft>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct MatrixTestChannelDraft {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub homeserver: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+}
+
+fn matrix_user_channel_config(
+    profile: &UserProfile,
+    channel_index: usize,
+) -> Result<MatrixUserChannelConfig, (StatusCode, String)> {
+    let Some(channel) = profile.config.channels.get(channel_index) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Matrix channel index {channel_index} not found"),
+        ));
+    };
+
+    let ChannelCredentials::Matrix {
+        homeserver,
+        mode,
+        user_id,
+        access_token,
+        password,
+        device_name,
+        ..
+    } = channel
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Channel index {channel_index} is not a Matrix channel"),
+        ));
+    };
+
+    if !mode.eq_ignore_ascii_case("user") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matrix invite review is only supported for user-account mode".into(),
+        ));
+    }
+
+    let has_token = !access_token.trim().is_empty();
+    let has_password_login = !user_id.trim().is_empty() && !password.trim().is_empty();
+    if !has_token && !has_password_login {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matrix user channel requires an access token or user_id + password".into(),
+        ));
+    }
+    if !has_token {
+        validate_matrix_user_id(user_id)?;
+    }
+
+    let homeserver = if homeserver.trim().is_empty() {
+        "http://localhost:6167".to_string()
+    } else {
+        homeserver.trim_end_matches('/').to_string()
+    };
+
+    Ok(MatrixUserChannelConfig {
+        homeserver,
+        user_id: non_empty_string(user_id),
+        access_token: non_empty_string(access_token),
+        password: non_empty_string(password),
+        device_name: non_empty_string(device_name),
+    })
+}
+
+fn matrix_test_channel_config(
+    profile: &UserProfile,
+    request: &MatrixTestConnectionRequest,
+) -> Result<MatrixUserChannelConfig, (StatusCode, String)> {
+    let draft = request.channel.as_ref();
+    if let Some(mode) = draft.and_then(|channel| non_empty_string_opt(channel.mode.as_deref())) {
+        if !mode.eq_ignore_ascii_case("user") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Matrix connection test is only supported for user-account mode".into(),
+            ));
+        }
+    }
+
+    let mut config = match request
+        .channel_index
+        .or_else(|| first_matrix_user_channel_index(profile))
+    {
+        Some(channel_index) => matrix_user_channel_config(profile, channel_index)?,
+        None => MatrixUserChannelConfig {
+            homeserver: "http://localhost:6167".into(),
+            user_id: None,
+            access_token: None,
+            password: None,
+            device_name: None,
+        },
+    };
+
+    if let Some(channel) = draft {
+        if let Some(value) = non_empty_string_opt(channel.homeserver.as_deref()) {
+            config.homeserver = value.trim_end_matches('/').to_string();
+        }
+        if let Some(value) = non_empty_string_opt(channel.user_id.as_deref()) {
+            config.user_id = Some(value);
+        }
+        if let Some(value) = non_display_secret_string_opt(channel.access_token.as_deref()) {
+            config.access_token = Some(value);
+        }
+        if let Some(value) = non_display_secret_string_opt(channel.password.as_deref()) {
+            config.password = Some(value);
+        }
+        if let Some(value) = non_empty_string_opt(channel.device_name.as_deref()) {
+            config.device_name = Some(value);
+        }
+    }
+
+    if config.access_token.is_none() && (config.user_id.is_none() || config.password.is_none()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matrix user channel requires an access token or user_id + password".into(),
+        ));
+    }
+    if config.access_token.is_none() {
+        if let Some(user_id) = config.user_id.as_deref() {
+            validate_matrix_user_id(user_id)?;
+        }
+    }
+
+    Ok(config)
+}
+
+fn first_matrix_user_channel_index(profile: &UserProfile) -> Option<usize> {
+    profile
+        .config
+        .channels
+        .iter()
+        .enumerate()
+        .find_map(|(idx, channel)| match channel {
+            ChannelCredentials::Matrix { mode, .. } if mode.eq_ignore_ascii_case("user") => {
+                Some(idx)
+            }
+            _ => None,
+        })
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn non_empty_string_opt(value: Option<&str>) -> Option<String> {
+    value.and_then(non_empty_string)
+}
+
+fn non_display_secret_string_opt(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || is_display_secret_value(trimmed) {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn validate_matrix_user_id(user_id: &str) -> Result<(), (StatusCode, String)> {
+    let trimmed = user_id.trim();
+    if is_matrix_full_user_id(trimmed) || is_matrix_login_localpart(trimmed) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Matrix login user must be a localpart like octos or a full Matrix ID like @octos:octos.meldry.com; do not use octos:octos.meldry.com without @.".into(),
+    ))
+}
+
+fn is_matrix_full_user_id(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('@') else {
+        return false;
+    };
+    let Some((localpart, server_name)) = rest.split_once(':') else {
+        return false;
+    };
+    !localpart.is_empty() && !server_name.trim().is_empty()
+}
+
+fn is_matrix_login_localpart(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(':')
+        && !value.starts_with('@')
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'.'
+                    | b'_'
+                    | b'='
+                    | b'-'
+                    | b'/'
+                    | b'+'
+            )
+        })
+}
+
+fn matrix_percent_encode_path(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+fn matrix_api_url(homeserver: &str, path: &str) -> String {
+    format!("{}{}", homeserver.trim_end_matches('/'), path)
+}
+
+/// HTTP client for Matrix admin calls (whoami/login/join/leave/sync?timeout=0).
+///
+/// All of these are immediate requests — unlike the gateway's long-poll `/sync`
+/// — so a bounded timeout keeps a slow or unreachable user-supplied homeserver
+/// from holding an axum worker open indefinitely.
+fn matrix_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn resolve_matrix_login(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+) -> Result<MatrixResolvedLogin, (StatusCode, String)> {
+    if let Some(token) = config.access_token.as_deref() {
+        let url = matrix_api_url(&config.homeserver, "/_matrix/client/v3/account/whoami");
+        let resp = http
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Matrix whoami failed (status={status}): {body}"),
+            ));
+        }
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        let user_id = payload
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| config.user_id.clone())
+            .ok_or((
+                StatusCode::BAD_GATEWAY,
+                "Matrix whoami response missing user_id".into(),
+            ))?;
+        let device_id = payload
+            .get("device_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        return Ok(MatrixResolvedLogin {
+            access_token: token.to_string(),
+            user_id,
+            device_id,
+            logout_after: false,
+        });
+    }
+
+    let user_id = config
+        .user_id
+        .as_deref()
+        .ok_or((StatusCode::BAD_REQUEST, "Matrix user_id is required".into()))?;
+    let password = config.password.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "Matrix password is required".into(),
+    ))?;
+    let body = json!({
+        "type": "m.login.password",
+        "identifier": { "type": "m.id.user", "user": user_id },
+        "password": password,
+        "initial_device_display_name": config.device_name.as_deref().unwrap_or("octos"),
+    });
+    let url = matrix_api_url(&config.homeserver, "/_matrix/client/v3/login");
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((StatusCode::BAD_GATEWAY, matrix_login_error(status, &body)));
+    }
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let token = payload
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Matrix login response missing access_token".into(),
+        ))?;
+    let user_id = payload
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| user_id.to_string());
+    let device_id = payload
+        .get("device_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Ok(MatrixResolvedLogin {
+        access_token: token.to_string(),
+        user_id,
+        device_id,
+        logout_after: true,
+    })
+}
+
+fn matrix_login_error(status: reqwest::StatusCode, body: &str) -> String {
+    let server_error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| body.trim().to_string());
+    let lower = server_error.to_ascii_lowercase();
+    if lower.contains("delegated authentication") || lower.contains("oidc") {
+        return format!(
+            "Matrix password login is not available on this homeserver (status={status}): \
+             it uses delegated authentication/OIDC. Paste a valid Matrix access token in \
+             Access token, or enable password login on the homeserver."
+        );
+    }
+    if server_error.is_empty() {
+        format!("Matrix login failed (status={status})")
+    } else {
+        format!("Matrix login failed (status={status}): {server_error}")
+    }
+}
+
+async fn logout_matrix_login(
+    http: &reqwest::Client,
+    homeserver: &str,
+    login: &MatrixResolvedLogin,
+) {
+    if !login.logout_after {
+        return;
+    }
+    let url = matrix_api_url(homeserver, "/_matrix/client/v3/logout");
+    if let Err(e) = http
+        .post(&url)
+        .bearer_auth(&login.access_token)
+        .send()
+        .await
+    {
+        tracing::warn!(error = %e, "Matrix logout after invite action failed");
+    }
+}
+
+async fn matrix_join_room(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+    login: &MatrixResolvedLogin,
+    room_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/join",
+        matrix_percent_encode_path(room_id)
+    );
+    let url = matrix_api_url(&config.homeserver, &path);
+    let resp = http
+        .post(&url)
+        .bearer_auth(&login.access_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Matrix join room failed (status={status}): {body}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn matrix_leave_room(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+    login: &MatrixResolvedLogin,
+    room_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/leave",
+        matrix_percent_encode_path(room_id)
+    );
+    let url = matrix_api_url(&config.homeserver, &path);
+    let resp = http
+        .post(&url)
+        .bearer_auth(&login.access_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Matrix reject invite failed (status={status}): {body}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn matrix_probe_sync(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+    login: &MatrixResolvedLogin,
+) -> Result<MatrixSyncProbe, (StatusCode, String)> {
+    let url = matrix_api_url(&config.homeserver, "/_matrix/client/v3/sync?timeout=0");
+    let resp = http
+        .get(&url)
+        .bearer_auth(&login.access_token)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Matrix sync probe failed (status={status}): {body}"),
+        ));
+    }
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let rooms = payload.get("rooms");
+    let joined_rooms = rooms
+        .and_then(|rooms| rooms.get("join"))
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    let invite_rooms = rooms
+        .and_then(|rooms| rooms.get("invite"))
+        .and_then(serde_json::Value::as_object);
+    let pending_invites = invite_rooms.map_or(0, serde_json::Map::len);
+    let pending_invite_details = invite_rooms
+        .map(|rooms| matrix_sync_invite_details(rooms, &login.user_id))
+        .unwrap_or_default();
+    let has_next_batch = payload
+        .get("next_batch")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    Ok(MatrixSyncProbe {
+        joined_rooms,
+        pending_invites,
+        has_next_batch,
+        pending_invite_details,
+    })
+}
+
+fn matrix_sync_invite_details(
+    invite_rooms: &serde_json::Map<String, serde_json::Value>,
+    self_user_id: &str,
+) -> Vec<MatrixSyncInviteSummary> {
+    invite_rooms
+        .iter()
+        .map(|(room_id, room)| matrix_sync_invite_detail(room_id, room, self_user_id))
+        .collect()
+}
+
+fn matrix_sync_invite_detail(
+    room_id: &str,
+    room: &serde_json::Value,
+    self_user_id: &str,
+) -> MatrixSyncInviteSummary {
+    let mut summary = MatrixSyncInviteSummary {
+        room_id: room_id.to_string(),
+        room_name: None,
+        canonical_alias: None,
+        inviter: None,
+        membership_event_id: None,
+    };
+
+    let Some(events) = room
+        .get("invite_state")
+        .and_then(|state| state.get("events"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return summary;
+    };
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str);
+        let content = event.get("content").unwrap_or(&serde_json::Value::Null);
+        match event_type {
+            Some("m.room.name") if summary.room_name.is_none() => {
+                summary.room_name = content
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            Some("m.room.canonical_alias") if summary.canonical_alias.is_none() => {
+                summary.canonical_alias = content
+                    .get("alias")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            Some("m.room.member") => {
+                let membership = content
+                    .get("membership")
+                    .and_then(serde_json::Value::as_str);
+                let state_key = event.get("state_key").and_then(serde_json::Value::as_str);
+                if membership == Some("invite")
+                    && (state_key.is_none() || state_key == Some(self_user_id))
+                {
+                    summary.inviter = event
+                        .get("sender")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    summary.membership_event_id = event
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+fn resolve_invite_channel_index(
+    profile: &UserProfile,
+    store: &octos_bus::MatrixInviteStore,
+    room_id: &str,
+    requested: Option<usize>,
+) -> Result<usize, (StatusCode, String)> {
+    if let Some(channel_index) = requested {
+        return Ok(channel_index);
+    }
+    let invites = store
+        .list(true)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(invite) = invites.iter().find(|invite| invite.room_id == room_id) {
+        return Ok(invite.channel_index);
+    }
+    first_matrix_user_channel_index(profile).ok_or((
+        StatusCode::NOT_FOUND,
+        "No Matrix user-account channel configured".into(),
+    ))
+}
+
+fn add_room_to_matrix_allowlist(
+    profile: &mut UserProfile,
+    channel_index: usize,
+    room_id: &str,
+) -> Result<bool, (StatusCode, String)> {
+    let Some(channel) = profile.config.channels.get_mut(channel_index) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Matrix channel index {channel_index} not found"),
+        ));
+    };
+    let ChannelCredentials::Matrix { rooms, .. } = channel else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Channel index {channel_index} is not a Matrix channel"),
+        ));
+    };
+    if rooms.iter().any(|room| room == room_id || room == "*") {
+        return Ok(false);
+    }
+    rooms.push(room_id.to_string());
+    Ok(true)
+}
+
+/// POST /api/my/profile/matrix/test
+pub async fn test_my_matrix_connection(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<MatrixTestConnectionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let config = matrix_test_channel_config(&profile, &req)?;
+
+    let http = matrix_http_client();
+    let login = resolve_matrix_login(&http, &config).await?;
+    let sync_result = matrix_probe_sync(&http, &config, &login).await;
+    logout_matrix_login(&http, &config.homeserver, &login).await;
+    let probe = sync_result?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Matrix connection is healthy",
+        "homeserver": config.homeserver,
+        "user_id": login.user_id,
+        "device_id": login.device_id,
+        "joined_rooms": probe.joined_rooms,
+        "pending_invites": probe.pending_invites,
+        "pending_invite_details": probe.pending_invite_details,
+        "sync": {
+            "ok": true,
+            "has_next_batch": probe.has_next_batch,
+        },
+    })))
+}
+
+/// GET /api/my/profile/matrix/invites
+pub async fn my_matrix_invites(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let invites = store
+        .list(false)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "invites": invites })))
+}
+
+/// POST /api/my/profile/matrix/invites/:room_id/accept
+pub async fn accept_my_matrix_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(room_id): Path<String>,
+    Json(req): Json<MatrixInviteActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let mut profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let channel_index =
+        resolve_invite_channel_index(&profile, &store, &room_id, req.channel_index)?;
+    let config = matrix_user_channel_config(&profile, channel_index)?;
+
+    let http = matrix_http_client();
+    let login = resolve_matrix_login(&http, &config).await?;
+    let join_result = matrix_join_room(&http, &config, &login, &room_id).await;
+    logout_matrix_login(&http, &config.homeserver, &login).await;
+    join_result?;
+
+    let add_to_allowed_rooms = req.add_to_allowed_rooms.unwrap_or(true);
+    let allowlist_updated = if add_to_allowed_rooms {
+        add_room_to_matrix_allowlist(&mut profile, channel_index, &room_id)?
+    } else {
+        false
+    };
+    if allowlist_updated {
+        profile.updated_at = chrono::Utc::now();
+        ps.save_with_merge(&mut profile).map_err(|e| {
+            tracing::error!(profile = %profile.id, error = %e, "failed to save Matrix room allowlist");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+    }
+    store
+        .remove(channel_index, &room_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": if allowlist_updated {
+            "Matrix invite accepted and room added to allowed rooms"
+        } else {
+            "Matrix invite accepted"
+        },
+        "allowlist_updated": allowlist_updated,
+    })))
+}
+
+/// POST /api/my/profile/matrix/invites/:room_id/reject
+pub async fn reject_my_matrix_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(room_id): Path<String>,
+    Json(req): Json<MatrixInviteActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let channel_index =
+        resolve_invite_channel_index(&profile, &store, &room_id, req.channel_index)?;
+    let config = matrix_user_channel_config(&profile, channel_index)?;
+
+    let http = matrix_http_client();
+    let login = resolve_matrix_login(&http, &config).await?;
+    let leave_result = matrix_leave_room(&http, &config, &login, &room_id).await;
+    logout_matrix_login(&http, &config.homeserver, &login).await;
+    leave_result?;
+
+    store
+        .remove(channel_index, &room_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Matrix invite rejected",
+    })))
+}
+
+/// POST /api/my/profile/matrix/invites/:room_id/dismiss
+pub async fn dismiss_my_matrix_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(room_id): Path<String>,
+    Json(req): Json<MatrixInviteActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let channel_index =
+        resolve_invite_channel_index(&profile, &store, &room_id, req.channel_index)?;
+    let dismissed = store
+        .dismiss(channel_index, &room_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "dismissed": dismissed,
+        "message": "Matrix invite dismissed locally",
+    })))
 }
 
 // ── Soul endpoints ───────────────────────────────────────────────────
@@ -2766,6 +3616,248 @@ mod tests {
         headers.insert("Host", "localhost:3000".parse().unwrap());
         headers.insert("X-Profile-Id", profile_id.parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn matrix_percent_encode_path_encodes_room_ids() {
+        assert_eq!(
+            matrix_percent_encode_path("!room:example.org"),
+            "%21room%3Aexample.org"
+        );
+    }
+
+    #[test]
+    fn matrix_sync_invite_details_include_room_and_inviter() {
+        let invite_rooms = json!({
+            "!ops:example.org": {
+                "invite_state": {
+                    "events": [
+                        {
+                            "type": "m.room.name",
+                            "content": { "name": "Ops Room" }
+                        },
+                        {
+                            "type": "m.room.canonical_alias",
+                            "content": { "alias": "#ops:example.org" }
+                        },
+                        {
+                            "type": "m.room.member",
+                            "sender": "@alice:example.org",
+                            "state_key": "@octos:example.org",
+                            "event_id": "$invite1",
+                            "content": { "membership": "invite" }
+                        }
+                    ]
+                }
+            }
+        });
+        let invite_rooms = invite_rooms.as_object().unwrap();
+
+        let details = matrix_sync_invite_details(invite_rooms, "@octos:example.org");
+
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].room_id, "!ops:example.org");
+        assert_eq!(details[0].room_name.as_deref(), Some("Ops Room"));
+        assert_eq!(
+            details[0].canonical_alias.as_deref(),
+            Some("#ops:example.org")
+        );
+        assert_eq!(details[0].inviter.as_deref(), Some("@alice:example.org"));
+        assert_eq!(details[0].membership_event_id.as_deref(), Some("$invite1"));
+    }
+
+    #[test]
+    fn matrix_accept_adds_room_to_allowlist_once() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_token".into(),
+            password: String::new(),
+            device_name: "octos".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        assert!(add_room_to_matrix_allowlist(&mut profile, 0, "!room:example.org").unwrap());
+        assert!(!add_room_to_matrix_allowlist(&mut profile, 0, "!room:example.org").unwrap());
+        let ChannelCredentials::Matrix { rooms, .. } = &profile.config.channels[0] else {
+            panic!("expected matrix channel");
+        };
+        assert_eq!(rooms, &vec!["!room:example.org".to_string()]);
+    }
+
+    #[test]
+    fn matrix_test_config_overlays_draft_values() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://old.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@old:example.org".into(),
+            access_token: "old_token".into(),
+            password: String::new(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://new.example.org/".into()),
+                user_id: Some("@new:example.org".into()),
+                access_token: Some("new_token".into()),
+                password: None,
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.homeserver, "https://new.example.org");
+        assert_eq!(config.user_id.as_deref(), Some("@new:example.org"));
+        assert_eq!(config.access_token.as_deref(), Some("new_token"));
+        assert_eq!(config.device_name.as_deref(), Some("old-device"));
+    }
+
+    #[test]
+    fn matrix_test_config_ignores_masked_draft_secrets() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_real_access_token".into(),
+            password: "real-password".into(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: None,
+                user_id: None,
+                access_token: Some("syt_***ken".into()),
+                password: Some("***".into()),
+                device_name: Some("new-device".into()),
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(
+            config.access_token.as_deref(),
+            Some("syt_real_access_token")
+        );
+        assert_eq!(config.password.as_deref(), Some("real-password"));
+        assert_eq!(config.device_name.as_deref(), Some("new-device"));
+    }
+
+    #[test]
+    fn matrix_test_config_accepts_password_login_localpart() {
+        let profile = make_user_profile("matrix-user", "Matrix User");
+        let request = MatrixTestConnectionRequest {
+            channel_index: None,
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://matrix.example.org".into()),
+                user_id: Some("octos".into()),
+                access_token: None,
+                password: Some("secret".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.user_id.as_deref(), Some("octos"));
+    }
+
+    #[test]
+    fn matrix_test_config_accepts_password_login_full_user_id() {
+        let profile = make_user_profile("matrix-user", "Matrix User");
+        let request = MatrixTestConnectionRequest {
+            channel_index: None,
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://matrix.example.org".into()),
+                user_id: Some("@octos:octos.meldry.com".into()),
+                access_token: None,
+                password: Some("secret".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.user_id.as_deref(), Some("@octos:octos.meldry.com"));
+    }
+
+    #[test]
+    fn matrix_test_config_rejects_password_login_bare_localpart_with_server() {
+        let profile = make_user_profile("matrix-user", "Matrix User");
+        let request = MatrixTestConnectionRequest {
+            channel_index: None,
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://matrix.example.org".into()),
+                user_id: Some("bot:example.org".into()),
+                access_token: None,
+                password: Some("secret".into()),
+                device_name: None,
+            }),
+        };
+
+        let err = matrix_test_channel_config(&profile, &request).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("localpart like octos"));
+        assert!(
+            err.1
+                .contains("do not use octos:octos.meldry.com without @")
+        );
+    }
+
+    #[test]
+    fn matrix_login_error_explains_oidc_password_login_rejection() {
+        let message = matrix_login_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"errcode":"M_FORBIDDEN","error":"This server uses delegated authentication. Use the OIDC provider to log in."}"#,
+        );
+
+        assert!(message.contains("password login is not available"));
+        assert!(message.contains("Access token"));
+        assert!(!message.contains("M_FORBIDDEN"));
     }
 
     #[test]

@@ -795,7 +795,7 @@ impl MatrixChannel {
 /// Encodes characters that are not unreserved (per RFC 3986) and also encodes
 /// characters commonly found in Matrix identifiers that could conflict with
 /// URL parsing (`:`, `@`, `!`, `#`).
-fn percent_encode_path(s: &str) -> String {
+pub(crate) fn percent_encode_path(s: &str) -> String {
     let mut encoded = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {

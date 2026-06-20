@@ -109,7 +109,11 @@ keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api"]
+# `matrix` is pulled in unconditionally: the `/api/my/profile/matrix/*`
+# handlers and the admin dashboard's Matrix invite UI reference matrix-only
+# types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
+# without it.
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

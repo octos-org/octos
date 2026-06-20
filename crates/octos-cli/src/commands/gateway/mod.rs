@@ -224,11 +224,19 @@ mod tests {
             primary: Some(crate::profiles::LlmModelSelectionConfig {
                 family_id: Some("openai".into()),
                 model_id: Some("gpt-4o-mini".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    api_key_env: Some("OPENAI_API_KEY".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             fallbacks: vec![crate::profiles::LlmModelSelectionConfig {
                 family_id: Some("openai".into()),
                 model_id: Some("gpt-4o".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    api_key_env: Some("OPENAI_API_KEY".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -423,6 +431,132 @@ mod tests {
     }
 
     #[test]
+    fn matrix_defaults_to_appservice_mode() {
+        let entry = matrix_entry(serde_json::json!({}));
+        assert!(!matrix_is_user_mode(&entry));
+    }
+
+    #[test]
+    fn matrix_user_mode_detected_case_insensitive() {
+        let entry = matrix_entry(serde_json::json!({ MATRIX_SETTING_MODE: "User" }));
+        assert!(matrix_is_user_mode(&entry));
+    }
+
+    #[test]
+    fn matrix_user_settings_accept_access_token() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_HOMESERVER: "https://matrix.org",
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_ROOMS: ["!a:matrix.org", "!b:matrix.org"],
+        }));
+
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+
+        assert_eq!(settings.homeserver, "https://matrix.org");
+        assert_eq!(settings.access_token.as_deref(), Some("syt_token"));
+        assert!(settings.password.is_none());
+        assert_eq!(settings.rooms, vec!["!a:matrix.org", "!b:matrix.org"]);
+        assert_eq!(settings.auto_join, octos_bus::MatrixAutoJoin::Off);
+        assert_eq!(
+            settings.group_policy,
+            octos_bus::MatrixGroupPolicy::Allowlist
+        );
+        assert!(settings.require_mention);
+    }
+
+    #[test]
+    fn matrix_user_settings_copy_allowed_senders() {
+        let entry = crate::config::ChannelEntry {
+            channel_type: MATRIX_CHANNEL_TYPE.to_string(),
+            allowed_senders: vec!["@alice:matrix.org".into(), "@bob:matrix.org".into()],
+            settings: serde_json::json!({
+                MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+                MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            }),
+        };
+
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+
+        assert_eq!(
+            settings.allowed_senders,
+            vec![
+                "@alice:matrix.org".to_string(),
+                "@bob:matrix.org".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_user_settings_accept_openclaw_style_policy_keys() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            "autoJoin": "allowlist",
+            "autoJoinAllowlist": ["!ops:matrix.org", "#support:matrix.org"],
+            "groupPolicy": "open",
+            "requireMention": false,
+        }));
+
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+
+        assert_eq!(settings.auto_join, octos_bus::MatrixAutoJoin::Allowlist);
+        assert_eq!(
+            settings.auto_join_allowlist,
+            vec![
+                "!ops:matrix.org".to_string(),
+                "#support:matrix.org".to_string()
+            ]
+        );
+        assert_eq!(settings.group_policy, octos_bus::MatrixGroupPolicy::Open);
+        assert!(!settings.require_mention);
+    }
+
+    #[test]
+    fn matrix_user_settings_accept_password_login() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_USER_ID: "@bot:matrix.org",
+            MATRIX_SETTING_PASSWORD: "secret",
+            MATRIX_SETTING_DEVICE_NAME: "octos-gw",
+        }));
+
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+
+        assert_eq!(settings.user_id.as_deref(), Some("@bot:matrix.org"));
+        assert_eq!(settings.password.as_deref(), Some("secret"));
+        assert_eq!(settings.device_name.as_deref(), Some("octos-gw"));
+        assert!(settings.access_token.is_none());
+    }
+
+    #[test]
+    fn matrix_user_settings_require_credentials() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_USER_ID: "@bot:matrix.org",
+        }));
+
+        let err = MatrixUserChannelSettings::from_entry(&entry).unwrap_err();
+        assert!(err.to_string().contains(MATRIX_USER_MISSING_AUTH_ERROR));
+    }
+
+    #[test]
+    fn test_gateway_registers_matrix_user_channel() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut channel_mgr = ChannelManager::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let _ = register_matrix_user_channel(&mut channel_mgr, &settings, &shutdown, tmp.path(), 0);
+
+        assert!(channel_mgr.get_channel(MATRIX_CHANNEL_TYPE).is_some());
+    }
+
+    #[test]
     fn test_dispatch_unknown_profile_falls_back() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
@@ -492,6 +626,16 @@ mod tests {
                 user_prefix: "bot_".to_string(),
                 port: MATRIX_DEFAULT_PORT,
                 allowed_senders: vec![],
+                mode: String::new(),
+                user_id: String::new(),
+                access_token: String::new(),
+                password: String::new(),
+                device_name: String::new(),
+                rooms: vec![],
+                auto_join: "off".to_string(),
+                auto_join_allowlist: vec![],
+                group_policy: "allowlist".to_string(),
+                require_mention: true,
             });
         store.save(&parent).unwrap();
 
@@ -578,6 +722,16 @@ mod tests {
                 user_prefix: "bot_".to_string(),
                 port: MATRIX_DEFAULT_PORT,
                 allowed_senders: vec![],
+                mode: String::new(),
+                user_id: String::new(),
+                access_token: String::new(),
+                password: String::new(),
+                device_name: String::new(),
+                rooms: vec![],
+                auto_join: "off".to_string(),
+                auto_join_allowlist: vec![],
+                group_policy: "allowlist".to_string(),
+                require_mention: true,
             });
         store.save(&parent).unwrap();
 
@@ -651,6 +805,16 @@ mod tests {
                 user_prefix: "bot_".to_string(),
                 port: MATRIX_DEFAULT_PORT,
                 allowed_senders: vec!["@admin:localhost".to_string()],
+                mode: String::new(),
+                user_id: String::new(),
+                access_token: String::new(),
+                password: String::new(),
+                device_name: String::new(),
+                rooms: vec![],
+                auto_join: "off".to_string(),
+                auto_join_allowlist: vec![],
+                group_policy: "allowlist".to_string(),
+                require_mention: true,
             });
         store.save(&parent).unwrap();
 
