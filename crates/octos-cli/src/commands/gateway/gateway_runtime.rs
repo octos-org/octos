@@ -61,9 +61,23 @@ enum GatewayLoopEvent {
     Inbound(octos_core::InboundMessage),
 }
 
+fn handle_session_delete_recv(
+    session_id: Option<String>,
+    session_delete_rx_open: &mut bool,
+) -> Option<String> {
+    match session_id {
+        Some(id) => Some(id),
+        None => {
+            *session_delete_rx_open = false;
+            None
+        }
+    }
+}
+
 async fn next_gateway_loop_event(
     agent_handle: &mut octos_bus::AgentHandle,
     session_delete_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    session_delete_rx_open: &mut bool,
     shutdown: &AtomicBool,
     shutdown_notify: &Notify,
 ) -> GatewayLoopEvent {
@@ -80,8 +94,8 @@ async fn next_gateway_loop_event(
                 GatewayLoopEvent::Wake
             }
         }
-        session_id = session_delete_rx.recv() => {
-            if let Some(id) = session_id {
+        session_id = session_delete_rx.recv(), if *session_delete_rx_open => {
+            if let Some(id) = handle_session_delete_recv(session_id, session_delete_rx_open) {
                 GatewayLoopEvent::SessionDeleted(id)
             } else {
                 GatewayLoopEvent::Wake
@@ -1673,6 +1687,7 @@ impl GatewayRuntime {
     pub(super) async fn run(mut self) -> Result<()> {
         let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
         let shutdown_notify = self.shutdown_notify.clone();
+        let mut session_delete_rx_open = true;
 
         // Main loop: dispatch inbound messages to concurrent tasks
         loop {
@@ -1682,6 +1697,7 @@ impl GatewayRuntime {
             let mut inbound = match next_gateway_loop_event(
                 &mut self.agent_handle,
                 &mut self.session_delete_rx,
+                &mut session_delete_rx_open,
                 &self.shutdown,
                 &shutdown_notify,
             )
@@ -2135,11 +2151,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn should_mark_session_delete_receiver_closed_when_sender_dropped() {
+        let mut session_delete_rx_open = true;
+
+        let session_id = handle_session_delete_recv(None, &mut session_delete_rx_open);
+
+        assert!(session_id.is_none());
+        assert!(
+            !session_delete_rx_open,
+            "closed session delete receiver must be disabled to avoid a busy gateway loop"
+        );
+    }
+
+    #[test]
+    fn should_keep_session_delete_receiver_open_when_session_id_received() {
+        let mut session_delete_rx_open = true;
+
+        let session_id = handle_session_delete_recv(
+            Some("session-123".to_string()),
+            &mut session_delete_rx_open,
+        );
+
+        assert_eq!(session_id.as_deref(), Some("session-123"));
+        assert!(
+            session_delete_rx_open,
+            "open session delete receiver must keep accepting future delete events"
+        );
+    }
+
     #[tokio::test]
     async fn notify_wake_does_not_starve_next_inbound_message() {
         let (mut agent_handle, publisher) = octos_bus::create_bus();
         let inbound_tx = publisher.inbound_sender();
         let (_delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let mut session_delete_rx_open = true;
         let shutdown = AtomicBool::new(false);
         let shutdown_notify = Notify::new();
 
@@ -2147,6 +2193,7 @@ mod tests {
         match next_gateway_loop_event(
             &mut agent_handle,
             &mut delete_rx,
+            &mut session_delete_rx_open,
             &shutdown,
             &shutdown_notify,
         )
@@ -2160,6 +2207,7 @@ mod tests {
         match next_gateway_loop_event(
             &mut agent_handle,
             &mut delete_rx,
+            &mut session_delete_rx_open,
             &shutdown,
             &shutdown_notify,
         )
@@ -2167,6 +2215,48 @@ mod tests {
         {
             GatewayLoopEvent::Inbound(inbound) => assert_eq!(inbound.content, "hello"),
             _ => panic!("expected inbound message after wake"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_session_delete_receiver_does_not_starve_next_inbound_message() {
+        let (mut agent_handle, publisher) = octos_bus::create_bus();
+        let inbound_tx = publisher.inbound_sender();
+        let (delete_tx, mut delete_rx) = mpsc::unbounded_channel::<String>();
+        let mut session_delete_rx_open = true;
+        let shutdown = AtomicBool::new(false);
+        let shutdown_notify = Notify::new();
+
+        drop(delete_tx);
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &mut session_delete_rx_open,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Wake => {}
+            _ => panic!("expected closed session delete receiver wake"),
+        }
+        assert!(
+            !session_delete_rx_open,
+            "closed session delete receiver must be disabled after one wake"
+        );
+
+        inbound_tx.send(make_inbound("hello")).await.unwrap();
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &mut session_delete_rx_open,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Inbound(inbound) => assert_eq!(inbound.content, "hello"),
+            _ => panic!("expected inbound message after closed delete receiver wake"),
         }
     }
 }
