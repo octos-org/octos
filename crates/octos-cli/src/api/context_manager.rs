@@ -578,6 +578,58 @@ fn context_ledger_covers_history(manager: &ContextManager, messages: &[Message])
     max_source_seq + 1 >= messages.len()
 }
 
+/// #1477: drop a trailing `[[VISUAL:...]]` rich-output directive from an
+/// assistant reply, returning the speakable prefix. Self-contained twin of
+/// `api::voice_turn::strip_visual_marker` — this module is ALSO compiled
+/// WITHOUT the `api` feature (it is re-exported as `crate::context_manager` for
+/// `session_actor`), so it must not depend on the api-gated `voice_turn`. Only a
+/// TRAILING marker is removed (the closing `]]` ends the trimmed reply); a
+/// mid-text mention is left intact.
+fn strip_trailing_visual_marker(reply: &str) -> &str {
+    const OPEN: &str = "[[VISUAL:";
+    const CLOSE: &str = "]]";
+    let trimmed = reply.trim_end();
+    let Some(start) = trimmed.rfind(OPEN) else {
+        return reply;
+    };
+    let after = &trimmed[start + OPEN.len()..];
+    let Some(end) = after.find(CLOSE) else {
+        return reply;
+    };
+    // The marker must be the trailing token: nothing after its closing `]]`.
+    if start + OPEN.len() + end + CLOSE.len() == trimmed.len() {
+        trimmed[..start].trim_end()
+    } else {
+        reply
+    }
+}
+
+/// #1477: remove EVERY `[[VISUAL:...]]` span (not just a trailing one) — for
+/// scrubbing a free-form compaction summary that may have folded a marker in at
+/// an arbitrary position. Self-contained twin of
+/// `api::voice_turn::remove_all_visual_markers` (see
+/// [`strip_trailing_visual_marker`] for why this module cannot call into
+/// `voice_turn`). An unterminated `[[VISUAL:` drops the remainder.
+fn remove_all_visual_markers(s: &str) -> String {
+    const OPEN: &str = "[[VISUAL:";
+    const CLOSE: &str = "]]";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find(CLOSE) {
+            Some(end) => rest = &after[end + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// #1477: scrub the in-band `[[VISUAL:...]]` directive from items IMPORTED from
 /// a persisted snapshot or a forked parent. The record-time sanitizer in
 /// `record_message_with_source_ref` only covers freshly-recorded messages; items
@@ -592,7 +644,7 @@ fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<Transcrip
         .filter_map(|mut item| {
             match &mut item.kind {
                 TranscriptItemKind::AssistantFinal { content } => {
-                    let cleaned = crate::api::voice_turn::strip_visual_marker(content);
+                    let cleaned = strip_trailing_visual_marker(content);
                     if cleaned.len() != content.len() {
                         *content = cleaned.to_string();
                     }
@@ -603,7 +655,7 @@ fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<Transcrip
                 }
                 TranscriptItemKind::CompactionSummary { summary, .. } => {
                     if summary.contains("[[VISUAL:") {
-                        *summary = crate::api::voice_turn::remove_all_visual_markers(summary);
+                        *summary = remove_all_visual_markers(summary);
                     }
                 }
                 _ => {}
@@ -987,8 +1039,7 @@ impl ContextManager {
                 // for display — see octos-web `use-voice-conversation.ts`); the
                 // ContextManager is model-only, so cleaning here never touches
                 // those surfaces. No-op for a reply without a trailing marker.
-                let assistant_content =
-                    crate::api::voice_turn::strip_visual_marker(&message.content);
+                let assistant_content = strip_trailing_visual_marker(&message.content);
                 if !assistant_content.trim().is_empty() {
                     ids.push(self.record_item_with_source_ref(
                         TranscriptItemKind::AssistantFinal {
