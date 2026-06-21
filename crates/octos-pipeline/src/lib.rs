@@ -13,6 +13,7 @@ pub mod events;
 pub mod executor;
 pub mod fidelity;
 pub mod graph;
+pub mod guard;
 pub mod handler;
 pub mod host_context;
 pub mod human_gate;
@@ -45,6 +46,7 @@ pub use graph::{
     DeadlineAction, HandlerKind, MissionCheckpoint, NodeOutcome, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode, Subgraph, validate_pipeline_id,
 };
+pub use guard::{GuardContext, GuardDecision, PipelineGuard, TimeoutGuard, TokenBudgetGuard};
 pub use handler::{
     CodergenHandler, GateHandler, Handler, HandlerRegistry, NoopHandler, ShellHandler,
 };

@@ -36,6 +36,7 @@ async fn main() {
     );
 
     let config = ExecutorConfig {
+        guards: Vec::new(),
         default_provider: provider,
         provider_router: None,
         memory,
