@@ -1,5 +1,7 @@
 //! Chat command: interactive multi-turn conversation with an agent.
 
+use std::future::Future;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +11,8 @@ use colored::Colorize;
 use eyre::{Result, WrapErr};
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
-    Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, HookExecutor, ToolRegistry,
+    Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
+    HookExecutor, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolRegistry,
     read_workspace_policy,
 };
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
@@ -78,6 +81,73 @@ pub struct ChatCommand {
 
 /// Exit commands.
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
+
+struct CliApprovalRequester;
+
+#[async_trait::async_trait]
+impl ToolApprovalRequester for CliApprovalRequester {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // Serialize prompts: if two approval-gated tools run in the same turn,
+        // their stdin prompts/reads must not interleave — otherwise a single
+        // `y` could approve whichever request won the stdin race rather than
+        // the one the user meant. One prompt at a time, process-wide.
+        static PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = PROMPT_LOCK.lock().await;
+        tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
+            .await
+            .unwrap_or(ToolApprovalDecision::Deny)
+    }
+}
+
+fn prompt_for_cli_approval(request: ToolApprovalRequest) -> ToolApprovalDecision {
+    eprintln!();
+    eprintln!("{}", "Approval required".yellow().bold());
+    eprintln!("{}", request.title.bold());
+    eprintln!("{}", request.body);
+    if let Some(cwd) = request.cwd.as_deref() {
+        eprintln!("cwd: {cwd}");
+    }
+
+    if !io::stdin().is_terminal() {
+        eprintln!("No interactive terminal available; denying request.");
+        return ToolApprovalDecision::Deny;
+    }
+
+    eprint!("Approve once? [y/N] ");
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    match io::stdin().read_line(&mut answer) {
+        Ok(_) if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") => {
+            ToolApprovalDecision::Approve
+        }
+        _ => ToolApprovalDecision::Deny,
+    }
+}
+
+async fn with_chat_approval<F, T>(
+    approval_requester: Arc<dyn ToolApprovalRequester>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    octos_agent::tools::TOOL_APPROVAL_CTX
+        .scope(approval_requester, future)
+        .await
+}
+
+async fn process_chat_turn(
+    agent: &Agent,
+    input: &str,
+    history: &[Message],
+    approval_requester: Arc<dyn ToolApprovalRequester>,
+) -> Result<ConversationResponse> {
+    with_chat_approval(
+        approval_requester,
+        agent.process_message(input, history, vec![]),
+    )
+    .await
+}
 
 impl Executable for ChatCommand {
     fn execute(self) -> Result<()> {
@@ -591,9 +661,12 @@ impl ChatCommand {
             }
         }
 
+        let approval_requester: Arc<dyn ToolApprovalRequester> = Arc::new(CliApprovalRequester);
+
         // Single-message mode: send one message and exit
         if let Some(msg) = self.message {
-            let response = agent.process_message(&msg, &[], vec![]).await?;
+            let response =
+                process_chat_turn(&agent, &msg, &[], Arc::clone(&approval_requester)).await?;
             if !response.streamed {
                 println!("{}", response.content);
             }
@@ -675,13 +748,16 @@ impl ChatCommand {
             }
 
             // Process message
-            let response = match agent.process_message(input, &history, vec![]).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("{}: {e}", "Error".red().bold());
-                    continue;
-                }
-            };
+            let response =
+                match process_chat_turn(&agent, input, &history, Arc::clone(&approval_requester))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{}: {e}", "Error".red().bold());
+                        continue;
+                    }
+                };
 
             // Append to history
             history.push(Message {
@@ -1085,6 +1161,89 @@ mod tests {
              attach one — otherwise legacy callers that never configured \
              an embedder would observe a behaviour change."
         );
+    }
+
+    #[cfg(unix)]
+    struct AlwaysAskPolicy;
+
+    #[cfg(unix)]
+    impl octos_agent::policy::CommandPolicy for AlwaysAskPolicy {
+        fn check(&self, _command: &str, _cwd: &std::path::Path) -> octos_agent::policy::Decision {
+            octos_agent::policy::Decision::Ask
+        }
+    }
+
+    #[cfg(unix)]
+    struct RecordingApprovalRequester {
+        decision: ToolApprovalDecision,
+        requests: Arc<std::sync::Mutex<Vec<ToolApprovalRequest>>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl ToolApprovalRequester for RecordingApprovalRequester {
+        async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+            self.requests.lock().expect("requests lock").push(request);
+            self.decision
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_approval_scope_resumes_ask_gated_shell_tool_once() {
+        use octos_agent::{ShellTool, Tool};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requester: Arc<dyn ToolApprovalRequester> = Arc::new(RecordingApprovalRequester {
+            decision: ToolApprovalDecision::Approve,
+            requests: Arc::clone(&requests),
+        });
+        let tool = ShellTool::new(tmp.path()).with_policy(Arc::new(AlwaysAskPolicy));
+
+        let result = with_chat_approval(
+            requester,
+            tool.execute(&serde_json::json!({"command": "printf approved"})),
+        )
+        .await
+        .expect("shell execution should return");
+
+        assert!(
+            result.success,
+            "approved command should run: {}",
+            result.output
+        );
+        assert!(result.output.contains("approved"), "{}", result.output);
+        let recorded = requests.lock().expect("requests lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].tool_name, "shell");
+        assert_eq!(recorded[0].command.as_deref(), Some("printf approved"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_approval_scope_denies_ask_gated_shell_tool_once() {
+        use octos_agent::{ShellTool, Tool};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requester: Arc<dyn ToolApprovalRequester> = Arc::new(RecordingApprovalRequester {
+            decision: ToolApprovalDecision::Deny,
+            requests: Arc::clone(&requests),
+        });
+        let tool = ShellTool::new(tmp.path()).with_policy(Arc::new(AlwaysAskPolicy));
+
+        let result = with_chat_approval(
+            requester,
+            tool.execute(&serde_json::json!({"command": "printf denied"})),
+        )
+        .await
+        .expect("shell execution should return");
+
+        assert!(!result.success, "denied command must not run");
+        assert!(!result.output.contains("denied\n"), "{}", result.output);
+        assert!(result.output.contains("Command denied by user approval"));
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
     }
 }
 
