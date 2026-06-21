@@ -776,6 +776,7 @@ pub mod admin;
 pub mod browser;
 pub mod check_background_tasks;
 pub mod check_workspace_contract;
+pub mod mofa_make;
 pub mod tool_config;
 pub mod workspace_history;
 
@@ -829,6 +830,9 @@ pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
+pub use mofa_make::{
+    MakeTypeEntry, MofaDescribeContentTypeTool, MofaMakeTool, make_dispatcher_with_entries,
+};
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 pub use workspace_history::{WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool};
 

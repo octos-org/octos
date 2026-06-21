@@ -3690,6 +3690,9 @@ impl ActorFactory {
 
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
+        // RFC-1 (issue #1290): wire the mofa_make dispatcher's
+        // back-reference at the same site.
+        agent.wire_mofa_make_dispatcher();
 
         // Load per-user status configuration
         let user_status_config = UserStatusConfig::load(&self.data_dir, session_key.base_key());

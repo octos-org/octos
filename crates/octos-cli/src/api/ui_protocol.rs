@@ -18176,6 +18176,8 @@ async fn run_standalone_turn(
     // (its internal `Weak<ToolRegistry>` is empty). Gateway does the
     // equivalent at `session_actor.rs:2500`.
     request_agent.wire_activate_tools();
+    // RFC-1: wire mofa_make at the same site.
+    request_agent.wire_mofa_make_dispatcher();
 
     let agent_session_id = session_id.clone();
     let approval_requester: Arc<dyn octos_agent::ToolApprovalRequester> =

@@ -526,6 +526,19 @@ impl Agent {
         }
     }
 
+    /// RFC-1 (issue #1290): wire the `mofa_make` dispatcher + companion
+    /// `mofa_describe_content_type` to the shared tool registry. The
+    /// dispatcher needs a `Weak<ToolRegistry>` so its `execute` path
+    /// can look up the forwarding target by name.
+    ///
+    /// Idempotent and silent on agents whose registry has no mofa-*
+    /// skills (no dispatcher registered → no-op). Hosts that call
+    /// `wire_activate_tools` after agent construction should call
+    /// this in the same site.
+    pub fn wire_mofa_make_dispatcher(&self) {
+        crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&self.tools);
+    }
+
     /// Set the agent configuration.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         // Apply worker_prompt override if provided.

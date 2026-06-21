@@ -15,6 +15,42 @@ pub struct PluginManifest {
     pub name: String,
     /// Plugin version.
     pub version: String,
+    /// RFC-1 (issue #1290): the `content_type` discriminator this skill
+    /// registers under for the unified `mofa_make({content_type, args})`
+    /// dispatcher. When `Some`, the skill participates in the
+    /// dispatcher's content_type enum, its `content_type_description` is
+    /// surfaced verbatim to the LLM, and its primary "make target" tool
+    /// (resolved via [`PluginManifest::make_target_tool_name`]) is hidden
+    /// from the LLM-visible spec list — but stays callable internally so
+    /// the dispatcher can forward to it.
+    ///
+    /// Manifests without this field behave exactly as they did before
+    /// RFC-1: every tool surfaces by its own name. Skills outside the
+    /// mofa-* content-generator family (e.g. mofa-fm voice management,
+    /// weather, news) never set this field and remain top-level tools.
+    #[serde(default)]
+    pub make_type: Option<String>,
+    /// RFC-1: human-readable blurb describing what this `content_type`
+    /// generates. Surfaced verbatim inside the `mofa_make` tool
+    /// description (concatenated into per-enum-value docs) so the LLM
+    /// has enough context to pick the right `content_type`. Keep short
+    /// (single sentence, <200 chars) — it shows up N times in the
+    /// system-visible spec.
+    #[serde(default)]
+    pub content_type_description: Option<String>,
+    /// RFC-1: explicit override for which tool inside this manifest is
+    /// the dispatcher's "make target". When unset, resolution is:
+    ///   1. tool named exactly `mofa_<make_type>` if present
+    ///   2. otherwise the first tool with `spawn_only: true`
+    ///   3. otherwise the first tool declared
+    ///
+    /// The override exists so a skill with several spawn_only tools
+    /// (or with an unconventional naming scheme like `podcast_generate`)
+    /// can pin the dispatcher's target without depending on declaration
+    /// order. Sibling tools whose names are NOT this target stay visible
+    /// to the LLM — e.g. `mofa_list_styles` next to `mofa_slides`.
+    #[serde(default)]
+    pub make_target_tool: Option<String>,
     /// Tools provided by this plugin.
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
@@ -104,6 +140,44 @@ impl PluginManifest {
             || !self.hooks.is_empty()
             || self.prompts.as_ref().is_some_and(|p| !p.include.is_empty())
             || self.discovery.is_some()
+    }
+
+    /// RFC-1: resolve the tool name the `mofa_make` dispatcher should
+    /// forward to when this skill's `make_type` is selected.
+    ///
+    /// Resolution order:
+    ///   1. `make_target_tool` if declared AND that tool exists in the
+    ///      manifest (verified so a typo doesn't silently fall through).
+    ///   2. Tool named `mofa_<make_type>` if present.
+    ///   3. First tool with `spawn_only: true` (the canonical "generator").
+    ///   4. First tool declared.
+    ///
+    /// Returns `None` when `make_type` is unset OR the manifest has zero
+    /// tools (extras-only skills are not dispatcher targets).
+    pub fn make_target_tool_name(&self) -> Option<&str> {
+        let make_type = self.make_type.as_deref()?;
+        if self.tools.is_empty() {
+            return None;
+        }
+        // 1. Explicit override.
+        if let Some(explicit) = self.make_target_tool.as_deref() {
+            if self.tools.iter().any(|t| t.name == explicit) {
+                return Some(explicit);
+            }
+            // Fall through to conventional lookup — operator typo
+            // shouldn't break the dispatcher.
+        }
+        // 2. Conventional name.
+        let conventional = format!("mofa_{make_type}");
+        if let Some(t) = self.tools.iter().find(|t| t.name == conventional) {
+            return Some(&t.name);
+        }
+        // 3. First spawn_only tool (canonical generator).
+        if let Some(t) = self.tools.iter().find(|t| t.spawn_only) {
+            return Some(&t.name);
+        }
+        // 4. First tool declared.
+        self.tools.first().map(|t| t.name.as_str())
     }
 }
 
@@ -902,6 +976,120 @@ mod tests {
             ConcurrencyClassClassification::Unknown(raw) => assert_eq!(raw, "nonsense"),
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    // RFC-1 — make_type / dispatcher target resolution
+    // ---------------------------------------------------------
+
+    fn manifest_with_tools(make_type: Option<&str>, tools: Vec<PluginToolDef>) -> PluginManifest {
+        PluginManifest {
+            name: "test-skill".into(),
+            version: "1.0".into(),
+            make_type: make_type.map(str::to_string),
+            content_type_description: None,
+            make_target_tool: None,
+            tools,
+            sha256: None,
+            binaries: HashMap::new(),
+            requires_network: false,
+            timeout_secs: None,
+            mcp_servers: vec![],
+            hooks: vec![],
+            prompts: None,
+        }
+    }
+
+    fn tool(name: &str, spawn_only: bool) -> PluginToolDef {
+        PluginToolDef {
+            name: name.into(),
+            description: "x".into(),
+            input_schema: default_schema(),
+            spawn_only,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
+    #[test]
+    fn make_type_field_parses_from_json() {
+        let json = r#"{
+            "name": "mofa-slides",
+            "version": "0.5.2",
+            "make_type": "slides",
+            "content_type_description": "PPTX decks",
+            "tools": [{"name": "mofa_slides", "description": "d"}]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.make_type.as_deref(), Some("slides"));
+        assert_eq!(m.content_type_description.as_deref(), Some("PPTX decks"));
+    }
+
+    #[test]
+    fn make_target_tool_resolution_prefers_explicit_override() {
+        let mut m = manifest_with_tools(
+            Some("podcast"),
+            vec![
+                tool("podcast_voices", false),
+                tool("podcast_generate", true),
+            ],
+        );
+        m.make_target_tool = Some("podcast_generate".into());
+        assert_eq!(m.make_target_tool_name(), Some("podcast_generate"));
+    }
+
+    #[test]
+    fn make_target_tool_resolution_finds_conventional_name() {
+        let m = manifest_with_tools(
+            Some("slides"),
+            vec![tool("mofa_list_styles", false), tool("mofa_slides", true)],
+        );
+        assert_eq!(m.make_target_tool_name(), Some("mofa_slides"));
+    }
+
+    #[test]
+    fn make_target_tool_resolution_falls_back_to_spawn_only() {
+        // No mofa_podcast tool; the resolver falls back to the first
+        // spawn_only=true tool (podcast_generate).
+        let m = manifest_with_tools(
+            Some("podcast"),
+            vec![
+                tool("podcast_voices", false),
+                tool("podcast_generate", true),
+            ],
+        );
+        assert_eq!(m.make_target_tool_name(), Some("podcast_generate"));
+    }
+
+    #[test]
+    fn make_target_tool_resolution_falls_back_to_first_tool() {
+        // No spawn_only tools at all; resolver returns the first tool.
+        let m = manifest_with_tools(Some("video"), vec![tool("mofa_youtube", false)]);
+        assert_eq!(m.make_target_tool_name(), Some("mofa_youtube"));
+    }
+
+    #[test]
+    fn make_target_tool_resolution_returns_none_when_make_type_unset() {
+        let m = manifest_with_tools(None, vec![tool("mofa_slides", true)]);
+        assert!(m.make_target_tool_name().is_none());
+    }
+
+    #[test]
+    fn make_target_tool_resolution_returns_none_for_empty_tools() {
+        let m = manifest_with_tools(Some("slides"), vec![]);
+        assert!(m.make_target_tool_name().is_none());
+    }
+
+    #[test]
+    fn make_target_tool_resolution_recovers_from_invalid_override() {
+        // Operator typo: `make_target_tool` points at a non-existent tool.
+        // The resolver must fall through to conventional lookup instead
+        // of returning `Some("nonexistent")` and creating a registry
+        // miss at dispatch time.
+        let mut m = manifest_with_tools(Some("cards"), vec![tool("mofa_cards", true)]);
+        m.make_target_tool = Some("totally_wrong".into());
+        assert_eq!(m.make_target_tool_name(), Some("mofa_cards"));
     }
 
     #[test]

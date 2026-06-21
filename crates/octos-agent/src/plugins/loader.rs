@@ -11,7 +11,7 @@ use crate::agent::MAX_TOOL_TIMEOUT_SECS;
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{MakeTypeEntry, Tool, ToolRegistry};
 
 use super::extras::{SKILL_EXPLORATION_PREAMBLE, SkillExtras, resolve_extras};
 use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
@@ -42,6 +42,13 @@ pub struct PluginLoadResult {
     pub hooks: Vec<HookConfig>,
     /// Prompt fragments read from skill directories.
     pub prompt_fragments: Vec<String>,
+    /// RFC-1 (issue #1290): dispatcher entries collected from manifests
+    /// that declare `make_type`. The host (CLI / serve / chat) uses
+    /// this list to register the `mofa_make` dispatcher AND hide the
+    /// individual target tools from the LLM-visible spec list. Empty
+    /// means no mofa-* skills were discovered — the dispatcher is not
+    /// registered (avoids publishing an unusable tool).
+    pub make_type_entries: Vec<MakeTypeEntry>,
 }
 
 struct LoadedPluginTool {
@@ -111,6 +118,22 @@ impl PluginLoadResult {
                 have_preamble = true;
             }
             self.prompt_fragments.push(frag);
+        }
+        // RFC-1: collect dispatcher entries. Last-write-wins by
+        // content_type so per-profile skills shadow global skills
+        // (matches the existing "first occurrence wins" semantics
+        // applied at the manifest layer above, then dedup by
+        // content_type here).
+        for entry in extras.make_type_entries {
+            if let Some(existing) = self
+                .make_type_entries
+                .iter_mut()
+                .find(|e| e.content_type == entry.content_type)
+            {
+                *existing = entry;
+            } else {
+                self.make_type_entries.push(entry);
+            }
         }
     }
 }
@@ -252,6 +275,74 @@ impl PluginLoader {
             }
         }
 
+        // RFC-1 (issue #1290): after every per-plugin registration is
+        // done, install the `mofa_make` dispatcher + its describe
+        // companion and hide the individual target tools from the
+        // LLM-visible spec list.
+        //
+        // Hiding uses `defer` (not unregister) so the target tools
+        // remain reachable via `registry.get(name)` — the dispatcher
+        // forwards to them by name, and legacy/internal callers (e.g.
+        // pre-existing test paths) can still invoke them directly. The
+        // LLM only sees `mofa_make` + `mofa_describe_content_type`,
+        // never the individual `mofa_slides` / `mofa_cards` / ...
+        // tools that the loader registered.
+        if !result.make_type_entries.is_empty() {
+            for entry in &result.make_type_entries {
+                if registry.get(&entry.target_tool).is_some() {
+                    // Defer hides from `specs()` while preserving
+                    // `get()` reachability. The dispatcher uses the
+                    // latter to forward. `defer` takes IntoIterator
+                    // so we pass a single-element iter::once.
+                    registry.defer(std::iter::once(entry.target_tool.clone()));
+                } else {
+                    warn!(
+                        content_type = %entry.content_type,
+                        target_tool = %entry.target_tool,
+                        "mofa_make dispatcher target not in registry — \
+                         skill load may have failed; dispatch will surface \
+                         DISPATCHER_ERROR at invocation"
+                    );
+                }
+            }
+            // Mint dispatcher pair (returns None only when entries
+            // is empty, ruled out by the outer guard).
+            if let Some((dispatcher, describe)) =
+                crate::tools::make_dispatcher_with_entries(result.make_type_entries.clone())
+            {
+                let dispatcher = std::sync::Arc::new(dispatcher);
+                let describe = std::sync::Arc::new(describe);
+                registry.register_arc(dispatcher.clone());
+                registry.register_arc(describe.clone());
+                // The dispatcher itself is spawn_only so the execution
+                // loop intercepts it and runs the forward in a
+                // background tokio task — matches the spawn_only
+                // contract every individual mofa_* skill historically
+                // had, and lets the chat UI anchor every long-running
+                // generation to a single bubble.
+                registry.mark_spawn_only(
+                    "mofa_make",
+                    Some(
+                        "SUCCESS: content generation started in the background. \
+                         The result will be delivered to the user automatically when ready. \
+                         No further action needed for this request."
+                            .into(),
+                    ),
+                );
+                // `mofa_describe_content_type` is a synchronous catalog
+                // query (no skill spawn), so it stays foreground.
+                tracing::info!(
+                    entries = result.make_type_entries.len(),
+                    "registered mofa_make dispatcher (RFC-1)"
+                );
+                // The dispatcher's Weak<ToolRegistry> back-reference is
+                // wired by `wire_mofa_make_registry_back_ref` AFTER
+                // the host wraps the registry in `Arc`.
+                result.tool_names.push("mofa_make".into());
+                result.tool_names.push("mofa_describe_content_type".into());
+            }
+        }
+
         if result.tool_count > 0 {
             info!(tools = result.tool_count, "loaded plugin tools");
         }
@@ -265,6 +356,31 @@ impl PluginLoader {
         }
 
         Ok(result)
+    }
+
+    /// RFC-1: wire the dispatcher's registry back-reference after the
+    /// host wraps the registry in `Arc`. The dispatcher's `execute`
+    /// path needs a `Weak<ToolRegistry>` to look up forwarding targets.
+    /// Without this call the dispatcher returns a `DISPATCHER_ERROR`
+    /// on every invocation.
+    ///
+    /// Idempotent and silent on registries with no mofa-* skills —
+    /// hosts can call it unconditionally after every load.
+    pub fn wire_mofa_make_registry_back_ref(registry: &std::sync::Arc<ToolRegistry>) {
+        let weak = std::sync::Arc::downgrade(registry);
+        if let Some(arc) = registry.get("mofa_make") {
+            if let Some(t) = arc.as_any().downcast_ref::<crate::tools::MofaMakeTool>() {
+                t.set_registry(weak.clone());
+            }
+        }
+        if let Some(arc) = registry.get("mofa_describe_content_type") {
+            if let Some(t) = arc
+                .as_any()
+                .downcast_ref::<crate::tools::MofaDescribeContentTypeTool>()
+            {
+                t.set_registry(weak);
+            }
+        }
     }
 
     /// Load a single plugin directory and return its tools and extras.
@@ -578,6 +694,17 @@ impl PluginLoader {
             .collect();
 
         let plugin_name = manifest.name.clone();
+        // RFC-1: snapshot the dispatcher metadata BEFORE `manifest.tools`
+        // is consumed by `into_iter()` below. Resolution of the target
+        // tool name uses [`PluginManifest::make_target_tool_name`] which
+        // walks `manifest.tools` — so we materialise the strings here
+        // and consume them after `tools` is built (so we can verify the
+        // target survived per-tool validation filtering).
+        let manifest_make_type: Option<String> = manifest.make_type.clone();
+        let manifest_content_desc: Option<String> = manifest.content_type_description.clone();
+        let manifest_make_target: Option<String> =
+            manifest.make_target_tool_name().map(|s| s.to_string());
+
         let tools: Vec<LoadedPluginTool> = manifest
             .tools
             .into_iter()
@@ -675,6 +802,55 @@ impl PluginLoader {
         // Return extras with spawn_only info
         extras.spawn_only_tools = spawn_only_names;
         extras.spawn_only_messages = spawn_only_msgs;
+
+        // RFC-1: if the manifest declares `make_type`, build a
+        // dispatcher entry now using the snapshot captured above.
+        // The aggregating loader (`load_into_with_options`) dedups
+        // these by content_type for per-profile shadowing and uses
+        // them to register the dispatcher + hide target tools.
+        //
+        // Tools that failed manifest validation above were filtered
+        // out of `tools`. If the target tool is one of those skipped
+        // tools the dispatcher entry would be a dead pointer at
+        // dispatch time, so we verify the target tool survived first.
+        if let Some(make_type) = manifest_make_type.as_deref() {
+            if let Some(target_tool) = manifest_make_target.as_deref() {
+                let target_survived = tools.iter().any(|loaded| loaded.tool.name() == target_tool);
+                if !target_survived {
+                    warn!(
+                        skill = %plugin_name,
+                        target_tool = %target_tool,
+                        "make_type declared but resolved target tool was \
+                         filtered out by manifest validation; dispatcher \
+                         entry skipped"
+                    );
+                } else {
+                    let description = manifest_content_desc.unwrap_or_else(|| {
+                        // Fall back to the tool's description so the
+                        // dispatcher spec still has something useful.
+                        tools
+                            .iter()
+                            .find(|loaded| loaded.tool.name() == target_tool)
+                            .map(|loaded| loaded.tool.description().to_string())
+                            .unwrap_or_default()
+                    });
+                    extras.make_type_entries.push(MakeTypeEntry::new(
+                        make_type.to_string(),
+                        plugin_name.clone(),
+                        target_tool.to_string(),
+                        description,
+                    ));
+                }
+            } else {
+                warn!(
+                    skill = %plugin_name,
+                    make_type = %make_type,
+                    "make_type declared but no resolvable target tool \
+                     (no `mofa_<make_type>`, no spawn_only tool, no tools \
+                     declared); dispatcher entry skipped"
+                );
+            }
+        }
 
         Ok((tools, extras))
     }
