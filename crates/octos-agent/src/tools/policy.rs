@@ -274,10 +274,16 @@ fn expand_group(name: &str) -> Option<&'static [&'static str]> {
 /// Returns `true` if the tool should be kept, `false` if it should be
 /// evicted from the registry.
 pub fn keep_tool_in_slides_session(tool_name: &str) -> bool {
-    if tool_name == "mofa_slides" {
-        return true;
-    }
-    !tool_name.starts_with("mofa_")
+    // RFC-1 fixup (codex P1 round 2): retain the dispatcher pair too.
+    // After the RFC-1 switch from `defer` → `mark_internal_hidden`,
+    // `mofa_slides` is registered but invisible to `specs()` — the
+    // LLM only sees `mofa_make` + `mofa_describe_content_type`. If
+    // `retain` evicts those (they share the `mofa_` prefix), slides
+    // sessions end up with NO visible slides-generation tool.
+    matches!(
+        tool_name,
+        "mofa_slides" | "mofa_make" | "mofa_describe_content_type"
+    ) || !tool_name.starts_with("mofa_")
 }
 
 #[cfg(test)]
@@ -437,6 +443,29 @@ mod tests {
         // — that's the one tool the system prompt instructs the LLM to
         // call. Evicting it would break the slides workflow entirely.
         assert!(keep_tool_in_slides_session("mofa_slides"));
+    }
+
+    /// RFC-1 fixup (codex round 2 P1): when the make_type-based
+    /// `mofa-slides` skill is installed, `mofa_slides` is hidden via
+    /// `mark_internal_hidden` and the LLM only sees `mofa_make` +
+    /// `mofa_describe_content_type`. The slides-session retain MUST
+    /// preserve those two so the LLM still has a slides-generation
+    /// entry-point. Pre-fixup, retain evicted both (they share the
+    /// `mofa_` prefix) and slides sessions ended up with no visible
+    /// slides tool whatsoever.
+    #[test]
+    fn should_keep_mofa_make_dispatcher_pair_in_slides_session() {
+        assert!(
+            keep_tool_in_slides_session("mofa_make"),
+            "mofa_make dispatcher MUST survive slides-session retain — \
+             it is the only LLM-facing entry-point after RFC-1 hides \
+             the individual mofa_slides target tool"
+        );
+        assert!(
+            keep_tool_in_slides_session("mofa_describe_content_type"),
+            "mofa_describe_content_type must survive slides-session \
+             retain so the LLM can fetch the slides args schema"
+        );
     }
 
     #[test]

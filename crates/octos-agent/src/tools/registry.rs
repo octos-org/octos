@@ -729,6 +729,20 @@ impl ToolRegistry {
                         .iter()
                         .filter_map(|name| {
                             let tool = self.tools.get(name)?;
+                            // RFC-1 fixup (codex round 2 P2):
+                            // internal-hidden tools must never appear
+                            // in the LLM-facing `activate_tools` hint
+                            // — calling activate() on them is a no-op
+                            // anyway, so advertising them would be a
+                            // misleading dead-end. Defensive belt:
+                            // even though `defer` / `defer_group` now
+                            // skip internal-hidden names, an older
+                            // call site or future regression that
+                            // mutates `deferred` directly should not
+                            // leak names through this hint.
+                            if self.internal_hidden.contains(name) {
+                                return None;
+                            }
                             if let Some(ref policy) = self.provider_policy {
                                 if !provider_policy_allows_equivalent_with_tags(
                                     policy,
@@ -1006,10 +1020,16 @@ impl ToolRegistry {
 
     /// Mark tools as deferred (hidden from specs until activated).
     /// Call during setup before wrapping in Arc.
+    ///
+    /// RFC-1 fixup (codex round 2 P2): names already in
+    /// `internal_hidden` are silently skipped — they are unconditionally
+    /// invisible / non-promotable, putting them in `deferred` too
+    /// would only leak them through the `activate_tools` description
+    /// enumeration without changing observable LLM visibility.
     pub fn defer(&mut self, names: impl IntoIterator<Item = String>) {
         let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
         for name in names {
-            if self.tools.contains_key(&name) {
+            if self.tools.contains_key(&name) && !self.internal_hidden.contains(&name) {
                 deferred.insert(name);
             }
         }
@@ -1017,11 +1037,14 @@ impl ToolRegistry {
     }
 
     /// Defer all tools in a named group (e.g. "group:web").
+    ///
+    /// RFC-1 fixup (codex round 2 P2): internal-hidden tools in the
+    /// group are skipped (same rationale as [`Self::defer`]).
     pub fn defer_group(&mut self, group: &str) {
         if let Some(info) = policy::tool_group_info(group) {
             let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
             for &tool in info.tools {
-                if self.tools.contains_key(tool) {
+                if self.tools.contains_key(tool) && !self.internal_hidden.contains(tool) {
                     deferred.insert(tool.to_string());
                 }
             }
@@ -1065,6 +1088,11 @@ impl ToolRegistry {
     }
 
     /// Returns info about currently deferred tool groups for the activate_tools tool.
+    ///
+    /// RFC-1 fixup (codex round 2 P2): internal-hidden tools are
+    /// filtered out so they are never enumerated in `activate_tools`
+    /// output. This is belt-and-suspenders alongside `defer` /
+    /// `defer_group` which already refuse to add them.
     pub fn deferred_groups(&self) -> Vec<(String, String, usize)> {
         let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         if deferred.is_empty() {
@@ -1073,7 +1101,11 @@ impl ToolRegistry {
 
         let mut groups = Vec::new();
         for info in policy::TOOL_GROUPS {
-            let count = info.tools.iter().filter(|&&t| deferred.contains(t)).count();
+            let count = info
+                .tools
+                .iter()
+                .filter(|&&t| deferred.contains(t) && !self.internal_hidden.contains(t))
+                .count();
             if count > 0 {
                 groups.push((info.name.to_string(), info.description.to_string(), count));
             }
@@ -1085,7 +1117,7 @@ impl ToolRegistry {
             .flat_map(|g| g.tools.iter().copied())
             .collect();
         for name in deferred.iter() {
-            if !grouped.contains(name.as_str()) {
+            if !grouped.contains(name.as_str()) && !self.internal_hidden.contains(name) {
                 groups.push((name.clone(), "Plugin tool".to_string(), 1));
             }
         }
@@ -3144,5 +3176,104 @@ mod profile_filter_tests {
                 "{kept} must NOT be evicted by the slides filter",
             );
         }
+    }
+
+    /// RFC-1 fixup (codex round 2 P2): when a make_type plugin marks a
+    /// dispatcher target as internal-hidden, subsequent calls to
+    /// `defer` / `defer_group` MUST NOT add that name to `deferred`,
+    /// because `specs()` would otherwise advertise the name in
+    /// `activate_tools`'s description, leaking the hidden target.
+    ///
+    /// Also: even if a name somehow ends up in `deferred` (older code
+    /// path, future regression), the `activate_tools` enumeration in
+    /// `specs()` defensively filters internal-hidden names.
+    #[test]
+    fn defer_group_skips_internal_hidden_targets() {
+        use async_trait::async_trait;
+        use eyre::Result;
+        use serde_json::Value;
+
+        struct FakeTool(&'static str);
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake (test fixture)"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        // Register every tool referenced by group:media so defer_group
+        // would normally find all of them.
+        for name in [
+            "mofa_comic",
+            "mofa_slides",
+            "mofa_infographic",
+            "mofa_cards",
+            "fm_tts",
+            "fm_voice_list",
+        ] {
+            reg.register(FakeTool(name));
+        }
+        // Simulate the RFC-1 loader: `mofa_slides` is the dispatcher's
+        // target, so it gets `mark_internal_hidden`. (We mark it
+        // BEFORE the defer_group call to mirror the loader timing.)
+        reg.mark_internal_hidden("mofa_slides");
+
+        // Now an unrelated code path defers the whole media group
+        // (e.g. a profile auto-defer pass run after plugin loading,
+        // mirroring the regression codex flagged).
+        reg.defer_group("group:media");
+
+        // Direct assertion: `mofa_slides` MUST NOT have been added to
+        // `deferred` — adding it would leak the name through the
+        // `activate_tools` spec description.
+        let deferred_names = reg.deferred_tool_names();
+        assert!(
+            !deferred_names.contains(&"mofa_slides".to_string()),
+            "internal-hidden mofa_slides must not be added to deferred \
+             by defer_group; got {:?}",
+            deferred_names
+        );
+
+        // The other media tools (not internal-hidden) SHOULD be in the
+        // deferred set as usual.
+        assert!(
+            deferred_names.contains(&"mofa_cards".to_string()),
+            "non-hidden group members must still be deferred; got {:?}",
+            deferred_names
+        );
+
+        // Belt-and-suspenders: even if we manually force the hidden
+        // name into deferred (bypassing the `defer` skip), `specs()`
+        // must still not leak it through the activate_tools hint.
+        {
+            // Bypass `defer` to simulate a regression / legacy code
+            // path that mutates the deferred set directly.
+            let mut deferred = reg.deferred.lock().unwrap();
+            deferred.insert("mofa_slides".to_string());
+        }
+        // Register a real activate_tools so specs() emits the hint.
+        reg.register(crate::tools::ActivateToolsTool::new());
+        let specs = reg.specs();
+        let activate_spec = specs
+            .iter()
+            .find(|s| s.name == "activate_tools")
+            .expect("activate_tools spec present");
+        assert!(
+            !activate_spec.description.contains("mofa_slides"),
+            "activate_tools description must defensively filter \
+             internal-hidden names even when `deferred` contains them; \
+             got: {:?}",
+            activate_spec.description
+        );
     }
 }
