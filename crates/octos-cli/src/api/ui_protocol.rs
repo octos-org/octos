@@ -68,6 +68,7 @@ use octos_core::ui_protocol::{
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
 };
+use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
@@ -118,6 +119,7 @@ use crate::context_manager::{
     CompactContextPolicy, ContextCompactionRecord, ContextManager, ForkPolicy, PromptBuildPolicy,
     PromptFrame, load_or_rebuild_context_manager, persist_context_manager_snapshot,
 };
+use crate::usage_ledger::{PersistentUsageLedger, USAGE_LEDGER_FILE, UsageCostSource, UsageEvent};
 use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
@@ -17009,6 +17011,23 @@ async fn run_standalone_turn(
             return;
         }
     };
+    let usage_profile_id = active_profile_id
+        .clone()
+        .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
+        .unwrap_or_else(|| profile_runtime.profile_id.clone());
+    let usage_ledger = match PersistentUsageLedger::open(&session_runtime.profile.data_dir).await {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(error) => {
+            warn!(
+                session = %session_id.0,
+                profile_id = %usage_profile_id,
+                path = %session_runtime.profile.data_dir.join(USAGE_LEDGER_FILE).display(),
+                error = %error,
+                "usage ledger unavailable; continuing turn without durable usage record"
+            );
+            None
+        }
+    };
 
     // Source the per-session primitives from the SessionRuntime.
     //
@@ -18212,6 +18231,10 @@ async fn run_standalone_turn(
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
     let context_manager_for_result = context_manager.clone();
     let context_data_dir_for_result = session_runtime.profile.data_dir.clone();
+    let usage_ledger_for_result = usage_ledger.clone();
+    let usage_profile_id_for_result = usage_profile_id.clone();
+    let usage_session_id_for_result = session_id.to_string();
+    let usage_run_id_for_result = turn_id.0.to_string();
     // UPCR-2026-015 (M9-β-1): pull the pre-uploaded media paths off
     // the params and feed them to the agent loop. `process_message`
     // already accepts a `Vec<String>` of paths (used by the
@@ -18884,6 +18907,59 @@ async fn run_standalone_turn(
                     None
                 };
                 let _ = final_reply_tx.send(final_send);
+                if let Some(usage_ledger) = usage_ledger_for_result.as_ref() {
+                    let provider_metadata = response.provider_metadata.clone();
+                    let provider = provider_metadata
+                        .as_ref()
+                        .map(|meta| meta.provider.clone())
+                        .or_else(|| {
+                            let provider = request_agent.provider_name();
+                            (!provider.is_empty()).then(|| provider.to_string())
+                        });
+                    let model = provider_metadata
+                        .as_ref()
+                        .map(|meta| meta.model.clone())
+                        .or_else(|| {
+                            let model = request_agent.model_id();
+                            (!model.is_empty()).then(|| model.to_string())
+                        });
+                    let estimated_cost_usd =
+                        model.as_deref().and_then(model_pricing).map(|pricing| {
+                            pricing.cost(
+                                response.token_usage.input_tokens,
+                                response.token_usage.output_tokens,
+                            )
+                        });
+                    let cost_source = if estimated_cost_usd.is_some() {
+                        UsageCostSource::CatalogEstimate
+                    } else {
+                        UsageCostSource::Unavailable
+                    };
+                    let event = UsageEvent::completed_run(
+                        usage_profile_id_for_result.clone(),
+                        usage_session_id_for_result.clone(),
+                        usage_run_id_for_result.clone(),
+                        provider,
+                        model,
+                        provider_metadata
+                            .as_ref()
+                            .and_then(|meta| meta.endpoint.clone()),
+                        u64::from(response.token_usage.input_tokens),
+                        u64::from(response.token_usage.output_tokens),
+                        estimated_cost_usd,
+                        cost_source,
+                        "appui",
+                        None,
+                    );
+                    if let Err(error) = usage_ledger.record(event).await {
+                        warn!(
+                            session = %usage_session_id_for_result,
+                            run = %usage_run_id_for_result,
+                            error = %error,
+                            "failed to record AppUI usage event"
+                        );
+                    }
+                }
                 // Issue #1332: include `message_id` so the consumer
                 // can build `TurnSessionResult` for the
                 // `turn/completed` lifecycle envelope. Absent when no

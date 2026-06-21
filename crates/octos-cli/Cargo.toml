@@ -84,7 +84,7 @@ lettre = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
-redb = { workspace = true, optional = true }
+redb.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for the symlink-safe preview file serve in
@@ -114,7 +114,7 @@ default = []
 # handlers and the admin dashboard's Matrix invite UI reference matrix-only
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
 # without it.
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "dep:redb", "octos-bus/api", "matrix"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

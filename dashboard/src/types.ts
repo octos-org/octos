@@ -366,6 +366,36 @@ export interface SharedMetrics {
   providers: SharedProviderMetrics[]
 }
 
+// ── Persistent Usage Analytics ──────────────────────────────────────
+
+export interface UsageTotals {
+  run_count: number
+  input_tokens: number
+  output_tokens: number
+  estimated_cost_usd: number
+}
+
+export interface UsageRollup {
+  key: string
+  totals: UsageTotals
+}
+
+export interface UsageAnalytics {
+  totals: UsageTotals
+  by_day: UsageRollup[]
+  by_month: UsageRollup[]
+  by_profile: UsageRollup[]
+  by_provider: UsageRollup[]
+  by_model: UsageRollup[]
+  by_channel: UsageRollup[]
+}
+
+export interface UsageQueryParams {
+  session_id?: string
+  from?: string
+  to?: string
+}
+
 // ── Admin Bot Config (legacy, kept for backwards compat) ─────────────
 
 export interface AdminBotConfig {
