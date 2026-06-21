@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::admin;
+use super::admin_audit;
 use super::admin_setup;
 use super::auth_handlers;
 use super::bilibili;
@@ -346,6 +347,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let admin_api = Router::new()
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .route("/api/admin/overview", get(admin::overview))
+        .route("/api/admin/audit", get(admin_audit::list_audit))
         .route("/api/admin/profiles", get(admin::list_profiles))
         .route("/api/admin/profiles", post(admin::create_profile))
         .route("/api/admin/profiles/{id}", get(admin::get_profile))

@@ -18,6 +18,7 @@ import type {
   MonitorProfileStatus,
   SystemMetrics,
   PurgeReport,
+  AdminAuditResponse,
 } from './types'
 
 const BASE = '/api/admin'
@@ -139,10 +140,31 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json()
 }
 
+function queryPath(path: string, params: Record<string, string | number | undefined | null>): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && `${value}`.trim() !== '') {
+      query.set(key, `${value}`)
+    }
+  }
+  const suffix = query.toString()
+  return suffix ? `${path}?${suffix}` : path
+}
+
 // ── Admin API (existing) ────────────────────────────────────────────
 
 export const api = {
   overview: () => request<OverviewResponse>('/overview'),
+
+  listAudit: (params?: {
+    actor?: string
+    action?: string
+    target_id?: string
+    from?: string
+    to?: string
+    limit?: number
+    offset?: number
+  }) => request<AdminAuditResponse>(queryPath('/audit', params ?? {})),
 
   listProfiles: () => request<ProfileResponse[]>('/profiles'),
 

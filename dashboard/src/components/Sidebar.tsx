@@ -68,6 +68,7 @@ export default function Sidebar() {
                 <div className="border-t border-gray-700/30 my-3" />
                 <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
                 <SidebarLink to="/users" icon={<UsersIcon />} label="Access" />
+                <SidebarLink to="/audit" icon={<AuditIcon />} label="Audit" />
                 <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
                 <SidebarLink to="/harness" icon={<ShieldIcon />} label="Harness" />
                 <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
@@ -213,6 +214,14 @@ function UsersIcon() {
   return (
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+    </svg>
+  )
+}
+
+function AuditIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 7h6M9 11h6M9 15h3M5 4h14a1 1 0 011 1v14l-3-2-3 2-3-2-3 2-3-2-3 2V5a1 1 0 011-1z" />
     </svg>
   )
 }

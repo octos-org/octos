@@ -507,6 +507,10 @@ impl ServeCommand {
             crate::login_allowlist::LoginAllowlistStore::open(&data_dir)
                 .wrap_err("failed to open login allowlist store")?,
         );
+        let admin_audit_store = Arc::new(
+            crate::admin_audit_store::AdminAuditStore::open(&data_dir)
+                .wrap_err("failed to open admin audit store")?,
+        );
         let auth_manager = {
             let (auth_config, derived_profile_password) = match config.dashboard_auth.clone() {
                 Some(auth) => (Some(auth), None),
@@ -638,6 +642,7 @@ impl ServeCommand {
             process_manager: Some(process_manager.clone()),
             user_store: Some(user_store),
             allowlist_store: Some(allowlist_store),
+            admin_audit_store: Some(admin_audit_store),
             auth_manager,
             http_client: reqwest::Client::new(),
             // If a config file was loaded, admin edits target that exact file.

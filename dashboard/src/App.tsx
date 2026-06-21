@@ -10,6 +10,7 @@ import Dashboard from './pages/Dashboard'
 import NewProfile from './pages/NewProfile'
 import LoginPage from './pages/LoginPage'
 import UsersPage from './pages/UsersPage'
+import AdminAuditPage from './pages/AdminAuditPage'
 import AdminBotPage from './pages/AdminBotPage'
 import ServerMetricsPage from './pages/ServerMetricsPage'
 import SetupRotateToken from './pages/SetupRotateToken'
@@ -35,6 +36,7 @@ export default function App() {
               {/* Global admin pages */}
               <Route index element={<Dashboard />} />
               <Route path="users" element={<AdminGuard><UsersPage /></AdminGuard>} />
+              <Route path="audit" element={<AdminGuard><AdminAuditPage /></AdminGuard>} />
               <Route path="admin-bot" element={<AdminGuard><AdminBotPage /></AdminGuard>} />
               <Route path="server" element={<AdminGuard><ServerMetricsPage /></AdminGuard>} />
               <Route path="harness" element={<AdminGuard><HarnessPage /></AdminGuard>} />
