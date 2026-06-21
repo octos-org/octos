@@ -39,8 +39,8 @@
 #                       "${session_id}" -> per-scenario session id
 #                       "${profile_id}" -> per-scenario profile id
 #                       "${email}"      -> per-scenario seeded email
-#   expect (table)    Optional. Per-step shape expectations the runner can
-#                     enforce without a full validator. Recognized keys:
+#   expect (table)    Optional. Per-step shape expectations the runner
+#                     enforces before scenario validators. Recognized keys:
 #                       ok            (bool)   whether the RPC must succeed.
 #                                              Defaults to true.
 #                       result_has    (array)  list of dotted-path keys that
@@ -48,9 +48,9 @@
 #                       error_kind    (string) when ok=false, the typed
 #                                              data.kind we expect.
 #
-# `validators` is reserved for the follow-up PR. Each scenario currently
-# advertises the validator name it WILL be wired to so we can grep for the
-# implementation gap. The runner ignores unknown validators today.
+# `validators` lists scenario-level invariants. Fast-tier validators are
+# enforced by `run.mjs` after the transcript is captured. Unknown validators
+# fail non-skipped scenarios so missing validator wiring cannot pass silently.
 #
 # `artifacts` is the standard bundle the runner writes per scenario:
 #   - rpc-transcript.jsonl     full stdio JSON-RPC trace
@@ -273,9 +273,10 @@ expect = { result_has = ["requested_path", "exists"] }
 # ---------------------------------------------------------------------------
 # tier-local / tier-release placeholders.
 #
-# These declare the *intent* so the next PR can grep for them, but they are
+# These declare the *intent* so follow-up work can grep for them, but they are
 # currently skipped with explicit reasons. Required placeholders fail the run
-# rather than producing a green release gate.
+# rather than producing a green release gate; release required-skip enforcement
+# lands separately from the fast validator slice.
 # ---------------------------------------------------------------------------
 
 [[scenarios]]
@@ -285,7 +286,7 @@ transport = "stdio"
 description = "Drive octos-tui through first-run wizard under live tmux (placeholder)."
 validators = ["tui_first_run_capture"]
 artifacts = ["tui-capture.txt", "rpc-transcript.jsonl"]
-skip_reason = "tier-local scenarios land with PR #2 (validators) and PR #3 (tier-local)."
+skip_reason = "tier-local scenarios land with the local tmux/provider follow-up."
 
 
 [[scenarios]]
@@ -296,4 +297,4 @@ description = "Release gate: full onboarding flow must avoid auth/send_code and 
 required = true
 validators = ["no_otp_emitted", "no_secret_leak_in_transcripts"]
 artifacts = ["rpc-transcript.jsonl", "redaction-report.json"]
-skip_reason = "tier-release gate enforced once validators ship (PR #2)."
+skip_reason = "tier-release required-skip gate lands in the release enforcement follow-up."

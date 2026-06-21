@@ -9,8 +9,8 @@
 // Scope of this PR:
 //   - Pack: onboarding (tier=fast only)
 //   - Mock-or-deterministic only; no provider key, no live tmux.
-//   - Validators are intentionally limited to shape checks (`result_has`,
-//     `ok`, `error_kind`). Real validators land in PR #2.
+//   - Fast-tier onboarding validators are enforced after the JSON-RPC
+//     transcript is captured. Tmux/live release validators remain separate.
 //
 // Hard rules:
 //   - Node stdlib only — no npm dependencies.
@@ -538,6 +538,157 @@ function getByPath(obj, dottedPath) {
   return cursor;
 }
 
+function readJsonl(file) {
+  if (!fs.existsSync(file)) return [];
+  const text = fs.readFileSync(file, 'utf8').trim();
+  if (!text) return [];
+  return text.split('\n').map((line, index) => {
+    try {
+      return JSON.parse(line);
+    } catch (err) {
+      return {
+        parse_error: String(err?.message || err),
+        line_number: index + 1,
+        raw: line,
+      };
+    }
+  });
+}
+
+function supportedMethods(frame) {
+  const result = frame?.result || {};
+  const capabilities = result.capabilities || {};
+  if (Array.isArray(capabilities)) return capabilities;
+  if (Array.isArray(capabilities.supported_methods)) return capabilities.supported_methods;
+  if (Array.isArray(capabilities.methods)) return capabilities.methods;
+  if (Array.isArray(result.supported_methods)) return result.supported_methods;
+  return [];
+}
+
+function validatorPassed(id, detail, evidence = []) {
+  return { id, status: 'passed', detail, evidence };
+}
+
+function validatorFailed(id, detail, evidence = []) {
+  return { id, status: 'failed', detail, evidence };
+}
+
+function frameMethod(row) {
+  return row?.frame?.method || row?.frame?.params?.method || null;
+}
+
+function transcriptHasOtpTraffic(transcriptRows) {
+  const otpMethods = new Set(['auth/send_code', 'auth/verify']);
+  return transcriptRows.some((row) => {
+    const method = frameMethod(row);
+    if (method && otpMethods.has(method)) return true;
+    return JSON.stringify(row).includes('auth/send_code')
+      || JSON.stringify(row).includes('auth/verify');
+  });
+}
+
+function successfulResult(stepFrames, id) {
+  const frame = stepFrames[id];
+  return frame && !frame.error ? frame.result || {} : null;
+}
+
+export function evaluateOnboardingValidators({ scenario, localCtx, stepFrames, transcriptRows, transcriptLog }) {
+  const checks = [];
+  for (const id of scenario.validators || []) {
+    switch (id) {
+      case 'onboarding_capability_flags': {
+        const clientMethods = supportedMethods(stepFrames.client_hello);
+        const listMethods = supportedMethods(stepFrames.capabilities);
+        const methods = new Set([...clientMethods, ...listMethods]);
+        const required = ['profile/local/create', 'onboarding/workspace_probe'];
+        const missing = required.filter((method) => !methods.has(method));
+        checks.push(missing.length === 0
+          ? validatorPassed(id, `advertised onboarding methods: ${required.join(', ')}`, [transcriptLog])
+          : validatorFailed(id, `missing advertised onboarding methods: ${missing.join(', ')}`, [transcriptLog]));
+        break;
+      }
+      case 'profile_local_create_no_otp': {
+        const otp = transcriptHasOtpTraffic(transcriptRows);
+        checks.push(!otp
+          ? validatorPassed(id, 'profile creation emitted no OTP auth traffic', [transcriptLog])
+          : validatorFailed(id, 'profile creation emitted auth/send_code or auth/verify traffic', [transcriptLog]));
+        break;
+      }
+      case 'profile_id_consistency': {
+        const ids = Object.values(stepFrames)
+          .map((frame) => frame?.result?.profile_id)
+          .filter(Boolean);
+        const unique = new Set(ids);
+        const expected = localCtx.profileId;
+        const ok = ids.length > 0 && unique.size === 1 && unique.has(expected);
+        checks.push(ok
+          ? validatorPassed(id, `profile_id remained ${expected}`, [transcriptLog])
+          : validatorFailed(id, `profile_id drifted; expected ${expected}, observed ${ids.join(', ') || '<none>'}`, [transcriptLog]));
+        break;
+      }
+      case 'profile_local_collision_typed_error': {
+        const frame = stepFrames.create_owner_b_collides;
+        const kind = frame?.error?.data?.kind || null;
+        checks.push(kind === 'profile_local_collision'
+          ? validatorPassed(id, 'collision returned typed profile_local_collision error', [transcriptLog])
+          : validatorFailed(id, `collision returned ${kind || '<none>'}`, [transcriptLog]));
+        break;
+      }
+      case 'workspace_probe_existing_writable': {
+        const result = successfulResult(stepFrames, 'probe_existing');
+        const ok = result
+          && result.exists === true
+          && result.is_directory === true
+          && result.writable === true
+          && result.root_escape === false
+          && result.workspace_policy
+          && typeof result.workspace_policy === 'object';
+        checks.push(ok
+          ? validatorPassed(id, 'existing workspace probe is writable and inside policy', [transcriptLog])
+          : validatorFailed(id, 'existing workspace probe did not prove writable in-policy directory', [transcriptLog]));
+        break;
+      }
+      case 'workspace_probe_missing_path': {
+        const result = successfulResult(stepFrames, 'probe_missing');
+        const ok = result
+          && result.exists === false
+          && result.is_directory === false
+          && result.root_escape === false;
+        checks.push(ok
+          ? validatorPassed(id, 'missing workspace probe reports a non-existent non-directory without root escape', [transcriptLog])
+          : validatorFailed(id, 'missing workspace probe did not report expected missing-path shape', [transcriptLog]));
+        break;
+      }
+      case 'workspace_probe_root_escape_typed': {
+        const result = successfulResult(stepFrames, 'probe_etc');
+        const ok = result && result.root_escape === true && typeof result.banned_root === 'string';
+        checks.push(ok
+          ? validatorPassed(id, `root escape probe reports banned_root=${result.banned_root} and root_escape=true`, [transcriptLog])
+          : validatorFailed(id, 'root escape probe did not report banned_root/root_escape', [transcriptLog]));
+        break;
+      }
+      case 'resume_partial_setup_safe': {
+        const allOk = ['create_profile', 'first_probe', 'resume_capabilities', 'resume_probe']
+          .every((stepId) => Boolean(successfulResult(stepFrames, stepId)));
+        const methods = new Set(supportedMethods(stepFrames.resume_capabilities));
+        const resumedProbe = successfulResult(stepFrames, 'resume_probe');
+        const ok = allOk
+          && methods.has('onboarding/workspace_probe')
+          && resumedProbe?.exists === true
+          && resumedProbe?.root_escape === false;
+        checks.push(ok
+          ? validatorPassed(id, 'capabilities and workspace probe remain usable after partial setup resume', [transcriptLog])
+          : validatorFailed(id, 'partial setup resume did not keep capabilities/probe usable', [transcriptLog]));
+        break;
+      }
+      default:
+        checks.push(validatorFailed(id, `validator ${id} is declared but not implemented`, [transcriptLog]));
+        break;
+    }
+  }
+  return checks;
+}
+
 export class StdioClient {
   constructor({ octosBin, dataDir, workspace, repoRoot, stderrLog, transcriptLog, timeoutMs }) {
     this.timeoutMs = timeoutMs;
@@ -766,6 +917,7 @@ async function runScenario(scenario, ctx, repoRoot, octosBin, runTimeoutMs) {
         ? 'required scenario cannot be skipped'
         : null,
       validators: scenario.validators || [],
+      validator_checks: [],
       steps: [],
     };
     writeJson(resultPath, summary);
@@ -792,6 +944,7 @@ async function runScenario(scenario, ctx, repoRoot, octosBin, runTimeoutMs) {
   });
 
   const stepResults = [];
+  const stepFrames = {};
   let scenarioOk = true;
   let fatal = null;
 
@@ -815,6 +968,7 @@ async function runScenario(scenario, ctx, repoRoot, octosBin, runTimeoutMs) {
       const errors = evaluateExpectations(step.expect, frame);
       const ok = errors.length === 0;
       if (!ok) scenarioOk = false;
+      stepFrames[step.id] = frame;
       stepResults.push({
         id: step.id,
         rpc: step.rpc,
@@ -832,6 +986,18 @@ async function runScenario(scenario, ctx, repoRoot, octosBin, runTimeoutMs) {
     await client.close();
   }
 
+  const transcriptRows = readJsonl(transcriptLog);
+  const validatorChecks = evaluateOnboardingValidators({
+    scenario,
+    localCtx,
+    stepFrames,
+    transcriptRows,
+    transcriptLog,
+  });
+  if (validatorChecks.some((check) => check.status !== 'passed')) {
+    scenarioOk = false;
+  }
+
   const summary = {
     name: scenario.name,
     tier: scenario.tier,
@@ -839,6 +1005,7 @@ async function runScenario(scenario, ctx, repoRoot, octosBin, runTimeoutMs) {
     status: scenarioOk && !fatal ? 'passed' : 'failed',
     fatal,
     validators: scenario.validators || [],
+    validator_checks: validatorChecks,
     steps: stepResults,
     artifacts: {
       data_dir: dataDir,
