@@ -118,6 +118,7 @@ api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metri
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]
+dingtalk = ["octos-bus/dingtalk"]
 slack = ["octos-bus/slack"]
 whatsapp = ["octos-bus/whatsapp"]
 email = ["octos-bus/email"]

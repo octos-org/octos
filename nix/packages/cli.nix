@@ -25,6 +25,7 @@ let
   workspaceToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
 
   supportedChannels = [
+    "dingtalk"
     "discord"
     "email"
     "feishu"

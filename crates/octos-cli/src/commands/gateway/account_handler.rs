@@ -51,6 +51,7 @@ pub async fn handle_account_command(
                         .map(|c| match c {
                             crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
                             crate::profiles::ChannelCredentials::Discord { .. } => "discord",
+                            crate::profiles::ChannelCredentials::DingTalk { .. } => "dingtalk",
                             crate::profiles::ChannelCredentials::Slack { .. } => "slack",
                             crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
                             crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",

@@ -74,7 +74,7 @@ in
           if overrideArgs == { } then cfg.package else cfg.package.override overrideArgs;
       };
 
-      enableAllChannels = mkEnableOption "all channels (telegram,discord,slack,whatsapp,feishu,email,twilio,wecom)";
+      enableAllChannels = mkEnableOption "all channels (telegram,discord,dingtalk,slack,whatsapp,feishu,email,twilio,wecom)";
 
       enableAppSkills = mkOption {
         type = nullOr bool;

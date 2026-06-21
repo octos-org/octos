@@ -227,6 +227,8 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
+| `DINGTALK_BOT_WEBHOOK` | DingTalk custom robot webhook URL |
+| `DINGTALK_BOT_SECRET` | DingTalk robot signing secret |
 | `SLACK_BOT_TOKEN` | Slack bot token |
 | `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu/Lark app ID |

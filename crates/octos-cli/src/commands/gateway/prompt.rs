@@ -106,6 +106,7 @@ pub async fn build_system_prompt(
 #[cfg(any(
     feature = "telegram",
     feature = "discord",
+    feature = "dingtalk",
     feature = "slack",
     feature = "whatsapp",
     feature = "email",

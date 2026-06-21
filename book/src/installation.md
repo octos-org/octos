@@ -32,7 +32,7 @@ cd octos
 # channel adapter. Build this first if you don't know which features
 # you need — it's what release artifacts ship.
 cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"
 
 # Minimal: CLI + chat + gateway with CLI channel only.
 # This produces a binary that does NOT have `octos serve` (the api
@@ -41,7 +41,7 @@ cargo install --path crates/octos-cli \
 cargo install --path crates/octos-cli
 
 # Trim the feature list to your needs. Available channel features:
-#   telegram, discord, slack, whatsapp, feishu, email, wecom, wecom-bot,
+#   telegram, discord, dingtalk, slack, whatsapp, feishu, email, wecom, wecom-bot,
 #   matrix, qq-bot, twilio, wechat
 # Required for `octos serve`: api
 # Other features: git (gitoxide), ast (tree-sitter)
@@ -192,7 +192,7 @@ rustup-init.exe
 git clone https://github.com/octos-org/octos.git
 cd octos
 cargo install --path crates/octos-cli `
-    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"
 
 # 3. Set API key and run
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
@@ -232,7 +232,7 @@ docker compose --profile gateway up -d
 Options:
   --minimal          CLI + chat only (no channels, no dashboard)
   --full             All channels + dashboard + app-skills
-  --channels LIST    Comma-separated: telegram,discord,slack,whatsapp,feishu,email,twilio,wecom
+  --channels LIST    Comma-separated: telegram,discord,dingtalk,slack,whatsapp,feishu,email,twilio,wecom
   --no-skills        Skip building app-skills
   --no-service       Skip launchd/systemd service setup
   --uninstall        Remove binaries and service files

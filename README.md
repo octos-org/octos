@@ -302,7 +302,7 @@ For development against an unreleased checkout:
 # crates/octos-cli` will give you a binary missing `serve` and
 # without channel adapters.
 cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"
 
 # Initialize workspace
 octos init
@@ -345,7 +345,7 @@ Use this when:
 - You changed Rust **or** dashboard code and need to see it running under the installed service.
 - You want to exercise the full installer flow against a local build.
 
-Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
+Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
 
 ## Documentation
 

@@ -1440,6 +1440,7 @@ impl Config {
                 "cli",
                 "telegram",
                 "discord",
+                "dingtalk",
                 "slack",
                 "whatsapp",
                 "email",

@@ -877,6 +877,16 @@ pub enum ChannelCredentials {
         #[serde(default = "default_discord_env")]
         token_env: String,
     },
+    DingTalk {
+        #[serde(default = "default_dingtalk_webhook_env")]
+        webhook_url_env: String,
+        #[serde(default = "default_dingtalk_secret_env")]
+        secret_env: String,
+        #[serde(default)]
+        allowed_senders: String,
+        #[serde(default)]
+        webhook_port: Option<u16>,
+    },
     Slack {
         #[serde(default = "default_slack_bot_env")]
         bot_token_env: String,
@@ -1027,6 +1037,12 @@ fn default_telegram_env() -> String {
 }
 fn default_discord_env() -> String {
     "DISCORD_BOT_TOKEN".into()
+}
+fn default_dingtalk_webhook_env() -> String {
+    "DINGTALK_BOT_WEBHOOK".into()
+}
+fn default_dingtalk_secret_env() -> String {
+    "DINGTALK_BOT_SECRET".into()
 }
 fn default_slack_bot_env() -> String {
     "SLACK_BOT_TOKEN".into()
@@ -1744,7 +1760,9 @@ pub(crate) fn config_from_profile(
             // Override webhook_port if auto-assigned (Feishu webhook / LINE)
             if matches!(
                 ch,
-                ChannelCredentials::Feishu { .. } | ChannelCredentials::Line { .. }
+                ChannelCredentials::Feishu { .. }
+                    | ChannelCredentials::Line { .. }
+                    | ChannelCredentials::DingTalk { .. }
             ) {
                 if let Some(port) = feishu_port_override {
                     entry["settings"]["webhook_port"] = serde_json::json!(port);
@@ -1891,6 +1909,30 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             "type": "discord",
             "settings": { "token_env": token_env }
         }),
+        ChannelCredentials::DingTalk {
+            webhook_url_env,
+            secret_env,
+            allowed_senders,
+            webhook_port,
+        } => {
+            let senders: Vec<&str> = allowed_senders
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut settings = serde_json::json!({
+                "webhook_url_env": webhook_url_env,
+                "secret_env": secret_env,
+            });
+            if let Some(port) = webhook_port {
+                settings["webhook_port"] = serde_json::json!(port);
+            }
+            serde_json::json!({
+                "type": "dingtalk",
+                "allowed_senders": senders,
+                "settings": settings,
+            })
+        }
         ChannelCredentials::Slack {
             bot_token_env,
             app_token_env,
@@ -2234,14 +2276,26 @@ pub fn line_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
     None
 }
 
+/// Check if a profile has a DingTalk channel and return its webhook port configuration.
+///
+/// Returns:
+/// - `Some(Some(port))` — DingTalk channel exists with explicit webhook port
+/// - `Some(None)` — DingTalk channel exists but needs an auto-assigned port
+/// - `None` — no DingTalk channel
+pub fn dingtalk_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
+    for ch in &profile.config.channels {
+        if let ChannelCredentials::DingTalk { webhook_port, .. } = ch {
+            return Some(*webhook_port);
+        }
+    }
+    None
+}
+
 /// Webhook port needed by any profile channel that listens for HTTP webhooks.
 pub fn profile_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
-    match (feishu_webhook_port(profile), line_webhook_port(profile)) {
-        (Some(f), Some(l)) => Some(f.or(l)),
-        (Some(f), None) => Some(f),
-        (None, Some(l)) => Some(l),
-        (None, None) => None,
-    }
+    feishu_webhook_port(profile)
+        .or_else(|| line_webhook_port(profile))
+        .or_else(|| dingtalk_webhook_port(profile))
 }
 
 /// Get the API channel port from a profile, if one is configured.
@@ -3971,6 +4025,12 @@ mod tests {
             ChannelCredentials::Discord {
                 token_env: "DC".into(),
             },
+            ChannelCredentials::DingTalk {
+                webhook_url_env: "DT_WEBHOOK".into(),
+                secret_env: "DT_SECRET".into(),
+                allowed_senders: "staff-1,staff-2".into(),
+                webhook_port: Some(8650),
+            },
             ChannelCredentials::Slack {
                 bot_token_env: "SB".into(),
                 app_token_env: "SA".into(),
@@ -3999,7 +4059,7 @@ mod tests {
 
         let json = serde_json::to_string(&channels).unwrap();
         let parsed: Vec<ChannelCredentials> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), 6);
+        assert_eq!(parsed.len(), 7);
     }
 
     #[test]

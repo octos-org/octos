@@ -41,7 +41,7 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
 Octos is a Rust-native AI agent platform that runs in three modes:
 
 - **`octos serve`** — Control plane with admin dashboard + ~140 REST endpoints. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels. On first launch with no admin profile, the embedded dashboard runs the **setup wizard**.
-- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
+- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, DingTalk, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
 ### Architecture
@@ -2118,6 +2118,8 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **Channels** | |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
+| `DINGTALK_BOT_WEBHOOK` | DingTalk custom robot webhook URL |
+| `DINGTALK_BOT_SECRET` | DingTalk robot signing secret |
 | `SLACK_BOT_TOKEN` | Slack bot token |
 | `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu/Lark app ID |

@@ -6267,6 +6267,7 @@ fn is_registered_channel_name(value: &str) -> bool {
         value,
         "api"
             | "cli"
+            | "dingtalk"
             | "discord"
             | "email"
             | "feishu"
