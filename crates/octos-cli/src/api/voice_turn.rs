@@ -561,12 +561,18 @@ fn image_skill_call(
     out_dir: &Path,
 ) -> Option<(&'static str, serde_json::Value)> {
     let out = out_dir.to_string_lossy().to_string();
+    // A UNIQUE output filename per dispatch (#1477 follow-up): the mofa skill
+    // caches by output path (`is_cached`: returns the existing file when it is
+    // >10KB, skipping generation). A fixed name like `image.png` therefore made
+    // every turn after the first in a session return the PREVIOUS turn's image
+    // (and skip generation entirely, so reference frames were never applied).
+    let uniq = uuid::Uuid::now_v7();
     match d.kind {
         VisualKind::Infographic => Some((
             "mofa_infographic",
             serde_json::json!({
                 "sections": [{ "prompt": d.brief }],
-                "out": format!("{out}/infographic.png"),
+                "out": format!("{out}/infographic-{uniq}.png"),
             }),
         )),
         // `mofa_image` (not `mofa_cards`): a plain "generate an image" request
@@ -579,7 +585,7 @@ fn image_skill_call(
             "mofa_image",
             serde_json::json!({
                 "prompt": d.brief,
-                "out": format!("{out}/image.png"),
+                "out": format!("{out}/image-{uniq}.png"),
             }),
         )),
         // Html (focused LLM call) and Illustrated (two-stage: run_illustration_image
@@ -601,9 +607,17 @@ pub(crate) async fn run_illustration_image(
     out_dir: &Path,
     ref_images: &[String],
 ) -> Option<PathBuf> {
+    // Unique output filename per dispatch — the mofa skill caches by output
+    // path (`is_cached`), so a fixed `illustration.png` returned the prior
+    // turn's image and skipped generation (hence reference frames were never
+    // applied). See `image_skill_call`.
+    let out = out_dir
+        .join(format!("illustration-{}.png", uuid::Uuid::now_v7()))
+        .to_string_lossy()
+        .into_owned();
     let mut args = serde_json::json!({
         "prompt": brief,
-        "out": out_dir.join("illustration.png").to_string_lossy(),
+        "out": out,
     });
     if !ref_images.is_empty() {
         args["ref_images"] = serde_json::json!(ref_images);
@@ -1299,13 +1313,19 @@ mod tests {
             }
             async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
                 // The brief is forwarded as the generation prompt, and the
-                // produced file is named under the turn's out dir.
+                // produced file is named UNIQUELY under the turn's out dir
+                // (`image-<uuid>.png`) so the mofa skill's path cache never
+                // returns a stale image.
                 assert_eq!(args["prompt"], serde_json::json!("一只猫"));
-                assert_eq!(args["out"], serde_json::json!("/tmp/out/image.png"));
+                let out = args["out"].as_str().expect("out is a string");
+                assert!(
+                    out.starts_with("/tmp/out/image-") && out.ends_with(".png"),
+                    "out must be a unique image-<uuid>.png under the out dir, got: {out}"
+                );
                 Ok(ToolResult {
                     success: true,
                     output: "ok".into(),
-                    files_to_send: vec![PathBuf::from("/tmp/out/image.png")],
+                    files_to_send: vec![PathBuf::from(out)],
                     ..Default::default()
                 })
             }
@@ -1319,7 +1339,12 @@ mod tests {
             brief: "一只猫".into(),
         };
         let rels = run_image_skill(&reg, &d, Path::new("/tmp/out")).await;
-        assert_eq!(rels, vec!["image.png".to_string()]);
+        assert_eq!(rels.len(), 1);
+        assert!(
+            rels[0].starts_with("image-") && rels[0].ends_with(".png"),
+            "delivered a unique image-<uuid>.png, got: {}",
+            rels[0]
+        );
     }
 
     #[test]

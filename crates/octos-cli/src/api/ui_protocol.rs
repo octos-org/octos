@@ -19058,6 +19058,13 @@ async fn run_standalone_turn(
             tracing::info!(
                 kind = ?directive.kind,
                 brief = %directive.brief,
+                // Diagnostics for camera-frame grounding: `live_video` is the
+                // explicit signal from the client; `ref_images` is how many
+                // camera frames are forwarded to the illustration generator.
+                // Both 0/false here means the generated image cannot be
+                // grounded on the real subject in front of the camera.
+                live_video = params.live_video,
+                ref_images = r_ref_images.len(),
                 "voice rich: dispatching visual directive"
             );
             tokio::spawn(async move {
