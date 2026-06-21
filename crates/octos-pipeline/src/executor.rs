@@ -12,7 +12,7 @@ use octos_agent::hooks::{HookContext, HookEvent, HookExecutor, HookPayload};
 use octos_agent::progress::ProgressEvent;
 use octos_agent::tools::TOOL_CTX;
 use octos_core::{Message, MessageRole, TokenUsage};
-use octos_llm::{ChatConfig, LlmProvider, ProviderRouter};
+use octos_llm::{ChatConfig, LlmProvider, ProviderRouter, SemaphoreThrottledProvider};
 use octos_memory::EpisodeStore;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -50,6 +50,9 @@ const DEFAULT_PIPELINE_PROJECTED_USD: f64 = 0.01;
 /// is empty. Chosen to match the operator rollup key used elsewhere in
 /// the harness for background pipelines.
 const DEFAULT_PIPELINE_CONTRACT_ID: &str = "pipeline";
+
+/// Default maximum number of concurrent LLM calls inside a single pipeline run.
+pub const DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS: usize = 4;
 
 /// Cumulative cap on the total number of fan-out workers a single pipeline
 /// run may spawn across its lifetime. Each worker counted once at dispatch
@@ -375,6 +378,11 @@ pub struct ExecutorConfig {
     /// outcome for edge routing; an `Abort` decision returns the partial
     /// pipeline result collected so far.
     pub guards: Vec<Arc<dyn PipelineGuard>>,
+    /// Maximum number of concurrent LLM calls inside this pipeline run.
+    /// `None` defaults to [`DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS`].
+    /// This pipeline-scoped semaphore prevents parallel worker retry storms
+    /// without changing global provider/router behavior.
+    pub max_concurrent_llm_calls: Option<usize>,
     /// Optional mission checkpoint store. When set, the executor:
     /// * loads the latest `PersistedCheckpoint` at the start of a run and
     ///   skips every node with id `<=` the recorded node in the pipeline's
@@ -1552,6 +1560,22 @@ impl PipelineExecutor {
         &self.config.workspace_context
     }
 
+    fn max_concurrent_llm_calls(&self) -> usize {
+        self.config
+            .max_concurrent_llm_calls
+            .unwrap_or(DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS)
+            .max(1)
+    }
+
+    fn pipeline_llm_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_llm_calls()))
+    }
+
+    #[doc(hidden)]
+    pub fn max_concurrent_llm_calls_for_test(&self) -> usize {
+        self.max_concurrent_llm_calls()
+    }
+
     /// Run a pipeline from a DOT string.
     pub async fn run(
         &self,
@@ -1559,8 +1583,10 @@ impl PipelineExecutor {
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PipelineResult> {
-        let handlers = self.build_handlers();
-        self.run_with_handlers(dot_content, user_input, variables, handlers)
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        let handlers = self.build_handlers(Some(llm_semaphore.clone()));
+        let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
             .await
     }
 
@@ -1574,8 +1600,9 @@ impl PipelineExecutor {
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PipelineResult> {
-        let handlers = self.build_handlers();
-        self.run_graph_with_handlers(graph, user_input, variables, handlers)
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        let handlers = self.build_handlers(Some(llm_semaphore.clone()));
+        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
             .await
     }
 
@@ -1593,8 +1620,9 @@ impl PipelineExecutor {
     ) -> Result<PipelineResult> {
         let graph = crate::compose::compose(ir_json, profile, variables)
             .map_err(|e| eyre::eyre!("IR compose failed: {e}"))?;
-        let handlers = self.build_handlers();
-        self.run_graph_with_handlers(graph, user_input, variables, handlers)
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        let handlers = self.build_handlers(Some(llm_semaphore.clone()));
+        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
             .await
     }
 
@@ -1623,10 +1651,37 @@ impl PipelineExecutor {
     /// built, so a compiled-IR graph inherits identical gating to a DOT graph.
     pub async fn run_graph_with_handlers(
         &self,
+        graph: PipelineGraph,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+        handlers: HandlerRegistry,
+    ) -> Result<PipelineResult> {
+        // Caller supplied their own handlers (whose codergen may or may not be
+        // throttled). Mint a fresh pipeline-scoped semaphore for the planner /
+        // fan-out dispatch on the legacy `execute_graph` path so this entry
+        // still bounds concurrent LLM calls.
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
+            .await
+    }
+
+    /// Body of [`Self::run_graph_with_handlers`] with an explicit
+    /// pipeline-scoped LLM concurrency semaphore. The semaphore bounds the
+    /// planner / fan-out LLM dispatch on the legacy `execute_graph` path so a
+    /// parallel worker retry storm can't exceed `max_concurrent_llm_calls`
+    /// without changing global provider/router behavior. The DAG path
+    /// (`execute_graph_dag`) never runs the planner/fan-out dispatch, and its
+    /// codergen handler is already throttled via `build_codergen`. The public
+    /// [`Self::run`] / [`Self::run_graph`] / [`Self::run_ir`] entries thread
+    /// the SAME semaphore into both `build_handlers` and here so codergen and
+    /// planner LLM calls share one limit.
+    async fn run_graph_with_handlers_throttled(
+        &self,
         mut graph: PipelineGraph,
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
         handlers: HandlerRegistry,
+        llm_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Result<PipelineResult> {
         // Replace the historical pipeline-guard plugin's
         // before_tool_call hook with an in-process pass that fills
@@ -1756,6 +1811,11 @@ impl PipelineExecutor {
         // Checkpoint-backed runs stay on the legacy walk: the DAG path does not
         // build the resume skip-set or persist `node.checkpoints`, so a
         // checkpointed pipeline must not silently lose resume/persist parity.
+        //
+        // The pipeline-scoped LLM throttle is threaded into the legacy
+        // `execute_graph` (which owns the planner / fan-out dispatch). The DAG
+        // path has no planner/fan-out dispatch and reaches the LLM only through
+        // its already-throttled codergen handler, so it needs no semaphore arg.
         let dag_selected = self.dag_override.unwrap_or_else(dag_scheduler_enabled);
         let use_dag = dag_selected
             && graph_is_dag_schedulable(&graph)
@@ -1765,8 +1825,15 @@ impl PipelineExecutor {
             self.execute_graph_dag(&graph, &handlers, &start_node, user_input, variables)
                 .await
         } else {
-            self.execute_graph(&graph, &handlers, &start_node, user_input, variables)
-                .await
+            self.execute_graph(
+                &graph,
+                &handlers,
+                &start_node,
+                user_input,
+                variables,
+                llm_semaphore,
+            )
+            .await
         };
 
         // coding-blue FA-7: pipeline-terminal validators. The gate
@@ -2173,10 +2240,13 @@ impl PipelineExecutor {
     /// confirm the per-handler wiring (compaction policy + workspace).
     #[doc(hidden)]
     pub fn build_codergen_for_test(&self) -> CodergenHandler {
-        self.build_codergen()
+        self.build_codergen(Some(self.pipeline_llm_semaphore()))
     }
 
-    fn build_codergen(&self) -> CodergenHandler {
+    fn build_codergen(
+        &self,
+        llm_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> CodergenHandler {
         let mut codergen = CodergenHandler::new(
             self.config.default_provider.clone(),
             self.config.memory.clone(),
@@ -2204,6 +2274,9 @@ impl PipelineExecutor {
         if let Some(ref router) = self.config.provider_router {
             codergen = codergen.with_provider_router(router.clone());
         }
+        if let Some(semaphore) = llm_semaphore {
+            codergen = codergen.with_llm_semaphore(semaphore);
+        }
 
         let ws_ctx = &self.config.workspace_context;
         if let Some(policy) = ws_ctx.policy.as_ref() {
@@ -2217,7 +2290,10 @@ impl PipelineExecutor {
         codergen
     }
 
-    fn build_handlers(&self) -> HandlerRegistry {
+    fn build_handlers(
+        &self,
+        llm_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> HandlerRegistry {
         let mut registry = HandlerRegistry::new();
 
         // coding-blue FA-7: `build_codergen` reads the installed
@@ -2225,7 +2301,7 @@ impl PipelineExecutor {
         // onto every LLM-call node. When the context is empty (legacy
         // path) the setters are no-ops — behaviour is byte-for-byte
         // identical to pre-FA-7.
-        let codergen = self.build_codergen();
+        let codergen = self.build_codergen(llm_semaphore);
 
         registry.register(HandlerKind::Codergen, Arc::new(codergen));
         // The `shell` handler is intentionally NOT registered: shell is
@@ -2324,6 +2400,7 @@ impl PipelineExecutor {
         start_node: &str,
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
+        llm_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Result<PipelineResult> {
         let pipeline_start = Instant::now();
         let mut current_node_id = start_node.to_string();
@@ -2961,6 +3038,9 @@ impl PipelineExecutor {
                         .or(node.model.as_deref())
                         .or(graph.default_model.as_deref()),
                 )?;
+                let planner_provider: Arc<dyn LlmProvider> = Arc::new(
+                    SemaphoreThrottledProvider::new(planner_provider, llm_semaphore.clone()),
+                );
 
                 // Default planning prompt, WITH runtime-variable substitution:
                 // the dynamic_parallel planner reads `node.prompt` directly
@@ -5566,6 +5646,7 @@ mod tests {
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
             guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -5679,6 +5760,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    #[test]
+    fn defaults_pipeline_llm_throttle_to_four_permits() {
+        let executor = PipelineExecutor::new(make_test_config());
+        assert_eq!(
+            executor.max_concurrent_llm_calls_for_test(),
+            DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS
+        );
+        assert_eq!(
+            executor
+                .build_codergen_for_test()
+                .llm_available_permits_for_test(),
+            Some(DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS)
+        );
+    }
+
+    #[test]
+    fn honors_configured_pipeline_llm_throttle_and_clamps_zero() {
+        let mut config = make_test_config();
+        config.max_concurrent_llm_calls = Some(2);
+        let executor = PipelineExecutor::new(config);
+        assert_eq!(executor.max_concurrent_llm_calls_for_test(), 2);
+        assert_eq!(
+            executor
+                .build_codergen_for_test()
+                .llm_available_permits_for_test(),
+            Some(2)
+        );
+
+        let mut config = make_test_config();
+        config.max_concurrent_llm_calls = Some(0);
+        let executor = PipelineExecutor::new(config);
+        assert_eq!(executor.max_concurrent_llm_calls_for_test(), 1);
+        assert_eq!(
+            executor
+                .build_codergen_for_test()
+                .llm_available_permits_for_test(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -5807,6 +5928,7 @@ mod tests {
             max_parallel_workers: 8,
             max_pipeline_fanout_total: Some(cap),
             guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6712,6 +6834,7 @@ mod tests {
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
             guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6767,6 +6890,7 @@ mod tests {
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
             guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6816,6 +6940,7 @@ mod tests {
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
             guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),

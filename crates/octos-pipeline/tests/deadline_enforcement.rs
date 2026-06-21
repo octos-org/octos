@@ -119,6 +119,7 @@ fn base_config(
         max_parallel_workers: 1,
         max_pipeline_fanout_total: None,
         guards: Vec::new(),
+        max_concurrent_llm_calls: None,
         checkpoint_store: None,
         hook_executor,
         workspace_context: octos_pipeline::context::PipelineContext::default(),

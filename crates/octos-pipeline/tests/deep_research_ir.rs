@@ -129,6 +129,7 @@ async fn deep_research_ir_runs_end_to_end() {
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
     let config = ExecutorConfig {
         guards: Vec::new(),
+        max_concurrent_llm_calls: None,
         default_provider: Arc::new(
             OpenAIProvider::new(key, "deepseek-chat").with_base_url("https://api.deepseek.com/v1"),
         ) as Arc<dyn LlmProvider>,
