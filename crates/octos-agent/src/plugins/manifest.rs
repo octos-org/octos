@@ -996,6 +996,11 @@ mod tests {
             mcp_servers: vec![],
             hooks: vec![],
             prompts: None,
+            hardware_lifecycle: None,
+            tool_discovery: octos_plugin::ToolDiscovery::Static,
+            required_safety_tier: crate::permissions::SafetyTier::default(),
+            tool_overrides: HashMap::new(),
+            discovery: None,
         }
     }
 

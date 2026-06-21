@@ -2983,7 +2983,8 @@ edition = "2021"
                 "content_type_description": "PPTX decks",
                 "tools": [{
                     "name": "mofa_slides",
-                    "description": "Render slides"
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
                 }]
             }"#,
         )
@@ -3090,7 +3091,8 @@ edition = "2021"
                 "content_type_description": "PPTX decks",
                 "tools": [{
                     "name": "mofa_slides",
-                    "description": "Render slides"
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
                 }]
             }"#,
         )
@@ -3168,7 +3170,8 @@ edition = "2021"
                 "content_type_description": "PPTX decks",
                 "tools": [{
                     "name": "mofa_slides",
-                    "description": "Render slides"
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
                 }]
             }"#,
         )
@@ -3290,7 +3293,11 @@ edition = "2021"
                 "version": "1.0",
                 "make_type": "slides",
                 "content_type_description": "PPTX decks",
-                "tools": [{"name": "mofa_slides", "description": "Render slides"}]
+                "tools": [{
+                    "name": "mofa_slides",
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
             }"#,
         )
         .unwrap();

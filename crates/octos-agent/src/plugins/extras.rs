@@ -450,6 +450,9 @@ mod tests {
         PluginManifest {
             name: name.into(),
             version: "1.0.0".into(),
+            make_type: None,
+            content_type_description: None,
+            make_target_tool: None,
             tools: tools
                 .into_iter()
                 .map(|t| PluginToolDef {
