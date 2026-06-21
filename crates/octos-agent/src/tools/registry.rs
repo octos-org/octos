@@ -183,6 +183,26 @@ pub struct ToolRegistry {
     /// wins when present. `spawn_only` tools never reach this path (they are
     /// backgrounded earlier in the execution loop).
     tool_timeout_secs: u64,
+    /// RFC-1 fixup (codex P1): tool names that are registered for
+    /// **internal** dispatch only — callable through `get()` /
+    /// `get_tool()` so internal forwarders (e.g. the `mofa_make`
+    /// dispatcher routing to its target) can reach them, but invisible
+    /// to:
+    ///
+    /// - `specs()` — the LLM never sees them in its tool list
+    /// - `activate_tools` enumeration — the deferred-list description
+    ///   in `activate_tools` spec does NOT advertise them, so the LLM
+    ///   has no signal that they exist
+    /// - `activate()` — calling `activate("<name>")` on an internal
+    ///   hidden tool is a no-op; the name cannot be promoted into the
+    ///   LLM-visible spec set
+    ///
+    /// Unlike `deferred`, names in this set are NOT recoverable via
+    /// `activate_tools`. This is the right semantic for `mofa_make`'s
+    /// hidden targets (`mofa_slides`, `mofa_cards`, ...): the
+    /// dispatcher is the ONLY supported LLM entry-point; allowing the
+    /// LLM to re-promote a sibling defeats the RFC-1 consolidation.
+    internal_hidden: HashSet<String>,
 }
 
 /// Default per-tool execution-timeout backstop (seconds) for the registry
@@ -220,6 +240,7 @@ impl ToolRegistry {
             session_key: None,
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
+            internal_hidden: HashSet::new(),
         }
     }
 
@@ -252,6 +273,47 @@ impl ToolRegistry {
         if let Some(msg) = message {
             self.spawn_only_messages.insert(name.to_string(), msg);
         }
+    }
+
+    /// RFC-1 fixup (codex P1): mark a tool as **internal hidden**.
+    ///
+    /// Internal hidden tools are still callable through `get()` /
+    /// `get_tool()` (so internal forwarders like the `mofa_make`
+    /// dispatcher can reach them), but they are removed from `specs()`
+    /// AND from `activate_tools`'s enumerated description AND cannot
+    /// be re-promoted via `activate(name)`.
+    ///
+    /// Use this for dispatcher target tools (mofa_slides, mofa_cards,
+    /// etc.) that should ONLY be reachable through their dispatcher
+    /// (`mofa_make`) — never directly callable by the LLM.
+    ///
+    /// Unlike `defer`, this is a one-way operation from the LLM's
+    /// point of view: there is no "un-hide" path through any
+    /// LLM-callable tool. (Internal callers can clear the marker
+    /// programmatically via [`Self::clear_internal_hidden`] if a
+    /// future code path needs to surface the tool — e.g. spawn child
+    /// registries that clear spawn_only also clear this set.)
+    pub fn mark_internal_hidden(&mut self, name: &str) {
+        if self.tools.contains_key(name) {
+            self.internal_hidden.insert(name.to_string());
+        }
+        self.invalidate_cache();
+    }
+
+    /// Whether the given tool is currently internal-hidden (RFC-1).
+    pub fn is_internal_hidden(&self, name: &str) -> bool {
+        self.internal_hidden.contains(name)
+    }
+
+    /// Clear all internal-hidden markers. Used by spawn child registries
+    /// where the same tools should be directly callable (the subagent
+    /// IS the background context — no dispatcher indirection needed).
+    pub fn clear_internal_hidden(&mut self) {
+        if self.internal_hidden.is_empty() {
+            return;
+        }
+        self.internal_hidden.clear();
+        self.invalidate_cache();
     }
 
     /// Check if a tool is marked spawn_only.
@@ -557,6 +619,13 @@ impl ToolRegistry {
             return false;
         }
         drop(deferred);
+        // RFC-1 fixup (codex P1): internal-hidden tools are also
+        // invisible to the LLM. They are callable only via internal
+        // forwarders (e.g. `mofa_make`), never through the LLM's tool
+        // list.
+        if self.internal_hidden.contains(name) {
+            return false;
+        }
         self.is_tool_visible_post_activation(name)
     }
 
@@ -578,6 +647,13 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(name) else {
             return false;
         };
+        // RFC-1 fixup (codex P1): an internal-hidden tool cannot be
+        // surfaced via `activate()`, so the post-activation predicate
+        // must report it as not visible — otherwise `activate_tools`
+        // would advertise a name it can never actually reach.
+        if self.internal_hidden.contains(name) {
+            return false;
+        }
         if let Some(ref policy) = self.provider_policy {
             if !provider_policy_allows_equivalent_with_tags(policy, name, tool.tags()) {
                 return false;
@@ -604,6 +680,10 @@ impl ToolRegistry {
             .tools
             .values()
             .filter(|t| !deferred.contains(t.name()))
+            // RFC-1 fixup (codex P1): exclude internal-hidden tools from
+            // the LLM-visible spec set. They remain callable via `get()`
+            // for internal forwarders (e.g. `mofa_make`).
+            .filter(|t| !self.internal_hidden.contains(t.name()))
             .filter(|t| {
                 self.provider_policy.as_ref().is_none_or(|p| {
                     provider_policy_allows_equivalent_with_tags(p, t.name(), t.tags())
@@ -743,6 +823,9 @@ impl ToolRegistry {
             let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
             deferred.retain(|name| self.tools.contains_key(name));
         }
+        // RFC-1 fixup: prune stale internal-hidden markers symmetrically.
+        self.internal_hidden
+            .retain(|name| self.tools.contains_key(name));
         self.invalidate_cache();
     }
 
@@ -895,6 +978,11 @@ impl ToolRegistry {
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
+            // RFC-1 fixup (codex P1): propagate internal-hidden markers
+            // onto per-turn snapshots so the per-turn registry observes
+            // the same invariants as the parent (mofa_make targets stay
+            // hidden from `specs()` and unreachable via `activate`).
+            internal_hidden: self.internal_hidden.clone(),
         };
         // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
         // Arcs still point to the PARENT's catalog cell. Re-register
@@ -944,17 +1032,28 @@ impl ToolRegistry {
     /// Activate a deferred tool group or individual tool. Works through `&self`
     /// (interior mutability) so it can be called during the agent loop via Arc.
     /// Returns the names of tools that were activated.
+    ///
+    /// RFC-1 fixup (codex P1): internal-hidden tools (registered via
+    /// [`Self::mark_internal_hidden`]) are NOT promotable — calls to
+    /// `activate("mofa_slides")` etc. cannot lift them into the
+    /// LLM-visible spec set. This preserves the RFC-1 invariant that
+    /// dispatcher targets are only reachable through their dispatcher.
     pub fn activate(&self, group_or_name: &str) -> Vec<String> {
         let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let mut activated = Vec::new();
 
         if let Some(info) = policy::tool_group_info(group_or_name) {
             for &tool in info.tools {
+                // Refuse to promote internal-hidden names even if they
+                // somehow appear in a tool group definition.
+                if self.internal_hidden.contains(tool) {
+                    continue;
+                }
                 if deferred.remove(tool) {
                     activated.push(tool.to_string());
                 }
             }
-        } else if deferred.remove(group_or_name) {
+        } else if !self.internal_hidden.contains(group_or_name) && deferred.remove(group_or_name) {
             activated.push(group_or_name.to_string());
         }
 
@@ -1442,6 +1541,10 @@ impl ToolRegistry {
         self.tools
             .values()
             .filter(|tool| !deferred.contains(tool.name()))
+            // RFC-1 fixup (codex P1): exclude internal-hidden tools from
+            // tool_search / tool_suggest discovery too — the LLM cannot
+            // call them directly, advertising them would be misleading.
+            .filter(|tool| !self.internal_hidden.contains(tool.name()))
             .filter(|tool| {
                 self.provider_policy.as_ref().is_none_or(|policy| {
                     provider_policy_allows_equivalent_with_tags(policy, tool.name(), tool.tags())
