@@ -107,6 +107,15 @@ pub async fn author_html(llm: &dyn LlmProvider, ctx: &RichHtmlContext) -> eyre::
         ..Default::default()
     };
     let resp = llm.chat(&messages, &[], &config).await?;
+    // #1477 P2: this focused authoring call runs OUTSIDE the turn's token
+    // accounting (the turn already emitted `done`), so surface its spend here
+    // for observability of the otherwise-invisible background cost.
+    tracing::info!(
+        input_tokens = resp.usage.input_tokens,
+        output_tokens = resp.usage.output_tokens,
+        illustration = ctx.illustration,
+        "rich_output: author_html token usage"
+    );
     let raw = resp
         .content
         .filter(|c| !c.trim().is_empty())

@@ -17893,6 +17893,12 @@ async fn run_standalone_turn(
     // most one final response and we only need it once in the post-turn
     // block.
     let (final_reply_tx, final_reply_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    // Voice rich output (#1477): the agent task lifts the trailing in-band
+    // `[[VISUAL:...]]` directive out of `response.content` (and strips it from
+    // every authoritative surface) and hands it here for the post-turn
+    // background dispatch. `None` for text turns or replies without a marker.
+    let (visual_directive_tx, visual_directive_rx) =
+        tokio::sync::oneshot::channel::<Option<crate::api::voice_turn::VisualDirective>>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -17953,7 +17959,26 @@ async fn run_standalone_turn(
         }
 
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
+                // Voice rich output (#1477): lift the trailing in-band
+                // `[[VISUAL:...]]` directive out of the reply and strip it from
+                // `response.content` AND every Assistant carrier in
+                // `response.messages` BEFORE capture / persist / done, so the
+                // internal control protocol never reaches the wire
+                // (`message/delta` from `done`, `message/persisted`) or storage
+                // (session JSONL). The directive is dispatched post-turn from the
+                // oneshot below; the client learns a visual is coming from the
+                // typed `visual/generating` event. Gated on voice turns. No-op
+                // (returns `None`, mutates nothing) without a real trailing marker.
+                let visual_directive = if had_audio_input {
+                    crate::api::voice_turn::strip_visual_directive(
+                        &mut response.content,
+                        &mut response.messages,
+                    )
+                } else {
+                    None
+                };
+                let _ = visual_directive_tx.send(visual_directive);
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -18454,6 +18479,8 @@ async fn run_standalone_turn(
                 // back to the session-history scan, matching the
                 // pre-#1134 behaviour.
                 let _ = final_reply_tx.send(None);
+                // No reply → no rich-output directive to dispatch.
+                let _ = visual_directive_tx.send(None);
                 // Codex round-2 MAJOR 2: prefer the typed user-actionable
                 // message over the raw LLM Display string. The agent
                 // loop's classifier (`HarnessError::classify_report` at
@@ -18505,6 +18532,15 @@ async fn run_standalone_turn(
     // splitter), so it is robust whether or not the reply was streamed.
     let mut voice_splitter = if had_audio_input {
         Some(crate::api::voice_turn::VoiceReplySplitter::new())
+    } else {
+        None
+    };
+    // Voice turn: marker-aware UI delta filter (#1477). Streams the reply to the
+    // chat bubble token-by-token while holding back the trailing
+    // `[[VISUAL:...]]` marker, so the live `message/delta` wire never carries the
+    // internal control protocol (durable surfaces are stripped in the agent task).
+    let mut voice_delta_filter = if had_audio_input {
+        Some(crate::api::voice_turn::VisibleDeltaFilter::new())
     } else {
         None
     };
@@ -18679,10 +18715,16 @@ async fn run_standalone_turn(
                 break;
             }
             _ => {
-                // Voice turn: accumulate streamed `token` text and hand off
-                // each complete sentence to the FIFO TTS worker for immediate
-                // synthesis (overlaps with the rest of LLM generation).
-                if let (Some(tx), Some(sp)) = (voice_tx.as_ref(), voice_splitter.as_mut()) {
+                // Voice turn: accumulate streamed `token` text and hand off each
+                // complete sentence to the FIFO TTS worker for immediate synthesis,
+                // AND emit the same text — minus the trailing `[[VISUAL:...]]`
+                // marker — as the UI `message/delta`, then SKIP the generic token
+                // forward so the raw marker never reaches the wire (#1477).
+                if let (Some(tx), Some(sp), Some(uf)) = (
+                    voice_tx.as_ref(),
+                    voice_splitter.as_mut(),
+                    voice_delta_filter.as_mut(),
+                ) {
                     if event.get("type").and_then(Value::as_str) == Some("token") {
                         if let Some(t) = event.get("text").and_then(Value::as_str) {
                             for sentence in sp.push(t) {
@@ -18690,7 +18732,24 @@ async fn run_standalone_turn(
                                     voice_streamed_count += 1;
                                 }
                             }
+                            let visible = uf.push(t);
+                            if !visible.is_empty() {
+                                let _ = send_notification_ephemeral(
+                                    &ws,
+                                    &ledger,
+                                    UiNotification::MessageDelta(MessageDeltaEvent {
+                                        session_id: session_id.clone(),
+                                        topic: None,
+                                        turn_id: turn_id.clone(),
+                                        text: visible,
+                                    }),
+                                );
+                                saw_delta = true;
+                            }
                         }
+                        // Token handled for this voice turn — do NOT forward the
+                        // raw token (it may carry the in-band marker).
+                        continue;
                     }
                 }
                 forward_progress_event(
@@ -18718,6 +18777,26 @@ async fn run_standalone_turn(
                     if tx.try_send(t).is_ok() {
                         voice_streamed_count += 1;
                     }
+                }
+            }
+        }
+        // Flush any held UI text the marker-aware filter retained that turned out
+        // NOT to be a real trailing marker (rare mid-reply `[[VISUAL:`); a genuine
+        // trailing marker yields nothing so it never reaches the wire (#1477).
+        if let Some(uf) = voice_delta_filter.take() {
+            if !interrupt_observed {
+                let recovered = uf.finish();
+                if !recovered.is_empty() {
+                    let _ = send_notification_ephemeral(
+                        &ws,
+                        &ledger,
+                        UiNotification::MessageDelta(MessageDeltaEvent {
+                            session_id: session_id.clone(),
+                            topic: None,
+                            turn_id: turn_id.clone(),
+                            text: recovered,
+                        }),
+                    );
                 }
             }
         }
@@ -18908,20 +18987,50 @@ async fn run_standalone_turn(
     // half is guaranteed to be either delivered or dropped — this
     // `await` will not block.
     let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
+    // Voice rich output (#1477): the directive was lifted + stripped inside the
+    // agent task; receive it here (`None` for text turns / replies with no
+    // marker). `final_response_content` is now the clean spoken reply (marker
+    // already gone), so it doubles as the HTML author's "spoken_reply" context.
+    let visual_directive = visual_directive_rx.await.ok().flatten();
 
-    // Voice rich output: dispatch the in-band [[VISUAL]] directive parsed from
-    // the AUTHORITATIVE final reply (robust whether or not it was streamed).
+    // Voice rich output: dispatch the in-band [[VISUAL]] directive.
     // HTML → a focused tool-less LLM call (rich_output); image-class → a
     // backend-orchestrated mofa skill. Fire-and-forget: the artifact arrives
     // async via the same `files_attached` channel as the reply audio, so the
-    // turn completes while the client shows a "generating" state. The model
-    // emits no tool call, so the Gemini-3 thought_signature path never arises.
+    // turn completes while the client shows a "generating" state. The client is
+    // told a visual is coming by the typed `visual/generating` event below (no
+    // in-band marker is on the wire). The model emits no tool call, so the
+    // Gemini-3 thought_signature path never arises.
     if had_audio_input && !interrupt_observed {
-        if let Some(directive) = final_response_content
-            .as_deref()
-            .and_then(crate::api::voice_turn::parse_visual_marker)
-        {
+        if let Some(directive) = visual_directive {
             use crate::api::voice_turn::VisualKind;
+            // Tell the client a visual is generating (typed signal, replaces the
+            // old in-band-marker scrape). Cleared by `file/attached` (success)
+            // or `visual/failed` (below).
+            super::ui_protocol_alpha9_bridge::emit_visual_generating_from_background(
+                &ledger,
+                &session_id,
+                &turn_id,
+                directive.kind.as_str(),
+            );
+            // #1477 P2: register the visual generation as a SUPERVISED background
+            // task (not a bare detached spawn) so it is observable in the admin
+            // dashboard, carries terminal status, and is cancelable — both via
+            // the session interrupt path (`cancel_session_spawn_only_tasks`) and
+            // its own cancel token, which the worker races below.
+            let r_supervisor = tool_registry.supervisor();
+            let r_task_call_id = format!("voice-visual-{}", uuid::Uuid::now_v7());
+            // Register under the FULL session key (incl. any `#topic` /
+            // profile dimension), NOT `base_key()`: the interrupt path queries
+            // `get_tasks_for_session(&session_id.to_string())` with an EXACT
+            // string match (`cancel_session_spawn_only_tasks`). A `base_key()`
+            // registration would file the task under `…web-123` while the
+            // interrupt of `…web-123#voice` looks for the full key and miss it.
+            // Using the full key also means an interrupt cancels only THIS
+            // topic's visual task, never a sibling topic's.
+            let r_task_id =
+                r_supervisor.register("voice_visual", &r_task_call_id, Some(session_id.0.as_str()));
+            let r_cancel = r_supervisor.cancel_token(&r_task_id);
             let r_ledger = ledger.clone();
             let r_session = session_id.clone();
             let r_turn = turn_id.clone();
@@ -18929,10 +19038,7 @@ async fn run_standalone_turn(
             let r_provider = llm_provider.clone();
             let r_registry = tool_registry.clone();
             let r_transcript = voice_transcripts.join("\n");
-            let r_spoken = final_response_content
-                .as_deref()
-                .map(|r| crate::api::voice_turn::strip_visual_marker(r).to_string())
-                .unwrap_or_default();
+            let r_spoken = final_response_content.clone().unwrap_or_default();
             // This turn's camera frame(s) → forwarded to the Illustrated path as
             // reference images so the generated illustration depicts the real
             // subject in front of the camera. Gated on the EXPLICIT live-video
@@ -18954,88 +19060,151 @@ async fn run_standalone_turn(
                 "voice rich: dispatching visual directive"
             );
             tokio::spawn(async move {
-                let rels: Vec<String> = match directive.kind {
-                    VisualKind::Html => {
-                        let ctx = octos_agent::rich_output::RichHtmlContext {
-                            transcript: r_transcript,
-                            spoken_reply: r_spoken,
-                            brief: directive.brief,
-                            illustration: false,
-                        };
-                        match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx).await
-                        {
-                            Ok(html) => {
-                                let name = format!("visual-{}.html", uuid::Uuid::now_v7());
-                                match tokio::fs::write(r_dir.join(&name), html).await {
-                                    Ok(()) => vec![name],
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "voice rich: html write failed");
-                                        Vec::new()
+                r_supervisor.mark_running(&r_task_id);
+                // #1477 P2: bound the background visual task. Image generation +
+                // HTML authoring are network/LLM calls with no other ceiling on
+                // this detached path, so cap them so a hung skill / provider
+                // cannot leak a task for the process lifetime. On timeout we
+                // deliver nothing (observable via the warn below), matching the
+                // other failure branches.
+                const VISUAL_DISPATCH_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(180);
+                let produce = async {
+                    let rels: Vec<String> = match directive.kind {
+                        VisualKind::Html => {
+                            let ctx = octos_agent::rich_output::RichHtmlContext {
+                                transcript: r_transcript,
+                                spoken_reply: r_spoken,
+                                brief: directive.brief,
+                                illustration: false,
+                            };
+                            match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx)
+                                .await
+                            {
+                                Ok(html) => {
+                                    let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                    match tokio::fs::write(r_dir.join(&name), html).await {
+                                        Ok(()) => vec![name],
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "voice rich: html write failed");
+                                            Vec::new()
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "voice rich: author_html failed");
-                                Vec::new()
-                            }
-                        }
-                    }
-                    VisualKind::Illustrated => {
-                        // Stage 1: generate a realistic illustration PNG.
-                        let png_bytes = match crate::api::voice_turn::run_illustration_image(
-                            &r_registry,
-                            &directive.brief,
-                            &r_dir,
-                            &r_ref_images,
-                        )
-                        .await
-                        {
-                            Some(p) => tokio::fs::read(&p).await.ok(),
-                            None => None,
-                        };
-                        // Stage 2: author HTML that embeds it (model uses the
-                        // placeholder src), then inline the PNG as a data URI so
-                        // the artifact is a single self-contained file. If image
-                        // gen failed, fall back to a no-illustration document.
-                        let ctx = octos_agent::rich_output::RichHtmlContext {
-                            transcript: r_transcript,
-                            spoken_reply: r_spoken,
-                            brief: directive.brief,
-                            illustration: png_bytes.is_some(),
-                        };
-                        match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx).await
-                        {
-                            Ok(html) => {
-                                let html = match png_bytes {
-                                    Some(bytes) => {
-                                        octos_agent::rich_output::inline_illustration(&html, &bytes)
-                                    }
-                                    None => html,
-                                };
-                                let name = format!("visual-{}.html", uuid::Uuid::now_v7());
-                                match tokio::fs::write(r_dir.join(&name), html).await {
-                                    Ok(()) => vec![name],
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "voice rich: html write failed");
-                                        Vec::new()
-                                    }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice rich: author_html failed");
+                                    Vec::new()
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "voice rich: author_html (illustrated) failed");
-                                Vec::new()
-                            }
                         }
-                    }
-                    VisualKind::Image | VisualKind::Infographic => {
-                        crate::api::voice_turn::run_image_skill(&r_registry, &directive, &r_dir)
+                        VisualKind::Illustrated => {
+                            // Stage 1: generate a realistic illustration PNG.
+                            let png_bytes = match crate::api::voice_turn::run_illustration_image(
+                                &r_registry,
+                                &directive.brief,
+                                &r_dir,
+                                &r_ref_images,
+                            )
                             .await
+                            {
+                                Some(p) => tokio::fs::read(&p).await.ok(),
+                                None => None,
+                            };
+                            // Stage 2: author HTML that embeds it (model uses the
+                            // placeholder src), then inline the PNG as a data URI so
+                            // the artifact is a single self-contained file. If image
+                            // gen failed, fall back to a no-illustration document.
+                            let ctx = octos_agent::rich_output::RichHtmlContext {
+                                transcript: r_transcript,
+                                spoken_reply: r_spoken,
+                                brief: directive.brief,
+                                illustration: png_bytes.is_some(),
+                            };
+                            match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx)
+                                .await
+                            {
+                                Ok(html) => {
+                                    let html = match png_bytes {
+                                        Some(bytes) => {
+                                            octos_agent::rich_output::inline_illustration(
+                                                &html, &bytes,
+                                            )
+                                        }
+                                        None => html,
+                                    };
+                                    let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                    match tokio::fs::write(r_dir.join(&name), html).await {
+                                        Ok(()) => vec![name],
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "voice rich: html write failed");
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice rich: author_html (illustrated) failed");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        VisualKind::Image | VisualKind::Infographic => {
+                            crate::api::voice_turn::run_image_skill(&r_registry, &directive, &r_dir)
+                                .await
+                        }
+                    };
+                    rels
+                };
+                // Race the work against the task's cancel token (fired by the
+                // session interrupt path) and the timeout. Each terminal branch
+                // reports its OWN reason so the supervisor row + `visual/failed`
+                // distinguish cancellation, timeout, and a clean-but-empty
+                // result (rather than folding all three into one message).
+                let rels = tokio::select! {
+                    biased;
+                    _ = r_cancel.cancelled() => {
+                        tracing::info!("voice rich: visual dispatch cancelled");
+                        r_supervisor.mark_failed(&r_task_id, "cancelled".to_owned());
+                        super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                            &r_ledger,
+                            &r_session,
+                            &r_turn,
+                            Some("cancelled".to_owned()),
+                        );
+                        return;
+                    }
+                    res = tokio::time::timeout(VISUAL_DISPATCH_TIMEOUT, produce) => match res {
+                        Ok(rels) => rels,
+                        Err(_) => {
+                            let reason =
+                                format!("timed out after {}s", VISUAL_DISPATCH_TIMEOUT.as_secs());
+                            tracing::warn!(
+                                timeout_s = VISUAL_DISPATCH_TIMEOUT.as_secs(),
+                                "voice rich: visual dispatch timed out, delivering nothing"
+                            );
+                            r_supervisor.mark_failed(&r_task_id, reason.clone());
+                            super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                                &r_ledger,
+                                &r_session,
+                                &r_turn,
+                                Some(reason),
+                            );
+                            return;
+                        }
                     }
                 };
                 if rels.is_empty() {
                     tracing::warn!("voice rich: produced no artifact to deliver");
+                    r_supervisor.mark_failed(&r_task_id, "produced no artifact".to_owned());
+                    // Clear the client's "generating" placeholder (#1477).
+                    super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                        &r_ledger,
+                        &r_session,
+                        &r_turn,
+                        Some("visual generation produced no artifact".to_owned()),
+                    );
                 } else {
                     tracing::info!(files = ?rels, "voice rich: delivering artifact(s)");
+                    r_supervisor.mark_completed(&r_task_id, rels.clone());
                     super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
                         &r_ledger,
                         &r_session,
@@ -22008,6 +22177,8 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // future addition forces an explicit decision here.
             UiNotification::TurnStarted(_)
             | UiNotification::MessageDelta(_)
+            | UiNotification::VisualGenerating(_)
+            | UiNotification::VisualFailed(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)

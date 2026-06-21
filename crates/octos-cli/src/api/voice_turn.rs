@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use octos_core::{Message, MessageRole};
 use octos_llm::ominix::OminixClient;
 
 /// 解析 OminiX 服务基址（平台级，env 优先）。与 `api/admin.rs` 的同名 helper 等价；
@@ -260,6 +261,16 @@ impl VisualKind {
             _ => None,
         }
     }
+
+    /// Wire token for the `visual/generating` event (`kind` field).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Illustrated => "illustrated",
+            Self::Image => "image",
+            Self::Infographic => "infographic",
+        }
+    }
 }
 
 /// A parsed in-band rich-output directive.
@@ -428,6 +439,121 @@ pub(crate) fn strip_visual_marker(reply: &str) -> &str {
     }
 }
 
+/// Remove EVERY `[[VISUAL:...]]` span from `s` (not just a trailing one).
+///
+/// Unlike [`strip_visual_marker`] (which only drops a trailing directive and
+/// preserves a mid-text mention), this scrubs the marker wherever it appears —
+/// used for sanitizing free-form text that may have folded a marker in at an
+/// arbitrary position, e.g. a pre-fix compaction summary. An unterminated
+/// `[[VISUAL:` drops the remainder.
+pub(crate) fn remove_all_visual_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("[[VISUAL:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find("]]") {
+            Some(end) => rest = &after[end + "]]".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Lift the trailing `[[VISUAL:...]]` directive out of the turn's authoritative
+/// reply surfaces and strip it in place, so the internal control protocol never
+/// reaches the WIRE (`message/delta` from `done`, `message/persisted`) or
+/// STORAGE (session JSONL). Strips both `content` (the final `response.content`)
+/// and every Assistant carrier in `messages` that ends with the same trailing
+/// marker. Returns the parsed directive for background dispatch, or `None` (and
+/// leaves everything intact) when there is no real trailing marker. The frontend
+/// learns a visual is coming from the typed `visual/generating` event instead.
+pub(crate) fn strip_visual_directive(
+    content: &mut String,
+    messages: &mut [Message],
+) -> Option<VisualDirective> {
+    let directive = parse_visual_marker(content)?;
+    *content = strip_visual_marker(content).to_string();
+    for message in messages.iter_mut() {
+        if message.role == MessageRole::Assistant {
+            let stripped = strip_visual_marker(&message.content);
+            if stripped.len() != message.content.len() {
+                message.content = stripped.to_string();
+            }
+        }
+    }
+    Some(directive)
+}
+
+/// Byte length of the marker-free visible prefix of `full`: everything up to a
+/// (possibly mid-reply) `[[VISUAL:` occurrence, else everything minus a trailing
+/// partial that could still grow into the marker. Trailing whitespace before
+/// that cut is also held back — the marker convention puts it on its own line,
+/// so the preceding newline would otherwise leak as a blank line. Cut points
+/// fall on char boundaries (`MARKER` is ASCII; `trim_end` is boundary-safe).
+fn visible_prefix_len(full: &str) -> usize {
+    let cut = match full.find(MARKER) {
+        Some(i) => i,
+        None => full.len() - marker_prefix_hold(full),
+    };
+    full[..cut].trim_end().len()
+}
+
+/// Token-granular twin of [`VoiceReplySplitter`] for the **UI message delta**
+/// stream of a voice turn: emits the reply text token-by-token while holding
+/// back any trailing (or still-forming) `[[VISUAL:...]]` marker, so the live
+/// `message/delta` wire never carries the internal control protocol (the
+/// durable surfaces are stripped separately by [`strip_visual_directive`]).
+pub(crate) struct VisibleDeltaFilter {
+    /// All text seen so far.
+    full: String,
+    /// Byte count already emitted as deltas (monotonic).
+    emitted: usize,
+}
+
+impl VisibleDeltaFilter {
+    pub(crate) fn new() -> Self {
+        Self {
+            full: String::new(),
+            emitted: 0,
+        }
+    }
+
+    /// Feed a streamed token; returns the newly-visible marker-free text to emit
+    /// as a delta now (empty when the token only extended a held-back marker).
+    pub(crate) fn push(&mut self, token: &str) -> String {
+        self.full.push_str(token);
+        let visible = visible_prefix_len(&self.full);
+        if visible > self.emitted {
+            let out = self.full[self.emitted..visible].to_string();
+            self.emitted = visible;
+            out
+        } else {
+            String::new()
+        }
+    }
+
+    /// End of stream: returns any held-back text that turned out NOT to be a
+    /// real trailing marker (a rare mid-reply `[[VISUAL:` quote), so nothing is
+    /// lost. A real trailing marker yields `""` (stays off the wire).
+    pub(crate) fn finish(self) -> String {
+        let visible = if parse_visual_marker(&self.full).is_some() {
+            strip_visual_marker(&self.full).len()
+        } else {
+            self.full.len()
+        };
+        if visible > self.emitted {
+            self.full[self.emitted..visible].to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// Maps a `kind` to a mofa tool name + input args. `Html` is not a skill →
 /// `None`.
 fn image_skill_call(
@@ -443,11 +569,17 @@ fn image_skill_call(
                 "out": format!("{out}/infographic.png"),
             }),
         )),
+        // `mofa_image` (not `mofa_cards`): a plain "generate an image" request
+        // wants a single picture, and — unlike `mofa_cards`, which emits no
+        // `files_to_send` (octos #1041, see `workspace_policy` test) so the
+        // backend would get empty rels and deliver nothing — `mofa_image`
+        // reports its produced PNG via `files_to_send`, the same proven path
+        // the Illustrated stage-1 call relies on.
         VisualKind::Image => Some((
-            "mofa_cards",
+            "mofa_image",
             serde_json::json!({
-                "cards": [{ "prompt": d.brief }],
-                "card_dir": out,
+                "prompt": d.brief,
+                "out": format!("{out}/image.png"),
             }),
         )),
         // Html (focused LLM call) and Illustrated (two-stage: run_illustration_image
@@ -469,13 +601,6 @@ pub(crate) async fn run_illustration_image(
     out_dir: &Path,
     ref_images: &[String],
 ) -> Option<PathBuf> {
-    let Some(tool) = registry.get_tool("mofa_image") else {
-        tracing::warn!(
-            tool = "mofa_image",
-            "voice rich: illustration skill not installed"
-        );
-        return None;
-    };
     let mut args = serde_json::json!({
         "prompt": brief,
         "out": out_dir.join("illustration.png").to_string_lossy(),
@@ -483,7 +608,11 @@ pub(crate) async fn run_illustration_image(
     if !ref_images.is_empty() {
         args["ref_images"] = serde_json::json!(ref_images);
     }
-    match tool.execute(&args).await {
+    // #1477 P2: route through the registry (provider policy + arg-size limit +
+    // deferred-tool auto-activation) rather than a bare `tool.execute()`, so the
+    // background visual call is governed like any other tool execution. `Err`
+    // covers skill-not-installed, policy-denied, and generation failure alike.
+    match registry.execute("mofa_image", &args).await {
         Ok(res) => res.files_to_send.into_iter().next(),
         Err(e) => {
             tracing::warn!(tool = "mofa_image", error = %e, "voice rich: illustration gen failed");
@@ -505,11 +634,9 @@ pub(crate) async fn run_image_skill(
     let Some((name, args)) = image_skill_call(d, out_dir) else {
         return Vec::new();
     };
-    let Some(tool) = registry.get_tool(name) else {
-        tracing::warn!(tool = name, "voice rich: image skill not installed");
-        return Vec::new();
-    };
-    match tool.execute(&args).await {
+    // #1477 P2: route through the registry (policy + arg-size + auto-activation)
+    // instead of a bare `tool.execute()`. `Err` = not installed / denied / failed.
+    match registry.execute(name, &args).await {
         Ok(res) => res
             .files_to_send
             .iter()
@@ -1147,6 +1274,113 @@ mod tests {
             run_illustration_image(&reg, "x", Path::new("/tmp"), &[])
                 .await
                 .is_none()
+        );
+    }
+
+    // octos #1041: `image` kind must route to `mofa_image` (which reports its
+    // PNG via `files_to_send`), NOT `mofa_cards` (which emits none, so the old
+    // mapping delivered nothing for a plain "generate an image" request).
+    #[tokio::test]
+    async fn run_image_skill_image_kind_uses_mofa_image_and_delivers_file() {
+        use octos_agent::{Tool, ToolRegistry, ToolResult};
+        use std::path::PathBuf;
+
+        struct FakeMofaImage;
+        #[async_trait::async_trait]
+        impl Tool for FakeMofaImage {
+            fn name(&self) -> &str {
+                "mofa_image"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+                // The brief is forwarded as the generation prompt, and the
+                // produced file is named under the turn's out dir.
+                assert_eq!(args["prompt"], serde_json::json!("一只猫"));
+                assert_eq!(args["out"], serde_json::json!("/tmp/out/image.png"));
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    files_to_send: vec![PathBuf::from("/tmp/out/image.png")],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(FakeMofaImage);
+        let reg = std::sync::Arc::new(reg);
+        let d = VisualDirective {
+            kind: VisualKind::Image,
+            brief: "一只猫".into(),
+        };
+        let rels = run_image_skill(&reg, &d, Path::new("/tmp/out")).await;
+        assert_eq!(rels, vec!["image.png".to_string()]);
+    }
+
+    #[test]
+    fn strip_visual_directive_strips_content_and_assistant_carriers() {
+        let mut content = "好的我给你画一个。\n[[VISUAL:html|可调增益电路]]".to_string();
+        let mut messages = vec![
+            Message::user("画个电路".to_string()),
+            Message::assistant("好的我给你画一个。\n[[VISUAL:html|可调增益电路]]".to_string()),
+        ];
+        let directive = strip_visual_directive(&mut content, &mut messages);
+        assert_eq!(directive.as_ref().map(|d| d.kind), Some(VisualKind::Html));
+        assert_eq!(content, "好的我给你画一个。");
+        assert_eq!(messages[1].content, "好的我给你画一个。");
+        assert_eq!(messages[0].content, "画个电路");
+    }
+
+    #[test]
+    fn strip_visual_directive_noop_without_trailing_marker() {
+        let mut content = "用 [[VISUAL:html|x]] 举例。".to_string();
+        let mut messages = vec![Message::assistant(content.clone())];
+        assert!(strip_visual_directive(&mut content, &mut messages).is_none());
+        assert!(content.contains("[[VISUAL:html|x]]"));
+    }
+
+    #[test]
+    fn visible_delta_filter_hides_trailing_marker() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["你好", "世界。", "\n[[VIS", "UAL:html|猫]]"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "你好世界。");
+    }
+
+    #[test]
+    fn visible_delta_filter_recovers_false_marker_on_finish() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["用 ", "[[VISUAL:html|x]]", " 举例。"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "用 [[VISUAL:html|x]] 举例。");
+    }
+
+    #[test]
+    fn remove_all_visual_markers_scrubs_every_occurrence() {
+        // Mid-text + trailing markers are both removed (unlike strip_visual_marker).
+        assert_eq!(
+            remove_all_visual_markers(
+                "讲了电路 [[VISUAL:html|图A]] 又讲了细胞[[VISUAL:image|图B]]"
+            ),
+            "讲了电路  又讲了细胞"
+        );
+        // Marker-free text is returned unchanged.
+        assert_eq!(remove_all_visual_markers("普通总结文本"), "普通总结文本");
+        // An unterminated marker drops the remainder.
+        assert_eq!(
+            remove_all_visual_markers("abc [[VISUAL:html|没闭合"),
+            "abc "
         );
     }
 }

@@ -578,6 +578,41 @@ fn context_ledger_covers_history(manager: &ContextManager, messages: &[Message])
     max_source_seq + 1 >= messages.len()
 }
 
+/// #1477: scrub the in-band `[[VISUAL:...]]` directive from items IMPORTED from
+/// a persisted snapshot or a forked parent. The record-time sanitizer in
+/// `record_message_with_source_ref` only covers freshly-recorded messages; items
+/// loaded verbatim from a (possibly pre-fix) ledger snapshot or inherited across
+/// a fork bypass it and would otherwise re-emit the marker through `for_prompt`.
+/// Strips the trailing marker from `AssistantFinal` (dropping a reply that
+/// collapses to empty) and removes any marker folded into an old
+/// `CompactionSummary`. No-op for marker-free items.
+fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<TranscriptItem> {
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            match &mut item.kind {
+                TranscriptItemKind::AssistantFinal { content } => {
+                    let cleaned = crate::api::voice_turn::strip_visual_marker(content);
+                    if cleaned.len() != content.len() {
+                        *content = cleaned.to_string();
+                    }
+                    if content.trim().is_empty() {
+                        // The reply was only a marker — no model-facing row.
+                        return None;
+                    }
+                }
+                TranscriptItemKind::CompactionSummary { summary, .. } => {
+                    if summary.contains("[[VISUAL:") {
+                        *summary = crate::api::voice_turn::remove_all_visual_markers(summary);
+                    }
+                }
+                _ => {}
+            }
+            Some(item)
+        })
+        .collect()
+}
+
 impl ContextManager {
     pub(crate) fn new(session_id: impl Into<String>, thread_id: Option<String>) -> Self {
         Self {
@@ -627,6 +662,10 @@ impl ContextManager {
             .into_iter()
             .filter(|item| !matches!(item.kind, TranscriptItemKind::SystemInstruction { .. }))
             .collect();
+        // #1477: a forked parent's items bypass `record_message_with_source_ref`,
+        // so scrub any in-band visual marker here too (see
+        // `sanitize_imported_visual_markers`).
+        let items = sanitize_imported_visual_markers(items);
         let next_item_seq = items
             .iter()
             .filter_map(|item| {
@@ -733,6 +772,14 @@ impl ContextManager {
             .into_iter()
             .filter(|item| !matches!(item.kind, TranscriptItemKind::SystemInstruction { .. }))
             .collect();
+        // #1477: a snapshot persisted by a pre-fix daemon can hold
+        // marker-bearing `AssistantFinal` / `CompactionSummary` items. These are
+        // imported verbatim (NOT through `record_message_with_source_ref`), and
+        // `context_ledger_covers_history` will happily Load such a snapshot
+        // instead of rebuilding — so `for_prompt` would re-emit the marker to
+        // the model. Scrub it at the import boundary, the snapshot-side
+        // complement to the record-time sanitizer.
+        let items = sanitize_imported_visual_markers(items);
         let next_item_seq = items
             .iter()
             .filter_map(|item| item.id.as_str().strip_prefix("ctxitem_"))
@@ -922,10 +969,30 @@ impl ContextManager {
                         source_ref.clone(),
                     ));
                 }
-                if !message.content.trim().is_empty() {
+                // Voice rich output (#1477): strip the in-band `[[VISUAL:...]]`
+                // directive from the assistant reply BEFORE it enters the
+                // transcript model. This is the record-time sanitizer — it
+                // covers every FRESHLY-RECORDED message path: boot replay
+                // (`from_session_history`), the in-loop bridge recording, and
+                // persisted-message merge. Items IMPORTED verbatim from a prior
+                // ledger snapshot or a forked parent do NOT pass through here;
+                // they are cleaned separately at the import boundary by
+                // `sanitize_imported_visual_markers`. Together the two keep the
+                // model-facing prompt, the compaction summaries (compaction
+                // reads `for_prompt` output), and the persisted manager snapshot
+                // free of the internal control protocol. The marker is
+                // intentionally still carried on the wire / session JSONL /
+                // displayed bubble, which the voice frontend depends on (it
+                // renders the "generating" state from the marker and strips it
+                // for display — see octos-web `use-voice-conversation.ts`); the
+                // ContextManager is model-only, so cleaning here never touches
+                // those surfaces. No-op for a reply without a trailing marker.
+                let assistant_content =
+                    crate::api::voice_turn::strip_visual_marker(&message.content);
+                if !assistant_content.trim().is_empty() {
                     ids.push(self.record_item_with_source_ref(
                         TranscriptItemKind::AssistantFinal {
-                            content: message.content.clone(),
+                            content: assistant_content.to_string(),
                         },
                         TranscriptItemSource::AgentLoop,
                         source_ref.clone(),
@@ -1982,6 +2049,191 @@ mod tests {
         assert!(frame.messages[1].content.contains("missing"));
         assert_eq!(frame.report.synthetic_item_ids.len(), 1);
         assert_eq!(frame.report.dropped_item_ids.len(), 1);
+    }
+
+    // #1477: the in-band `[[VISUAL:...]]` directive must never reach the
+    // model-facing prompt. It is sanitized at the single record chokepoint, so
+    // it leaks neither through live recording (`record_message`) nor through
+    // boot/snapshot replay (`from_session_history`), and the stored item it
+    // produces is clean (so the persisted snapshot + any compaction summary —
+    // which reads `for_prompt` output — are clean too).
+    #[test]
+    fn assistant_visual_marker_is_stripped_from_model_prompt_and_stored_item() {
+        let reply = "好的,我给你画一张细胞结构图。\n[[VISUAL:illustrated|人类细胞结构写实插图]]";
+
+        for manager in [
+            {
+                let mut m = ContextManager::new("s", None);
+                m.record_message(&Message::user("讲讲细胞结构"));
+                m.record_message(&Message::assistant(reply));
+                m
+            },
+            // Boot/snapshot replay path funnels through the same chokepoint.
+            ContextManager::from_session_history(
+                "s",
+                None,
+                &[Message::user("讲讲细胞结构"), Message::assistant(reply)],
+            ),
+        ] {
+            // The stored AssistantFinal item (hence the persisted snapshot) is
+            // already clean.
+            assert!(
+                !manager
+                    .items()
+                    .iter()
+                    .any(|i| matches!(&i.kind, TranscriptItemKind::AssistantFinal { content } if content.contains("VISUAL"))),
+                "stored AssistantFinal item must not contain the marker"
+            );
+            // The projected model prompt is clean (this is what the bridge sends
+            // and what compaction summarizes).
+            let frame = manager.for_prompt(&PromptBuildPolicy::default());
+            assert!(
+                !frame.messages.iter().any(|m| m.content.contains("VISUAL")),
+                "model prompt must not contain the marker"
+            );
+            // The spoken text itself survives.
+            let assistant = frame
+                .messages
+                .iter()
+                .find(|m| m.role == MessageRole::Assistant)
+                .expect("assistant message present");
+            assert_eq!(assistant.content, "好的,我给你画一张细胞结构图。");
+        }
+    }
+
+    // #1477 (codex follow-up): the compaction SUMMARY must also be marker-free.
+    // The real appui flow summarizes `for_prompt` output (now sanitized), so the
+    // summary text — and the installed CompactionSummary item it becomes — never
+    // carry the marker.
+    #[test]
+    fn compaction_summary_is_marker_free() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::system("system"));
+        for index in 0..6 {
+            manager.record_message(&Message::user(format!("u{index}")));
+            // Each assistant turn appends a trailing visual marker.
+            manager.record_message(&Message::assistant(format!(
+                "a{index}\n[[VISUAL:html|示意图{index}]]"
+            )));
+        }
+        // Summarize EXACTLY what the appui path feeds compaction: the projected
+        // prompt. With the record-time strip, that projection is already clean.
+        let before = manager.for_prompt(&PromptBuildPolicy::default());
+        let summary = octos_agent::compaction::compact_messages(&before.messages, 512);
+        assert!(
+            !summary.contains("VISUAL"),
+            "compaction summary input/output must be marker-free, got: {summary}"
+        );
+        let _ = manager.install_compaction_summary(&summary, 2);
+        let prompt = manager.for_prompt(&PromptBuildPolicy::default());
+        assert!(
+            !prompt.messages.iter().any(|m| m.content.contains("VISUAL")),
+            "post-compaction prompt (incl. System summary) must be marker-free"
+        );
+    }
+
+    // #1477 (codex round-3): a snapshot persisted by a PRE-fix daemon holds
+    // dirty `AssistantFinal` / `CompactionSummary` items that bypass the
+    // record-time sanitizer. When `context_ledger_covers_history` Loads it
+    // (instead of rebuilding), `for_prompt` must still not leak the marker.
+    #[test]
+    fn loaded_dirty_snapshot_does_not_leak_visual_marker_to_prompt() {
+        // Build a dirty manager via `record_item`, which injects the raw item
+        // kind WITHOUT the message-level sanitizer (simulating a pre-fix write).
+        let mut dirty = ContextManager::new("s", None);
+        dirty.record_item(
+            TranscriptItemKind::AssistantFinal {
+                content: "这是答案。\n[[VISUAL:html|示意图]]".to_owned(),
+            },
+            TranscriptItemSource::AgentLoop,
+        );
+        dirty.record_item(
+            TranscriptItemKind::CompactionSummary {
+                compaction_id: ContextCompactionId::new("c1"),
+                summary: "早些轮次:用户问了电路 [[VISUAL:html|旧图]] 然后继续。".to_owned(),
+                input_transcript_hash: "h0".to_owned(),
+                replacement_transcript_hash: "h1".to_owned(),
+            },
+            TranscriptItemSource::AgentLoop,
+        );
+
+        // Round-trip through the snapshot import path (the Loaded branch).
+        let loaded = ContextManager::from_snapshot(dirty.snapshot());
+
+        // Stored items are scrubbed (so the re-persisted snapshot is clean too).
+        assert!(!loaded.items().iter().any(|i| match &i.kind {
+            TranscriptItemKind::AssistantFinal { content } => content.contains("VISUAL"),
+            TranscriptItemKind::CompactionSummary { summary, .. } => summary.contains("VISUAL"),
+            _ => false,
+        }));
+        // The model-facing prompt is clean.
+        let frame = loaded.for_prompt(&PromptBuildPolicy::default());
+        assert!(
+            !frame.messages.iter().any(|m| m.content.contains("VISUAL")),
+            "loaded snapshot must not re-emit the marker to the model"
+        );
+        // The spoken answer text survives.
+        assert!(
+            frame
+                .messages
+                .iter()
+                .any(|m| m.content.contains("这是答案。"))
+        );
+    }
+
+    // #1477 (codex round-4, P3 strengthening): exercise the REAL production
+    // path — persist a dirty snapshot whose `source_seq` covers the history,
+    // then `load_or_rebuild_context_manager` must take the `Loaded` branch (not
+    // rebuild) AND still project a marker-free prompt.
+    #[test]
+    fn load_or_rebuild_loaded_branch_strips_visual_marker_from_prompt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = "voice:local:test#voice";
+        let source = |seq: usize, kind: &str| {
+            Some(TranscriptSourceRef {
+                session_id: session_id.to_owned(),
+                thread_id: None,
+                source_seq: Some(seq),
+                source_event_kind: kind.to_owned(),
+            })
+        };
+
+        // Build a dirty manager directly (bypassing the record-time sanitizer)
+        // with source_seqs that will COVER the two-message history below.
+        let mut dirty = ContextManager::new(session_id, None);
+        dirty.record_item_with_source_ref(
+            TranscriptItemKind::UserInput {
+                content: "讲讲电路".to_owned(),
+                media: Vec::new(),
+            },
+            TranscriptItemSource::SessionLog,
+            source(0, "user_message"),
+        );
+        dirty.record_item_with_source_ref(
+            TranscriptItemKind::AssistantFinal {
+                content: "好的。\n[[VISUAL:html|电路图]]".to_owned(),
+            },
+            TranscriptItemSource::AgentLoop,
+            source(1, "assistant_final"),
+        );
+        persist_context_manager_snapshot(temp.path(), session_id, &dirty)
+            .expect("persist dirty snapshot");
+
+        let history = vec![
+            Message::user("讲讲电路"),
+            Message::assistant("好的。\n[[VISUAL:html|电路图]]"),
+        ];
+        let (loaded, status) =
+            load_or_rebuild_context_manager(temp.path(), session_id, None, &history);
+
+        // The snapshot covers the history → Loaded, NOT rebuilt.
+        assert_eq!(status, ContextLedgerLoadStatus::Loaded);
+        let frame = loaded.for_prompt(&PromptBuildPolicy::default());
+        assert!(
+            !frame.messages.iter().any(|m| m.content.contains("VISUAL")),
+            "Loaded snapshot must not re-emit the marker to the model"
+        );
+        assert!(frame.messages.iter().any(|m| m.content == "好的。"));
     }
 
     #[test]
