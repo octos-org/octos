@@ -211,6 +211,9 @@ jobs:
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
+
       # RFC-2 (issue #1291): validate every bundled `crates/app-skills/*/manifest.json`
       # against the strict octos JSON schema validator. A failure here means a
       # bundled skill ships a manifest shape that strict LLM-provider validators
@@ -400,6 +403,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
@@ -456,6 +461,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
@@ -507,6 +514,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
@@ -550,12 +559,13 @@ jobs:
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
@@ -589,12 +599,13 @@ jobs:
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
@@ -630,12 +641,13 @@ jobs:
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
@@ -671,13 +683,14 @@ jobs:
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         shell: bash
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/${b}.exe" dist/ 2>/dev/null || true
           done
           cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *

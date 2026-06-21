@@ -112,7 +112,7 @@ fi
 # ── Bundle (same binary list as .github/workflows/ci.yml:179-182) ────
 TARBALL="octos-bundle-${TRIPLE}.tar.gz"
 rm -rf dist && mkdir dist
-for b in octos news_fetch deep-search deep_crawl send_email account_manager \
+for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager \
          voice clock weather; do
     cp "target/release/$b" dist/ 2>/dev/null || true
 done

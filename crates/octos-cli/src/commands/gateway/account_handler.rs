@@ -348,10 +348,11 @@ fn handle_account_update(
                     "macos" => octos_agent::SandboxMode::Macos,
                     "docker" => octos_agent::SandboxMode::Docker,
                     "bwrap" => octos_agent::SandboxMode::Bwrap,
+                    "landlock" => octos_agent::SandboxMode::Landlock,
                     "appcontainer" => octos_agent::SandboxMode::AppContainer,
                     _ => {
                         return format!(
-                            "Invalid sandbox mode: {val}\nValid modes: auto, macos, docker, bwrap, appcontainer"
+                            "Invalid sandbox mode: {val}\nValid modes: auto, macos, docker, bwrap, landlock, appcontainer"
                         );
                     }
                 };
@@ -459,7 +460,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_update_invalid_mode_message_lists_appcontainer() {
+    async fn account_update_persists_landlock_sandbox_mode() {
+        let (_dir, store, sub_id) = create_store_with_sub_account();
+        let profile_store = Some(store.clone());
+
+        let response = handle_account_command(
+            &format!("update {sub_id} sandbox=true sandbox-mode=landlock"),
+            Some("parent"),
+            &profile_store,
+        )
+        .await;
+
+        assert!(
+            response.contains("Updated sub-account"),
+            "unexpected response: {response}"
+        );
+
+        let updated = store.get(&sub_id).expect("load sub").expect("sub exists");
+        assert_eq!(
+            updated.config.sandbox.mode,
+            octos_agent::SandboxMode::Landlock
+        );
+        assert!(updated.config.sandbox.enabled);
+    }
+
+    #[tokio::test]
+    async fn account_update_invalid_mode_message_lists_landlock_and_appcontainer() {
         let (_dir, store, sub_id) = create_store_with_sub_account();
         let profile_store = Some(store);
 
@@ -470,6 +496,8 @@ mod tests {
         )
         .await;
 
-        assert!(response.contains("Valid modes: auto, macos, docker, bwrap, appcontainer"));
+        assert!(
+            response.contains("Valid modes: auto, macos, docker, bwrap, landlock, appcontainer")
+        );
     }
 }
