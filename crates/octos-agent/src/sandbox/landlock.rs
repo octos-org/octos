@@ -25,7 +25,11 @@ impl Sandbox for LinuxContainerSandbox {
             tracing::error!("octos-sandbox helper not found, refusing unsandboxed Linux command");
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
-                .arg("echo 'sandbox error: octos-sandbox helper not found' >&2; exit 1");
+                .arg("echo 'sandbox error: octos-sandbox helper not found' >&2; exit 1")
+                .current_dir(cwd);
+            for var in BLOCKED_ENV_VARS {
+                cmd.env_remove(var);
+            }
             return cmd;
         };
 
