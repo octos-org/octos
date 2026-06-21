@@ -913,6 +913,7 @@ impl TerminalReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum M9ProtocolFixture {
     Basic,
+    M19StdioHappyPath,
     Slow,
     ToolEvents,
     Approval,
@@ -936,7 +937,11 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
         return None;
     }
 
-    if prompt_lower.contains("m9 approval fixture") || prompt_lower.contains("m9-approval-e2e") {
+    if prompt_lower.contains("m19_stdio_happy_path_final_line") {
+        Some(M9ProtocolFixture::M19StdioHappyPath)
+    } else if prompt_lower.contains("m9 approval fixture")
+        || prompt_lower.contains("m9-approval-e2e")
+    {
         Some(M9ProtocolFixture::Approval)
     } else if prompt_lower.contains("m14 codex p0 tool parity fixture")
         || prompt_lower.contains("codex p0 tool parity")
@@ -13959,6 +13964,28 @@ async fn run_m9_fixture_turn(
                     topic: None,
                     turn_id: turn_id.clone(),
                     text: "OK".to_owned(),
+                }),
+            );
+            if m9_fixture_delay_or_interrupt(
+                &mut interrupt_rx,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            {
+                M9FixtureOutcome::Interrupted
+            } else {
+                M9FixtureOutcome::Completed
+            }
+        }
+        M9ProtocolFixture::M19StdioHappyPath => {
+            let _ = send_notification_ephemeral(
+                &ws,
+                &ledger,
+                UiNotification::MessageDelta(MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: "`M19_STDIO_HAPPY_PATH_FINAL_LINE`".to_owned(),
                 }),
             );
             if m9_fixture_delay_or_interrupt(
