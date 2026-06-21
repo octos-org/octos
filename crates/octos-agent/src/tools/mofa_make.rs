@@ -453,7 +453,10 @@ impl MofaDescribeContentTypeTool {
         }
     }
 
-    fn entries(&self) -> Vec<MakeTypeEntry> {
+    /// Snapshot the catalog. Mirrors [`MofaMakeTool::entries`].
+    /// `pub` so per-turn snapshot paths can copy catalog entries when
+    /// minting fresh tool instances (RFC-1 fixup, codex P2).
+    pub fn entries(&self) -> Vec<MakeTypeEntry> {
         self.catalog
             .lock()
             .unwrap_or_else(|e| e.into_inner())

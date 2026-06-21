@@ -17084,6 +17084,46 @@ async fn run_standalone_turn(
     if tool_registry.get("activate_tools").is_some() {
         tool_registry.register(octos_agent::ActivateToolsTool::new());
     }
+    // RFC-1 fixup (codex P2): apply the SAME freshness pattern to the
+    // `mofa_make` / `mofa_describe_content_type` dispatcher pair.
+    // `snapshot_excluding` clones `Arc<dyn Tool>` instances, so the
+    // dispatcher in the per-turn registry is the SAME object as the
+    // SessionRuntime's cached dispatcher. Calling
+    // `wire_mofa_make_registry_back_ref` further down (via
+    // `Agent::new_shared`'s central wire, see Fix #1) would mutate
+    // that shared dispatcher's `Mutex<Weak<ToolRegistry>>` to point
+    // at THIS turn's registry — and overlapping turns/background
+    // `mofa_make` runs on the cached session registry would then
+    // resolve through the WRONG registry (or, once the per-turn
+    // registry drops, an empty Weak → DISPATCHER_ERROR).
+    //
+    // Mint fresh `MofaMakeTool` + `MofaDescribeContentTypeTool`
+    // instances seeded from the existing dispatcher's catalog so the
+    // per-turn registry has its own dispatcher object whose Weak is
+    // safe to rewire. The SessionRuntime's cached dispatcher keeps
+    // its original Weak (set at SessionRuntime bootstrap), so other
+    // turns are unaffected.
+    if let Some(existing) = tool_registry.get("mofa_make").cloned() {
+        if let Some(dispatcher) = existing
+            .as_any()
+            .downcast_ref::<octos_agent::MofaMakeTool>()
+        {
+            let entries = dispatcher.entries();
+            let fresh_dispatcher = octos_agent::MofaMakeTool::new();
+            for entry in &entries {
+                fresh_dispatcher.register_or_replace(entry.clone());
+            }
+            tool_registry.register(fresh_dispatcher);
+
+            if tool_registry.get("mofa_describe_content_type").is_some() {
+                let fresh_describe = octos_agent::MofaDescribeContentTypeTool::new();
+                for entry in &entries {
+                    fresh_describe.register_or_replace(entry.clone());
+                }
+                tool_registry.register(fresh_describe);
+            }
+        }
+    }
 
     // Slides session structural guardrail — PR #1265 follow-up.
     //
@@ -40873,6 +40913,161 @@ ignore = []
         assert_eq!(
             text_frames, 0,
             "no text reply must be sent on the un-deliverable last-resort path"
+        );
+    }
+
+    /// RFC-1 fixup (codex P2): the per-turn `tool_registry.snapshot_excluding(&[])`
+    /// path in `process_chat_message_streaming` clones the
+    /// `Arc<dyn Tool>` instances. Without an explicit re-registration,
+    /// the per-turn dispatcher object is the SAME shared instance as
+    /// the cached session registry's dispatcher. Any subsequent
+    /// `wire_mofa_make_registry_back_ref` call would mutate the
+    /// shared object's `Mutex<Weak<ToolRegistry>>` and other
+    /// overlapping turns/background `mofa_make` runs would resolve
+    /// through the WRONG registry.
+    ///
+    /// This test simulates the snapshot pattern the production path
+    /// uses and asserts that after the per-turn re-registration
+    /// (which mirrors how `activate_tools` is re-registered just
+    /// above in the same file) the per-turn dispatcher is a SEPARATE
+    /// object from the cached one — so wiring one's Weak does NOT
+    /// touch the other's.
+    #[test]
+    fn per_turn_snapshot_creates_fresh_dispatcher() {
+        use octos_agent::tools::{MakeTypeEntry, Tool, ToolRegistry};
+        use octos_agent::{MofaDescribeContentTypeTool, MofaMakeTool};
+
+        // Build the parent session registry: register the dispatcher
+        // pair seeded with one entry. This mirrors what the loader
+        // does during `SessionRuntime::bootstrap`.
+        let mut parent = ToolRegistry::new();
+        let entry =
+            MakeTypeEntry::new("slides", "mofa-slides", "mofa_slides", "Slides description");
+
+        let parent_dispatcher = MofaMakeTool::new();
+        parent_dispatcher.register_or_replace(entry.clone());
+        let parent_describe = MofaDescribeContentTypeTool::new();
+        parent_describe.register_or_replace(entry.clone());
+
+        let parent_dispatcher_arc: Arc<dyn octos_agent::tools::Tool> = Arc::new(parent_dispatcher);
+        let parent_describe_arc: Arc<dyn octos_agent::tools::Tool> = Arc::new(parent_describe);
+        parent.register_arc(parent_dispatcher_arc.clone());
+        parent.register_arc(parent_describe_arc.clone());
+
+        // Wire the parent dispatcher's Weak to a parent-Arc registry —
+        // this represents the SessionRuntime's cached registry wiring.
+        let parent_arc = Arc::new(parent);
+        let parent_dispatcher_back = parent_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("parent mofa_make registered");
+        parent_dispatcher_back.set_registry(Arc::downgrade(&parent_arc));
+
+        // Capture identity (Arc data pointer) of the parent dispatcher.
+        let parent_disp_ptr =
+            Arc::as_ptr(&parent_arc.get("mofa_make").cloned().unwrap()) as *const ();
+
+        // Simulate the per-turn snapshot path. The cloned Arc points
+        // to the SAME dispatcher object as the parent's (this is the
+        // bug codex flagged).
+        let mut per_turn = parent_arc.snapshot_excluding(&[]);
+        let cloned_disp_ptr =
+            Arc::as_ptr(&per_turn.get("mofa_make").cloned().unwrap()) as *const ();
+        assert_eq!(
+            cloned_disp_ptr, parent_disp_ptr,
+            "snapshot_excluding clones Arc references — pre-fix sanity \
+             check that the per-turn arc IS the same object as the \
+             parent's (this is the share-mutate hazard)"
+        );
+
+        // Apply the production fixup: mint fresh dispatcher + describe
+        // instances seeded from the existing dispatcher's catalog, and
+        // re-register on the per-turn registry. This is what the
+        // production path in ui_protocol.rs does post-snapshot.
+        if let Some(existing) = per_turn.get("mofa_make").cloned() {
+            let dispatcher = existing
+                .as_any()
+                .downcast_ref::<MofaMakeTool>()
+                .expect("dispatcher downcast");
+            let entries = dispatcher.entries();
+            let fresh_dispatcher = MofaMakeTool::new();
+            for entry in &entries {
+                fresh_dispatcher.register_or_replace(entry.clone());
+            }
+            per_turn.register(fresh_dispatcher);
+
+            if per_turn.get("mofa_describe_content_type").is_some() {
+                let fresh_describe = MofaDescribeContentTypeTool::new();
+                for entry in &entries {
+                    fresh_describe.register_or_replace(entry.clone());
+                }
+                per_turn.register(fresh_describe);
+            }
+        }
+
+        // Post-fixup identity assertion: the per-turn dispatcher is a
+        // DIFFERENT Arc object than the parent's. So wiring the
+        // per-turn dispatcher's Weak no longer touches the parent's.
+        let new_disp_ptr = Arc::as_ptr(&per_turn.get("mofa_make").cloned().unwrap()) as *const ();
+        assert_ne!(
+            new_disp_ptr, parent_disp_ptr,
+            "post-fixup per-turn dispatcher must be a SEPARATE Arc \
+             object from the parent's — share-mutate hazard closed"
+        );
+
+        // And the catalog of the fresh dispatcher must mirror the
+        // parent's — the LLM still sees the same content_type enum.
+        let per_turn_dispatcher = per_turn
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("per-turn mofa_make registered");
+        let entries = per_turn_dispatcher.entries();
+        assert_eq!(entries.len(), 1, "catalog must be propagated");
+        assert_eq!(entries[0].content_type, "slides");
+        assert_eq!(entries[0].target_tool, "mofa_slides");
+
+        // Critical: wire the per-turn dispatcher's Weak to the per-turn
+        // registry and confirm the parent's dispatcher's Weak still
+        // points at the parent registry (i.e. has NOT been mutated).
+        let per_turn_arc = Arc::new(per_turn);
+        let per_turn_dispatcher_back = per_turn_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("per-turn mofa_make registered");
+        per_turn_dispatcher_back.set_registry(Arc::downgrade(&per_turn_arc));
+
+        // The parent dispatcher's Weak must still upgrade to the
+        // parent registry. If the share-mutate hazard were live, this
+        // would now point at the per-turn registry or be dropped.
+        let parent_after = parent_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("parent mofa_make still registered");
+        // Use a dispatch call on the parent registry to verify
+        // end-to-end. The parent registry doesn't have `mofa_slides`
+        // registered (we didn't add it above) so the call surfaces a
+        // DISPATCHER_ERROR specifically mentioning the missing target —
+        // which proves the parent's Weak still resolves to the parent
+        // registry. If the per-turn registry's Weak had clobbered the
+        // parent's, the call would either (a) succeed by reaching some
+        // per-turn-only tool, (b) error with "tool registry is not
+        // available" (Weak dropped). Neither matches the expected
+        // parent-registry behaviour.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(parent_after.execute(&serde_json::json!({
+            "content_type": "slides",
+            "args": {}
+        })));
+        let result = result.unwrap();
+        // The parent's registry has the dispatcher catalog but no
+        // mofa_slides target tool. The error message must mention
+        // mofa_slides (proving we routed through the parent's catalog +
+        // parent's get() lookup, not the per-turn's).
+        assert!(
+            result.output.contains("[DISPATCHER_ERROR]") && result.output.contains("mofa_slides"),
+            "parent dispatcher must still resolve via the parent registry's \
+             get() and report the parent-side missing target; got: {:?}",
+            result.output
         );
     }
 }
