@@ -396,16 +396,30 @@ impl Agent {
         memory: Arc<EpisodeStore>,
     ) -> Self {
         let system_prompt = include_str!("../prompts/worker.txt").to_string();
+        // RFC-1 fixup (codex P1 + round-3 P2): refresh the `mofa_make`
+        // dispatcher pair before wrapping the registry in `Arc`, then
+        // wire the (fresh) dispatcher's `Weak<ToolRegistry>` back-reference.
+        //
+        // Why the refresh: callers that build per-node/per-turn
+        // registries from CACHED `Arc<dyn Tool>` instances (notably
+        // `octos-pipeline`, which caches plugin tool Arcs once and
+        // registers the SAME `Arc<MofaMakeTool>` into every node
+        // registry) would otherwise have the central wire below mutate
+        // the SHARED dispatcher object. Two overlapping pipeline nodes
+        // would then race on the dispatcher's `Mutex<Weak>` and one
+        // node's `mofa_make` call could resolve through the OTHER
+        // node's registry — or, once one node's registry drops, the
+        // shared dispatcher's Weak would point at a dropped registry
+        // and surface `[DISPATCHER_ERROR]`.
+        //
+        // Minting fresh instances seeded from the existing catalog
+        // gives each registry its own dispatcher object; the cached
+        // Arc kept by the caller is untouched. Mirrors the same
+        // share-mutate-hazard fix the per-turn WS path applies (see
+        // `ui_protocol.rs::process_chat_message_streaming`).
+        let mut tools = tools;
+        Self::refresh_mofa_make_dispatcher_in_place(&mut tools);
         let tools = Arc::new(tools);
-        // RFC-1 fixup (codex P1): wire the `mofa_make` dispatcher's
-        // `Weak<ToolRegistry>` back-reference here, immediately after the
-        // registry is wrapped in `Arc`. This is the single chokepoint every
-        // plugin-loading path eventually flows through (`octos chat`,
-        // `SpawnTool` child registries, pipeline node agents, gateway,
-        // serve), so wiring at this site means callers never need to
-        // remember to call `wire_mofa_make_dispatcher` themselves. On
-        // registries with no mofa-* skills (no dispatcher tool registered),
-        // the helper is a silent no-op.
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
@@ -446,6 +460,25 @@ impl Agent {
 
     /// Create a new agent sharing pre-existing Arc-wrapped resources.
     /// Useful for per-request agents that share tools/memory with a base agent.
+    ///
+    /// **Share-mutate hazard for `mofa_make`**: this method calls
+    /// [`Self::wire_mofa_make_dispatcher`] which mutates the dispatcher's
+    /// internal `Mutex<Weak<ToolRegistry>>`. If `tools` carries a
+    /// dispatcher Arc that is ALSO held by another `Arc<ToolRegistry>`
+    /// (typical for per-turn snapshots built from `snapshot_excluding`,
+    /// or per-node pipeline registries built from a shared plugin tool
+    /// cache), that other registry will silently lose its back-reference.
+    ///
+    /// Callers MUST mint fresh `MofaMakeTool` / `MofaDescribeContentTypeTool`
+    /// instances seeded from the existing dispatcher's catalog and
+    /// `register_arc` them on `tools` BEFORE calling `Agent::new_shared`
+    /// (the ui_protocol.rs per-turn path is the canonical example). The
+    /// constructor cannot do this itself because `Arc<ToolRegistry>` is
+    /// shared-immutable.
+    ///
+    /// `Agent::new` does the freshen internally (it owns the
+    /// `ToolRegistry` and can mutate it before the Arc wrap); use that
+    /// entry-point when the caller has an owned registry.
     pub fn new_shared(
         id: AgentId,
         llm: Arc<dyn LlmProvider>,
@@ -453,17 +486,11 @@ impl Agent {
         memory: Arc<EpisodeStore>,
     ) -> Self {
         let system_prompt = include_str!("../prompts/worker.txt").to_string();
-        // RFC-1 fixup (codex P1): mirror `Agent::new` — wire the
-        // dispatcher's `Weak<ToolRegistry>` back-reference unconditionally
-        // on construction. For `new_shared`, the registry was already
-        // wrapped in `Arc` upstream; we just refresh the dispatcher's Weak
-        // to point at THIS Arc. Idempotent — the helper checks for the
-        // dispatcher tool's presence and downcasts before mutating. Note
-        // that callers using `snapshot_excluding` should follow the
-        // per-turn snapshot path (see `Fix #3`) and re-register fresh
-        // dispatcher instances before constructing the agent, so the
-        // shared dispatcher's Weak is never overwritten by a per-turn
-        // rewire.
+        // RFC-1 fixup (codex P1 + round-3 P2): wire the dispatcher's
+        // `Weak<ToolRegistry>` back-reference. The freshen step that
+        // `Agent::new` does in-place cannot happen here (the registry
+        // is shared-immutable behind `Arc`), so callers must freshen
+        // before construction. See the doc comment above for details.
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
@@ -560,6 +587,53 @@ impl Agent {
     /// this in the same site.
     pub fn wire_mofa_make_dispatcher(&self) {
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&self.tools);
+    }
+
+    /// RFC-1 fixup (codex P2 round 3): mint a fresh `MofaMakeTool` +
+    /// `MofaDescribeContentTypeTool` pair seeded from the existing
+    /// dispatcher's catalog, then re-register them on `tools` so the
+    /// per-agent dispatcher is a SEPARATE Arc object from whatever
+    /// the caller cached / cloned in.
+    ///
+    /// Why: when `octos-pipeline` (and similar callers) build per-node
+    /// registries from a shared `Arc<MofaMakeTool>` cache, the central
+    /// wire in `Agent::new` would otherwise mutate the SHARED
+    /// dispatcher's `Mutex<Weak<ToolRegistry>>` and let one node's
+    /// `mofa_make` call resolve through another node's registry. After
+    /// the refresh, each node owns its own dispatcher instance whose
+    /// Weak can be wired safely.
+    ///
+    /// No-op when the registry has no mofa-* skills (no dispatcher to
+    /// freshen). Internal-hidden markers, spawn_only markers, and
+    /// every other registry side-state survive the refresh because
+    /// only the dispatcher tool instances are replaced.
+    fn refresh_mofa_make_dispatcher_in_place(tools: &mut ToolRegistry) {
+        use crate::tools::{MofaDescribeContentTypeTool, MofaMakeTool};
+
+        let entries = match tools.get("mofa_make") {
+            Some(arc) => match arc.as_any().downcast_ref::<MofaMakeTool>() {
+                Some(dispatcher) => dispatcher.entries(),
+                None => return,
+            },
+            None => return,
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        let fresh_dispatcher = MofaMakeTool::new();
+        for entry in &entries {
+            fresh_dispatcher.register_or_replace(entry.clone());
+        }
+        tools.register(fresh_dispatcher);
+
+        if tools.get("mofa_describe_content_type").is_some() {
+            let fresh_describe = MofaDescribeContentTypeTool::new();
+            for entry in &entries {
+                fresh_describe.register_or_replace(entry.clone());
+            }
+            tools.register(fresh_describe);
+        }
     }
 
     /// Set the agent configuration.

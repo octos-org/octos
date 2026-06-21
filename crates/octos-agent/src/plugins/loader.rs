@@ -3233,4 +3233,160 @@ edition = "2021"
             result.output
         );
     }
+
+    /// RFC-1 fixup (codex round 3 P2): when an owned `ToolRegistry`
+    /// arrives at `Agent::new` carrying a SHARED dispatcher Arc (e.g.
+    /// from `octos-pipeline`'s cached plugin registration that
+    /// `register_arc`s the same `Arc<MofaMakeTool>` into every node
+    /// registry), the central wire MUST mint a fresh dispatcher
+    /// before wiring its `Weak<ToolRegistry>` — otherwise that wire
+    /// would mutate the shared dispatcher and overlapping pipeline
+    /// nodes would race on its `Mutex<Weak>`.
+    ///
+    /// This test simulates the pipeline pattern: build a shared
+    /// `Arc<MofaMakeTool>`, `register_arc` it into TWO independent
+    /// `ToolRegistry` instances, construct two `Agent`s, and assert
+    /// the two agents' dispatchers are SEPARATE Arc objects (so
+    /// wiring one's Weak doesn't touch the other's).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_new_mints_fresh_dispatcher_when_input_is_shared() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::agent::Agent;
+        use crate::tools::MofaMakeTool;
+        use async_trait::async_trait;
+        use octos_core::AgentId;
+        use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+        use octos_memory::EpisodeStore;
+
+        struct NoopLlm;
+        #[async_trait]
+        impl LlmProvider for NoopLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                eyre::bail!("unused")
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "noop"
+            }
+        }
+
+        // Build a make_type plugin once.
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-slides");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mofa-slides",
+                "version": "1.0",
+                "make_type": "slides",
+                "content_type_description": "PPTX decks",
+                "tools": [{"name": "mofa_slides", "description": "Render slides"}]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("mofa-slides");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Stage a registry once and pull out the dispatcher `Arc` so
+        // we can `register_arc` it into multiple per-node registries
+        // (mirrors `octos-pipeline::CachedPluginRegistration::apply_to`).
+        let mut staging = ToolRegistry::new();
+        let _ = PluginLoader::load_into(&mut staging, &[dir.path().to_path_buf()], &[]).unwrap();
+        let shared_dispatcher_arc = staging
+            .get_tool("mofa_make")
+            .expect("staging mofa_make registered");
+
+        // Build TWO independent registries that share the same
+        // dispatcher Arc — the pre-fix hazard.
+        let make_registry = || -> ToolRegistry {
+            let mut reg = ToolRegistry::new();
+            // Register the target tool so the dispatcher's catalog
+            // entry has somewhere to forward to.
+            let target = staging
+                .get_tool("mofa_slides")
+                .expect("staging mofa_slides registered");
+            reg.register_arc(target);
+            reg.register_arc(shared_dispatcher_arc.clone());
+            reg
+        };
+        let registry_a = make_registry();
+        let registry_b = make_registry();
+
+        // Construct two agents through `Agent::new`. With the round-3
+        // fixup each call mints a FRESH dispatcher for that agent.
+        let memory_a = std::sync::Arc::new(
+            EpisodeStore::open(dir.path().join("episodes-a"))
+                .await
+                .expect("episode store"),
+        );
+        let memory_b = std::sync::Arc::new(
+            EpisodeStore::open(dir.path().join("episodes-b"))
+                .await
+                .expect("episode store"),
+        );
+        let llm: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::new(NoopLlm);
+        let agent_a = Agent::new(AgentId::new("a"), llm.clone(), registry_a, memory_a);
+        let agent_b = Agent::new(AgentId::new("b"), llm, registry_b, memory_b);
+
+        // Identity assertion: the two agents' dispatchers are separate
+        // Arc objects. If the freshen step were skipped, both would
+        // point at `shared_dispatcher_arc` and wiring one's Weak
+        // would mutate the other's.
+        let disp_a = agent_a.tool_registry().get("mofa_make").cloned().unwrap();
+        let disp_b = agent_b.tool_registry().get("mofa_make").cloned().unwrap();
+        let shared_ptr = std::sync::Arc::as_ptr(&shared_dispatcher_arc) as *const ();
+        let a_ptr = std::sync::Arc::as_ptr(&disp_a) as *const ();
+        let b_ptr = std::sync::Arc::as_ptr(&disp_b) as *const ();
+        assert_ne!(
+            a_ptr, shared_ptr,
+            "Agent::new must mint a fresh dispatcher for agent A"
+        );
+        assert_ne!(
+            b_ptr, shared_ptr,
+            "Agent::new must mint a fresh dispatcher for agent B"
+        );
+        assert_ne!(
+            a_ptr, b_ptr,
+            "agent A and agent B must have SEPARATE dispatcher Arcs \
+             (share-mutate hazard would have produced the same Arc)"
+        );
+
+        // Each agent's dispatcher must resolve through its OWN
+        // registry (proving its Weak points at the right place).
+        let disp_a_typed = disp_a
+            .as_any()
+            .downcast_ref::<MofaMakeTool>()
+            .expect("downcast");
+        let result_a = disp_a_typed
+            .execute(&serde_json::json!({
+                "content_type": "slides",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        // The target IS in agent A's registry (registered above), so
+        // dispatch should succeed (no DISPATCHER_ERROR for missing
+        // registry or missing target).
+        assert!(
+            !result_a.output.contains("[DISPATCHER_ERROR]"),
+            "agent A's dispatcher must resolve through agent A's \
+             registry; got {:?}",
+            result_a.output
+        );
+    }
 }

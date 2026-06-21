@@ -221,6 +221,15 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
         name: "group:media",
         description: "Media generation: comics, slides, infographics, cards, and text-to-speech",
         tools: &[
+            // RFC-1 fixup (codex round 3 P2): include the dispatcher
+            // pair so profile/policy allow-lists that grant only
+            // `group:media` still have a LLM-visible entry-point. Pre-
+            // fixup, an `allow: [group:media]` policy would retain
+            // only the (now internal-hidden) concrete targets and
+            // drop `mofa_make` / `mofa_describe_content_type`,
+            // leaving the LLM with no callable generation tool.
+            "mofa_make",
+            "mofa_describe_content_type",
             "mofa_comic",
             "mofa_slides",
             "mofa_infographic",
@@ -466,6 +475,38 @@ mod tests {
             "mofa_describe_content_type must survive slides-session \
              retain so the LLM can fetch the slides args schema"
         );
+    }
+
+    /// RFC-1 fixup (codex round 3 P2): the `group:media` definition
+    /// must include the `mofa_make` dispatcher pair so any policy that
+    /// allow-lists `group:media` retains an LLM-callable generation
+    /// entry-point. Pre-fixup the group held only the concrete
+    /// targets (`mofa_slides`, `mofa_cards`, ...), so a profile with
+    /// `allow: [group:media]` would keep only internal-hidden tools
+    /// and drop the dispatcher, leaving no callable surface.
+    #[test]
+    fn group_media_includes_mofa_make_dispatcher_pair() {
+        let info = tool_group_info("group:media").expect("group:media defined");
+        assert!(
+            info.tools.contains(&"mofa_make"),
+            "group:media must include mofa_make so allow-list policies \
+             retain the dispatcher; got {:?}",
+            info.tools
+        );
+        assert!(
+            info.tools.contains(&"mofa_describe_content_type"),
+            "group:media must include mofa_describe_content_type so \
+             allow-list policies retain the catalog query tool"
+        );
+        // And a policy that allows only group:media must accept these
+        // names — guards against future regression that removes the
+        // dispatcher from the group while keeping the targets.
+        let policy = ToolPolicy {
+            allow: vec!["group:media".into()],
+            ..Default::default()
+        };
+        assert!(policy.is_allowed("mofa_make"));
+        assert!(policy.is_allowed("mofa_describe_content_type"));
     }
 
     #[test]
