@@ -23,6 +23,16 @@ function formatUptime(secs: number): string {
   return `${mins}m`
 }
 
+function formatAge(timestampMs: number, nowMs: number): string {
+  const elapsedSecs = Math.max(0, Math.floor((nowMs - timestampMs) / 1000))
+  if (elapsedSecs < 60) return `${elapsedSecs}s ago`
+  const elapsedMins = Math.floor(elapsedSecs / 60)
+  if (elapsedMins < 60) return `${elapsedMins}m ago`
+  const elapsedHours = Math.floor(elapsedMins / 60)
+  if (elapsedHours < 24) return `${elapsedHours}h ago`
+  return `${Math.floor(elapsedHours / 24)}d ago`
+}
+
 function cpuColor(pct: number): string {
   if (pct >= 80) return 'bg-red-500'
   if (pct >= 50) return 'bg-yellow-500'
@@ -84,6 +94,8 @@ export default function ServerMetricsPage() {
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [live, setLive] = useState(true)
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [procSort, setProcSort] = useState<ProcSortKey>('memory_bytes')
   const [procDir, setProcDir] = useState<SortDir>('desc')
   const [procOpen, setProcOpen] = useState(false)
@@ -93,10 +105,14 @@ export default function ServerMetricsPage() {
   const fetchMetrics = async () => {
     try {
       const data = await api.systemMetrics({ procs: procOpenRef.current })
+      const fetchedAt = Date.now()
       setMetrics(data)
+      setLastUpdatedAt(fetchedAt)
+      setNowMs(fetchedAt)
       setError(null)
     } catch (e: any) {
-      setError(e.message)
+      setError(e?.message || 'Unknown error')
+      setNowMs(Date.now())
     }
   }
 
@@ -106,6 +122,11 @@ export default function ServerMetricsPage() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
     }
+  }, [])
+
+  useEffect(() => {
+    const clock = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(clock)
   }, [])
 
   const toggleLive = () => {
@@ -164,29 +185,37 @@ export default function ServerMetricsPage() {
   const swapPercent = m.swap.total_bytes > 0
     ? (m.swap.used_bytes / m.swap.total_bytes) * 100
     : 0
+  const updatedAge = lastUpdatedAt === null ? null : formatAge(lastUpdatedAt, nowMs)
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-xl font-bold text-white">{m.platform.hostname || 'Server'}</h1>
           <p className="text-sm text-gray-500">
             {m.platform.os} {m.platform.os_version} &middot; up {formatUptime(m.platform.uptime_secs)}
           </p>
         </div>
-        <button
-          onClick={toggleLive}
-          className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-700 hover:bg-white/5 transition"
-        >
-          <span className={`inline-block w-2 h-2 rounded-full ${live ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
-          {live ? 'Live' : 'Paused'}
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          {updatedAge && (
+            <span className="text-xs text-gray-500" aria-live="polite">
+              Updated {updatedAge}
+            </span>
+          )}
+          <button
+            onClick={toggleLive}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-700 hover:bg-white/5 transition"
+          >
+            <span className={`inline-block w-2 h-2 rounded-full ${live ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
+            {live ? 'Live' : 'Paused'}
+          </button>
+        </div>
       </div>
 
       {error && (
         <div className="text-xs text-yellow-500 bg-yellow-500/10 rounded-lg px-3 py-2">
-          Update failed: {error} (showing last known data)
+          Update failed: {error}. {updatedAge ? `Last successful update: ${updatedAge}.` : 'Showing last known data.'}
         </div>
       )}
 
