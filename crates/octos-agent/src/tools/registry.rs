@@ -840,6 +840,33 @@ impl ToolRegistry {
         // RFC-1 fixup: prune stale internal-hidden markers symmetrically.
         self.internal_hidden
             .retain(|name| self.tools.contains_key(name));
+        // RFC-1 fixup (codex round 4 P2): prune dispatcher catalogs
+        // when their forwarding targets are evicted. The slides-session
+        // `retain(keep_tool_in_slides_session)` removes `mofa_cards`,
+        // `mofa_comic`, etc. from `tools`, but the `MofaMakeTool`
+        // dispatcher's catalog (built at load time) still advertises
+        // those `content_type` enum values to the LLM. Without this
+        // prune the LLM can call `mofa_make({content_type: "cards"})`
+        // and observe a `[DISPATCHER_ERROR]` because the target was
+        // evicted — weakening the slides-only guardrail.
+        if let Some(arc) = self.tools.get("mofa_make") {
+            if let Some(dispatcher) = arc.as_any().downcast_ref::<super::MofaMakeTool>() {
+                let surviving: Vec<super::MakeTypeEntry> = dispatcher
+                    .entries()
+                    .into_iter()
+                    .filter(|entry| self.tools.contains_key(&entry.target_tool))
+                    .collect();
+                dispatcher.replace_entries(surviving.clone());
+                if let Some(describe_arc) = self.tools.get("mofa_describe_content_type") {
+                    if let Some(describe) = describe_arc
+                        .as_any()
+                        .downcast_ref::<super::MofaDescribeContentTypeTool>()
+                    {
+                        describe.replace_entries(surviving);
+                    }
+                }
+            }
+        }
         self.invalidate_cache();
     }
 
@@ -1213,6 +1240,14 @@ impl ToolRegistry {
                 .keys()
                 .filter(|n| !deferred.contains(n.as_str()))
                 .filter(|n| !self.spawn_only.contains(n.as_str()))
+                // RFC-1 fixup (codex round 4 P2): internal-hidden tools
+                // are invisible to the LLM and cannot be re-promoted via
+                // `activate_tools`. Counting them in the LRU "active"
+                // set would inflate the count past `max_active` and
+                // force eviction of LLM-visible tools (activate_tools,
+                // memory tools, …) when several `mofa_*` targets are
+                // pinned as base tools by the gateway / profile.
+                .filter(|n| !self.internal_hidden.contains(n.as_str()))
                 .map(|n| n.as_str())
                 .collect();
             lifecycle.find_evictable(&active)
@@ -2269,6 +2304,71 @@ mod lifecycle_tests {
         );
     }
 
+    /// RFC-1 fixup (codex round 4 P2): internal-hidden tools must be
+    /// excluded from the LRU "active" set just like spawn_only tools
+    /// are. If they are counted as active, several `mofa_*` hidden
+    /// targets pinned as base tools by the gateway / profile would
+    /// inflate the active count past `max_active`, forcing eviction
+    /// of LLM-visible tools (activate_tools, memory tools, …).
+    ///
+    /// This test sets `max_active = 1` and registers two
+    /// internal-hidden tools alongside the builtin set. Without the
+    /// fix, the hidden tools count toward the active set and at least
+    /// one LLM-visible tool gets evicted. With the fix, hidden tools
+    /// are ignored and the LRU only evicts visible tools when their
+    /// own count exceeds `max_active`.
+    #[test]
+    fn internal_hidden_excluded_from_lru_active_set() {
+        let mut reg = make_registry(10, 1);
+
+        // Mark two builtin tools as internal-hidden so we don't need
+        // to wire a plugin. The LRU should not count these against
+        // the active budget.
+        reg.mark_internal_hidden("glob");
+        reg.mark_internal_hidden("grep");
+
+        // Advance several ticks; nothing has been used, so all
+        // non-base tools are candidates for eviction once the active
+        // count exceeds max_active. Pin only one base tool so we
+        // depend on the internal_hidden filter to keep
+        // active_count <= max_active.
+        reg.set_base_tools(["read_file"]);
+
+        // Without the round-4 fix, `glob` + `grep` would inflate the
+        // active count and force eviction of unrelated visible tools.
+        // With the fix, they are skipped entirely; eviction only
+        // fires if visible-tool count itself exceeds max_active.
+        for _ in 0..5 {
+            reg.tick();
+        }
+        let evicted = reg.auto_evict();
+
+        // Critical: the LRU MUST NOT evict any visible tool just
+        // because hidden mofa_* targets exist. With `max_active=10`
+        // and ~17 builtin tools, two are hidden, leaving ~15 visible
+        // — still > 10, so SOME visible tool may be evicted. The
+        // important post-condition: `glob` and `grep` are NEITHER
+        // evicted (they are not in the active set at all) NOR
+        // re-promoted into specs.
+        assert!(
+            !evicted.contains(&"glob".to_string()),
+            "internal-hidden glob must not be evicted (it was never in the active set); \
+             evicted={:?}",
+            evicted
+        );
+        assert!(
+            !evicted.contains(&"grep".to_string()),
+            "internal-hidden grep must not be evicted; evicted={:?}",
+            evicted
+        );
+
+        // And they MUST NOT be visible in specs() — internal-hidden
+        // suppresses spec emission regardless of LRU.
+        let visible: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
+        assert!(!visible.contains(&"glob".to_string()));
+        assert!(!visible.contains(&"grep".to_string()));
+    }
+
     #[test]
     fn stalest_evicted_first() {
         let mut reg = make_registry(5, 2);
@@ -3275,5 +3375,105 @@ mod profile_filter_tests {
              got: {:?}",
             activate_spec.description
         );
+    }
+
+    /// RFC-1 fixup (codex round 4 P2): when `retain` evicts dispatcher
+    /// target tools (e.g. `mofa_cards`, `mofa_comic` during the
+    /// slides-session retain pass), the surviving `MofaMakeTool`
+    /// dispatcher's catalog must be pruned in lockstep. Otherwise the
+    /// dispatcher's `content_type` enum continues to advertise the
+    /// evicted content types and the LLM can call them, only to
+    /// observe `[DISPATCHER_ERROR]` because the target is gone.
+    #[test]
+    fn retain_prunes_mofa_make_catalog_to_surviving_targets() {
+        use super::policy::keep_tool_in_slides_session;
+        use crate::tools::{MakeTypeEntry, MofaDescribeContentTypeTool, MofaMakeTool};
+        use async_trait::async_trait;
+        use eyre::Result;
+        use serde_json::Value;
+
+        struct FakeTool(&'static str);
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        // Register target tools for three content_types so the
+        // dispatcher catalog has entries to prune.
+        reg.register(FakeTool("mofa_slides"));
+        reg.register(FakeTool("mofa_cards"));
+        reg.register(FakeTool("mofa_comic"));
+
+        // Construct a dispatcher pair seeded with all three entries
+        // (mirrors what the loader does after discovering three
+        // `make_type` plugins).
+        let dispatcher = MofaMakeTool::new();
+        let describe = MofaDescribeContentTypeTool::new();
+        for entry in [
+            MakeTypeEntry::new("slides", "mofa-slides", "mofa_slides", "PPTX decks"),
+            MakeTypeEntry::new("cards", "mofa-cards", "mofa_cards", "Greeting cards"),
+            MakeTypeEntry::new("comic", "mofa-comic", "mofa_comic", "Comic strips"),
+        ] {
+            dispatcher.register_or_replace(entry.clone());
+            describe.register_or_replace(entry);
+        }
+        reg.register(dispatcher);
+        reg.register(describe);
+        // Hide each target (the loader does this in
+        // `mark_internal_hidden` after dispatcher registration).
+        for target in ["mofa_slides", "mofa_cards", "mofa_comic"] {
+            reg.mark_internal_hidden(target);
+        }
+
+        // Sanity: the catalog has 3 entries before retain.
+        let pre = reg
+            .get("mofa_make")
+            .and_then(|arc| arc.as_any().downcast_ref::<MofaMakeTool>())
+            .unwrap()
+            .entries();
+        assert_eq!(pre.len(), 3, "catalog must have 3 entries before retain");
+
+        // Apply the slides-session retain. This evicts `mofa_cards`
+        // and `mofa_comic` but keeps `mofa_slides` + the dispatcher
+        // pair.
+        reg.retain(keep_tool_in_slides_session);
+
+        // Post-condition: the dispatcher's catalog has been pruned to
+        // only the surviving content_type (slides). The LLM's
+        // mofa_make enum will no longer offer `cards` or `comic`.
+        let post = reg
+            .get("mofa_make")
+            .and_then(|arc| arc.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("mofa_make survived retain")
+            .entries();
+        assert_eq!(
+            post.len(),
+            1,
+            "catalog must be pruned to surviving targets; got {:?}",
+            post
+        );
+        assert_eq!(post[0].content_type, "slides");
+
+        // The describe tool's catalog is pruned symmetrically so the
+        // LLM cannot fetch a schema for an evicted content_type.
+        let describe_post = reg
+            .get("mofa_describe_content_type")
+            .and_then(|arc| arc.as_any().downcast_ref::<MofaDescribeContentTypeTool>())
+            .expect("describe tool survived retain")
+            .entries();
+        assert_eq!(describe_post.len(), 1);
+        assert_eq!(describe_post[0].content_type, "slides");
     }
 }

@@ -189,6 +189,19 @@ impl MofaMakeTool {
         }
     }
 
+    /// Replace the entire catalog with the given list.
+    ///
+    /// RFC-1 fixup (codex round 4 P2): used by `ToolRegistry::retain`
+    /// to prune dispatcher entries whose forwarding targets have been
+    /// evicted from the registry (e.g. slides-session retain pass).
+    /// Without this prune the catalog's `content_type` enum would
+    /// still advertise content types whose targets are gone, and the
+    /// LLM would observe `[DISPATCHER_ERROR]` on dispatch.
+    pub fn replace_entries(&self, entries: Vec<MakeTypeEntry>) {
+        let mut catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+        catalog.entries = entries;
+    }
+
     /// Snapshot the catalog — used by tests and by the describe tool.
     pub fn entries(&self) -> Vec<MakeTypeEntry> {
         self.catalog
@@ -451,6 +464,15 @@ impl MofaDescribeContentTypeTool {
         } else {
             catalog.entries.push(entry);
         }
+    }
+
+    /// Replace the entire catalog with the given list. Mirrors
+    /// [`MofaMakeTool::replace_entries`] — used by
+    /// `ToolRegistry::retain` to keep the describe tool in sync with
+    /// the dispatcher when target tools are evicted.
+    pub fn replace_entries(&self, entries: Vec<MakeTypeEntry>) {
+        let mut catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+        catalog.entries = entries;
     }
 
     /// Snapshot the catalog. Mirrors [`MofaMakeTool::entries`].
