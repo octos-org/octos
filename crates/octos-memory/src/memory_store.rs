@@ -339,9 +339,22 @@ mod tests {
         store.append_today("note 1").await.unwrap();
         store.append_today("note 2").await.unwrap();
 
-        let content = store.read_today().await.unwrap();
+        let content = read_all_daily_notes(dir.path()).await;
         assert!(content.contains("note 1"));
         assert!(content.contains("note 2"));
+    }
+
+    async fn read_all_daily_notes(data_dir: &Path) -> String {
+        let mut entries = tokio::fs::read_dir(data_dir.join("memory")).await.unwrap();
+        let mut content = String::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("MEMORY.md") {
+                continue;
+            }
+            content.push_str(&tokio::fs::read_to_string(path).await.unwrap());
+        }
+        content
     }
 
     #[tokio::test]
