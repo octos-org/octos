@@ -95,6 +95,7 @@ fn config(
     accountant: Arc<CostAccountant>,
 ) -> ExecutorConfig {
     ExecutorConfig {
+        guards: Vec::new(),
         default_provider: Arc::new(MockProvider) as Arc<dyn LlmProvider>,
         provider_router: None,
         memory,

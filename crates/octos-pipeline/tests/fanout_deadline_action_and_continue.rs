@@ -109,6 +109,7 @@ impl Handler for ScriptedHandler {
 async fn make_executor(dir: &TempDir) -> PipelineExecutor {
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
     let config = ExecutorConfig {
+        guards: Vec::new(),
         default_provider: Arc::new(StubProvider) as Arc<dyn octos_llm::LlmProvider>,
         provider_router: None,
         memory,
