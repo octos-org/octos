@@ -736,6 +736,11 @@ impl GatewayRuntime {
                     mcp_servers: Vec::new(),
                     hooks: rt.plugin_hooks.clone(),
                     prompt_fragments: rt.plugin_prompt_fragments.clone(),
+                    // RFC-1: the bootstrap path already registered the
+                    // dispatcher inside `ProfileRuntime`; the gateway
+                    // doesn't need to re-register, so the entries list
+                    // stays empty here (no double-registration).
+                    make_type_entries: Vec::new(),
                 };
                 plugin_dirs_for_spawn = rt.plugin_dirs.clone();
             } else {

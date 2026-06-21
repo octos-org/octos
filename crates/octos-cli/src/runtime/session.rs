@@ -530,6 +530,10 @@ impl SessionRuntime {
         // and the LLM cannot pull a deferred group back on demand.
         // Gateway does the equivalent at `session_actor.rs:2500`.
         agent.wire_activate_tools();
+        // RFC-1 (issue #1290): same pattern for the `mofa_make`
+        // dispatcher. The loader registered it but its `Weak<ToolRegistry>`
+        // back-reference needs the Arc-wrapped registry; we plant it here.
+        agent.wire_mofa_make_dispatcher();
 
         let agent = Arc::new(agent);
 

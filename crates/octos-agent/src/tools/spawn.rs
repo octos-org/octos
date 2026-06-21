@@ -2488,6 +2488,13 @@ impl Tool for SpawnTool {
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
+            // RFC-1 fixup (codex P1): also clear internal-hidden markers.
+            // In a subagent registry, the mofa_make dispatcher's targets
+            // (mofa_slides, mofa_cards, …) should be directly callable —
+            // the subagent's whole purpose may be to drive that target
+            // tool; routing through a dispatcher adds latency without
+            // value once we are already in a spawned context.
+            tools.clear_internal_hidden();
             ensure_subagent_tools_available(&tools, &allowed_tools)
                 .map_err(|error| eyre::eyre!(error))?;
             let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
@@ -2967,6 +2974,11 @@ impl Tool for SpawnTool {
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
+                // RFC-1 fixup (codex P1): mirror the sync spawn path — clear
+                // internal-hidden markers so subagent registries can call
+                // dispatcher targets directly without going through
+                // `mofa_make`.
+                tools.clear_internal_hidden();
                 let availability_check = ensure_subagent_tools_available(&tools, &allowed_tools)
                     .map_err(|error| eyre::eyre!(error));
                 let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());

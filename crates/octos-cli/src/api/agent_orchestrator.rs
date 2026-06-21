@@ -846,6 +846,10 @@ impl InProcessAgentOrchestrator {
             worker = worker.with_system_prompt(system_prompt);
         }
         worker.wire_activate_tools();
+        // RFC-1: wire mofa_make for spawned workers too — child
+        // registries inherit a shared catalog so the dispatcher must
+        // resolve through the right registry handle.
+        worker.wire_mofa_make_dispatcher();
 
         // #991 / M15-B — `cancel_token` was registered above (see the
         // P2 follow-up comment) before the agent was published. The
