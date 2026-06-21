@@ -26,6 +26,7 @@
     "test:live:swarm": "npx playwright test --workers=1 tests/swarm-dispatch-gate.spec.ts",
     "ux:tmux:run": "node scripts/ux-tmux-run.mjs",
     "ux:tmux:validate": "node scripts/ux-tmux-validate.mjs",
+    "ux:tmux:validate:backpressure-test": "node --test tests/ux/backpressure-validate.test.mjs",
     "soak:m14:codex-tool-parity": "node scripts/m14-codex-tool-parity-soak.mjs",
     "soak:m11:session-sandbox": "cd .. && bash scripts/validate-session-policy-local.sh",
     "soak:m18:appui-transport-parity": "node scripts/m18-appui-transport-parity-soak.mjs",

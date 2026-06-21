@@ -75,7 +75,8 @@ impl MemoryStore {
             .wrap_err("failed to open today's notes for append")?;
         file.write_all(format!("\n## {}\n\n{}\n", heading, content).as_bytes())
             .await
-            .wrap_err("failed to append to today's notes")
+            .wrap_err("failed to append to today's notes")?;
+        file.flush().await.wrap_err("failed to flush today's notes")
     }
 
     /// Read recent daily notes (excluding today). Returns `(date, content)` pairs.
