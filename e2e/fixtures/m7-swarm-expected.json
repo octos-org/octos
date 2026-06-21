@@ -1,0 +1,100 @@
+{
+  "schema": "octos.swarm.m7.live_gate.v1",
+  "issue": 511,
+  "workflow": "m7_swarm_dispatch",
+  "required_test_count": 5,
+  "required_subagents": 3,
+  "required_progress_events": 3,
+  "required_artifacts": 3,
+  "required_matrix_rooms": 1,
+  "required_matrix_puppets": 3,
+  "required_validator_aggregates": 1,
+  "live_gate_env": "OCTOS_M7_SWARM_LIVE=1",
+  "disallowed_hosts": [
+    "dspfac.ocean.ominix.io"
+  ],
+  "api_endpoints": {
+    "sessions": "/api/sessions",
+    "session_messages": "/api/sessions/{session_id}/messages",
+    "session_tasks": "/api/sessions/{session_id}/tasks",
+    "ui_protocol_ws": "/api/ui-protocol/ws"
+  },
+  "prompts": {
+    "dispatch": "Use the M7.5 swarm dispatch primitive for a live release-gate run. Spawn exactly three sub-agents through the M7.1 MCP path. Assign each sub-agent one short section of a swarm dispatch readiness report: routing, artifacts, and matrix coordination. Each sub-agent must produce one durable artifact. The swarm coordinator must emit progress events, attribute cost ledger rows per sub-agent, create or reuse the Matrix room plus puppet registration surface required by M7.3, run the M4.3 aggregate validator over the combined result, and reply with a concise machine-readable summary containing child session ids, artifact paths, cost evidence, Matrix room ids, puppet ids, and aggregate validator status. Do not ask for confirmation."
+  },
+  "markers": {
+    "subagent": [
+      "child_session_key",
+      "sub-agent",
+      "subagent",
+      "swarm_agent",
+      "m7.1",
+      "m7.5"
+    ],
+    "progress": [
+      "tool_progress",
+      "progress_updated",
+      "task_updated",
+      "current_phase",
+      "progress_message",
+      "progress_pct"
+    ],
+    "artifact": [
+      "output_files",
+      "artifact",
+      "artifact_path",
+      "workspace_path",
+      "file_ref"
+    ],
+    "cost": [
+      "cost",
+      "cost_attribution",
+      "tokens_in",
+      "tokens_out",
+      "input_tokens",
+      "output_tokens",
+      "usd_used"
+    ],
+    "matrix_room": [
+      "matrix_room_id",
+      "room_id",
+      "!octos",
+      "matrix room"
+    ],
+    "matrix_puppet": [
+      "matrix_user_id",
+      "puppet",
+      "puppet_id",
+      "@octos"
+    ],
+    "validator": [
+      "m4.3",
+      "aggregate_validator",
+      "validator_aggregate",
+      "validation_status",
+      "validator status"
+    ]
+  },
+  "limits": {
+    "dispatch_timeout_seconds": 900,
+    "spawn_timeout_seconds": 180,
+    "artifact_timeout_seconds": 900,
+    "reload_timeout_seconds": 60,
+    "poll_interval_seconds": 5,
+    "diagnostic_sample_limit": 20
+  },
+  "diagnostic_schema": {
+    "schema": "octos.swarm.m7.live_gate.diagnostic.v1",
+    "required_fields": [
+      "schema",
+      "status",
+      "kind",
+      "detail",
+      "issue",
+      "base_url",
+      "profile",
+      "session_id",
+      "timestamp"
+    ]
+  }
+}
