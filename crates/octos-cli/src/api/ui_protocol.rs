@@ -28975,6 +28975,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -29048,6 +29049,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 1,
@@ -31149,6 +31151,8 @@ ignore = []
             }],
             media: Vec::new(),
             topic: Some("coding".into()),
+            live_video: false,
+            reasoning_effort: None,
             rewrite_for: None,
         });
         validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
@@ -31165,6 +31169,7 @@ ignore = []
             topic: None,
             profile_id: None,
             cwd: None,
+            sandbox: None,
             after: None,
         });
         assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
@@ -38817,6 +38822,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11-session-sandbox"),
             features,
@@ -38839,6 +38845,7 @@ ignore = []
             &state,
             &ledger,
             &approvals,
+            &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some("m11-session-sandbox"),
             features,
