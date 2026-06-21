@@ -1,10 +1,12 @@
 //! Auth command: login, logout, status, and keychain management.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use eyre::Result;
+use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
 
 use super::Executable;
 use crate::auth::{AuthStore, keychain, oauth, token};
@@ -89,6 +91,36 @@ pub enum AuthAction {
         #[arg(long)]
         password: Option<String>,
     },
+
+    /// Issue a short-lived session ingress secret for an external CLI agent.
+    #[command(name = "issue-work-secret")]
+    IssueWorkSecret {
+        /// Session id the external agent may access.
+        #[arg(long)]
+        session: String,
+        /// Grant lifetime, e.g. 15m, 1h, or 3600s.
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// Public API base URL the guest should connect to.
+        #[arg(long, default_value = "http://127.0.0.1:50080")]
+        api_base_url: String,
+        /// Profile id to bind on authenticated AppUI dispatch.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Data directory that `octos serve` uses.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Revoke a previously issued work secret.
+    #[command(name = "revoke-work-secret")]
+    RevokeWorkSecret {
+        /// Encoded work secret or raw session_ingress_token.
+        token_or_secret: String,
+        /// Data directory that `octos serve` uses.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 impl Executable for AuthCommand {
@@ -117,6 +149,17 @@ impl AuthCommand {
             AuthAction::Keys { profile } => list_keys(profile.as_deref()),
             AuthAction::RemoveKey { name, profile } => remove_key(&name, profile.as_deref()),
             AuthAction::Unlock { password } => unlock_keychain(password),
+            AuthAction::IssueWorkSecret {
+                session,
+                ttl,
+                api_base_url,
+                profile,
+                data_dir,
+            } => issue_work_secret(&session, &ttl, &api_base_url, profile, data_dir),
+            AuthAction::RevokeWorkSecret {
+                token_or_secret,
+                data_dir,
+            } => revoke_work_secret(&token_or_secret, data_dir),
         }
     }
 }
@@ -494,6 +537,75 @@ fn unlock_keychain(password: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn issue_work_secret(
+    session: &str,
+    ttl: &str,
+    api_base_url: &str,
+    profile: Option<String>,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    let secret = create_work_secret(session, ttl, api_base_url, profile, data_dir)?;
+    println!("{}", secret.encode()?);
+    Ok(())
+}
+
+fn create_work_secret(
+    session: &str,
+    ttl: &str,
+    api_base_url: &str,
+    profile: Option<String>,
+    data_dir: Option<PathBuf>,
+) -> Result<WorkSecret> {
+    let data_dir = super::resolve_data_dir(data_dir)?;
+    let ttl = parse_ttl(ttl)?;
+    let token = generate_ingress_token()?;
+    let store = WorkSecretGrantStore::new(&data_dir);
+    store.issue(session, &token, api_base_url, ttl, profile)?;
+    Ok(WorkSecret::new(api_base_url, token))
+}
+
+fn revoke_work_secret(token_or_secret: &str, data_dir: Option<PathBuf>) -> Result<()> {
+    let data_dir = super::resolve_data_dir(data_dir)?;
+    let token = WorkSecret::decode(token_or_secret)
+        .map(|secret| secret.session_ingress_token)
+        .unwrap_or_else(|_| token_or_secret.to_string());
+    let store = WorkSecretGrantStore::new(&data_dir);
+    if store.revoke_token(&token)? {
+        println!("{} Revoked work secret", "OK".green().bold());
+    } else {
+        println!("No active work secret matched the provided token");
+    }
+    Ok(())
+}
+
+fn generate_ingress_token() -> Result<String> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|error| eyre::eyre!(error))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn parse_ttl(input: &str) -> Result<chrono::Duration> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        eyre::bail!("ttl cannot be empty");
+    }
+    let (number, multiplier) = match trimmed.chars().last().unwrap() {
+        's' | 'S' => (&trimmed[..trimmed.len() - 1], 1),
+        'm' | 'M' => (&trimmed[..trimmed.len() - 1], 60),
+        'h' | 'H' => (&trimmed[..trimmed.len() - 1], 60 * 60),
+        'd' | 'D' => (&trimmed[..trimmed.len() - 1], 24 * 60 * 60),
+        _ => (trimmed, 1),
+    };
+    let value: i64 = number
+        .parse()
+        .map_err(|_| eyre::eyre!("ttl must be a positive integer with optional s/m/h/d suffix"))?;
+    if value <= 0 {
+        eyre::bail!("ttl must be positive");
+    }
+    Ok(chrono::Duration::seconds(value.saturating_mul(multiplier)))
+}
+
 /// Get profiles matching the optional filter, or all profiles.
 fn get_profiles(
     store: &ProfileStore,
@@ -512,6 +624,7 @@ fn get_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
 
     #[test]
     fn keychain_target_scopes_by_name_and_by_content() {
@@ -606,5 +719,43 @@ mod tests {
         let plan = plan_removal(&entries, NAME, |_| true);
         assert!(plan.profiles_to_update.is_empty());
         assert!(plan.accounts_to_delete.is_empty());
+    }
+
+    #[test]
+    fn parses_work_secret_ttl_suffixes() {
+        assert_eq!(parse_ttl("30s").unwrap().num_seconds(), 30);
+        assert_eq!(parse_ttl("15m").unwrap().num_seconds(), 900);
+        assert_eq!(parse_ttl("2h").unwrap().num_seconds(), 7200);
+        assert_eq!(parse_ttl("1d").unwrap().num_seconds(), 86_400);
+        assert_eq!(parse_ttl("45").unwrap().num_seconds(), 45);
+    }
+
+    #[test]
+    fn rejects_invalid_work_secret_ttl() {
+        assert!(parse_ttl("").is_err());
+        assert!(parse_ttl("0s").is_err());
+        assert!(parse_ttl("abc").is_err());
+    }
+
+    #[test]
+    fn issue_work_secret_persists_decodable_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = create_work_secret(
+            "local:auth-test",
+            "5m",
+            "http://127.0.0.1:50080",
+            Some("profile-a".into()),
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        let encoded = secret.encode().unwrap();
+        let decoded = WorkSecret::decode(&encoded).unwrap();
+        assert_eq!(decoded.api_base_url, "http://127.0.0.1:50080");
+
+        let store = WorkSecretGrantStore::new(dir.path());
+        let grant = store
+            .validate("local:auth-test", &decoded.session_ingress_token)
+            .unwrap();
+        assert_eq!(grant.profile_id.as_deref(), Some("profile-a"));
     }
 }
