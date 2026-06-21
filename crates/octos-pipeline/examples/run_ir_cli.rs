@@ -37,6 +37,7 @@ async fn main() {
 
     let config = ExecutorConfig {
         guards: Vec::new(),
+        max_concurrent_llm_calls: None,
         default_provider: provider,
         provider_router: None,
         memory,

@@ -997,6 +997,7 @@ impl Tool for RunPipelineTool {
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
             guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             // coding-blue FA-7: adopt workspace-contract enforcement.

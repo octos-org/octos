@@ -8,7 +8,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use octos_core::{AgentId, Task, TaskContext, TaskKind, TokenUsage};
-use octos_llm::{ContextWindowOverride, EmbeddingProvider, LlmProvider, ProviderRouter};
+use octos_llm::{
+    ContextWindowOverride, EmbeddingProvider, LlmProvider, ProviderRouter,
+    SemaphoreThrottledProvider,
+};
 use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
@@ -292,6 +295,7 @@ pub struct CodergenHandler {
     memory: Arc<EpisodeStore>,
     working_dir: PathBuf,
     provider_router: Option<Arc<ProviderRouter>>,
+    llm_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     provider_policy: Option<octos_agent::ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
     /// Section B (codex review P1.1): pipeline-level strict-signing
@@ -355,6 +359,7 @@ impl CodergenHandler {
             memory,
             working_dir,
             provider_router: None,
+            llm_semaphore: None,
             provider_policy: None,
             plugin_dirs: Vec::new(),
             plugin_require_signed: false,
@@ -439,6 +444,13 @@ impl CodergenHandler {
 
     pub fn with_provider_router(mut self, router: Arc<ProviderRouter>) -> Self {
         self.provider_router = Some(router);
+        self
+    }
+
+    /// Attach the per-pipeline LLM call throttle. The semaphore is shared
+    /// across every codergen worker in a single pipeline run.
+    pub fn with_llm_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.llm_semaphore = Some(semaphore);
         self
     }
 
@@ -550,6 +562,13 @@ impl CodergenHandler {
         self.cached_plugin_registration().tool_names.clone()
     }
 
+    #[doc(hidden)]
+    pub fn llm_available_permits_for_test(&self) -> Option<usize> {
+        self.llm_semaphore
+            .as_ref()
+            .map(|semaphore| semaphore.available_permits())
+    }
+
     /// Resolve LLM provider for a node, following SpawnTool pattern.
     ///
     /// When a model is explicitly specified and a `ProviderRouter` is available,
@@ -599,6 +618,12 @@ impl Handler for CodergenHandler {
         let provider: Arc<dyn LlmProvider> = match node.context_window {
             Some(cw) => Arc::new(ContextWindowOverride::new(base_provider, cw)),
             None => base_provider,
+        };
+        let provider: Arc<dyn LlmProvider> = match &self.llm_semaphore {
+            Some(semaphore) => {
+                Arc::new(SemaphoreThrottledProvider::new(provider, semaphore.clone()))
+            }
+            None => provider,
         };
 
         // Build tool registry (same pattern as SpawnTool sync, spawn.rs:269-278)

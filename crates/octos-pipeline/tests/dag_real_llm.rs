@@ -45,6 +45,7 @@ async fn make_executor(dir: &TempDir, dag: bool) -> PipelineExecutor {
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
     let config = ExecutorConfig {
         guards: Vec::new(),
+        max_concurrent_llm_calls: None,
         default_provider: deepseek(),
         provider_router: None,
         memory,
