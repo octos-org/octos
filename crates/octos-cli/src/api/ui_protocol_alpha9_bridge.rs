@@ -49,6 +49,7 @@ use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     FileAttachedEvent, SessionEventBridgedEvent, TurnCompletedEvent, TurnId, TurnSessionResult,
     TurnStartedEvent, UiNotification, VisualFailedEvent, VisualGeneratingEvent,
+    VisualSucceededEvent,
 };
 use serde_json::Value;
 
@@ -325,9 +326,33 @@ pub(super) fn emit_visual_generating_from_background(
     }));
 }
 
+/// #1477 voice rich output: the background visual task produced its artifact(s).
+/// The structured success counterpart of
+/// [`emit_visual_generating_from_background`] — the client clears the
+/// "generating" placeholder off THIS, keeping the visual lifecycle decoupled
+/// from `file/attached` (emitted alongside it, NOT in place of it). `files` are
+/// the workspace-relative artifact names, same as the accompanying
+/// `file/attached`.
+pub(super) fn emit_visual_succeeded_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    kind: &str,
+    files: &[String],
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualSucceeded(VisualSucceededEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        kind: kind.to_owned(),
+        files: files.to_vec(),
+    }));
+}
+
 /// #1477 voice rich output: the background visual task failed / timed out, so
-/// the client should clear the "generating" placeholder. Success needs no such
-/// event — it is signalled by the eventual `file/attached`.
+/// the client should clear the "generating" placeholder.
 pub(super) fn emit_visual_failed_from_background(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,

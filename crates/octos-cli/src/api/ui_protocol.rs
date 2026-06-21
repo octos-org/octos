@@ -19061,6 +19061,10 @@ async fn run_standalone_turn(
             );
             tokio::spawn(async move {
                 r_supervisor.mark_running(&r_task_id);
+                // Capture the kind token before `produce` consumes `directive`
+                // (its `brief` is moved into the skill calls); needed for the
+                // typed `visual/succeeded` on the success branch.
+                let r_kind = directive.kind.as_str();
                 // #1477 P2: bound the background visual task. Image generation +
                 // HTML authoring are network/LLM calls with no other ceiling on
                 // this detached path, so cap them so a hung skill / provider
@@ -19205,6 +19209,13 @@ async fn run_standalone_turn(
                 } else {
                     tracing::info!(files = ?rels, "voice rich: delivering artifact(s)");
                     r_supervisor.mark_completed(&r_task_id, rels.clone());
+                    // Deliver the artifact(s) AND emit the typed success signal.
+                    // `file/attached` stays a pure artifact-delivery event; the
+                    // visual lifecycle terminates on `visual/succeeded` (#1477),
+                    // so the client never has to infer success from a file
+                    // extension — and the lifecycle survives a future
+                    // `projection.envelope.v1` cutover that supersedes
+                    // `file/attached`.
                     super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
                         &r_ledger,
                         &r_session,
@@ -19212,6 +19223,9 @@ async fn run_standalone_turn(
                         &rels,
                         &[],
                         None,
+                    );
+                    super::ui_protocol_alpha9_bridge::emit_visual_succeeded_from_background(
+                        &r_ledger, &r_session, &r_turn, r_kind, &rels,
                     );
                 }
             });
@@ -22178,6 +22192,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             UiNotification::TurnStarted(_)
             | UiNotification::MessageDelta(_)
             | UiNotification::VisualGenerating(_)
+            | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)

@@ -1042,9 +1042,16 @@ pub mod methods {
     /// client show a "generating" placeholder WITHOUT scraping an in-band
     /// marker out of the assistant text. Ungated; emitted on the same
     /// ledger-backed live path as `file/attached` (durable append, so a
-    /// reconnecting client replays it). Success is signalled by the eventual
-    /// `file/attached`, failure by `visual/failed`.
+    /// reconnecting client replays it). The lifecycle is terminated by a typed
+    /// `visual/succeeded` or `visual/failed` — NOT by `file/attached` (which is
+    /// purely an artifact-delivery signal).
     pub const VISUAL_GENERATING: &str = "visual/generating";
+    /// #1477 voice rich output — the background visual task produced its
+    /// artifact(s). The structured success counterpart of `visual/generating`:
+    /// the client clears the "generating" placeholder off THIS event, keeping
+    /// the visual lifecycle decoupled from `file/attached`. Emitted alongside
+    /// `file/attached` on the success branch.
+    pub const VISUAL_SUCCEEDED: &str = "visual/succeeded";
     /// #1477 voice rich output — the background visual task failed or timed
     /// out, so the client should clear the "generating" placeholder.
     pub const VISUAL_FAILED: &str = "visual/failed";
@@ -1225,6 +1232,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
     methods::VISUAL_GENERATING,
+    methods::VISUAL_SUCCEEDED,
     methods::VISUAL_FAILED,
     methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
@@ -4514,7 +4522,7 @@ pub struct MessageDeltaEvent {
 /// the turn. The client renders a "generating" placeholder keyed off this
 /// typed event instead of scraping an in-band `[[VISUAL:...]]` marker out of the
 /// assistant text (which the backend now keeps out of the wire/persisted
-/// surfaces entirely). Cleared by the eventual `file/attached` (success) or
+/// surfaces entirely). The lifecycle terminates on `visual/succeeded` or
 /// `visual/failed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VisualGeneratingEvent {
@@ -4524,6 +4532,25 @@ pub struct VisualGeneratingEvent {
     pub turn_id: TurnId,
     /// `html` | `illustrated` | `image` | `infographic`.
     pub kind: String,
+}
+
+/// #1477 voice rich output: the background visual task produced its artifact(s).
+/// The structured success counterpart of [`VisualGeneratingEvent`] — the client
+/// clears the "generating" placeholder off this, NOT off `file/attached` (which
+/// stays a pure artifact-delivery signal). Emitted alongside `file/attached` on
+/// the success branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisualSucceededEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    /// `html` | `illustrated` | `image` | `infographic`.
+    pub kind: String,
+    /// Workspace-relative filenames of the delivered artifact(s) — the same
+    /// paths carried on the accompanying `file/attached` event(s).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 /// #1477 voice rich output: the background visual task failed or timed out, so
@@ -5491,6 +5518,8 @@ pub enum UiNotification {
     MessageDelta(MessageDeltaEvent),
     /// #1477 voice rich output: a background visual artifact started generating.
     VisualGenerating(VisualGeneratingEvent),
+    /// #1477 voice rich output: a background visual artifact was produced.
+    VisualSucceeded(VisualSucceededEvent),
     /// #1477 voice rich output: a background visual task failed / timed out.
     VisualFailed(VisualFailedEvent),
     ToolStarted(ToolStartedEvent),
@@ -5588,6 +5617,7 @@ impl UiNotification {
             Self::TurnStarted(_) => methods::TURN_STARTED,
             Self::MessageDelta(_) => methods::MESSAGE_DELTA,
             Self::VisualGenerating(_) => methods::VISUAL_GENERATING,
+            Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
             Self::VisualFailed(_) => methods::VISUAL_FAILED,
             Self::ToolStarted(_) => methods::TOOL_STARTED,
             Self::ToolProgress(_) => methods::TOOL_PROGRESS,
@@ -5632,6 +5662,7 @@ impl UiNotification {
             Self::TurnStarted(event) => &event.session_id,
             Self::MessageDelta(event) => &event.session_id,
             Self::VisualGenerating(event) => &event.session_id,
+            Self::VisualSucceeded(event) => &event.session_id,
             Self::VisualFailed(event) => &event.session_id,
             Self::ToolStarted(event) => &event.session_id,
             Self::ToolProgress(event) => &event.session_id,
@@ -5677,6 +5708,9 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::VisualGenerating(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::VisualSucceeded(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::VisualFailed(event) => {
@@ -5737,6 +5771,7 @@ impl UiNotification {
             Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualGenerating(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VisualSucceeded(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualFailed(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5767,6 +5802,7 @@ impl UiNotification {
             Self::TurnStarted(params) => serde_json::to_value(params),
             Self::MessageDelta(params) => serde_json::to_value(params),
             Self::VisualGenerating(params) => serde_json::to_value(params),
+            Self::VisualSucceeded(params) => serde_json::to_value(params),
             Self::VisualFailed(params) => serde_json::to_value(params),
             Self::ToolStarted(params) => serde_json::to_value(params),
             Self::ToolProgress(params) => serde_json::to_value(params),
@@ -5866,6 +5902,7 @@ impl UiNotification {
             methods::VISUAL_GENERATING => {
                 Ok(Self::VisualGenerating(decode_params(method, params)?))
             }
+            methods::VISUAL_SUCCEEDED => Ok(Self::VisualSucceeded(decode_params(method, params)?)),
             methods::VISUAL_FAILED => Ok(Self::VisualFailed(decode_params(method, params)?)),
             methods::TOOL_STARTED => Ok(Self::ToolStarted(decode_params(method, params)?)),
             methods::TOOL_PROGRESS => Ok(Self::ToolProgress(decode_params(method, params)?)),
@@ -6201,6 +6238,11 @@ mod tests {
             decoded
                 .supported_notifications
                 .contains(&methods::VISUAL_GENERATING.to_owned())
+        );
+        assert!(
+            decoded
+                .supported_notifications
+                .contains(&methods::VISUAL_SUCCEEDED.to_owned())
         );
         assert!(
             decoded
@@ -6668,6 +6710,7 @@ mod tests {
                 "turn/spawn_complete",
                 "file/attached",
                 "visual/generating",
+                "visual/succeeded",
                 "visual/failed",
                 "projection/envelope",
                 "session/event",
@@ -6836,6 +6879,7 @@ mod tests {
                     "turn/spawn_complete",
                     "file/attached",
                     "visual/generating",
+                    "visual/succeeded",
                     "visual/failed",
                     "projection/envelope",
                     "session/event",
@@ -7449,6 +7493,24 @@ mod tests {
         let decoded =
             UiNotification::from_rpc_notification(wire).expect("decode visual/generating");
         assert_eq!(decoded, generating);
+
+        let succeeded = UiNotification::VisualSucceeded(VisualSucceededEvent {
+            session_id: SessionKey("local:voice".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(1)),
+            kind: "html".into(),
+            files: vec!["visual-abc.html".into()],
+        });
+        assert_eq!(succeeded.method(), methods::VISUAL_SUCCEEDED);
+        let wire = succeeded
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize visual/succeeded");
+        assert_eq!(wire.method, methods::VISUAL_SUCCEEDED);
+        assert_eq!(wire.params["kind"], json!("html"));
+        assert_eq!(wire.params["files"], json!(["visual-abc.html"]));
+        let decoded = UiNotification::from_rpc_notification(wire).expect("decode visual/succeeded");
+        assert_eq!(decoded, succeeded);
 
         let failed = UiNotification::VisualFailed(VisualFailedEvent {
             session_id: SessionKey("local:voice".into()),
