@@ -653,10 +653,10 @@ fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<Transcrip
                         return None;
                     }
                 }
-                TranscriptItemKind::CompactionSummary { summary, .. } => {
-                    if summary.contains("[[VISUAL:") {
-                        *summary = remove_all_visual_markers(summary);
-                    }
+                TranscriptItemKind::CompactionSummary { summary, .. }
+                    if summary.contains("[[VISUAL:") =>
+                {
+                    *summary = remove_all_visual_markers(summary);
                 }
                 _ => {}
             }
