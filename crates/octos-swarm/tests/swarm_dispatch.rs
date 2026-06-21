@@ -42,6 +42,10 @@ struct FakeBackend {
     /// Per-dispatch delay, applied before responding. Used by the
     /// parallel test to ensure fan-out is truly concurrent.
     delay: Mutex<Option<Duration>>,
+    /// Number of backend dispatches currently inside the fake backend.
+    active_dispatches: AtomicUsize,
+    /// High-water mark for simultaneously active dispatches.
+    max_active_dispatches: AtomicUsize,
 }
 
 impl FakeBackend {
@@ -62,6 +66,32 @@ impl FakeBackend {
 
     fn history(&self) -> Vec<(String, serde_json::Value)> {
         self.history.lock().unwrap().clone()
+    }
+
+    fn max_active_dispatches(&self) -> usize {
+        self.max_active_dispatches.load(Ordering::SeqCst)
+    }
+}
+
+struct ActiveDispatchGuard<'a> {
+    backend: &'a FakeBackend,
+}
+
+impl<'a> ActiveDispatchGuard<'a> {
+    fn enter(backend: &'a FakeBackend) -> Self {
+        let active = backend.active_dispatches.fetch_add(1, Ordering::SeqCst) + 1;
+        backend
+            .max_active_dispatches
+            .fetch_max(active, Ordering::SeqCst);
+        Self { backend }
+    }
+}
+
+impl Drop for ActiveDispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.backend
+            .active_dispatches
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -87,6 +117,7 @@ impl McpAgentBackend for FakeBackend {
             .unwrap()
             .push((contract_id.clone(), request.task.clone()));
 
+        let _active_dispatch = ActiveDispatchGuard::enter(self);
         let delay = *self.delay.lock().unwrap();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -197,9 +228,8 @@ async fn should_fan_out_parallel_n_contracts() {
     backend.script("a", vec![success("result-a")]);
     backend.script("b", vec![success("result-b")]);
     backend.script("c", vec![success("result-c")]);
-    // Delay each dispatch so the test can prove the fan-out actually
-    // overlaps; with 3 contracts at 100ms apiece, a sequential run
-    // would take >=300ms while a parallel run stays near 100ms.
+    // Delay each dispatch so the test can prove fan-out overlap using
+    // the fake backend's active-dispatch high-water mark.
     backend.set_delay(Duration::from_millis(100));
 
     let dir = tempfile::tempdir().unwrap();
@@ -208,7 +238,6 @@ async fn should_fan_out_parallel_n_contracts() {
         .await
         .unwrap();
 
-    let start = std::time::Instant::now();
     let result = swarm
         .dispatch(
             "d1",
@@ -221,14 +250,14 @@ async fn should_fan_out_parallel_n_contracts() {
         )
         .await
         .unwrap();
-    let elapsed = start.elapsed();
 
     assert_eq!(result.outcome, SwarmOutcomeKind::Success);
     assert_eq!(result.total_subtasks, 3);
     assert_eq!(result.completed_subtasks, 3);
     assert!(
-        elapsed < Duration::from_millis(280),
-        "fan-out was not concurrent: {elapsed:?}"
+        backend.max_active_dispatches() > 1,
+        "fan-out did not overlap dispatches; max active dispatches: {}",
+        backend.max_active_dispatches()
     );
     // History records every issued contract.
     assert_eq!(backend.history().len(), 3);
