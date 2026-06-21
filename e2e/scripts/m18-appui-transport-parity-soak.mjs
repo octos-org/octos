@@ -1059,6 +1059,8 @@ function routeProbeParams(method) {
       return { profile_id: profileId, name: 'm18-missing-skill' };
     case 'profile/skills/remove':
       return { profile_id: profileId, name: 'm18-missing-skill' };
+    case 'onboarding/workspace_probe':
+      return { path: workspace };
     default:
       throw new Error(`missing route probe params for ${method}`);
   }

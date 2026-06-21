@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "source": "crates/octos-core/src/ui_protocol.rs UI_PROTOCOL_COMMAND_METHODS plus crates/octos-cli/src/api/ui_protocol.rs APPUI_EXTRA_METHODS",
-  "last_reviewed": "2026-05-18",
-  "issue": "octos#1030",
+  "last_reviewed": "2026-05-24",
+  "issue": "octos#1030, octos#716",
   "transports": ["websocket", "stdio"],
   "methods": [
     { "method": "profile/local/create", "classification": "shared" },
@@ -52,7 +52,7 @@
     { "method": "system/status.get", "classification": "shared" },
     { "method": "content/list", "classification": "auth_bound_stdio_unsupported" },
     { "method": "content/delete", "classification": "auth_bound_stdio_unsupported" },
-    { "method": "content/bulk_delete", "classification": "shared" },
+    { "method": "content/bulk_delete", "classification": "auth_bound_stdio_unsupported" },
     { "method": "router/set_mode", "classification": "shared" },
     { "method": "router/get_metrics", "classification": "shared" },
     { "method": "config/capabilities/list", "classification": "shared_extra" },
@@ -65,7 +65,7 @@
     { "method": "auth/send_code", "classification": "shared_extra" },
     { "method": "auth/verify", "classification": "shared_extra" },
     { "method": "auth/me", "classification": "auth_bound_stdio_unsupported" },
-    { "method": "auth/logout", "classification": "shared_extra" },
+    { "method": "auth/logout", "classification": "auth_bound_stdio_unsupported" },
     { "method": "profile/llm/catalog", "classification": "shared_extra" },
     { "method": "profile/llm/upsert", "classification": "shared_extra" },
     { "method": "profile/llm/delete", "classification": "shared_extra" },
@@ -75,6 +75,7 @@
     { "method": "profile/skills/registry/search", "classification": "shared_extra" },
     { "method": "profile/skills/install", "classification": "shared_extra" },
     { "method": "profile/skills/remove", "classification": "shared_extra" },
+    { "method": "onboarding/workspace_probe", "classification": "local_solo_extra" },
     { "method": "client_hello", "classification": "shared_extra" }
   ]
 }
