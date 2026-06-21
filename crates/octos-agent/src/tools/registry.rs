@@ -840,29 +840,33 @@ impl ToolRegistry {
         // RFC-1 fixup: prune stale internal-hidden markers symmetrically.
         self.internal_hidden
             .retain(|name| self.tools.contains_key(name));
-        // RFC-1 fixup (codex round 4 P2 + round 5 P1): prune dispatcher
-        // catalogs when their forwarding targets are evicted. The
-        // slides-session `retain(keep_tool_in_slides_session)` removes
-        // `mofa_cards`, `mofa_comic`, etc. from `tools`, but the
-        // `MofaMakeTool` dispatcher's catalog (built at load time)
-        // still advertises those `content_type` enum values to the LLM.
-        // Without this prune the LLM can call
-        // `mofa_make({content_type: "cards"})` and observe a
-        // `[DISPATCHER_ERROR]` because the target was evicted —
-        // weakening the slides-only guardrail.
+        // RFC-1 fixup (codex round 4 P2 + round 5 P1/P2): prune
+        // dispatcher catalogs when their forwarding targets are
+        // evicted. The slides-session
+        // `retain(keep_tool_in_slides_session)` removes `mofa_cards`,
+        // `mofa_comic`, etc. from `tools`, but the `MofaMakeTool`
+        // dispatcher's catalog (built at load time) still advertises
+        // those `content_type` enum values to the LLM. Without this
+        // prune the LLM can call `mofa_make({content_type: "cards"})`
+        // and observe a `[DISPATCHER_ERROR]` because the target was
+        // evicted — weakening the slides-only guardrail.
         //
-        // round 5 P1: this registry may have been built via
+        // Round 5 P1: this registry may have been built via
         // `snapshot_excluding` / `rebind_cwd`, which clones the
         // dispatcher tool as a SHARED `Arc<dyn Tool>` with the
         // base/profile registry. Calling `replace_entries` on a shared
-        // dispatcher would poison the base's catalog — every
-        // subsequent session cloned from the same base would also
-        // observe the pruned catalog. Detect sharing via
-        // `Arc::strong_count` and, when shared, mint a FRESH
-        // dispatcher seeded only with the surviving entries and
-        // register it locally. Solo holders keep the cheaper
-        // in-place mutation path. The Weak<ToolRegistry> back-ref on
-        // the fresh dispatcher is intentionally left unwired here —
+        // dispatcher would poison the base's catalog — every subsequent
+        // session cloned from the same base would also observe the
+        // pruned catalog. Round 5 P2: an earlier attempt gated on
+        // `Arc::strong_count > 2`, but the threshold is racy under
+        // concurrent retains across sibling snapshots (the count can
+        // dip back to 2 between snapshot ops, causing the in-place
+        // branch to fire on a still-shared Arc). Always mint a FRESH
+        // dispatcher seeded with surviving entries and register it
+        // locally — the allocation cost is paid once per retain pass
+        // and the shared-Arc hazard is unconditionally eliminated. The
+        // `Weak<ToolRegistry>` back-ref on the fresh dispatcher is
+        // intentionally left unwired here —
         // `Agent::new::refresh_mofa_make_dispatcher_in_place` /
         // `wire_mofa_make_registry_back_ref` rewires it before the
         // agent loop executes, matching the freshen path used by
@@ -874,36 +878,22 @@ impl ToolRegistry {
                     .into_iter()
                     .filter(|entry| self.tools.contains_key(&entry.target_tool))
                     .collect();
-                // `arc` is one local clone + at least one HashMap entry,
-                // so strong_count is >= 2 in the solo-owner case. A
-                // shared dispatcher (the base/profile registry still
-                // holds the same Arc) pushes the count to >= 3. Use
-                // `> 2` to detect sharing precisely.
-                let dispatcher_shared = Arc::strong_count(&arc) > 2;
-                if dispatcher_shared {
-                    let fresh = super::MofaMakeTool::new();
-                    for entry in &surviving {
-                        fresh.register_or_replace(entry.clone());
-                    }
-                    self.register(fresh);
-                } else {
-                    dispatcher.replace_entries(surviving.clone());
+                let fresh = super::MofaMakeTool::new();
+                for entry in &surviving {
+                    fresh.register_or_replace(entry.clone());
                 }
+                self.register(fresh);
                 if let Some(describe_arc) = self.tools.get("mofa_describe_content_type").cloned() {
-                    if let Some(describe) = describe_arc
+                    if describe_arc
                         .as_any()
                         .downcast_ref::<super::MofaDescribeContentTypeTool>()
+                        .is_some()
                     {
-                        let describe_shared = Arc::strong_count(&describe_arc) > 2;
-                        if describe_shared {
-                            let fresh = super::MofaDescribeContentTypeTool::new();
-                            for entry in &surviving {
-                                fresh.register_or_replace(entry.clone());
-                            }
-                            self.register(fresh);
-                        } else {
-                            describe.replace_entries(surviving);
+                        let fresh_describe = super::MofaDescribeContentTypeTool::new();
+                        for entry in &surviving {
+                            fresh_describe.register_or_replace(entry.clone());
                         }
+                        self.register(fresh_describe);
                     }
                 }
             }
