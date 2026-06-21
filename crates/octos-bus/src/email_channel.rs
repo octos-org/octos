@@ -14,6 +14,8 @@ use tracing::{info, warn};
 
 use crate::channel::Channel;
 
+const MAX_EMAIL_TOPIC_CHARS: usize = 120;
+
 /// Email channel configuration.
 pub struct EmailConfig {
     pub imap_host: String,
@@ -31,6 +33,16 @@ pub struct EmailConfig {
 pub struct EmailChannel {
     config: Arc<EmailConfig>,
     shutdown: Arc<AtomicBool>,
+}
+
+struct ParsedEmail {
+    from: String,
+    subject: String,
+    text_body: String,
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    thread_topic: String,
 }
 
 impl EmailChannel {
@@ -147,7 +159,7 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
         .join(",");
 
     // Collect parsed emails first, then drop the stream to release session borrow.
-    let mut parsed_emails: Vec<(String, String, String)> = Vec::new();
+    let mut parsed_emails = Vec::new();
     {
         let mut messages = session
             .fetch(&seq_set, "RFC822")
@@ -178,11 +190,28 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
 
             let from = extract_header(&parsed, "From").unwrap_or_default();
             let subject = extract_header(&parsed, "Subject").unwrap_or_default();
+            let message_id = extract_header(&parsed, "Message-ID").and_then(non_empty_header);
+            let in_reply_to = extract_header(&parsed, "In-Reply-To").and_then(non_empty_header);
+            let references = extract_header(&parsed, "References").and_then(non_empty_header);
+            let thread_topic = email_thread_topic(
+                message_id.as_deref(),
+                in_reply_to.as_deref(),
+                references.as_deref(),
+                &subject,
+            );
             let mut text_body = extract_text_body(&parsed).unwrap_or_default();
             octos_core::truncate_utf8(&mut text_body, config.max_body_chars, "...");
 
             if !text_body.is_empty() {
-                parsed_emails.push((from, subject, text_body));
+                parsed_emails.push(ParsedEmail {
+                    from,
+                    subject,
+                    text_body,
+                    message_id,
+                    in_reply_to,
+                    references,
+                    thread_topic,
+                });
             }
         }
     }
@@ -196,22 +225,23 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
 
     // Send parsed emails as inbound messages
     let mut count = 0;
-    for (from, subject, text_body) in parsed_emails {
-        let sender_email = extract_email_address(&from);
+    for email in parsed_emails {
+        let sender_email = extract_email_address(&email.from);
+        let message_id = email.message_id.clone();
 
-        if should_skip_self_reply(&sender_email, &subject, config) {
+        if should_skip_self_reply(&sender_email, &email.subject, config) {
             info!(
                 sender = %sender_email,
-                subject = %subject,
+                subject = %email.subject,
                 "skipping self-sent email reply"
             );
             continue;
         }
 
-        let content = if subject.is_empty() {
-            text_body
+        let content = if email.subject.is_empty() {
+            email.text_body
         } else {
-            format!("[Subject: {subject}]\n{text_body}")
+            format!("[Subject: {}]\n{}", email.subject, email.text_body)
         };
 
         let inbound = InboundMessage {
@@ -221,8 +251,14 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
             content,
             timestamp: Utc::now(),
             media: vec![],
-            metadata: serde_json::json!({ "subject": subject }),
-            message_id: None,
+            metadata: serde_json::json!({
+                "subject": email.subject,
+                "topic": email.thread_topic,
+                "message_id": email.message_id,
+                "in_reply_to": email.in_reply_to,
+                "references": email.references,
+            }),
+            message_id,
             origin: octos_core::MessageOrigin::ExternalUser,
         };
 
@@ -283,6 +319,90 @@ fn extract_header(mail: &mailparse::ParsedMail, name: &str) -> Option<String> {
         .iter()
         .find(|h| h.get_key().eq_ignore_ascii_case(name))
         .map(|h| h.get_value())
+}
+
+fn non_empty_header(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn email_thread_topic(
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+    subject: &str,
+) -> String {
+    let topic_source = references
+        .and_then(first_message_id)
+        .or_else(|| in_reply_to.and_then(first_message_id))
+        .or_else(|| message_id.and_then(first_message_id))
+        .or_else(|| normalized_subject(subject))
+        .unwrap_or_else(|| "untitled".to_string());
+
+    format!("email-{}", sanitize_topic_component(&topic_source))
+}
+
+fn first_message_id(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .map(|part| part.trim().trim_matches('<').trim_matches('>'))
+        .find(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalized_subject(subject: &str) -> Option<String> {
+    let mut normalized = subject.trim();
+    loop {
+        let lower = normalized.to_ascii_lowercase();
+        let stripped = ["re:", "fw:", "fwd:"]
+            .iter()
+            .find(|prefix| lower.starts_with(**prefix))
+            .map(|prefix| &normalized[prefix.len()..]);
+
+        let Some(stripped) = stripped else {
+            break;
+        };
+        normalized = stripped.trim();
+    }
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn sanitize_topic_component(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_separator = false;
+
+    for ch in value.trim().chars() {
+        if out.len() >= MAX_EMAIL_TOPIC_CHARS {
+            break;
+        }
+
+        if ch.is_alphanumeric() || ch == '-' {
+            previous_separator = false;
+            out.push(ch);
+        } else if !previous_separator && !out.is_empty() {
+            previous_separator = true;
+            out.push('_');
+        }
+    }
+
+    while out.ends_with('_') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "untitled".to_string()
+    } else {
+        out
+    }
 }
 
 /// Extract the first text/plain body from a parsed email.
@@ -406,5 +526,42 @@ mod tests {
             "New incoming question",
             &config
         ));
+    }
+
+    #[test]
+    fn email_thread_topic_prefers_root_reference() {
+        assert_eq!(
+            email_thread_topic(
+                Some("<reply@example.com>"),
+                Some("<parent@example.com>"),
+                Some("<root@example.com> <parent@example.com>"),
+                "Re: Project update",
+            ),
+            "email-root_example_com"
+        );
+    }
+
+    #[test]
+    fn email_thread_topic_falls_back_to_message_id() {
+        assert_eq!(
+            email_thread_topic(Some("<first@example.com>"), None, None, "Project update"),
+            "email-first_example_com"
+        );
+    }
+
+    #[test]
+    fn email_thread_topic_falls_back_to_normalized_subject() {
+        assert_eq!(
+            email_thread_topic(None, None, None, "Re: Fwd: Quarterly Plan"),
+            "email-Quarterly_Plan"
+        );
+    }
+
+    #[test]
+    fn email_thread_topic_preserves_unicode_subject_words() {
+        assert_eq!(
+            email_thread_topic(None, None, None, "Re: 你好 世界"),
+            "email-你好_世界"
+        );
     }
 }
