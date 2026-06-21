@@ -1115,6 +1115,10 @@ pub(crate) fn create_provider_with_api_type(
     base_url: Option<String>,
     api_type: Option<&str>,
 ) -> Result<Arc<dyn LlmProvider>> {
+    if name == "custom" {
+        return create_custom_provider(config, model, base_url, api_type);
+    }
+
     let entry = octos_llm::registry::lookup(name).ok_or_else(|| {
         eyre::eyre!(
             "unknown provider: {name}. Valid: {}",
@@ -1195,4 +1199,113 @@ pub(crate) fn create_provider_with_api_type(
 
     let provider = (entry.create)(params)?;
     Ok(provider)
+}
+
+fn create_custom_provider(
+    config: &Config,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_type: Option<&str>,
+) -> Result<Arc<dyn LlmProvider>> {
+    let key = config.get_api_key("custom")?;
+    let model = model.ok_or_else(|| eyre::eyre!("custom provider requires model"))?;
+    let base_url = base_url.ok_or_else(|| eyre::eyre!("custom provider requires base_url"))?;
+
+    // Extract timeout overrides from gateway config (if any).
+    let llm_timeout_secs = config.gateway.as_ref().and_then(|g| g.llm_timeout_secs);
+    let llm_connect_timeout_secs = config
+        .gateway
+        .as_ref()
+        .and_then(|g| g.llm_connect_timeout_secs);
+
+    match api_type.unwrap_or("openai") {
+        "openai" => {
+            let mut provider = octos_llm::openai::OpenAIProvider::new(key, model)
+                .with_base_url(&base_url)
+                .with_provider_label("custom");
+            if let Some(t) = llm_timeout_secs {
+                let c =
+                    llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+                provider = provider.with_http_timeout(t, c);
+            }
+            Ok(Arc::new(provider))
+        }
+        "anthropic" => {
+            let mut provider = octos_llm::anthropic::AnthropicProvider::new(key, model)
+                .with_base_url(&base_url)
+                .with_provider_label("custom");
+            if let Some(t) = llm_timeout_secs {
+                let c =
+                    llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+                provider = provider.with_http_timeout(t, c);
+            }
+            Ok(Arc::new(provider))
+        }
+        other => eyre::bail!("unsupported custom api_type '{other}'; use openai or anthropic"),
+    }
+}
+
+#[cfg(test)]
+mod custom_provider_tests {
+    use super::*;
+
+    fn custom_config() -> Config {
+        let mut config = Config {
+            api_key_env: Some("CUSTOM_API_KEY".to_string()),
+            ..Default::default()
+        };
+        config
+            .env_vars
+            .insert("CUSTOM_API_KEY".to_string(), "test-key".to_string());
+        config
+    }
+
+    #[test]
+    fn creates_custom_openai_compatible_provider() {
+        let provider = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("llama-3.1-70b-instruct".to_string()),
+            Some("http://127.0.0.1:11434/v1".to_string()),
+            Some("openai"),
+        )
+        .unwrap();
+
+        assert_eq!(provider.provider_name(), "custom");
+        assert_eq!(provider.model_id(), "llama-3.1-70b-instruct");
+    }
+
+    #[test]
+    fn creates_custom_anthropic_compatible_provider() {
+        let provider = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("claude-compatible".to_string()),
+            Some("https://proxy.example.com/anthropic".to_string()),
+            Some("anthropic"),
+        )
+        .unwrap();
+
+        assert_eq!(provider.provider_name(), "custom");
+        assert_eq!(provider.model_id(), "claude-compatible");
+    }
+
+    #[test]
+    fn rejects_custom_provider_without_base_url() {
+        let result = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("llama".to_string()),
+            None,
+            Some("openai"),
+        );
+
+        match result {
+            Ok(provider) => panic!(
+                "expected missing base_url error, got provider {}",
+                provider.provider_name()
+            ),
+            Err(err) => assert!(err.to_string().contains("requires base_url")),
+        }
+    }
 }

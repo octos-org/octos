@@ -1407,7 +1407,7 @@ impl Config {
 
         // Check provider is valid
         if let Some(ref provider) = self.provider {
-            if octos_llm::registry::lookup(provider).is_none() {
+            if provider != "custom" && octos_llm::registry::lookup(provider).is_none() {
                 let valid = octos_llm::registry::all_names();
                 warnings.push(format!(
                     "Unknown provider '{}'. Valid options: {}",
@@ -1715,6 +1715,23 @@ mod tests {
         };
         let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("Unknown provider")));
+    }
+
+    #[test]
+    fn test_validate_allows_custom_provider_with_base_url() {
+        let config = Config {
+            provider: Some("custom".to_string()),
+            model: Some("llama-3.1-70b-instruct".to_string()),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            api_type: Some("openai".to_string()),
+            api_key_env: Some("CUSTOM_API_KEY".to_string()),
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert!(
+            !warnings.iter().any(|w| w.contains("Unknown provider")),
+            "custom provider config should not warn as unknown: {warnings:?}"
+        );
     }
 
     #[test]
