@@ -623,6 +623,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(webhook_proxy::line_webhook_proxy),
         )
         .route(
+            "/webhook/dingtalk/{profile_id}",
+            post(webhook_proxy::dingtalk_webhook_proxy),
+        )
+        .route(
             "/webhook/twilio/{profile_id}",
             post(webhook_proxy::twilio_webhook_proxy),
         );

@@ -78,6 +78,41 @@ export DISCORD_BOT_TOKEN="..."
 
 ---
 
+## DingTalk
+
+DingTalk supports outbound custom-robot sends and incoming outgoing-robot callbacks.
+
+```bash
+export DINGTALK_BOT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
+export DINGTALK_BOT_SECRET="SEC..."
+```
+
+```json
+{
+  "type": "dingtalk",
+  "allowed_senders": ["staff-id-1"],
+  "settings": {
+    "webhook_url_env": "DINGTALK_BOT_WEBHOOK",
+    "secret_env": "DINGTALK_BOT_SECRET",
+    "webhook_port": 8650
+  }
+}
+```
+
+For inbound events, configure the DingTalk outgoing robot callback URL as:
+
+```text
+https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
+```
+
+Build with the `dingtalk` feature flag:
+
+```bash
+cargo build --release -p octos-cli --features dingtalk
+```
+
+---
+
 ## WhatsApp
 
 Requires a Node.js bridge (Baileys) running at a WebSocket URL.
@@ -442,6 +477,7 @@ Long responses are automatically split into channel-safe chunks:
 |---------|-----------------------|
 | Telegram | 4000 |
 | Discord | 1900 |
+| DingTalk | 3600 |
 | Slack | 3900 |
 
 Split preference: paragraph boundary > newline > sentence end > space > hard cut.

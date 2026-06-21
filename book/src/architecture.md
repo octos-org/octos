@@ -1049,6 +1049,7 @@ pub trait Channel: Send + Sync {
 | **CLI** | stdin/stdout | (always) | N/A | N/A |
 | **Telegram** | teloxide long-poll | `telegram` | Bot token (env) | teloxide built-in |
 | **Discord** | serenity gateway | `discord` | Bot token (env) | serenity built-in |
+| **DingTalk** | custom robot send + outgoing robot webhook | `dingtalk` | Webhook URL + signing secret | msgId |
 | **Slack** | Socket Mode (tokio-tungstenite) | `slack` | Bot token + App token | message_ts |
 | **WhatsApp** | WebSocket bridge (ws://localhost:3001) | `whatsapp` | Baileys bridge | HashSet (10K cap, clear on overflow) |
 | **Feishu** | WebSocket (tokio-tungstenite) | `feishu` | App ID + Secret → tenant token (TTL 6000s) | HashSet (10K cap, clear on overflow) |

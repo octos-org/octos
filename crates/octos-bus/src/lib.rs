@@ -16,6 +16,8 @@ pub mod session;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
+#[cfg(feature = "dingtalk")]
+pub mod dingtalk_channel;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
 #[cfg(feature = "email")]
@@ -68,6 +70,8 @@ pub use session::{
 
 #[cfg(feature = "api")]
 pub use api_channel::{ApiChannel, TaskCancelOutcome, TaskRelaunchOutcome};
+#[cfg(feature = "dingtalk")]
+pub use dingtalk_channel::DingTalkChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]

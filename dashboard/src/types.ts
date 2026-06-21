@@ -191,13 +191,14 @@ export interface BulkActionResponse {
   count: number
 }
 
-export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'feishu' | 'line' | 'email'
+export type ChannelType = 'telegram' | 'discord' | 'dingtalk' | 'slack' | 'whatsapp' | 'feishu' | 'line' | 'email'
 
-export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'line', 'email']
+export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'dingtalk', 'slack', 'whatsapp', 'feishu', 'line', 'email']
 
 export const CHANNEL_COLORS: Record<ChannelType, string> = {
   telegram: 'bg-blue-500',
   discord: 'bg-indigo-500',
+  dingtalk: 'bg-sky-500',
   slack: 'bg-purple-500',
   whatsapp: 'bg-green-500',
   feishu: 'bg-cyan-500',
@@ -208,6 +209,7 @@ export const CHANNEL_COLORS: Record<ChannelType, string> = {
 export const CHANNEL_LABELS: Record<ChannelType, string> = {
   telegram: 'TG',
   discord: 'DC',
+  dingtalk: 'DT',
   slack: 'SL',
   whatsapp: 'WA',
   feishu: 'FS',

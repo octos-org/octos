@@ -1450,6 +1450,15 @@ pub(crate) fn validate_channel_credentials(
                     return Err("Feishu channel: app_id_env must be non-empty".into());
                 }
             }
+            ChannelCredentials::DingTalk {
+                webhook_url_env,
+                secret_env,
+                ..
+            } if webhook_url_env.is_empty() && secret_env.is_empty() => {
+                return Err(
+                    "DingTalk channel: webhook_url_env or secret_env must be non-empty".into(),
+                );
+            }
             _ => {}
         }
     }
@@ -3257,6 +3266,7 @@ pub async fn config_check(
         .map(|c| match c {
             crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
             crate::profiles::ChannelCredentials::Discord { .. } => "discord",
+            crate::profiles::ChannelCredentials::DingTalk { .. } => "dingtalk",
             crate::profiles::ChannelCredentials::Slack { .. } => "slack",
             crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
             crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
@@ -3397,6 +3407,14 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             }
             crate::profiles::ChannelCredentials::Discord { token_env, .. } => {
                 insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::DingTalk {
+                webhook_url_env,
+                secret_env,
+                ..
+            } => {
+                insert_ref(webhook_url_env, "channels");
+                insert_ref(secret_env, "channels");
             }
             crate::profiles::ChannelCredentials::Slack {
                 bot_token_env,

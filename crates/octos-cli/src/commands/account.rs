@@ -488,6 +488,7 @@ fn channel_type(ch: &ChannelCredentials) -> &'static str {
     match ch {
         ChannelCredentials::Telegram { .. } => "telegram",
         ChannelCredentials::Discord { .. } => "discord",
+        ChannelCredentials::DingTalk { .. } => "dingtalk",
         ChannelCredentials::Slack { .. } => "slack",
         ChannelCredentials::WhatsApp { .. } => "whatsapp",
         ChannelCredentials::Feishu { .. } => "feishu",

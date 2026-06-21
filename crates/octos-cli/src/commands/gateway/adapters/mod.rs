@@ -16,6 +16,8 @@ use crate::config::ChannelEntry;
 #[cfg(feature = "api")]
 mod api;
 mod cli;
+#[cfg(feature = "dingtalk")]
+mod dingtalk;
 #[cfg(feature = "discord")]
 mod discord;
 #[cfg(feature = "email")]
@@ -48,6 +50,7 @@ mod whatsapp;
 #[cfg(any(
     feature = "telegram",
     feature = "discord",
+    feature = "dingtalk",
     feature = "slack",
     feature = "whatsapp",
     feature = "email",
@@ -115,6 +118,8 @@ pub fn register_all(
             "telegram" => telegram::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "discord")]
             "discord" => discord::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
+            #[cfg(feature = "dingtalk")]
+            "dingtalk" => dingtalk::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "slack")]
             "slack" => slack::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "whatsapp")]
