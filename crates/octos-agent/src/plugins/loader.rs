@@ -2837,6 +2837,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            make_type_entries: vec![],
         };
         result.merge_extras(e1);
 
@@ -2850,6 +2851,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            make_type_entries: vec![],
         };
         result.merge_extras(e2);
 
@@ -2863,6 +2865,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            make_type_entries: vec![],
         };
         result.merge_extras(e3);
 
@@ -2905,6 +2908,155 @@ edition = "2021"
             4,
             "expected 4 fragments (1 preamble + 3 cards); got {:?}",
             result.prompt_fragments
+        );
+    }
+
+    /// RFC-1 fixup (codex P1): the `mofa_make` dispatcher's
+    /// `Weak<ToolRegistry>` back-reference must be wired centrally so
+    /// every plugin-loading path — chat, gateway, serve, spawn child
+    /// registries, pipeline node agents — produces a dispatcher that
+    /// can actually resolve its forwarding target. Pre-fixup, only
+    /// callers that explicitly called `agent.wire_mofa_make_dispatcher()`
+    /// got a working dispatcher; chat (`SessionActor::process_chat`),
+    /// `SpawnTool` child registries, and pipeline node agents skipped
+    /// that wiring and every `mofa_make` call returned
+    /// `[DISPATCHER_ERROR]`.
+    ///
+    /// This test mints a real plugin with a `make_type` declaration,
+    /// runs it through `PluginLoader::load_into` (the same entry-point
+    /// every host uses), then constructs an `Agent` via `Agent::new`
+    /// (the typical chat-session entry-point). Without the central
+    /// wire in `Agent::new`, the dispatcher's `Weak` would be empty
+    /// and dispatch would surface `[DISPATCHER_ERROR]`. With the fix,
+    /// the wire happens automatically and the dispatcher forwards to
+    /// the registered target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mofa_make_dispatcher_wired_in_chat_session_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::agent::Agent;
+        use crate::tools::MofaMakeTool;
+        use async_trait::async_trait;
+        use octos_core::AgentId;
+        use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+        use octos_memory::EpisodeStore;
+
+        // Minimal LlmProvider stub so we can construct an Agent without
+        // pulling in a real backend. `chat` is never called by this test.
+        struct NoopLlm;
+        #[async_trait]
+        impl LlmProvider for NoopLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                eyre::bail!("not exercised in this test")
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "noop"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-slides");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // Manifest declares `make_type: "slides"` so the loader's RFC-1
+        // path mints a dispatcher + describe pair and routes the
+        // `mofa_slides` target through it.
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mofa-slides",
+                "version": "1.0",
+                "make_type": "slides",
+                "content_type_description": "PPTX decks",
+                "tools": [{
+                    "name": "mofa_slides",
+                    "description": "Render slides"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("mofa-slides");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"slides ready\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Load via the standard `load_into` entry-point. The loader
+        // registers `mofa_slides`, mints `mofa_make` + `mofa_describe_content_type`,
+        // and hides the target. The Weak<ToolRegistry> is NOT yet set —
+        // that's `Agent::new`'s job in this fix.
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert!(
+            result.tool_names.iter().any(|n| n == "mofa_make"),
+            "loader must register mofa_make dispatcher for make_type plugins; got {:?}",
+            result.tool_names
+        );
+
+        // Confirm the dispatcher's Weak is empty BEFORE Agent::new
+        // (precondition; locks in the failing path).
+        let pre_arc = std::sync::Arc::new(registry);
+        let pre_dispatcher = pre_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("mofa_make registered");
+        let exec_result = pre_dispatcher
+            .execute(&serde_json::json!({
+                "content_type": "slides",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        assert!(
+            exec_result.output.contains("[DISPATCHER_ERROR]"),
+            "pre-Agent::new dispatcher must NOT be wired; got {:?}",
+            exec_result.output
+        );
+
+        // Now exercise the central wire via `Agent::new`. Use a fresh
+        // load + a fresh `Agent::new` so we measure THIS fix in
+        // isolation (the previous `pre_arc` was a sanity probe).
+        let mut registry = ToolRegistry::new();
+        let _ = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let memory = std::sync::Arc::new(
+            EpisodeStore::open(dir.path().join("episodes"))
+                .await
+                .expect("episode store"),
+        );
+        let llm: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::new(NoopLlm);
+        let agent = Agent::new(AgentId::new("test-chat-session"), llm, registry, memory);
+
+        // After `Agent::new`, the dispatcher must be able to upgrade
+        // its Weak<ToolRegistry> and reach the target tool. With the
+        // central wire in `Agent::new`, this dispatch resolves.
+        let dispatcher = agent
+            .tool_registry()
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("mofa_make registered after Agent::new");
+        let result = dispatcher
+            .execute(&serde_json::json!({
+                "content_type": "slides",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.output.contains("[DISPATCHER_ERROR]"),
+            "post-Agent::new dispatcher must be wired (no DISPATCHER_ERROR); got {:?}",
+            result.output
         );
     }
 }

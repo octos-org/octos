@@ -396,11 +396,22 @@ impl Agent {
         memory: Arc<EpisodeStore>,
     ) -> Self {
         let system_prompt = include_str!("../prompts/worker.txt").to_string();
+        let tools = Arc::new(tools);
+        // RFC-1 fixup (codex P1): wire the `mofa_make` dispatcher's
+        // `Weak<ToolRegistry>` back-reference here, immediately after the
+        // registry is wrapped in `Arc`. This is the single chokepoint every
+        // plugin-loading path eventually flows through (`octos chat`,
+        // `SpawnTool` child registries, pipeline node agents, gateway,
+        // serve), so wiring at this site means callers never need to
+        // remember to call `wire_mofa_make_dispatcher` themselves. On
+        // registries with no mofa-* skills (no dispatcher tool registered),
+        // the helper is a silent no-op.
+        crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
             id,
             llm,
-            tools: Arc::new(tools),
+            tools,
             memory,
             embedder: None,
             system_prompt: RwLock::new(system_prompt),
@@ -442,6 +453,18 @@ impl Agent {
         memory: Arc<EpisodeStore>,
     ) -> Self {
         let system_prompt = include_str!("../prompts/worker.txt").to_string();
+        // RFC-1 fixup (codex P1): mirror `Agent::new` — wire the
+        // dispatcher's `Weak<ToolRegistry>` back-reference unconditionally
+        // on construction. For `new_shared`, the registry was already
+        // wrapped in `Arc` upstream; we just refresh the dispatcher's Weak
+        // to point at THIS Arc. Idempotent — the helper checks for the
+        // dispatcher tool's presence and downcasts before mutating. Note
+        // that callers using `snapshot_excluding` should follow the
+        // per-turn snapshot path (see `Fix #3`) and re-register fresh
+        // dispatcher instances before constructing the agent, so the
+        // shared dispatcher's Weak is never overwritten by a per-turn
+        // rewire.
+        crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
             id,
