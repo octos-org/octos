@@ -1586,8 +1586,14 @@ impl PipelineExecutor {
         let llm_semaphore = self.pipeline_llm_semaphore();
         let handlers = self.build_handlers(Some(llm_semaphore.clone()));
         let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
-        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
-            .await
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Run an already-parsed [`PipelineGraph`] using the executor's default
@@ -1602,8 +1608,14 @@ impl PipelineExecutor {
     ) -> Result<PipelineResult> {
         let llm_semaphore = self.pipeline_llm_semaphore();
         let handlers = self.build_handlers(Some(llm_semaphore.clone()));
-        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
-            .await
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Compile an L2 typed-IR program (see [`crate::compose`]) under `profile`
@@ -1622,8 +1634,14 @@ impl PipelineExecutor {
             .map_err(|e| eyre::eyre!("IR compose failed: {e}"))?;
         let llm_semaphore = self.pipeline_llm_semaphore();
         let handlers = self.build_handlers(Some(llm_semaphore.clone()));
-        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
-            .await
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Run a pipeline from a DOT string using a caller-supplied handler
@@ -1661,8 +1679,14 @@ impl PipelineExecutor {
         // fan-out dispatch on the legacy `execute_graph` path so this entry
         // still bounds concurrent LLM calls.
         let llm_semaphore = self.pipeline_llm_semaphore();
-        self.run_graph_with_handlers_throttled(graph, user_input, variables, handlers, llm_semaphore)
-            .await
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Body of [`Self::run_graph_with_handlers`] with an explicit
