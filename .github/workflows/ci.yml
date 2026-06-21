@@ -279,6 +279,7 @@ jobs:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -805,4 +806,4 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
-          cargo test -p crew-agent --test security_sandbox -- --nocapture
+          cargo test -p octos-agent --test security_sandbox -- --nocapture
