@@ -19005,8 +19005,9 @@ async fn run_standalone_turn(
         if let Some(directive) = visual_directive {
             use crate::api::voice_turn::VisualKind;
             // Tell the client a visual is generating (typed signal, replaces the
-            // old in-band-marker scrape). Cleared by `file/attached` (success)
-            // or `visual/failed` (below).
+            // old in-band-marker scrape). The lifecycle terminates on the typed
+            // `visual/succeeded` or `visual/failed` (below) — never on
+            // `file/attached`, which is a pure artifact-delivery signal.
             super::ui_protocol_alpha9_bridge::emit_visual_generating_from_background(
                 &ledger,
                 &session_id,
