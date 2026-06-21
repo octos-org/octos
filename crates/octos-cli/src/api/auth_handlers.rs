@@ -3099,7 +3099,7 @@ pub(crate) fn is_authorized_for_profile(
 ///
 /// For regular users, returns their user ID. For admin token, returns the admin's own profile ID
 /// (auto-creating the admin profile if it doesn't exist yet).
-fn resolve_my_profile_id(
+pub(crate) fn resolve_my_profile_id(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
     state: &AppState,

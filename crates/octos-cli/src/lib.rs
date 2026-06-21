@@ -49,6 +49,7 @@ pub mod tenant;
 pub mod tools;
 #[cfg(feature = "api")]
 pub mod updater;
+pub mod usage_ledger;
 #[cfg(feature = "api")]
 pub mod user_store;
 pub mod workflow_runtime;

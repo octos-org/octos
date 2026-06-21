@@ -49,6 +49,7 @@ mod ui_protocol_reasoning_effort;
 mod ui_protocol_sanitize;
 mod ui_protocol_scope;
 mod ui_protocol_task_output;
+pub mod usage;
 pub mod user_admin;
 pub(crate) mod voice_turn;
 pub mod voices;

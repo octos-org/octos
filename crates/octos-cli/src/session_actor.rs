@@ -23,11 +23,12 @@ use octos_agent::tools::{
 };
 use octos_agent::{
     Agent, AgentConfig, AgentVerifierConfig, ApprovalDecision, ApprovalRequestEnvelope,
-    ApprovalResponsePayload, ApprovalTimeoutBehavior, CompactionSummarizerKind, HookContext,
-    HookExecutor, HookPayload, HookResult, HumanPendingApprovalStore, LoopRetryState,
-    PendingApproval, PendingApprovalDraft, PromptContextManager, PromptContextPhase,
-    PromptContextReport, PromptContextRequest, TaskSupervisor, TokenTracker, TurnAttachmentContext,
-    WorkspacePolicy, read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    ApprovalResponsePayload, ApprovalTimeoutBehavior, CompactionSummarizerKind,
+    ConversationResponse, HookContext, HookExecutor, HookPayload, HookResult,
+    HumanPendingApprovalStore, LoopRetryState, PendingApproval, PendingApprovalDraft,
+    PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
+    TaskSupervisor, TokenTracker, TurnAttachmentContext, WorkspacePolicy, read_workspace_policy,
+    workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -63,6 +64,7 @@ use crate::context_manager::{
 };
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
+use crate::usage_ledger::{PersistentUsageLedger, UsageCostSource, UsageEvent};
 use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
 
 /// Parameters for dispatching an inbound message to a session actor.
@@ -2644,6 +2646,8 @@ pub struct ActorFactory {
     pub hook_context_template: Option<HookContext>,
     /// Data directory for creating per-actor SessionHandle instances.
     pub data_dir: std::path::PathBuf,
+    /// Durable per-profile usage ledger for completed LLM runs.
+    pub usage_ledger: Option<Arc<PersistentUsageLedger>>,
     /// Shared SessionManager for admin operations (/sessions, /new, /delete).
     /// NOT used by actors — only by the gateway main loop.
     pub session_mgr: Arc<Mutex<SessionManager>>,
@@ -3709,6 +3713,7 @@ impl ActorFactory {
             sender_user_id: sender_user_id.clone(),
             user_status_config,
             data_dir: self.data_dir.clone(),
+            usage_ledger: self.usage_ledger.clone(),
             max_history: self.max_history.clone(),
             idle_timeout: self.idle_timeout,
             session_timeout: self.session_timeout,
@@ -3720,6 +3725,11 @@ impl ActorFactory {
             adaptive_router: self.adaptive_router.clone(),
             lane_routing: self.lane_routing.clone(),
             memory_store: self.memory_store.clone(),
+            usage_profile_id: self
+                .profile_id
+                .clone()
+                .or_else(|| session_key.profile_id().map(ToOwned::to_owned))
+                .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: self.active_sessions.clone(),
@@ -4190,6 +4200,11 @@ struct SessionActor {
     user_status_config: UserStatusConfig,
     /// Data directory for persisting user configs.
     data_dir: std::path::PathBuf,
+    /// Durable per-profile usage ledger. `None` only in tests or if startup
+    /// deliberately omitted usage accounting.
+    usage_ledger: Option<Arc<PersistentUsageLedger>>,
+    /// Profile/account id used for usage analytics rollups.
+    usage_profile_id: String,
     max_history: Arc<std::sync::atomic::AtomicUsize>,
 
     idle_timeout: Duration,
@@ -4280,6 +4295,71 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn record_usage_event(
+        &self,
+        response: &ConversationResponse,
+        run_id: Option<&str>,
+        attribution: Option<&str>,
+    ) {
+        let Some(usage_ledger) = self.usage_ledger.as_ref() else {
+            return;
+        };
+        let provider_metadata = response.provider_metadata.clone();
+        let provider = provider_metadata
+            .as_ref()
+            .map(|meta| meta.provider.clone())
+            .or_else(|| {
+                let provider = self.agent.provider_name();
+                (!provider.is_empty()).then(|| provider.to_string())
+            });
+        let model = provider_metadata
+            .as_ref()
+            .map(|meta| meta.model.clone())
+            .or_else(|| {
+                let model = self.agent.model_id();
+                (!model.is_empty()).then(|| model.to_string())
+            });
+        let estimated_cost_usd = model.as_deref().and_then(model_pricing).map(|pricing| {
+            pricing.cost(
+                response.token_usage.input_tokens,
+                response.token_usage.output_tokens,
+            )
+        });
+        let cost_source = if estimated_cost_usd.is_some() {
+            UsageCostSource::CatalogEstimate
+        } else {
+            UsageCostSource::Unavailable
+        };
+        let run_id = run_id
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let event = UsageEvent::completed_run(
+            self.usage_profile_id.clone(),
+            self.session_key.to_string(),
+            run_id.clone(),
+            provider,
+            model,
+            provider_metadata
+                .as_ref()
+                .and_then(|meta| meta.endpoint.clone()),
+            u64::from(response.token_usage.input_tokens),
+            u64::from(response.token_usage.output_tokens),
+            estimated_cost_usd,
+            cost_source,
+            self.channel.clone(),
+            attribution.map(ToOwned::to_owned),
+        );
+        if let Err(error) = usage_ledger.record(event).await {
+            warn!(
+                session = %self.session_key,
+                run = %run_id,
+                error = %error,
+                "failed to record gateway usage event"
+            );
+        }
+    }
+
     async fn emit_hook_payload(&self, payload: HookPayload) {
         let Some(hooks) = self.hooks.as_ref() else {
             return;
@@ -7494,6 +7574,8 @@ impl SessionActor {
                 let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
                     pricing.cost(cr.token_usage.input_tokens, cr.token_usage.output_tokens)
                 });
+                self.record_usage_event(cr, client_message_id.as_deref(), None)
+                    .await;
                 // Bug 3 / W1.G4 cost panel — collect per-node cost rows that
                 // tools (today: `run_pipeline`) surfaced through their
                 // `ToolResult.structured_metadata` side-channel. Without this
@@ -8915,6 +8997,10 @@ impl SessionActor {
         } else {
             None
         };
+        if let Ok(Ok(ref cr)) = result {
+            self.record_usage_event(cr, client_message_id.as_deref(), None)
+                .await;
+        }
 
         match result {
             Ok(Ok(conv_response)) => {
@@ -11139,6 +11225,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -11217,6 +11305,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout,
@@ -11376,6 +11466,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -11507,6 +11599,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -11634,6 +11728,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -11733,6 +11829,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -11831,6 +11929,8 @@ mod tests {
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: std::path::PathBuf::from("/tmp"),
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -14335,6 +14435,7 @@ mod tests {
             hooks: None,
             hook_context_template: None,
             data_dir: dir.path().to_path_buf(),
+            usage_ledger: None,
             session_mgr,
             out_tx: out_tx.clone(),
             spawn_inbound_tx: spawn_tx,
@@ -17276,6 +17377,8 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            usage_ledger: None,
+            usage_profile_id: "test-profile".to_string(),
         };
 
         let handle = tokio::spawn(actor.run());

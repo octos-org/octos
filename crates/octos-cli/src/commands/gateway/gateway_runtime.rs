@@ -1282,6 +1282,11 @@ impl GatewayRuntime {
         let subagent_output_router = Arc::new(octos_agent::SubAgentOutputRouter::new(
             data_dir.join("subagent-outputs"),
         ));
+        let usage_ledger = Arc::new(
+            crate::usage_ledger::PersistentUsageLedger::open(&data_dir)
+                .await
+                .wrap_err("failed to open usage ledger")?,
+        );
 
         // Build ActorFactory with all shared resources
         let actor_factory = ActorFactory {
@@ -1293,6 +1298,7 @@ impl GatewayRuntime {
             hooks,
             hook_context_template,
             data_dir: data_dir.clone(),
+            usage_ledger: Some(usage_ledger.clone()),
             session_mgr: session_mgr.clone(),
             out_tx: out_tx.clone(),
             spawn_inbound_tx,

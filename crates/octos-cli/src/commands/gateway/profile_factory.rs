@@ -919,6 +919,10 @@ impl ProfileActorFactoryBuilder {
         } else {
             Some(Arc::new(HookExecutor::new(all_hooks)))
         };
+        let usage_ledger = Arc::new(
+            crate::usage_ledger::PersistentUsageLedger::open_sync(&profile_data_dir)
+                .wrap_err("failed to open profile usage ledger")?,
+        );
 
         Ok(ActorFactory {
             agent_config: self.agent_config.clone(),
@@ -932,6 +936,7 @@ impl ProfileActorFactoryBuilder {
                 profile_id: Some(profile_id.to_string()),
             }),
             data_dir: profile_data_dir,
+            usage_ledger: Some(usage_ledger),
             session_mgr: self.session_mgr.clone(),
             out_tx: self.out_tx.clone(),
             spawn_inbound_tx: self.spawn_inbound_tx.clone(),

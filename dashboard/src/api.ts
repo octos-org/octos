@@ -20,6 +20,8 @@ import type {
   SystemMetrics,
   PurgeReport,
   AdminAuditResponse,
+  UsageAnalytics,
+  UsageQueryParams,
 } from './types'
 
 const BASE = '/api/admin'
@@ -152,6 +154,15 @@ function queryPath(path: string, params: Record<string, string | number | undefi
   return suffix ? `${path}?${suffix}` : path
 }
 
+function usageQuery(query?: UsageQueryParams): string {
+  const params = new URLSearchParams()
+  if (query?.session_id) params.set('session_id', query.session_id)
+  if (query?.from) params.set('from', query.from)
+  if (query?.to) params.set('to', query.to)
+  const encoded = params.toString()
+  return encoded ? `?${encoded}` : ''
+}
+
 // ── Admin API (existing) ────────────────────────────────────────────
 
 export const api = {
@@ -223,6 +234,17 @@ export const api = {
 
   providerMetrics: (id: string) =>
     request<SharedMetrics | null>(`/profiles/${id}/metrics`),
+
+  usage: (query?: UsageQueryParams) =>
+    request<UsageAnalytics>(`/usage${usageQuery(query)}`),
+
+  profileUsage: (id: string, query?: UsageQueryParams) =>
+    request<UsageAnalytics>(`/profiles/${id}/usage${usageQuery(query)}`),
+
+  profileSessionUsage: (id: string, sessionId: string, query?: Omit<UsageQueryParams, 'session_id'>) =>
+    request<UsageAnalytics>(
+      `/profiles/${id}/usage/sessions/${encodeURIComponent(sessionId)}${usageQuery(query)}`,
+    ),
 
   // Sub-account management
   listSubAccounts: (parentId: string) =>
@@ -512,6 +534,14 @@ export const myApi = {
 
   providerMetrics: () =>
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
+
+  usage: (query?: UsageQueryParams) =>
+    authedRequest<UsageAnalytics>(`/my/usage${usageQuery(query)}`),
+
+  sessionUsage: (sessionId: string, query?: Omit<UsageQueryParams, 'session_id'>) =>
+    authedRequest<UsageAnalytics>(
+      `/my/usage/sessions/${encodeURIComponent(sessionId)}${usageQuery(query)}`,
+    ),
 
   listProfileSkills: () =>
     authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(

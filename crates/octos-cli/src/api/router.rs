@@ -26,6 +26,7 @@ use super::solo_auth;
 use super::static_files;
 use super::swarm as swarm_api;
 use super::ui_protocol;
+use super::usage;
 use super::user_admin;
 use super::webhook_proxy;
 use crate::user_store::UserRole;
@@ -279,6 +280,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/my/profile/metrics",
             get(auth_handlers::my_provider_metrics),
         )
+        .route("/api/my/usage", get(usage::my_usage))
+        .route(
+            "/api/my/usage/sessions/{session_id}",
+            get(usage::my_session_usage),
+        )
         .route(
             "/api/my/profile/skills",
             get(auth_handlers::my_profile_skills),
@@ -376,6 +382,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/profiles/{id}/metrics",
             get(admin::provider_metrics),
+        )
+        .route("/api/admin/usage", get(usage::admin_usage))
+        .route(
+            "/api/admin/profiles/{id}/usage",
+            get(usage::admin_profile_usage),
+        )
+        .route(
+            "/api/admin/profiles/{id}/usage/sessions/{session_id}",
+            get(usage::admin_profile_session_usage),
         )
         .route(
             "/api/admin/profiles/{id}/whatsapp/qr",
