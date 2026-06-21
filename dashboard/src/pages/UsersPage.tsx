@@ -54,6 +54,7 @@ export default function UsersPage() {
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [bulkErrors, setBulkErrors] = useState<string[]>([])
+  const [updatingRoleId, setUpdatingRoleId] = useState<string | null>(null)
 
   const loadData = useCallback(async () => {
     try {
@@ -255,6 +256,25 @@ export default function UsersPage() {
     } finally {
       setBulkDeleting(false)
       setBulkDeleteOpen(false)
+    }
+  }
+
+  const handleChangeRole = async (user: User) => {
+    const nextRole: UserRole = user.role === 'admin' ? 'user' : 'admin'
+    const action = nextRole === 'admin' ? 'Promote' : 'Demote'
+    const target = nextRole === 'admin' ? 'admin' : 'regular user'
+    if (!confirm(`${action} account "${user.email}" to ${target}?`)) {
+      return
+    }
+    try {
+      setUpdatingRoleId(user.id)
+      await api.updateUserRole(user.id, nextRole)
+      toast(`${action}d account "${user.email}"`)
+      await loadData()
+    } catch (e: any) {
+      toast(e.message, 'error')
+    } finally {
+      setUpdatingRoleId(null)
     }
   }
 
@@ -511,13 +531,26 @@ export default function UsersPage() {
                     {formatDate(user.last_login_at)}
                   </td>
                   <td className="px-4 py-3 text-right">
-                    <button
-                      onClick={() => setPendingConfirm({ kind: 'user', user })}
-                      disabled={deletingId === user.id}
-                      className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
-                    >
-                      {deletingId === user.id ? 'Deleting...' : 'Delete'}
-                    </button>
+                    <div className="flex justify-end gap-3">
+                      <button
+                        onClick={() => handleChangeRole(user)}
+                        disabled={updatingRoleId === user.id}
+                        className="text-xs text-amber-300 hover:text-amber-200 disabled:opacity-50"
+                      >
+                        {updatingRoleId === user.id
+                          ? 'Updating...'
+                          : user.role === 'admin'
+                            ? 'Demote'
+                            : 'Promote'}
+                      </button>
+                      <button
+                        onClick={() => setPendingConfirm({ kind: 'user', user })}
+                        disabled={deletingId === user.id}
+                        className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                      >
+                        {deletingId === user.id ? 'Deleting...' : 'Delete'}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}

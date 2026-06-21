@@ -447,7 +447,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
-        .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        .route(
+            "/api/admin/users/{id}",
+            delete(user_admin::delete_user).patch(user_admin::update_user),
+        )
         .route(
             "/api/admin/allowed-emails",
             get(user_admin::list_allowed_emails),
