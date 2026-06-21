@@ -1,5 +1,37 @@
 import { defineConfig } from '@playwright/test';
 
+const LIVE_E2E_PATTERNS = [
+  '**/live-*.spec.ts',
+  '**/*-live.spec.ts',
+  '**/mini*.spec.ts',
+  '**/*mini*.spec.ts',
+  '**/fleet-*.spec.ts',
+  '**/*fleet*.spec.ts',
+  '**/background-task-header-switching.spec.ts',
+  '**/coding-hardcases.spec.ts',
+  '**/kimi-loop-replay.spec.ts',
+  '**/refactor-capabilities.spec.ts',
+  '**/runtime-regression.spec.ts',
+  '**/session-recovery.spec.ts',
+  '**/skill-compat-gate.spec.ts',
+];
+
+function hasExplicitTestSelection(argv: string[]): boolean {
+  return argv.slice(2).some((arg) => {
+    if (arg.startsWith('-')) return false;
+    return (
+      arg.includes('tests/') ||
+      arg.includes('.spec.') ||
+      arg.includes('.test.') ||
+      arg.includes('.property.')
+    );
+  });
+}
+
+const includeLiveE2e =
+  process.env.OCTOS_PLAYWRIGHT_LIVE === '1' ||
+  hasExplicitTestSelection(process.argv);
+
 /**
  * E2E tests for the octos web client + API.
  *
@@ -9,6 +41,10 @@ import { defineConfig } from '@playwright/test';
  *
  * Run:
  *   npx playwright test
+ *
+ * Default discovery excludes live/fleet/mini suites so a normal e2e run cannot
+ * accidentally hit production hosts. Pass an explicit test path/glob, or set
+ * OCTOS_PLAYWRIGHT_LIVE=1, for intentional live validation.
  */
 export default defineConfig({
   testDir: './tests',
@@ -18,6 +54,7 @@ export default defineConfig({
     '**/*.test.mjs',
     '**/*.property.ts',
   ],
+  testIgnore: includeLiveE2e ? [] : LIVE_E2E_PATTERNS,
   timeout: 60_000,
   retries: 0,
   use: {
