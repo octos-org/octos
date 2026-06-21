@@ -378,7 +378,7 @@ octos-agent (agent loop, tool registry, MCP, hooks, three-tier compaction,
    ├─ octos-memory    (long-term + episodic + HNSW vector + BM25 hybrid search)
    ├─ octos-pipeline  (DOT-graph workflows, per-node model, bounded fan-out)
    ├─ octos-plugin    (skill manifest, discovery, gating, lifecycle, protocol v2)
-   ├─ octos-sandbox   (Windows AppContainer helper binary)
+   ├─ octos-sandbox   (platform sandbox helper binary)
    ├─ octos-swarm     (PM/swarm dispatcher, ledger, topology, validator gate)
    └─ octos-core      (Task, Message, Error types — no internal deps)
 

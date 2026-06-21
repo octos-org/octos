@@ -78,6 +78,7 @@ run_workspace_all_features() {
 
 run_release_bundle() {
   cargo build --release -p octos-cli --features "$FEATURES"
+  cargo build --release -p octos-sandbox
   # shellcheck disable=SC2086
   cargo build --release ${SKILL_CRATES}
 }
