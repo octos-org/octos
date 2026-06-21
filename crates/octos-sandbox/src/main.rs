@@ -180,7 +180,16 @@ fn apply_linux_landlock(cwd: &std::path::Path, extra_read_paths: &[PathBuf]) -> 
         "/dev/urandom",
         "/dev/random",
     ];
-    const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin"];
+    const SYSTEM_EXEC_PATHS: &[&str] = &[
+        "/usr/bin",
+        "/bin",
+        // Dynamically linked binaries need execute access to their ELF
+        // interpreter, which commonly lives below one of these directories.
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib",
+        "/lib64",
+    ];
     const SYSTEM_WRITE_PATHS: &[&str] = &["/tmp", "/var/tmp", "/dev/null"];
 
     let abi = ABI::V1;
