@@ -66,7 +66,6 @@ fn audio_ext(encoding: &str) -> &'static str {
 /// `Some(())` on a clean end (final negative-sequence frame), `None` on any
 /// transport/protocol failure. Shared by the collect→file path ([`synthesize_ws`])
 /// and the ⑤ push-to-client path.
-#[allow(dead_code)] // the push-to-client consumer is wired in ⑤.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn synthesize_ws_stream(
     appid: &str,
@@ -75,7 +74,7 @@ pub(crate) async fn synthesize_ws_stream(
     voice: &str,
     encoding: &str,
     text: &str,
-    mut on_chunk: impl FnMut(&[u8]),
+    mut on_chunk: impl FnMut(&[u8], bool),
 ) -> Option<()> {
     let reqid = uuid::Uuid::now_v7().to_string();
     let payload = build_submit_payload(appid, token, cluster, voice, encoding, text, &reqid);
@@ -111,7 +110,7 @@ pub(crate) async fn synthesize_ws_stream(
         match msg {
             Message::Binary(data) => match parse_server_frame(&data) {
                 Ok(ServerFrame::Audio { data, is_last }) => {
-                    on_chunk(&data);
+                    on_chunk(&data, is_last);
                     if is_last {
                         break;
                     }
@@ -147,7 +146,7 @@ pub(crate) async fn synthesize_ws(
     out_dir: &Path,
 ) -> Option<PathBuf> {
     let mut audio: Vec<u8> = Vec::new();
-    synthesize_ws_stream(appid, token, cluster, voice, encoding, text, |c| {
+    synthesize_ws_stream(appid, token, cluster, voice, encoding, text, |c, _last| {
         audio.extend_from_slice(c)
     })
     .await?;

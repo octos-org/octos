@@ -62,8 +62,8 @@ use octos_core::ui_protocol::{
     UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
     UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
@@ -19141,9 +19141,47 @@ async fn run_standalone_turn(
             &session_runtime.profile.voice.default_voice,
         );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
+        let w_ws = ws.clone();
+        let w_voice_audio = features.voice_audio;
         let handle = tokio::spawn(async move {
+            use base64::Engine as _;
             let mut n: usize = 0;
             while let Some(sentence) = rx.recv().await {
+                // Streaming cloud path: push reply audio as `voice/audio_chunk`
+                // frames so a negotiated client plays progressively. Falls
+                // through to the whole-file path when the client did not
+                // negotiate, the turn is not cloud-routed, or the stream fails.
+                if w_voice_audio {
+                    let segment_id = uuid::Uuid::now_v7().to_string();
+                    let mut seq: u32 = 0;
+                    let streamed = crate::api::voice_turn::synthesize_reply_streaming(
+                        &sentence,
+                        &w_provider,
+                        |bytes, last, mime| {
+                            let ev = VoiceAudioChunkEvent {
+                                session_id: w_session.clone(),
+                                topic: None,
+                                turn_id: w_turn.clone(),
+                                segment_id: segment_id.clone(),
+                                seq,
+                                mime: mime.to_string(),
+                                audio_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                last,
+                            };
+                            let _ = send_notification_ephemeral(
+                                &w_ws,
+                                &w_ledger,
+                                UiNotification::VoiceAudioChunk(ev),
+                            );
+                            seq += 1;
+                        },
+                    )
+                    .await;
+                    if streamed.is_some() {
+                        n += 1;
+                        continue;
+                    }
+                }
                 if let Some(path) = crate::api::voice_turn::synthesize_reply(
                     &sentence,
                     &w_voice,

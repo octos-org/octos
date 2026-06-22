@@ -371,6 +371,47 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
 ///
 /// `voice` is the on-device voice preset (voices.json); the cloud route uses
 /// its own `VOLC_TTS_VOICE` env instead. Returns `None` on failure.
+/// Streaming cloud-TTS variant: synthesize `text` over the Volcano v1 ws
+/// `submit` protocol and invoke `on_chunk(bytes, is_last, mime)` for each audio
+/// frame as it arrives. Returns `Some(())` when the cloud stream completed (the
+/// caller delivered audio progressively and should NOT also write a file), or
+/// `None` when the request is not cloud-routed / env is missing / the stream
+/// failed — in which case the caller falls back to [`synthesize_reply`].
+///
+/// Only the cloud (`"auto"`/`"volcano"`) route streams; on-device engines keep
+/// the whole-file path. `voice`/speed come from `VOLC_TTS_*` env, same as the
+/// non-streaming cloud path.
+pub(crate) async fn synthesize_reply_streaming(
+    text: &str,
+    provider: &str,
+    mut on_chunk: impl FnMut(&[u8], bool, &str),
+) -> Option<()> {
+    if !matches!(provider, "auto" | "volcano") {
+        return None;
+    }
+    let speak = ensure_terminal_punctuation(&clean_for_tts(text));
+    if speak.trim().is_empty() {
+        return None;
+    }
+    let cfg = volcano_from_env()?;
+    let mime = match cfg.encoding.as_str() {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "ogg_opus" => "audio/ogg",
+        _ => "audio/mpeg",
+    };
+    crate::api::volcano_ws::synthesize_ws_stream(
+        &cfg.appid,
+        &cfg.token,
+        &cfg.cluster,
+        &cfg.voice,
+        &cfg.encoding,
+        &speak,
+        |bytes, last| on_chunk(bytes, last, mime),
+    )
+    .await
+}
+
 pub(crate) async fn synthesize_reply(
     text: &str,
     voice: &str,
