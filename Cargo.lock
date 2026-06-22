@@ -3918,6 +3918,8 @@ dependencies = [
  "reqwest 0.12.28",
  "rust-embed",
  "rustix",
+ "rustls 0.23.36",
+ "rustls-native-certs",
  "rustyline",
  "serde",
  "serde_json",
