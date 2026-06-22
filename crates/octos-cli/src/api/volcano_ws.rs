@@ -61,22 +61,22 @@ fn audio_ext(encoding: &str) -> &'static str {
     }
 }
 
-/// Stream-synthesize `text` over the v1 ws_binary protocol, collecting the
-/// audio chunks into one file under `out_dir` (drop-in for the HTTP `query`
-/// path). Returns the written path, or `None` on any failure (caller falls
-/// back). This ④a step still buffers to a complete file; streaming the chunks
-/// onward to the client is ⑤.
-#[allow(dead_code)] // wired into synthesize_reply later.
+/// Streaming core: open the v1 ws_binary connection, send the `submit`
+/// request, and invoke `on_chunk` for each audio chunk as it arrives. Returns
+/// `Some(())` on a clean end (final negative-sequence frame), `None` on any
+/// transport/protocol failure. Shared by the collect→file path ([`synthesize_ws`])
+/// and the ⑤ push-to-client path.
+#[allow(dead_code)] // the push-to-client consumer is wired in ⑤.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn synthesize_ws(
+pub(crate) async fn synthesize_ws_stream(
     appid: &str,
     token: &str,
     cluster: &str,
     voice: &str,
     encoding: &str,
     text: &str,
-    out_dir: &Path,
-) -> Option<PathBuf> {
+    mut on_chunk: impl FnMut(&[u8]),
+) -> Option<()> {
     let reqid = uuid::Uuid::now_v7().to_string();
     let payload = build_submit_payload(appid, token, cluster, voice, encoding, text, &reqid);
     let frame = encode_request_frame(&payload, false);
@@ -104,7 +104,6 @@ pub(crate) async fn synthesize_ws(
         .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano ws send failed"))
         .ok()?;
 
-    let mut audio: Vec<u8> = Vec::new();
     while let Some(msg) = ws.next().await {
         let msg = msg
             .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano ws recv failed"))
@@ -112,7 +111,7 @@ pub(crate) async fn synthesize_ws(
         match msg {
             Message::Binary(data) => match parse_server_frame(&data) {
                 Ok(ServerFrame::Audio { data, is_last }) => {
-                    audio.extend_from_slice(&data);
+                    on_chunk(&data);
                     if is_last {
                         break;
                     }
@@ -130,11 +129,37 @@ pub(crate) async fn synthesize_ws(
             _ => {} // ping/pong/text: ignore
         }
     }
+    Some(())
+}
+
+/// Collect→file wrapper over [`synthesize_ws_stream`]: buffers every chunk and
+/// writes one file under `out_dir` (drop-in for the HTTP `query` path). The
+/// streaming push-to-client path (⑤) uses `synthesize_ws_stream` directly.
+#[allow(dead_code)] // wired into synthesize_reply later.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn synthesize_ws(
+    appid: &str,
+    token: &str,
+    cluster: &str,
+    voice: &str,
+    encoding: &str,
+    text: &str,
+    out_dir: &Path,
+) -> Option<PathBuf> {
+    let mut audio: Vec<u8> = Vec::new();
+    synthesize_ws_stream(appid, token, cluster, voice, encoding, text, |c| {
+        audio.extend_from_slice(c)
+    })
+    .await?;
 
     if audio.is_empty() {
         return None;
     }
-    let out_path = out_dir.join(format!("reply-{reqid}.{}", audio_ext(encoding)));
+    let out_path = out_dir.join(format!(
+        "reply-{}.{}",
+        uuid::Uuid::now_v7(),
+        audio_ext(encoding)
+    ));
     tokio::fs::write(&out_path, &audio)
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano ws write failed"))
