@@ -948,7 +948,6 @@ fn write_source_info(dir: &std::path::Path, repo: &str, subdir: Option<&str>, br
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn tool_metadata() {
@@ -1053,32 +1052,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn run_wrapper(skill_dir: &std::path::Path, tool: &str, input_json: &str) -> (i32, String) {
-        let mut child = std::process::Command::new(skill_dir.join("main"))
-            .arg(tool)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(input_json.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-        )
-    }
-
-    #[cfg(unix)]
     #[test]
     fn maybe_install_binary_generates_mofa_publish_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("mofa-publish");
-        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("manifest.json"),
             r#"{
@@ -1088,25 +1066,26 @@ mod tests {
 }"#,
         )
         .unwrap();
+        // mofa-publish now ships as a Cargo-based Rust skill with an explicit
+        // [[bin]] name, so it gets the generic lazy-cargo wrapper.
         std::fs::write(
-            skill_dir.join("scripts/publish_site.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+            skill_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-publish-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-publish"
+path = "src/main.rs"
+"#,
         )
         .unwrap();
 
         maybe_install_binary(&skill_dir);
-        assert!(skill_dir.join("main").exists());
-
-        let (status, stdout) = run_wrapper(
-            &skill_dir,
-            "mofa_publish",
-            r#"{"site_dir":"./docs","slug":"demo","setup_ci":true}"#,
-        );
-        assert_eq!(status, 0);
-        assert!(stdout.contains("publish:"));
-        assert!(stdout.contains("--site-dir ./docs"));
-        assert!(stdout.contains("--slug demo"));
-        assert!(stdout.contains("--setup-ci"));
+        let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-publish"));
     }
 
     #[cfg(unix)]
@@ -1114,7 +1093,7 @@ mod tests {
     fn maybe_install_binary_generates_mofa_site_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("mofa-site");
-        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("manifest.json"),
             r#"{
@@ -1124,39 +1103,26 @@ mod tests {
 }"#,
         )
         .unwrap();
+        // mofa-site now ships as a Cargo-based Rust skill with an explicit
+        // [[bin]] name, so it gets the generic lazy-cargo wrapper.
         std::fs::write(
-            skill_dir.join("scripts/bootstrap_quarto_lesson.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"quarto:$*\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            skill_dir.join("scripts/bootstrap_template.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"template:$*\"\n",
+            skill_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-site-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-site"
+path = "src/main.rs"
+"#,
         )
         .unwrap();
 
         maybe_install_binary(&skill_dir);
-        assert!(skill_dir.join("main").exists());
-
-        let (status_quarto, stdout_quarto) = run_wrapper(
-            &skill_dir,
-            "mofa_site",
-            r#"{"content_dir":"./content","title":"Lesson"}"#,
-        );
-        assert_eq!(status_quarto, 0);
-        assert!(stdout_quarto.contains("quarto:"));
-        assert!(stdout_quarto.contains("--out-dir ./content/site"));
-        assert!(stdout_quarto.contains("--title Lesson"));
-
-        let (status_template, stdout_template) = run_wrapper(
-            &skill_dir,
-            "mofa_site",
-            r#"{"content_dir":"./content","template":"nextjs-app","title":"Forum"}"#,
-        );
-        assert_eq!(status_template, 0);
-        assert!(stdout_template.contains("template:"));
-        assert!(stdout_template.contains("--template nextjs-app"));
-        assert!(stdout_template.contains("--site-name Forum"));
+        let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-site"));
     }
 
     #[cfg(unix)]
