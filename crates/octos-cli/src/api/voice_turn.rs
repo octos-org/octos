@@ -299,6 +299,14 @@ fn volcano_from_env() -> Option<VolcanoTts> {
     })
 }
 
+/// Process-wide HTTP client for Volcano TTS. Reused across per-sentence
+/// syntheses so each sentence doesn't pay a fresh TCP+TLS handshake to
+/// bytedance — reqwest pools connections (keep-alive) on a shared client.
+fn volcano_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 /// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
 /// returns base64 audio in JSON). Writes the decoded audio to `out_dir` and
 /// returns the path. `None` on any failure (caller falls back to ominix).
@@ -313,7 +321,7 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
         "request": { "reqid": reqid, "text": text, "operation": "query", "text_type": "plain" },
     });
 
-    let client = reqwest::Client::new();
+    let client = volcano_client();
     let resp = client
         .post(&cfg.endpoint)
         // Volcano's quirky scheme: literal "Bearer;" + token (semicolon, no space).
@@ -427,6 +435,19 @@ pub(crate) async fn synthesize_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volcano_client_is_reused_across_calls() {
+        // Per-sentence synthesis must not rebuild the HTTP client each time —
+        // a fresh client per sentence pays a new TCP+TLS handshake to bytedance.
+        // A shared process-wide client returns the same instance every call.
+        let a = volcano_client();
+        let b = volcano_client();
+        assert!(
+            std::ptr::eq(a, b),
+            "volcano TTS client should be a shared instance, not rebuilt per call"
+        );
+    }
 
     #[tokio::test]
     async fn synthesize_reply_returns_none_for_blank_text() {
