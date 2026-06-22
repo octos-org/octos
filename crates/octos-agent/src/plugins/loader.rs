@@ -949,39 +949,9 @@ fn ensure_plugin_executable_for_manifest(
 
     let main_path = plugin_dir.join("main");
 
-    // mofa-publish: shell-script skill with JSON-over-stdin plugin protocol.
-    if manifest.name == "mofa-publish"
-        && manifest
-            .tools
-            .iter()
-            .any(|tool| tool.name == "mofa_publish")
-        && plugin_dir.join("scripts/publish_site.sh").exists()
-    {
-        write_executable_wrapper(&main_path, mofa_publish_wrapper_script())?;
-        info!(
-            plugin = %manifest.name,
-            executable = %main_path.display(),
-            "generated fallback executable wrapper"
-        );
-        return Ok(true);
-    }
-
-    // mofa-site: scaffold helper scripts routed through a thin wrapper.
-    if manifest.name == "mofa-site"
-        && manifest.tools.iter().any(|tool| tool.name == "mofa_site")
-        && plugin_dir
-            .join("scripts/bootstrap_quarto_lesson.sh")
-            .exists()
-        && plugin_dir.join("scripts/bootstrap_template.sh").exists()
-    {
-        write_executable_wrapper(&main_path, mofa_site_wrapper_script())?;
-        info!(
-            plugin = %manifest.name,
-            executable = %main_path.display(),
-            "generated fallback executable wrapper"
-        );
-        return Ok(true);
-    }
+    // mofa-publish / mofa-site are now Cargo-based Rust skills (they ship a
+    // Cargo.toml + [[bin]]), so they fall through to the generic Cargo path
+    // below alongside mofa-podcast — no bespoke bash+python wrapper.
 
     // Cargo-based skills: create a lazy launcher so runtime can self-heal if
     // install-time build/download was skipped or unavailable.
@@ -1060,149 +1030,6 @@ fn write_executable_wrapper(path: &Path, content: &str) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
-}
-
-fn mofa_publish_wrapper_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOL="${1:-}"
-
-if [[ "$TOOL" != "mofa_publish" ]]; then
-  printf '{"output":"Unknown tool: %s","success":false}\n' "$TOOL"
-  exit 0
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '{"output":"python3 is required to run mofa-publish.","success":false}\n'
-  exit 0
-fi
-
-INPUT="$(cat)"
-OCTOS_PLUGIN_INPUT="$INPUT" python3 - "$SCRIPT_DIR/scripts/publish_site.sh" <<'PY'
-import json
-import os
-import subprocess
-import sys
-
-script_path = sys.argv[1]
-raw = (os.environ.get("OCTOS_PLUGIN_INPUT") or "").strip() or "{}"
-try:
-    payload = json.loads(raw)
-except Exception as exc:
-    print(f'{{"output":"invalid JSON input: {exc}","success":false}}')
-    sys.exit(0)
-
-cmd = ["bash", script_path]
-
-def add_value(key: str, flag: str) -> None:
-    value = payload.get(key)
-    if value is None:
-        return
-    if isinstance(value, bool):
-        if value:
-            cmd.append(flag)
-        return
-    text = str(value).strip()
-    if text:
-        cmd.extend([flag, text])
-
-add_value("site_dir", "--site-dir")
-add_value("target", "--target")
-add_value("slug", "--slug")
-add_value("repo", "--repo")
-add_value("repo_root", "--repo-root")
-add_value("mini_host", "--mini-host")
-add_value("mini_user", "--mini-user")
-add_value("ssh_key", "--ssh-key")
-add_value("ssh_password_env", "--ssh-password-env")
-add_value("ssh_port", "--ssh-port")
-add_value("remote_root", "--remote-root")
-add_value("cname", "--cname")
-add_value("setup_ci", "--setup-ci")
-
-proc = subprocess.run(cmd)
-sys.exit(proc.returncode)
-PY
-"#
-}
-
-fn mofa_site_wrapper_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOL="${1:-}"
-
-if [[ "$TOOL" != "mofa_site" ]]; then
-  printf '{"output":"Unknown tool: %s","success":false}\n' "$TOOL"
-  exit 0
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '{"output":"python3 is required to run mofa-site.","success":false}\n'
-  exit 0
-fi
-
-INPUT="$(cat)"
-OCTOS_PLUGIN_INPUT="$INPUT" python3 - \
-  "$SCRIPT_DIR/scripts/bootstrap_quarto_lesson.sh" \
-  "$SCRIPT_DIR/scripts/bootstrap_template.sh" <<'PY'
-import json
-import os
-import subprocess
-import sys
-
-quarto_script = sys.argv[1]
-template_script = sys.argv[2]
-raw = (os.environ.get("OCTOS_PLUGIN_INPUT") or "").strip() or "{}"
-try:
-    payload = json.loads(raw)
-except Exception as exc:
-    print(f'{{"output":"invalid JSON input: {exc}","success":false}}')
-    sys.exit(0)
-
-template = str(payload.get("template") or "quarto-lesson").strip() or "quarto-lesson"
-title = str(payload.get("title") or "Generated Site").strip() or "Generated Site"
-content_dir = payload.get("content_dir")
-out_dir = payload.get("out_dir")
-if not out_dir:
-    if isinstance(content_dir, str) and content_dir.strip():
-        out_dir = os.path.join(content_dir, "site")
-    else:
-        out_dir = "skill-output/mofa-site"
-
-language = payload.get("language")
-theme = payload.get("theme")
-description = payload.get("description")
-
-if template == "quarto-lesson":
-    cmd = ["bash", quarto_script, "--out-dir", str(out_dir), "--title", title]
-    if isinstance(description, str) and description.strip():
-        cmd.extend(["--description", description.strip()])
-    if isinstance(theme, str) and theme.strip():
-        cmd.extend(["--theme", theme.strip()])
-    if isinstance(language, str) and language.strip():
-        cmd.extend(["--language", language.strip()])
-else:
-    cmd = [
-        "bash",
-        template_script,
-        "--template",
-        template,
-        "--out-dir",
-        str(out_dir),
-        "--site-name",
-        title,
-    ]
-    if isinstance(description, str) and description.strip():
-        cmd.extend(["--description", description.strip()])
-    if isinstance(language, str) and language.strip():
-        cmd.extend(["--locale", language.strip()])
-
-proc = subprocess.run(cmd)
-sys.exit(proc.returncode)
-PY
-"#
 }
 
 fn lazy_cargo_wrapper_script(bin_name: &str) -> String {
@@ -1336,7 +1163,6 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_load_nonexistent_dir() {
@@ -2176,10 +2002,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_loader_bootstraps_script_skill_wrapper() {
+    fn test_loader_bootstraps_cargo_skill_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
-        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+        std::fs::create_dir(&plugin_dir).unwrap();
 
         std::fs::write(
             plugin_dir.join("manifest.json"),
@@ -2190,9 +2016,18 @@ mod tests {
 }"#,
         )
         .unwrap();
+        // mofa-publish now ships as a Cargo-based Rust skill.
         std::fs::write(
-            plugin_dir.join("scripts/publish_site.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-publish"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-publish"
+path = "src/main.rs"
+"#,
         )
         .unwrap();
 
@@ -2278,12 +2113,10 @@ edition = "2021"
 
     #[cfg(unix)]
     #[test]
-    fn test_mofa_publish_wrapper_executes_script() {
-        use std::process::{Command, Stdio};
-
+    fn test_ensure_plugin_executable_creates_lazy_cargo_wrapper_for_mofa_publish() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
-        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+        std::fs::create_dir(&plugin_dir).unwrap();
 
         std::fs::write(
             plugin_dir.join("manifest.json"),
@@ -2294,31 +2127,66 @@ edition = "2021"
 }"#,
         )
         .unwrap();
+        // mofa-publish now ships as a Cargo-based Rust skill with an explicit
+        // [[bin]] name, so it gets the generic lazy-cargo wrapper.
         std::fs::write(
-            plugin_dir.join("scripts/publish_site.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-publish-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-publish"
+path = "src/main.rs"
+"#,
         )
         .unwrap();
 
-        ensure_plugin_executable(&plugin_dir).unwrap();
-        let mut child = Command::new(plugin_dir.join("main"))
-            .arg("mofa_publish")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(br#"{"site_dir":"./docs","slug":"demo","setup_ci":true}"#)
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success());
-        assert!(stdout.contains("--site-dir ./docs"));
-        assert!(stdout.contains("--slug demo"));
-        assert!(stdout.contains("--setup-ci"));
+        let changed = ensure_plugin_executable(&plugin_dir).unwrap();
+        assert!(changed);
+        let wrapper = std::fs::read_to_string(plugin_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-publish"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_plugin_executable_creates_lazy_cargo_wrapper_for_mofa_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-site");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-site",
+  "version": "0.1.0",
+  "tools": [{"name": "mofa_site", "description": "site", "input_schema": {"type": "object", "properties": {}}}]
+}"#,
+        )
+        .unwrap();
+        // mofa-site now ships as a Cargo-based Rust skill with an explicit
+        // [[bin]] name, so it gets the generic lazy-cargo wrapper.
+        std::fs::write(
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-site-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-site"
+path = "src/main.rs"
+"#,
+        )
+        .unwrap();
+
+        let changed = ensure_plugin_executable(&plugin_dir).unwrap();
+        assert!(changed);
+        let wrapper = std::fs::read_to_string(plugin_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-site"));
     }
 
     #[cfg(unix)]
