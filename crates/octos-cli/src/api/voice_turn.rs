@@ -441,18 +441,24 @@ impl VoiceReplySplitter {
     /// speech so nothing is lost to a mid-reply `[[` or stray partial.
     pub(crate) fn finish(self) -> (Option<String>, Option<VisualDirective>) {
         let directive = parse_visual_marker(&self.full);
-        // Drop whichever REAL trailing control marker(s) the full reply carries
-        // from the spoken tail, so neither reaches TTS. A held-back region that
-        // turned out NOT to be a real trailing marker (a rare mid-reply `[[`) is
-        // left intact and recovered as speech. The visual directive is returned
-        // for dispatch; the exit marker's decision is lifted separately off the
-        // final content (`strip_exit_directive`).
+        // Drop ALL real trailing control markers (visual and/or exit, in either
+        // order) from the spoken tail so neither reaches TTS — a stacked
+        // `…[[VISUAL:…]][[EXIT]]` must peel both. A held-back region that turned
+        // out NOT to be a real trailing marker (a rare mid-reply `[[`) is left
+        // intact and recovered as speech. The visual directive is returned for
+        // dispatch; the exit decision is lifted separately off the final content
+        // (`strip_control_directives`).
         let mut speak: &str = self.pending.as_str();
-        if directive.is_some() {
-            speak = strip_visual_marker(speak);
-        }
-        if parse_exit_marker(&self.full) {
-            speak = strip_exit_marker(speak);
+        loop {
+            if parse_visual_marker(speak).is_some() {
+                speak = strip_visual_marker(speak);
+                continue;
+            }
+            if parse_exit_marker(speak) {
+                speak = strip_exit_marker(speak);
+                continue;
+            }
+            break;
         }
         let speak = speak.trim();
         let tail = if speak.is_empty() {
@@ -578,6 +584,38 @@ pub(crate) fn strip_exit_directive(content: &mut String, messages: &mut [Message
     true
 }
 
+/// Strip STACKED trailing control markers ([[VISUAL:...]] and/or [[EXIT]]) from
+/// the turn's authoritative reply surfaces in EITHER order, returning the parsed
+/// visual directive (if any) and whether an exit was requested.
+///
+/// A reply may end with both markers (e.g. `…[[VISUAL:…]][[EXIT]]`): stripping
+/// only the outermost would leave the inner one trailing on the wire
+/// (`message/delta`, `message/persisted`) and in storage (session JSONL), and —
+/// for the visual case — never dispatch it. So this loops, peeling whichever
+/// marker is currently trailing, until neither is. Reuses (and supersedes on the
+/// turn path) the per-marker [`strip_visual_directive`] / [`strip_exit_directive`].
+pub(crate) fn strip_control_directives(
+    content: &mut String,
+    messages: &mut [Message],
+) -> (Option<VisualDirective>, bool) {
+    let mut directive = None;
+    let mut exit = false;
+    loop {
+        if let Some(d) = strip_visual_directive(content, messages) {
+            if directive.is_none() {
+                directive = Some(d);
+            }
+            continue;
+        }
+        if strip_exit_directive(content, messages) {
+            exit = true;
+            continue;
+        }
+        break;
+    }
+    (directive, exit)
+}
+
 /// Byte length of the marker-free visible prefix of `full`: everything up to a
 /// (possibly mid-reply) `[[VISUAL:` occurrence, else everything minus a trailing
 /// partial that could still grow into the marker. Trailing whitespace before
@@ -631,13 +669,22 @@ impl VisibleDeltaFilter {
     /// nothing is lost. A real trailing control marker (visual or exit) yields
     /// `""` for that span (stays off the wire).
     pub(crate) fn finish(self) -> String {
-        let mut visible = self.full.len();
-        if parse_visual_marker(&self.full).is_some() {
-            visible = visible.min(strip_visual_marker(&self.full).len());
+        // Peel ALL real trailing control markers (visual and/or exit, in either
+        // order) so a stacked `…[[VISUAL:…]][[EXIT]]` never leaks the inner one
+        // onto the `message/delta` wire.
+        let mut clean: &str = self.full.as_str();
+        loop {
+            if parse_visual_marker(clean).is_some() {
+                clean = strip_visual_marker(clean);
+                continue;
+            }
+            if parse_exit_marker(clean) {
+                clean = strip_exit_marker(clean);
+                continue;
+            }
+            break;
         }
-        if parse_exit_marker(&self.full) {
-            visible = visible.min(strip_exit_marker(&self.full).len());
-        }
+        let visible = clean.len();
         if visible > self.emitted {
             self.full[self.emitted..visible].to_string()
         } else {
@@ -1615,5 +1662,96 @@ mod tests {
             "citation must still be spoken: {spoken:?}"
         );
         assert!(spoken.contains("后面还有内容"));
+    }
+
+    // ── stacked control markers (review fix: visual + exit, either order) ──
+
+    #[test]
+    fn strip_control_directives_handles_visual_then_exit() {
+        // `…[[VISUAL:…]][[EXIT]]` — peeling only the outer EXIT would leave the
+        // visual marker trailing in content/messages. The combined strip must
+        // return the visual directive AND exit=true, leaving the text clean.
+        let mut content = "好的，给你画一个，再见！\n[[VISUAL:html|电路]]\n[[EXIT]]".to_string();
+        let mut messages = vec![
+            Message::user("画个电路然后再见".to_string()),
+            Message::assistant(
+                "好的，给你画一个，再见！\n[[VISUAL:html|电路]]\n[[EXIT]]".to_string(),
+            ),
+        ];
+        let (directive, exit) = strip_control_directives(&mut content, &mut messages);
+        assert_eq!(directive.as_ref().map(|d| d.kind), Some(VisualKind::Html));
+        assert!(exit);
+        assert_eq!(content, "好的，给你画一个，再见！");
+        assert_eq!(messages[1].content, "好的，给你画一个，再见！");
+        assert!(!content.contains("[["), "no marker may leak: {content:?}");
+    }
+
+    #[test]
+    fn strip_control_directives_handles_exit_then_visual() {
+        // Reverse order: `…[[EXIT]][[VISUAL:…]]`. Order-independent.
+        let mut content = "再见！\n[[EXIT]]\n[[VISUAL:image|一只猫]]".to_string();
+        let mut messages = vec![Message::assistant(
+            "再见！\n[[EXIT]]\n[[VISUAL:image|一只猫]]".to_string(),
+        )];
+        let (directive, exit) = strip_control_directives(&mut content, &mut messages);
+        assert_eq!(directive.as_ref().map(|d| d.kind), Some(VisualKind::Image));
+        assert!(exit);
+        assert_eq!(content, "再见！");
+        assert!(!content.contains("[["));
+    }
+
+    #[test]
+    fn strip_control_directives_single_markers_and_none() {
+        // Exit only.
+        let mut c = "再见！\n[[EXIT]]".to_string();
+        let (d, e) = strip_control_directives(&mut c, &mut []);
+        assert!(d.is_none() && e);
+        assert_eq!(c, "再见！");
+        // Visual only.
+        let mut c = "看图。\n[[VISUAL:html|电路]]".to_string();
+        let (d, e) = strip_control_directives(&mut c, &mut []);
+        assert_eq!(d.map(|d| d.kind), Some(VisualKind::Html));
+        assert!(!e);
+        assert_eq!(c, "看图。");
+        // Neither.
+        let mut c = "普通回复。".to_string();
+        let (d, e) = strip_control_directives(&mut c, &mut []);
+        assert!(d.is_none() && !e);
+        assert_eq!(c, "普通回复。");
+    }
+
+    #[test]
+    fn splitter_holds_back_stacked_visual_and_exit_markers() {
+        // Neither marker may reach TTS when both trail the reply.
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for tok in ["好的，再见！\n", "[[VISUAL:html|电路]]", "\n[[EXIT]]"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+                spoken.push('\n');
+            }
+        }
+        let (tail, _directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("再见"));
+        assert!(
+            !spoken.contains("VISUAL"),
+            "visual leaked to TTS: {spoken:?}"
+        );
+        assert!(!spoken.contains("EXIT"), "exit leaked to TTS: {spoken:?}");
+        assert!(!spoken.contains("[["), "no bracket leak: {spoken:?}");
+    }
+
+    #[test]
+    fn visible_delta_filter_hides_stacked_visual_and_exit_markers() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["好的，再见！", "\n[[VISUAL:html|电路]]", "\n[[EXIT]]"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "好的，再见！");
     }
 }

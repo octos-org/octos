@@ -18507,38 +18507,28 @@ async fn run_standalone_turn(
 
         match result {
             Ok(mut response) => {
-                // Voice rich output (#1477): lift the trailing in-band
-                // `[[VISUAL:...]]` directive out of the reply and strip it from
+                // Voice control markers: lift the trailing in-band
+                // `[[VISUAL:...]]` (#1477) and `[[EXIT]]` (UPCR-2026-025)
+                // directives out of the reply and strip them from
                 // `response.content` AND every Assistant carrier in
                 // `response.messages` BEFORE capture / persist / done, so the
                 // internal control protocol never reaches the wire
                 // (`message/delta` from `done`, `message/persisted`) or storage
-                // (session JSONL). The directive is dispatched post-turn from the
-                // oneshot below; the client learns a visual is coming from the
-                // typed `visual/generating` event. Gated on voice turns. No-op
-                // (returns `None`, mutates nothing) without a real trailing marker.
-                let visual_directive = if had_audio_input {
-                    crate::api::voice_turn::strip_visual_directive(
+                // (session JSONL). Stacked markers in either order are both
+                // peeled (review fix). The directives are dispatched post-turn
+                // from the oneshots below; the client learns a visual is coming
+                // from `visual/generating` and an exit from `voice/exit`. Gated
+                // on voice turns. No-op (returns `(None, false)`, mutates
+                // nothing) without a real trailing marker.
+                let (visual_directive, exit_requested) = if had_audio_input {
+                    crate::api::voice_turn::strip_control_directives(
                         &mut response.content,
                         &mut response.messages,
                     )
                 } else {
-                    None
+                    (None, false)
                 };
                 let _ = visual_directive_tx.send(visual_directive);
-                // Voice exit intent (UPCR-2026-025): lift + strip the trailing
-                // `[[EXIT]]` marker the same way, BEFORE capture / persist / done,
-                // so it never reaches the wire or storage. The post-turn block
-                // emits the typed `voice/exit` event from this signal. Gated on
-                // voice turns; `false` without a real trailing marker.
-                let exit_requested = if had_audio_input {
-                    crate::api::voice_turn::strip_exit_directive(
-                        &mut response.content,
-                        &mut response.messages,
-                    )
-                } else {
-                    false
-                };
                 let _ = exit_directive_tx.send(exit_requested);
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
@@ -19613,17 +19603,13 @@ async fn run_standalone_turn(
 
     // Voice exit intent (UPCR-2026-025): the agent task signalled whether the
     // user asked to leave (the `[[EXIT]]` marker was lifted + stripped there).
-    // Emit the typed `voice/exit` so the client returns home from /voice — the
-    // client gates the actual navigation on its own reply-audio queue draining,
-    // so the farewell is heard first. No in-band marker is on the wire.
+    // Receive the flag now, but DEFER emitting `voice/exit` until AFTER the
+    // farewell reply audio has been attached (the streamed path above, or the
+    // whole-reply fallback synth below) — review fix: emitting here would let a
+    // no-sentence-boundary reply's `voice/exit` reach the client before its
+    // farewell `file/attached`, so the client could navigate away before the
+    // goodbye is heard, violating the "farewell first" contract.
     let exit_requested = exit_directive_rx.await.unwrap_or(false);
-    if had_audio_input && !interrupt_observed && exit_requested {
-        super::ui_protocol_alpha9_bridge::emit_voice_exit_from_background(
-            &ledger,
-            &session_id,
-            &turn_id,
-        );
-    }
 
     // Voice rich output: dispatch the in-band [[VISUAL]] directive.
     // HTML → a focused tool-less LLM call (rich_output); image-class → a
@@ -19922,6 +19908,21 @@ async fn run_standalone_turn(
                 tracing::info!(audio = %audio_path.display(), "voice_turn: synthesized reply audio");
             }
         }
+    }
+
+    // Voice exit intent (UPCR-2026-025): NOW that the farewell reply audio has
+    // been attached (streamed sentences awaited above, or the whole-reply
+    // fallback synth just above), emit the typed `voice/exit`. Emitting here —
+    // strictly AFTER the farewell `file/attached` — guarantees the client has
+    // the goodbye audio queued before it sees the exit signal, so it plays the
+    // farewell before leaving /voice (the events share the ordered ledger live
+    // path). No in-band marker is on the wire.
+    if had_audio_input && !interrupt_observed && exit_requested {
+        super::ui_protocol_alpha9_bridge::emit_voice_exit_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+        );
     }
 
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
