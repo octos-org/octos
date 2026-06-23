@@ -18366,7 +18366,10 @@ async fn run_standalone_turn(
              brief 是给生成器的一句话简述。\
              普通问答/闲聊/事实回答【不要】加标记。\
              示例1:用户说『我想直观看到负反馈电路如何负反馈』→ 口播『我给你画一个可调增益的负反馈电路,你可以拖滑块看输出怎么被拉回来。』,然后另起一行:[[VISUAL:html|可调增益的负反馈电路交互演示,滑块调增益,实时显示反馈如何稳定输出]]\
-             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]]"
+             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]\
+             \n退出意图:当用户明确想结束对话/离开/不聊了/再见/拜拜/静音/退出语音助手时——先用一句简短自然的话告别(如『好的,再见啦!』),然后【另起一行】只追加一个标记:[[EXIT]]。\
+             仅在用户确实想退出时才加;普通问答/闲聊/继续提问【绝对不要】加。\
+             示例:用户说『再见』或『退出吧』→ 口播『好的,再见!』,然后另起一行:[[EXIT]]]"
         );
         // The audio is now in the prompt as text. Drop it from the
         // agent-visible media so the model answers the transcript directly
@@ -18436,6 +18439,13 @@ async fn run_standalone_turn(
     // background dispatch. `None` for text turns or replies without a marker.
     let (visual_directive_tx, visual_directive_rx) =
         tokio::sync::oneshot::channel::<Option<crate::api::voice_turn::VisualDirective>>();
+    // Voice exit intent (UPCR-2026-025): the agent task lifts the trailing
+    // in-band `[[EXIT]]` marker out of `response.content` (stripping it from
+    // every authoritative surface) and signals here whether the user asked to
+    // leave. The post-turn block emits the typed `voice/exit` event so the
+    // client returns home after the farewell audio. `false` for text turns or
+    // replies without the marker.
+    let (exit_directive_tx, exit_directive_rx) = tokio::sync::oneshot::channel::<bool>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -18516,6 +18526,20 @@ async fn run_standalone_turn(
                     None
                 };
                 let _ = visual_directive_tx.send(visual_directive);
+                // Voice exit intent (UPCR-2026-025): lift + strip the trailing
+                // `[[EXIT]]` marker the same way, BEFORE capture / persist / done,
+                // so it never reaches the wire or storage. The post-turn block
+                // emits the typed `voice/exit` event from this signal. Gated on
+                // voice turns; `false` without a real trailing marker.
+                let exit_requested = if had_audio_input {
+                    crate::api::voice_turn::strip_exit_directive(
+                        &mut response.content,
+                        &mut response.messages,
+                    )
+                } else {
+                    false
+                };
+                let _ = exit_directive_tx.send(exit_requested);
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -19586,6 +19610,20 @@ async fn run_standalone_turn(
     // marker). `final_response_content` is now the clean spoken reply (marker
     // already gone), so it doubles as the HTML author's "spoken_reply" context.
     let visual_directive = visual_directive_rx.await.ok().flatten();
+
+    // Voice exit intent (UPCR-2026-025): the agent task signalled whether the
+    // user asked to leave (the `[[EXIT]]` marker was lifted + stripped there).
+    // Emit the typed `voice/exit` so the client returns home from /voice — the
+    // client gates the actual navigation on its own reply-audio queue draining,
+    // so the farewell is heard first. No in-band marker is on the wire.
+    let exit_requested = exit_directive_rx.await.unwrap_or(false);
+    if had_audio_input && !interrupt_observed && exit_requested {
+        super::ui_protocol_alpha9_bridge::emit_voice_exit_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+        );
+    }
 
     // Voice rich output: dispatch the in-band [[VISUAL]] directive.
     // HTML → a focused tool-less LLM call (rich_output); image-class → a
