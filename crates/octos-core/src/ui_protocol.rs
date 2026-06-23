@@ -1059,6 +1059,14 @@ pub mod methods {
     /// #1477 voice rich output — the background visual task failed or timed
     /// out, so the client should clear the "generating" placeholder.
     pub const VISUAL_FAILED: &str = "visual/failed";
+    /// UPCR-2026-025 voice exit intent — the voice turn detected an end /
+    /// goodbye / mute intent (the model appended an in-band `[[EXIT]]` control
+    /// marker, which the backend strips from every model-/client-facing surface
+    /// and replaces with this typed event). The client uses it to leave the
+    /// `/voice` screen and return home AFTER the turn's farewell audio finishes
+    /// playing — it must NOT navigate before the reply audio drains. Ungated;
+    /// emitted on the same ledger-backed live path as `file/attached`.
+    pub const VOICE_EXIT: &str = "voice/exit";
     /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
     /// envelope notification (spec § 14). γ-1 reserves the method name
     /// in the notification methods list as part of capability negotiation
@@ -1238,6 +1246,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::VISUAL_GENERATING,
     methods::VISUAL_SUCCEEDED,
     methods::VISUAL_FAILED,
+    methods::VOICE_EXIT,
     methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
     methods::ROUTER_STATUS,
@@ -4587,6 +4596,21 @@ pub struct VisualFailedEvent {
     pub reason: Option<String>,
 }
 
+/// UPCR-2026-025 voice exit intent: the voice turn detected an end / goodbye /
+/// mute intent. The model appended an in-band `[[EXIT]]` control marker; the
+/// backend strips it from every model-/client-facing surface (so it never
+/// reaches TTS, the `message/delta` wire, or the persisted session) and emits
+/// this typed event instead. The client leaves the `/voice` screen and returns
+/// home — but only AFTER the turn's farewell audio finishes playing, so the
+/// goodbye is heard before navigation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceExitEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStartedEvent {
     pub session_id: SessionKey,
@@ -5544,6 +5568,9 @@ pub enum UiNotification {
     VisualSucceeded(VisualSucceededEvent),
     /// #1477 voice rich output: a background visual task failed / timed out.
     VisualFailed(VisualFailedEvent),
+    /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
+    /// goodbye / mute intent; the client returns home after the farewell audio.
+    VoiceExit(VoiceExitEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
     ToolCompleted(ToolCompletedEvent),
@@ -5641,6 +5668,7 @@ impl UiNotification {
             Self::VisualGenerating(_) => methods::VISUAL_GENERATING,
             Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
             Self::VisualFailed(_) => methods::VISUAL_FAILED,
+            Self::VoiceExit(_) => methods::VOICE_EXIT,
             Self::ToolStarted(_) => methods::TOOL_STARTED,
             Self::ToolProgress(_) => methods::TOOL_PROGRESS,
             Self::ToolCompleted(_) => methods::TOOL_COMPLETED,
@@ -5686,6 +5714,7 @@ impl UiNotification {
             Self::VisualGenerating(event) => &event.session_id,
             Self::VisualSucceeded(event) => &event.session_id,
             Self::VisualFailed(event) => &event.session_id,
+            Self::VoiceExit(event) => &event.session_id,
             Self::ToolStarted(event) => &event.session_id,
             Self::ToolProgress(event) => &event.session_id,
             Self::ToolCompleted(event) => &event.session_id,
@@ -5735,6 +5764,7 @@ impl UiNotification {
             Self::VisualSucceeded(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::VoiceExit(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::VisualFailed(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -5795,6 +5825,7 @@ impl UiNotification {
             Self::VisualGenerating(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualSucceeded(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualFailed(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VoiceExit(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5826,6 +5857,7 @@ impl UiNotification {
             Self::VisualGenerating(params) => serde_json::to_value(params),
             Self::VisualSucceeded(params) => serde_json::to_value(params),
             Self::VisualFailed(params) => serde_json::to_value(params),
+            Self::VoiceExit(params) => serde_json::to_value(params),
             Self::ToolStarted(params) => serde_json::to_value(params),
             Self::ToolProgress(params) => serde_json::to_value(params),
             Self::ToolCompleted(params) => serde_json::to_value(params),
@@ -5926,6 +5958,7 @@ impl UiNotification {
             }
             methods::VISUAL_SUCCEEDED => Ok(Self::VisualSucceeded(decode_params(method, params)?)),
             methods::VISUAL_FAILED => Ok(Self::VisualFailed(decode_params(method, params)?)),
+            methods::VOICE_EXIT => Ok(Self::VoiceExit(decode_params(method, params)?)),
             methods::TOOL_STARTED => Ok(Self::ToolStarted(decode_params(method, params)?)),
             methods::TOOL_PROGRESS => Ok(Self::ToolProgress(decode_params(method, params)?)),
             methods::TOOL_COMPLETED => Ok(Self::ToolCompleted(decode_params(method, params)?)),
@@ -6745,6 +6778,7 @@ mod tests {
                 "visual/generating",
                 "visual/succeeded",
                 "visual/failed",
+                "voice/exit",
                 "projection/envelope",
                 "session/event",
                 "router/status",
@@ -6914,6 +6948,7 @@ mod tests {
                     "visual/generating",
                     "visual/succeeded",
                     "visual/failed",
+                    "voice/exit",
                     "projection/envelope",
                     "session/event",
                     "router/status",
@@ -7561,6 +7596,31 @@ mod tests {
         assert_eq!(wire.params["reason"], json!("timed out"));
         let decoded = UiNotification::from_rpc_notification(wire).expect("decode visual/failed");
         assert_eq!(decoded, failed);
+    }
+
+    #[test]
+    fn voice_exit_wire_contract() {
+        // UPCR-2026-025: the typed exit notification carries session_id + turn_id
+        // (and an optional topic); it round-trips intact and the topic is stamped
+        // from a topic-scoped session key, mirroring the visual/* lifecycle.
+        let exit = UiNotification::VoiceExit(VoiceExitEvent {
+            session_id: SessionKey("local:voice#exit".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(42)),
+        });
+        assert_eq!(exit.method(), methods::VOICE_EXIT);
+        let wire = exit
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize voice/exit");
+        assert_eq!(wire.method, methods::VOICE_EXIT);
+        // Topic is stamped from the `#exit` suffix of the session key on the wire.
+        assert_eq!(wire.params["topic"], json!("exit"));
+        let decoded = UiNotification::from_rpc_notification(wire).expect("decode voice/exit");
+        // Equality holds after the topic was stamped from the session key.
+        assert_eq!(decoded.method(), methods::VOICE_EXIT);
+        assert_eq!(decoded.session_id().0, "local:voice#exit");
+        assert_eq!(decoded.topic(), Some("exit"));
     }
 
     #[test]
