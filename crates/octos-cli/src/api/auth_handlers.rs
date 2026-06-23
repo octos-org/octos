@@ -668,7 +668,7 @@ pub async fn verify(
                 (None, Some(RootLoginTarget::Allowlisted)) => {
                     user_store.get_by_email(&requested_email).ok().flatten()
                 }
-                (None, None) => None,
+                (None, None) => user_store.get_by_email(&requested_email).ok().flatten(),
             };
 
             if matches!(root_login_target, Some(RootLoginTarget::Allowlisted)) {
@@ -4856,6 +4856,68 @@ mod tests {
         let allowlist_entry = allowlist_store.get("newuser@example.com").unwrap().unwrap();
         assert_eq!(allowlist_entry.claimed_user_id.as_deref(), Some("newuser"));
         assert!(allowlist_entry.claimed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn root_self_registration_can_complete_login_and_provision_profile() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+        auth_mgr.set_allow_self_registration(true);
+        let state = Arc::new(state);
+
+        let Json(send_resp) = send_code(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "selfreg@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(send_resp.ok);
+
+        let code = auth_mgr
+            .test_pending_code("selfreg@example.com", None)
+            .await
+            .expect("self-registration should create a global OTP");
+
+        let Json(verify_resp) = verify(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(VerifyRequest {
+                email: "selfreg@example.com".into(),
+                code,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(verify_resp.ok);
+        assert!(verify_resp.token.is_some());
+        let user = verify_resp
+            .user
+            .expect("verify should return the self-registered user");
+        assert_eq!(user.id, "selfreg");
+
+        let saved_user = user_store
+            .get_by_email("selfreg@example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_user.id, "selfreg");
+        assert!(profile_store.get("selfreg").unwrap().is_some());
+
+        let Json(me_resp) = me(
+            State(state),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "selfreg".into(),
+                role: UserRole::User,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(me_resp.user.id, "selfreg");
+        assert_eq!(me_resp.portal.home_profile_id, "selfreg");
     }
 
     #[tokio::test]
