@@ -108,6 +108,9 @@ pub fn register_all(
     entries: &[ChannelEntry],
     ctx: &mut ChannelRegistrationCtx<'_>,
 ) -> eyre::Result<()> {
+    #[cfg(feature = "matrix")]
+    ensure_single_matrix_channel(entries)?;
+
     for (channel_index, entry) in entries.iter().enumerate() {
         // `channel_index` is only consumed by the matrix arm below.
         #[cfg(not(feature = "matrix"))]
@@ -169,4 +172,51 @@ pub fn register_all(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "matrix")]
+fn ensure_single_matrix_channel(entries: &[ChannelEntry]) -> eyre::Result<()> {
+    let mut first_index: Option<usize> = None;
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.channel_type != "matrix" {
+            continue;
+        }
+        if let Some(first) = first_index {
+            eyre::bail!(
+                "multiple Matrix channels are not supported yet; channel indexes {first} and {idx} share the same routing key"
+            );
+        }
+        first_index = Some(idx);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "matrix"))]
+mod tests {
+    use super::*;
+
+    fn entry(channel_type: &str) -> ChannelEntry {
+        ChannelEntry {
+            channel_type: channel_type.to_string(),
+            allowed_senders: Vec::new(),
+            settings: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_matrix_channels_before_registration() {
+        let entries = vec![entry("cli"), entry("matrix"), entry("matrix")];
+
+        let err = ensure_single_matrix_channel(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("multiple Matrix channels"));
+        assert!(err.to_string().contains("1 and 2"));
+    }
+
+    #[test]
+    fn allows_single_matrix_channel() {
+        let entries = vec![entry("cli"), entry("matrix")];
+
+        ensure_single_matrix_channel(&entries).unwrap();
+    }
 }

@@ -1468,12 +1468,8 @@ fn matrix_test_channel_config(
         if let Some(value) = non_empty_string_opt(channel.user_id.as_deref()) {
             config.user_id = Some(value);
         }
-        if let Some(value) = non_display_secret_string_opt(channel.access_token.as_deref()) {
-            config.access_token = Some(value);
-        }
-        if let Some(value) = non_display_secret_string_opt(channel.password.as_deref()) {
-            config.password = Some(value);
-        }
+        apply_matrix_draft_secret(&mut config.access_token, channel.access_token.as_deref());
+        apply_matrix_draft_secret(&mut config.password, channel.password.as_deref());
         if let Some(value) = non_empty_string_opt(channel.device_name.as_deref()) {
             config.device_name = Some(value);
         }
@@ -1521,15 +1517,19 @@ fn non_empty_string_opt(value: Option<&str>) -> Option<String> {
     value.and_then(non_empty_string)
 }
 
-fn non_display_secret_string_opt(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() || is_display_secret_value(trimmed) {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
+fn apply_matrix_draft_secret(target: &mut Option<String>, draft: Option<&str>) {
+    let Some(value) = draft else {
+        return;
+    };
+    let trimmed = value.trim();
+    if is_display_secret_value(trimmed) {
+        return;
+    }
+    if trimmed.is_empty() {
+        *target = None;
+    } else {
+        *target = Some(trimmed.to_string());
+    }
 }
 
 fn validate_matrix_user_id(user_id: &str) -> Result<(), (StatusCode, String)> {
@@ -1589,6 +1589,8 @@ fn matrix_percent_encode_path(s: &str) -> String {
     encoded
 }
 
+const MATRIX_ERROR_BODY_MAX_BYTES: usize = 2048;
+
 fn matrix_api_url(homeserver: &str, path: &str) -> String {
     format!("{}{}", homeserver.trim_end_matches('/'), path)
 }
@@ -1601,8 +1603,65 @@ fn matrix_api_url(homeserver: &str, path: &str) -> String {
 fn matrix_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to build Matrix HTTP client")
+}
+
+async fn matrix_error_body(resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut truncated = resp
+        .content_length()
+        .map(|len| len > MATRIX_ERROR_BODY_MAX_BYTES as u64)
+        .unwrap_or(false);
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if buf.len() + chunk.len() > MATRIX_ERROR_BODY_MAX_BYTES {
+                    let remaining = MATRIX_ERROR_BODY_MAX_BYTES.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    sanitize_matrix_error_body(&String::from_utf8_lossy(&buf), truncated)
+}
+
+fn sanitize_matrix_error_body(raw: &str, truncated: bool) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in raw.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+
+    let mut out = out.trim().to_string();
+    if truncated {
+        if out.is_empty() {
+            out.push_str("[truncated]");
+        } else {
+            out.push_str(" ... [truncated]");
+        }
+    }
+    out
 }
 
 async fn resolve_matrix_login(
@@ -1619,7 +1678,7 @@ async fn resolve_matrix_login(
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = matrix_error_body(resp).await;
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("Matrix whoami failed (status={status}): {body}"),
@@ -1673,7 +1732,7 @@ async fn resolve_matrix_login(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((StatusCode::BAD_GATEWAY, matrix_login_error(status, &body)));
     }
     let payload: serde_json::Value = resp
@@ -1769,7 +1828,7 @@ async fn matrix_join_room(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Matrix join room failed (status={status}): {body}"),
@@ -1798,7 +1857,7 @@ async fn matrix_leave_room(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Matrix reject invite failed (status={status}): {body}"),
@@ -1821,7 +1880,7 @@ async fn matrix_probe_sync(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Matrix sync probe failed (status={status}): {body}"),
@@ -3667,6 +3726,42 @@ mod tests {
     }
 
     #[test]
+    fn matrix_error_body_sanitizes_and_marks_truncation() {
+        let summary = sanitize_matrix_error_body("line1\nline2\t\u{0}secret", true);
+
+        assert_eq!(summary, "line1 line2 secret ... [truncated]");
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn matrix_http_client_does_not_follow_redirects() {
+        use axum::Router;
+        use axum::response::Redirect;
+        use axum::routing::get;
+
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { Redirect::temporary("/target") }),
+            )
+            .route("/target", get(|| async { "target" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = matrix_http_client()
+            .get(format!("http://{addr}/redirect"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[test]
     fn matrix_accept_adds_room_to_allowlist_once() {
         let mut profile = make_user_profile("matrix-user", "Matrix User");
         profile.config.channels.push(ChannelCredentials::Matrix {
@@ -3784,6 +3879,47 @@ mod tests {
         );
         assert_eq!(config.password.as_deref(), Some("real-password"));
         assert_eq!(config.device_name.as_deref(), Some("new-device"));
+    }
+
+    #[test]
+    fn matrix_test_config_empty_access_token_clears_saved_token() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_real_access_token".into(),
+            password: String::new(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: None,
+                user_id: None,
+                access_token: Some(String::new()),
+                password: Some("new-password".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.access_token, None);
+        assert_eq!(config.password.as_deref(), Some("new-password"));
     }
 
     #[test]
