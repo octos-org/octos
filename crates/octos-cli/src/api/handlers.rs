@@ -210,11 +210,25 @@ fn request_owner_profile(
         )
         .ok()?
     };
-    Some(if pid == ADMIN_PROFILE_ID {
+    Some(owner_profile_for_resolved_request(
+        pid,
+        header_profile_id.as_deref(),
+    ))
+}
+
+fn owner_profile_for_resolved_request(
+    resolved_profile_id: String,
+    header_profile_id: Option<&str>,
+) -> String {
+    // Admin without an explicit tenant route is the legacy bootstrap/admin
+    // surface and runs default sessions under `_main`. If the client explicitly
+    // routes to `admin` (X-Profile-Id or hosted profile route), keep `admin` so
+    // upload ownership matches the WS `session/open` runtime.
+    if resolved_profile_id == ADMIN_PROFILE_ID && header_profile_id.is_none() {
         MAIN_PROFILE_ID.to_string()
     } else {
-        pid
-    })
+        resolved_profile_id
+    }
 }
 
 fn request_host(headers: &HeaderMap) -> Option<String> {
@@ -1638,16 +1652,12 @@ pub async fn upload(
         )
         .map_err(|_| (StatusCode::FORBIDDEN, "forbidden".to_string()))?
     };
-    // An admin token with NO tenant routing runs its WS session under the
-    // default profile (`MAIN_PROFILE_ID`), not under `admin`. Stamp the upload
-    // the same way so the materializer doesn't treat the admin's own upload as
-    // foreign (codex round-6 P2). Admin acting AS a tenant carries a header,
-    // which resolves to that tenant above (not `admin`).
-    let profile_id = if resolved_profile_id == ADMIN_PROFILE_ID {
-        MAIN_PROFILE_ID.to_string()
-    } else {
-        resolved_profile_id
-    };
+    // Keep upload ownership aligned with the WS session runtime. Admin without
+    // an explicit route remains `_main`; explicit `X-Profile-Id: admin` stays
+    // `admin`, otherwise voice turns in the admin Home profile lose their audio
+    // during tenant materialization.
+    let profile_id =
+        owner_profile_for_resolved_request(resolved_profile_id, header_profile_id.as_deref());
 
     // Determine upload directory (per-tenant subdir).
     let upload_dir = std::env::temp_dir().join("octos-uploads").join(&profile_id);
@@ -5747,6 +5757,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn owner_profile_maps_unrouted_admin_to_main() {
+        let pid = owner_profile_for_resolved_request(ADMIN_PROFILE_ID.to_string(), None);
+        assert_eq!(pid, MAIN_PROFILE_ID);
+    }
+
+    #[test]
+    fn owner_profile_keeps_explicit_admin_route() {
+        let pid = owner_profile_for_resolved_request(
+            ADMIN_PROFILE_ID.to_string(),
+            Some(ADMIN_PROFILE_ID),
+        );
+        assert_eq!(pid, ADMIN_PROFILE_ID);
     }
 
     #[test]

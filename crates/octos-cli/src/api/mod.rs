@@ -21,6 +21,7 @@ pub(crate) mod goal_loop_runtime;
 mod handlers;
 pub(crate) mod master_continuation_scheduler;
 pub mod metrics;
+pub(crate) mod ominix_runtime;
 pub mod preview;
 pub mod preview_tokens;
 pub mod purge;

@@ -504,6 +504,25 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/monitor/profiles/{id}",
             post(admin::update_profile_monitor),
         )
+        // OMiniX runtime installer/repair aliases. Kept outside the
+        // platform-skills dynamic segment so the repair UI has a stable
+        // orchestration endpoint.
+        .route(
+            "/api/admin/ominix/runtime",
+            get(admin::platform_runtime_status),
+        )
+        .route(
+            "/api/admin/ominix/repair",
+            post(admin::platform_runtime_repair),
+        )
+        .route(
+            "/api/admin/ominix/install",
+            post(admin::platform_runtime_install),
+        )
+        .route(
+            "/api/admin/ominix/bootstrap",
+            post(admin::platform_runtime_bootstrap),
+        )
         // Platform skills management
         .route(
             "/api/admin/platform-skills",
@@ -537,6 +556,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/platform-skills/ominix-api/logs",
             get(admin::platform_service_logs),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/runtime",
+            get(admin::platform_runtime_status),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/repair",
+            post(admin::platform_runtime_repair),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/install",
+            post(admin::platform_runtime_install),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/bootstrap",
+            post(admin::platform_runtime_bootstrap),
         )
         // Model management (proxy to ominix-api)
         .route(

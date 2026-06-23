@@ -124,6 +124,21 @@ pub struct CatalogModel {
     pub status: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CatalogPayload {
+    Models(Vec<CatalogModel>),
+    Envelope { models: Vec<CatalogModel> },
+}
+
+impl CatalogPayload {
+    fn into_models(self) -> Vec<CatalogModel> {
+        match self {
+            Self::Models(models) | Self::Envelope { models } => models,
+        }
+    }
+}
+
 fn default_status() -> String {
     "not_downloaded".into()
 }
@@ -393,9 +408,11 @@ impl OminixClient {
             eyre::bail!("ominix-api catalog returned {status}");
         }
 
-        resp.json()
+        let payload: CatalogPayload = resp
+            .json()
             .await
-            .wrap_err("failed to parse ominix-api catalog")
+            .wrap_err("failed to parse ominix-api catalog")?;
+        Ok(payload.into_models())
     }
 
     /// Fetch catalog from ominix-api, filtered to only platform-allowed models.
