@@ -474,6 +474,17 @@ Projection and session bridging (accepted `UPCR-2026-014`):
 - `file/attached`
 - `session/event`
 
+Voice rich-output visual lifecycle (#1477, ungated; accepted
+`UPCR-2026-024`):
+
+- `visual/generating`, `visual/succeeded`, `visual/failed` — typed
+  lifecycle for a background visual artifact (illustrated HTML / image /
+  infographic) produced by a voice turn. Emitted on the same
+  ledger-backed live path as `file/attached`, but kept distinct from it:
+  `file/attached` stays a pure artifact-delivery signal while these carry
+  the placeholder lifecycle, so the split survives a future
+  `projection.envelope.v1` cutover. See § 8.
+
 Router and queue (Wave4-A):
 
 - `router/status`, `router/failover`, `queue/state`
@@ -1705,6 +1716,30 @@ declare `files_to_send`. Payload fields:
   background-result paths that don't run inside a tool execution).
 - `mime` — MIME-type hint (optional; clients fall back to extension
   sniffing when absent).
+
+### `visual/generating`, `visual/succeeded`, `visual/failed`
+
+Typed visual-artifact lifecycle introduced by `UPCR-2026-024` (#1477,
+voice rich output). A voice turn may append an in-band `[[VISUAL:...]]`
+control marker; the backend strips it from every model-/client-facing
+surface and instead drives the client off these three structured events,
+so the client never scrapes the marker out of the assistant text. Ungated
+and emitted on the same ledger-backed live path as `file/attached` (durable
+append → replayed on reconnect).
+
+The lifecycle is `generating → (succeeded | failed)` and is deliberately
+decoupled from `file/attached`, which stays a pure artifact-delivery
+signal: the client raises and clears the "generating" placeholder off
+these events, NOT off `file/attached`. Payload fields:
+
+- `visual/generating` — `session_id`, `turn_id` (required); `kind`
+  (`html` | `illustrated` | `image` | `infographic`); optional `topic`.
+- `visual/succeeded` — same fields as `generating`, plus `files`: the
+  workspace-relative filenames of the delivered artifact(s) (the same paths
+  carried on the accompanying `file/attached` event(s); omitted when empty).
+  Emitted alongside `file/attached` on the success branch.
+- `visual/failed` — `session_id`, `turn_id` (required); optional `topic`
+  and `reason` (failure/timeout/cancel detail).
 
 ### `session/event`
 
