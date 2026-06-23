@@ -18734,16 +18734,19 @@ async fn run_standalone_turn(
                             }
                             let visible = uf.push(t);
                             if !visible.is_empty() {
-                                let _ = send_notification_ephemeral(
-                                    &ws,
-                                    &ledger,
-                                    UiNotification::MessageDelta(MessageDeltaEvent {
-                                        session_id: session_id.clone(),
-                                        topic: None,
-                                        turn_id: turn_id.clone(),
-                                        text: visible,
-                                    }),
-                                );
+                                // #1477 P2: dual-emit the canonical envelope so
+                                // projection.envelope.v1 clients also receive the
+                                // voice delta — a bare ephemeral send is filtered
+                                // out for them. Mirrors forward_progress_event's
+                                // MessageDelta handling (emit envelope, then legacy).
+                                let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                                    session_id: session_id.clone(),
+                                    topic: None,
+                                    turn_id: turn_id.clone(),
+                                    text: visible,
+                                });
+                                emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+                                let _ = send_notification_ephemeral(&ws, &ledger, delta);
                                 saw_delta = true;
                             }
                         }
@@ -18787,16 +18790,17 @@ async fn run_standalone_turn(
             if !interrupt_observed {
                 let recovered = uf.finish();
                 if !recovered.is_empty() {
-                    let _ = send_notification_ephemeral(
-                        &ws,
-                        &ledger,
-                        UiNotification::MessageDelta(MessageDeltaEvent {
-                            session_id: session_id.clone(),
-                            topic: None,
-                            turn_id: turn_id.clone(),
-                            text: recovered,
-                        }),
-                    );
+                    // #1477 P2: dual-emit the envelope (see the streaming path
+                    // above) so projection.envelope.v1 clients also get the
+                    // recovered tail delta.
+                    let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                        session_id: session_id.clone(),
+                        topic: None,
+                        turn_id: turn_id.clone(),
+                        text: recovered,
+                    });
+                    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+                    let _ = send_notification_ephemeral(&ws, &ledger, delta);
                 }
             }
         }
