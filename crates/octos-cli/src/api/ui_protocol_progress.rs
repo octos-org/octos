@@ -431,6 +431,9 @@ fn map_cost_update(context: &ProgressMappingContext, event: &Value) -> UiProgres
     // sniff `metadata.label` continue to work (we still emit the field
     // omitted when absent).
     update.model = string_field(event, &["model"]);
+    // Carry the model context window so clients render an honest ctx-fill
+    // gauge against the real window instead of a hardcoded default.
+    update.context_window = u64_field(event, &["context_window"]);
 
     let mut metadata = UiProgressMetadata::token_cost(update);
     metadata.message = string_field(event, &["message", "status"]);
@@ -894,6 +897,28 @@ mod tests {
             .token_cost
             .expect("token cost metadata");
         assert_eq!(cost.model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn ui_protocol_progress_cost_update_carries_context_window_into_token_cost_metadata() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "cost_update",
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "model": "deepseek-v4-pro",
+                "context_window": 131072
+            }),
+        );
+
+        let status = mapping.status.expect("cost status");
+        let cost = status
+            .event
+            .metadata
+            .token_cost
+            .expect("token cost metadata");
+        assert_eq!(cost.context_window, Some(131072));
     }
 
     #[test]

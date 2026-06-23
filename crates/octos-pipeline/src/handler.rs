@@ -1262,6 +1262,7 @@ mod tests {
                     response_cost: Some(0.0008),
                     session_cost: Some(0.0008),
                     model: Some("claude-sonnet".into()),
+                    context_window: None,
                 });
             })
             .await;

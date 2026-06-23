@@ -140,6 +140,10 @@ pub enum ProgressEvent {
         /// `None` when the reporter cannot resolve a model id (e.g.
         /// synthetic test fixtures).
         model: Option<String>,
+        /// Model context window in tokens, when the provider exposes it.
+        /// Lets clients render an honest ctx-fill gauge against the real
+        /// window instead of a hardcoded default.
+        context_window: Option<u32>,
     },
 }
 
