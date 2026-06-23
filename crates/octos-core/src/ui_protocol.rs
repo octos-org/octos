@@ -4341,6 +4341,11 @@ pub struct UiTokenCostUpdate {
     /// scraping the legacy `metadata.label` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Model context window in tokens, when the provider exposes it. Lets
+    /// clients render an honest context-fill gauge against the real window
+    /// instead of a hardcoded default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl UiTokenCostUpdate {
@@ -4356,6 +4361,7 @@ impl UiTokenCostUpdate {
             session_cost: None,
             currency: None,
             model: None,
+            context_window: None,
         }
     }
 }

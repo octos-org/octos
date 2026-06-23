@@ -122,6 +122,7 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
             session_output_tokens,
             session_cost,
             model,
+            context_window,
             ..
         } => {
             // Always serialize the cost_update payload as an object so we
@@ -136,6 +137,11 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
             });
             if let Some(model) = model.as_deref() {
                 payload["model"] = serde_json::Value::String(model.to_string());
+            }
+            // Per-model context window so clients render an honest ctx gauge
+            // against the real window instead of a hardcoded default.
+            if let Some(window) = context_window {
+                payload["context_window"] = serde_json::json!(window);
             }
             payload
         }
@@ -309,6 +315,7 @@ mod tests {
             response_cost: Some(0.001),
             session_cost: Some(0.005),
             model: None,
+            context_window: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "cost_update");
@@ -329,6 +336,7 @@ mod tests {
             response_cost: None,
             session_cost: None,
             model: None,
+            context_window: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "cost_update");
@@ -347,10 +355,25 @@ mod tests {
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
+            context_window: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "cost_update");
         assert_eq!(json["model"], "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn event_to_json_cost_update_carries_context_window() {
+        let event = ProgressEvent::CostUpdate {
+            session_input_tokens: 1,
+            session_output_tokens: 1,
+            response_cost: None,
+            session_cost: None,
+            model: None,
+            context_window: Some(200_000),
+        };
+        let json = event_to_json(&event, None);
+        assert_eq!(json["context_window"], 200_000);
     }
 
     #[test]
@@ -427,6 +450,7 @@ mod tests {
                     response_cost: None,
                     session_cost: None,
                     model: None,
+                    context_window: None,
                 },
                 "cost_update",
             ),

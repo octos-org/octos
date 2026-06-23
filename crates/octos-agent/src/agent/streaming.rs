@@ -483,12 +483,25 @@ impl Agent {
         } else {
             Some(metadata.model.clone())
         };
+        // Resolve the context window from the SAME slot that answered. For the
+        // active slot (`provider_index == None`) use the provider's configured
+        // window (honors any context override); for a failover/routed slot
+        // derive it from the model that actually answered, parallel to how
+        // `model` and `pricing` are resolved above — otherwise the gauge could
+        // report the right model with the primary slot's window.
+        let context_window = match response.provider_index {
+            Some(_) if !metadata.model.is_empty() => {
+                octos_llm::context::context_window_tokens(&metadata.model)
+            }
+            _ => self.llm.context_window(),
+        };
         self.reporter().report(ProgressEvent::CostUpdate {
             session_input_tokens: total_usage.input_tokens,
             session_output_tokens: total_usage.output_tokens,
             response_cost,
             session_cost,
             model,
+            context_window: Some(context_window),
         });
     }
 
