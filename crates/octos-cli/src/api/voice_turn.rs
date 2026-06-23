@@ -304,23 +304,53 @@ pub(crate) fn parse_visual_marker(reply: &str) -> Option<VisualDirective> {
     Some(VisualDirective { kind, brief })
 }
 
-/// The in-band marker opener. Streaming holds back only text that is — or could
-/// still grow into — this exact prefix, **not** any `[[`, so ordinary bracket
-/// notation (e.g. a `[[1]]` citation) never suppresses the rest of the TTS.
+/// The in-band visual marker opener. Streaming holds back only text that is —
+/// or could still grow into — this exact prefix, **not** any `[[`, so ordinary
+/// bracket notation (e.g. a `[[1]]` citation) never suppresses the rest of the
+/// TTS.
 const MARKER: &str = "[[VISUAL:";
 
+/// The in-band exit-intent marker (UPCR-2026-025). A fixed, self-contained
+/// trailing token the model appends after a farewell when the user wants to end
+/// / leave / mute. Held back from TTS and the `message/delta` wire exactly like
+/// [`MARKER`]; the actual exit decision is lifted off the final reply content
+/// via [`parse_exit_marker`] / [`strip_exit_directive`].
+const EXIT_MARKER: &str = "[[EXIT]]";
+
+/// Every in-band control marker held back from TTS / the delta wire. All share
+/// the `[[` opener; a trailing partial that could still grow into ANY of them is
+/// held back, and a full occurrence of any marks the start of the held region.
+/// Ordinary `[[…]]` notation (citations) matches none, so it is still spoken.
+const CONTROL_MARKERS: &[&str] = &[MARKER, EXIT_MARKER];
+
 /// Length in bytes of the longest suffix of `s` that is a non-empty prefix of
-/// [`MARKER`]. Those trailing chars are held back from TTS because the next
-/// streamed token might complete the marker. `MARKER` is ASCII, so any match is
-/// at a char boundary (safe to slice).
-fn marker_prefix_hold(s: &str) -> usize {
+/// `marker`. Both control markers are ASCII, so any match is at a char boundary
+/// (safe to slice).
+fn single_marker_prefix_hold(s: &str, marker: &str) -> usize {
     let sb = s.as_bytes();
-    let mb = MARKER.as_bytes();
+    let mb = marker.as_bytes();
     let max = mb.len().min(sb.len());
     (1..=max)
         .rev()
         .find(|&n| sb[sb.len() - n..] == mb[..n])
         .unwrap_or(0)
+}
+
+/// Length in bytes of the longest trailing partial that could still grow into
+/// ANY control marker — those chars are held back from TTS because the next
+/// streamed token might complete a marker.
+fn marker_prefix_hold(s: &str) -> usize {
+    CONTROL_MARKERS
+        .iter()
+        .map(|m| single_marker_prefix_hold(s, m))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Earliest byte index in `s` of a fully-present control-marker opener (visual
+/// or exit), or `None`. Everything from that index onward is held back.
+fn find_control_marker(s: &str) -> Option<usize> {
+    CONTROL_MARKERS.iter().filter_map(|m| s.find(m)).min()
 }
 
 /// Sentence chunking: strong boundaries (。！？!?…；;\n) always split; commas /
@@ -380,12 +410,12 @@ impl VoiceReplySplitter {
         self.full.push_str(token);
         self.pending.push_str(token);
 
-        if let Some(idx) = self.pending.find(MARKER) {
-            // A full `[[VISUAL:` appeared — treat everything from it onward as
-            // the (trailing) marker region and hold it back. Emit the speakable
-            // text before it; keep the unfinished pre-marker tail + the held
-            // region in `pending` (recovered in `finish` if it turns out not to
-            // be a real trailing marker).
+        if let Some(idx) = find_control_marker(&self.pending) {
+            // A full control marker (`[[VISUAL:` or `[[EXIT]]`) appeared — treat
+            // everything from it onward as the (trailing) marker region and hold
+            // it back. Emit the speakable text before it; keep the unfinished
+            // pre-marker tail + the held region in `pending` (recovered in
+            // `finish` if it turns out not to be a real trailing marker).
             let mut head = self.pending[..idx].to_string();
             let rest = self.pending[idx..].to_string();
             let out = drain_sentences(&mut head);
@@ -411,12 +441,20 @@ impl VoiceReplySplitter {
     /// speech so nothing is lost to a mid-reply `[[` or stray partial.
     pub(crate) fn finish(self) -> (Option<String>, Option<VisualDirective>) {
         let directive = parse_visual_marker(&self.full);
-        let speak = if directive.is_some() {
-            strip_visual_marker(&self.pending)
-        } else {
-            self.pending.as_str()
+        // Drop whichever REAL trailing control marker(s) the full reply carries
+        // from the spoken tail, so neither reaches TTS. A held-back region that
+        // turned out NOT to be a real trailing marker (a rare mid-reply `[[`) is
+        // left intact and recovered as speech. The visual directive is returned
+        // for dispatch; the exit marker's decision is lifted separately off the
+        // final content (`strip_exit_directive`).
+        let mut speak: &str = self.pending.as_str();
+        if directive.is_some() {
+            speak = strip_visual_marker(speak);
         }
-        .trim();
+        if parse_exit_marker(&self.full) {
+            speak = strip_exit_marker(speak);
+        }
+        let speak = speak.trim();
         let tail = if speak.is_empty() {
             None
         } else {
@@ -433,6 +471,32 @@ impl VoiceReplySplitter {
 pub(crate) fn strip_visual_marker(reply: &str) -> &str {
     if parse_visual_marker(reply).is_some() {
         let i = reply.rfind("[[VISUAL:").expect("trailing marker present");
+        reply[..i].trim_end()
+    } else {
+        reply
+    }
+}
+
+/// Whether the model reply carries a TRAILING `[[EXIT]]` control marker
+/// (UPCR-2026-025). Trailing-only: the marker must end the right-trimmed reply,
+/// so a mid-reply mention / quote of the syntax never triggers an exit (mirrors
+/// [`parse_visual_marker`]).
+pub(crate) fn parse_exit_marker(reply: &str) -> bool {
+    let trimmed = reply.trim_end();
+    match trimmed.rfind(EXIT_MARKER) {
+        Some(start) => start + EXIT_MARKER.len() == trimmed.len(),
+        None => false,
+    }
+}
+
+/// Drop a trailing `[[EXIT]]` marker, returning the speakable prefix. Only a
+/// TRAILING marker is stripped (consistent with [`parse_exit_marker`]); a
+/// mid-reply mention is left intact.
+pub(crate) fn strip_exit_marker(reply: &str) -> &str {
+    if parse_exit_marker(reply) {
+        let i = reply
+            .rfind(EXIT_MARKER)
+            .expect("trailing exit marker present");
         reply[..i].trim_end()
     } else {
         reply
@@ -489,6 +553,31 @@ pub(crate) fn strip_visual_directive(
     Some(directive)
 }
 
+/// Lift the trailing `[[EXIT]]` control marker out of the turn's authoritative
+/// reply surfaces and strip it in place, so the internal control protocol never
+/// reaches the WIRE (`message/delta`, `message/persisted`) or STORAGE (session
+/// JSONL). Strips both `content` (the final `response.content`) and every
+/// Assistant carrier in `messages` whose trailing marker matches. Returns `true`
+/// when a real trailing marker was found and removed (the caller then emits the
+/// typed `voice/exit` event), or `false` (leaving everything intact) otherwise.
+/// Mirrors [`strip_visual_directive`]; the client learns to leave the voice
+/// screen from the typed `voice/exit` event, not from the marker text.
+pub(crate) fn strip_exit_directive(content: &mut String, messages: &mut [Message]) -> bool {
+    if !parse_exit_marker(content) {
+        return false;
+    }
+    *content = strip_exit_marker(content).to_string();
+    for message in messages.iter_mut() {
+        if message.role == MessageRole::Assistant {
+            let stripped = strip_exit_marker(&message.content);
+            if stripped.len() != message.content.len() {
+                message.content = stripped.to_string();
+            }
+        }
+    }
+    true
+}
+
 /// Byte length of the marker-free visible prefix of `full`: everything up to a
 /// (possibly mid-reply) `[[VISUAL:` occurrence, else everything minus a trailing
 /// partial that could still grow into the marker. Trailing whitespace before
@@ -496,7 +585,7 @@ pub(crate) fn strip_visual_directive(
 /// so the preceding newline would otherwise leak as a blank line. Cut points
 /// fall on char boundaries (`MARKER` is ASCII; `trim_end` is boundary-safe).
 fn visible_prefix_len(full: &str) -> usize {
-    let cut = match full.find(MARKER) {
+    let cut = match find_control_marker(full) {
         Some(i) => i,
         None => full.len() - marker_prefix_hold(full),
     };
@@ -538,14 +627,17 @@ impl VisibleDeltaFilter {
     }
 
     /// End of stream: returns any held-back text that turned out NOT to be a
-    /// real trailing marker (a rare mid-reply `[[VISUAL:` quote), so nothing is
-    /// lost. A real trailing marker yields `""` (stays off the wire).
+    /// real trailing marker (a rare mid-reply `[[VISUAL:` / `[[EXIT]]` quote), so
+    /// nothing is lost. A real trailing control marker (visual or exit) yields
+    /// `""` for that span (stays off the wire).
     pub(crate) fn finish(self) -> String {
-        let visible = if parse_visual_marker(&self.full).is_some() {
-            strip_visual_marker(&self.full).len()
-        } else {
-            self.full.len()
-        };
+        let mut visible = self.full.len();
+        if parse_visual_marker(&self.full).is_some() {
+            visible = visible.min(strip_visual_marker(&self.full).len());
+        }
+        if parse_exit_marker(&self.full) {
+            visible = visible.min(strip_exit_marker(&self.full).len());
+        }
         if visible > self.emitted {
             self.full[self.emitted..visible].to_string()
         } else {
@@ -1407,5 +1499,121 @@ mod tests {
             remove_all_visual_markers("abc [[VISUAL:html|没闭合"),
             "abc "
         );
+    }
+
+    // ── voice exit intent (UPCR-2026-025) ─────────────────────────────────
+
+    #[test]
+    fn parse_exit_marker_requires_trailing_position() {
+        // Trailing marker (with trailing whitespace / newline) is accepted.
+        assert!(parse_exit_marker("好的，再见啦！\n[[EXIT]]"));
+        assert!(parse_exit_marker("拜拜。[[EXIT]]  \n"));
+        // A mid-reply mention / quote must NOT trigger an exit.
+        assert!(!parse_exit_marker("我说 [[EXIT]] 只是举个例子，然后继续。"));
+        // Absent.
+        assert!(!parse_exit_marker("普通口播回复，没有标记。"));
+    }
+
+    #[test]
+    fn strip_exit_marker_only_strips_trailing() {
+        assert_eq!(strip_exit_marker("再见啦。\n[[EXIT]]"), "再见啦。");
+        // Mid-reply mention is left intact (not truncated).
+        let mid = "用 [[EXIT]] 举例，然后继续。";
+        assert_eq!(strip_exit_marker(mid), mid);
+        // No marker → unchanged.
+        assert_eq!(strip_exit_marker("纯口播没有标记"), "纯口播没有标记");
+    }
+
+    #[test]
+    fn strip_exit_directive_strips_content_and_assistant_carriers() {
+        let mut content = "好的，再见！\n[[EXIT]]".to_string();
+        let mut messages = vec![
+            Message::user("再见".to_string()),
+            Message::assistant("好的，再见！\n[[EXIT]]".to_string()),
+        ];
+        assert!(strip_exit_directive(&mut content, &mut messages));
+        assert_eq!(content, "好的，再见！");
+        assert_eq!(messages[1].content, "好的，再见！");
+        assert_eq!(messages[0].content, "再见");
+    }
+
+    #[test]
+    fn strip_exit_directive_noop_without_trailing_marker() {
+        let mut content = "用 [[EXIT]] 举例。".to_string();
+        let mut messages = vec![Message::assistant(content.clone())];
+        assert!(!strip_exit_directive(&mut content, &mut messages));
+        assert!(content.contains("[[EXIT]]"));
+    }
+
+    #[test]
+    fn splitter_holds_back_exit_marker_from_tts_even_when_token_split() {
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        // The exit marker streams in as several chunks; none may leak to TTS.
+        for tok in ["好的，", "再见啦！\n", "[[EX", "IT]]"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+                spoken.push('\n');
+            }
+        }
+        let (tail, directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("再见啦"));
+        assert!(
+            !spoken.contains("EXIT"),
+            "marker must never reach TTS: {spoken:?}"
+        );
+        assert!(!spoken.contains("[["), "no bracket leak: {spoken:?}");
+        // The splitter returns no visual directive for an exit-only reply.
+        assert!(directive.is_none());
+    }
+
+    #[test]
+    fn visible_delta_filter_hides_trailing_exit_marker() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["再见", "啦。", "\n[[EX", "IT]]"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "再见啦。");
+    }
+
+    #[test]
+    fn visible_delta_filter_recovers_false_exit_marker_on_finish() {
+        // A mid-reply `[[EXIT]]` quote is NOT a trailing marker → recovered.
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["用 ", "[[EXIT]]", " 举例。"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "用 [[EXIT]] 举例。");
+    }
+
+    #[test]
+    fn ordinary_double_bracket_still_reaches_tts_with_exit_marker_added() {
+        // Regression: generalizing the hold-back to the control-marker SET must
+        // not suppress ordinary `[[1]]` citations — they are a prefix of neither
+        // `[[VISUAL:` nor `[[EXIT]]` past the shared `[[`.
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for tok in ["看这个 [[1]] 参考。", "后面还有内容。"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+            }
+        }
+        let (tail, _directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("看这个"));
+        assert!(
+            spoken.contains("[[1]]"),
+            "citation must still be spoken: {spoken:?}"
+        );
+        assert!(spoken.contains("后面还有内容"));
     }
 }
