@@ -48,7 +48,8 @@ use octos_agent::BackgroundResultPayload;
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     FileAttachedEvent, SessionEventBridgedEvent, TurnCompletedEvent, TurnId, TurnSessionResult,
-    TurnStartedEvent, UiNotification,
+    TurnStartedEvent, UiNotification, VisualFailedEvent, VisualGeneratingEvent,
+    VisualSucceededEvent,
 };
 use serde_json::Value;
 
@@ -302,6 +303,70 @@ pub(super) fn emit_files_attached_from_background(
             mime,
         );
     }
+}
+
+/// #1477 voice rich output: announce that a background visual artifact began
+/// generating, so the client can show a "generating" placeholder driven by this
+/// typed event instead of scraping an in-band marker out of the assistant text.
+/// Routed on the BASE session key (like [`emit_files_attached_from_background`])
+/// while still carrying the topic so topic-scoped subscribers accept it.
+pub(super) fn emit_visual_generating_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    kind: &str,
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualGenerating(VisualGeneratingEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        kind: kind.to_owned(),
+    }));
+}
+
+/// #1477 voice rich output: the background visual task produced its artifact(s).
+/// The structured success counterpart of
+/// [`emit_visual_generating_from_background`] — the client clears the
+/// "generating" placeholder off THIS, keeping the visual lifecycle decoupled
+/// from `file/attached` (emitted alongside it, NOT in place of it). `files` are
+/// the workspace-relative artifact names, same as the accompanying
+/// `file/attached`.
+pub(super) fn emit_visual_succeeded_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    kind: &str,
+    files: &[String],
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualSucceeded(VisualSucceededEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        kind: kind.to_owned(),
+        files: files.to_vec(),
+    }));
+}
+
+/// #1477 voice rich output: the background visual task failed / timed out, so
+/// the client should clear the "generating" placeholder.
+pub(super) fn emit_visual_failed_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    reason: Option<String>,
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualFailed(VisualFailedEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        reason,
+    }));
 }
 
 /// Lightweight extension-based MIME sniffer used by

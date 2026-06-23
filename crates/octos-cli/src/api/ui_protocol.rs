@@ -18355,7 +18355,18 @@ async fn run_standalone_turn(
         // ask for short, speakable answers. Text chat (had_audio_input == false)
         // keeps its normal detailed/formatted persona — this branch never runs there.
         prompt = format!(
-            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。]"
+            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。\
+             \n若(且仅若)可视化更能帮助用户理解——例如他想『看到/画出/演示/直观理解』某个结构性、空间性或图示性的东西(电路、波形、数学曲线、流程、UI 草图等)——\
+             在口播正文之后【另起一行】追加一个标记:[[VISUAL:kind|brief]]。\
+             按【用户的认知需求】选 kind:\
+             html=纯动态/可调交互、靠动手玩参数理解、不需要看实物的样子(电路、波形、数学曲线、流程、算法);\
+             illustrated=既要看清实物真实样子、又要交互讲解/标注的结构性内容(细胞、器官、动植物、解剖、天体、机械构造等)——系统会先生成写实插图再叠加交互标注;\
+             image=只要一张写实或艺术单图(某物长什么样、画作);\
+             infographic=多段并列要点/步骤的信息图。\
+             brief 是给生成器的一句话简述。\
+             普通问答/闲聊/事实回答【不要】加标记。\
+             示例1:用户说『我想直观看到负反馈电路如何负反馈』→ 口播『我给你画一个可调增益的负反馈电路,你可以拖滑块看输出怎么被拉回来。』,然后另起一行:[[VISUAL:html|可调增益的负反馈电路交互演示,滑块调增益,实时显示反馈如何稳定输出]]\
+             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]]"
         );
         // The audio is now in the prompt as text. Drop it from the
         // agent-visible media so the model answers the transcript directly
@@ -18419,6 +18430,12 @@ async fn run_standalone_turn(
     // most one final response and we only need it once in the post-turn
     // block.
     let (final_reply_tx, final_reply_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    // Voice rich output (#1477): the agent task lifts the trailing in-band
+    // `[[VISUAL:...]]` directive out of `response.content` (and strips it from
+    // every authoritative surface) and hands it here for the post-turn
+    // background dispatch. `None` for text turns or replies without a marker.
+    let (visual_directive_tx, visual_directive_rx) =
+        tokio::sync::oneshot::channel::<Option<crate::api::voice_turn::VisualDirective>>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -18479,7 +18496,26 @@ async fn run_standalone_turn(
         }
 
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
+                // Voice rich output (#1477): lift the trailing in-band
+                // `[[VISUAL:...]]` directive out of the reply and strip it from
+                // `response.content` AND every Assistant carrier in
+                // `response.messages` BEFORE capture / persist / done, so the
+                // internal control protocol never reaches the wire
+                // (`message/delta` from `done`, `message/persisted`) or storage
+                // (session JSONL). The directive is dispatched post-turn from the
+                // oneshot below; the client learns a visual is coming from the
+                // typed `visual/generating` event. Gated on voice turns. No-op
+                // (returns `None`, mutates nothing) without a real trailing marker.
+                let visual_directive = if had_audio_input {
+                    crate::api::voice_turn::strip_visual_directive(
+                        &mut response.content,
+                        &mut response.messages,
+                    )
+                } else {
+                    None
+                };
+                let _ = visual_directive_tx.send(visual_directive);
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -19033,6 +19069,8 @@ async fn run_standalone_turn(
                 // back to the session-history scan, matching the
                 // pre-#1134 behaviour.
                 let _ = final_reply_tx.send(None);
+                // No reply → no rich-output directive to dispatch.
+                let _ = visual_directive_tx.send(None);
                 // Codex round-2 MAJOR 2: prefer the typed user-actionable
                 // message over the raw LLM Display string. The agent
                 // loop's classifier (`HarnessError::classify_report` at
@@ -19076,38 +19114,26 @@ async fn run_standalone_turn(
     // streams `token` events, instead of waiting for the whole reply. A FIFO
     // worker keeps the emitted audio ordered without blocking this loop. All
     // gated on `had_audio_input`, so text chat is untouched.
-    fn drain_voice_sentences(buf: &mut String) -> Vec<String> {
-        // Strong boundaries always split; commas (soft) split once the segment is
-        // long enough (>=8 chars) so the first audio comes out fast. Now that
-        // few-shot synthesis keeps comma-fragments free of the "啊/哦" filler
-        // (that was zero-shot, not chunking), comma-splitting buys ~1s lower
-        // first-audio latency vs whole-sentence without the artifacts.
-        const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
-        const SOFT: &[char] = &['，', ',', '、'];
-        const SOFT_MIN_CHARS: usize = 8;
-        let mut out = Vec::new();
-        loop {
-            let mut cut = None;
-            for (count, (i, c)) in buf.char_indices().enumerate() {
-                if STRONG.contains(&c) || (SOFT.contains(&c) && count + 1 >= SOFT_MIN_CHARS) {
-                    cut = Some(i + c.len_utf8());
-                    break;
-                }
-            }
-            match cut {
-                Some(idx) => {
-                    let sentence = buf[..idx].trim().to_string();
-                    *buf = buf[idx..].to_string();
-                    if !sentence.is_empty() {
-                        out.push(sentence);
-                    }
-                }
-                None => break,
-            }
-        }
-        out
-    }
-    let mut voice_buf = String::new();
+    // Voice turn: a `VoiceReplySplitter` feeds complete sentences to the TTS
+    // worker AS tokens stream, while holding back any trailing in-band
+    // `[[VISUAL:kind|brief]]` marker so it never reaches TTS. Sentence-splitting
+    // lives in `voice_turn::VoiceReplySplitter` (unit-tested). The rich-output
+    // directive is parsed later from the authoritative final reply (not the
+    // splitter), so it is robust whether or not the reply was streamed.
+    let mut voice_splitter = if had_audio_input {
+        Some(crate::api::voice_turn::VoiceReplySplitter::new())
+    } else {
+        None
+    };
+    // Voice turn: marker-aware UI delta filter (#1477). Streams the reply to the
+    // chat bubble token-by-token while holding back the trailing
+    // `[[VISUAL:...]]` marker, so the live `message/delta` wire never carries the
+    // internal control protocol (durable surfaces are stripped in the agent task).
+    let mut voice_delta_filter = if had_audio_input {
+        Some(crate::api::voice_turn::VisibleDeltaFilter::new())
+    } else {
+        None
+    };
     let mut voice_streamed_count: usize = 0;
     let (voice_tx, voice_handle) = if had_audio_input {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -19279,19 +19305,44 @@ async fn run_standalone_turn(
                 break;
             }
             _ => {
-                // Voice turn: accumulate streamed `token` text and hand off
-                // each complete sentence to the FIFO TTS worker for immediate
-                // synthesis (overlaps with the rest of LLM generation).
-                if let Some(ref tx) = voice_tx {
+                // Voice turn: accumulate streamed `token` text and hand off each
+                // complete sentence to the FIFO TTS worker for immediate synthesis,
+                // AND emit the same text — minus the trailing `[[VISUAL:...]]`
+                // marker — as the UI `message/delta`, then SKIP the generic token
+                // forward so the raw marker never reaches the wire (#1477).
+                if let (Some(tx), Some(sp), Some(uf)) = (
+                    voice_tx.as_ref(),
+                    voice_splitter.as_mut(),
+                    voice_delta_filter.as_mut(),
+                ) {
                     if event.get("type").and_then(Value::as_str) == Some("token") {
                         if let Some(t) = event.get("text").and_then(Value::as_str) {
-                            voice_buf.push_str(t);
-                            for sentence in drain_voice_sentences(&mut voice_buf) {
+                            for sentence in sp.push(t) {
                                 if tx.try_send(sentence).is_ok() {
                                     voice_streamed_count += 1;
                                 }
                             }
+                            let visible = uf.push(t);
+                            if !visible.is_empty() {
+                                // #1477 P2: dual-emit the canonical envelope so
+                                // projection.envelope.v1 clients also receive the
+                                // voice delta — a bare ephemeral send is filtered
+                                // out for them. Mirrors forward_progress_event's
+                                // MessageDelta handling (emit envelope, then legacy).
+                                let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                                    session_id: session_id.clone(),
+                                    topic: None,
+                                    turn_id: turn_id.clone(),
+                                    text: visible,
+                                });
+                                emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+                                let _ = send_notification_ephemeral(&ws, &ledger, delta);
+                                saw_delta = true;
+                            }
                         }
+                        // Token handled for this voice turn — do NOT forward the
+                        // raw token (it may carry the in-band marker).
+                        continue;
                     }
                 }
                 forward_progress_event(
@@ -19309,13 +19360,38 @@ async fn run_standalone_turn(
         }
     }
 
-    // Voice turn: flush the trailing partial sentence, close the channel, and
-    // wait for the FIFO TTS worker to finish emitting all sentence audio.
+    // Voice turn: flush the trailing partial sentence (marker already held back
+    // by the splitter), close the channel, and wait for the FIFO TTS worker.
     if let Some(tx) = voice_tx {
-        if !interrupt_observed {
-            let tail = voice_buf.trim().to_string();
-            if !tail.is_empty() && tx.try_send(tail).is_ok() {
-                voice_streamed_count += 1;
+        if let Some(sp) = voice_splitter.take() {
+            let (tail, _directive) = sp.finish();
+            if !interrupt_observed {
+                if let Some(t) = tail {
+                    if tx.try_send(t).is_ok() {
+                        voice_streamed_count += 1;
+                    }
+                }
+            }
+        }
+        // Flush any held UI text the marker-aware filter retained that turned out
+        // NOT to be a real trailing marker (rare mid-reply `[[VISUAL:`); a genuine
+        // trailing marker yields nothing so it never reaches the wire (#1477).
+        if let Some(uf) = voice_delta_filter.take() {
+            if !interrupt_observed {
+                let recovered = uf.finish();
+                if !recovered.is_empty() {
+                    // #1477 P2: dual-emit the envelope (see the streaming path
+                    // above) so projection.envelope.v1 clients also get the
+                    // recovered tail delta.
+                    let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                        session_id: session_id.clone(),
+                        topic: None,
+                        turn_id: turn_id.clone(),
+                        text: recovered,
+                    });
+                    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+                    let _ = send_notification_ephemeral(&ws, &ledger, delta);
+                }
             }
         }
         drop(tx);
@@ -19505,6 +19581,258 @@ async fn run_standalone_turn(
     // half is guaranteed to be either delivered or dropped — this
     // `await` will not block.
     let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
+    // Voice rich output (#1477): the directive was lifted + stripped inside the
+    // agent task; receive it here (`None` for text turns / replies with no
+    // marker). `final_response_content` is now the clean spoken reply (marker
+    // already gone), so it doubles as the HTML author's "spoken_reply" context.
+    let visual_directive = visual_directive_rx.await.ok().flatten();
+
+    // Voice rich output: dispatch the in-band [[VISUAL]] directive.
+    // HTML → a focused tool-less LLM call (rich_output); image-class → a
+    // backend-orchestrated mofa skill. Fire-and-forget: the artifact arrives
+    // async via the same `files_attached` channel as the reply audio, so the
+    // turn completes while the client shows a "generating" state. The client is
+    // told a visual is coming by the typed `visual/generating` event below (no
+    // in-band marker is on the wire). The model emits no tool call, so the
+    // Gemini-3 thought_signature path never arises.
+    if had_audio_input && !interrupt_observed {
+        if let Some(directive) = visual_directive {
+            use crate::api::voice_turn::VisualKind;
+            // Tell the client a visual is generating (typed signal, replaces the
+            // old in-band-marker scrape). The lifecycle terminates on the typed
+            // `visual/succeeded` or `visual/failed` (below) — never on
+            // `file/attached`, which is a pure artifact-delivery signal.
+            super::ui_protocol_alpha9_bridge::emit_visual_generating_from_background(
+                &ledger,
+                &session_id,
+                &turn_id,
+                directive.kind.as_str(),
+            );
+            // #1477 P2: register the visual generation as a SUPERVISED background
+            // task (not a bare detached spawn) so it is observable in the admin
+            // dashboard, carries terminal status, and is cancelable — both via
+            // the session interrupt path (`cancel_session_spawn_only_tasks`) and
+            // its own cancel token, which the worker races below.
+            let r_supervisor = tool_registry.supervisor();
+            let r_task_call_id = format!("voice-visual-{}", uuid::Uuid::now_v7());
+            // Register under the FULL session key (incl. any `#topic` /
+            // profile dimension), NOT `base_key()`: the interrupt path queries
+            // `get_tasks_for_session(&session_id.to_string())` with an EXACT
+            // string match (`cancel_session_spawn_only_tasks`). A `base_key()`
+            // registration would file the task under `…web-123` while the
+            // interrupt of `…web-123#voice` looks for the full key and miss it.
+            // Using the full key also means an interrupt cancels only THIS
+            // topic's visual task, never a sibling topic's.
+            let r_task_id =
+                r_supervisor.register("voice_visual", &r_task_call_id, Some(session_id.0.as_str()));
+            let r_cancel = r_supervisor.cancel_token(&r_task_id);
+            let r_ledger = ledger.clone();
+            let r_session = session_id.clone();
+            let r_turn = turn_id.clone();
+            let r_dir = session_runtime.workspace_root.clone();
+            let r_provider = llm_provider.clone();
+            let r_registry = tool_registry.clone();
+            let r_transcript = voice_transcripts.join("\n");
+            let r_spoken = final_response_content.clone().unwrap_or_default();
+            // This turn's camera frame(s) → forwarded to the Illustrated path as
+            // reference images so the generated illustration depicts the real
+            // subject in front of the camera. Gated on the EXPLICIT live-video
+            // signal (#1478), consistent with the loop_runner video-call note —
+            // never inferred from "there's an image attached" (a voice note +
+            // uploaded image is not a live camera frame).
+            let r_ref_images: Vec<String> = if params.live_video {
+                asr_media
+                    .iter()
+                    .filter(|p| octos_bus::media::is_image(p))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            tracing::info!(
+                kind = ?directive.kind,
+                brief = %directive.brief,
+                // Diagnostics for camera-frame grounding: `live_video` is the
+                // explicit signal from the client; `ref_images` is how many
+                // camera frames are forwarded to the illustration generator.
+                // Both 0/false here means the generated image cannot be
+                // grounded on the real subject in front of the camera.
+                live_video = params.live_video,
+                ref_images = r_ref_images.len(),
+                "voice rich: dispatching visual directive"
+            );
+            tokio::spawn(async move {
+                r_supervisor.mark_running(&r_task_id);
+                // Capture the kind token before `produce` consumes `directive`
+                // (its `brief` is moved into the skill calls); needed for the
+                // typed `visual/succeeded` on the success branch.
+                let r_kind = directive.kind.as_str();
+                // #1477 P2: bound the background visual task. Image generation +
+                // HTML authoring are network/LLM calls with no other ceiling on
+                // this detached path, so cap them so a hung skill / provider
+                // cannot leak a task for the process lifetime. On timeout we
+                // deliver nothing (observable via the warn below), matching the
+                // other failure branches.
+                const VISUAL_DISPATCH_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(180);
+                let produce = async {
+                    let rels: Vec<String> = match directive.kind {
+                        VisualKind::Html => {
+                            let ctx = octos_agent::rich_output::RichHtmlContext {
+                                transcript: r_transcript,
+                                spoken_reply: r_spoken,
+                                brief: directive.brief,
+                                illustration: false,
+                            };
+                            match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx)
+                                .await
+                            {
+                                Ok(html) => {
+                                    let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                    match tokio::fs::write(r_dir.join(&name), html).await {
+                                        Ok(()) => vec![name],
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "voice rich: html write failed");
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice rich: author_html failed");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        VisualKind::Illustrated => {
+                            // Stage 1: generate a realistic illustration PNG.
+                            let png_bytes = match crate::api::voice_turn::run_illustration_image(
+                                &r_registry,
+                                &directive.brief,
+                                &r_dir,
+                                &r_ref_images,
+                            )
+                            .await
+                            {
+                                Some(p) => tokio::fs::read(&p).await.ok(),
+                                None => None,
+                            };
+                            // Stage 2: author HTML that embeds it (model uses the
+                            // placeholder src), then inline the PNG as a data URI so
+                            // the artifact is a single self-contained file. If image
+                            // gen failed, fall back to a no-illustration document.
+                            let ctx = octos_agent::rich_output::RichHtmlContext {
+                                transcript: r_transcript,
+                                spoken_reply: r_spoken,
+                                brief: directive.brief,
+                                illustration: png_bytes.is_some(),
+                            };
+                            match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx)
+                                .await
+                            {
+                                Ok(html) => {
+                                    let html = match png_bytes {
+                                        Some(bytes) => {
+                                            octos_agent::rich_output::inline_illustration(
+                                                &html, &bytes,
+                                            )
+                                        }
+                                        None => html,
+                                    };
+                                    let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                    match tokio::fs::write(r_dir.join(&name), html).await {
+                                        Ok(()) => vec![name],
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "voice rich: html write failed");
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice rich: author_html (illustrated) failed");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        VisualKind::Image | VisualKind::Infographic => {
+                            crate::api::voice_turn::run_image_skill(&r_registry, &directive, &r_dir)
+                                .await
+                        }
+                    };
+                    rels
+                };
+                // Race the work against the task's cancel token (fired by the
+                // session interrupt path) and the timeout. Each terminal branch
+                // reports its OWN reason so the supervisor row + `visual/failed`
+                // distinguish cancellation, timeout, and a clean-but-empty
+                // result (rather than folding all three into one message).
+                let rels = tokio::select! {
+                    biased;
+                    _ = r_cancel.cancelled() => {
+                        tracing::info!("voice rich: visual dispatch cancelled");
+                        r_supervisor.mark_failed(&r_task_id, "cancelled".to_owned());
+                        super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                            &r_ledger,
+                            &r_session,
+                            &r_turn,
+                            Some("cancelled".to_owned()),
+                        );
+                        return;
+                    }
+                    res = tokio::time::timeout(VISUAL_DISPATCH_TIMEOUT, produce) => match res {
+                        Ok(rels) => rels,
+                        Err(_) => {
+                            let reason =
+                                format!("timed out after {}s", VISUAL_DISPATCH_TIMEOUT.as_secs());
+                            tracing::warn!(
+                                timeout_s = VISUAL_DISPATCH_TIMEOUT.as_secs(),
+                                "voice rich: visual dispatch timed out, delivering nothing"
+                            );
+                            r_supervisor.mark_failed(&r_task_id, reason.clone());
+                            super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                                &r_ledger,
+                                &r_session,
+                                &r_turn,
+                                Some(reason),
+                            );
+                            return;
+                        }
+                    }
+                };
+                if rels.is_empty() {
+                    tracing::warn!("voice rich: produced no artifact to deliver");
+                    r_supervisor.mark_failed(&r_task_id, "produced no artifact".to_owned());
+                    // Clear the client's "generating" placeholder (#1477).
+                    super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                        &r_ledger,
+                        &r_session,
+                        &r_turn,
+                        Some("visual generation produced no artifact".to_owned()),
+                    );
+                } else {
+                    tracing::info!(files = ?rels, "voice rich: delivering artifact(s)");
+                    r_supervisor.mark_completed(&r_task_id, rels.clone());
+                    // Deliver the artifact(s) AND emit the typed success signal.
+                    // `file/attached` stays a pure artifact-delivery event; the
+                    // visual lifecycle terminates on `visual/succeeded` (#1477),
+                    // so the client never has to infer success from a file
+                    // extension — and the lifecycle survives a future
+                    // `projection.envelope.v1` cutover that supersedes
+                    // `file/attached`.
+                    super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                        &r_ledger,
+                        &r_session,
+                        &r_turn,
+                        &rels,
+                        &[],
+                        None,
+                    );
+                    super::ui_protocol_alpha9_bridge::emit_visual_succeeded_from_background(
+                        &r_ledger, &r_session, &r_turn, r_kind, &rels,
+                    );
+                }
+            });
+        }
+    }
 
     // ── 语音轮 TTS（serve 路径）────────────────────────────────────
     // 仅当本轮有音频输入（语音轮）时，把最终文本回复合成为音频并下发，
@@ -19519,6 +19847,10 @@ async fn run_standalone_turn(
     // path above produced no audio (e.g. a reply with no sentence boundaries).
     if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
+            // Strip any in-band [[VISUAL:...]] marker so the fallback synth does
+            // not read the marker aloud (the streamed path's splitter already
+            // does this; this is the no-sentence-boundary fallback).
+            let reply = crate::api::voice_turn::strip_visual_marker(reply);
             // Per-tenant reply voice: live override wins, else profile default.
             let voice = crate::api::voices::resolve_reply_voice(
                 &session_runtime.profile.profile_id,
@@ -22542,6 +22874,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // future addition forces an explicit decision here.
             UiNotification::TurnStarted(_)
             | UiNotification::MessageDelta(_)
+            | UiNotification::VisualGenerating(_)
+            | UiNotification::VisualSucceeded(_)
+            | UiNotification::VisualFailed(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)

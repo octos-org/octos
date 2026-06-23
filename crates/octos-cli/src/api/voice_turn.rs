@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use octos_core::{Message, MessageRole};
 use octos_llm::ominix::OminixClient;
 
 /// 解析 OminiX 服务基址（平台级，env 优先）。与 `api/admin.rs` 的同名 helper 等价；
@@ -228,6 +229,438 @@ pub(crate) fn clean_for_tts(text: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+// ── Voice-turn rich output (in-band `[[VISUAL:kind|brief]]` marker) ────────
+//
+// The fast turn may append a marker after the spoken reply when the model
+// decides a visual would help. The backend parses it and dispatches: `html`
+// goes to a focused tool-less LLM authoring call (octos-agent `rich_output`),
+// the rest to mofa skills. The model never emits a tool call, sidestepping the
+// Gemini-3 thought_signature 400.
+
+/// Rich-output kind. `Html` goes to the focused LLM authoring call; the rest
+/// go to mofa skills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisualKind {
+    Html,
+    /// Realistic illustration embedded inside interactive HTML (two-stage:
+    /// `mofa_image` generates a PNG → inlined into an `author_html` document).
+    Illustrated,
+    Image,
+    Infographic,
+}
+
+impl VisualKind {
+    fn from_token(s: &str) -> Option<Self> {
+        match s.trim() {
+            "html" => Some(Self::Html),
+            "illustrated" => Some(Self::Illustrated),
+            "image" => Some(Self::Image),
+            "infographic" => Some(Self::Infographic),
+            _ => None,
+        }
+    }
+
+    /// Wire token for the `visual/generating` event (`kind` field).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Illustrated => "illustrated",
+            Self::Image => "image",
+            Self::Infographic => "infographic",
+        }
+    }
+}
+
+/// A parsed in-band rich-output directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisualDirective {
+    pub kind: VisualKind,
+    pub brief: String,
+}
+
+/// Parse a trailing `[[VISUAL:kind|brief]]` marker from the model reply.
+/// Returns `None` (treat as a plain spoken reply) when absent, the kind is
+/// unrecognized, the marker is malformed, or the brief is empty.
+pub(crate) fn parse_visual_marker(reply: &str) -> Option<VisualDirective> {
+    // The marker is appended AFTER the spoken reply, so only accept it when its
+    // closing `]]` ends the (right-trimmed) reply. This stops a mid-reply
+    // mention or quote of the `[[VISUAL:...]]` syntax from triggering an artifact.
+    let trimmed = reply.trim_end();
+    let start = trimmed.rfind("[[VISUAL:")?;
+    let after = &trimmed[start + "[[VISUAL:".len()..];
+    let end = after.find("]]")?;
+    if start + "[[VISUAL:".len() + end + "]]".len() != trimmed.len() {
+        return None; // not the trailing marker
+    }
+    let body = &after[..end];
+    let (kind_tok, brief) = body.split_once('|')?;
+    let kind = VisualKind::from_token(kind_tok)?;
+    let brief = brief.trim().to_string();
+    if brief.is_empty() {
+        return None;
+    }
+    Some(VisualDirective { kind, brief })
+}
+
+/// The in-band marker opener. Streaming holds back only text that is — or could
+/// still grow into — this exact prefix, **not** any `[[`, so ordinary bracket
+/// notation (e.g. a `[[1]]` citation) never suppresses the rest of the TTS.
+const MARKER: &str = "[[VISUAL:";
+
+/// Length in bytes of the longest suffix of `s` that is a non-empty prefix of
+/// [`MARKER`]. Those trailing chars are held back from TTS because the next
+/// streamed token might complete the marker. `MARKER` is ASCII, so any match is
+/// at a char boundary (safe to slice).
+fn marker_prefix_hold(s: &str) -> usize {
+    let sb = s.as_bytes();
+    let mb = MARKER.as_bytes();
+    let max = mb.len().min(sb.len());
+    (1..=max)
+        .rev()
+        .find(|&n| sb[sb.len() - n..] == mb[..n])
+        .unwrap_or(0)
+}
+
+/// Sentence chunking: strong boundaries (。！？!?…；;\n) always split; commas /
+/// ideographic commas (soft) split once the segment is >=8 chars (faster first
+/// audio). Returns the complete sentences; `buf` keeps the unfinished tail.
+/// Module-level twin of the `ui_protocol` inline version, used by
+/// [`VoiceReplySplitter`] and unit tests.
+fn drain_sentences(buf: &mut String) -> Vec<String> {
+    const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
+    const SOFT: &[char] = &['，', ',', '、'];
+    const SOFT_MIN_CHARS: usize = 8;
+    let mut out = Vec::new();
+    loop {
+        let mut cut = None;
+        for (count, (i, c)) in buf.char_indices().enumerate() {
+            if STRONG.contains(&c) || (SOFT.contains(&c) && count + 1 >= SOFT_MIN_CHARS) {
+                cut = Some(i + c.len_utf8());
+                break;
+            }
+        }
+        match cut {
+            Some(idx) => {
+                let sentence = buf[..idx].trim().to_string();
+                *buf = buf[idx..].to_string();
+                if !sentence.is_empty() {
+                    out.push(sentence);
+                }
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Streams speakable text apart from a trailing `[[VISUAL:...]]` marker. Once
+/// `[[` appears, everything from there on is held back from TTS (it may be the
+/// marker); at the end the directive is parsed from the accumulated full text.
+pub(crate) struct VoiceReplySplitter {
+    /// Text seen but not yet emitted to TTS. Speakable sentences are drained
+    /// from its front each push; a (possibly partial) trailing marker is held
+    /// back here until `finish` decides whether it was a real marker.
+    pending: String,
+    /// All text seen so far (used to parse the trailing marker on `finish`).
+    full: String,
+}
+
+impl VoiceReplySplitter {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: String::new(),
+            full: String::new(),
+        }
+    }
+
+    /// Feed a streamed token; returns the complete sentences ready for TTS now.
+    pub(crate) fn push(&mut self, token: &str) -> Vec<String> {
+        self.full.push_str(token);
+        self.pending.push_str(token);
+
+        if let Some(idx) = self.pending.find(MARKER) {
+            // A full `[[VISUAL:` appeared — treat everything from it onward as
+            // the (trailing) marker region and hold it back. Emit the speakable
+            // text before it; keep the unfinished pre-marker tail + the held
+            // region in `pending` (recovered in `finish` if it turns out not to
+            // be a real trailing marker).
+            let mut head = self.pending[..idx].to_string();
+            let rest = self.pending[idx..].to_string();
+            let out = drain_sentences(&mut head);
+            self.pending = head;
+            self.pending.push_str(&rest);
+            return out;
+        }
+
+        // No full marker yet: hold back only a trailing partial that could still
+        // grow into `[[VISUAL:` (not arbitrary `[[`); drain the rest.
+        let hold = marker_prefix_hold(&self.pending);
+        let split = self.pending.len() - hold;
+        let mut head = self.pending[..split].to_string();
+        let held = self.pending[split..].to_string();
+        let out = drain_sentences(&mut head);
+        self.pending = head;
+        self.pending.push_str(&held);
+        out
+    }
+
+    /// End of stream: returns the remaining speakable tail + parsed directive.
+    /// If no real trailing marker parsed, any held-back text is recovered as
+    /// speech so nothing is lost to a mid-reply `[[` or stray partial.
+    pub(crate) fn finish(self) -> (Option<String>, Option<VisualDirective>) {
+        let directive = parse_visual_marker(&self.full);
+        let speak = if directive.is_some() {
+            strip_visual_marker(&self.pending)
+        } else {
+            self.pending.as_str()
+        }
+        .trim();
+        let tail = if speak.is_empty() {
+            None
+        } else {
+            Some(speak.to_string())
+        };
+        (tail, directive)
+    }
+}
+
+/// Drop a trailing `[[VISUAL:...]]` marker, returning the speakable prefix. For
+/// the **non-streamed fallback** (whole-reply synth) so the marker isn't read
+/// aloud as text. Only a TRAILING marker is stripped (consistent with
+/// [`parse_visual_marker`]); a mid-reply mention is left intact.
+pub(crate) fn strip_visual_marker(reply: &str) -> &str {
+    if parse_visual_marker(reply).is_some() {
+        let i = reply.rfind("[[VISUAL:").expect("trailing marker present");
+        reply[..i].trim_end()
+    } else {
+        reply
+    }
+}
+
+/// Remove EVERY `[[VISUAL:...]]` span from `s` (not just a trailing one).
+///
+/// Unlike [`strip_visual_marker`] (which only drops a trailing directive and
+/// preserves a mid-text mention), this scrubs the marker wherever it appears —
+/// used for sanitizing free-form text that may have folded a marker in at an
+/// arbitrary position, e.g. a pre-fix compaction summary. An unterminated
+/// `[[VISUAL:` drops the remainder.
+pub(crate) fn remove_all_visual_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("[[VISUAL:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find("]]") {
+            Some(end) => rest = &after[end + "]]".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Lift the trailing `[[VISUAL:...]]` directive out of the turn's authoritative
+/// reply surfaces and strip it in place, so the internal control protocol never
+/// reaches the WIRE (`message/delta` from `done`, `message/persisted`) or
+/// STORAGE (session JSONL). Strips both `content` (the final `response.content`)
+/// and every Assistant carrier in `messages` that ends with the same trailing
+/// marker. Returns the parsed directive for background dispatch, or `None` (and
+/// leaves everything intact) when there is no real trailing marker. The frontend
+/// learns a visual is coming from the typed `visual/generating` event instead.
+pub(crate) fn strip_visual_directive(
+    content: &mut String,
+    messages: &mut [Message],
+) -> Option<VisualDirective> {
+    let directive = parse_visual_marker(content)?;
+    *content = strip_visual_marker(content).to_string();
+    for message in messages.iter_mut() {
+        if message.role == MessageRole::Assistant {
+            let stripped = strip_visual_marker(&message.content);
+            if stripped.len() != message.content.len() {
+                message.content = stripped.to_string();
+            }
+        }
+    }
+    Some(directive)
+}
+
+/// Byte length of the marker-free visible prefix of `full`: everything up to a
+/// (possibly mid-reply) `[[VISUAL:` occurrence, else everything minus a trailing
+/// partial that could still grow into the marker. Trailing whitespace before
+/// that cut is also held back — the marker convention puts it on its own line,
+/// so the preceding newline would otherwise leak as a blank line. Cut points
+/// fall on char boundaries (`MARKER` is ASCII; `trim_end` is boundary-safe).
+fn visible_prefix_len(full: &str) -> usize {
+    let cut = match full.find(MARKER) {
+        Some(i) => i,
+        None => full.len() - marker_prefix_hold(full),
+    };
+    full[..cut].trim_end().len()
+}
+
+/// Token-granular twin of [`VoiceReplySplitter`] for the **UI message delta**
+/// stream of a voice turn: emits the reply text token-by-token while holding
+/// back any trailing (or still-forming) `[[VISUAL:...]]` marker, so the live
+/// `message/delta` wire never carries the internal control protocol (the
+/// durable surfaces are stripped separately by [`strip_visual_directive`]).
+pub(crate) struct VisibleDeltaFilter {
+    /// All text seen so far.
+    full: String,
+    /// Byte count already emitted as deltas (monotonic).
+    emitted: usize,
+}
+
+impl VisibleDeltaFilter {
+    pub(crate) fn new() -> Self {
+        Self {
+            full: String::new(),
+            emitted: 0,
+        }
+    }
+
+    /// Feed a streamed token; returns the newly-visible marker-free text to emit
+    /// as a delta now (empty when the token only extended a held-back marker).
+    pub(crate) fn push(&mut self, token: &str) -> String {
+        self.full.push_str(token);
+        let visible = visible_prefix_len(&self.full);
+        if visible > self.emitted {
+            let out = self.full[self.emitted..visible].to_string();
+            self.emitted = visible;
+            out
+        } else {
+            String::new()
+        }
+    }
+
+    /// End of stream: returns any held-back text that turned out NOT to be a
+    /// real trailing marker (a rare mid-reply `[[VISUAL:` quote), so nothing is
+    /// lost. A real trailing marker yields `""` (stays off the wire).
+    pub(crate) fn finish(self) -> String {
+        let visible = if parse_visual_marker(&self.full).is_some() {
+            strip_visual_marker(&self.full).len()
+        } else {
+            self.full.len()
+        };
+        if visible > self.emitted {
+            self.full[self.emitted..visible].to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Maps a `kind` to a mofa tool name + input args. `Html` is not a skill →
+/// `None`.
+fn image_skill_call(
+    d: &VisualDirective,
+    out_dir: &Path,
+) -> Option<(&'static str, serde_json::Value)> {
+    let out = out_dir.to_string_lossy().to_string();
+    // A UNIQUE output filename per dispatch (#1477 follow-up): the mofa skill
+    // caches by output path (`is_cached`: returns the existing file when it is
+    // >10KB, skipping generation). A fixed name like `image.png` therefore made
+    // every turn after the first in a session return the PREVIOUS turn's image
+    // (and skip generation entirely, so reference frames were never applied).
+    let uniq = uuid::Uuid::now_v7();
+    match d.kind {
+        VisualKind::Infographic => Some((
+            "mofa_infographic",
+            serde_json::json!({
+                "sections": [{ "prompt": d.brief }],
+                "out": format!("{out}/infographic-{uniq}.png"),
+            }),
+        )),
+        // `mofa_image` (not `mofa_cards`): a plain "generate an image" request
+        // wants a single picture, and — unlike `mofa_cards`, which emits no
+        // `files_to_send` (octos #1041, see `workspace_policy` test) so the
+        // backend would get empty rels and deliver nothing — `mofa_image`
+        // reports its produced PNG via `files_to_send`, the same proven path
+        // the Illustrated stage-1 call relies on.
+        VisualKind::Image => Some((
+            "mofa_image",
+            serde_json::json!({
+                "prompt": d.brief,
+                "out": format!("{out}/image-{uniq}.png"),
+            }),
+        )),
+        // Html (focused LLM call) and Illustrated (two-stage: run_illustration_image
+        // then author_html) are not direct file-delivering skills.
+        VisualKind::Html | VisualKind::Illustrated => None,
+    }
+}
+
+/// Illustrated path, stage 1: generate one PNG via `mofa_image` and return the
+/// **absolute** produced path so the caller can read + inline its bytes into the
+/// HTML (the PNG itself is not delivered as a separate artifact). `None` when the
+/// skill is missing / failed / produced no file.
+///
+/// `ref_images` (e.g. this turn's camera frame) are forwarded to ground the
+/// illustration on the real subject; omitted from the args entirely when empty.
+pub(crate) async fn run_illustration_image(
+    registry: &std::sync::Arc<octos_agent::ToolRegistry>,
+    brief: &str,
+    out_dir: &Path,
+    ref_images: &[String],
+) -> Option<PathBuf> {
+    // Unique output filename per dispatch — the mofa skill caches by output
+    // path (`is_cached`), so a fixed `illustration.png` returned the prior
+    // turn's image and skipped generation (hence reference frames were never
+    // applied). See `image_skill_call`.
+    let out = out_dir
+        .join(format!("illustration-{}.png", uuid::Uuid::now_v7()))
+        .to_string_lossy()
+        .into_owned();
+    let mut args = serde_json::json!({
+        "prompt": brief,
+        "out": out,
+    });
+    if !ref_images.is_empty() {
+        args["ref_images"] = serde_json::json!(ref_images);
+    }
+    // #1477 P2: route through the registry (provider policy + arg-size limit +
+    // deferred-tool auto-activation) rather than a bare `tool.execute()`, so the
+    // background visual call is governed like any other tool execution. `Err`
+    // covers skill-not-installed, policy-denied, and generation failure alike.
+    match registry.execute("mofa_image", &args).await {
+        Ok(res) => res.files_to_send.into_iter().next(),
+        Err(e) => {
+            tracing::warn!(tool = "mofa_image", error = %e, "voice rich: illustration gen failed");
+            None
+        }
+    }
+}
+
+/// Backend orchestration: fetch the mofa skill for `kind` and run it directly
+/// (a spawn_only skill is awaited synchronously here — the caller is already in
+/// its own `tokio::spawn`, latency-insensitive), returning the produced files'
+/// relative names. Skill not installed / execution failed → empty vec. The
+/// caller delivers them via files_attached.
+pub(crate) async fn run_image_skill(
+    registry: &std::sync::Arc<octos_agent::ToolRegistry>,
+    d: &VisualDirective,
+    out_dir: &Path,
+) -> Vec<String> {
+    let Some((name, args)) = image_skill_call(d, out_dir) else {
+        return Vec::new();
+    };
+    // #1477 P2: route through the registry (policy + arg-size + auto-activation)
+    // instead of a bare `tool.execute()`. `Err` = not installed / denied / failed.
+    match registry.execute(name, &args).await {
+        Ok(res) => res
+            .files_to_send
+            .iter()
+            .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(tool = name, error = %e, "voice rich: image skill failed");
+            Vec::new()
+        }
+    }
 }
 
 /// Ensure the text ends on a *strong* terminal boundary so the TTS engine
@@ -564,6 +997,415 @@ mod tests {
         assert_eq!(
             got,
             vec!["/tmp/a/note.ogg".to_string(), "/tmp/a/clip.wav".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_visual_marker_extracts_kind_and_brief() {
+        let d =
+            parse_visual_marker("好的我给你画一个。\n[[VISUAL:html|可调增益的负反馈电路交互演示]]")
+                .expect("marker present");
+        assert_eq!(d.kind, VisualKind::Html);
+        assert_eq!(d.brief, "可调增益的负反馈电路交互演示");
+    }
+
+    #[test]
+    fn parse_visual_marker_maps_image_kinds() {
+        assert_eq!(
+            parse_visual_marker("x [[VISUAL:image|一只猫]]")
+                .unwrap()
+                .kind,
+            VisualKind::Image
+        );
+        assert_eq!(
+            parse_visual_marker("x [[VISUAL:infographic|三段]]")
+                .unwrap()
+                .kind,
+            VisualKind::Infographic
+        );
+        assert_eq!(
+            parse_visual_marker("讲解细胞 [[VISUAL:illustrated|人类细胞结构]]")
+                .unwrap()
+                .kind,
+            VisualKind::Illustrated
+        );
+    }
+
+    #[test]
+    fn parse_visual_marker_none_when_absent_or_unknown_kind() {
+        assert!(parse_visual_marker("纯口播回复，没有标记。").is_none());
+        assert!(parse_visual_marker("[[VISUAL:bogus|x]]").is_none());
+        assert!(parse_visual_marker("[[VISUAL:html|]]").is_none()); // empty brief
+    }
+
+    #[test]
+    fn parse_visual_marker_requires_trailing_position() {
+        // A mid-reply mention / quote of the syntax must NOT trigger an artifact.
+        assert!(
+            parse_visual_marker("我用 [[VISUAL:html|x]] 这种写法举个例子，然后继续说。").is_none()
+        );
+        // Trailing marker (with trailing whitespace/newline) is accepted.
+        let d = parse_visual_marker("好的。\n[[VISUAL:html|电路]]  \n").expect("trailing");
+        assert_eq!(d.kind, VisualKind::Html);
+        assert_eq!(d.brief, "电路");
+    }
+
+    #[test]
+    fn strip_visual_marker_only_strips_trailing() {
+        assert_eq!(
+            strip_visual_marker("我画一个。\n[[VISUAL:html|电路]]"),
+            "我画一个。"
+        );
+        // Mid-reply mention is left intact (not truncated).
+        let mid = "用 [[VISUAL:html|x]] 举例，然后继续。";
+        assert_eq!(strip_visual_marker(mid), mid);
+    }
+
+    #[test]
+    fn splitter_ignores_non_visual_double_bracket() {
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for tok in ["看这个 [[1]] 参考。", "后面还有内容。"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+            }
+        }
+        let (tail, directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("看这个"));
+        assert!(
+            spoken.contains("后面还有内容"),
+            "ordinary [[ must not truncate TTS: {spoken:?}"
+        );
+        assert!(directive.is_none());
+    }
+
+    #[test]
+    fn splitter_holds_back_marker_from_tts_even_when_token_split() {
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        // The marker streams in as several chunks; none may leak "[[VIS..." to TTS.
+        for tok in ["你好。\n", "[[VIS", "UAL:html|画个", "电路]]"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+                spoken.push('\n');
+            }
+        }
+        let (tail, directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("你好"));
+        assert!(
+            !spoken.contains("VISUAL"),
+            "marker must never reach TTS: {spoken:?}"
+        );
+        assert!(!spoken.contains("[["), "no bracket leak: {spoken:?}");
+        assert_eq!(directive.unwrap().kind, VisualKind::Html);
+    }
+
+    #[test]
+    fn splitter_holds_back_when_double_bracket_split_across_tokens() {
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for tok in ["你好世界[", "[VISUAL:image|猫]]"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+            }
+        }
+        let (tail, directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("你好世界"));
+        assert!(
+            !spoken.contains("["),
+            "single bracket must not leak: {spoken:?}"
+        );
+        assert_eq!(directive.unwrap().kind, VisualKind::Image);
+    }
+
+    #[test]
+    fn splitter_passes_through_when_no_marker() {
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for s in sp.push("第一句。第二句！") {
+            spoken.push_str(&s);
+        }
+        let (tail, directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("第一句"));
+        assert!(spoken.contains("第二句"));
+        assert!(directive.is_none());
+    }
+
+    #[test]
+    fn strip_visual_marker_drops_trailing_directive() {
+        assert_eq!(
+            strip_visual_marker("我给你画一个。\n[[VISUAL:html|电路]]"),
+            "我给你画一个。"
+        );
+        assert_eq!(strip_visual_marker("纯口播没有标记"), "纯口播没有标记");
+    }
+
+    #[tokio::test]
+    async fn run_image_skill_delivers_relative_filenames() {
+        use octos_agent::{Tool, ToolRegistry, ToolResult};
+        use std::path::PathBuf;
+
+        struct FakeImageTool;
+        #[async_trait::async_trait]
+        impl Tool for FakeImageTool {
+            fn name(&self) -> &str {
+                "mofa_infographic"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    files_to_send: vec![PathBuf::from("/tmp/out/poster.png")],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(FakeImageTool);
+        let reg = std::sync::Arc::new(reg);
+        let d = VisualDirective {
+            kind: VisualKind::Infographic,
+            brief: "三段信息图".into(),
+        };
+        let rels = run_image_skill(&reg, &d, Path::new("/tmp/out")).await;
+        assert_eq!(rels, vec!["poster.png".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_image_skill_empty_when_skill_missing() {
+        use octos_agent::ToolRegistry;
+        let reg = std::sync::Arc::new(ToolRegistry::new());
+        let d = VisualDirective {
+            kind: VisualKind::Image,
+            brief: "猫".into(),
+        };
+        assert!(
+            run_image_skill(&reg, &d, Path::new("/tmp"))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_illustration_image_returns_produced_path() {
+        use octos_agent::{Tool, ToolRegistry, ToolResult};
+        use std::path::PathBuf;
+
+        struct FakeMofaImage;
+        #[async_trait::async_trait]
+        impl Tool for FakeMofaImage {
+            fn name(&self) -> &str {
+                "mofa_image"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+                // The brief is forwarded as the generation prompt, and any camera
+                // frame is forwarded as a reference image to ground the result.
+                assert_eq!(args["prompt"], serde_json::json!("细胞结构"));
+                assert_eq!(args["ref_images"], serde_json::json!(["/cam/frame.jpg"]));
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    files_to_send: vec![PathBuf::from("/tmp/out/illustration.png")],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(FakeMofaImage);
+        let reg = std::sync::Arc::new(reg);
+        let refs = vec!["/cam/frame.jpg".to_string()];
+        let got = run_illustration_image(&reg, "细胞结构", Path::new("/tmp/out"), &refs).await;
+        assert_eq!(got, Some(PathBuf::from("/tmp/out/illustration.png")));
+    }
+
+    #[tokio::test]
+    async fn run_illustration_image_omits_ref_images_when_none() {
+        use octos_agent::{Tool, ToolRegistry, ToolResult};
+        use std::path::PathBuf;
+
+        struct NoRefTool;
+        #[async_trait::async_trait]
+        impl Tool for NoRefTool {
+            fn name(&self) -> &str {
+                "mofa_image"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+                // No frame this turn → the arg is absent (not an empty array).
+                assert!(args.get("ref_images").is_none());
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    files_to_send: vec![PathBuf::from("/tmp/out/illustration.png")],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(NoRefTool);
+        let reg = std::sync::Arc::new(reg);
+        let got = run_illustration_image(&reg, "x", Path::new("/tmp/out"), &[]).await;
+        assert_eq!(got, Some(PathBuf::from("/tmp/out/illustration.png")));
+    }
+
+    #[tokio::test]
+    async fn run_illustration_image_none_when_skill_missing() {
+        use octos_agent::ToolRegistry;
+        let reg = std::sync::Arc::new(ToolRegistry::new());
+        assert!(
+            run_illustration_image(&reg, "x", Path::new("/tmp"), &[])
+                .await
+                .is_none()
+        );
+    }
+
+    // octos #1041: `image` kind must route to `mofa_image` (which reports its
+    // PNG via `files_to_send`), NOT `mofa_cards` (which emits none, so the old
+    // mapping delivered nothing for a plain "generate an image" request).
+    #[tokio::test]
+    async fn run_image_skill_image_kind_uses_mofa_image_and_delivers_file() {
+        use octos_agent::{Tool, ToolRegistry, ToolResult};
+        use std::path::PathBuf;
+
+        struct FakeMofaImage;
+        #[async_trait::async_trait]
+        impl Tool for FakeMofaImage {
+            fn name(&self) -> &str {
+                "mofa_image"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+                // The brief is forwarded as the generation prompt, and the
+                // produced file is named UNIQUELY under the turn's out dir
+                // (`image-<uuid>.png`) so the mofa skill's path cache never
+                // returns a stale image.
+                assert_eq!(args["prompt"], serde_json::json!("一只猫"));
+                let out = args["out"].as_str().expect("out is a string");
+                assert!(
+                    out.starts_with("/tmp/out/image-") && out.ends_with(".png"),
+                    "out must be a unique image-<uuid>.png under the out dir, got: {out}"
+                );
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    files_to_send: vec![PathBuf::from(out)],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(FakeMofaImage);
+        let reg = std::sync::Arc::new(reg);
+        let d = VisualDirective {
+            kind: VisualKind::Image,
+            brief: "一只猫".into(),
+        };
+        let rels = run_image_skill(&reg, &d, Path::new("/tmp/out")).await;
+        assert_eq!(rels.len(), 1);
+        assert!(
+            rels[0].starts_with("image-") && rels[0].ends_with(".png"),
+            "delivered a unique image-<uuid>.png, got: {}",
+            rels[0]
+        );
+    }
+
+    #[test]
+    fn strip_visual_directive_strips_content_and_assistant_carriers() {
+        let mut content = "好的我给你画一个。\n[[VISUAL:html|可调增益电路]]".to_string();
+        let mut messages = vec![
+            Message::user("画个电路".to_string()),
+            Message::assistant("好的我给你画一个。\n[[VISUAL:html|可调增益电路]]".to_string()),
+        ];
+        let directive = strip_visual_directive(&mut content, &mut messages);
+        assert_eq!(directive.as_ref().map(|d| d.kind), Some(VisualKind::Html));
+        assert_eq!(content, "好的我给你画一个。");
+        assert_eq!(messages[1].content, "好的我给你画一个。");
+        assert_eq!(messages[0].content, "画个电路");
+    }
+
+    #[test]
+    fn strip_visual_directive_noop_without_trailing_marker() {
+        let mut content = "用 [[VISUAL:html|x]] 举例。".to_string();
+        let mut messages = vec![Message::assistant(content.clone())];
+        assert!(strip_visual_directive(&mut content, &mut messages).is_none());
+        assert!(content.contains("[[VISUAL:html|x]]"));
+    }
+
+    #[test]
+    fn visible_delta_filter_hides_trailing_marker() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["你好", "世界。", "\n[[VIS", "UAL:html|猫]]"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "你好世界。");
+    }
+
+    #[test]
+    fn visible_delta_filter_recovers_false_marker_on_finish() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["用 ", "[[VISUAL:html|x]]", " 举例。"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "用 [[VISUAL:html|x]] 举例。");
+    }
+
+    #[test]
+    fn remove_all_visual_markers_scrubs_every_occurrence() {
+        // Mid-text + trailing markers are both removed (unlike strip_visual_marker).
+        assert_eq!(
+            remove_all_visual_markers(
+                "讲了电路 [[VISUAL:html|图A]] 又讲了细胞[[VISUAL:image|图B]]"
+            ),
+            "讲了电路  又讲了细胞"
+        );
+        // Marker-free text is returned unchanged.
+        assert_eq!(remove_all_visual_markers("普通总结文本"), "普通总结文本");
+        // An unterminated marker drops the remainder.
+        assert_eq!(
+            remove_all_visual_markers("abc [[VISUAL:html|没闭合"),
+            "abc "
         );
     }
 }
