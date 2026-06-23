@@ -2319,7 +2319,7 @@ pub async fn platform_runtime_bootstrap(
     let octos_home = store.octos_home_dir();
     let mut actions = Vec::new();
 
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(&octos_home);
+    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
     for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
         if allowlist.find(model_id).is_none() {
             allowlist
@@ -2331,7 +2331,7 @@ pub async fn platform_runtime_bootstrap(
             actions.push(format!("enabled {model_id} for {role}"));
         }
     }
-    allowlist.save(&octos_home).map_err(|e| {
+    allowlist.save(octos_home).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to save platform model allowlist: {e}"),
