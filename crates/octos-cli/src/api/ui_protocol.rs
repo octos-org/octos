@@ -16876,6 +16876,25 @@ fn reasoning_effort_from_wire(
     }
 }
 
+/// Post-terminal `spawn_only` drain: which progress event types must NOT be
+/// forwarded to clients after the foreground turn has already emitted its
+/// terminal `turn/completed`.
+///
+/// - `done` / `error`: the agent main loop already emitted the terminal turn
+///   signal before the drain started; re-forwarding would double-emit.
+/// - `token`: a late assistant delta carries the *foreground* turn's id (the
+///   drain reuses the turn's `progress_context`). On legacy clients that arm
+///   `live_reply` from `message_delta`, a delta for an already-completed turn
+///   resurrects it and latches the input gate forever — the "queued N messages
+///   after active turn" TUI/web wedge. The background `spawn_only` task reports
+///   its real progress via `task_*` / `tool_*` / `file_*` events (all still
+///   forwarded), never via raw foreground tokens, so dropping these loses
+///   nothing user-facing. Pairs with the octos-tui client guard that ignores
+///   deltas for already-terminal turns (belt + suspenders).
+fn drain_should_skip_event(event_type: Option<&str>) -> bool {
+    matches!(event_type, Some("done") | Some("error") | Some("token"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -19540,24 +19559,24 @@ async fn run_standalone_turn(
                     Ok(value) => value,
                     Err(_) => continue,
                 };
-                match event.get("type").and_then(Value::as_str) {
-                    // Already emitted by the agent's main-loop terminal
-                    // path. Skip silently in the drain.
-                    Some("done") | Some("error") => continue,
-                    _ => {
-                        forward_progress_event(
-                            &drain_ws,
-                            &drain_ledger,
-                            &drain_session_id,
-                            &drain_progress_context,
-                            drain_contracts.as_ref(),
-                            drain_workspace_root.as_deref(),
-                            &mut drain_tracker,
-                            &mut drain_saw_delta,
-                            &event,
-                        );
-                    }
+                // `done`/`error` were already emitted by the agent's
+                // main-loop terminal path; `token` would resurrect the
+                // now-completed foreground turn on legacy clients (the
+                // input-gate wedge). See `drain_should_skip_event`.
+                if drain_should_skip_event(event.get("type").and_then(Value::as_str)) {
+                    continue;
                 }
+                forward_progress_event(
+                    &drain_ws,
+                    &drain_ledger,
+                    &drain_session_id,
+                    &drain_progress_context,
+                    drain_contracts.as_ref(),
+                    drain_workspace_root.as_deref(),
+                    &mut drain_tracker,
+                    &mut drain_saw_delta,
+                    &event,
+                );
             }
             // `drain_saw_delta` only matters when callers want to backfill
             // the terminal `done`'s assistant content; the drain runs
@@ -23008,6 +23027,41 @@ mod tests {
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
         QuestionId, SessionSandboxParams, approval_scopes, methods, rpc_error_codes,
     };
+
+    #[test]
+    fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
+        // Regression for the "queued N messages after active turn" wedge: the
+        // post-terminal spawn_only drain must drop late assistant `token`
+        // deltas (they carry the already-completed foreground turn id and
+        // resurrect the client's input gate) alongside the already-emitted
+        // `done`/`error` terminal signals...
+        assert!(drain_should_skip_event(Some("done")));
+        assert!(drain_should_skip_event(Some("error")));
+        assert!(drain_should_skip_event(Some("token")));
+
+        // ...while still forwarding the background task's real progress, which
+        // is the entire point of the drain (#961). None of these produce a
+        // `MessageDelta`, so none can wedge the turn gate.
+        for keep in [
+            "task_started",
+            "task_updated",
+            "task_completed",
+            "task_interrupted",
+            "tool_start",
+            "tool_progress",
+            "tool_end",
+            "file_modified",
+            "file_written",
+            "cost_update",
+        ] {
+            assert!(
+                !drain_should_skip_event(Some(keep)),
+                "drain must forward background event `{keep}`"
+            );
+        }
+        // A typeless event is forwarded (the mapper warns on it downstream).
+        assert!(!drain_should_skip_event(None));
+    }
 
     fn local_profile_state(dir: &Path) -> AppState {
         AppState {
