@@ -740,6 +740,19 @@ fn build_volcano(
             .or_else(|| env.filter(|s| !s.is_empty()))
     };
     let appid = pick(cloud.and_then(|c| c.appid.as_ref()), env_appid)?;
+    let endpoint = pick(cloud.and_then(|c| c.endpoint.as_ref()), env_endpoint)
+        .unwrap_or_else(|| "https://openspeech.bytedance.com/api/v1/tts".to_string());
+    // The endpoint is partly tenant-controlled (per-profile `tts_cloud.endpoint`)
+    // and the token may be the host-global `VOLC_TTS_TOKEN`. Never send the token
+    // anywhere but an HTTPS Volcano host — otherwise a tenant could point the
+    // endpoint at an internal/attacker address and exfiltrate the token (SSRF).
+    if !is_allowed_volcano_endpoint(&endpoint) {
+        tracing::warn!(
+            endpoint = %endpoint,
+            "voice_turn: refusing cloud TTS — endpoint not in the HTTPS Volcano allowlist; token NOT sent"
+        );
+        return None;
+    }
     Some(VolcanoTts {
         appid,
         token,
@@ -749,9 +762,24 @@ fn build_volcano(
             .unwrap_or_else(|| "BV001_streaming".to_string()),
         encoding: pick(cloud.and_then(|c| c.encoding.as_ref()), env_encoding)
             .unwrap_or_else(|| "mp3".to_string()),
-        endpoint: pick(cloud.and_then(|c| c.endpoint.as_ref()), env_endpoint)
-            .unwrap_or_else(|| "https://openspeech.bytedance.com/api/v1/tts".to_string()),
+        endpoint,
     })
+}
+
+/// HTTPS Volcano TTS hosts the token may be sent to. Keep this tight — it is the
+/// SSRF / token-exfiltration boundary for the partly tenant-controlled endpoint.
+const VOLCANO_ALLOWED_HOSTS: &[&str] = &["openspeech.bytedance.com"];
+
+/// True only for an `https://` URL whose host is in [`VOLCANO_ALLOWED_HOSTS`].
+fn is_allowed_volcano_endpoint(endpoint: &str) -> bool {
+    match reqwest::Url::parse(endpoint) {
+        Ok(u) => {
+            u.scheme() == "https"
+                && u.host_str()
+                    .is_some_and(|h| VOLCANO_ALLOWED_HOSTS.contains(&h))
+        }
+        Err(_) => false,
+    }
 }
 
 /// Resolve a Volcano config from typed per-profile cloud settings + env token.
@@ -949,7 +977,7 @@ mod tests {
             Some("clu".into()),
             Some("envvoice".into()),
             Some("wav".into()),
-            Some("https://example/tts".into()),
+            Some("https://openspeech.bytedance.com/api/v1/tts".into()),
         )
         .unwrap();
         assert_eq!(v.token, "tok");
@@ -957,12 +985,39 @@ mod tests {
         assert_eq!(v.voice, "envvoice");
         assert_eq!(v.cluster, "clu");
         assert_eq!(v.encoding, "wav");
-        assert_eq!(v.endpoint, "https://example/tts");
+        assert_eq!(v.endpoint, "https://openspeech.bytedance.com/api/v1/tts");
     }
 
     #[test]
     fn should_return_none_when_no_appid_anywhere() {
         assert!(build_volcano(Some("tok".into()), None, None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn should_reject_non_volcano_endpoint_to_prevent_ssrf() {
+        // A tenant-controlled endpoint pointing off the Volcano allowlist must
+        // never receive the token — build_volcano returns None.
+        let cloud = CloudTtsConfig {
+            appid: Some("1".into()),
+            endpoint: Some("https://attacker.example/tts".into()),
+            ..Default::default()
+        };
+        assert!(build_volcano(Some("tok".into()), Some(&cloud), None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn should_reject_http_volcano_endpoint() {
+        // Even the right host over plain http is rejected (must be https).
+        assert!(!is_allowed_volcano_endpoint("http://openspeech.bytedance.com/api/v1/tts"));
+        assert!(!is_allowed_volcano_endpoint("https://evil.openspeech.bytedance.com.attacker.com/"));
+        assert!(!is_allowed_volcano_endpoint("not a url"));
+    }
+
+    #[test]
+    fn should_allow_default_volcano_endpoint() {
+        assert!(is_allowed_volcano_endpoint(
+            "https://openspeech.bytedance.com/api/v1/tts"
+        ));
     }
 
     #[tokio::test]
