@@ -2489,4 +2489,17 @@ mod tests {
         assert_eq!(cloud.voice.as_deref(), Some("BV700"));
         assert_eq!(cloud.cluster, None);
     }
+
+    #[test]
+    fn should_overlay_profile_tts_provider_over_host_voice() {
+        let host = VoiceConfig { tts_provider: "auto".into(), ..Default::default() };
+        let overridden = host
+            .with_tts_provider_override(Some("cloud"))
+            .with_cloud_override(Some(&CloudTtsConfig {
+                appid: Some("42".into()),
+                ..Default::default()
+            }));
+        assert_eq!(overridden.tts_provider, "cloud");
+        assert_eq!(overridden.cloud.unwrap().appid.as_deref(), Some("42"));
+    }
 }

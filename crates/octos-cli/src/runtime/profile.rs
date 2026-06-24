@@ -1021,15 +1021,18 @@ impl ProfileRuntime {
             // setting living on the top-level config.json, not on per-profile
             // JSON. `config_from_profile` drops it, so the caller (serve/gateway)
             // passes the host's `config.voice` here; fall back to defaults when
-            // absent. The *timbre* (`default_voice`), however, is per-tenant:
-            // overlay the profile's `voice_default` on top so each user keeps
-            // their own reply voice (set via `PUT /api/my/voice`).
+            // absent. Per-tenant settings (*timbre*, TTS route, cloud config) are
+            // overlaid: `voice_default` (reply voice via `PUT /api/my/voice`),
+            // `tts_provider` (route: auto/local/cloud), and `tts_cloud` (cloud
+            // credentials).
             voice: config
                 .voice
                 .clone()
                 .or_else(|| host_voice.cloned())
                 .unwrap_or_default()
-                .with_default_voice_override(profile.config.voice_default.as_deref()),
+                .with_default_voice_override(profile.config.voice_default.as_deref())
+                .with_tts_provider_override(profile.config.tts_provider.as_deref())
+                .with_cloud_override(profile.config.tts_cloud.as_ref()),
         }))
     }
 }
