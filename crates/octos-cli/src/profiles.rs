@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig};
+use crate::config::{ChannelEntry, CloudTtsConfig, Config, FallbackModel, GatewayConfig};
 
 pub const MAX_SUB_ACCOUNTS_PER_PARENT: usize = 10;
 
@@ -61,6 +61,15 @@ pub struct ProfileConfig {
     /// serve default. Set by `PUT /api/my/voice`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_default: Option<String>,
+    /// Per-profile TTS route override (`auto`/`local`/`cloud`). `None` →
+    /// inherit the serve-level `VoiceConfig.tts_provider`. Applied in
+    /// `runtime/profile.rs` via `VoiceConfig::with_tts_provider_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_provider: Option<String>,
+    /// Per-profile non-secret cloud (Volcano) TTS settings. The token rides
+    /// `env_vars["VOLC_TTS_TOKEN"]`. `None` → inherit serve / env defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_cloud: Option<CloudTtsConfig>,
     /// Coding review specialist template. When omitted, `/review`
     /// uses the server's built-in default specialists. Operators may
     /// configure this per profile to change the native reviewer fanout
@@ -4347,5 +4356,20 @@ mod tests {
         assert_eq!(settings["user_id"], "@bot:matrix.org");
         assert_eq!(settings["password"], "secret");
         assert_eq!(settings["device_name"], "octos-gw");
+    }
+
+    #[test]
+    fn should_roundtrip_tts_provider_and_cloud_on_profile_config() {
+        let json = r#"{ "tts_provider": "cloud", "tts_cloud": { "appid": "999", "voice": "BV700" } }"#;
+        let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tts_provider.as_deref(), Some("cloud"));
+        assert_eq!(cfg.tts_cloud.as_ref().unwrap().appid.as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn should_default_tts_fields_to_none_when_absent() {
+        let cfg: ProfileConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.tts_provider.is_none());
+        assert!(cfg.tts_cloud.is_none());
     }
 }
