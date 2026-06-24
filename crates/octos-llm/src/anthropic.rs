@@ -78,9 +78,10 @@ impl AnthropicProvider {
         tools: &'a [ToolSpec],
         config: &'a ChatConfig,
     ) -> AnthropicRequest<'a> {
+        let max_tokens = config.max_tokens.unwrap_or(4096);
         AnthropicRequest {
             model: &self.model,
-            max_tokens: config.max_tokens.unwrap_or(4096),
+            max_tokens,
             messages: messages
                 .iter()
                 .filter(|m| m.role != octos_core::MessageRole::System)
@@ -110,7 +111,9 @@ impl AnthropicProvider {
                 }
             },
             tools: if tools.is_empty() { None } else { Some(tools) },
-            thinking: config.reasoning_effort.map(build_anthropic_thinking),
+            thinking: config
+                .reasoning_effort
+                .and_then(|effort| build_anthropic_thinking(effort, max_tokens)),
             context_management: config.context_management.as_ref(),
         }
     }
@@ -253,11 +256,23 @@ struct AnthropicThinking {
     budget_tokens: u32,
 }
 
-fn build_anthropic_thinking(effort: ReasoningEffort) -> AnthropicThinking {
-    AnthropicThinking {
-        r#type: "enabled",
-        budget_tokens: anthropic_thinking_budget_tokens(effort),
+/// Anthropic requires `1024 <= budget_tokens < max_tokens`, and the reply still
+/// needs output room. Clamp the per-effort budget to leave a reserve below
+/// `max_tokens`; if `max_tokens` is too small to fit a valid (>=1024) budget,
+/// return `None` so we omit the thinking param entirely instead of emitting a
+/// request Claude rejects before the turn starts.
+fn build_anthropic_thinking(effort: ReasoningEffort, max_tokens: u32) -> Option<AnthropicThinking> {
+    const MIN_BUDGET: u32 = 1_024;
+    const OUTPUT_RESERVE: u32 = 1_024;
+    let budget =
+        anthropic_thinking_budget_tokens(effort).min(max_tokens.saturating_sub(OUTPUT_RESERVE));
+    if budget < MIN_BUDGET {
+        return None;
     }
+    Some(AnthropicThinking {
+        r#type: "enabled",
+        budget_tokens: budget,
+    })
 }
 
 fn anthropic_thinking_budget_tokens(effort: ReasoningEffort) -> u32 {
@@ -381,6 +396,12 @@ enum ContentBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// Any other block type — notably `redacted_thinking` (opaque, returned when
+    /// extended thinking is enabled), but also forward-compat for future block
+    /// types. Without this the internally-tagged enum fails to deserialize an
+    /// unknown `type` and the whole response (answer + tool calls) is lost.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -410,6 +431,7 @@ fn anthropic_response_to_chat_response(api_response: AnthropicResponse) -> ChatR
             ContentBlock::Thinking { thinking } => {
                 append_nonempty(&mut reasoning_content, thinking);
             }
+            ContentBlock::Unknown => {}
             ContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(octos_core::ToolCall {
                     id,
@@ -728,12 +750,70 @@ mod tests {
 
         let config = ChatConfig {
             reasoning_effort: Some(ReasoningEffort::High),
+            // Large enough output budget to fit the full High ladder (8192) with
+            // the output reserve, so it is not clamped here.
+            max_tokens: Some(32_000),
             ..Default::default()
         };
         let request = provider.build_request(&messages, &[], &config);
         let body = serde_json::to_value(&request).unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8_192);
+    }
+
+    #[test]
+    fn should_clamp_thinking_budget_below_max_tokens() {
+        // P2: budget must stay strictly below max_tokens (with output room).
+        // High ladder is 8192; with max_tokens=6000 it clamps to 6000-1024=4976.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            max_tokens: Some(6_000),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert_eq!(budget, 4_976, "clamped to max_tokens - reserve");
+        assert!(budget < 6_000, "budget strictly below max_tokens");
+        assert!(budget >= 1_024, "budget meets Anthropic minimum");
+    }
+
+    #[test]
+    fn should_omit_thinking_when_max_tokens_too_small() {
+        // P2: when max_tokens can't fit a valid (>=1024) budget, omit thinking
+        // entirely rather than emit a request Claude rejects.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            max_tokens: Some(1_500), // 1500 - 1024 = 476 < 1024 → omit
+            ..Default::default()
+        };
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking omitted when max_tokens too small: {body}"
+        );
+    }
+
+    #[test]
+    fn should_parse_redacted_thinking_block() {
+        // P2: a redacted_thinking block must not break deserialization; the
+        // answer/tool calls still come through and it contributes no reasoning.
+        let api_response: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "content": [
+                { "type": "redacted_thinking", "data": "Er0BCkY..." },
+                { "type": "text", "text": "The answer is 42." }
+            ],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 5, "output_tokens": 7 }
+        }))
+        .unwrap();
+
+        let response = anthropic_response_to_chat_response(api_response);
+        assert_eq!(response.content.as_deref(), Some("The answer is 42."));
+        assert_eq!(response.reasoning_content, None);
     }
 
     #[test]
