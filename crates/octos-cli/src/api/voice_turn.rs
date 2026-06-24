@@ -824,11 +824,11 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
 }
 
 /// Synthesize a reply to an audio file, picking the TTS route from `provider`:
-/// - `"auto"`: cloud Volcano when `VOLC_TTS_*` env is configured, else
-///   on-device GPT-SoVITS.
-/// - `"volcano"`: force cloud Volcano; fall back to on-device sovits when the
-///   env is missing or the request fails.
-/// - `"sovits"` / `"qwen3"`: force the named on-device engine (no cloud).
+/// - `"auto"`: cloud Volcano when a token resolves, else on-device.
+/// - `"cloud"` (alias `"volcano"`): force cloud Volcano; falls back to
+///   on-device when the token/appid is missing or the request fails.
+/// - `"local"` (or any other value, incl. legacy `"sovits"`/`"qwen3"`):
+///   on-device synthesis using the default engine.
 ///
 /// `voice` is the on-device voice preset (voices.json); the cloud route uses
 /// its own `VOLC_TTS_VOICE` env instead. Returns `None` on failure.
@@ -861,8 +861,8 @@ pub(crate) async fn synthesize_reply(
             tracing::warn!("voice_turn: volcano TTS failed; falling back to ominix");
         } else if provider == "cloud" || provider == "volcano" {
             tracing::warn!(
-                "voice_turn: tts route=cloud but VOLC_TTS_TOKEN/appid missing; \
-                 falling back to on-device"
+                provider = %provider,
+                "voice_turn: tts cloud route but VOLC_TTS_TOKEN/appid missing; falling back to on-device"
             );
         }
     }
@@ -945,6 +945,7 @@ mod tests {
             Some("https://example/tts".into()),
         )
         .unwrap();
+        assert_eq!(v.token, "tok");
         assert_eq!(v.appid, "envid");
         assert_eq!(v.voice, "envvoice");
         assert_eq!(v.cluster, "clu");
