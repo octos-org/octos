@@ -1032,7 +1032,8 @@ impl ProfileRuntime {
                 .unwrap_or_default()
                 .with_default_voice_override(profile.config.voice_default.as_deref())
                 .with_tts_provider_override(profile.config.tts_provider.as_deref())
-                .with_cloud_override(profile.config.tts_cloud.as_ref()),
+                .with_cloud_override(profile.config.tts_cloud.as_ref())
+                .with_cloud_token_from_env(&profile.config.env_vars),
         }))
     }
 }

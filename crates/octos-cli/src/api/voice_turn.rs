@@ -757,8 +757,15 @@ fn build_volcano(
 /// Resolve a Volcano config from typed per-profile cloud settings + env token.
 fn resolve_volcano(cloud: Option<&CloudTtsConfig>) -> Option<VolcanoTts> {
     let env = |k: &str| std::env::var(k).ok();
+    // Token precedence: the runtime-resolved per-profile token (from `env_vars`,
+    // set by `ProfileRuntime::bootstrap`) wins; fall back to the process env for
+    // legacy pure-`export` setups.
+    let token = cloud
+        .and_then(|c| c.token.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| env("VOLC_TTS_TOKEN"));
     build_volcano(
-        env("VOLC_TTS_TOKEN"),
+        token,
         cloud,
         env("VOLC_TTS_APPID"),
         env("VOLC_TTS_CLUSTER"),
