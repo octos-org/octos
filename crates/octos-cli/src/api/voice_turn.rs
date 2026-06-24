@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use octos_core::{Message, MessageRole};
 use octos_llm::ominix::OminixClient;
 
+use crate::config::CloudTtsConfig;
+
 /// 解析 OminiX 服务基址（平台级，env 优先）。与 `api/admin.rs` 的同名 helper 等价；
 /// 抽到此处避免跨模块可见性问题。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
@@ -714,22 +716,56 @@ struct VolcanoTts {
     endpoint: String,
 }
 
-fn volcano_from_env() -> Option<VolcanoTts> {
-    let appid = std::env::var("VOLC_TTS_APPID")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let token = std::env::var("VOLC_TTS_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())?;
+/// Whether the route wants the cloud path. Legacy `volcano` aliases `cloud`.
+fn wants_cloud(provider: &str) -> bool {
+    matches!(provider, "auto" | "cloud" | "volcano")
+}
+
+/// Pure core: merge typed (non-secret) cloud config over env fallbacks, applying
+/// engine defaults. Requires a non-empty token AND a resolvable appid.
+fn build_volcano(
+    token: Option<String>,
+    cloud: Option<&CloudTtsConfig>,
+    env_appid: Option<String>,
+    env_cluster: Option<String>,
+    env_voice: Option<String>,
+    env_encoding: Option<String>,
+    env_endpoint: Option<String>,
+) -> Option<VolcanoTts> {
+    let token = token.filter(|s| !s.is_empty())?;
+    let pick = |typed: Option<&String>, env: Option<String>| -> Option<String> {
+        typed
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .or_else(|| env.filter(|s| !s.is_empty()))
+    };
+    let appid = pick(cloud.and_then(|c| c.appid.as_ref()), env_appid)?;
     Some(VolcanoTts {
         appid,
         token,
-        cluster: std::env::var("VOLC_TTS_CLUSTER").unwrap_or_else(|_| "volcano_tts".to_string()),
-        voice: std::env::var("VOLC_TTS_VOICE").unwrap_or_else(|_| "BV001_streaming".to_string()),
-        encoding: std::env::var("VOLC_TTS_ENCODING").unwrap_or_else(|_| "mp3".to_string()),
-        endpoint: std::env::var("VOLC_TTS_ENDPOINT")
-            .unwrap_or_else(|_| "https://openspeech.bytedance.com/api/v1/tts".to_string()),
+        cluster: pick(cloud.and_then(|c| c.cluster.as_ref()), env_cluster)
+            .unwrap_or_else(|| "volcano_tts".to_string()),
+        voice: pick(cloud.and_then(|c| c.voice.as_ref()), env_voice)
+            .unwrap_or_else(|| "BV001_streaming".to_string()),
+        encoding: pick(cloud.and_then(|c| c.encoding.as_ref()), env_encoding)
+            .unwrap_or_else(|| "mp3".to_string()),
+        endpoint: pick(cloud.and_then(|c| c.endpoint.as_ref()), env_endpoint)
+            .unwrap_or_else(|| "https://openspeech.bytedance.com/api/v1/tts".to_string()),
     })
+}
+
+/// Resolve a Volcano config from typed per-profile cloud settings + env token.
+fn resolve_volcano(cloud: Option<&CloudTtsConfig>) -> Option<VolcanoTts> {
+    let env = |k: &str| std::env::var(k).ok();
+    build_volcano(
+        env("VOLC_TTS_TOKEN"),
+        cloud,
+        env("VOLC_TTS_APPID"),
+        env("VOLC_TTS_CLUSTER"),
+        env("VOLC_TTS_VOICE"),
+        env("VOLC_TTS_ENCODING"),
+        env("VOLC_TTS_ENDPOINT"),
+    )
 }
 
 /// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
@@ -800,6 +836,7 @@ pub(crate) async fn synthesize_reply(
     text: &str,
     voice: &str,
     provider: &str,
+    cloud: Option<&CloudTtsConfig>,
     out_dir: &Path,
 ) -> Option<PathBuf> {
     let speak = clean_for_tts(text);
@@ -812,30 +849,26 @@ pub(crate) async fn synthesize_reply(
     let tts_t = std::time::Instant::now();
     eprintln!("[TIMING] TTS_start epoch_ms={}", now_ms());
 
-    // Cloud route. "auto" uses cloud only when env is present; "volcano" forces
-    // it (still falls back to on-device on failure). Cloud is faster (no
+    // Cloud route. "auto" uses cloud only when env is present; "cloud"/"volcano"
+    // force it (still falls back to on-device on failure). Cloud is faster (no
     // on-device model reload) and higher quality when available.
-    let want_cloud = matches!(provider, "auto" | "volcano");
+    let want_cloud = wants_cloud(provider);
     if want_cloud {
-        if let Some(cfg) = volcano_from_env() {
+        if let Some(cfg) = resolve_volcano(cloud) {
             if let Some(path) = synthesize_volcano(&cfg, &speak, out_dir).await {
                 return Some(path);
             }
             tracing::warn!("voice_turn: volcano TTS failed; falling back to ominix");
-        } else if provider == "volcano" {
+        } else if provider == "cloud" || provider == "volcano" {
             tracing::warn!(
-                "voice_turn: tts_provider=volcano but VOLC_TTS_* env missing; \
-                 falling back to on-device sovits"
+                "voice_turn: tts route=cloud but VOLC_TTS_TOKEN/appid missing; \
+                 falling back to on-device"
             );
         }
     }
 
-    // On-device route. Forced engine for "sovits"/"qwen3"; sovits otherwise.
-    let engine = if provider == "qwen3" {
-        "qwen3"
-    } else {
-        "sovits"
-    };
+    // On-device route: always the default engine (no qwen3 UI split).
+    let engine = "sovits";
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
     match client
@@ -860,11 +893,74 @@ pub(crate) async fn synthesize_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CloudTtsConfig;
+
+    #[test]
+    fn should_want_cloud_for_auto_cloud_and_legacy_volcano() {
+        for p in ["auto", "cloud", "volcano"] {
+            assert!(wants_cloud(p), "{p} should want cloud");
+        }
+        for p in ["local", "sovits", "qwen3", ""] {
+            assert!(!wants_cloud(p), "{p} should NOT want cloud");
+        }
+    }
+
+    #[test]
+    fn should_return_none_when_token_missing() {
+        let cloud = CloudTtsConfig { appid: Some("1".into()), ..Default::default() };
+        assert!(build_volcano(None, Some(&cloud), None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn should_prefer_typed_cloud_over_env_and_apply_defaults() {
+        let cloud = CloudTtsConfig {
+            appid: Some("typed".into()),
+            voice: Some("BV700".into()),
+            ..Default::default()
+        };
+        let v = build_volcano(
+            Some("tok".into()),
+            Some(&cloud),
+            Some("envid".into()), // typed appid wins
+            None, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(v.appid, "typed");
+        assert_eq!(v.voice, "BV700");
+        assert_eq!(v.cluster, "volcano_tts"); // default
+        assert_eq!(v.encoding, "mp3"); // default
+        assert_eq!(v.endpoint, "https://openspeech.bytedance.com/api/v1/tts");
+        assert_eq!(v.token, "tok");
+    }
+
+    #[test]
+    fn should_fall_back_to_env_when_cloud_none() {
+        let v = build_volcano(
+            Some("tok".into()),
+            None,
+            Some("envid".into()),
+            Some("clu".into()),
+            Some("envvoice".into()),
+            Some("wav".into()),
+            Some("https://example/tts".into()),
+        )
+        .unwrap();
+        assert_eq!(v.appid, "envid");
+        assert_eq!(v.voice, "envvoice");
+        assert_eq!(v.cluster, "clu");
+        assert_eq!(v.encoding, "wav");
+        assert_eq!(v.endpoint, "https://example/tts");
+    }
+
+    #[test]
+    fn should_return_none_when_no_appid_anywhere() {
+        assert!(build_volcano(Some("tok".into()), None, None, None, None, None, None).is_none());
+    }
 
     #[tokio::test]
     async fn synthesize_reply_returns_none_for_blank_text() {
         let dir = std::env::temp_dir();
-        let got = synthesize_reply("   ", "vivian", "auto", &dir).await;
+        let got = synthesize_reply("   ", "vivian", "auto", None, &dir).await;
         assert!(got.is_none());
     }
 
