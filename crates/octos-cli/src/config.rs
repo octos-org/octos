@@ -600,15 +600,16 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub asr_language: Option<String>,
     /// Which TTS route to use for synthesized replies:
-    /// - `"auto"` (default): cloud Volcano when the `VOLC_TTS_*` env is
-    ///   configured, otherwise the on-device GPT-SoVITS engine.
-    /// - `"volcano"`: force cloud Volcano (falls back to on-device sovits
-    ///   when the env is missing or the request fails).
-    /// - `"sovits"`: force the on-device GPT-SoVITS engine.
-    /// - `"qwen3"`: force the on-device Qwen3-TTS pool.
+    /// - `"auto"` (default): cloud when a token is configured, else on-device.
+    /// - `"local"`: force the on-device ominix-api engine.
+    /// - `"cloud"`: force cloud Volcano (falls back to on-device when the token
+    ///   is missing or the request fails).
     ///
-    /// Cloud credentials always come from `VOLC_TTS_*` env vars (secrets are
-    /// never read from config); this switch only selects the *route*.
+    /// Legacy aliases accepted for back-compat: `"volcano"` → `cloud`;
+    /// `"sovits"` / `"qwen3"` → `local`.
+    ///
+    /// Cloud credentials: the non-secret settings live in `cloud` (CloudTtsConfig);
+    /// the token is read from `VOLC_TTS_TOKEN` (never stored in config).
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
     /// Non-secret cloud (Volcano) TTS settings. `None` → resolve entirely from
