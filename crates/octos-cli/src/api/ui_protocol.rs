@@ -19167,6 +19167,7 @@ async fn run_standalone_turn(
             &session_runtime.profile.voice.default_voice,
         );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
+        let w_cloud = session_runtime.profile.voice.cloud.clone();
         let handle = tokio::spawn(async move {
             let mut n: usize = 0;
             while let Some(sentence) = rx.recv().await {
@@ -19174,6 +19175,7 @@ async fn run_standalone_turn(
                     &sentence,
                     &w_voice,
                     &w_provider,
+                    w_cloud.as_ref(),
                     &w_dir,
                 )
                 .await
@@ -19876,9 +19878,10 @@ async fn run_standalone_turn(
                 &session_runtime.profile.voice.default_voice,
             );
             let provider = session_runtime.profile.voice.tts_provider.as_str();
+            let cloud = session_runtime.profile.voice.cloud.as_ref();
             let reply_audio_dir = session_runtime.workspace_root.as_path();
             if let Some(audio_path) =
-                crate::api::voice_turn::synthesize_reply(reply, &voice, provider, reply_audio_dir)
+                crate::api::voice_turn::synthesize_reply(reply, &voice, provider, cloud, reply_audio_dir)
                     .await
             {
                 // Deliver via the EXISTING file/attached carrier. Emit the
