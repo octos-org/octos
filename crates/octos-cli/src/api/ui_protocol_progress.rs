@@ -6,10 +6,11 @@
 #![allow(dead_code)]
 
 use octos_core::ui_protocol::{
-    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, TaskRuntimeState as UiTaskRuntimeState,
-    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnId,
-    UiFileMutationNotice, UiNotification, UiProgressEvent, UiProgressMetadata, UiRetryBackoff,
-    UiTokenCostUpdate, WarningEvent, file_mutation_operations, progress_kinds,
+    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, ReasoningDeltaEvent,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnId, UiFileMutationNotice, UiNotification,
+    UiProgressEvent, UiProgressMetadata, UiRetryBackoff, UiTokenCostUpdate, WarningEvent,
+    file_mutation_operations, progress_kinds,
 };
 use octos_core::{SessionKey, TaskId};
 use serde_json::{Value, json};
@@ -98,6 +99,7 @@ pub(crate) fn map_progress_json(
 
     match event_type {
         "token" => map_token(context, event),
+        "reasoning_chunk" => map_reasoning_chunk(context, event),
         "tool_start" => map_tool_start(context, event),
         "tool_progress" => map_tool_progress(context, event),
         "tool_end" => map_tool_end(context, event),
@@ -329,6 +331,23 @@ fn map_token(context: &ProgressMappingContext, event: &Value) -> UiProgressMappi
     };
 
     UiProgressMapping::notifications(vec![UiNotification::MessageDelta(MessageDeltaEvent {
+        session_id: context.session_id.clone(),
+        topic: None,
+        turn_id: context.turn_id.clone(),
+        text,
+    })])
+}
+
+fn map_reasoning_chunk(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let Some(text) = string_field(event, &["text"]) else {
+        return UiProgressMapping::warning(
+            context,
+            "invalid_progress",
+            "reasoning_chunk progress event is missing string field `text`".to_string(),
+        );
+    };
+
+    UiProgressMapping::notifications(vec![UiNotification::ReasoningDelta(ReasoningDeltaEvent {
         session_id: context.session_id.clone(),
         topic: None,
         turn_id: context.turn_id.clone(),
@@ -693,6 +712,21 @@ mod tests {
             panic!("expected message delta notification");
         };
         assert_eq!(delta.text, "hi");
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_reasoning_chunk_to_reasoning_delta() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({ "type": "reasoning_chunk", "text": "thinking" }),
+        );
+
+        assert_eq!(mapping.status, None);
+        assert_eq!(mapping.warning, None);
+        let [UiNotification::ReasoningDelta(delta)] = mapping.notifications.as_slice() else {
+            panic!("expected reasoning delta notification");
+        };
+        assert_eq!(delta.text, "thinking");
     }
 
     #[test]

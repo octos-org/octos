@@ -119,6 +119,9 @@ pub enum ProgressEvent {
     /// Streaming text chunk from LLM.
     StreamChunk { text: String, iteration: u32 },
 
+    /// Streaming reasoning chunk from LLM.
+    ReasoningChunk { text: String, iteration: u32 },
+
     /// Streaming completed.
     StreamDone { iteration: u32 },
 
@@ -436,6 +439,7 @@ impl ProgressReporter for ConsoleReporter {
                     }
                 }
             }
+            ProgressEvent::ReasoningChunk { .. } => {}
             ProgressEvent::StreamDone { .. } => {
                 use std::io::Write;
                 if let Ok(mut buf) = self.stdout.lock() {

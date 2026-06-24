@@ -1005,6 +1005,7 @@ pub mod methods {
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_ERROR: &str = "turn/error";
     pub const MESSAGE_DELTA: &str = "message/delta";
+    pub const MESSAGE_REASONING_DELTA: &str = "message/reasoning_delta";
     pub const TOOL_STARTED: &str = "tool/started";
     pub const TOOL_PROGRESS: &str = "tool/progress";
     pub const TOOL_COMPLETED: &str = "tool/completed";
@@ -1219,6 +1220,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::TURN_COMPLETED,
     methods::TURN_ERROR,
     methods::MESSAGE_DELTA,
+    methods::MESSAGE_REASONING_DELTA,
     methods::TOOL_STARTED,
     methods::TOOL_PROGRESS,
     methods::TOOL_COMPLETED,
@@ -3376,6 +3378,9 @@ pub enum Payload {
     /// `assistant_persisted` for the same thread REPLACES the
     /// accumulated text.
     AssistantDelta { text: String },
+    /// One streamed assistant reasoning fragment. Clients render this on a
+    /// separate reasoning surface from assistant answer text.
+    ReasoningDelta { text: String },
     /// Final assistant text persisted to the ledger after streaming
     /// completes. Carries the durable [`MessageMeta`] so the projection
     /// can finalize the bubble's identity and surface attachments. Its
@@ -4546,6 +4551,15 @@ pub struct MessageDeltaEvent {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningDeltaEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    pub text: String,
+}
+
 /// #1477 voice rich output: a background visual artifact began generating for
 /// the turn. The client renders a "generating" placeholder keyed off this
 /// typed event instead of scraping an in-band `[[VISUAL:...]]` marker out of the
@@ -5544,6 +5558,7 @@ pub enum UiNotification {
     SessionOpened(SessionOpened),
     TurnStarted(TurnStartedEvent),
     MessageDelta(MessageDeltaEvent),
+    ReasoningDelta(ReasoningDeltaEvent),
     /// #1477 voice rich output: a background visual artifact started generating.
     VisualGenerating(VisualGeneratingEvent),
     /// #1477 voice rich output: a background visual artifact was produced.
@@ -5644,6 +5659,7 @@ impl UiNotification {
             Self::SessionOpened(_) => methods::SESSION_OPEN,
             Self::TurnStarted(_) => methods::TURN_STARTED,
             Self::MessageDelta(_) => methods::MESSAGE_DELTA,
+            Self::ReasoningDelta(_) => methods::MESSAGE_REASONING_DELTA,
             Self::VisualGenerating(_) => methods::VISUAL_GENERATING,
             Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
             Self::VisualFailed(_) => methods::VISUAL_FAILED,
@@ -5689,6 +5705,7 @@ impl UiNotification {
             Self::SessionOpened(event) => &event.session_id,
             Self::TurnStarted(event) => &event.session_id,
             Self::MessageDelta(event) => &event.session_id,
+            Self::ReasoningDelta(event) => &event.session_id,
             Self::VisualGenerating(event) => &event.session_id,
             Self::VisualSucceeded(event) => &event.session_id,
             Self::VisualFailed(event) => &event.session_id,
@@ -5733,6 +5750,9 @@ impl UiNotification {
         match self {
             Self::TurnStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::MessageDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ReasoningDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::VisualGenerating(event) => {
@@ -5798,6 +5818,7 @@ impl UiNotification {
         match self {
             Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ReasoningDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualGenerating(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualSucceeded(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualFailed(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5829,6 +5850,7 @@ impl UiNotification {
             Self::SessionOpened(params) => serde_json::to_value(params),
             Self::TurnStarted(params) => serde_json::to_value(params),
             Self::MessageDelta(params) => serde_json::to_value(params),
+            Self::ReasoningDelta(params) => serde_json::to_value(params),
             Self::VisualGenerating(params) => serde_json::to_value(params),
             Self::VisualSucceeded(params) => serde_json::to_value(params),
             Self::VisualFailed(params) => serde_json::to_value(params),
@@ -5927,6 +5949,9 @@ impl UiNotification {
             methods::SESSION_OPEN => Ok(Self::SessionOpened(decode_params(method, params)?)),
             methods::TURN_STARTED => Ok(Self::TurnStarted(decode_params(method, params)?)),
             methods::MESSAGE_DELTA => Ok(Self::MessageDelta(decode_params(method, params)?)),
+            methods::MESSAGE_REASONING_DELTA => {
+                Ok(Self::ReasoningDelta(decode_params(method, params)?))
+            }
             methods::VISUAL_GENERATING => {
                 Ok(Self::VisualGenerating(decode_params(method, params)?))
             }
