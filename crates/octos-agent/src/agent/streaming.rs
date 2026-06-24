@@ -258,6 +258,10 @@ impl Agent {
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
                     reasoning.push_str(&delta);
+                    self.reporter().report(ProgressEvent::ReasoningChunk {
+                        text: delta.clone(),
+                        iteration,
+                    });
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
@@ -557,7 +561,7 @@ mod tests {
     //! These tests run with `tokio::time::pause` so the 180s inter-chunk
     //! timeout fires instantly under virtual time.
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -574,9 +578,27 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::Agent;
+    use crate::progress::{ProgressEvent, ProgressReporter};
     use crate::tools::ToolRegistry;
 
     struct NoopProvider;
+
+    #[derive(Default)]
+    struct CapturingReporter {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+
+    impl CapturingReporter {
+        fn events(&self) -> Vec<ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ProgressReporter for CapturingReporter {
+        fn report(&self, event: ProgressEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     #[async_trait]
     impl LlmProvider for NoopProvider {
@@ -800,6 +822,42 @@ mod tests {
         assert!(streamed);
         assert_eq!(response.content.as_deref(), Some("Hello, fast world!"));
         assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn reasoning_delta_reports_reasoning_chunk_and_keeps_buffering() {
+        let (agent, _dir) = build_test_agent().await;
+        let reporter = Arc::new(CapturingReporter::default());
+        agent.set_reporter(reporter.clone());
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ReasoningDelta("plan ".to_string()),
+            StreamEvent::ReasoningDelta("step".to_string()),
+            StreamEvent::TextDelta("Answer".to_string()),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 3, 100)
+            .await
+            .expect("clean reasoning stream must assemble");
+
+        assert!(streamed);
+        assert_eq!(response.content.as_deref(), Some("Answer"));
+        assert_eq!(response.reasoning_content.as_deref(), Some("plan step"));
+
+        let reasoning_chunks: Vec<(String, u32)> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProgressEvent::ReasoningChunk { text, iteration } => Some((text, iteration)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning_chunks,
+            vec![("plan ".to_string(), 3), ("step".to_string(), 3)]
+        );
     }
 
     #[tokio::test]

@@ -94,6 +94,17 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::StreamChunk { text, iteration } => {
                 StreamProgressEvent::Chunk { text, iteration }
             }
+            ProgressEvent::ReasoningChunk { text, iteration } => {
+                let mut payload = serde_json::json!({
+                    "type": "reasoning_chunk",
+                    "text": text,
+                    "iteration": iteration,
+                });
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             ProgressEvent::StreamDone { iteration } => {
                 StreamProgressEvent::StreamDone { iteration }
             }
@@ -969,6 +980,10 @@ mod tests {
             content: "answer".into(),
             iteration: 1,
         });
+        reporter.report(ProgressEvent::ReasoningChunk {
+            text: "thinking".into(),
+            iteration: 1,
+        });
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 10,
             session_output_tokens: 20,
@@ -986,11 +1001,11 @@ mod tests {
         }
 
         // ToolStarted, ToolCompleted, ToolProgress emit RawSse + a typed
-        // mapped event each, so 6 reports → 6 RawSse JSON payloads.
+        // mapped event each, so 7 reports → 7 RawSse JSON payloads.
         assert_eq!(
             raw_payloads.len(),
-            6,
-            "expected 6 RawSse payloads, got {}: {:?}",
+            7,
+            "expected 7 RawSse payloads, got {}: {:?}",
             raw_payloads.len(),
             raw_payloads
         );

@@ -129,45 +129,7 @@ impl LlmProvider for OpenRouterProvider {
             .await
             .wrap_err("failed to parse OpenRouter response")?;
 
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| eyre::eyre!("no choices in OpenRouter response"))?;
-
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tc| octos_core::ToolCall {
-                id: tc.id,
-                name: tc.function.name,
-                arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
-                metadata: None,
-            })
-            .collect();
-
-        let stop_reason = match choice.finish_reason.as_str() {
-            "stop" => StopReason::EndTurn,
-            "tool_calls" => StopReason::ToolUse,
-            "length" => StopReason::MaxTokens,
-            "content_filter" => StopReason::ContentFiltered,
-            _ => StopReason::EndTurn,
-        };
-
-        Ok(ChatResponse {
-            content: choice.message.content,
-            reasoning_content: None,
-            tool_calls,
-            stop_reason,
-            usage: TokenUsage {
-                input_tokens: api_response.usage.prompt_tokens,
-                output_tokens: api_response.usage.completion_tokens,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        openrouter_response_to_chat_response(api_response)
     }
 
     async fn chat_stream(
@@ -392,6 +354,8 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ApiToolCall>>,
 }
 
@@ -411,6 +375,53 @@ struct FunctionCall {
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+}
+
+fn openrouter_response_to_chat_response(api_response: ApiResponse) -> Result<ChatResponse> {
+    let ApiResponse { choices, usage } = api_response;
+    let choice = choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre::eyre!("no choices in OpenRouter response"))?;
+
+    let ResponseMessage {
+        content,
+        reasoning,
+        reasoning_content,
+        tool_calls,
+    } = choice.message;
+
+    let tool_calls = tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tc| octos_core::ToolCall {
+            id: tc.id,
+            name: tc.function.name,
+            arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
+            metadata: None,
+        })
+        .collect();
+
+    let stop_reason = match choice.finish_reason.as_str() {
+        "stop" => StopReason::EndTurn,
+        "tool_calls" => StopReason::ToolUse,
+        "length" => StopReason::MaxTokens,
+        "content_filter" => StopReason::ContentFiltered,
+        _ => StopReason::EndTurn,
+    };
+
+    Ok(ChatResponse {
+        content,
+        reasoning_content: reasoning.or(reasoning_content),
+        tool_calls,
+        stop_reason,
+        usage: TokenUsage {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            ..Default::default()
+        },
+        provider_index: None,
+    })
 }
 
 #[cfg(test)]
@@ -591,6 +602,69 @@ mod tests {
         assert_eq!(resp.choices[0].finish_reason, "stop");
         assert_eq!(resp.usage.prompt_tokens, 10);
         assert_eq!(resp.usage.completion_tokens, 5);
+    }
+
+    #[test]
+    fn test_api_response_reasoning_field_to_chat_response() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Final answer.",
+                    "reasoning": "OpenRouter reasoning text.",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        });
+        let resp: ApiResponse = serde_json::from_value(json).unwrap();
+        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        assert_eq!(
+            chat.reasoning_content.as_deref(),
+            Some("OpenRouter reasoning text.")
+        );
+        assert_eq!(chat.content.as_deref(), Some("Final answer."));
+    }
+
+    #[test]
+    fn test_api_response_reasoning_content_fallback_to_chat_response() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Final answer.",
+                    "reasoning_content": "Compatible reasoning text.",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        });
+        let resp: ApiResponse = serde_json::from_value(json).unwrap();
+        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        assert_eq!(
+            chat.reasoning_content.as_deref(),
+            Some("Compatible reasoning text.")
+        );
+        assert_eq!(chat.content.as_deref(), Some("Final answer."));
+    }
+
+    #[test]
+    fn test_openrouter_sse_reasoning_delta_key() {
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"choices": [{"delta": {"reasoning": "Route-specific thought."}}]}"#.into(),
+        };
+        let events = crate::openai::parse_openai_sse_events(&event);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], crate::types::StreamEvent::ReasoningDelta(t) if t == "Route-specific thought.")
+        );
     }
 
     #[test]

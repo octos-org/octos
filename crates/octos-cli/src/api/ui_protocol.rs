@@ -8775,6 +8775,7 @@ fn live_event_passes_capability_filter(
     //
     // Legacy events superseded by envelopes per spec § 14.7:
     //   - message/delta             → assistant_delta envelope
+    //   - message/reasoning_delta   → reasoning_delta envelope
     //   - message/persisted         → assistant_persisted or user_message envelope
     //   - tool/started              → tool_start envelope
     //   - tool/progress             → tool_progress envelope
@@ -8788,6 +8789,7 @@ fn live_event_passes_capability_filter(
     if features.projection_envelope {
         if let UiProtocolLedgerEvent::Notification(
             UiNotification::MessageDelta(_)
+            | UiNotification::ReasoningDelta(_)
             | UiNotification::MessagePersisted(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
@@ -16892,7 +16894,10 @@ fn reasoning_effort_from_wire(
 ///   nothing user-facing. Pairs with the octos-tui client guard that ignores
 ///   deltas for already-terminal turns (belt + suspenders).
 fn drain_should_skip_event(event_type: Option<&str>) -> bool {
-    matches!(event_type, Some("done") | Some("error") | Some("token"))
+    matches!(
+        event_type,
+        Some("done") | Some("error") | Some("token") | Some("reasoning_chunk")
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20298,7 +20303,7 @@ async fn try_emit_terminal(
 }
 
 /// UPCR-2026-014 M9-γ dual-emit helper for `MessageDelta` /
-/// `ToolStarted` / `ToolProgress` / `ToolCompleted` (the legacy
+/// `ReasoningDelta` / `ToolStarted` / `ToolProgress` / `ToolCompleted` (the legacy
 /// notifications surfaced by `forward_progress_event`).
 ///
 /// For every legacy notification produced by the progress mapper, this
@@ -20335,6 +20340,13 @@ fn emit_envelope_for_legacy_notification(
             UiNotification::MessageDelta(event) => (
                 event.turn_id.0.to_string(),
                 Payload::AssistantDelta {
+                    text: event.text.clone(),
+                },
+                None,
+            ),
+            UiNotification::ReasoningDelta(event) => (
+                event.turn_id.0.to_string(),
+                Payload::ReasoningDelta {
                     text: event.text.clone(),
                 },
                 None,
@@ -20485,6 +20497,9 @@ fn forward_progress_event(
         match notification {
             UiNotification::MessageDelta(_) => {
                 *saw_delta = true;
+                let _ = send_notification_ephemeral(ws, ledger, notification);
+            }
+            UiNotification::ReasoningDelta(_) => {
                 let _ = send_notification_ephemeral(ws, ledger, notification);
             }
             UiNotification::ApprovalRequested(request) => {
@@ -22269,6 +22284,7 @@ fn send_raw_notification_ephemeral(
     if matches!(
         method,
         ui_methods::MESSAGE_DELTA
+            | ui_methods::MESSAGE_REASONING_DELTA
             | ui_methods::MESSAGE_PERSISTED
             | ui_methods::TOOL_STARTED
             | ui_methods::TOOL_PROGRESS
@@ -22893,6 +22909,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // future addition forces an explicit decision here.
             UiNotification::TurnStarted(_)
             | UiNotification::MessageDelta(_)
+            | UiNotification::ReasoningDelta(_)
             | UiNotification::VisualGenerating(_)
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_)
@@ -23025,7 +23042,8 @@ mod tests {
         ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
         DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-        QuestionId, SessionSandboxParams, approval_scopes, methods, rpc_error_codes,
+        QuestionId, ReasoningDeltaEvent, SessionSandboxParams, approval_scopes, methods,
+        rpc_error_codes,
     };
 
     #[test]
@@ -23038,6 +23056,7 @@ mod tests {
         assert!(drain_should_skip_event(Some("done")));
         assert!(drain_should_skip_event(Some("error")));
         assert!(drain_should_skip_event(Some("token")));
+        assert!(drain_should_skip_event(Some("reasoning_chunk")));
 
         // ...while still forwarding the background task's real progress, which
         // is the entire point of the drain (#961). None of these produce a
@@ -37484,6 +37503,15 @@ ignore = []
                 "assistant_delta",
             ),
             (
+                UiNotification::ReasoningDelta(ReasoningDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: "reasoning".into(),
+                }),
+                "reasoning_delta",
+            ),
+            (
                 UiNotification::ToolStarted(ToolStartedEvent {
                     session_id: session_id.clone(),
                     topic: None,
@@ -37537,6 +37565,7 @@ ignore = []
                 UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
                     match &env.envelope.payload {
                         Payload::AssistantDelta { .. } => Some("assistant_delta".into()),
+                        Payload::ReasoningDelta { .. } => Some("reasoning_delta".into()),
                         Payload::ToolStart { .. } => Some("tool_start".into()),
                         Payload::ToolProgress { .. } => Some("tool_progress".into()),
                         Payload::ToolEnd { .. } => Some("tool_end".into()),

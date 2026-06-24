@@ -971,8 +971,13 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
 
     if let Some(choices) = data["choices"].as_array() {
         for choice in choices {
-            // Reasoning/thinking content (kimi-k2.5, o1, etc.)
-            if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
+            // Reasoning/thinking content (kimi-k2.5, o1, etc.). OpenRouter
+            // uses `reasoning`; most OpenAI-compatible providers use
+            // `reasoning_content`.
+            if let Some(reasoning) = choice["delta"]["reasoning_content"]
+                .as_str()
+                .or_else(|| choice["delta"]["reasoning"].as_str())
+            {
                 if !reasoning.is_empty() {
                     events.push(StreamEvent::ReasoningDelta(reasoning.to_string()));
                 }

@@ -227,7 +227,10 @@ impl LlmProvider for GeminiProvider {
         let request = GeminiRequest {
             contents,
             system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
-                parts: vec![GeminiPart::Text { text }],
+                parts: vec![GeminiPart::Text {
+                    text,
+                    thought: None,
+                }],
             }),
             tools: gemini_tools,
             generation_config: Some(build_gemini_generation_config(config)),
@@ -270,78 +273,7 @@ impl LlmProvider for GeminiProvider {
         let api_response: GeminiResponse =
             serde_json::from_str(&response_text).wrap_err("failed to parse Gemini response")?;
 
-        // Extract content from response
-        let candidate = api_response
-            .candidates
-            .into_iter()
-            .next()
-            .ok_or_else(|| eyre::eyre!("no candidates in Gemini response"))?;
-
-        let mut content = None;
-        let mut tool_calls = Vec::new();
-
-        for part in candidate.content.parts {
-            match part {
-                GeminiPart::Text { text } => {
-                    content = Some(text);
-                }
-                GeminiPart::FunctionCall {
-                    function_call,
-                    thought_signature,
-                } => {
-                    let metadata = thought_signature
-                        .map(|sig| serde_json::json!({ "thought_signature": sig }));
-                    tool_calls.push(octos_core::ToolCall {
-                        id: next_gemini_tool_call_id(),
-                        name: function_call.name,
-                        arguments: function_call.args,
-                        metadata,
-                    });
-                }
-                GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
-                    // InlineData and FunctionResponse are only used in requests
-                }
-            }
-        }
-
-        let stop_reason = match candidate.finish_reason.as_deref() {
-            Some("STOP") => StopReason::EndTurn,
-            Some("MAX_TOKENS") => StopReason::MaxTokens,
-            Some("SAFETY" | "RECITATION" | "OTHER" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
-                StopReason::ContentFiltered
-            }
-            Some("MALFORMED_FUNCTION_CALL") => {
-                // Gemini sometimes fails to format tool calls properly.
-                // Treat as empty response so the retry logic picks it up.
-                tracing::warn!("Gemini returned MALFORMED_FUNCTION_CALL");
-                StopReason::EndTurn
-            }
-            _ if !tool_calls.is_empty() => StopReason::ToolUse,
-            _ => StopReason::EndTurn,
-        };
-
-        // Gemini doesn't always return usage in the same format
-        let usage = api_response.usage_metadata.unwrap_or(GeminiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-            thoughts_token_count: 0,
-            cached_content_token_count: 0,
-        });
-
-        Ok(ChatResponse {
-            content,
-            reasoning_content: None,
-            tool_calls,
-            stop_reason,
-            usage: TokenUsage {
-                input_tokens: usage.prompt_token_count,
-                output_tokens: usage.candidates_token_count,
-                reasoning_tokens: usage.thoughts_token_count,
-                cache_read_tokens: usage.cached_content_token_count,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        gemini_response_to_chat_response(api_response)
     }
 
     async fn chat_stream(
@@ -374,7 +306,10 @@ impl LlmProvider for GeminiProvider {
         let request = GeminiRequest {
             contents,
             system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
-                parts: vec![GeminiPart::Text { text }],
+                parts: vec![GeminiPart::Text {
+                    text,
+                    thought: None,
+                }],
             }),
             tools: gemini_tools,
             generation_config: Some(build_gemini_generation_config(config)),
@@ -475,6 +410,8 @@ struct GeminiContent {
 enum GeminiPart {
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought: Option<bool>,
     },
     InlineData {
         #[serde(rename = "inlineData")]
@@ -581,6 +518,7 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                 if !msg.content.is_empty() {
                     parts.push(GeminiPart::Text {
                         text: msg.content.clone(),
+                        thought: None,
                     });
                 }
                 // Include functionCall parts for any tool calls the model made.
@@ -607,6 +545,7 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                 if parts.is_empty() {
                     parts.push(GeminiPart::Text {
                         text: String::new(),
+                        thought: None,
                     });
                 }
                 push_or_merge(&mut contents, "model", parts);
@@ -677,6 +616,7 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     if images.is_empty() {
         return vec![GeminiPart::Text {
             text: msg.content.clone(),
+            thought: None,
         }];
     }
 
@@ -694,6 +634,7 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     if !msg.content.is_empty() {
         parts.push(GeminiPart::Text {
             text: msg.content.clone(),
+            thought: None,
         });
     }
     parts
@@ -818,6 +759,98 @@ struct GeminiUsageMetadata {
     cached_content_token_count: u32,
 }
 
+fn append_nonempty(target: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match target {
+        Some(existing) => existing.push_str(&text),
+        None => *target = Some(text),
+    }
+}
+
+fn gemini_response_to_chat_response(api_response: GeminiResponse) -> Result<ChatResponse> {
+    let GeminiResponse {
+        candidates,
+        usage_metadata,
+    } = api_response;
+
+    let candidate = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre::eyre!("no candidates in Gemini response"))?;
+
+    let mut content = None;
+    let mut reasoning_content = None;
+    let mut tool_calls = Vec::new();
+
+    for part in candidate.content.parts {
+        match part {
+            GeminiPart::Text { text, thought } => {
+                if thought.unwrap_or(false) {
+                    append_nonempty(&mut reasoning_content, text);
+                } else {
+                    append_nonempty(&mut content, text);
+                }
+            }
+            GeminiPart::FunctionCall {
+                function_call,
+                thought_signature,
+            } => {
+                let metadata =
+                    thought_signature.map(|sig| serde_json::json!({ "thought_signature": sig }));
+                tool_calls.push(octos_core::ToolCall {
+                    id: next_gemini_tool_call_id(),
+                    name: function_call.name,
+                    arguments: function_call.args,
+                    metadata,
+                });
+            }
+            GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
+                // InlineData and FunctionResponse are only used in requests.
+            }
+        }
+    }
+
+    let stop_reason = match candidate.finish_reason.as_deref() {
+        Some("STOP") => StopReason::EndTurn,
+        Some("MAX_TOKENS") => StopReason::MaxTokens,
+        Some("SAFETY" | "RECITATION" | "OTHER" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
+            StopReason::ContentFiltered
+        }
+        Some("MALFORMED_FUNCTION_CALL") => {
+            // Gemini sometimes fails to format tool calls properly.
+            // Treat as empty response so the retry logic picks it up.
+            tracing::warn!("Gemini returned MALFORMED_FUNCTION_CALL");
+            StopReason::EndTurn
+        }
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        _ => StopReason::EndTurn,
+    };
+
+    let usage = usage_metadata.unwrap_or(GeminiUsageMetadata {
+        prompt_token_count: 0,
+        candidates_token_count: 0,
+        thoughts_token_count: 0,
+        cached_content_token_count: 0,
+    });
+
+    Ok(ChatResponse {
+        content,
+        reasoning_content,
+        tool_calls,
+        stop_reason,
+        usage: TokenUsage {
+            input_tokens: usage.prompt_token_count,
+            output_tokens: usage.candidates_token_count,
+            reasoning_tokens: usage.thoughts_token_count,
+            cache_read_tokens: usage.cached_content_token_count,
+            ..Default::default()
+        },
+        provider_index: None,
+    })
+}
+
 // --- Streaming SSE helpers ---
 
 #[derive(Default)]
@@ -841,7 +874,11 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                 for part in parts {
                     if let Some(text) = part["text"].as_str() {
                         if !text.is_empty() {
-                            events.push(StreamEvent::TextDelta(text.to_string()));
+                            if part["thought"].as_bool().unwrap_or(false) {
+                                events.push(StreamEvent::ReasoningDelta(text.to_string()));
+                            } else {
+                                events.push(StreamEvent::TextDelta(text.to_string()));
+                            }
                         }
                     }
                     if let Some(fc) = part.get("functionCall") {
@@ -1110,7 +1147,10 @@ mod tests {
 
     #[test]
     fn test_parts_compatible_blocks_mixed_types() {
-        let text = vec![GeminiPart::Text { text: "hi".into() }];
+        let text = vec![GeminiPart::Text {
+            text: "hi".into(),
+            thought: None,
+        }];
         let func_resp = vec![GeminiPart::FunctionResponse {
             function_response: GeminiFunctionResponse {
                 name: "test".into(),
@@ -1135,6 +1175,20 @@ mod tests {
         let events = map_gemini_sse(&mut state, &event);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "Hello"));
+    }
+
+    #[test]
+    fn test_gemini_sse_thought_text_delta() {
+        let mut state = GeminiStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"candidates": [{"content": {"parts": [{"text": "Check the invariants.", "thought": true}]}}]}"#.into(),
+        };
+        let events = map_gemini_sse(&mut state, &event);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "Check the invariants.")
+        );
     }
 
     #[test]
@@ -1253,6 +1307,46 @@ mod tests {
             data: "not valid json".into(),
         };
         assert!(map_gemini_sse(&mut state, &event).is_empty());
+    }
+
+    #[test]
+    fn test_gemini_response_captures_thought_parts() {
+        let api_response: GeminiResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "Inspect the constraints.",
+                                "thought": true
+                            },
+                            {
+                                "text": "Return the concise answer."
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP"
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 22,
+                "thoughtsTokenCount": 7
+            }
+        }))
+        .unwrap();
+
+        let response = gemini_response_to_chat_response(api_response).unwrap();
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("Inspect the constraints.")
+        );
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Return the concise answer.")
+        );
+        assert_eq!(response.usage.reasoning_tokens, 7);
     }
 
     // --- Provider metadata tests ---
