@@ -13,6 +13,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::vision;
 
 use crate::config::ChatConfig;
+use crate::config::ReasoningEffort;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::{
     ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
@@ -109,6 +110,7 @@ impl AnthropicProvider {
                 }
             },
             tools: if tools.is_empty() { None } else { Some(tools) },
+            thinking: config.reasoning_effort.map(build_anthropic_thinking),
             context_management: config.context_management.as_ref(),
         }
     }
@@ -155,45 +157,7 @@ impl LlmProvider for AnthropicProvider {
             .await
             .wrap_err("failed to parse Anthropic response")?;
 
-        // Convert response to our types
-        let mut content = None;
-        let mut tool_calls = Vec::new();
-
-        for block in api_response.content {
-            match block {
-                ContentBlock::Text { text } => {
-                    content = Some(text);
-                }
-                ContentBlock::ToolUse { id, name, input } => {
-                    tool_calls.push(octos_core::ToolCall {
-                        id,
-                        name,
-                        arguments: input,
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        let stop_reason = match api_response.stop_reason.as_str() {
-            "end_turn" => StopReason::EndTurn,
-            "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::MaxTokens,
-            _ => StopReason::EndTurn,
-        };
-
-        Ok(ChatResponse {
-            content,
-            reasoning_content: None,
-            tool_calls,
-            stop_reason,
-            usage: TokenUsage {
-                input_tokens: api_response.usage.input_tokens,
-                output_tokens: api_response.usage.output_tokens,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        Ok(anthropic_response_to_chat_response(api_response))
     }
 
     async fn chat_stream(
@@ -272,6 +236,8 @@ struct AnthropicRequest<'a> {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolSpec]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
     /// M8.5 tier 2: forwarded from `ChatConfig.context_management`. Opaque
     /// payload (typically `{ "edits": [ { "type":
     /// "clear_tool_uses_20250919", ... } ] }`) that tells Anthropic's server
@@ -279,6 +245,28 @@ struct AnthropicRequest<'a> {
     /// non-null and the caller opted in via the builder.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_management: Option<&'a serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AnthropicThinking {
+    r#type: &'static str,
+    budget_tokens: u32,
+}
+
+fn build_anthropic_thinking(effort: ReasoningEffort) -> AnthropicThinking {
+    AnthropicThinking {
+        r#type: "enabled",
+        budget_tokens: anthropic_thinking_budget_tokens(effort),
+    }
+}
+
+fn anthropic_thinking_budget_tokens(effort: ReasoningEffort) -> u32 {
+    match effort {
+        ReasoningEffort::Low => 1_024,
+        ReasoningEffort::Medium => 4_096,
+        ReasoningEffort::High => 8_192,
+        ReasoningEffort::Max => 16_000,
+    }
 }
 
 #[derive(Serialize)]
@@ -385,6 +373,9 @@ enum ContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -396,6 +387,59 @@ enum ContentBlock {
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+fn append_nonempty(target: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match target {
+        Some(existing) => existing.push_str(&text),
+        None => *target = Some(text),
+    }
+}
+
+fn anthropic_response_to_chat_response(api_response: AnthropicResponse) -> ChatResponse {
+    let mut content = None;
+    let mut reasoning_content = None;
+    let mut tool_calls = Vec::new();
+
+    for block in api_response.content {
+        match block {
+            ContentBlock::Text { text } => append_nonempty(&mut content, text),
+            ContentBlock::Thinking { thinking } => {
+                append_nonempty(&mut reasoning_content, thinking);
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                tool_calls.push(octos_core::ToolCall {
+                    id,
+                    name,
+                    arguments: input,
+                    metadata: None,
+                });
+            }
+        }
+    }
+
+    let stop_reason = match api_response.stop_reason.as_str() {
+        "end_turn" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        _ => StopReason::EndTurn,
+    };
+
+    ChatResponse {
+        content,
+        reasoning_content,
+        tool_calls,
+        stop_reason,
+        usage: TokenUsage {
+            input_tokens: api_response.usage.input_tokens,
+            output_tokens: api_response.usage.output_tokens,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
 }
 
 // --- Streaming SSE helpers ---
@@ -468,6 +512,14 @@ fn map_anthropic_sse(
                     vec![StreamEvent::TextDelta(
                         data["delta"]["text"].as_str().unwrap_or("").to_string(),
                     )]
+                }
+                "thinking_delta" => {
+                    let thinking = data["delta"]["thinking"].as_str().unwrap_or("");
+                    if thinking.is_empty() {
+                        vec![]
+                    } else {
+                        vec![StreamEvent::ReasoningDelta(thinking.to_string())]
+                    }
                 }
                 "input_json_delta" => {
                     if let Some(&tool_idx) = state.block_to_tool.get(&idx) {
@@ -664,6 +716,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn should_emit_thinking_only_when_reasoning_effort_is_set() {
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+
+        let default_config = ChatConfig::default();
+        let default_request = provider.build_request(&messages, &[], &default_config);
+        let default_body = serde_json::to_value(&default_request).unwrap();
+        assert!(default_body.get("thinking").is_none());
+
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &[], &config);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8_192);
+    }
+
+    #[test]
+    fn test_response_captures_thinking_content_block() {
+        let api_response: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Compare the constraints first.",
+                    "signature": "opaque"
+                },
+                {
+                    "type": "text",
+                    "text": "Use the narrower option."
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34
+            }
+        }))
+        .unwrap();
+
+        let response = anthropic_response_to_chat_response(api_response);
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("Compare the constraints first.")
+        );
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Use the narrower option.")
+        );
+    }
+
     // --- SSE mapping tests ---
 
     #[test]
@@ -688,6 +793,18 @@ mod tests {
         let events = map_anthropic_sse(&mut state, &event);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "Hello"));
+    }
+
+    #[test]
+    fn test_sse_thinking_delta() {
+        let mut state = AnthropicStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Check edge cases."}}"#.into(),
+        };
+        let events = map_anthropic_sse(&mut state, &event);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "Check edge cases."));
     }
 
     #[test]
