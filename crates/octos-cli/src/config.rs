@@ -2525,7 +2525,10 @@ mod tests {
 
     #[test]
     fn should_override_cloud_when_some() {
-        let cloud = CloudTtsConfig { appid: Some("123".into()), ..Default::default() };
+        let cloud = CloudTtsConfig {
+            appid: Some("123".into()),
+            ..Default::default()
+        };
         let cfg = VoiceConfig::default().with_cloud_override(Some(&cloud));
         assert_eq!(cfg.cloud.unwrap().appid.as_deref(), Some("123"));
     }
@@ -2548,8 +2551,14 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&cloud).unwrap();
-        assert!(!json.contains("token"), "token key must not serialize: {json}");
-        assert!(!json.contains("supersecret"), "token value must not leak: {json}");
+        assert!(
+            !json.contains("token"),
+            "token key must not serialize: {json}"
+        );
+        assert!(
+            !json.contains("supersecret"),
+            "token value must not leak: {json}"
+        );
     }
 
     #[test]
@@ -2559,7 +2568,10 @@ mod tests {
             ..Default::default()
         };
         let dbg = format!("{cloud:?}");
-        assert!(!dbg.contains("supersecret"), "Debug must redact token: {dbg}");
+        assert!(
+            !dbg.contains("supersecret"),
+            "Debug must redact token: {dbg}"
+        );
         assert!(dbg.contains("redacted"));
     }
 
@@ -2588,7 +2600,10 @@ mod tests {
 
     #[test]
     fn should_overlay_profile_tts_provider_over_host_voice() {
-        let host = VoiceConfig { tts_provider: "auto".into(), ..Default::default() };
+        let host = VoiceConfig {
+            tts_provider: "auto".into(),
+            ..Default::default()
+        };
         let overridden = host
             .with_tts_provider_override(Some("cloud"))
             .with_cloud_override(Some(&CloudTtsConfig {

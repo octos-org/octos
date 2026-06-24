@@ -4360,10 +4360,14 @@ mod tests {
 
     #[test]
     fn should_roundtrip_tts_provider_and_cloud_on_profile_config() {
-        let json = r#"{ "tts_provider": "cloud", "tts_cloud": { "appid": "999", "voice": "BV700" } }"#;
+        let json =
+            r#"{ "tts_provider": "cloud", "tts_cloud": { "appid": "999", "voice": "BV700" } }"#;
         let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.tts_provider.as_deref(), Some("cloud"));
-        assert_eq!(cfg.tts_cloud.as_ref().unwrap().appid.as_deref(), Some("999"));
+        assert_eq!(
+            cfg.tts_cloud.as_ref().unwrap().appid.as_deref(),
+            Some("999")
+        );
     }
 
     #[test]

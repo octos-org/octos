@@ -803,6 +803,20 @@ fn resolve_volcano(cloud: Option<&CloudTtsConfig>) -> Option<VolcanoTts> {
     )
 }
 
+/// HTTP client for Volcano TTS, with redirects DISABLED. Even though the
+/// endpoint is allowlisted to an HTTPS Volcano host, that host could still
+/// respond with a 3xx to an off-allowlist address; `reqwest` would otherwise
+/// follow it and 307/308 preserve the POST body — replaying the token to the
+/// redirect target. `Policy::none()` makes a redirect a terminal response we
+/// never follow, closing that exfiltration path.
+fn volcano_http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"))
+        .ok()
+}
+
 /// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
 /// returns base64 audio in JSON). Writes the decoded audio to `out_dir` and
 /// returns the path. `None` on any failure (caller falls back to ominix).
@@ -817,7 +831,7 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
         "request": { "reqid": reqid, "text": text, "operation": "query", "text_type": "plain" },
     });
 
-    let client = reqwest::Client::new();
+    let client = volcano_http_client()?;
     let resp = client
         .post(&cfg.endpoint)
         // Volcano's quirky scheme: literal "Bearer;" + token (semicolon, no space).
@@ -942,7 +956,10 @@ mod tests {
 
     #[test]
     fn should_return_none_when_token_missing() {
-        let cloud = CloudTtsConfig { appid: Some("1".into()), ..Default::default() };
+        let cloud = CloudTtsConfig {
+            appid: Some("1".into()),
+            ..Default::default()
+        };
         assert!(build_volcano(None, Some(&cloud), None, None, None, None, None).is_none());
     }
 
@@ -957,7 +974,10 @@ mod tests {
             Some("tok".into()),
             Some(&cloud),
             Some("envid".into()), // typed appid wins
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(v.appid, "typed");
@@ -1002,14 +1022,29 @@ mod tests {
             endpoint: Some("https://attacker.example/tts".into()),
             ..Default::default()
         };
-        assert!(build_volcano(Some("tok".into()), Some(&cloud), None, None, None, None, None).is_none());
+        assert!(
+            build_volcano(
+                Some("tok".into()),
+                Some(&cloud),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn should_reject_http_volcano_endpoint() {
         // Even the right host over plain http is rejected (must be https).
-        assert!(!is_allowed_volcano_endpoint("http://openspeech.bytedance.com/api/v1/tts"));
-        assert!(!is_allowed_volcano_endpoint("https://evil.openspeech.bytedance.com.attacker.com/"));
+        assert!(!is_allowed_volcano_endpoint(
+            "http://openspeech.bytedance.com/api/v1/tts"
+        ));
+        assert!(!is_allowed_volcano_endpoint(
+            "https://evil.openspeech.bytedance.com.attacker.com/"
+        ));
         assert!(!is_allowed_volcano_endpoint("not a url"));
     }
 
@@ -1018,6 +1053,40 @@ mod tests {
         assert!(is_allowed_volcano_endpoint(
             "https://openspeech.bytedance.com/api/v1/tts"
         ));
+    }
+
+    #[tokio::test]
+    async fn volcano_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A one-shot server that answers every connection with a 307 to another
+        // host. A client that followed redirects would replay the POST there;
+        // ours must instead surface the 307 as a terminal response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let resp = "HTTP/1.1 307 Temporary Redirect\r\n\
+                    Location: http://attacker.example/steal\r\n\
+                    Content-Length: 0\r\n\r\n";
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let client = volcano_http_client().expect("client builds");
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .body("token=secret")
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(
+            resp.status().as_u16(),
+            307,
+            "redirects must NOT be followed (token would leak to the target)"
+        );
     }
 
     #[tokio::test]

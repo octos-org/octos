@@ -19880,9 +19880,14 @@ async fn run_standalone_turn(
             let provider = session_runtime.profile.voice.tts_provider.as_str();
             let cloud = session_runtime.profile.voice.cloud.as_ref();
             let reply_audio_dir = session_runtime.workspace_root.as_path();
-            if let Some(audio_path) =
-                crate::api::voice_turn::synthesize_reply(reply, &voice, provider, cloud, reply_audio_dir)
-                    .await
+            if let Some(audio_path) = crate::api::voice_turn::synthesize_reply(
+                reply,
+                &voice,
+                provider,
+                cloud,
+                reply_audio_dir,
+            )
+            .await
             {
                 // Deliver via the EXISTING file/attached carrier. Emit the
                 // WORKSPACE-RELATIVE filename, NOT the absolute path:
