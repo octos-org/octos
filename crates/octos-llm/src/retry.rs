@@ -575,8 +575,8 @@ mod tests {
     // FailFast policy tests
     // ──────────────────────────────────────────────────────────────────────
 
-    /// Provider that always returns a retryable 429 error and counts `chat`
-    /// calls.
+    /// Provider that always returns a retryable error and counts `chat` and
+    /// `chat_stream` calls via a shared counter.
     struct CountingProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -597,6 +597,16 @@ mod tests {
             _tools: &[ToolSpec],
             _config: &ChatConfig,
         ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::rate_limited(Some(0)).into())
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatStream> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(LlmError::rate_limited(Some(0)).into())
         }
@@ -636,7 +646,39 @@ mod tests {
     async fn should_retry_when_normal_policy() {
         use crate::{LlmCallPolicy, with_llm_call_policy};
         use std::sync::atomic::Ordering;
-        let provider = CountingProvider::always_err_429();
+        // Use a 503 ServerError — NOT a rate-limit error — so that
+        // `rate_limit_delay` returns `None` and `calculate_delay` uses the
+        // configured 1-2 ms delays. Using `rate_limited(Some(0))` here would
+        // trigger the 30 s rate-limit fallback delay (3 retries × 30 s = 90 s).
+        struct CountingServer503 {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl LlmProvider for CountingServer503 {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(LlmError::new(
+                    LlmErrorKind::ServerError { status: 503 },
+                    "service unavailable",
+                )
+                .into())
+            }
+            fn model_id(&self) -> &str {
+                "counting-503"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+
+        let provider = CountingServer503 {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
         let calls = provider.calls.clone();
         let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
             max_retries: 3,
@@ -655,6 +697,32 @@ mod tests {
             calls.load(Ordering::SeqCst),
             4,
             "Normal retries max_retries+1 times"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_call_inner_once_when_failfast_on_stream() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::Ordering;
+        let provider = CountingProvider::always_err_429();
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            retry.chat_stream(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "FailFast must not retry chat_stream"
         );
     }
 
