@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use eyre::Result;
 use octos_core::Message;
 use octos_core::TokenUsage;
-use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
+use octos_llm::{ChatConfig, ChatResponse, LlmCallPolicy, StopReason, ToolSpec};
 use tracing::{info, warn};
 
 use super::Agent;
@@ -46,7 +46,10 @@ impl Agent {
         // reflects actual consumption, not just the final successful call.
         let mut retry_usage = TokenUsage::default();
 
-        for attempt in 0..=Self::LLM_RETRY_MAX {
+        let fail_fast = octos_llm::current_llm_call_policy() == LlmCallPolicy::FailFast;
+        let retry_max = if fail_fast { 0 } else { Self::LLM_RETRY_MAX };
+
+        for attempt in 0..=retry_max {
             let call_start = Instant::now();
             // Try the full LLM call (stream creation + consumption)
             // Estimate input tokens from message bytes (rough: ~4 chars per token
@@ -98,10 +101,8 @@ impl Agent {
                         return Ok((response, streamed));
                     }
 
-                    if attempt == Self::LLM_RETRY_MAX {
-                        // All streaming retries exhausted. Try one final non-streaming
-                        // call — this goes through FallbackProvider.chat() which tries
-                        // all fallback providers, not just the primary.
+                    if attempt == retry_max {
+                        // All streaming retries exhausted.
                         let reason = if response.stop_reason == StopReason::ContentFiltered {
                             "content filtered by safety/moderation"
                         } else {
@@ -111,6 +112,19 @@ impl Agent {
                             reason: format!("streaming retries exhausted: {reason}"),
                         });
                         self.llm.report_late_failure();
+
+                        if fail_fast {
+                            // FailFast: skip the non-streaming fallback, return error directly.
+                            return Err(eyre::eyre!(
+                                "LLM returned empty response after {} retries: {}",
+                                retry_max + 1,
+                                reason
+                            ));
+                        }
+
+                        // Try one final non-streaming call — this goes through
+                        // FallbackProvider.chat() which tries all fallback providers,
+                        // not just the primary.
                         warn!(
                             attempts = Self::LLM_RETRY_MAX + 1,
                             reason, "streaming retries exhausted, trying non-streaming fallback"
@@ -156,7 +170,7 @@ impl Agent {
                     });
                     warn!(
                         attempt = attempt + 1,
-                        max = Self::LLM_RETRY_MAX,
+                        max = retry_max,
                         delay_s = delay.as_secs(),
                         iteration,
                         stop_reason = ?response.stop_reason,
@@ -171,7 +185,7 @@ impl Agent {
                         message: format!(
                             "Retrying ({}/{})... {}",
                             attempt + 1,
-                            Self::LLM_RETRY_MAX + 1,
+                            retry_max + 1,
                             reason,
                         ),
                         iteration,
@@ -179,7 +193,7 @@ impl Agent {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    if attempt < Self::LLM_RETRY_MAX && Self::is_retryable_stream_error(&e) {
+                    if attempt < retry_max && Self::is_retryable_stream_error(&e) {
                         let delay = Duration::from_secs(1 << attempt);
                         turn.record_retry(LoopRetryReason::StreamError {
                             attempt: attempt + 1,
@@ -187,7 +201,7 @@ impl Agent {
                         });
                         warn!(
                             attempt = attempt + 1,
-                            max = Self::LLM_RETRY_MAX,
+                            max = retry_max,
                             delay_s = delay.as_secs(),
                             error = %e,
                             iteration,
@@ -201,18 +215,25 @@ impl Agent {
                             message: format!(
                                 "Retrying ({}/{})... stream error",
                                 attempt + 1,
-                                Self::LLM_RETRY_MAX + 1,
+                                retry_max + 1,
                             ),
                             iteration,
                         });
                         last_error = Some(e);
                         tokio::time::sleep(delay).await;
-                    } else if attempt == Self::LLM_RETRY_MAX {
-                        // Stream retries exhausted — try non-streaming with full fallback chain
+                    } else if attempt == retry_max {
+                        // Stream retries exhausted.
                         turn.record_retry(LoopRetryReason::ProviderFailover {
                             reason: "stream retries exhausted".to_string(),
                         });
                         self.llm.report_late_failure();
+
+                        if fail_fast {
+                            // FailFast: skip the non-streaming fallback, return error directly.
+                            return Err(e);
+                        }
+
+                        // Try non-streaming with full fallback chain
                         warn!(
                             error = %e,
                             "stream retries exhausted, trying non-streaming fallback"
@@ -240,5 +261,211 @@ impl Agent {
 
         // All retries exhausted with errors
         Err(last_error.unwrap_or_else(|| eyre::eyre!("LLM call failed after retries")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use octos_core::{AgentId, Message};
+    use octos_llm::{
+        ChatConfig, ChatResponse, ChatStream, LlmCallPolicy, LlmProvider, StopReason, StreamEvent,
+        TokenUsage as LlmTokenUsage, ToolSpec, with_llm_call_policy,
+    };
+    use octos_memory::EpisodeStore;
+
+    use super::super::Agent;
+    use super::super::turn_state::LoopTurnState;
+    use crate::tools::ToolRegistry;
+
+    // ── Shared call counters ──────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct CallCounters {
+        chat_stream: AtomicU32,
+        chat: AtomicU32,
+    }
+
+    // ── Provider that always errors on chat_stream (retryable 503) ───────────
+
+    struct AlwaysErrStreamProvider {
+        counters: Arc<CallCounters>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysErrStreamProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.counters.chat.fetch_add(1, Ordering::SeqCst);
+            eyre::bail!("non-streaming fallback should not be called under FailFast")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            self.counters.chat_stream.fetch_add(1, Ordering::SeqCst);
+            // Return a stream that immediately yields a retryable 503 error.
+            let events: Vec<StreamEvent> = vec![StreamEvent::Done(StopReason::EndTurn)];
+            let _ = events; // unused — we error at stream creation level
+            Err(eyre::eyre!("503 server error: stream unavailable"))
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-always-err"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    // ── Provider that returns empty response (no content, no tool_calls) ──────
+
+    struct AlwaysEmptyProvider {
+        counters: Arc<CallCounters>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysEmptyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.counters.chat.fetch_add(1, Ordering::SeqCst);
+            eyre::bail!("non-streaming fallback should not be called under FailFast")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            self.counters.chat_stream.fetch_add(1, Ordering::SeqCst);
+            // Return a stream that yields an empty (retriable) response.
+            let events = vec![
+                StreamEvent::Usage(LlmTokenUsage::default()),
+                StreamEvent::Done(StopReason::EndTurn),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-always-empty"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
+    async fn build_agent(provider: Arc<dyn LlmProvider>) -> (Agent, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = ToolRegistry::new();
+        let agent = Agent::new(AgentId::new("llm-call-test"), provider, tools, memory);
+        (agent, dir)
+    }
+
+    fn msgs() -> Vec<Message> {
+        vec![Message::user("hello")]
+    }
+
+    fn turn() -> LoopTurnState {
+        LoopTurnState::new(Instant::now())
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// Under FailFast, a provider whose stream always errors (retryable 503):
+    ///   - chat_stream called exactly once (no retries)
+    ///   - chat (non-streaming fallback) never called
+    #[tokio::test]
+    async fn should_call_once_and_skip_fallback_when_failfast_stream_error() {
+        let counters = Arc::new(CallCounters::default());
+        let provider = Arc::new(AlwaysErrStreamProvider {
+            counters: counters.clone(),
+        });
+        let (agent, _dir) = build_agent(provider).await;
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent
+                .call_llm_with_hooks(
+                    &msgs(),
+                    &[],
+                    &ChatConfig::default(),
+                    1,
+                    &octos_core::TokenUsage::default(),
+                    &mut turn(),
+                )
+                .await
+        })
+        .await;
+
+        assert!(result.is_err(), "should propagate the stream error");
+        assert_eq!(
+            counters.chat_stream.load(Ordering::SeqCst),
+            1,
+            "chat_stream must be called exactly once under FailFast"
+        );
+        assert_eq!(
+            counters.chat.load(Ordering::SeqCst),
+            0,
+            "non-streaming fallback must NOT be called under FailFast"
+        );
+    }
+
+    /// Under FailFast, a provider whose stream always returns an empty response:
+    ///   - chat_stream called exactly once (no retries)
+    ///   - chat (non-streaming fallback) never called
+    #[tokio::test]
+    async fn should_call_once_and_skip_fallback_when_failfast_empty_response() {
+        let counters = Arc::new(CallCounters::default());
+        let provider = Arc::new(AlwaysEmptyProvider {
+            counters: counters.clone(),
+        });
+        let (agent, _dir) = build_agent(provider).await;
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent
+                .call_llm_with_hooks(
+                    &msgs(),
+                    &[],
+                    &ChatConfig::default(),
+                    1,
+                    &octos_core::TokenUsage::default(),
+                    &mut turn(),
+                )
+                .await
+        })
+        .await;
+
+        assert!(result.is_err(), "should propagate the empty response error");
+        assert_eq!(
+            counters.chat_stream.load(Ordering::SeqCst),
+            1,
+            "chat_stream must be called exactly once under FailFast (empty response)"
+        );
+        assert_eq!(
+            counters.chat.load(Ordering::SeqCst),
+            0,
+            "non-streaming fallback must NOT be called under FailFast (empty response)"
+        );
     }
 }
