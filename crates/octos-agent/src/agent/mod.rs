@@ -387,6 +387,13 @@ pub struct Agent {
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
     pub(super) verifier_config: Option<AgentVerifierConfig>,
+    /// Voice-turn failure projection sink (Task 8). When the agent loop runs
+    /// under [`octos_llm::LlmCallPolicy::FailFast`] and a FOREGROUND LLM call
+    /// fails terminally, the loop emits a single [`crate::TurnFailure`] here so
+    /// the voice closeout (octos-cli) can render a spoken error/empty message.
+    /// `None` keeps pre-Task-8 behaviour byte-for-byte — the original
+    /// `eyre::Report` still flows out of the loop unchanged.
+    pub(super) voice_failure_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::TurnFailure>>,
 }
 
 impl Agent {
@@ -457,6 +464,7 @@ impl Agent {
             prompt_context_manager: None,
             session_scope: None,
             verifier_config: None,
+            voice_failure_sink: None,
         }
     }
 
@@ -528,6 +536,7 @@ impl Agent {
             prompt_context_manager: None,
             session_scope: None,
             verifier_config: None,
+            voice_failure_sink: None,
         }
     }
 
@@ -696,6 +705,19 @@ impl Agent {
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    /// Attach the voice-turn failure projection sink (Task 8). When set and the
+    /// loop runs under [`octos_llm::LlmCallPolicy::FailFast`], a single
+    /// [`crate::TurnFailure`] is emitted on terminal foreground-LLM failure
+    /// (empty response or classified LLM error). Hook-deny LLM failures are
+    /// intentionally excluded so the existing permission behaviour is
+    /// preserved.
+    pub fn set_voice_failure_sink(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::TurnFailure>,
+    ) {
+        self.voice_failure_sink = Some(tx);
     }
 
     /// Enable M8.4's [`FileStateCache`] for file tools.
