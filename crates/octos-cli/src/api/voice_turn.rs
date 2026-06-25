@@ -957,7 +957,9 @@ fn volcano_http_client() -> Option<&'static reqwest::Client> {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"))
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"),
+                )
                 .ok()
         })
         .as_ref()
