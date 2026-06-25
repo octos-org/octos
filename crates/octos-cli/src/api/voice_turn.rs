@@ -1284,8 +1284,8 @@ mod tests {
         // Per-sentence synthesis must not rebuild the HTTP client each time —
         // a fresh client per sentence pays a new TCP+TLS handshake to bytedance.
         // A shared process-wide client returns the same instance every call.
-        let a = volcano_client();
-        let b = volcano_client();
+        let a = volcano_http_client().expect("client builds");
+        let b = volcano_http_client().expect("client builds");
         assert!(
             std::ptr::eq(a, b),
             "volcano TTS client should be a shared instance, not rebuilt per call"
