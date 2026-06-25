@@ -263,7 +263,12 @@ impl LlmProvider for RetryProvider {
                     return Ok(response);
                 }
                 Err(e) => {
-                    if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
+                    let fail_fast =
+                        crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+                    if !fail_fast
+                        && attempt < self.config.max_retries
+                        && Self::is_retryable_error(&e)
+                    {
                         let delay = Self::rate_limit_delay(&e)
                             .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
@@ -301,7 +306,12 @@ impl LlmProvider for RetryProvider {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
+                    let fail_fast =
+                        crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+                    if !fail_fast
+                        && attempt < self.config.max_retries
+                        && Self::is_retryable_error(&e)
+                    {
                         let delay = Self::rate_limit_delay(&e)
                             .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
@@ -559,6 +569,93 @@ mod tests {
         assert_eq!(provider.calculate_delay(3), Duration::from_secs(8));
         // Should cap at max_delay
         assert_eq!(provider.calculate_delay(10), Duration::from_secs(60));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // FailFast policy tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Provider that always returns a retryable 429 error and counts `chat`
+    /// calls.
+    struct CountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingProvider {
+        fn always_err_429() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::rate_limited(Some(0)).into())
+        }
+
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_call_inner_once_when_failfast_even_if_retryable() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::Ordering;
+        let provider = CountingProvider::always_err_429();
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            retry.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "FailFast must not retry");
+    }
+
+    #[tokio::test]
+    async fn should_retry_when_normal_policy() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::Ordering;
+        let provider = CountingProvider::always_err_429();
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            retry.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "Normal retries max_retries+1 times"
+        );
     }
 
     struct MockProvider;
