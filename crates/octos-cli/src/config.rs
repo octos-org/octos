@@ -561,6 +561,46 @@ pub struct EmailConfig {
     pub feishu_region: Option<String>,
 }
 
+/// Non-secret Volcano (cloud) TTS settings. The **persisted** secret (the API
+/// token) is NEVER stored here — it lives in `env_vars["VOLC_TTS_TOKEN"]` so the
+/// shared masking/restore machinery covers it. The `token` field below is a
+/// runtime-only carrier (`#[serde(skip)]`): `ProfileRuntime::bootstrap` resolves
+/// the token from the profile's `env_vars` and stashes it here so the in-process
+/// `serve` path (which, unlike the gateway worker, does not get `env_vars`
+/// injected into `std::env`) can authenticate. It is never serialized and the
+/// `Debug` impl redacts it. Missing non-secret fields fall back to engine
+/// defaults at resolve time (see `voice_turn::resolve_volcano`).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CloudTtsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Runtime-only resolved API token (from `env_vars["VOLC_TTS_TOKEN"]`).
+    /// Never serialized; redacted in `Debug`.
+    #[serde(skip)]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for CloudTtsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudTtsConfig")
+            .field("appid", &self.appid)
+            .field("voice", &self.voice)
+            .field("cluster", &self.cluster)
+            .field("encoding", &self.encoding)
+            .field("endpoint", &self.endpoint)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Voice (ASR/TTS) configuration for auto-transcription and auto-synthesis.
 /// The OminiX API URL is a platform-wide setting via OMINIX_API_URL env var
 /// (default http://localhost:8080), NOT per-profile.
@@ -582,17 +622,23 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub asr_language: Option<String>,
     /// Which TTS route to use for synthesized replies:
-    /// - `"auto"` (default): cloud Volcano when the `VOLC_TTS_*` env is
-    ///   configured, otherwise the on-device GPT-SoVITS engine.
-    /// - `"volcano"`: force cloud Volcano (falls back to on-device sovits
-    ///   when the env is missing or the request fails).
-    /// - `"sovits"`: force the on-device GPT-SoVITS engine.
-    /// - `"qwen3"`: force the on-device Qwen3-TTS pool.
+    /// - `"auto"` (default): cloud when a token is configured, else on-device.
+    /// - `"local"`: force the on-device ominix-api engine.
+    /// - `"cloud"`: force cloud Volcano (falls back to on-device when the token
+    ///   is missing or the request fails).
     ///
-    /// Cloud credentials always come from `VOLC_TTS_*` env vars (secrets are
-    /// never read from config); this switch only selects the *route*.
+    /// Legacy aliases accepted for back-compat: `"volcano"` → `cloud`;
+    /// `"sovits"` / `"qwen3"` → `local`.
+    ///
+    /// Cloud credentials: the non-secret settings live in `cloud` (CloudTtsConfig);
+    /// the token is read from `VOLC_TTS_TOKEN` (never stored in config).
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
+    /// Non-secret cloud (Volcano) TTS settings. `None` → resolve entirely from
+    /// `VOLC_TTS_*` env (back-compat). Per-profile override via
+    /// `ProfileConfig.tts_cloud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudTtsConfig>,
 }
 
 impl Default for VoiceConfig {
@@ -604,6 +650,7 @@ impl Default for VoiceConfig {
             default_voice: default_voice_preset(),
             asr_language: None,
             tts_provider: default_tts_provider(),
+            cloud: None,
         }
     }
 }
@@ -618,6 +665,54 @@ impl VoiceConfig {
         if let Some(v) = override_voice {
             if !v.is_empty() {
                 self.default_voice = v.to_string();
+            }
+        }
+        self
+    }
+
+    /// Apply a per-profile TTS route override (`auto`/`local`/`cloud`). Empty /
+    /// `None` leaves the serve-level route untouched.
+    pub fn with_tts_provider_override(mut self, override_provider: Option<&str>) -> Self {
+        if let Some(p) = override_provider {
+            if !p.is_empty() {
+                self.tts_provider = p.to_string();
+            }
+        }
+        self
+    }
+
+    /// Apply a per-profile cloud-TTS settings override. `None` leaves the
+    /// serve-level (or env-fallback) settings untouched.
+    pub fn with_cloud_override(mut self, override_cloud: Option<&CloudTtsConfig>) -> Self {
+        if let Some(c) = override_cloud {
+            self.cloud = Some(c.clone());
+        }
+        self
+    }
+
+    /// Resolve the cloud-TTS API token from a profile's `env_vars`
+    /// (`VOLC_TTS_TOKEN`, keychain-aware) and stash it on `cloud.token`.
+    ///
+    /// This bridges the gap that the in-process `serve` path does not get the
+    /// profile's `env_vars` injected into `std::env` (only the gateway worker
+    /// does), so `voice_turn::resolve_volcano` can read the token from the
+    /// runtime config instead. No-op when there is no `cloud` config, when the
+    /// token is already set, or when `env_vars` has no (resolvable) token.
+    pub fn with_cloud_token_from_env(
+        mut self,
+        env_vars: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        if let Some(cloud) = self.cloud.as_mut() {
+            if cloud.token.as_deref().unwrap_or("").is_empty() {
+                if let Some(raw) = env_vars.get("VOLC_TTS_TOKEN") {
+                    if let Some(resolved) =
+                        crate::auth::keychain::resolve_value("VOLC_TTS_TOKEN", raw)
+                    {
+                        if !resolved.is_empty() {
+                            cloud.token = Some(resolved);
+                        }
+                    }
+                }
             }
         }
         self
@@ -2411,5 +2506,111 @@ mod tests {
             base.with_default_voice_override(Some("")).default_voice,
             "doubao"
         );
+    }
+
+    #[test]
+    fn should_override_tts_provider_when_some_nonempty() {
+        let cfg = VoiceConfig::default().with_tts_provider_override(Some("cloud"));
+        assert_eq!(cfg.tts_provider, "cloud");
+    }
+
+    #[test]
+    fn should_keep_tts_provider_when_override_none_or_empty() {
+        let base = VoiceConfig::default();
+        let kept = base.clone().with_tts_provider_override(None);
+        assert_eq!(kept.tts_provider, base.tts_provider);
+        let kept2 = base.clone().with_tts_provider_override(Some(""));
+        assert_eq!(kept2.tts_provider, base.tts_provider);
+    }
+
+    #[test]
+    fn should_override_cloud_when_some() {
+        let cloud = CloudTtsConfig {
+            appid: Some("123".into()),
+            ..Default::default()
+        };
+        let cfg = VoiceConfig::default().with_cloud_override(Some(&cloud));
+        assert_eq!(cfg.cloud.unwrap().appid.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn should_roundtrip_cloud_tts_config_serde() {
+        let json = r#"{ "cloud": { "appid": "a", "voice": "BV700" } }"#;
+        let cfg: VoiceConfig = serde_json::from_str(json).unwrap();
+        let cloud = cfg.cloud.unwrap();
+        assert_eq!(cloud.appid.as_deref(), Some("a"));
+        assert_eq!(cloud.voice.as_deref(), Some("BV700"));
+        assert_eq!(cloud.cluster, None);
+    }
+
+    #[test]
+    fn should_never_serialize_cloud_token() {
+        let cloud = CloudTtsConfig {
+            appid: Some("a".into()),
+            token: Some("supersecret".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cloud).unwrap();
+        assert!(
+            !json.contains("token"),
+            "token key must not serialize: {json}"
+        );
+        assert!(
+            !json.contains("supersecret"),
+            "token value must not leak: {json}"
+        );
+    }
+
+    #[test]
+    fn should_redact_cloud_token_in_debug() {
+        let cloud = CloudTtsConfig {
+            token: Some("supersecret".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{cloud:?}");
+        assert!(
+            !dbg.contains("supersecret"),
+            "Debug must redact token: {dbg}"
+        );
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn should_resolve_cloud_token_from_env_vars() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("VOLC_TTS_TOKEN".to_string(), "T-abc".to_string());
+        let vc = VoiceConfig {
+            cloud: Some(CloudTtsConfig {
+                appid: Some("1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .with_cloud_token_from_env(&env);
+        assert_eq!(vc.cloud.unwrap().token.as_deref(), Some("T-abc"));
+    }
+
+    #[test]
+    fn should_not_resolve_cloud_token_when_no_cloud_config() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("VOLC_TTS_TOKEN".to_string(), "T-abc".to_string());
+        let vc = VoiceConfig::default().with_cloud_token_from_env(&env);
+        assert!(vc.cloud.is_none());
+    }
+
+    #[test]
+    fn should_overlay_profile_tts_provider_over_host_voice() {
+        let host = VoiceConfig {
+            tts_provider: "auto".into(),
+            ..Default::default()
+        };
+        let overridden = host
+            .with_tts_provider_override(Some("cloud"))
+            .with_cloud_override(Some(&CloudTtsConfig {
+                appid: Some("42".into()),
+                ..Default::default()
+            }));
+        assert_eq!(overridden.tts_provider, "cloud");
+        assert_eq!(overridden.cloud.unwrap().appid.as_deref(), Some("42"));
     }
 }
