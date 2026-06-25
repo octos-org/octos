@@ -77,6 +77,9 @@ tar = { workspace = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 rust-embed = { workspace = true, optional = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
@@ -114,7 +117,7 @@ default = []
 # handlers and the admin dashboard's Matrix invite UI reference matrix-only
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
 # without it.
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-native-certs", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

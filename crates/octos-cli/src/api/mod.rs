@@ -54,6 +54,7 @@ pub mod usage;
 pub mod user_admin;
 pub(crate) mod voice_turn;
 pub mod voices;
+pub(crate) mod volcano_ws;
 pub mod webhook_proxy;
 pub mod ws_slash;
 

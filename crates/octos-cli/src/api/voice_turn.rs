@@ -942,18 +942,25 @@ fn resolve_volcano(cloud: Option<&CloudTtsConfig>) -> Option<VolcanoTts> {
     )
 }
 
-/// HTTP client for Volcano TTS, with redirects DISABLED. Even though the
+/// Process-wide HTTP client for Volcano TTS, with redirects DISABLED. Even though the
 /// endpoint is allowlisted to an HTTPS Volcano host, that host could still
 /// respond with a 3xx to an off-allowlist address; `reqwest` would otherwise
 /// follow it and 307/308 preserve the POST body — replaying the token to the
 /// redirect target. `Policy::none()` makes a redirect a terminal response we
-/// never follow, closing that exfiltration path.
-fn volcano_http_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"))
-        .ok()
+/// never follow, closing that exfiltration path. The client is reused across
+/// per-sentence syntheses so each sentence does not pay a fresh TCP+TLS
+/// handshake to Volcano.
+fn volcano_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"))
+                .ok()
+        })
+        .as_ref()
 }
 
 /// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
@@ -1020,6 +1027,48 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
 ///
 /// `voice` is the on-device voice preset (voices.json); the cloud route uses
 /// its own `VOLC_TTS_VOICE` env instead. Returns `None` on failure.
+/// Streaming cloud-TTS variant: synthesize `text` over the Volcano v1 ws
+/// `submit` protocol and invoke `on_chunk(bytes, is_last, mime)` for each audio
+/// frame as it arrives. Returns `Some(())` when the cloud stream completed (the
+/// caller delivered audio progressively and should NOT also write a file), or
+/// `None` when the request is not cloud-routed / env is missing / the stream
+/// failed — in which case the caller falls back to [`synthesize_reply`].
+///
+/// Only the cloud (`"auto"`/`"cloud"`/`"volcano"`) route streams; on-device
+/// engines keep the whole-file path. Voice/speed come from the same resolved
+/// cloud config as the non-streaming cloud path.
+pub(crate) async fn synthesize_reply_streaming(
+    text: &str,
+    provider: &str,
+    cloud: Option<&CloudTtsConfig>,
+    mut on_chunk: impl FnMut(&[u8], bool, &str),
+) -> Option<()> {
+    if !wants_cloud(provider) {
+        return None;
+    }
+    let speak = ensure_terminal_punctuation(&clean_for_tts(text));
+    if speak.trim().is_empty() {
+        return None;
+    }
+    let cfg = resolve_volcano(cloud)?;
+    let mime = match cfg.encoding.as_str() {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "ogg_opus" => "audio/ogg",
+        _ => "audio/mpeg",
+    };
+    crate::api::volcano_ws::synthesize_ws_stream(
+        &cfg.appid,
+        &cfg.token,
+        &cfg.cluster,
+        &cfg.voice,
+        &cfg.encoding,
+        &speak,
+        |bytes, last| on_chunk(bytes, last, mime),
+    )
+    .await
+}
+
 pub(crate) async fn synthesize_reply(
     text: &str,
     voice: &str,
@@ -1225,6 +1274,19 @@ mod tests {
             resp.status().as_u16(),
             307,
             "redirects must NOT be followed (token would leak to the target)"
+        );
+    }
+
+    #[test]
+    fn volcano_client_is_reused_across_calls() {
+        // Per-sentence synthesis must not rebuild the HTTP client each time —
+        // a fresh client per sentence pays a new TCP+TLS handshake to bytedance.
+        // A shared process-wide client returns the same instance every call.
+        let a = volcano_client();
+        let b = volcano_client();
+        assert!(
+            std::ptr::eq(a, b),
+            "volcano TTS client should be a shared instance, not rebuilt per call"
         );
     }
 
