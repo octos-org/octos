@@ -83,6 +83,7 @@ pub use agent::{
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
     rich_output,
+    turn_failure::{TurnFailure, is_voice_empty_response},
     verifier::{
         AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
         VerifierVerdict,
