@@ -488,6 +488,16 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   the placeholder lifecycle, so the split survives a future
   `projection.envelope.v1` cutover. See § 8.
 
+Voice exit intent (ungated; accepted `UPCR-2026-025`):
+
+- `voice/exit` — the voice turn detected an end / goodbye / mute intent
+  (the model appended an in-band `[[EXIT]]` control marker, which the
+  backend strips from every model-/client-facing surface). The client
+  leaves the `/voice` screen and returns home — after the turn's farewell
+  audio finishes playing (navigation is gated client-side on the reply
+  audio draining). Emitted on the same ledger-backed live path as
+  `file/attached`. See § 8.
+
 Router and queue (Wave4-A):
 
 - `router/status`, `router/failover`, `queue/state`
@@ -1743,6 +1753,24 @@ these events, NOT off `file/attached`. Payload fields:
   Emitted alongside `file/attached` on the success branch.
 - `visual/failed` — `session_id`, `turn_id` (required); optional `topic`
   and `reason` (failure/timeout/cancel detail).
+
+### `voice/exit`
+
+Typed voice-exit signal introduced by `UPCR-2026-025`. A voice turn may
+append an in-band `[[EXIT]]` control marker after a short spoken farewell
+when the user expresses an end / goodbye / mute intent; the backend strips
+it from every model-/client-facing surface (live `message/delta`, persisted
+`response.content`, assistant carriers) and instead emits this structured
+event, so the client never scrapes the marker out of the assistant text.
+Ungated and emitted on the same ledger-backed live path as `file/attached`
+(durable append → replayed on reconnect).
+
+The client uses it to leave the `/voice` screen and return home, but gates
+the actual navigation on its OWN reply-audio queue draining — so the spoken
+farewell is heard before the screen changes. The event is the trigger; the
+client owns the timing. Payload fields:
+
+- `voice/exit` — `session_id`, `turn_id` (required); optional `topic`.
 
 ### `session/event`
 

@@ -18390,7 +18390,10 @@ async fn run_standalone_turn(
              brief 是给生成器的一句话简述。\
              普通问答/闲聊/事实回答【不要】加标记。\
              示例1:用户说『我想直观看到负反馈电路如何负反馈』→ 口播『我给你画一个可调增益的负反馈电路,你可以拖滑块看输出怎么被拉回来。』,然后另起一行:[[VISUAL:html|可调增益的负反馈电路交互演示,滑块调增益,实时显示反馈如何稳定输出]]\
-             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]]"
+             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]\
+             \n退出意图:当用户明确想结束对话/离开/不聊了/再见/拜拜/静音/退出语音助手时——先用一句简短自然的话告别(如『好的,再见啦!』),然后【另起一行】只追加一个标记:[[EXIT]]。\
+             仅在用户确实想退出时才加;普通问答/闲聊/继续提问【绝对不要】加。\
+             示例:用户说『再见』或『退出吧』→ 口播『好的,再见!』,然后另起一行:[[EXIT]]]"
         );
         // The audio is now in the prompt as text. Drop it from the
         // agent-visible media so the model answers the transcript directly
@@ -18460,6 +18463,13 @@ async fn run_standalone_turn(
     // background dispatch. `None` for text turns or replies without a marker.
     let (visual_directive_tx, visual_directive_rx) =
         tokio::sync::oneshot::channel::<Option<crate::api::voice_turn::VisualDirective>>();
+    // Voice exit intent (UPCR-2026-025): the agent task lifts the trailing
+    // in-band `[[EXIT]]` marker out of `response.content` (stripping it from
+    // every authoritative surface) and signals here whether the user asked to
+    // leave. The post-turn block emits the typed `voice/exit` event so the
+    // client returns home after the farewell audio. `false` for text turns or
+    // replies without the marker.
+    let (exit_directive_tx, exit_directive_rx) = tokio::sync::oneshot::channel::<bool>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -18521,25 +18531,29 @@ async fn run_standalone_turn(
 
         match result {
             Ok(mut response) => {
-                // Voice rich output (#1477): lift the trailing in-band
-                // `[[VISUAL:...]]` directive out of the reply and strip it from
+                // Voice control markers: lift the trailing in-band
+                // `[[VISUAL:...]]` (#1477) and `[[EXIT]]` (UPCR-2026-025)
+                // directives out of the reply and strip them from
                 // `response.content` AND every Assistant carrier in
                 // `response.messages` BEFORE capture / persist / done, so the
                 // internal control protocol never reaches the wire
                 // (`message/delta` from `done`, `message/persisted`) or storage
-                // (session JSONL). The directive is dispatched post-turn from the
-                // oneshot below; the client learns a visual is coming from the
-                // typed `visual/generating` event. Gated on voice turns. No-op
-                // (returns `None`, mutates nothing) without a real trailing marker.
-                let visual_directive = if had_audio_input {
-                    crate::api::voice_turn::strip_visual_directive(
+                // (session JSONL). Stacked markers in either order are both
+                // peeled (review fix). The directives are dispatched post-turn
+                // from the oneshots below; the client learns a visual is coming
+                // from `visual/generating` and an exit from `voice/exit`. Gated
+                // on voice turns. No-op (returns `(None, false)`, mutates
+                // nothing) without a real trailing marker.
+                let (visual_directive, exit_requested) = if had_audio_input {
+                    crate::api::voice_turn::strip_control_directives(
                         &mut response.content,
                         &mut response.messages,
                     )
                 } else {
-                    None
+                    (None, false)
                 };
                 let _ = visual_directive_tx.send(visual_directive);
+                let _ = exit_directive_tx.send(exit_requested);
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -19611,6 +19625,16 @@ async fn run_standalone_turn(
     // already gone), so it doubles as the HTML author's "spoken_reply" context.
     let visual_directive = visual_directive_rx.await.ok().flatten();
 
+    // Voice exit intent (UPCR-2026-025): the agent task signalled whether the
+    // user asked to leave (the `[[EXIT]]` marker was lifted + stripped there).
+    // Receive the flag now, but DEFER emitting `voice/exit` until AFTER the
+    // farewell reply audio has been attached (the streamed path above, or the
+    // whole-reply fallback synth below) — review fix: emitting here would let a
+    // no-sentence-boundary reply's `voice/exit` reach the client before its
+    // farewell `file/attached`, so the client could navigate away before the
+    // goodbye is heard, violating the "farewell first" contract.
+    let exit_requested = exit_directive_rx.await.unwrap_or(false);
+
     // Voice rich output: dispatch the in-band [[VISUAL]] directive.
     // HTML → a focused tool-less LLM call (rich_output); image-class → a
     // backend-orchestrated mofa skill. Fire-and-forget: the artifact arrives
@@ -19908,6 +19932,21 @@ async fn run_standalone_turn(
                 tracing::info!(audio = %audio_path.display(), "voice_turn: synthesized reply audio");
             }
         }
+    }
+
+    // Voice exit intent (UPCR-2026-025): NOW that the farewell reply audio has
+    // been attached (streamed sentences awaited above, or the whole-reply
+    // fallback synth just above), emit the typed `voice/exit`. Emitting here —
+    // strictly AFTER the farewell `file/attached` — guarantees the client has
+    // the goodbye audio queued before it sees the exit signal, so it plays the
+    // farewell before leaving /voice (the events share the ordered ledger live
+    // path). No in-band marker is on the wire.
+    if had_audio_input && !interrupt_observed && exit_requested {
+        super::ui_protocol_alpha9_bridge::emit_voice_exit_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+        );
     }
 
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
@@ -22913,6 +22952,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::VisualGenerating(_)
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_)
+            | UiNotification::VoiceExit(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)
