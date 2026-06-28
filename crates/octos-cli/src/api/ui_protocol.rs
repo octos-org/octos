@@ -30645,6 +30645,119 @@ ignore = []
         );
     }
 
+    // ── Task 13: voice fail-fast error-attachment exactly-once delivery ──────
+
+    /// Drain all queued outbound frames and return their JSON-RPC `method`s.
+    fn drain_frame_methods(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<String> {
+        let mut methods = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let WsMessage::Text(text) = msg {
+                if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
+                    if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                        methods.push(method.to_string());
+                    }
+                }
+            }
+        }
+        methods
+    }
+
+    #[tokio::test]
+    async fn error_attachment_direct_canonical_client_gets_one_envelope_frame() {
+        // A projection.envelope.v1 client (octos-web) must receive the canonical
+        // file_attached envelope EXACTLY ONCE; the legacy frame is filtered out.
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1],
+            false,
+        ));
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:err-canon".into());
+        let turn_id = TurnId::new();
+
+        let result = emit_error_attachment_direct(
+            &ws,
+            &ledger,
+            &session_id,
+            None,
+            &turn_id,
+            "out/apology.mp3",
+            "audio/mpeg",
+        );
+        assert!(result.is_ok(), "canonical delivery should succeed");
+
+        let methods = drain_frame_methods(&mut rx);
+        assert_eq!(
+            methods,
+            vec![octos_core::ui_protocol::methods::PROJECTION_ENVELOPE.to_string()],
+            "canonical client receives exactly the envelope frame, not the legacy one"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_attachment_direct_legacy_client_gets_one_file_attached_frame() {
+        // A legacy (file_attached.v1, no envelope) client must receive the
+        // legacy file/attached frame EXACTLY ONCE; the envelope is filtered out.
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1],
+            false,
+        ));
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:err-legacy".into());
+        let turn_id = TurnId::new();
+
+        let result = emit_error_attachment_direct(
+            &ws,
+            &ledger,
+            &session_id,
+            None,
+            &turn_id,
+            "out/apology.mp3",
+            "audio/mpeg",
+        );
+        assert!(result.is_ok(), "legacy delivery should succeed");
+
+        let methods = drain_frame_methods(&mut rx);
+        assert_eq!(
+            methods,
+            vec![octos_core::ui_protocol::methods::FILE_ATTACHED.to_string()],
+            "legacy client receives exactly the file/attached frame, not the envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_attachment_direct_returns_err_when_writer_closed() {
+        // P1: if the frame cannot enqueue (peer gone), the helper returns Err so
+        // the closeout's attach_count does not over-count a drop as "heard".
+        let (tx, rx) = mpsc::channel(16);
+        let ws = WsConnection::new(tx);
+        ws.update_live_features(ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1],
+            false,
+        ));
+        drop(rx); // close the writer
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:err-closed".into());
+        let turn_id = TurnId::new();
+
+        let result = emit_error_attachment_direct(
+            &ws,
+            &ledger,
+            &session_id,
+            None,
+            &turn_id,
+            "out/apology.mp3",
+            "audio/mpeg",
+        );
+        assert!(
+            result.is_err(),
+            "a closed writer must surface as Err so attach_count stays 0"
+        );
+    }
+
     /// Opt-in preservation: a stdio connection that DOES consume
     /// envelopes can still negotiate `projection.envelope.v1` via
     /// `client_hello` (`from_requested_feature_tokens` with the stdio
