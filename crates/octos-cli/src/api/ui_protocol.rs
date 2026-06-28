@@ -22784,6 +22784,89 @@ fn send_notification_durable(
     }
 }
 
+/// Direct-send a voice fail-fast error-audio attachment onto THIS connection's
+/// WS write queue (design D8), origin-tagged so the connection's own live
+/// forwarder skips the broadcast duplicate while other connections still fan
+/// out. Emits BOTH the legacy `file/attached` notification and the canonical
+/// `file_attached` envelope; the per-connection capability filter passes
+/// exactly one shape, so the client receives the attachment exactly once.
+///
+/// Returns `Ok(())` only when the applicable shape was actually enqueued, so
+/// the closeout's `attach_count` does not over-count a backpressure/disconnect
+/// drop (design D8/P1 — "user heard the error audio" must mean a frame really
+/// reached the write queue).
+fn emit_error_attachment_direct(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    topic: Option<&str>,
+    turn_id: &TurnId,
+    rel_path: &str,
+    mime: &str,
+) -> Result<(), SendError> {
+    let conn = ws.connection_id;
+    let mut delivered = false;
+    let mut last_err: Option<SendError> = None;
+
+    // Legacy `file/attached` notification (origin-tagged on the broadcast).
+    let legacy_note = UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+        session_id: session_id.clone(),
+        topic: topic
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(ToOwned::to_owned),
+        turn_id: turn_id.clone(),
+        path: rel_path.to_string(),
+        tool_call_id: None,
+        mime: Some(mime.to_string()),
+    });
+    let legacy_ev = ledger.append_notification_from(legacy_note, conn);
+    if direct_send_passes_capability_filter(ws, &legacy_ev.event) {
+        let method = ledger_event_method(&legacy_ev.event);
+        match frame_from_ledger(legacy_ev.event) {
+            Some(frame) => match ws.send_durable(frame, method) {
+                Ok(()) => delivered = true,
+                Err(e) => last_err = Some(e),
+            },
+            None => last_err = Some(SendError::BackpressureDrop),
+        }
+    }
+
+    // Canonical `file_attached` envelope (origin-tagged on the broadcast).
+    // `size_bytes = 0` mirrors `emit_file_attached`'s behaviour for
+    // workspace-relative paths (`artifact_size_bytes` returns 0 for them).
+    let payload = Payload::FileAttached {
+        path: rel_path.to_string(),
+        mime: mime.to_string(),
+        size_bytes: 0,
+    };
+    if let Some(env_ev) = ledger.emit_envelope_with_topic_from(
+        session_id,
+        turn_id.0.to_string(),
+        payload,
+        None,
+        topic,
+        conn,
+    ) {
+        if direct_send_passes_capability_filter(ws, &env_ev.event) {
+            let method = ledger_event_method(&env_ev.event);
+            match frame_from_ledger(env_ev.event) {
+                Some(frame) => match ws.send_durable(frame, method) {
+                    Ok(()) => delivered = true,
+                    Err(e) => last_err = Some(e),
+                },
+                None => last_err = Some(SendError::BackpressureDrop),
+            }
+        }
+    }
+
+    if delivered {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or(SendError::BackpressureDrop))
+    }
+}
+
 fn send_notification_ephemeral(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
