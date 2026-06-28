@@ -57,12 +57,30 @@ impl Agent {
             let input_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
             let input_estimate = (input_bytes / 3) as u32;
 
-            let call_result = async {
+            let build_and_consume = async {
                 let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
                 self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
                     .await
-            }
-            .await;
+            };
+            // Voice fail-fast: bound the WHOLE {build + consume} future with the
+            // voice overall deadline. The per-chunk `StreamTimeouts` only start
+            // inside `consume_stream`, so a provider that hangs while returning
+            // response headers would otherwise inherit the long production
+            // request timeout. Normal turns keep that long backstop unchanged.
+            let call_result = if fail_fast {
+                match tokio::time::timeout(self.config.voice_overall_deadline, build_and_consume)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => Err(octos_llm::LlmError::timeout(format!(
+                        "voice overall deadline exceeded after {}s",
+                        self.config.voice_overall_deadline.as_secs()
+                    ))
+                    .into()),
+                }
+            } else {
+                build_and_consume.await
+            };
 
             match call_result {
                 Ok((response, streamed)) => {
@@ -268,7 +286,9 @@ impl Agent {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    use super::super::AgentConfig;
 
     use async_trait::async_trait;
     use futures::stream;
@@ -373,6 +393,44 @@ mod tests {
         }
     }
 
+    // ── Provider that hangs forever at stream creation (build phase) ──────────
+
+    struct HangingBuildProvider;
+
+    #[async_trait]
+    impl LlmProvider for HangingBuildProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            eyre::bail!("non-streaming fallback should not be called under FailFast")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            // Never resolves: simulates a provider that accepts the POST but
+            // never returns response headers (build phase hangs). The voice
+            // overall deadline must bound this, since `StreamTimeouts` only
+            // starts ticking once `consume_stream` runs.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-hang"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
     // ── Test helpers ──────────────────────────────────────────────────────────
 
     async fn build_agent(provider: Arc<dyn LlmProvider>) -> (Agent, tempfile::TempDir) {
@@ -466,6 +524,76 @@ mod tests {
             counters.chat.load(Ordering::SeqCst),
             0,
             "non-streaming fallback must NOT be called under FailFast (empty response)"
+        );
+    }
+
+    /// Under FailFast, a provider that hangs forever at stream *build* must be
+    /// bounded by the voice overall deadline (the `StreamTimeouts` guards only
+    /// start once `consume_stream` runs, so they cannot catch a build-phase
+    /// hang). The call returns `Err` well within the deadline + slack.
+    #[tokio::test]
+    async fn should_timeout_build_stream_when_failfast() {
+        let (agent, _dir) = build_agent(Arc::new(HangingBuildProvider)).await;
+        let agent = agent.with_config(AgentConfig {
+            voice_overall_deadline: Duration::from_millis(50),
+            ..AgentConfig::default()
+        });
+
+        let start = Instant::now();
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent
+                .call_llm_with_hooks(
+                    &msgs(),
+                    &[],
+                    &ChatConfig::default(),
+                    1,
+                    &octos_core::TokenUsage::default(),
+                    &mut turn(),
+                )
+                .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "build-stream hang must surface as an error"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "build-stream hang must be bounded by the voice overall deadline, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Normal policy keeps the long production backstop — the voice deadline is
+    /// not applied — so the same hang is NOT bounded by 50ms. (We only assert
+    /// it does not return quickly; we never actually wait out the real cap.)
+    #[tokio::test]
+    async fn should_not_apply_voice_deadline_when_normal_policy() {
+        let (agent, _dir) = build_agent(Arc::new(HangingBuildProvider)).await;
+        let agent = agent.with_config(AgentConfig {
+            voice_overall_deadline: Duration::from_millis(50),
+            ..AgentConfig::default()
+        });
+
+        // Under Normal policy the 50ms voice deadline must be ignored, so the
+        // call is still pending after comfortably more than 50ms.
+        let pending = tokio::time::timeout(Duration::from_millis(300), async {
+            agent
+                .call_llm_with_hooks(
+                    &msgs(),
+                    &[],
+                    &ChatConfig::default(),
+                    1,
+                    &octos_core::TokenUsage::default(),
+                    &mut turn(),
+                )
+                .await
+        })
+        .await;
+        assert!(
+            pending.is_err(),
+            "Normal policy must NOT apply the 50ms voice deadline"
         );
     }
 }

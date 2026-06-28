@@ -107,6 +107,14 @@ pub struct AgentConfig {
     /// tool; the host projects the request to the channel and resumes via
     /// [`Agent::execute_approved_tool`]. `None` disables the flow.
     pub human_approval_rules: Option<crate::approval::HumanApprovalRules>,
+    /// Voice fail-fast overall deadline for a single foreground LLM call,
+    /// covering BOTH the stream-build (`chat_stream().await`) and consume
+    /// phases. `StreamTimeouts` only starts ticking inside `consume_stream`,
+    /// so a provider that hangs while returning response headers would
+    /// otherwise inherit the long production request timeout. Only applied
+    /// under [`octos_llm::LlmCallPolicy::FailFast`] (voice turns). Default 30s;
+    /// env override `OCTOS_VOICE_LLM_DEADLINE_SECS`.
+    pub voice_overall_deadline: std::time::Duration,
 }
 
 /// Default time-to-first-token grace for streaming LLM calls (180s).
@@ -115,6 +123,14 @@ pub const DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS: u64 = 180;
 pub const DEFAULT_LLM_STREAM_IDLE_SECS: u64 = 90;
 /// Default overall wall-clock cap for a single streaming LLM call (1200s / 20m).
 pub const DEFAULT_LLM_CALL_MAX_SECS: u64 = 1200;
+/// Default voice fail-fast overall deadline (30s) covering build + consume.
+pub const DEFAULT_VOICE_LLM_DEADLINE_SECS: u64 = 30;
+/// Tightened time-to-first-token grace for voice fail-fast turns (10s). A
+/// spoken reply cannot wait minutes for the first token the way a reasoning
+/// chat turn can, so the voice path overrides the generous production grace.
+pub const VOICE_STREAM_TTFT_SECS: u64 = 10;
+/// Tightened inter-chunk idle timeout for voice fail-fast turns (10s).
+pub const VOICE_STREAM_IDLE_SECS: u64 = 10;
 
 /// Read an env-overridable seconds value, mirroring the convention in
 /// `octos-cli/src/session_actor.rs` (`std::env::var(...).parse()` with a clamp
@@ -181,6 +197,10 @@ impl Default for AgentConfig {
             ),
             llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
             human_approval_rules: None,
+            voice_overall_deadline: env_secs_or(
+                "OCTOS_VOICE_LLM_DEADLINE_SECS",
+                DEFAULT_VOICE_LLM_DEADLINE_SECS,
+            ),
         }
     }
 }
