@@ -860,7 +860,14 @@ impl UiProtocolLedger {
         client_message_id: Option<String>,
     ) -> Option<LedgeredUiProtocolEvent> {
         let topic = session_id.topic().map(ToOwned::to_owned);
-        self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
+        self.emit_envelope_inner(
+            session_id,
+            thread_id,
+            payload,
+            client_message_id,
+            topic,
+            None,
+        )
     }
 
     /// Codex BLOCKER #1336-round-2 (BLOCKER 5): variant of
@@ -886,7 +893,43 @@ impl UiProtocolLedger {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(ToOwned::to_owned);
-        self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
+        self.emit_envelope_inner(
+            session_id,
+            thread_id,
+            payload,
+            client_message_id,
+            topic,
+            None,
+        )
+    }
+
+    /// Origin-tagged counterpart of [`emit_envelope_with_topic`]. Tags the
+    /// broadcast copy with `from_connection` so that connection's live
+    /// forwarder skips the duplicate — the caller has already direct-sent the
+    /// canonical envelope frame onto its own WS write queue (Task 11, so the
+    /// error-attachment frame lands before the terminal frame). Other
+    /// connections still receive the envelope via fan-out.
+    pub(crate) fn emit_envelope_with_topic_from(
+        &self,
+        session_id: &SessionKey,
+        thread_id: String,
+        payload: Payload,
+        client_message_id: Option<String>,
+        topic: Option<&str>,
+        from_connection: ConnectionId,
+    ) -> Option<LedgeredUiProtocolEvent> {
+        let topic = topic
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(ToOwned::to_owned);
+        self.emit_envelope_inner(
+            session_id,
+            thread_id,
+            payload,
+            client_message_id,
+            topic,
+            Some(from_connection),
+        )
     }
 
     fn emit_envelope_inner(
@@ -896,6 +939,7 @@ impl UiProtocolLedger {
         payload: Payload,
         client_message_id: Option<String>,
         topic: Option<String>,
+        from_connection: Option<ConnectionId>,
     ) -> Option<LedgeredUiProtocolEvent> {
         // Codex #1336 round-2 BLOCKER 2: allocate envelope seq, apply
         // hard barrier, build the notification, append to the ledger
@@ -968,7 +1012,7 @@ impl UiProtocolLedger {
             ledgered = LedgeredUiProtocolEvent {
                 cursor: cursor.clone(),
                 event: stamped.clone(),
-                from_connection: None,
+                from_connection,
             };
 
             // Accounting that the original `append` does after entry
@@ -3086,6 +3130,45 @@ mod tests {
             received.event,
             UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn emit_envelope_with_topic_from_tags_origin_for_broadcast_skip() {
+        // The error-attachment direct-send path (Task 11) needs the canonical
+        // envelope broadcast to carry the originating connection so that
+        // connection's own live forwarder skips the duplicate (the handler
+        // already direct-sent the frame). Other connections still fan out.
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:origin".into());
+        let mut rx = ledger.subscribe(&session_id);
+        let conn = ConnectionId::next();
+
+        let payload = octos_core::ui_protocol::Payload::FileAttached {
+            path: "out/reply.mp3".into(),
+            mime: "audio/mpeg".into(),
+            size_bytes: 0,
+        };
+        let emitted = ledger
+            .emit_envelope_with_topic_from(
+                &session_id,
+                "thread-1".into(),
+                payload,
+                None,
+                None,
+                conn,
+            )
+            .expect("envelope emitted");
+        assert_eq!(emitted.from_connection, Some(conn), "returned event tagged");
+
+        let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("live event arrived")
+            .expect("receiver still open");
+        assert_eq!(
+            received.from_connection,
+            Some(conn),
+            "broadcast copy must carry the origin tag so the forwarder skips it"
+        );
     }
 
     #[tokio::test]
