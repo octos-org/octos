@@ -857,9 +857,131 @@ pub(crate) async fn synthesize_reply(
     }
 }
 
+// Voice fail-fast spoken-error lines (design D5). Wording is示意 and tweakable;
+// the bucketing / precedence is authoritative.
+const SPEAK_QUOTA: &str = "我这会儿有点忙不过来，稍后再跟我说一次好吗？";
+const SPEAK_RATE: &str = "请求有点多，等几秒再说一遍？";
+const SPEAK_NET: &str = "网络好像不太稳，再说一遍试试？";
+const SPEAK_CTX: &str = "我们聊得有点长了，新开一段再聊吧。";
+const SPEAK_FILTERED: &str = "这个我可能没法回答。";
+const SPEAK_GENERIC: &str = "抱歉，我这边出了点小问题，稍后再试。";
+const SPEAK_EMPTY: &str = "我好像没太听清，再说一遍？";
+
+/// Map a fail-fast [`octos_agent::TurnFailure`] to a short spoken line.
+///
+/// Precedence (design D5): a strongly-typed [`octos_agent::HarnessError`]
+/// maps directly; `Internal` / `ProviderUnavailable` (where a streaming 429
+/// loses its quota/rate-limit signal through `classify_report`) fall back to a
+/// raw-detail substring scan so the most common 429 still hits the right line.
+/// `ContentFiltered` is never spoken as "didn't catch that". Returns a
+/// `&'static str` so the caller feeds it straight through the normal TTS path.
+pub(crate) fn voice_error_speech(f: &octos_agent::TurnFailure) -> &'static str {
+    use octos_agent::{HarnessError as H, TurnFailure};
+    let (error, raw) = match f {
+        TurnFailure::EmptyResponse => return SPEAK_EMPTY,
+        TurnFailure::LlmError { error, raw_detail } => (error, raw_detail.to_lowercase()),
+    };
+    match error {
+        H::Quota { .. } => SPEAK_QUOTA,
+        H::RateLimited { .. } => SPEAK_RATE,
+        H::Network { .. } | H::Timeout { .. } => SPEAK_NET,
+        H::ContextOverflow { .. } => SPEAK_CTX,
+        H::ContentFiltered { .. } => SPEAK_FILTERED,
+        H::Authentication { .. } | H::InvalidRequest { .. } => SPEAK_GENERIC,
+        // Streaming 429 / transport errors land in `Internal` (and provider
+        // 5xx in `ProviderUnavailable`); rescue the common signals from the
+        // raw provider detail so the user still hears the right reason.
+        H::Internal { .. } | H::ProviderUnavailable { .. } => {
+            if raw.contains("token_quota_exceeded") || raw.contains("quota") {
+                SPEAK_QUOTA
+            } else if raw.contains("429") || raw.contains("rate limit") {
+                SPEAK_RATE
+            } else if raw.contains("timeout") || raw.contains("network") {
+                SPEAK_NET
+            } else {
+                SPEAK_GENERIC
+            }
+        }
+        // Tool / plugin / delegation faults: one generic apology.
+        _ => SPEAK_GENERIC,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octos_agent::{HarnessError, TurnFailure};
+
+    fn llm(error: HarnessError, raw: &str) -> TurnFailure {
+        TurnFailure::LlmError {
+            error,
+            raw_detail: raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn should_speak_quota_text_for_typed_quota() {
+        let f = llm(
+            HarnessError::Quota {
+                message: "..".into(),
+            },
+            "..",
+        );
+        assert!(voice_error_speech(&f).contains('忙'));
+    }
+
+    #[test]
+    fn should_speak_quota_text_for_internal_with_quota_raw_detail() {
+        // A streaming 429 classifies to Internal; the raw_detail must rescue it.
+        let f = llm(
+            HarnessError::Internal {
+                message: "stream".into(),
+            },
+            r#"{"code":"token_quota_exceeded"} HTTP 429"#,
+        );
+        assert!(
+            voice_error_speech(&f).contains('忙'),
+            "raw quota signal must map to the Quota line"
+        );
+    }
+
+    #[test]
+    fn should_speak_rate_text_for_internal_with_bare_429_raw_detail() {
+        let f = llm(
+            HarnessError::Internal {
+                message: "stream".into(),
+            },
+            "HTTP 429 too many requests",
+        );
+        assert!(voice_error_speech(&f).contains("请求有点多"));
+    }
+
+    #[test]
+    fn should_speak_empty_text_for_empty_response() {
+        assert!(voice_error_speech(&TurnFailure::EmptyResponse).contains("没太听清"));
+    }
+
+    #[test]
+    fn should_speak_generic_for_internal_without_known_raw_signal() {
+        let f = llm(
+            HarnessError::Internal {
+                message: "weird".into(),
+            },
+            "weird",
+        );
+        assert!(voice_error_speech(&f).contains("出了点小问题"));
+    }
+
+    #[test]
+    fn should_speak_filtered_text_for_content_filtered() {
+        let f = llm(
+            HarnessError::ContentFiltered {
+                message: "..".into(),
+            },
+            "..",
+        );
+        assert!(voice_error_speech(&f).contains("没法回答"));
+    }
 
     #[tokio::test]
     async fn synthesize_reply_returns_none_for_blank_text() {
