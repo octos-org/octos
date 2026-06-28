@@ -18399,6 +18399,20 @@ async fn run_standalone_turn(
         // the agent into calling `voice_transcribe` / exploring the workspace.
         turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
     }
+    // Voice fail-fast (design D1/D2): `had_audio_input` (ASR produced spoken
+    // text) is the AUTHORITATIVE voice flag — `voice_turn_hint` is only a
+    // pre-ASR latency hint. Under a voice turn we run the agent with the
+    // FailFast LLM call policy (single attempt — no retry/failover/hedge) and
+    // capture a single classified `TurnFailure` on this side channel so the
+    // closeout can speak a short apology and emit a classified terminal. Text
+    // turns leave the sink unset and run under the default `Normal` policy.
+    let mut voice_failure_rx = if had_audio_input {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<octos_agent::TurnFailure>();
+        request_agent.set_voice_failure_sink(tx);
+        Some(rx)
+    } else {
+        None
+    };
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
@@ -18500,12 +18514,24 @@ async fn run_standalone_turn(
             }
             None => Box::pin(message_future),
         };
-        let result = octos_llm::with_router_context(
-            router_ctx,
-            octos_llm::with_lane_context(
-                lane_ctx,
-                octos_agent::tools::TOOL_APPROVAL_CTX
-                    .scope(approval_requester, scoped_message_future),
+        // Voice fail-fast (D2): wrap the whole provider stack outermost so
+        // every wrapper and the leaf provider short-circuit retry/failover/
+        // hedge no matter how deep the agent loop recurses into `chat()`.
+        // Text turns run `Normal` (full retry ladder), byte-for-byte unchanged.
+        let call_policy = if had_audio_input {
+            octos_llm::LlmCallPolicy::FailFast
+        } else {
+            octos_llm::LlmCallPolicy::Normal
+        };
+        let result = octos_llm::with_llm_call_policy(
+            call_policy,
+            octos_llm::with_router_context(
+                router_ctx,
+                octos_llm::with_lane_context(
+                    lane_ctx,
+                    octos_agent::tools::TOOL_APPROVAL_CTX
+                        .scope(approval_requester, scoped_message_future),
+                ),
             ),
         )
         .await;
@@ -19095,24 +19121,35 @@ async fn run_standalone_turn(
                 let _ = final_reply_tx.send(None);
                 // No reply → no rich-output directive to dispatch.
                 let _ = visual_directive_tx.send(None);
-                // Codex round-2 MAJOR 2: prefer the typed user-actionable
-                // message over the raw LLM Display string. The agent
-                // loop's classifier (`HarnessError::classify_report` at
-                // loop_runner.rs:419) maps a raw `LlmError` to a
-                // user-friendly `HarnessError` variant whose
-                // `message()` says "top up or switch provider" /
-                // "check your API key" — but the loop currently bails
-                // with the ORIGINAL `eyre::Report` (still wrapping
-                // `LlmError`), so `error.to_string()` here would emit
-                // the raw `"API error (lane): provider quota exhausted
-                // — HTTP 403 ..."` instead. Downcast and re-classify
-                // so the SPA sees the actionable text.
-                let wire_message = classify_runtime_error_message(&error);
-                let error = json!({
-                    "type": "error",
-                    "message": wire_message,
-                });
-                let _ = progress_tx_for_result.send(error.to_string()).await;
+                // Voice fail-fast (design D4): SUPPRESS the generic
+                // `{"type":"error"}` progress on a voice turn. The classified
+                // failure already rode the `voice_failure_sink` (a `TurnFailure`),
+                // which is the voice turn's single authoritative failure signal.
+                // Emitting the progress error here would trip the consumer's
+                // immediate `try_emit_terminal(Errored)` and bypass the
+                // two-phase "error audio → terminal" closeout (D8). The agent
+                // task simply ends; the consumer observes `progress_rx` close
+                // and runs the voice closeout below. Text turns are unchanged.
+                if !had_audio_input {
+                    // Codex round-2 MAJOR 2: prefer the typed user-actionable
+                    // message over the raw LLM Display string. The agent
+                    // loop's classifier (`HarnessError::classify_report` at
+                    // loop_runner.rs:419) maps a raw `LlmError` to a
+                    // user-friendly `HarnessError` variant whose
+                    // `message()` says "top up or switch provider" /
+                    // "check your API key" — but the loop currently bails
+                    // with the ORIGINAL `eyre::Report` (still wrapping
+                    // `LlmError`), so `error.to_string()` here would emit
+                    // the raw `"API error (lane): provider quota exhausted
+                    // — HTTP 403 ..."` instead. Downcast and re-classify
+                    // so the SPA sees the actionable text.
+                    let wire_message = classify_runtime_error_message(&error);
+                    let error = json!({
+                        "type": "error",
+                        "message": wire_message,
+                    });
+                    let _ = progress_tx_for_result.send(error.to_string()).await;
+                }
             }
         }
     });
@@ -19159,51 +19196,60 @@ async fn run_standalone_turn(
         None
     };
     let mut voice_streamed_count: usize = 0;
-    let (voice_tx, voice_handle) = if had_audio_input {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-        let w_ledger = ledger.clone();
-        let w_session = session_id.clone();
-        let w_turn = turn_id.clone();
-        let w_dir = session_runtime.workspace_root.clone();
+    // Voice fail-fast closeout (D8) synthesizes the error apology with the SAME
+    // TTS settings the worker uses, but the worker moves them into its spawn —
+    // so capture a clone here in the outer scope. `(voice, provider, dir)`.
+    let voice_tts: Option<(String, String, std::path::PathBuf)> = if had_audio_input {
         // Per-tenant reply voice: live override (set via PUT /api/my/voice) wins,
         // else the profile's bootstrapped default.
-        let w_voice = crate::api::voices::resolve_reply_voice(
+        let voice = crate::api::voices::resolve_reply_voice(
             &session_runtime.profile.profile_id,
             &session_runtime.profile.voice.default_voice,
         );
-        let w_provider = session_runtime.profile.voice.tts_provider.clone();
-        let handle = tokio::spawn(async move {
-            let mut n: usize = 0;
-            while let Some(sentence) = rx.recv().await {
-                if let Some(path) = crate::api::voice_turn::synthesize_reply(
-                    &sentence,
-                    &w_voice,
-                    &w_provider,
-                    &w_dir,
-                )
-                .await
-                {
-                    let rel = path
-                        .file_name()
-                        .map(|x| x.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                    super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
-                        &w_ledger,
-                        &w_session,
-                        &w_turn,
-                        std::slice::from_ref(&rel),
-                        &[],
-                        None,
-                    );
-                    n += 1;
-                }
-            }
-            n
-        });
-        (Some(tx), Some(handle))
+        let provider = session_runtime.profile.voice.tts_provider.clone();
+        let dir = session_runtime.workspace_root.clone();
+        Some((voice, provider, dir))
     } else {
-        (None, None)
+        None
     };
+    let (mut voice_tx, mut voice_handle) =
+        if let Some((w_voice, w_provider, w_dir)) = voice_tts.clone() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+            let w_ledger = ledger.clone();
+            let w_session = session_id.clone();
+            let w_turn = turn_id.clone();
+            let handle = tokio::spawn(async move {
+                let mut n: usize = 0;
+                while let Some(sentence) = rx.recv().await {
+                    if let Some(path) = crate::api::voice_turn::synthesize_reply(
+                        &sentence,
+                        &w_voice,
+                        &w_provider,
+                        &w_dir,
+                    )
+                    .await
+                    {
+                        let rel = path
+                            .file_name()
+                            .map(|x| x.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                        super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                            &w_ledger,
+                            &w_session,
+                            &w_turn,
+                            std::slice::from_ref(&rel),
+                            &[],
+                            None,
+                        );
+                        n += 1;
+                    }
+                }
+                n
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
 
     loop {
         // Race progress events against the interrupt signal so an interrupt
@@ -19384,9 +19430,122 @@ async fn run_standalone_turn(
         }
     }
 
+    // Voice fail-fast closeout (design D8/D9). The agent suppressed the generic
+    // error progress (D4), so a failed voice turn reaches here via `progress_rx`
+    // closing, with a single classified `TurnFailure` queued on the side
+    // channel. Two-phase, interrupt-aware:
+    //   Phase 1 — discard the half-buffered sentence (the reply never
+    //     completed), close the TTS queue, and await the worker to learn the
+    //     real attach count (how much, if anything, the user already heard).
+    //   Phase 2 — iff the user heard NOTHING, synthesize the apology and
+    //     direct-send it onto THIS connection's WS write queue (so it lands
+    //     before the terminal, D8 ordering), bounded by a closeout deadline.
+    // Then emit exactly one classified `Errored` terminal (D10). Every phase
+    // keeps reading `interrupt_rx` so an interrupt is still acked within 5s;
+    // on interrupt we abort + reap the worker (no late `file/attached`) and
+    // fall through to the shared interrupt block, which emits `code=interrupted`
+    // (D9/P1 — never the LLM error text). Skipped entirely for text turns and
+    // for normally-completed voice turns (no queued `TurnFailure`).
+    let voice_failure = if interrupt_observed {
+        None
+    } else {
+        voice_failure_rx.as_mut().and_then(|rx| rx.try_recv().ok())
+    };
+    if let Some(failure) = voice_failure {
+        let closeout_deadline = std::time::Duration::from_secs(8);
+        // Phase 1: discard the partial sentence, close the queue, drain worker.
+        voice_splitter.take();
+        voice_delta_filter.take();
+        if let Some(tx) = voice_tx.take() {
+            drop(tx);
+        }
+        let mut attached = 0usize;
+        if let Some(mut handle) = voice_handle.take() {
+            let abort = handle.abort_handle();
+            tokio::select! {
+                biased;
+                r = interrupt_rx.recv() => {
+                    if matches!(r, Some(())) {
+                        interrupt_observed = true;
+                        abort.abort();
+                    }
+                }
+                res = &mut handle => {
+                    attached = res.unwrap_or(0);
+                }
+            }
+            if interrupt_observed {
+                // Reap the aborted worker so it cannot emit a late attachment
+                // after the terminal (D9).
+                let _ = handle.await;
+            }
+        }
+        // Phase 2: nothing heard → speak the apology onto this WS queue ahead
+        // of the terminal. Interrupt- and deadline-bounded (TTS can wedge:
+        // Volcano 120s + local sovits fallback).
+        if !interrupt_observed && attached == 0 {
+            if let Some((w_voice, w_provider, w_dir)) = voice_tts.as_ref() {
+                let text = crate::api::voice_turn::voice_error_speech(&failure);
+                let synth =
+                    crate::api::voice_turn::synthesize_reply(text, w_voice, w_provider, w_dir);
+                tokio::pin!(synth);
+                tokio::select! {
+                    biased;
+                    r = interrupt_rx.recv() => {
+                        if matches!(r, Some(())) {
+                            interrupt_observed = true;
+                        }
+                    }
+                    path = &mut synth => {
+                        if let Some(path) = path {
+                            let rel = path
+                                .file_name()
+                                .map(|x| x.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                            let _ = emit_error_attachment_direct(
+                                &ws,
+                                &ledger,
+                                &session_id,
+                                session_id.topic(),
+                                &turn_id,
+                                &rel,
+                                "audio/mpeg",
+                            );
+                        }
+                    }
+                    _ = tokio::time::sleep(closeout_deadline) => {
+                        // TTS wedged past the deadline — give up on the audio
+                        // and fall through to the text terminal (D10).
+                    }
+                }
+            }
+        }
+        // Emit exactly one classified Errored terminal unless an interrupt won
+        // (the shared interrupt block below emits `code=interrupted`).
+        if !interrupt_observed {
+            let code: &str = match &failure {
+                octos_agent::TurnFailure::LlmError { error, .. } => error.variant_name(),
+                octos_agent::TurnFailure::EmptyResponse => "empty_response",
+            };
+            let speech = crate::api::voice_turn::voice_error_speech(&failure);
+            flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some((code, speech)),
+                None,
+            )
+            .await;
+        }
+    }
+
     // Voice turn: flush the trailing partial sentence (marker already held back
     // by the splitter), close the channel, and wait for the FIFO TTS worker.
-    if let Some(tx) = voice_tx {
+    if let Some(tx) = voice_tx.take() {
         if let Some(sp) = voice_splitter.take() {
             let (tail, _directive) = sp.finish();
             if !interrupt_observed {
@@ -19419,7 +19578,7 @@ async fn run_standalone_turn(
             }
         }
         drop(tx);
-        if let Some(handle) = voice_handle {
+        if let Some(handle) = voice_handle.take() {
             voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
         }
     }
