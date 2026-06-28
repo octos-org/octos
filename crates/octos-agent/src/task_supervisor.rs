@@ -2942,7 +2942,7 @@ impl TaskSupervisor {
             Err(error) => return Err(error),
         };
 
-        let mut restored = HashMap::new();
+        let mut restored: HashMap<String, BackgroundTask> = HashMap::new();
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else {
                 continue;
@@ -2956,9 +2956,96 @@ impl TaskSupervisor {
             if record.schema_version > CURRENT_TASK_LEDGER_SCHEMA {
                 continue;
             }
-            restored.insert(record.task.id.clone(), record.task);
+            // Keep the freshest snapshot per id by `updated_at`, not blindly
+            // the last JSONL row: SUP1 and a later per-turn supervisor both
+            // append to the SAME per-session ledger, so rows can interleave
+            // such that an older snapshot lands after a newer one. (codex P2.)
+            match restored.get(&record.task.id) {
+                Some(existing) if existing.updated_at >= record.task.updated_at => {}
+                _ => {
+                    restored.insert(record.task.id.clone(), record.task);
+                }
+            }
         }
         Ok(restored)
+    }
+
+    /// Re-read the persistence ledger and merge any snapshot newer (by
+    /// `updated_at`) than the in-memory copy into `self.tasks`. Unlike
+    /// [`Self::enable_persistence`] this does NOT run the orphan sweep, persist
+    /// snapshots, or fire callbacks — it only freshens stale in-memory rows.
+    ///
+    /// Per-turn supervisors share a per-session ledger: a later turn's
+    /// supervisor restores a copy of an earlier turn's still-running task but
+    /// never receives that task's later status updates (those go to the owning
+    /// supervisor). Calling this before projecting/acting on tasks lets the
+    /// later supervisor pick up the owner's terminal write, so a finished
+    /// cross-turn task can't surface as `running` or accept a stale cancel.
+    /// Returns the number of rows refreshed; `Ok(0)` if persistence is off.
+    pub fn refresh_from_persistence(&self) -> std::io::Result<usize> {
+        let path = {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(path) => path.clone(),
+                None => return Ok(0),
+            }
+        };
+        let restored = Self::load_persisted_tasks(&path)?;
+        let mut refreshed = 0;
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        for (task_id, task) in restored {
+            // Only freshen tasks THIS supervisor already owns — never import a
+            // row absent here. Importing would let an older supervisor
+            // accumulate copies of a later supervisor's tasks, and
+            // `cancel_task`/`relaunch_task` (oldest-first) would then fire the
+            // wrong supervisor's token while the real worker runs on (codex P1).
+            if let Some(existing) = tasks.get(&task_id) {
+                if task.updated_at > existing.updated_at {
+                    tasks.insert(task_id, task);
+                    refreshed += 1;
+                }
+            }
+        }
+        Ok(refreshed)
+    }
+
+    /// Like [`Self::refresh_from_persistence`] but only for `task_id`. Returns
+    /// the freshened task (newer of ledger vs in-memory), or `None` if absent
+    /// in both. Used before cancel/relaunch act on a task so a stale in-memory
+    /// `Running` copy in a later supervisor can't accept a doomed cancel.
+    pub fn refresh_task_from_persistence(
+        &self,
+        task_id: &str,
+    ) -> std::io::Result<Option<BackgroundTask>> {
+        let path = {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        if let Some(path) = path {
+            let restored = Self::load_persisted_tasks(&path)?;
+            if let Some(task) = restored.get(task_id) {
+                let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Update only if this supervisor already owns the task — never
+                // import an absent row (codex P1; see `refresh_from_persistence`).
+                if let Some(existing) = tasks.get(task_id) {
+                    if task.updated_at > existing.updated_at {
+                        tasks.insert(task_id.to_string(), task.clone());
+                    }
+                }
+            }
+        }
+        Ok(self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .cloned())
     }
 
     /// Fire the on_change callback (if set) with a task snapshot.
