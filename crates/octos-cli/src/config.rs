@@ -1227,8 +1227,8 @@ impl Default for GatewayConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChatConfig {
     /// Enable the slash-command interactive menu (Phase 2).
-    /// Default: false (dark-launch — stable before default-on).
-    #[serde(default)]
+    /// Default: true (enabled by default; set to false to opt-out).
+    #[serde(default = "default_true")]
     pub slash_menu: bool,
 }
 

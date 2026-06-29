@@ -687,7 +687,7 @@ impl ChatCommand {
         let use_reedline = config
             .chat
             .as_ref()
-            .map_or(false, |c| c.slash_menu)
+            .map_or(true, |c| c.slash_menu)
             && io::stdin().is_terminal();
 
         let mut reedline_editor = if use_reedline {
