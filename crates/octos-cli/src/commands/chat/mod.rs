@@ -26,7 +26,9 @@ use rustyline::DefaultEditor;
 use super::Executable;
 use crate::config::Config;
 
+mod slash_completer;
 mod slash_filter;
+mod slash_prompt;
 mod slash_registry;
 
 /// Interactive multi-turn chat with an agent.
@@ -676,13 +678,31 @@ impl ChatCommand {
             return Ok(());
         }
 
-        // Set up readline
+        // Set up readline — use reedline menu if enabled and on a TTY
         let history_dir = data_dir.join("history");
         std::fs::create_dir_all(&history_dir).ok();
         let history_path = history_dir.join("chat_history");
+        let reedline_history_path = history_dir.join("chat_history_reedline");
 
-        let mut rl = DefaultEditor::new().wrap_err("failed to initialize readline")?;
-        let _ = rl.load_history(&history_path);
+        let use_reedline = config
+            .chat
+            .as_ref()
+            .map_or(false, |c| c.slash_menu)
+            && io::stdin().is_terminal();
+
+        let mut reedline_editor = if use_reedline {
+            Some(slash_prompt::SlashPrompt::new(&reedline_history_path)?)
+        } else {
+            None
+        };
+
+        let mut rl = if reedline_editor.is_none() {
+            let mut editor = DefaultEditor::new().wrap_err("failed to initialize readline")?;
+            let _ = editor.load_history(&history_path);
+            Some(editor)
+        } else {
+            None
+        };
 
         // Banner
         println!("{}", "octos chat".cyan().bold());
@@ -692,43 +712,51 @@ impl ChatCommand {
         // Conversation history
         let mut history: Vec<Message> = Vec::new();
 
-        // Interactive loop — readline is blocking so we run it on a separate thread.
+        // Interactive loop.
         loop {
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
 
-            // Spawn blocking readline on a separate thread
-            let (line_tx, line_rx) = tokio::sync::oneshot::channel();
-            let mut rl_moved = rl;
-            let readline_handle = tokio::task::spawn_blocking(move || {
-                let result = rl_moved.readline("you> ");
-                let _ = line_tx.send(result);
-                rl_moved
-            });
-
-            // Wait for user input
-            let readline_result = line_rx
-                .await
-                .unwrap_or(Err(rustyline::error::ReadlineError::Eof));
-
-            // Recover the Editor from the blocking thread
-            rl = readline_handle.await.unwrap_or_else(|_| {
-                rustyline::DefaultEditor::new().expect("failed to create editor")
-            });
-
-            let line = match readline_result {
-                Ok(line) => line,
-                Err(
-                    rustyline::error::ReadlineError::Interrupted
-                    | rustyline::error::ReadlineError::Eof,
-                ) => {
-                    break;
+            // Read a line — reedline or rustyline fallback.
+            let line = if let Some(ref mut re) = reedline_editor {
+                match re.read_line("you> ") {
+                    Ok(Some(l)) => l,
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("Input error: {e}");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Input error: {e}");
-                    break;
+            } else if let Some(mut editor) = rl.take() {
+                let (line_tx, line_rx) = tokio::sync::oneshot::channel();
+                let handle = tokio::task::spawn_blocking(move || {
+                    let result = editor.readline("you> ");
+                    let _ = line_tx.send(result);
+                    editor
+                });
+
+                let readline_result = line_rx
+                    .await
+                    .unwrap_or(Err(rustyline::error::ReadlineError::Eof));
+
+                rl = Some(handle.await.unwrap_or_else(|_| {
+                    rustyline::DefaultEditor::new().expect("failed to create editor")
+                }));
+
+                match readline_result {
+                    Ok(l) => l,
+                    Err(
+                        rustyline::error::ReadlineError::Interrupted
+                        | rustyline::error::ReadlineError::Eof,
+                    ) => break,
+                    Err(e) => {
+                        eprintln!("Input error: {e}");
+                        break;
+                    }
                 }
+            } else {
+                break;
             };
 
             let input = line.trim();
@@ -736,7 +764,9 @@ impl ChatCommand {
                 continue;
             }
 
-            rl.add_history_entry(input).ok();
+            if let Some(ref mut editor) = rl {
+                editor.add_history_entry(input).ok();
+            }
 
             if let Some(cmd_idx) = resolve_dispatch(input, SLASH_COMMANDS) {
                 let cmd = &SLASH_COMMANDS[cmd_idx];
@@ -797,7 +827,12 @@ impl ChatCommand {
         }
 
         // Save history
-        let _ = rl.save_history(&history_path);
+        if let Some(ref mut editor) = rl {
+            let _ = editor.save_history(&history_path);
+        }
+        if let Some(ref mut re) = reedline_editor {
+            re.save_history().ok();
+        }
         println!("{}", "Goodbye!".dimmed());
 
         Ok(())

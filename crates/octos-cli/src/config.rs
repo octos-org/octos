@@ -74,6 +74,10 @@ pub struct Config {
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
 
+    /// Chat REPL configuration (optional).
+    #[serde(default)]
+    pub chat: Option<ChatConfig>,
+
     /// MCP server configurations.
     #[serde(default)]
     pub mcp_servers: Vec<octos_agent::McpServerConfig>,
@@ -1217,6 +1221,15 @@ impl Default for GatewayConfig {
             reasoning_effort: None,
         }
     }
+}
+
+/// Chat REPL configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ChatConfig {
+    /// Enable the slash-command interactive menu (Phase 2).
+    /// Default: false (dark-launch — stable before default-on).
+    #[serde(default)]
+    pub slash_menu: bool,
 }
 
 fn default_max_sessions() -> usize {

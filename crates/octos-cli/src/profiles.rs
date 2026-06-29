@@ -1906,6 +1906,7 @@ pub(crate) fn config_from_profile(
         // JSON declared. Defaults to permissive when the profile omits
         // the field.
         plugins: profile.config.plugins.clone(),
+        chat: None,
     }
 }
 

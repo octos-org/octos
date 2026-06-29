@@ -45,6 +45,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rustyline = { workspace = true }
+reedline = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true, optional = true }
