@@ -26,6 +26,9 @@ use rustyline::DefaultEditor;
 use super::Executable;
 use crate::config::Config;
 
+mod slash_filter;
+mod slash_registry;
+
 /// Interactive multi-turn chat with an agent.
 #[derive(Debug, Args)]
 pub struct ChatCommand {
@@ -79,8 +82,8 @@ pub struct ChatCommand {
     pub profile: Option<String>,
 }
 
-/// Exit commands.
-const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
+use slash_filter::resolve_dispatch;
+use slash_registry::SLASH_COMMANDS;
 
 struct CliApprovalRequester;
 
@@ -735,16 +738,18 @@ impl ChatCommand {
 
             rl.add_history_entry(input).ok();
 
-            if EXIT_COMMANDS.contains(&input.to_lowercase().as_str()) {
-                break;
-            }
-
-            // Handle /config command
-            if input == "/config" || input.starts_with("/config ") {
-                let args = input.strip_prefix("/config").unwrap_or("").trim();
-                let response = tool_config.handle_config_command(args).await;
-                println!("{response}");
-                continue;
+            if let Some(cmd_idx) = resolve_dispatch(input, SLASH_COMMANDS) {
+                let cmd = &SLASH_COMMANDS[cmd_idx];
+                match cmd.name {
+                    "/exit" => break,
+                    "/config" => {
+                        let args = input.strip_prefix("/config").unwrap_or("").trim();
+                        let response = tool_config.handle_config_command(args).await;
+                        println!("{response}");
+                        continue;
+                    }
+                    _ => {} // future commands: dispatch by kind
+                }
             }
 
             // Process message
