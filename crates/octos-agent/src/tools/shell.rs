@@ -16,6 +16,38 @@ use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::tools::TOOL_CTX;
 
+/// Trait for prompting the user when a command triggers `Decision::Ask`.
+#[async_trait]
+pub trait ShellApprovalProvider: Send + Sync {
+    async fn request_approval(&self, command: &str) -> bool;
+}
+
+/// Stdin-based approval provider for the interactive TUI.
+///
+/// Prints the command to stderr and reads `[y/N]` from stdin in a blocking
+/// task so it doesn't block the async runtime.
+pub struct StdinApprovalProvider;
+
+#[async_trait]
+impl ShellApprovalProvider for StdinApprovalProvider {
+    async fn request_approval(&self, command: &str) -> bool {
+        use std::io::Write as _;
+        let command = command.to_string();
+        tokio::task::spawn_blocking(move || {
+            eprint!("\n\u{26a0}\u{fe0f}  Command requires approval: {command}\nAllow? [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+            } else {
+                false
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
 /// Tool for executing shell commands.
 pub struct ShellTool {
     /// Timeout for command execution.
@@ -26,6 +58,9 @@ pub struct ShellTool {
     policy: Arc<dyn CommandPolicy>,
     /// Sandbox for command isolation.
     sandbox: Box<dyn Sandbox>,
+    /// Provider for interactive approval when `Decision::Ask` is returned.
+    /// When `None`, `Ask` commands are auto-denied.
+    approval: Option<Arc<dyn ShellApprovalProvider>>,
 }
 
 impl ShellTool {
@@ -36,6 +71,7 @@ impl ShellTool {
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
             sandbox: Box::new(NoSandbox),
+            approval: None,
         }
     }
 
@@ -55,6 +91,17 @@ impl ShellTool {
     pub fn with_sandbox(mut self, sandbox: Box<dyn Sandbox>) -> Self {
         self.sandbox = sandbox;
         self
+    }
+
+    /// Set a custom approval provider for `Decision::Ask` commands.
+    pub fn with_approval(mut self, approval: Arc<dyn ShellApprovalProvider>) -> Self {
+        self.approval = Some(approval);
+        self
+    }
+
+    /// Wire stdin-based interactive approval for the TUI.
+    pub fn with_stdin_approval(self) -> Self {
+        self.with_approval(Arc::new(StdinApprovalProvider))
     }
 }
 
@@ -195,15 +242,22 @@ impl Tool for ShellTool {
                 });
             }
             Decision::Ask => {
-                tracing::warn!(command = %input.command, "command requires approval — denied (no interactive approval available)");
-                return Ok(ToolResult {
-                    output: format!(
-                        "Command requires approval and was denied: {}\n\nThis command matches a potentially dangerous pattern (e.g. sudo, rm -rf, git push --force). It cannot be executed without interactive approval.",
-                        input.command
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
+                let approved = if let Some(provider) = &self.approval {
+                    provider.request_approval(&input.command).await
+                } else {
+                    false
+                };
+                if !approved {
+                    tracing::warn!(command = %input.command, "command requires approval — denied");
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Command requires approval and was denied: {}\n\nThis command matches a potentially dangerous pattern (e.g. sudo, rm -rf, git push --force). It cannot be executed without interactive approval.",
+                            input.command
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
             }
             Decision::Allow => {}
         }
@@ -394,6 +448,55 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("requires approval"));
+    }
+
+    struct AlwaysAskPolicy;
+    impl crate::policy::CommandPolicy for AlwaysAskPolicy {
+        fn check(&self, _command: &str, _cwd: &std::path::Path) -> crate::policy::Decision {
+            crate::policy::Decision::Ask
+        }
+    }
+
+    struct AlwaysApproveProvider;
+    #[async_trait]
+    impl ShellApprovalProvider for AlwaysApproveProvider {
+        async fn request_approval(&self, _command: &str) -> bool {
+            true
+        }
+    }
+
+    struct AlwaysRejectProvider;
+    #[async_trait]
+    impl ShellApprovalProvider for AlwaysRejectProvider {
+        async fn request_approval(&self, _command: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn should_execute_when_user_approves_ask_command() {
+        let tool = ShellTool::new(std::env::temp_dir())
+            .with_policy(Arc::new(AlwaysAskPolicy))
+            .with_approval(Arc::new(AlwaysApproveProvider));
+        let result = tool
+            .execute(&serde_json::json!({"command": "echo approved"}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success after approval, got: {}", result.output);
+        assert!(result.output.contains("approved"));
+    }
+
+    #[tokio::test]
+    async fn should_deny_when_user_rejects_ask_command() {
+        let tool = ShellTool::new(std::env::temp_dir())
+            .with_policy(Arc::new(AlwaysAskPolicy))
+            .with_approval(Arc::new(AlwaysRejectProvider));
+        let result = tool
+            .execute(&serde_json::json!({"command": "echo this-should-not-run"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("denied"), "expected 'denied' in: {}", result.output);
     }
 
     #[tokio::test]

@@ -255,7 +255,7 @@ pub use read_file::ReadFileTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
 pub use send_file::SendFileTool;
-pub use shell::ShellTool;
+pub use shell::{ShellApprovalProvider, ShellTool, StdinApprovalProvider};
 pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
 pub use synthesize_research::SynthesizeResearchTool;
 pub use web_fetch::WebFetchTool;

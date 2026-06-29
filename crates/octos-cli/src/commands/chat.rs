@@ -168,6 +168,17 @@ impl ChatCommand {
         let sandbox = octos_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
 
+        // Replace the shell tool with one that prompts the user in the terminal
+        // when a command triggers Decision::Ask (e.g. sudo, rm -rf).
+        // A second sandbox is created from the same config because the first was
+        // consumed by with_builtins_and_sandbox.
+        let tui_sandbox = octos_agent::create_sandbox(&config.sandbox);
+        tools.register(
+            octos_agent::ShellTool::new(&cwd)
+                .with_sandbox(tui_sandbox)
+                .with_stdin_approval(),
+        );
+
         // Open tool config store for user-customizable tool defaults
         let tool_config = std::sync::Arc::new(
             octos_agent::ToolConfigStore::open(&data_dir)
