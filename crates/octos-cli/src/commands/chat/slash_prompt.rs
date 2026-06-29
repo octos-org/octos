@@ -24,6 +24,8 @@ struct MenuState {
     active: bool,
     matches: Vec<usize>,
     selected: usize,
+    /// Number of lines the menu occupied on the last render.
+    prev_lines: usize,
 }
 
 impl MenuState {
@@ -61,9 +63,10 @@ impl MenuState {
 
     fn prev(&mut self) {
         if !self.matches.is_empty() {
-            self.selected = self.selected.saturating_sub(1);
-            if self.selected >= self.matches.len() {
+            if self.selected == 0 {
                 self.selected = self.matches.len() - 1;
+            } else {
+                self.selected -= 1;
             }
         }
     }
@@ -104,7 +107,6 @@ impl History {
 
     fn add(&mut self, line: &str) {
         if !line.trim().is_empty() {
-            // Dedup: remove previous identical entry then push to front.
             let l = line.to_string();
             self.entries.retain(|e| e != &l);
             self.entries.push(l);
@@ -112,28 +114,21 @@ impl History {
         self.cursor = None;
     }
 
-    fn prev(&mut self, _current: &str) -> Option<&str> {
+    fn prev(&mut self) -> Option<&str> {
         if self.entries.is_empty() {
             return None;
         }
-        let idx = self.cursor.map_or(self.entries.len() - 1, |c| c.saturating_sub(1));
-        // Clamp to valid range.
-        let idx = idx.min(self.entries.len() - 1);
+        let idx = self.cursor.map_or(self.entries.len().saturating_sub(1), |c| c.saturating_sub(1));
+        let idx = idx.min(self.entries.len().saturating_sub(1));
         self.cursor = Some(idx);
-        // If cursor is 0 and we'd go negative, return current unchanged.
-        if let Some(c) = self.cursor {
-            if c < self.entries.len() {
-                return Some(&self.entries[c]);
-            }
-        }
-        None
+        self.entries.get(idx).map(|s| s.as_str())
     }
 
-    fn next(&mut self, _current: &str) -> Option<&str> {
+    fn next(&mut self) -> Option<&str> {
         match self.cursor {
             Some(c) if c + 1 < self.entries.len() => {
                 self.cursor = Some(c + 1);
-                Some(&self.entries[c + 1])
+                self.entries.get(c + 1).map(|s| s.as_str())
             }
             _ => {
                 self.cursor = None;
@@ -157,8 +152,6 @@ impl SlashPrompt {
     pub fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
         let mut stdout = io::stdout();
         enable_raw_mode()?;
-
-        // Queue the initial prompt.
         queue!(stdout, Print(prompt))?;
         stdout.flush()?;
 
@@ -166,9 +159,24 @@ impl SlashPrompt {
         let mut cursor: usize = 0;
         let mut menu = MenuState::default();
         let mut history_nav_buffer: Option<String> = None;
+
         let result: io::Result<Option<String>> = (|| {
             loop {
-                // Re-render.
+                let has_menu = menu.active && !menu.matches.is_empty();
+                let menu_count = if has_menu { menu.matches.len() } else { 0 };
+
+                // --- clear old menu area ---
+                if menu.prev_lines > 0 && menu_count < menu.prev_lines {
+                    // Move cursor down to where old menu started, clear from there.
+                    for _ in 0..menu.prev_lines {
+                        queue!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine))?;
+                    }
+                    // Move back up.
+                    queue!(stdout, cursor::MoveUp(menu.prev_lines as u16))?;
+                }
+                menu.prev_lines = menu_count;
+
+                // --- re-render prompt + buffer ---
                 queue!(
                     stdout,
                     SavePosition,
@@ -178,7 +186,6 @@ impl SlashPrompt {
                     SetAttribute(Attribute::Reset),
                 )?;
 
-                // Print buffer with cursor.
                 if cursor == buffer.len() {
                     queue!(stdout, Print(&buffer))?;
                 } else {
@@ -188,22 +195,12 @@ impl SlashPrompt {
                     queue!(stdout, RestorePosition)?;
                 }
 
-                // Print menu if active.
-                let menu_lines = if menu.active && !menu.matches.is_empty() {
-                    let mut lines = Vec::new();
+                // --- render menu ---
+                if has_menu {
+                    queue!(stdout, Print("\r\n"))?;
                     for (i, &idx) in menu.matches.iter().enumerate() {
                         let cmd = &SLASH_COMMANDS[idx];
                         let sel = i == menu.selected;
-                        lines.push((cmd.name, cmd.description, sel));
-                    }
-                    Some(lines)
-                } else {
-                    None
-                };
-
-                if let Some(ref lines) = menu_lines {
-                    queue!(stdout, Print("\r\n"))?;
-                    for &(name, desc, sel) in lines {
                         queue!(
                             stdout,
                             Clear(ClearType::CurrentLine),
@@ -214,27 +211,18 @@ impl SlashPrompt {
                         } else {
                             queue!(stdout, SetAttribute(Attribute::Dim))?;
                         }
-                        queue!(stdout, Print(format!("  {name}  {desc}")))?;
-                        queue!(stdout, SetAttribute(Attribute::Reset))?;
-                        queue!(stdout, Print("\r\n"))?;
+                        queue!(stdout, Print(format!("  {}  {}", cmd.name, cmd.description)))?;
+                        queue!(stdout, SetAttribute(Attribute::Reset), Print("\r\n"))?;
                     }
                 }
 
-                // Restore cursor to after the buffer.
+                // --- restore cursor ---
                 queue!(stdout, RestorePosition)?;
-                if cursor < buffer.len() {
-                    // We saved position mid-buffer; move cursor back there.
-                    queue!(stdout, cursor::MoveToColumn(
-                        (prompt.len() + cursor) as u16
-                    ))?;
-                } else {
-                    queue!(stdout, cursor::MoveToColumn(
-                        (prompt.len() + buffer.len()) as u16
-                    ))?;
-                }
+                let target_col = prompt.len() + if cursor < buffer.len() { cursor } else { buffer.len() };
+                queue!(stdout, cursor::MoveToColumn(target_col as u16))?;
                 stdout.flush()?;
 
-                // Read keystroke.
+                // --- read keystroke ---
                 let ev = event::read()?;
                 match ev {
                     Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, .. })
@@ -243,24 +231,19 @@ impl SlashPrompt {
                         match code {
                             KeyCode::Char(c) => {
                                 history_nav_buffer = None;
-                                if menu.active {
-                                    // In menu mode, typing filters the command.
-                                    buffer.insert(cursor, c);
-                                    cursor += 1;
+                                buffer.insert(cursor, c);
+                                cursor += 1;
+                                if buffer.trim_start().starts_with('/') {
                                     let prefix = slash_prefix(&buffer, cursor)
                                         .map(|(p, _)| p)
                                         .unwrap_or("");
-                                    menu.update(prefix);
-                                } else {
-                                    buffer.insert(cursor, c);
-                                    cursor += 1;
-                                    // Auto-open menu if first char is '/'.
-                                    if buffer.trim_start().starts_with('/') {
-                                        let prefix = slash_prefix(&buffer, cursor)
-                                            .map(|(p, _)| p)
-                                            .unwrap_or("");
+                                    if menu.active {
+                                        menu.update(prefix);
+                                    } else {
                                         menu.open(prefix);
                                     }
+                                } else {
+                                    menu.close();
                                 }
                             }
                             KeyCode::Backspace => {
@@ -268,76 +251,73 @@ impl SlashPrompt {
                                 if cursor > 0 {
                                     buffer.remove(cursor - 1);
                                     cursor -= 1;
-                                    if menu.active {
-                                        let prefix = slash_prefix(&buffer, cursor)
-                                            .map(|(p, _)| p)
-                                            .unwrap_or("");
-                                        menu.update(prefix);
-                                    }
-                                    // Close menu if slash removed from start.
-                                    if buffer.trim_start().is_empty()
-                                        || !buffer.trim_start().starts_with('/')
-                                    {
-                                        menu.close();
-                                    }
+                                }
+                                if buffer.trim_start().starts_with('/') {
+                                    let prefix = slash_prefix(&buffer, cursor)
+                                        .map(|(p, _)| p)
+                                        .unwrap_or("");
+                                    menu.update(prefix);
+                                } else {
+                                    menu.close();
                                 }
                             }
                             KeyCode::Delete => {
                                 history_nav_buffer = None;
                                 if cursor < buffer.len() {
                                     buffer.remove(cursor);
-                                    if menu.active {
-                                        let prefix = slash_prefix(&buffer, cursor)
-                                            .map(|(p, _)| p)
-                                            .unwrap_or("");
-                                        menu.update(prefix);
-                                    }
+                                }
+                                if buffer.trim_start().starts_with('/') {
+                                    let prefix = slash_prefix(&buffer, cursor)
+                                        .map(|(p, _)| p)
+                                        .unwrap_or("");
+                                    menu.update(prefix);
+                                } else {
+                                    menu.close();
                                 }
                             }
                             KeyCode::Enter => {
                                 history_nav_buffer = None;
+                                // Accept selected command if menu is open.
                                 if menu.active && !menu.matches.is_empty() {
-                                    // Accept selected command.
                                     if let Some(selected) = menu.selected_command() {
                                         let cmd = SLASH_COMMANDS
                                             .iter()
                                             .find(|c| c.name == selected)
                                             .unwrap();
-                                        buffer = selected.to_string();
-                                        cursor = buffer.len();
-                                        menu.close();
-                                        if cmd.kind == CommandKind::TakesArgs {
-                                            buffer.push(' ');
-                                            cursor += 1;
-                                        }
-                                        // Re-render before potentially submitting.
-                                        queue!(stdout, SavePosition)?;
-                                        queue!(stdout, cursor::MoveToColumn(0))?;
-                                        queue!(stdout, Clear(ClearType::CurrentLine))?;
-                                        queue!(stdout, Print(prompt))?;
-                                        queue!(stdout, Print(&buffer))?;
-                                        queue!(stdout, RestorePosition)?;
-                                        stdout.flush()?;
                                         if cmd.kind == CommandKind::Immediate {
-                                            // For exit, submit immediately.
+                                            buffer = selected.to_string();
+                                            cursor = buffer.len();
+                                            menu.close();
+                                        } else if cmd.kind == CommandKind::TakesArgs {
+                                            buffer = selected.to_string();
+                                            buffer.push(' ');
+                                            cursor = buffer.len();
+                                            menu.close();
                                         }
                                     }
                                 }
-                                // Clear menu area.
+                                // Clear menu area below.
+                                for _ in 0..menu.prev_lines {
+                                    queue!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine))?;
+                                }
+                                // Move back to the prompt line and finalize.
+                                if menu.prev_lines > 0 {
+                                    queue!(stdout, cursor::MoveToColumn(0))?;
+                                    queue!(stdout, Clear(ClearType::CurrentLine))?;
+                                    queue!(stdout, Print(prompt), Print(&buffer))?;
+                                }
                                 queue!(stdout, Print("\r\n"))?;
-                                // Submit (break loop).
+                                stdout.flush()?;
                                 disable_raw_mode()?;
                                 return Ok(Some(buffer));
                             }
                             KeyCode::Esc => {
-                                if menu.active {
-                                    menu.close();
-                                }
+                                history_nav_buffer = None;
+                                menu.close();
                             }
                             KeyCode::Tab => {
                                 history_nav_buffer = None;
                                 if menu.active && !menu.matches.is_empty() {
-                                    // Complete to first match.
                                     if let Some(selected) = menu.selected_command() {
                                         let cmd = SLASH_COMMANDS
                                             .iter()
@@ -349,7 +329,10 @@ impl SlashPrompt {
                                             buffer.push(' ');
                                             cursor += 1;
                                         }
-                                        menu.close();
+                                        // Keep menu open for further typing/navigation if TakesArgs.
+                                        if cmd.kind == CommandKind::Immediate {
+                                            menu.close();
+                                        }
                                     }
                                 }
                             }
@@ -360,7 +343,7 @@ impl SlashPrompt {
                                     if history_nav_buffer.is_none() {
                                         history_nav_buffer = Some(buffer.clone());
                                     }
-                                    if let Some(entry) = self.history.prev(&buffer) {
+                                    if let Some(entry) = self.history.prev() {
                                         buffer = entry.to_string();
                                         cursor = buffer.len();
                                         menu.close();
@@ -371,7 +354,7 @@ impl SlashPrompt {
                                 if menu.active {
                                     menu.next();
                                 } else {
-                                    if let Some(entry) = self.history.next(&buffer) {
+                                    if let Some(entry) = self.history.next() {
                                         buffer = entry.to_string();
                                         cursor = buffer.len();
                                         menu.close();
@@ -381,16 +364,8 @@ impl SlashPrompt {
                                     }
                                 }
                             }
-                            KeyCode::Left => {
-                                if cursor > 0 {
-                                    cursor -= 1;
-                                }
-                            }
-                            KeyCode::Right => {
-                                if cursor < buffer.len() {
-                                    cursor += 1;
-                                }
-                            }
+                            KeyCode::Left => { if cursor > 0 { cursor -= 1; } }
+                            KeyCode::Right => { if cursor < buffer.len() { cursor += 1; } }
                             KeyCode::Home => cursor = 0,
                             KeyCode::End => cursor = buffer.len(),
                             _ => {}
@@ -400,14 +375,22 @@ impl SlashPrompt {
                         if menu.active {
                             menu.close();
                         } else {
-                            disable_raw_mode()?;
+                            // Clear menu area before exiting.
+                            for _ in 0..menu.prev_lines {
+                                queue!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine))?;
+                            }
                             queue!(stdout, Print("^C\r\n"))?;
                             stdout.flush()?;
+                            disable_raw_mode()?;
                             return Ok(None);
                         }
                     }
                     Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers: KeyModifiers::CONTROL, .. }) => {
                         if buffer.is_empty() {
+                            for _ in 0..menu.prev_lines {
+                                queue!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine))?;
+                            }
+                            stdout.flush()?;
                             disable_raw_mode()?;
                             return Ok(None);
                         }
@@ -418,7 +401,6 @@ impl SlashPrompt {
             }
         })();
 
-        // Ensure raw mode is disabled on all exit paths.
         let _ = disable_raw_mode();
         result
     }
