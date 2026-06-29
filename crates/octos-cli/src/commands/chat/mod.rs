@@ -767,6 +767,9 @@ impl ChatCommand {
             if let Some(ref mut editor) = rl {
                 editor.add_history_entry(input).ok();
             }
+            if let Some(ref mut re) = reedline_editor {
+                re.add_history(input);
+            }
 
             if let Some(cmd_idx) = resolve_dispatch(input, SLASH_COMMANDS) {
                 let cmd = &SLASH_COMMANDS[cmd_idx];

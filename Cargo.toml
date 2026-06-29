@@ -92,6 +92,7 @@ colored = "2"
 dirs = "5"
 rustyline = "15"
 reedline = "0.35"
+crossterm = "0.28"
 open = "5"
 
 # Keychain (platform-native secure credential storage)

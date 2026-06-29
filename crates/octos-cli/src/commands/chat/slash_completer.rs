@@ -7,6 +7,7 @@ use super::slash_registry::CommandKind;
 
 /// Completer that provides slash-command suggestions when the cursor is
 /// inside a leading command token (starts with `/`).
+#[allow(dead_code)] // Phase 3 crossterm prompt does not use reedline completer directly
 pub struct SlashCompleter;
 
 impl Completer for SlashCompleter {

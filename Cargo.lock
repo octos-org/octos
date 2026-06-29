@@ -3933,6 +3933,7 @@ dependencies = [
  "color-eyre",
  "colored 2.2.0",
  "constant_time_eq",
+ "crossterm",
  "dirs",
  "eyre",
  "flate2",
