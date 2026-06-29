@@ -55,7 +55,7 @@ impl Menu for SlashMenu {
     fn indicator(&self) -> &str { "" }
 
     fn is_active(&self) -> bool {
-        self.active && !self.values.is_empty()
+        self.active
     }
 
     fn menu_event(&mut self, event: MenuEvent) {
