@@ -1,20 +1,21 @@
 //! Reedline assembly for the `octos chat` REPL with slash-command menu.
-//! Uses Hinter (inline hint) for zero-clutter suggestion display;
-//! ColumnarMenu only activates on explicit Tab completion.
+//! Custom Menu: vertical dropdown with ↑/↓ navigation; completely hidden
+//! when there are no completions (no "NO RECORDS FOUND" placeholder).
+//! Plain prompt removes status-indicator symbols.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::path::Path;
 
 use eyre::{Result, WrapErr};
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, Emacs, FileBackedHistory, Hinter, History,
-    KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal,
+    default_emacs_keybindings, Completer, EditCommand, Editor, Emacs, FileBackedHistory, KeyCode,
+    KeyModifiers, Menu, MenuEvent, Painter, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, Suggestion, UndoBehavior,
 };
 
 use super::slash_completer::SlashCompleter;
-use super::slash_filter::{match_commands, slash_prefix};
-use super::slash_registry::SLASH_COMMANDS;
+use super::slash_filter::slash_prefix;
 
 // ── Plain prompt: no ">" or mode-status symbols ─────────────────────
 
@@ -23,74 +24,125 @@ struct PlainPrompt {
 }
 
 impl Prompt for PlainPrompt {
-    fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.text)
-    }
-    fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_history_search_indicator(
-        &self,
-        _history_search: PromptHistorySearch,
-    ) -> Cow<'_, str> {
+    fn render_prompt_left(&self) -> Cow<'_, str> { Cow::Borrowed(&self.text) }
+    fn render_prompt_right(&self) -> Cow<'_, str> { Cow::Borrowed("") }
+    fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> { Cow::Borrowed("") }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> { Cow::Borrowed("") }
+    fn render_prompt_history_search_indicator(&self, _: PromptHistorySearch) -> Cow<'_, str> {
         Cow::Borrowed("")
     }
 }
 
-// ── Hinter: inline suggestions, disappears on no-match ──────────────
+// ── Custom Menu: auto-hides when empty ──────────────────────────────
 
-struct SlashHinter {
-    last_matches: Vec<usize>,
+struct SlashMenu {
+    active: bool,
+    values: Vec<Suggestion>,
+    selected: usize,
 }
 
-impl Hinter for SlashHinter {
-    fn handle(
-        &mut self,
-        line: &str,
-        pos: usize,
-        _history: &dyn History,
-        _use_ansi_coloring: bool,
-        _cwd: &str,
-    ) -> String {
-        let prefix = match slash_prefix(line, pos) {
-            Some((p, _)) => p,
-            None => {
-                self.last_matches.clear();
-                return String::new();
+impl SlashMenu {
+    fn new() -> Self {
+        Self { active: false, values: Vec::new(), selected: 0 }
+    }
+}
+
+impl Menu for SlashMenu {
+    // Override `name` / `indicator` so `settings()` (which panics by
+    // default) is never invoked — we don't implement `MenuBuilder` and
+    // reedline's runtime never calls `settings()` either.
+    fn name(&self) -> &str { "slash_menu" }
+    fn indicator(&self) -> &str { "" }
+
+    fn is_active(&self) -> bool {
+        self.active && !self.values.is_empty()
+    }
+
+    fn menu_event(&mut self, event: MenuEvent) {
+        match event {
+            MenuEvent::Activate(..) => self.active = true,
+            MenuEvent::Deactivate => {
+                self.active = false;
+                self.values.clear();
+                self.selected = 0;
             }
-        };
+            MenuEvent::NextElement => {
+                if !self.values.is_empty() {
+                    self.selected = (self.selected + 1).min(self.values.len() - 1);
+                }
+            }
+            MenuEvent::PreviousElement => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
 
-        let indices = match_commands(prefix, SLASH_COMMANDS);
-        if indices.is_empty() {
-            self.last_matches.clear();
-            return String::new();
+    fn can_quick_complete(&self) -> bool { true }
+
+    fn can_partially_complete(
+        &mut self, _values_updated: bool, _editor: &mut Editor, _completer: &mut dyn Completer,
+    ) -> bool { true }
+
+    fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
+        let line = editor.get_buffer().to_string();
+        let cursor = Cell::new(line.len());
+        editor.edit_buffer(|buf| cursor.set(buf.insertion_point()), UndoBehavior::MoveCursor);
+        let pos = cursor.get();
+
+        self.values = completer.complete(&line, pos);
+
+        // Auto-close when cursor leaves the slash-command token.
+        if slash_prefix(&line, pos).is_none() {
+            self.active = false;
         }
 
-        self.last_matches = indices;
-        let names: Vec<&str> = self
-            .last_matches
-            .iter()
-            .map(|&i| SLASH_COMMANDS[i].name)
-            .collect();
-        format!("  {}", names.join("  "))
+        if self.selected >= self.values.len().saturating_sub(1) {
+            self.selected = self.values.len().saturating_sub(1);
+        }
     }
 
-    fn complete_hint(&self) -> String {
-        self.last_matches
-            .first()
-            .map(|&i| SLASH_COMMANDS[i].name.to_string())
-            .unwrap_or_default()
+    fn update_working_details(
+        &mut self, _editor: &mut Editor, _completer: &mut dyn Completer, _painter: &Painter,
+    ) {}
+
+    fn replace_in_buffer(&self, editor: &mut Editor) {
+        if let Some(val) = self.values.get(self.selected) {
+            let replacement = val.value.clone();
+            editor.edit_buffer(
+                |buf| {
+                    let end = buf.get_buffer().len();
+                    buf.replace_range(..end, &replacement);
+                },
+                UndoBehavior::CreateUndoPoint,
+            );
+        }
     }
 
-    fn next_hint_token(&self) -> String {
-        self.complete_hint()
+    fn menu_required_lines(&self, _terminal_columns: u16) -> u16 {
+        if !self.active || self.values.is_empty() { 0 } else { self.values.len() as u16 }
     }
+
+    fn menu_string(&self, _available_lines: u16, _use_ansi_coloring: bool) -> String {
+        if !self.active || self.values.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for (i, val) in self.values.iter().enumerate() {
+            if i == self.selected {
+                out.push_str(&format!(" \x1b[7m {}  {}\x1b[0m\n", val.value, val.description.as_deref().unwrap_or("")));
+            } else {
+                out.push_str(&format!("   \x1b[2m{}\x1b[0m  {}\n", val.value, val.description.as_deref().unwrap_or("")));
+            }
+        }
+        out
+    }
+
+    fn min_rows(&self) -> u16 {
+        if !self.active || self.values.is_empty() { 0 } else { self.values.len() as u16 }
+    }
+
+    fn get_values(&self) -> &[Suggestion] { &self.values }
 }
 
 // ── Public builder ──────────────────────────────────────────────────
@@ -102,20 +154,14 @@ pub struct SlashPrompt {
 impl SlashPrompt {
     pub fn new(history_path: &Path) -> Result<Self> {
         let completer = Box::new(SlashCompleter);
-        let hinter = Box::new(SlashHinter {
-            last_matches: Vec::new(),
-        });
+        let menu = ReedlineMenu::EngineCompleter(Box::new(SlashMenu::new()));
 
-        let menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("slash_menu"),
-        ));
-
-        // Tab activates the menu for arrow-key navigation; no auto-open on `/`.
         let mut keybindings = default_emacs_keybindings();
         keybindings.add_binding(
             KeyModifiers::NONE,
-            KeyCode::Tab,
+            KeyCode::Char('/'),
             ReedlineEvent::Multiple(vec![
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar('/')]),
                 ReedlineEvent::Menu("slash_menu".to_string()),
             ]),
         );
@@ -128,7 +174,6 @@ impl SlashPrompt {
 
         let editor = Reedline::create()
             .with_completer(completer)
-            .with_hinter(hinter)
             .with_menu(menu)
             .with_edit_mode(edit_mode)
             .with_history(history);
@@ -137,14 +182,9 @@ impl SlashPrompt {
     }
 
     pub fn read_line(&mut self, prompt: &str) -> std::io::Result<Option<String>> {
-        let prompt = PlainPrompt {
-            text: prompt.to_string(),
-        };
-        let signal = self
-            .editor
-            .read_line(&prompt)
+        let prompt = PlainPrompt { text: prompt.to_string() };
+        let signal = self.editor.read_line(&prompt)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
         match signal {
             Signal::Success(line) => Ok(Some(line)),
             Signal::CtrlC | Signal::CtrlD => Ok(None),
@@ -152,9 +192,7 @@ impl SlashPrompt {
     }
 
     pub fn save_history(&mut self) -> Result<()> {
-        self.editor
-            .sync_history()
-            .wrap_err("failed to sync reedline history")?;
+        self.editor.sync_history().wrap_err("failed to sync reedline history")?;
         Ok(())
     }
 }
