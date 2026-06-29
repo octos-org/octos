@@ -1,29 +1,56 @@
 //! Reedline assembly for the `octos chat` REPL with slash-command menu.
-//! Wraps reedline setup (editor, keybindings, history, completer, menu)
-//! into a single read-line call that mirrors the current rustyline loop.
+//! Uses a plain prompt (no status-indicator symbols) and reedline's
+//! built-in ColumnarMenu.  Empty-menu placeholder is a known reedline
+//! restriction (ColumnarMenu hardcodes "NO RECORDS FOUND" internally).
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use eyre::{Result, WrapErr};
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, DefaultPrompt, DefaultPromptSegment, EditCommand,
-    Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
-    ReedlineMenu, Signal,
+    default_emacs_keybindings, ColumnarMenu, EditCommand, Emacs, FileBackedHistory, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal,
 };
 
 use super::slash_completer::SlashCompleter;
 
-/// Builder for a reedline editor configured with slash-command menu support.
+// ── Plain prompt: no ">" or mode-status symbols ─────────────────────
+
+struct PlainPrompt {
+    text: String,
+}
+
+impl Prompt for PlainPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.text)
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        _history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+}
+
+// ── Public builder ──────────────────────────────────────────────────
+
 pub struct SlashPrompt {
     editor: Reedline,
 }
 
 impl SlashPrompt {
-    /// Build a reedline editor wired with the slash-command completer,
-    /// a columnar menu, and custom keybinding for auto-open on `/`.
     pub fn new(history_path: &Path) -> Result<Self> {
         let completer = Box::new(SlashCompleter);
-
         let menu = ReedlineMenu::EngineCompleter(Box::new(
             ColumnarMenu::default().with_name("slash_menu"),
         ));
@@ -39,7 +66,6 @@ impl SlashPrompt {
         );
 
         let edit_mode = Box::new(Emacs::new(keybindings));
-
         let history = Box::new(
             FileBackedHistory::with_file(256, history_path.to_path_buf())
                 .wrap_err("failed to open reedline history")?,
@@ -56,13 +82,10 @@ impl SlashPrompt {
         Ok(Self { editor })
     }
 
-    /// Read one line from the user. Returns the line or `None` on exit/interrupt.
     pub fn read_line(&mut self, prompt: &str) -> std::io::Result<Option<String>> {
-        let prompt = DefaultPrompt::new(
-            DefaultPromptSegment::Basic(prompt.to_string()),
-            DefaultPromptSegment::Basic("".to_string()),
-        );
-
+        let prompt = PlainPrompt {
+            text: prompt.to_string(),
+        };
         let signal = self
             .editor
             .read_line(&prompt)
@@ -74,7 +97,6 @@ impl SlashPrompt {
         }
     }
 
-    /// Persist history to disk.
     pub fn save_history(&mut self) -> Result<()> {
         self.editor
             .sync_history()
