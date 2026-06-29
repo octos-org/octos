@@ -234,13 +234,14 @@ impl SlashPrompt {
                                 buffer.insert(cursor, c);
                                 cursor += 1;
                                 if buffer.trim_start().starts_with('/') {
-                                    let prefix = slash_prefix(&buffer, cursor)
-                                        .map(|(p, _)| p)
-                                        .unwrap_or("");
-                                    if menu.active {
-                                        menu.update(prefix);
+                                    if let Some((prefix, _)) = slash_prefix(&buffer, cursor) {
+                                        if menu.active {
+                                            menu.update(prefix);
+                                        } else {
+                                            menu.open(prefix);
+                                        }
                                     } else {
-                                        menu.open(prefix);
+                                        menu.close();
                                     }
                                 } else {
                                     menu.close();
@@ -253,10 +254,11 @@ impl SlashPrompt {
                                     cursor -= 1;
                                 }
                                 if buffer.trim_start().starts_with('/') {
-                                    let prefix = slash_prefix(&buffer, cursor)
-                                        .map(|(p, _)| p)
-                                        .unwrap_or("");
-                                    menu.update(prefix);
+                                    if let Some((prefix, _)) = slash_prefix(&buffer, cursor) {
+                                        menu.update(prefix);
+                                    } else {
+                                        menu.close();
+                                    }
                                 } else {
                                     menu.close();
                                 }
@@ -267,10 +269,11 @@ impl SlashPrompt {
                                     buffer.remove(cursor);
                                 }
                                 if buffer.trim_start().starts_with('/') {
-                                    let prefix = slash_prefix(&buffer, cursor)
-                                        .map(|(p, _)| p)
-                                        .unwrap_or("");
-                                    menu.update(prefix);
+                                    if let Some((prefix, _)) = slash_prefix(&buffer, cursor) {
+                                        menu.update(prefix);
+                                    } else {
+                                        menu.close();
+                                    }
                                 } else {
                                     menu.close();
                                 }
