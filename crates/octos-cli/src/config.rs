@@ -44,6 +44,12 @@ pub struct Config {
     #[serde(default)]
     pub api_key_env: Option<String>,
 
+    /// Direct API key value (alternative to api_key_env).
+    /// When both `api_key` and the env var referenced by `api_key_env` are present,
+    /// the env var takes precedence.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
     /// Profile-scoped environment values, including API keys persisted by the dashboard/AppUI.
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
@@ -329,6 +335,9 @@ pub struct FallbackModel {
     /// Override the API key env var for this fallback.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Direct API key for this fallback (env var takes precedence when both present).
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Override auto-detected model hints for this fallback.
     #[serde(default)]
     pub model_hints: Option<octos_llm::openai::ModelHints>,
@@ -480,6 +489,9 @@ pub struct SubProviderConfig {
     /// If not set, falls back to the default for the provider (e.g. OPENAI_API_KEY).
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Direct API key for this sub-provider (env var takes precedence when both present).
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Custom base URL for this sub-provider.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -513,6 +525,10 @@ pub struct EmbeddingConfig {
     /// Environment variable name for the API key (overrides provider default).
     #[serde(default)]
     pub api_key_env: Option<String>,
+
+    /// Direct API key (env var takes precedence when both present).
+    #[serde(default)]
+    pub api_key: Option<String>,
 
     /// Custom base URL for the embedding API.
     #[serde(default)]
@@ -1450,15 +1466,15 @@ impl Config {
         result
     }
 
-    /// Get the API key: auth store first, then environment variable.
+    /// Get the API key: auth store → env_vars (with keychain) → process env → config.api_key.
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Resolve the env var name we expect to hold this provider's key, and
         // mark it as a secret FIRST — before any early return — so the
         // configured key var is stripped from the default subprocess
         // environment regardless of which resolution path (auth store /
-        // env_vars / keychain / process env) actually wins below. This also
-        // covers a custom `api_key_env` whose NAME does not look secret to the
-        // heuristic, so it can't be `echo`'d from the shell tool. Registered
+        // env_vars / keychain / process env / direct api_key) actually wins below.
+        // This also covers a custom `api_key_env` whose NAME does not look secret
+        // to the heuristic, so it can't be `echo`'d from the shell tool. Registered
         // names are still allowlistable: a tool that declares the var in its
         // manifest `env` list may receive it (the sanctioned path for skills
         // that call LLMs). See `octos_agent::subprocess_env`.
@@ -1490,9 +1506,24 @@ impl Config {
             return Ok(value);
         }
 
-        std::env::var(&env_var).wrap_err_with(|| {
-            format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
-        })
+        // Process environment variable — takes precedence over config.api_key.
+        if let Ok(value) = std::env::var(&env_var) {
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+
+        // Fallback to direct api_key stored in config.
+        if let Some(ref key) = self.api_key {
+            if !key.is_empty() {
+                return Ok(key.clone());
+            }
+        }
+
+        Err(eyre::eyre!(
+            "{env_var} not set. Run `octos auth login -p {provider}`, set the env var, or add `api_key` to config.json"
+
+        ))
     }
 
     /// Validate the configuration, returning any warnings.
@@ -2612,5 +2643,142 @@ mod tests {
             }));
         assert_eq!(overridden.tts_provider, "cloud");
         assert_eq!(overridden.cloud.unwrap().appid.as_deref(), Some("42"));
+    }
+
+    // ── api_key fallback tests ──────────────────────────────────────────
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_fallback_to_api_key_when_env_var_not_set() {
+        let original = std::env::var_os("TEST_API_KEY");
+        // SAFETY: guarded by test isolation — no concurrency within this test.
+        unsafe { std::env::remove_var("TEST_API_KEY"); }
+
+        let config = Config {
+            api_key_env: Some("TEST_API_KEY".to_string()),
+            api_key: Some("direct-key-value".to_string()),
+            ..Default::default()
+        };
+
+        let key = config.get_api_key("test");
+
+        match original {
+            Some(v) => unsafe { std::env::set_var("TEST_API_KEY", v) },
+            None => unsafe { std::env::remove_var("TEST_API_KEY") },
+        }
+
+        assert_eq!(key.unwrap(), "direct-key-value");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_prefer_env_var_over_api_key_when_both_present() {
+        let original = std::env::var_os("TEST_API_KEY");
+        // SAFETY: guarded by test isolation.
+        unsafe { std::env::set_var("TEST_API_KEY", "env-key-value"); }
+
+        let config = Config {
+            api_key_env: Some("TEST_API_KEY".to_string()),
+            api_key: Some("direct-key-value".to_string()),
+            ..Default::default()
+        };
+
+        let key = config.get_api_key("test");
+
+        match original {
+            Some(v) => unsafe { std::env::set_var("TEST_API_KEY", v) },
+            None => unsafe { std::env::remove_var("TEST_API_KEY") },
+        }
+
+        assert_eq!(key.unwrap(), "env-key-value");
+    }
+
+    #[test]
+    fn should_use_api_key_when_no_api_key_env_specified() {
+        let config = Config {
+            api_key_env: None,
+            api_key: Some("direct-only-key".to_string()),
+            ..Default::default()
+        };
+
+        let key = config.get_api_key("openai");
+        assert_eq!(key.unwrap(), "direct-only-key");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_error_when_neither_env_var_nor_api_key_set() {
+        let original = std::env::var_os("OPENAI_API_KEY");
+        // SAFETY: guarded by test isolation.
+        unsafe { std::env::remove_var("OPENAI_API_KEY"); }
+
+        let config = Config {
+            api_key_env: None,
+            api_key: None,
+            ..Default::default()
+        };
+
+        let result = config.get_api_key("openai");
+
+        match original {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("OPENAI_API_KEY not set"));
+    }
+
+    #[test]
+    fn test_embedding_config_deserializes_api_key() {
+        let json = r#"{
+            "provider": "openai",
+            "embedding": {
+                "provider": "openai",
+                "api_key": "sk-embed-key"
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let emb = config.embedding.unwrap();
+        assert_eq!(emb.api_key.as_deref(), Some("sk-embed-key"));
+        assert!(emb.api_key_env.is_none());
+    }
+
+    #[test]
+    fn test_sub_provider_config_deserializes_api_key() {
+        let json = r#"{
+            "provider": "openai",
+            "sub_providers": [
+                {
+                    "key": "cheap",
+                    "provider": "openai",
+                    "api_key": "sk-sub-key"
+                }
+            ]
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let sp = &config.sub_providers[0];
+        assert_eq!(sp.api_key.as_deref(), Some("sk-sub-key"));
+        assert!(sp.api_key_env.is_none());
+    }
+
+    #[test]
+    fn test_fallback_model_deserializes_api_key() {
+        let json = r#"{
+            "provider": "openai",
+            "fallback_models": [
+                {
+                    "provider": "gemini",
+                    "api_key": "sk-fb-key"
+                }
+            ]
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let fb = &config.fallback_models[0];
+        assert_eq!(fb.api_key.as_deref(), Some("sk-fb-key"));
+        assert!(fb.api_key_env.is_none());
     }
 }

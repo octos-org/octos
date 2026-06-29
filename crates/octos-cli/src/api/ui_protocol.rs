@@ -7014,6 +7014,7 @@ async fn raw_profile_llm_upsert(
         base_url: nonempty(params.selection.route.base_url),
         api_key_env: nonempty(params.selection.route.api_key_env)
             .or_else(|| dashboard_family_api_key_env(&family_id)),
+        api_key: None,
         api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
     };
     if let (Some(api_key_env), Some(api_key)) = (
@@ -7127,6 +7128,7 @@ async fn raw_profile_llm_test(
         base_url: nonempty(params.selection.route.base_url),
         api_key_env: nonempty(params.selection.route.api_key_env)
             .or_else(|| dashboard_family_api_key_env(&family_id)),
+        api_key: None,
         api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
     };
 

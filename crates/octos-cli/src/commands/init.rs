@@ -154,14 +154,23 @@ fn select_api_type(info: &ProviderInfo, raw_input: &str) -> ApiTypeSelection {
 fn build_config(
     info: &ProviderInfo,
     model: &str,
-    api_key_env: &str,
+    key_config: &KeyConfig,
     api_selection: ApiTypeSelection,
 ) -> serde_json::Value {
     let mut config = json!({
         "provider": info.name,
         "model": model,
-        "api_key_env": api_key_env
     });
+
+    match key_config {
+        KeyConfig::EnvVar(env) => {
+            config["api_key_env"] = json!(env);
+        }
+        KeyConfig::Direct(key) => {
+            config["api_key"] = json!(key);
+        }
+        KeyConfig::Skip => {}
+    }
 
     if let Some(base_url) = api_selection.base_url {
         config["base_url"] = json!(base_url);
@@ -173,6 +182,17 @@ fn build_config(
     config
 }
 
+/// How the user wants to provide their API key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyConfig {
+    /// Reference an environment variable by name (e.g. "OPENAI_API_KEY").
+    EnvVar(String),
+    /// Store the key value directly in config.json.
+    Direct(String),
+    /// Skip key configuration for now.
+    Skip,
+}
+
 /// A fully-resolved custom (self-hosted / proxy) provider selection.
 ///
 /// The preset providers in `PROVIDERS` are written via [`build_config`] which
@@ -182,7 +202,7 @@ fn build_config(
 struct SelectedProvider {
     provider: String,
     model: String,
-    api_key_env: String,
+    key_config: KeyConfig,
     base_url: Option<String>,
     api_type: Option<String>,
 }
@@ -192,8 +212,16 @@ impl SelectedProvider {
         let mut config = json!({
             "provider": self.provider,
             "model": self.model,
-            "api_key_env": self.api_key_env
         });
+        match &self.key_config {
+            KeyConfig::EnvVar(env) => {
+                config["api_key_env"] = json!(env);
+            }
+            KeyConfig::Direct(key) => {
+                config["api_key"] = json!(key);
+            }
+            KeyConfig::Skip => {}
+        }
         if let Some(base_url) = &self.base_url {
             config["base_url"] = json!(base_url);
         }
@@ -328,15 +356,11 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
 
     let api_type = prompt_api_type()?;
 
-    println!();
-    print!("Environment variable containing the API Key [{CUSTOM_API_KEY_ENV}]: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let api_key_env = if input.trim().is_empty() {
-        CUSTOM_API_KEY_ENV.to_string()
-    } else {
-        input.trim().to_string()
+    let key_config = prompt_key_config()?;
+
+    let env_var_name = match &key_config {
+        KeyConfig::EnvVar(name) => name.clone(),
+        KeyConfig::Direct(_) | KeyConfig::Skip => CUSTOM_API_KEY_ENV.to_string(),
     };
 
     println!();
@@ -345,7 +369,7 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
         models_endpoint(&base_url)
     );
     io::stdout().flush()?;
-    let fetched_models = match fetch_custom_models(&base_url, &api_key_env) {
+    let fetched_models = match fetch_custom_models(&base_url, &env_var_name) {
         Ok(models) if !models.is_empty() => {
             println!("{}", "✓".green());
             models
@@ -366,10 +390,71 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
     Ok(SelectedProvider {
         provider: CUSTOM_PROVIDER_NAME.to_string(),
         model,
-        api_key_env,
+        key_config,
         base_url: Some(base_url),
         api_type: Some(api_type),
     })
+}
+
+/// Prompt the user to choose how to configure the API key.
+fn prompt_key_config() -> Result<KeyConfig> {
+    println!();
+    println!("{}", "API Key Configuration".green());
+    println!();
+    println!("How would you like to configure the API key?");
+    println!("  1. Set the API key directly");
+    println!("     — stores the key value in config.json");
+    println!("  2. Environment variable name");
+    println!("     — stores env var name, reads the key from your shell environment");
+    println!("  3. Skip for now");
+    println!("     — configure later with `octos auth login` or edit config.json");
+    println!();
+    print!("Choose [1]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    match input.trim() {
+        "2" => {
+            print!("Environment variable name [OPENAI_API_KEY]: ");
+            io::stdout().flush()?;
+            let mut env_input = String::new();
+            io::stdin().read_line(&mut env_input)?;
+            let env = if env_input.trim().is_empty() {
+                "OPENAI_API_KEY".to_string()
+            } else {
+                env_input.trim().to_string()
+            };
+            Ok(KeyConfig::EnvVar(env))
+        }
+        "3" => Ok(KeyConfig::Skip),
+        _ => {
+            // Default: direct key mode
+            println!();
+            println!(
+                "{}",
+                "Note: the key will be stored in plaintext in config.json."
+                    .yellow()
+            );
+            println!(
+                "{}",
+                "For production use, environment variables or `octos auth login` are recommended."
+                    .dimmed()
+            );
+            println!();
+            print!("Enter the API key: ");
+            io::stdout().flush()?;
+            let mut key_input = String::new();
+            io::stdin().read_line(&mut key_input)?;
+            let key = key_input.trim().to_string();
+            if key.is_empty() {
+                println!("{} No key entered, skipping.", "Warning:".yellow());
+                Ok(KeyConfig::Skip)
+            } else {
+                Ok(KeyConfig::Direct(key))
+            }
+        }
+    }
 }
 
 /// Write the resolved config plus the bootstrap scaffolding (gitignore,
@@ -382,7 +467,7 @@ fn write_init_files(
     config_dir: PathBuf,
     config_path: PathBuf,
     config: Value,
-    api_key_env: String,
+    key_config: &KeyConfig,
 ) -> Result<()> {
     // Create directory
     std::fs::create_dir_all(&config_dir)
@@ -403,14 +488,44 @@ fn write_init_files(
     println!();
 
     // Check if API key is set
-    if std::env::var(&api_key_env).is_err() {
-        println!("{} {} is not set", "Warning:".yellow(), api_key_env);
-        println!();
-        println!("Set it with:");
-        println!("  export {}=your-api-key", api_key_env);
-        println!();
-    } else {
-        println!("{} {} is set", "✓".green(), api_key_env);
+    match key_config {
+        KeyConfig::EnvVar(env_var) => {
+            if std::env::var(env_var).is_err() {
+                println!(
+                    "{} {} is not set",
+                    "Warning:".yellow(),
+                    env_var
+                );
+                println!();
+                println!("Set it with:");
+                println!("  export {}=your-api-key", env_var);
+                println!();
+            } else {
+                println!("{} {} is set", "✓".green(), env_var);
+            }
+        }
+        KeyConfig::Direct(_) => {
+            println!(
+                "{} API key stored directly in config.json",
+                "✓".green()
+            );
+            println!(
+                "{}",
+                "  An environment variable for this provider (if set) will take precedence."
+                    .dimmed()
+            );
+        }
+        KeyConfig::Skip => {
+            println!(
+                "{} No API key configured.",
+                "Info:".cyan()
+            );
+            println!(
+                "{}",
+                "  Run `octos auth login -p <provider>` or edit config.json to add a key."
+                    .dimmed()
+            );
+        }
     }
 
     // Create .gitignore if it doesn't exist
@@ -631,14 +746,14 @@ impl Executable for InitCommand {
         // Flag-driven custom provider: write it directly and skip the preset
         // selection flow entirely.
         if let Some(custom) = custom_flag_selection {
-            let api_key_env = custom.api_key_env.clone();
-            return write_init_files(config_dir, config_path, custom.to_json(), api_key_env);
+            let key_config = custom.key_config.clone();
+            return write_init_files(config_dir, config_path, custom.to_json(), &key_config);
         }
 
         // Load model catalog for hints
         let catalog = load_catalog_models();
 
-        let (provider_info_idx, model, api_key_env, api_selection) = if self.defaults {
+        let (provider_info_idx, model, key_config, api_selection) = if self.defaults {
             // Auto-detect from env vars, or prompt if none found
             let idx = detect_from_env().unwrap_or(0); // fallback to first (openai)
             let info = &PROVIDERS[idx];
@@ -653,7 +768,7 @@ impl Executable for InitCommand {
             (
                 idx,
                 default_model,
-                info.api_key_env.to_string(),
+                KeyConfig::EnvVar(info.api_key_env.to_string()),
                 default_api_type_selection(info),
             )
         } else {
@@ -699,12 +814,12 @@ impl Executable for InitCommand {
                     Ok(n) if n >= 1 && n <= PROVIDERS.len() => n - 1,
                     Ok(n) if n == PROVIDERS.len() + 1 => {
                         let custom = prompt_custom_provider()?;
-                        let api_key_env = custom.api_key_env.clone();
+                        let key_config = custom.key_config.clone();
                         return write_init_files(
                             config_dir,
                             config_path,
                             custom.to_json(),
-                            api_key_env,
+                            &key_config,
                         );
                     }
                     _ => {
@@ -783,30 +898,17 @@ impl Executable for InitCommand {
                 input.trim().to_string()
             };
 
-            // API key env var
-            println!();
-            print!(
-                "Environment variable containing the API Key [{}]: ",
-                info.api_key_env
-            );
-            io::stdout().flush()?;
+            // API key configuration
+            let key_config = prompt_key_config()?;
 
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let api_key_env = if input.trim().is_empty() {
-                info.api_key_env.to_string()
-            } else {
-                input.trim().to_string()
-            };
-
-            (idx, model, api_key_env, api_selection)
+            (idx, model, key_config, api_selection)
         };
 
         let info = &PROVIDERS[provider_info_idx];
 
-        let config = build_config(info, &model, &api_key_env, api_selection);
+        let config = build_config(info, &model, &key_config, api_selection);
 
-        write_init_files(config_dir, config_path, config, api_key_env)
+        write_init_files(config_dir, config_path, config, &key_config)
     }
 }
 
@@ -833,10 +935,11 @@ impl InitCommand {
                 .custom_model
                 .clone()
                 .unwrap_or_else(|| "auto".to_string()),
-            api_key_env: self
-                .custom_api_key_env
-                .clone()
-                .unwrap_or_else(|| CUSTOM_API_KEY_ENV.to_string()),
+            key_config: KeyConfig::EnvVar(
+                self.custom_api_key_env
+                    .clone()
+                    .unwrap_or_else(|| CUSTOM_API_KEY_ENV.to_string()),
+            ),
             base_url: Some(validate_base_url(base_url)?),
             api_type: Some(
                 self.custom_api_type
@@ -892,7 +995,7 @@ mod tests {
         let config = build_config(
             provider("minimax"),
             "MiniMax-M2.7",
-            "MINIMAX_API_KEY",
+            &KeyConfig::EnvVar("MINIMAX_API_KEY".to_string()),
             select_api_type(provider("minimax"), "2"),
         );
 
@@ -908,7 +1011,7 @@ mod tests {
         let config = build_config(
             provider("minimax"),
             "MiniMax-M2.7",
-            "MINIMAX_API_KEY",
+            &KeyConfig::EnvVar("MINIMAX_API_KEY".to_string()),
             select_api_type(provider("minimax"), ""),
         );
 
@@ -918,11 +1021,39 @@ mod tests {
     }
 
     #[test]
+    fn config_writes_api_key_when_direct_mode() {
+        let config = build_config(
+            provider("openai"),
+            "gpt-4.1-mini",
+            &KeyConfig::Direct("sk-test-key-123".to_string()),
+            default_api_type_selection(provider("openai")),
+        );
+
+        assert_eq!(config["provider"], "openai");
+        assert_eq!(config["api_key"], "sk-test-key-123");
+        assert!(config.get("api_key_env").is_none());
+    }
+
+    #[test]
+    fn config_omits_key_fields_when_skip_mode() {
+        let config = build_config(
+            provider("openai"),
+            "gpt-4.1-mini",
+            &KeyConfig::Skip,
+            default_api_type_selection(provider("openai")),
+        );
+
+        assert_eq!(config["provider"], "openai");
+        assert!(config.get("api_key").is_none());
+        assert!(config.get("api_key_env").is_none());
+    }
+
+    #[test]
     fn custom_provider_config_writes_required_fields() {
         let selected = SelectedProvider {
             provider: CUSTOM_PROVIDER_NAME.to_string(),
             model: "llama-3.1-70b-instruct".to_string(),
-            api_key_env: CUSTOM_API_KEY_ENV.to_string(),
+            key_config: KeyConfig::EnvVar(CUSTOM_API_KEY_ENV.to_string()),
             base_url: Some("https://api.example.com/v1".to_string()),
             api_type: Some("openai".to_string()),
         };
@@ -934,6 +1065,22 @@ mod tests {
         assert_eq!(config["base_url"], json!("https://api.example.com/v1"));
         assert_eq!(config["api_type"], json!("openai"));
         assert_eq!(config["api_key_env"], json!("CUSTOM_API_KEY"));
+    }
+
+    #[test]
+    fn custom_provider_config_writes_direct_key() {
+        let selected = SelectedProvider {
+            provider: CUSTOM_PROVIDER_NAME.to_string(),
+            model: "mistral-large".to_string(),
+            key_config: KeyConfig::Direct("sk-custom-key".to_string()),
+            base_url: Some("https://api.example.com/v1".to_string()),
+            api_type: Some("openai".to_string()),
+        };
+
+        let config = selected.to_json();
+
+        assert_eq!(config["api_key"], json!("sk-custom-key"));
+        assert!(config.get("api_key_env").is_none());
     }
 
     #[test]
@@ -952,7 +1099,10 @@ mod tests {
 
         assert_eq!(selected.provider, "custom");
         assert_eq!(selected.model, "qwen-2.5-14b");
-        assert_eq!(selected.api_key_env, "EXAMPLE_KEY");
+        assert_eq!(
+            selected.key_config,
+            KeyConfig::EnvVar("EXAMPLE_KEY".to_string())
+        );
         assert_eq!(
             selected.base_url.as_deref(),
             Some("https://api.example.com/v1")

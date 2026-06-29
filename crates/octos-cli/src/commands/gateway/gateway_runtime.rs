@@ -854,12 +854,15 @@ impl GatewayRuntime {
 
                 // 1. Register explicit sub_providers (highest priority)
                 for sp in &config.sub_providers {
-                    let sp_config = if sp.api_key_env.is_some() {
+                    let sp_config = {
                         let mut c = config.clone();
-                        c.api_key_env = sp.api_key_env.clone();
+                        if sp.api_key_env.is_some() {
+                            c.api_key_env = sp.api_key_env.clone();
+                        }
+                        if sp.api_key.is_some() {
+                            c.api_key = sp.api_key.clone();
+                        }
                         c
-                    } else {
-                        config.clone()
                     };
                     match chat::create_provider_with_api_type(
                         &sp.provider,
@@ -921,6 +924,9 @@ impl GatewayRuntime {
                                 // Different provider — clear primary's api_key_env so the
                                 // registry resolves the correct env var (e.g. OPENAI_API_KEY)
                                 c.api_key_env = None;
+                            }
+                            if fb.api_key.is_some() {
+                                c.api_key = fb.api_key.clone();
                             }
                             c
                         };

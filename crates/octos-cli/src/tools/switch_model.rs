@@ -139,11 +139,15 @@ impl SwitchModelTool {
                 let key_status = if let Some(ref env_var) = fb.api_key_env {
                     if std::env::var(env_var).is_ok() {
                         "ready"
+                    } else if fb.api_key.is_some() {
+                        "ready (direct key)"
                     } else {
                         "needs API key"
                     }
+                } else if fb.api_key.is_some() {
+                    "ready (direct key)"
                 } else {
-                    "ready"
+                    "needs API key"
                 };
                 lines.push(format!("  - {}/{} [{}]", fb.provider, model, key_status));
             }

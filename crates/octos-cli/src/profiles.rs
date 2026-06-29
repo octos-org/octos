@@ -566,6 +566,9 @@ pub struct LlmRouteConfig {
     /// API key env var for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Direct API key for this route (env var takes precedence when both present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Protocol override for this route, e.g. "anthropic" or "responses".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_type: Option<String>,
@@ -1797,6 +1800,10 @@ pub(crate) fn config_from_profile(
                 .route
                 .as_ref()
                 .and_then(|route| route.api_key_env.clone()),
+            api_key: fb
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key.clone()),
             model_hints: fb.model_hints.clone(),
             api_type: fb.route.as_ref().and_then(|route| route.api_type.clone()),
             cost_per_m: fb.cost_per_m,
@@ -1818,6 +1825,12 @@ pub(crate) fn config_from_profile(
                 .route
                 .as_ref()
                 .and_then(|route| route.api_key_env.clone())
+        }),
+        api_key: primary.and_then(|selection| {
+            selection
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key.clone())
         }),
         env_vars: profile.config.env_vars.clone(),
         api_type: primary.and_then(|selection| {
@@ -2335,6 +2348,7 @@ mod tests {
                 label: None,
                 base_url: base_url.map(str::to_string),
                 api_key_env: api_key_env.map(str::to_string),
+                api_key: None,
                 api_type: None,
             }),
             ..Default::default()
@@ -2549,6 +2563,7 @@ mod tests {
                             label: Some("WiseModel".into()),
                             base_url: Some("https://api.wisemodel.cn/v1".into()),
                             api_key_env: Some("WISEMODEL_API_KEY".into()),
+                            api_key: None,
                             api_type: Some("openai".into()),
                         }),
                         cost_per_m: Some(3.2),
@@ -2599,6 +2614,7 @@ mod tests {
                             label: Some("AutoDL".into()),
                             base_url: Some("https://www.autodl.art/api/v1".into()),
                             api_key_env: Some("AUTODL_API_KEY".into()),
+                            api_key: None,
                             api_type: Some("openai".into()),
                         }),
                         model_hints: Some(octos_llm::openai::ModelHints {
@@ -2619,6 +2635,7 @@ mod tests {
                             label: Some("WiseModel".into()),
                             base_url: Some("https://api.wisemodel.cn/v1".into()),
                             api_key_env: Some("WISEMODEL_API_KEY".into()),
+                            api_key: None,
                             api_type: Some("openai".into()),
                         }),
                         model_hints: Some(octos_llm::openai::ModelHints {

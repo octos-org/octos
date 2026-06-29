@@ -1230,6 +1230,7 @@ mod tests {
                             label: None,
                             base_url: None,
                             api_key_env: Some(KEY_NAME.to_string()),
+                            api_key: None,
                             api_type: None,
                         }),
                         ..Default::default()
@@ -1328,6 +1329,7 @@ mod tests {
                             label: None,
                             base_url: None,
                             api_key_env: Some(KEY_NAME.to_string()),
+                            api_key: None,
                             api_type: None,
                         }),
                         ..Default::default()
@@ -1419,6 +1421,7 @@ mod tests {
                             label: None,
                             base_url: None,
                             api_key_env: Some(KEY_NAME.to_string()),
+                            api_key: None,
                             api_type: None,
                         }),
                         ..Default::default()
@@ -1475,6 +1478,7 @@ mod tests {
                             label: None,
                             base_url: None,
                             api_key_env: Some(key_env.to_string()),
+                            api_key: None,
                             api_type: None,
                         }),
                         ..Default::default()

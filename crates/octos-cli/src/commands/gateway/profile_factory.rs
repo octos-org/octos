@@ -205,12 +205,15 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
             vec![Arc::new(RetryProvider::new(base_provider))];
         let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
         for fallback in &config.fallback_models {
-            let fallback_config = if fallback.api_key_env.is_some() {
+            let fallback_config = {
                 let mut cloned = config.clone();
-                cloned.api_key_env = fallback.api_key_env.clone();
+                if fallback.api_key_env.is_some() {
+                    cloned.api_key_env = fallback.api_key_env.clone();
+                }
+                if fallback.api_key.is_some() {
+                    cloned.api_key = fallback.api_key.clone();
+                }
                 cloned
-            } else {
-                config.clone()
             };
             match crate::commands::chat::create_provider_with_api_type(
                 &fallback.provider,
@@ -296,12 +299,15 @@ pub(crate) fn build_strong_chain(
     }
     let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
     for fallback in strong_fallbacks {
-        let fallback_config = if fallback.api_key_env.is_some() {
+        let fallback_config = {
             let mut cloned = config.clone();
-            cloned.api_key_env = fallback.api_key_env.clone();
+            if fallback.api_key_env.is_some() {
+                cloned.api_key_env = fallback.api_key_env.clone();
+            }
+            if fallback.api_key.is_some() {
+                cloned.api_key = fallback.api_key.clone();
+            }
             cloned
-        } else {
-            config.clone()
         };
         if let Ok(provider) = crate::commands::chat::create_provider_with_api_type(
             &fallback.provider,
@@ -388,12 +394,15 @@ pub(crate) fn build_plugin_env(
     // can access all configured keys.
     for fb in &config.fallback_models {
         let fb_provider = fb.provider.as_str();
-        let fb_config = if fb.api_key_env.is_some() {
+        let fb_config = {
             let mut c = config.clone();
-            c.api_key_env = fb.api_key_env.clone();
+            if fb.api_key_env.is_some() {
+                c.api_key_env = fb.api_key_env.clone();
+            }
+            if fb.api_key.is_some() {
+                c.api_key = fb.api_key.clone();
+            }
             c
-        } else {
-            config.clone()
         };
 
         if let Ok(key) = fb_config.get_api_key(fb_provider) {
@@ -760,6 +769,9 @@ impl ProfileActorFactoryBuilder {
                             c.api_key_env = fb.api_key_env.clone();
                         } else if fb.provider != profile_config.provider.as_deref().unwrap_or("") {
                             c.api_key_env = None;
+                        }
+                        if fb.api_key.is_some() {
+                            c.api_key = fb.api_key.clone();
                         }
                         c
                     };
