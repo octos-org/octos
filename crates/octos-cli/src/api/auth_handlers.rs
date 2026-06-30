@@ -1304,6 +1304,141 @@ pub async fn set_my_voice(
     }))
 }
 
+// ── Voice pipeline readiness ──────────────────────────────────────────
+
+/// Readiness of a single voice-pipeline leg.
+#[derive(Serialize)]
+pub struct VoiceLeg {
+    pub ready: bool,
+    /// Human-readable status for the UI to surface the failing leg precisely.
+    pub detail: String,
+}
+
+/// Readiness of the TTS leg, including which route the profile resolves to.
+#[derive(Serialize)]
+pub struct VoiceTtsLeg {
+    pub ready: bool,
+    /// Effective route for this profile: `"cloud"` or `"local"`.
+    pub mode: String,
+    pub detail: String,
+}
+
+/// Aggregated voice-assistant pre-flight readiness for one tenant.
+#[derive(Serialize)]
+pub struct VoiceReadiness {
+    /// All legs ready → a voice turn can complete end to end.
+    pub ready: bool,
+    pub asr: VoiceLeg,
+    pub llm: VoiceLeg,
+    pub tts: VoiceTtsLeg,
+}
+
+/// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
+///
+/// Confirms the whole pipeline can run under THIS profile's current config:
+/// - **ASR**: on-device model ready. Always required — there is no cloud ASR
+///   route (only TTS has a cloud option), so ASR is on-device in every mode.
+/// - **LLM**: the profile's provider chain is constructed (running runtime with
+///   a named provider).
+/// - **TTS**: the *chosen* route is actually usable — cloud credentials resolve
+///   for `cloud`/`volcano` (and `auto` when configured), otherwise the on-device
+///   GPT-SoVITS engine is available. Mirrors `voice_turn::synthesize_reply`'s
+///   routing so the check matches what a real turn would do.
+pub async fn voice_readiness(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<VoiceReadiness>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
+    let profile_id = profile.id.clone();
+
+    // ── ASR leg (always on-device) ──
+    let runtime = crate::api::ominix_runtime::runtime_status(&state.http_client).await;
+    let health_healthy = runtime.health.healthy;
+    let asr_ok = crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
+    let asr = VoiceLeg {
+        ready: asr_ok,
+        detail: if asr_ok {
+            "On-device ASR ready".into()
+        } else if !health_healthy {
+            "Voice engine unavailable".into()
+        } else {
+            "On-device ASR model not ready".into()
+        },
+    };
+
+    // ── LLM leg ──
+    // The provider chain is built at bootstrap; a running runtime with a named
+    // provider means the LLM is wired for this tenant.
+    let rt = state.profiles.get(&profile_id);
+    let llm = VoiceLeg {
+        ready: rt.map(|r| !r.provider_name.is_empty()).unwrap_or(false),
+        detail: match rt {
+            Some(r) if !r.provider_name.is_empty() => format!("LLM provider: {}", r.provider_name),
+            Some(_) => "LLM provider not configured".into(),
+            None => "Profile runtime not started".into(),
+        },
+    };
+
+    // ── TTS leg (route-aware) ──
+    let (provider, cloud) = rt
+        .map(|r| (r.voice.tts_provider.clone(), r.voice.cloud.clone()))
+        .unwrap_or_else(|| ("auto".to_string(), None));
+    let cloud_configured = crate::api::voice_turn::cloud_tts_configured(cloud.as_ref());
+    let tts = match crate::api::voice_turn::classify_tts_route(&provider, cloud_configured) {
+        crate::api::voice_turn::TtsRoute::Cloud => VoiceTtsLeg {
+            ready: cloud_configured,
+            mode: "cloud".into(),
+            detail: if cloud_configured {
+                "Volcano cloud TTS configured".into()
+            } else {
+                "Cloud TTS selected but credentials missing (appid + VOLC_TTS_TOKEN)".into()
+            },
+        },
+        crate::api::voice_turn::TtsRoute::Local => {
+            let local_ok = health_healthy && local_tts_voice_available(&profile_id);
+            VoiceTtsLeg {
+                ready: local_ok,
+                mode: "local".into(),
+                detail: if local_ok {
+                    "On-device GPT-SoVITS ready".into()
+                } else if !health_healthy {
+                    "Voice engine unavailable".into()
+                } else {
+                    "No on-device voice available".into()
+                },
+            }
+        }
+    };
+
+    let ready = asr.ready && llm.ready && tts.ready;
+    Ok(Json(VoiceReadiness {
+        ready,
+        asr,
+        llm,
+        tts,
+    }))
+}
+
+/// Whether this tenant has at least one synthesizable on-device voice in the
+/// registry (shared presets + voices it owns). Mirrors `GET /api/voices`
+/// scoping, so it reflects exactly what the on-device engine could speak.
+fn local_tts_voice_available(profile_id: &str) -> bool {
+    let registry_path = crate::api::voices::registry_path();
+    match octos_llm::ominix::VoicesRegistry::load(&registry_path) {
+        Ok(reg) => !reg
+            .synthesizable_visible(|ref_audio| {
+                crate::api::voices::voice_visible_to(profile_id, ref_audio)
+            })
+            .is_empty(),
+        Err(_) => false,
+    }
+}
+
 // ── Matrix invite review endpoints ────────────────────────────────────
 
 #[derive(Clone, Debug)]

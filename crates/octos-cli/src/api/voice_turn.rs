@@ -860,6 +860,46 @@ fn wants_cloud(provider: &str) -> bool {
     matches!(provider, "auto" | "cloud" | "volcano")
 }
 
+/// The effective TTS route for pre-flight readiness reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtsRoute {
+    /// Cloud Volcano. For explicit `cloud`/`volcano` this is reported even when
+    /// the credentials are missing, so a pre-flight check can flag "cloud
+    /// chosen but not configured" instead of masking it behind the silent
+    /// on-device fallback that [`synthesize_reply`] applies at request time.
+    Cloud,
+    /// On-device GPT-SoVITS via ominix-api.
+    Local,
+}
+
+/// Classify the effective TTS route for readiness, mirroring
+/// [`synthesize_reply`]'s routing decision (minus the on-failure fallback):
+/// `auto` resolves to cloud only when the credentials are present; explicit
+/// `cloud`/`volcano` always reports cloud (so missing creds surface as a
+/// not-ready cloud leg, matching the user's chosen route); everything else
+/// (`local`, legacy `sovits`/`qwen3`, unknown) is on-device.
+pub(crate) fn classify_tts_route(provider: &str, cloud_configured: bool) -> TtsRoute {
+    match provider {
+        "cloud" | "volcano" => TtsRoute::Cloud,
+        "auto" => {
+            if cloud_configured {
+                TtsRoute::Cloud
+            } else {
+                TtsRoute::Local
+            }
+        }
+        _ => TtsRoute::Local,
+    }
+}
+
+/// Whether the cloud (Volcano) TTS path is fully configured for this profile —
+/// token + appid resolve and the endpoint is in the HTTPS allowlist. This is
+/// exactly what [`synthesize_reply`] needs to actually take the cloud path, so
+/// it is the authoritative "cloud TTS ready" signal for pre-flight checks.
+pub(crate) fn cloud_tts_configured(cloud: Option<&CloudTtsConfig>) -> bool {
+    resolve_volcano(cloud).is_some()
+}
+
 /// Pure core: merge typed (non-secret) cloud config over env fallbacks, applying
 /// engine defaults. Requires a non-empty token AND a resolvable appid.
 fn build_volcano(
@@ -1090,6 +1130,33 @@ mod tests {
         }
         for p in ["local", "sovits", "qwen3", ""] {
             assert!(!wants_cloud(p), "{p} should NOT want cloud");
+        }
+    }
+
+    #[test]
+    fn should_classify_explicit_cloud_as_cloud_route_even_without_creds() {
+        // The caller explicitly chose cloud; readiness must report the cloud
+        // leg (and then flag it not-ready) rather than hide behind the local
+        // fallback.
+        assert_eq!(classify_tts_route("cloud", false), TtsRoute::Cloud);
+        assert_eq!(classify_tts_route("volcano", false), TtsRoute::Cloud);
+        assert_eq!(classify_tts_route("cloud", true), TtsRoute::Cloud);
+    }
+
+    #[test]
+    fn should_classify_auto_by_cloud_config_presence() {
+        assert_eq!(classify_tts_route("auto", true), TtsRoute::Cloud);
+        assert_eq!(classify_tts_route("auto", false), TtsRoute::Local);
+    }
+
+    #[test]
+    fn should_classify_local_and_unknown_as_local_route() {
+        for p in ["local", "sovits", "qwen3", "", "anything"] {
+            assert_eq!(
+                classify_tts_route(p, true),
+                TtsRoute::Local,
+                "{p} should route on-device regardless of cloud config"
+            );
         }
     }
 
