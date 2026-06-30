@@ -1373,11 +1373,18 @@ pub async fn voice_readiness(
 
     // ── LLM leg ──
     // The provider chain is built at bootstrap; a running runtime with a named
-    // provider means the LLM is wired for this tenant.
-    let rt = state.profiles.get(&profile_id);
+    // provider means the LLM is wired for this tenant. Resolve via the same
+    // path session/turn handling uses — including dynamically bootstrapped
+    // runtimes (onboarding, `profile/llm/upsert`) that live outside
+    // `state.profiles` — so readiness can't report "not started" while voice
+    // turns actually work.
+    let rt = crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id));
     let llm = VoiceLeg {
-        ready: rt.map(|r| !r.provider_name.is_empty()).unwrap_or(false),
-        detail: match rt {
+        ready: rt
+            .as_ref()
+            .map(|r| !r.provider_name.is_empty())
+            .unwrap_or(false),
+        detail: match rt.as_ref() {
             Some(r) if !r.provider_name.is_empty() => format!("LLM provider: {}", r.provider_name),
             Some(_) => "LLM provider not configured".into(),
             None => "Profile runtime not started".into(),
@@ -1386,6 +1393,7 @@ pub async fn voice_readiness(
 
     // ── TTS leg (route-aware) ──
     let (provider, cloud) = rt
+        .as_ref()
         .map(|r| (r.voice.tts_provider.clone(), r.voice.cloud.clone()))
         .unwrap_or_else(|| ("auto".to_string(), None));
     let cloud_configured = crate::api::voice_turn::cloud_tts_configured(cloud.as_ref());

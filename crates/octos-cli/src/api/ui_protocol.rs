@@ -9598,7 +9598,7 @@ fn workspace_policy_probe(root: Option<&Path>) -> Value {
 /// no-profile flow is in use (single-agent serve, no connection-level
 /// profile identity). Falls back to `MAIN_PROFILE_ID` so the
 /// canonical "_main" profile in standalone deployments still resolves.
-fn resolve_session_profile_runtime(
+pub(crate) fn resolve_session_profile_runtime(
     state: &AppState,
     active_profile_id: Option<&str>,
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
