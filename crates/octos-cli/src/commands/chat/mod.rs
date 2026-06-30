@@ -85,7 +85,7 @@ pub struct ChatCommand {
 }
 
 use slash_filter::resolve_dispatch;
-use slash_registry::{CommandKind, SLASH_COMMANDS};
+use slash_registry::{CommandHandler, CommandKind, SLASH_COMMANDS};
 
 struct CliApprovalRequester;
 
@@ -773,22 +773,31 @@ impl ChatCommand {
 
             if let Some(cmd_idx) = resolve_dispatch(input, SLASH_COMMANDS) {
                 let cmd = &SLASH_COMMANDS[cmd_idx];
+
+                // ── Flow control by CommandKind ──────────────────────
                 match cmd.kind {
-                    CommandKind::Immediate => break,
+                    CommandKind::Immediate => {}
                     CommandKind::TakesArgs => {
                         let args = input
                             .strip_prefix(cmd.name)
                             .unwrap_or("")
                             .trim();
-                        // Currently only /config uses TakesArgs.
-                        if cmd.name == "/config" {
-                            let response = tool_config.handle_config_command(args).await;
-                            println!("{response}");
+                        // ── Handler dispatch by CommandHandler ───────
+                        // No string matching — the compiler ensures every
+                        // handler variant is covered.
+                        match cmd.handler {
+                            CommandHandler::ToolConfig => {
+                                let response = tool_config.handle_config_command(args).await;
+                                println!("{response}");
+                            }
+                            CommandHandler::Exit => {} // unreachable: Exit is always Immediate
                         }
                         continue;
                     }
                     CommandKind::HasSubcommands => {} // Phase 3
                 }
+                // Immediate commands reach here → break unconditionally.
+                break;
             }
 
             // Process message
