@@ -1579,7 +1579,16 @@ pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
 /// Shared lookup table for session-scoped background task supervisors.
 #[derive(Default, Clone)]
 pub struct SessionTaskQueryStore {
-    supervisors: Arc<StdMutex<HashMap<String, SessionTaskQueryEntry>>>,
+    /// Per-session list of registered supervisors, oldest-first. A session
+    /// accumulates more than one when a long-running `spawn_only` task spawned
+    /// in an earlier turn is still live (its worker holds that turn's
+    /// supervisor alive via `Arc<ToolRegistry>`) while a later turn registers a
+    /// fresh supervisor — `ToolRegistry::snapshot_excluding` builds a NEW
+    /// `TaskSupervisor` per turn. Keeping all live ones (rather than
+    /// overwriting) lets `cancel_task` reach the supervisor whose cancel token
+    /// the live worker actually polls; cancelling through a later turn's
+    /// supervisor would only fire a useless fresh token.
+    supervisors: Arc<StdMutex<HashMap<String, Vec<SessionTaskQueryEntry>>>>,
 }
 
 struct SessionTaskQueryEntry {
@@ -1732,31 +1741,49 @@ impl SessionTaskQueryStore {
         data_dir: &Path,
     ) {
         let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(
-            session_key.to_string(),
-            SessionTaskQueryEntry {
-                supervisor: Arc::downgrade(supervisor),
-                data_dir: data_dir.to_path_buf(),
-            },
-        );
-    }
-
-    /// Look up the live supervisor + data dir for `session_key`, pruning a
-    /// stale entry if the underlying `Arc<TaskSupervisor>` has been dropped.
-    fn lookup_live_supervisor(&self, session_key: &str) -> Option<(Arc<TaskSupervisor>, PathBuf)> {
-        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.get(session_key).and_then(|entry| {
-            entry
-                .supervisor
-                .upgrade()
-                .map(|supervisor| (supervisor, entry.data_dir.clone()))
-        }) {
-            Some(entry) => Some(entry),
-            None => {
-                guard.remove(session_key);
-                None
+        let entries = guard.entry(session_key.to_string()).or_default();
+        // Drop entries whose supervisor has been dropped (its turn ended with
+        // no live task holding it), then dedup: if this exact supervisor is
+        // already registered, just refresh its data_dir. Otherwise append at
+        // the end so the per-session order stays oldest-first — `cancel_task`
+        // scans oldest-first to prefer the supervisor the live worker polls.
+        entries.retain(|entry| entry.supervisor.strong_count() > 0);
+        for entry in entries.iter_mut() {
+            if let Some(existing) = entry.supervisor.upgrade() {
+                if Arc::ptr_eq(&existing, supervisor) {
+                    entry.data_dir = data_dir.to_path_buf();
+                    return;
+                }
             }
         }
+        entries.push(SessionTaskQueryEntry {
+            supervisor: Arc::downgrade(supervisor),
+            data_dir: data_dir.to_path_buf(),
+        });
+    }
+
+    /// Return every live supervisor + data dir registered for `session_key`,
+    /// oldest-first, pruning entries whose `Arc<TaskSupervisor>` has dropped
+    /// (and the session key entirely when none remain). A session has more
+    /// than one when an earlier turn's supervisor is still alive — a live
+    /// `spawn_only` worker holds it — alongside a later turn's fresh one.
+    fn live_entries_for_session(&self, session_key: &str) -> Vec<(Arc<TaskSupervisor>, PathBuf)> {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entries) = guard.get_mut(session_key) else {
+            return Vec::new();
+        };
+        let mut live = Vec::new();
+        entries.retain(|entry| match entry.supervisor.upgrade() {
+            Some(supervisor) => {
+                live.push((supervisor, entry.data_dir.clone()));
+                true
+            }
+            None => false,
+        });
+        if entries.is_empty() {
+            guard.remove(session_key);
+        }
+        live
     }
 
     /// Return the JSON task list for `session_key` and every reachable
@@ -1779,17 +1806,29 @@ impl SessionTaskQueryStore {
         queue.push_back(session_key.to_string());
         visited.insert(session_key.to_string());
 
+        let mut seen_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(current) = queue.pop_front() {
-            let Some((supervisor, data_dir)) = self.lookup_live_supervisor(&current) else {
-                continue;
-            };
-            for task in supervisor.get_tasks_for_session(&current) {
-                if let Some(child_key) = task.child_session_key.as_deref() {
-                    if visited.insert(child_key.to_string()) {
-                        queue.push_back(child_key.to_string());
+            // A session may have several live supervisors (an earlier-turn task
+            // still running while a later turn registered a fresh supervisor);
+            // walk them oldest-first and dedup by task id, since a restored
+            // copy of the same task can surface in more than one supervisor.
+            for (supervisor, data_dir) in self.live_entries_for_session(&current) {
+                // Freshen stale cross-turn copies from the ledger first (codex
+                // P2): a later supervisor's restored copy is frozen at restore
+                // time, so a finished task could otherwise surface as running
+                // once its owning supervisor drops.
+                let _ = supervisor.refresh_from_persistence();
+                for task in supervisor.get_tasks_for_session(&current) {
+                    if !seen_task_ids.insert(task.id.clone()) {
+                        continue;
                     }
+                    if let Some(child_key) = task.child_session_key.as_deref() {
+                        if visited.insert(child_key.to_string()) {
+                            queue.push_back(child_key.to_string());
+                        }
+                    }
+                    tasks.push(sanitize_task_for_response(&data_dir, &task));
                 }
-                tasks.push(sanitize_task_for_response(&data_dir, &task));
             }
         }
 
@@ -1816,17 +1855,25 @@ impl SessionTaskQueryStore {
         queue.push_back(session_key.to_string());
         visited.insert(session_key.to_string());
 
+        let mut seen_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(current) = queue.pop_front() {
-            let Some((supervisor, data_dir)) = self.lookup_live_supervisor(&current) else {
-                continue;
-            };
-            for task in supervisor.get_tasks_for_session(&current) {
-                if let Some(child_key) = task.child_session_key.as_deref() {
-                    if visited.insert(child_key.to_string()) {
-                        queue.push_back(child_key.to_string());
+            // See `query_json`: walk every live supervisor for the session
+            // oldest-first, dedup by task id across supervisors.
+            for (supervisor, data_dir) in self.live_entries_for_session(&current) {
+                // Freshen stale cross-turn copies from the ledger (codex P2),
+                // same as `query_json` — this feeds reconnect replay.
+                let _ = supervisor.refresh_from_persistence();
+                for task in supervisor.get_tasks_for_session(&current) {
+                    if !seen_task_ids.insert(task.id.clone()) {
+                        continue;
                     }
+                    if let Some(child_key) = task.child_session_key.as_deref() {
+                        if visited.insert(child_key.to_string()) {
+                            queue.push_back(child_key.to_string());
+                        }
+                    }
+                    tasks.push((task, data_dir.clone()));
                 }
-                tasks.push((task, data_dir.clone()));
             }
         }
 
@@ -1843,6 +1890,11 @@ impl SessionTaskQueryStore {
     /// `Err(TaskCancelError::NotFound)`.
     pub fn cancel_task(&self, task_id: &str) -> Result<(), octos_agent::TaskCancelError> {
         for supervisor in self.live_supervisors() {
+            // Freshen this task from the ledger first (codex P2): a stale
+            // restored `Running` copy in a later supervisor must not accept a
+            // cancel after the owning supervisor already drove it terminal —
+            // `cancel` then correctly returns `AlreadyTerminal`.
+            let _ = supervisor.refresh_task_from_persistence(task_id);
             if supervisor.get_task(task_id).is_some() {
                 return supervisor.cancel(task_id);
             }
@@ -1859,6 +1911,9 @@ impl SessionTaskQueryStore {
         opts: octos_agent::RelaunchOpts,
     ) -> Result<String, octos_agent::TaskRelaunchError> {
         for supervisor in self.live_supervisors() {
+            // Freshen from the ledger first (codex P2) so a stale cross-turn
+            // copy doesn't drive a relaunch off outdated state.
+            let _ = supervisor.refresh_task_from_persistence(task_id);
             if supervisor.get_task(task_id).is_some() {
                 return supervisor.relaunch(task_id, opts);
             }
@@ -1872,12 +1927,21 @@ impl SessionTaskQueryStore {
     fn live_supervisors(&self) -> Vec<Arc<TaskSupervisor>> {
         let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
         let mut alive = Vec::new();
-        guard.retain(|_, entry| match entry.supervisor.upgrade() {
-            Some(supervisor) => {
-                alive.push(supervisor);
-                true
-            }
-            None => false,
+        // Flatten every session's supervisor list, oldest-first within each
+        // session, pruning dropped entries (and now-empty sessions).
+        // Oldest-first matters for `cancel_task`: when a task spawned in an
+        // earlier turn has a restored copy in a later turn's supervisor, the
+        // earlier (live) supervisor must be tried first so cancel fires the
+        // token the worker is actually polling.
+        guard.retain(|_, entries| {
+            entries.retain(|entry| match entry.supervisor.upgrade() {
+                Some(supervisor) => {
+                    alive.push(supervisor);
+                    true
+                }
+                None => false,
+            });
+            !entries.is_empty()
         });
         alive
     }
@@ -10362,6 +10426,240 @@ mod tests {
             store
                 .raw_tasks_for_session(&SessionKey::new("api", "other").to_string())
                 .is_empty()
+        );
+    }
+
+    /// Cross-turn cancel regression (codex P2): a `spawn_only` task spawned in
+    /// turn 1 polls turn-1's cancel token. When turn 2 registers a fresh
+    /// supervisor for the SAME session, the store must keep turn-1's supervisor
+    /// (still alive — the live worker holds it via `Arc<ToolRegistry>`)
+    /// reachable, so cancel fires the token the worker actually polls rather
+    /// than a later supervisor's useless fresh one. The old `HashMap::insert`
+    /// evicted turn-1's supervisor, leaving the task uncancellable.
+    #[test]
+    fn cancel_task_reaches_earlier_turn_supervisor_after_a_later_turn_registers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        let task_id = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&task_id);
+        let live_token = sup1.cancel_token(&task_id);
+        assert!(!live_token.is_cancelled());
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+
+        // Turn 2's fresh supervisor for the same session (used to evict sup1).
+        let sup2 = Arc::new(TaskSupervisor::new());
+        store.register(&session_key, &sup2, &data_dir);
+
+        store
+            .cancel_task(&task_id)
+            .expect("task spawned under the earlier supervisor must still cancel");
+        assert!(
+            live_token.is_cancelled(),
+            "cancel must fire the live (turn-1) supervisor's token"
+        );
+    }
+
+    /// `query_json` walks EVERY live supervisor for a session (not just the
+    /// last-registered one) and dedups by task id: the task whose live copy is
+    /// in the earlier supervisor appears exactly once, and a later-supervisor's
+    /// own task still surfaces.
+    #[test]
+    fn query_json_walks_all_live_supervisors_and_dedups_by_task_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        // A later turn's supervisor restores T1 (same id) from the shared
+        // ledger and also owns its own T2.
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        assert!(sup2.get_task(&t1).is_some(), "T1 restored into sup2");
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        let json = store.query_json(&session_key.to_string());
+        let ids: Vec<String> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            ids.iter().filter(|id| **id == t1).count(),
+            1,
+            "T1 must appear exactly once across the two supervisors"
+        );
+        assert!(
+            ids.contains(&t2),
+            "the later supervisor's own task must still surface"
+        );
+    }
+
+    /// `raw_tasks_for_session` mirrors `query_json`'s multi-supervisor walk +
+    /// task-id dedup (it feeds reconnect/session-open task replay).
+    #[test]
+    fn raw_tasks_for_session_walks_all_live_supervisors_and_dedups() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        let tasks = store.raw_tasks_for_session(&session_key.to_string());
+        assert_eq!(
+            tasks.iter().filter(|(task, _)| task.id == t1).count(),
+            1,
+            "T1 must appear exactly once"
+        );
+        assert!(
+            tasks.iter().any(|(task, _)| task.id == t2),
+            "the later supervisor's own task must surface"
+        );
+    }
+
+    /// codex P2 follow-up: a later turn's supervisor (sup2) holds a restored
+    /// copy of an earlier turn's task (t1) and never receives its later status
+    /// updates. After sup1 completes t1 and drops while sup2 stays alive for its
+    /// own task, the store must reconcile t1 from the ledger — never surfacing
+    /// sup2's stale `Running` copy, nor accepting a cancel against the
+    /// already-finished task.
+    #[test]
+    fn store_reconciles_stale_cross_turn_copy_from_ledger() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        // sup1 finishes t1 (persists Completed to the shared ledger) then drops
+        // — its turn ended and the worker released the per-turn registry.
+        sup1.mark_completed(&t1, vec![]);
+        drop(sup1);
+
+        // sup2's stale `Running` copy of t1 must never surface.
+        let raw = store.raw_tasks_for_session(&session_key.to_string());
+        assert!(
+            !raw.iter()
+                .any(|(task, _)| task.id == t1 && task.status == octos_agent::TaskStatus::Running),
+            "t1's stale running copy must not surface after its owner completed it"
+        );
+        assert!(
+            raw.iter().any(|(task, _)| task.id == t2),
+            "sup2's own task must still surface"
+        );
+        // query_json shows t1 at most once (deduped) and t2 present.
+        let ids: Vec<String> = store
+            .query_json(&session_key.to_string())
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(ids.iter().filter(|id| **id == t1).count() <= 1);
+        assert!(
+            ids.contains(&t2),
+            "sup2's own task must surface in query_json"
+        );
+
+        // A cancel against the finished task reports AlreadyTerminal — proving
+        // the store reconciled t1's terminal status from the ledger rather than
+        // acting on sup2's stale running copy.
+        assert!(matches!(
+            store.cancel_task(&t1),
+            Err(octos_agent::TaskCancelError::AlreadyTerminal)
+        ));
+    }
+
+    /// codex P1 follow-up: ledger refresh must never import a task into a
+    /// supervisor that doesn't own it. Two live turns share a ledger but poll
+    /// different cancel tokens; if an older supervisor imported a later
+    /// supervisor's task, cancel/relaunch (oldest-first) would fire the wrong
+    /// token while the real worker ran on. Refresh updates only already-owned
+    /// rows, so cancel routes to the owning supervisor's live token.
+    #[test]
+    fn refresh_does_not_import_a_later_supervisors_task_into_an_older_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        // sup1 (turn N) owns t1; sup2 (turn N+1, registered later) owns t2.
+        // Both live, both persist to the shared ledger.
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+        let t2_token = sup2.cancel_token(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        // A projection refreshes every supervisor from the ledger.
+        let _ = store.query_json(&session_key.to_string());
+
+        // sup1 (registered before t2 existed) must NOT have imported t2.
+        assert!(
+            sup1.get_task(&t2).is_none(),
+            "t2 must not be imported into the older supervisor"
+        );
+
+        // Cancelling t2 must fire sup2's live token (the worker's), not sup1's.
+        store.cancel_task(&t2).expect("t2 is cancellable");
+        assert!(
+            t2_token.is_cancelled(),
+            "cancel must reach t2's owning supervisor (sup2) live token"
         );
     }
 
