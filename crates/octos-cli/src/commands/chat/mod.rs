@@ -85,7 +85,7 @@ pub struct ChatCommand {
 }
 
 use slash_filter::resolve_dispatch;
-use slash_registry::SLASH_COMMANDS;
+use slash_registry::{CommandKind, SLASH_COMMANDS};
 
 struct CliApprovalRequester;
 
@@ -773,15 +773,21 @@ impl ChatCommand {
 
             if let Some(cmd_idx) = resolve_dispatch(input, SLASH_COMMANDS) {
                 let cmd = &SLASH_COMMANDS[cmd_idx];
-                match cmd.name {
-                    "/exit" => break,
-                    "/config" => {
-                        let args = input.strip_prefix("/config").unwrap_or("").trim();
-                        let response = tool_config.handle_config_command(args).await;
-                        println!("{response}");
+                match cmd.kind {
+                    CommandKind::Immediate => break,
+                    CommandKind::TakesArgs => {
+                        let args = input
+                            .strip_prefix(cmd.name)
+                            .unwrap_or("")
+                            .trim();
+                        // Currently only /config uses TakesArgs.
+                        if cmd.name == "/config" {
+                            let response = tool_config.handle_config_command(args).await;
+                            println!("{response}");
+                        }
                         continue;
                     }
-                    _ => {} // future commands: dispatch by kind
+                    CommandKind::HasSubcommands => {} // Phase 3
                 }
             }
 
