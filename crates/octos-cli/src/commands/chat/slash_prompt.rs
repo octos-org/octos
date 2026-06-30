@@ -166,12 +166,15 @@ impl SlashPrompt {
                 let menu_count = if has_menu { menu.matches.len() } else { 0 };
 
                 // --- clear old menu area ---
-                if menu.prev_lines > 0 && menu_count < menu.prev_lines {
-                    // Move cursor down to where old menu started, clear from there.
+                // Always erase previous menu lines before re-rendering.
+                // If we only cleared when the menu shrinks, equal-size
+                // re-renders would leave ghost lines from prior cycles
+                // because Print(\"\\r\\n\") scrolls the terminal up every
+                // keystroke, pushing old output into the scrollback.
+                if menu.prev_lines > 0 {
                     for _ in 0..menu.prev_lines {
                         queue!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine))?;
                     }
-                    // Move back up.
                     queue!(stdout, cursor::MoveUp(menu.prev_lines as u16))?;
                 }
                 menu.prev_lines = menu_count;
