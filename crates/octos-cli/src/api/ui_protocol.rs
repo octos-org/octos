@@ -29,9 +29,9 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
     ContentListParams, ContextCompactionCompletedEvent, ContextNormalizationReportedEvent,
-    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent,
-    MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor, Payload,
-    ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    Envelope, EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem,
+    MessageDeltaEvent, MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor,
+    Payload, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
@@ -12039,6 +12039,23 @@ async fn handle_session_hydrate(
     } else {
         None
     };
+    let replayed_tool_envelopes = if features.spawn_complete && include_set.messages {
+        Some(
+            replayed
+                .iter()
+                .filter_map(|event| match &event.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev))
+                        if hydrate_replays_tool_payload(&ev.envelope) =>
+                    {
+                        Some(ev.envelope.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
 
     // Codex Bug C round-6: gate the new identity/provenance fields
     // on `features.spawn_complete`. Without negotiation we leave
@@ -12194,6 +12211,7 @@ async fn handle_session_hydrate(
         pending_approvals,
         pending_questions,
         replayed_envelopes,
+        replayed_tool_envelopes,
     };
     send_serialized_rpc_result(
         ws,
@@ -12201,6 +12219,13 @@ async fn handle_session_hydrate(
         octos_core::ui_protocol::methods::SESSION_HYDRATE,
         result,
     );
+}
+
+fn hydrate_replays_tool_payload(envelope: &Envelope) -> bool {
+    matches!(
+        envelope.payload,
+        Payload::ToolStart { .. } | Payload::ToolProgress { .. } | Payload::ToolEnd { .. }
+    )
 }
 
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
@@ -35917,6 +35942,15 @@ ignore = []
             content: "deep_research delivered.".into(),
             media: vec!["research/_report.md".into()],
         }));
+        ledger.emit_envelope(
+            &session_id,
+            "cmid-user-1".into(),
+            Payload::ToolStart {
+                tool_call_id: "tc-shell-1".into(),
+                name: "shell".into(),
+            },
+            None,
+        );
 
         // 1) Negotiated client: messages list is byte-identical to
         // the legacy shape (3 rows), AND the new
@@ -35998,6 +36032,17 @@ ignore = []
         assert_eq!(envelopes[0]["seq"], 2);
         assert_eq!(envelopes[0]["content"], "deep_research delivered.");
         assert_eq!(envelopes[0]["media"], json!(["research/_report.md"]));
+        let tool_envelopes = frame_new["result"]["replayed_tool_envelopes"]
+            .as_array()
+            .expect("replayed_tool_envelopes array");
+        assert_eq!(tool_envelopes.len(), 1, "single tool envelope retained");
+        assert_eq!(tool_envelopes[0]["thread_id"], "cmid-user-1");
+        assert_eq!(tool_envelopes[0]["payload"]["type"], "tool_start");
+        assert_eq!(
+            tool_envelopes[0]["payload"]["data"]["tool_call_id"],
+            "tc-shell-1",
+        );
+        assert_eq!(tool_envelopes[0]["payload"]["data"]["name"], "shell");
 
         // 2) Non-negotiated client: legacy wire shape — messages
         // list intact, and `replayed_envelopes` field is OMITTED
@@ -36030,6 +36075,11 @@ ignore = []
         assert!(
             !result.contains_key("replayed_envelopes"),
             "legacy clients see byte-identical wire (no replayed_envelopes key); got keys: {:?}",
+            result.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            !result.contains_key("replayed_tool_envelopes"),
+            "legacy clients see no tool replay field; got keys: {:?}",
             result.keys().collect::<Vec<_>>(),
         );
         // Codex Bug C round-6: non-negotiated clients also see the
