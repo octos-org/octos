@@ -561,6 +561,11 @@ pub struct SessionInfo {
     /// the client should fall back to deriving a title from message content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Recency timestamp (RFC3339) — `SessionMeta.updated_at`, or the JSONL
+    /// file mtime as a cheap fallback. Lets the TUI sort the session list by
+    /// most-recently-touched. None when neither source is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -636,9 +641,9 @@ pub async fn list_sessions(
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
-            sess.list_top_level_sessions_with_title()
+            sess.list_top_level_sessions_with_meta()
                 .into_iter()
-                .filter_map(|(id, count, title)| {
+                .filter_map(|(id, count, title, updated_at)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
                         return None;
@@ -650,6 +655,7 @@ pub async fn list_sessions(
                         id: chat_id.to_string(),
                         message_count: count,
                         title,
+                        updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                     })
                 }),
         );
@@ -715,9 +721,9 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
     let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
         return Vec::new();
     };
-    mgr.list_top_level_sessions_with_title()
+    mgr.list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title)| {
+        .filter_map(|(id, count, title, updated_at)| {
             if is_internal_api_session_id(&id) {
                 return None;
             }
@@ -725,6 +731,7 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
                 id,
                 message_count: count,
                 title,
+                updated_at: updated_at.map(|dt| dt.to_rfc3339()),
             })
         })
         .collect()
@@ -3949,6 +3956,7 @@ mod tests {
             id: "test-session".into(),
             message_count: 42,
             title: None,
+            updated_at: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -3956,6 +3964,10 @@ mod tests {
         assert!(
             json.get("title").is_none(),
             "None title must be omitted from JSON"
+        );
+        assert!(
+            json.get("updated_at").is_none(),
+            "None updated_at must be omitted from JSON"
         );
     }
 
@@ -3965,9 +3977,22 @@ mod tests {
             id: "test-session".into(),
             message_count: 7,
             title: Some("My Pinned Chat".into()),
+            updated_at: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
+    }
+
+    #[test]
+    fn session_info_serialize_includes_updated_at() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 3,
+            title: None,
+            updated_at: Some("2026-07-02T12:00:00+00:00".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
     }
 
     #[test]

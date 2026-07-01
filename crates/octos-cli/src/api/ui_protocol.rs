@@ -36,31 +36,31 @@ use octos_core::ui_protocol::{
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionSnapshotParams, SessionStatusGetParams,
-    SessionTasksListParams, SessionTitleSetParams, SessionWorkspaceGetParams,
-    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
-    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
-    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
-    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
-    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
-    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
-    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
-    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord, UiArtifactPaneItem,
-    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
-    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
+    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
+    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
+    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
+    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
+    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
     UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
     progress_kinds, thread_status,
@@ -4268,6 +4268,19 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionRollback(params) => {
+                handle_session_rollback(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4824,6 +4837,19 @@ where
                     connection_profile_id_owned.as_deref(),
                     None,
                     features,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionRollback(params) => {
+                handle_session_rollback(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
                     id,
                     params,
                 )
@@ -8211,6 +8237,7 @@ fn validate_session_ingress_command_scope(
         UiCommand::TaskArtifactList(params) => params.session_id.clone(),
         UiCommand::TaskArtifactRead(params) => params.session_id.clone(),
         UiCommand::SessionHydrate(params) => params.session_id.clone(),
+        UiCommand::SessionRollback(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
         UiCommand::SessionSnapshot(params) => {
@@ -12201,6 +12228,166 @@ async fn handle_session_hydrate(
         octos_core::ui_protocol::methods::SESSION_HYDRATE,
         result,
     );
+}
+
+/// `session/rollback` — conversation-only rewind. Drops the last `num_turns`
+/// user turns from the session (persisted + in-memory), persists an idempotent
+/// append-only marker, and returns the trimmed thread projected exactly like
+/// `session/hydrate` (messages + threads + turns + cursor).
+///
+/// Scoped / resolved identically to [`handle_session_hydrate`]. Rejected when a
+/// turn is in progress for the session (rewinding under an active turn would
+/// race the writer). NOTHING outside the conversation transcript is touched —
+/// no git, worktree, or workspace file state.
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_rollback(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionRollbackParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_ROLLBACK;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // `num_turns` must be >= 1 — a zero-turn rollback is a no-op the client
+    // should never send.
+    if params.num_turns < 1 {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: num_turns must be >= 1"))
+                .with_data(json!({ "kind": "invalid_num_turns" })),
+        );
+        return;
+    }
+
+    // Snapshot the ledger once for the trimmed-thread projection's cursor +
+    // turn overlay (mirrors the hydrate handler).
+    let (replayed, head_cursor) = match ledger.snapshot_with_cursor(&params.session_id, None) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    // Guard: refuse to rewind while a turn is in flight for this session.
+    // Detected via the same process-global active-turn registry the
+    // turn/hydrate handlers consult. Checked before taking the sessions lock so
+    // we never hold two locks at once.
+    if active_turn_sessions(active_turns)
+        .await
+        .contains(&params.session_id)
+    {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: a turn is in progress; interrupt it before rolling back"
+            ))
+            .with_data(json!({ "kind": "turn_in_progress" })),
+        );
+        return;
+    }
+
+    // Apply the rollback (marker + in-memory trim) and project the trimmed
+    // thread while holding the sessions lock, so the projection reflects the
+    // post-trim snapshot.
+    let (dropped_turns, messages, threads, orphans) = {
+        let mut sessions_guard = sessions.lock().await;
+        // Reject unknown sessions per the hydrate error model — we do NOT
+        // auto-create on rollback.
+        if !sessions_guard.session_known(&params.session_id) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        let dropped_turns = match sessions_guard
+            .rollback_last_n_user_turns(&params.session_id, params.num_turns)
+            .await
+        {
+            Ok(dropped) => dropped,
+            Err(error) => {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: {error}")),
+                );
+                return;
+            }
+        };
+        let session = sessions_guard.get_or_create(&params.session_id).await;
+        // Same message projection as `handle_session_hydrate` for a
+        // non-negotiated client: seqs are the trimmed transcript's indices.
+        let messages = session
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(seq, msg)| HydratedMessage {
+                seq: seq as u64,
+                role: msg.role.as_str().to_owned(),
+                content: msg.content.clone(),
+                turn_id: None,
+                thread_id: msg.thread_id.clone(),
+                client_message_id: msg.client_message_id.clone(),
+                persisted_at: msg.timestamp,
+                message_id: None,
+                source: None,
+                media: msg.media.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (threads, orphans) = build_thread_graph_entries(session);
+        (dropped_turns, messages, threads, orphans)
+    };
+    let _ = orphans;
+
+    // Turn projection reuses the exact hydrate helper over the trimmed threads.
+    let turns = collect_session_turns(&params.session_id, active_turns, &replayed, &threads).await;
+
+    let thread = SessionHydrateResult {
+        session_id: params.session_id.clone(),
+        cursor: head_cursor,
+        context: None,
+        context_state: None,
+        messages: Some(messages),
+        threads: Some(threads),
+        turns: Some(turns),
+        pending_approvals: None,
+        pending_questions: None,
+        replayed_envelopes: None,
+    };
+    let result = SessionRollbackResult {
+        dropped_turns,
+        thread,
+    };
+    send_serialized_rpc_result(ws, id, method, result);
 }
 
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
@@ -23313,6 +23500,7 @@ mod tests {
                 "node_id": "design",
             }),
             methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
+            methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
             methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
             methods::TURN_STATE_GET => json!({
                 "session_id": session_id,
@@ -35364,6 +35552,226 @@ ignore = []
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(10),
         });
+    }
+
+    /// Open a disk-backed `SessionManager` and persist `turns` user turns
+    /// (user + assistant each, thread-grouped) so `session/rollback` has a real
+    /// JSONL to append its marker to and reload from. Returns the state plus the
+    /// live `TempDir` — the caller must keep it alive for the test's duration.
+    async fn prg_state_with_persisted_turns(
+        session_id: &SessionKey,
+        turns: usize,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+        let manager = Arc::new(tokio::sync::Mutex::new(manager));
+        {
+            let mut guard = manager.lock().await;
+            for n in 1..=turns {
+                let tid = format!("t{n}");
+                let now = Utc::now() + chrono::Duration::milliseconds((n as i64) * 2);
+                let user = Message {
+                    role: MessageRole::User,
+                    content: format!("turn {n}"),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    client_message_id: Some(tid.clone()),
+                    thread_id: Some(tid.clone()),
+                    timestamp: now,
+                };
+                guard
+                    .add_message(session_id, user)
+                    .await
+                    .expect("persist user");
+                let asst = Message {
+                    role: MessageRole::Assistant,
+                    content: format!("reply {n}"),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    client_message_id: None,
+                    thread_id: Some(tid.clone()),
+                    timestamp: now + chrono::Duration::milliseconds(1),
+                };
+                guard
+                    .add_message(session_id, asst)
+                    .await
+                    .expect("persist assistant");
+            }
+        }
+        let state = Arc::new(AppState {
+            sessions: Some(manager),
+            ..AppState::empty_for_tests()
+        });
+        (state, tmp)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_drops_last_turn_and_returns_trimmed_thread() {
+        let session_id = SessionKey("local:rollback-1".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb1".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "rb1");
+        let result = &frame["result"];
+        assert_eq!(result["dropped_turns"], 1);
+        let thread = &result["thread"];
+        assert_eq!(thread["session_id"], session_id.to_string());
+        assert!(thread["cursor"].is_object());
+        let messages = thread["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            4,
+            "turns 1 & 2 remain after dropping turn 3"
+        );
+        assert!(messages.iter().all(|m| m["content"] != "turn 3"));
+        assert!(messages.iter().all(|m| m["content"] != "reply 3"));
+        let threads = thread["threads"].as_array().expect("threads array");
+        assert_eq!(threads.len(), 2);
+        assert!(thread["turns"].is_array());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_survives_reload_from_disk() {
+        let session_id = SessionKey("local:rollback-reload".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb2".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // Evict the cache and reload from disk: the append-only marker replays
+        // the trim (it was persisted, not truncated).
+        {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.invalidate_cache(&session_id);
+            let session = guard.get_or_create(&session_id).await;
+            assert_eq!(
+                session.messages.len(),
+                4,
+                "rollback marker must survive a disk reload"
+            );
+            assert!(session.messages.iter().all(|m| m.content != "turn 3"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rejects_when_turn_in_progress() {
+        let session_id = SessionKey("local:rollback-busy".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        // Insert a synthetic in-flight turn, exactly as handle_turn_start would.
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let dummy_handle = tokio::spawn(async {});
+        {
+            let mut guard = active_turns.lock().await;
+            guard.insert(
+                session_id.clone(),
+                ActiveTurn {
+                    turn_id: TurnId::new(),
+                    state: Arc::new(TokioMutex::new(TurnState::Active)),
+                    interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+                    abort: dummy_handle.abort_handle(),
+                },
+            );
+        }
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb3".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(
+            frame.get("error").is_some(),
+            "rollback under an active turn must error: {frame}"
+        );
+        assert_eq!(frame["error"]["data"]["kind"], "turn_in_progress");
+        // The transcript must be untouched (6 messages = 3 turns).
+        {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let session = guard.get_or_create(&session_id).await;
+            assert_eq!(session.messages.len(), 6, "no trim under an active turn");
+        }
+        active_turns.lock().await.remove(&session_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rejects_zero_num_turns() {
+        let session_id = SessionKey("local:rollback-zero".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb0".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 0,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(frame.get("error").is_some(), "num_turns=0 must be rejected");
+        assert_eq!(frame["error"]["data"]["kind"], "invalid_num_turns");
     }
 
     #[tokio::test(flavor = "current_thread")]
