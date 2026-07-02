@@ -1415,10 +1415,12 @@ impl SessionManager {
                     let mut items: Vec<SessionTimelineItem> = Vec::with_capacity(
                         flat_timeline.len().saturating_add(per_user_timeline.len()),
                     );
-                    let mut seen = std::collections::HashSet::new();
+                    let mut seen: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
 
                     for item in flat_timeline.into_iter().chain(per_user_timeline) {
-                        match &item {
+                        match item {
+                            SessionTimelineItem::Rollback { .. } => items.push(item),
                             SessionTimelineItem::Message(message) => {
                                 // The dedup fingerprint must be synthesis-INDEPENDENT: a
                                 // legacy flat row (no persisted `thread_id`) and its
@@ -1428,20 +1430,43 @@ impl SessionManager {
                                 // logical message. `thread_id` is only synthesized later
                                 // in `fold_session_timeline`, and neither field is content
                                 // identity, so normalize both to `None` before
-                                // fingerprinting. Otherwise the two copies fingerprint
+                                // fingerprinting — else the two copies fingerprint
                                 // differently, both survive, and a partial-migration
                                 // (stale flat + per-user) session doubles on reload.
-                                let mut ident = message.as_ref().clone();
+                                let mut ident = (*message).clone();
                                 ident.thread_id = None;
                                 ident.client_message_id = None;
                                 let Ok(fingerprint) = serde_json::to_string(&ident) else {
                                     continue;
                                 };
-                                if seen.insert(fingerprint) {
-                                    items.push(item);
+                                // On a cross-layout dup, keep the RICHER copy: the
+                                // migrated per-user row carries the canonical
+                                // thread_id/client_message_id the legacy flat row lacks,
+                                // so hydrate/thread projections resolve the real IDs on
+                                // reload rather than the flat row's missing/synthesized
+                                // ones (flat is processed first, so without this the
+                                // stale row would win).
+                                let richness = message.thread_id.is_some() as u8
+                                    + message.client_message_id.is_some() as u8;
+                                match seen.get(&fingerprint).copied() {
+                                    None => {
+                                        seen.insert(fingerprint, items.len());
+                                        items.push(SessionTimelineItem::Message(message));
+                                    }
+                                    Some(idx) => {
+                                        let kept = match &items[idx] {
+                                            SessionTimelineItem::Message(existing) => {
+                                                existing.thread_id.is_some() as u8
+                                                    + existing.client_message_id.is_some() as u8
+                                            }
+                                            SessionTimelineItem::Rollback { .. } => u8::MAX,
+                                        };
+                                        if richness > kept {
+                                            items[idx] = SessionTimelineItem::Message(message);
+                                        }
+                                    }
                                 }
                             }
-                            SessionTimelineItem::Rollback { .. } => items.push(item),
                         }
                     }
                     // Stable sort: preserves flat-before-per-user order for
@@ -3266,7 +3291,9 @@ mod tests {
         // Same logical rows (identical role/content/timestamp). The flat copy has
         // NO thread_id (legacy); the per-user copy carries a synthesized thread_id
         // (migrated) — the only serialized difference between the two.
-        let row = |content: &str, offset: i64, thread_id: Option<&str>| {
+        // ids = Some((thread_id, client_message_id)) for the migrated per-user
+        // copy; None for the legacy flat copy (which carries neither).
+        let row = |content: &str, offset: i64, ids: Option<(&str, &str)>| {
             let role = if content.starts_with("turn") {
                 MessageRole::User
             } else {
@@ -3274,7 +3301,12 @@ mod tests {
             };
             let mut m = make_message(role, content);
             m.timestamp = base + chrono::Duration::milliseconds(offset);
-            m.thread_id = thread_id.map(|s| s.to_string());
+            let (tid, cmid) = match ids {
+                Some((t, c)) => (Some(t.to_string()), Some(c.to_string())),
+                None => (None, None),
+            };
+            m.thread_id = tid;
+            m.client_message_id = cmid;
             m
         };
         let meta = |updated_ms: i64| {
@@ -3312,8 +3344,8 @@ mod tests {
             format!(
                 "{}\n{}\n{}\n",
                 serde_json::to_string(&meta(2)).unwrap(),
-                serde_json::to_string(&row("turn 1", 0, Some("t1"))).unwrap(),
-                serde_json::to_string(&row("reply 1", 1, Some("t1"))).unwrap(),
+                serde_json::to_string(&row("turn 1", 0, Some(("t1", "cmid-turn1")))).unwrap(),
+                serde_json::to_string(&row("reply 1", 1, Some(("t1", "cmid-reply1")))).unwrap(),
             ),
         )
         .unwrap();
@@ -3334,6 +3366,18 @@ mod tests {
                 .count(),
             1,
             "migrated 'turn 1' must appear exactly once: {contents:?}"
+        );
+        // The RICHER per-user copy must win the dedup, so its canonical
+        // client_message_id survives (not the flat row's None).
+        let turn1 = session
+            .messages
+            .iter()
+            .find(|m| m.content == "turn 1")
+            .expect("turn 1 present");
+        assert_eq!(
+            turn1.client_message_id.as_deref(),
+            Some("cmid-turn1"),
+            "dedup must keep the canonical per-user row's client_message_id"
         );
     }
 
