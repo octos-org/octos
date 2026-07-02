@@ -382,39 +382,78 @@ fn rollback_marker_line(num_turns: u32) -> Result<String> {
     Ok(serde_json::to_string(&record)?)
 }
 
-/// Assemble the ordered `Message` list from a session JSONL's post-meta lines,
-/// applying any interleaved [`SessionControlRecord`] at its position in the
-/// log.
+/// One ordered item in a session JSONL's post-meta timeline: a persisted
+/// [`Message`] or an append-only rollback control marker. Parsing keeps the two
+/// interleaved in log order so the marker can be replayed positionally — by log
+/// order within a single file ([`fold_session_timeline`]) or by timestamp after
+/// a flat + per-user merge (in [`SessionManager::load_from_disk`]).
+///
+/// `Message` is boxed so the small `Rollback` variant does not inflate every
+/// element of a session-length `Vec` (clippy `large_enum_variant`).
+enum SessionTimelineItem {
+    Message(Box<Message>),
+    Rollback { num_turns: u32, at: DateTime<Utc> },
+}
+
+/// Parse a session JSONL's post-meta lines into an ordered timeline WITHOUT
+/// applying any rollback drop.
 ///
 /// Control lines are recognized before the `Message` decode (they carry a
 /// `kind` discriminator a `Message` never has) and are NOT parsed as messages.
-/// A `rollback` record drops the last N user turns accumulated *so far* —
-/// applying it positionally (rather than after the whole file) is what makes
-/// rewind-then-continue survive a reload: turns appended after the marker are
-/// kept, turns before it are trimmed. `thread_id`s are synthesized for legacy
-/// rows before each drop and once at the end, so a file without any control
-/// record assembles exactly as it did pre-marker (a single synthesize pass over
-/// the full transcript).
-fn assemble_session_messages<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Message> {
-    let mut messages: Vec<Message> = Vec::new();
+/// Unparseable lines are skipped, matching the prior
+/// `filter_map(|line| serde_json::from_str(line).ok())` behavior. The rollback
+/// drop is deferred to [`fold_session_timeline`] so the merge path in
+/// [`SessionManager::load_from_disk`] can apply markers against the combined
+/// flat + per-user transcript rather than one file in isolation.
+fn parse_session_timeline<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<SessionTimelineItem> {
+    let mut timeline: Vec<SessionTimelineItem> = Vec::new();
     for line in lines.filter(|line| !line.trim().is_empty()) {
         if let Ok(control) = serde_json::from_str::<SessionControlRecord>(line) {
             match control {
-                SessionControlRecord::Rollback { num_turns, .. } => {
-                    synthesize_thread_ids(&mut messages);
-                    crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+                SessionControlRecord::Rollback { num_turns, at } => {
+                    timeline.push(SessionTimelineItem::Rollback { num_turns, at });
                 }
             }
             continue;
         }
         if let Ok(message) = serde_json::from_str::<Message>(line) {
-            messages.push(message);
+            timeline.push(SessionTimelineItem::Message(Box::new(message)));
         }
-        // Unparseable lines are skipped, matching the prior
-        // `filter_map(|line| serde_json::from_str(line).ok())` behavior.
+    }
+    timeline
+}
+
+/// Fold an ordered timeline into the trimmed `Message` list, replaying each
+/// rollback marker at its position.
+///
+/// A `rollback` record drops the last N user turns accumulated *so far* —
+/// applying it positionally (rather than after the whole timeline) is what makes
+/// rewind-then-continue survive a reload: turns appended after the marker are
+/// kept, turns before it are trimmed. `thread_id`s are synthesized for legacy
+/// rows before each drop and once at the end, so a timeline without any control
+/// record folds exactly as it did pre-marker (a single synthesize pass over the
+/// full transcript).
+fn fold_session_timeline(timeline: Vec<SessionTimelineItem>) -> Vec<Message> {
+    let mut messages: Vec<Message> = Vec::new();
+    for item in timeline {
+        match item {
+            SessionTimelineItem::Message(message) => messages.push(*message),
+            SessionTimelineItem::Rollback { num_turns, .. } => {
+                synthesize_thread_ids(&mut messages);
+                crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+            }
+        }
     }
     synthesize_thread_ids(&mut messages);
     messages
+}
+
+/// Assemble the ordered `Message` list from a session JSONL's post-meta lines,
+/// applying any interleaved [`SessionControlRecord`] at its position in the
+/// log. Single-file convenience over [`parse_session_timeline`] +
+/// [`fold_session_timeline`].
+fn assemble_session_messages<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Message> {
+    fold_session_timeline(parse_session_timeline(lines))
 }
 
 fn record_session_persist(outcome: &'static str) {
@@ -858,7 +897,7 @@ impl SessionManager {
             }
             // Read just the first line for metadata (title + updated_at);
             // fall back to count_lines for the message count.
-            let (title, updated_at) = std::fs::read_to_string(path)
+            let (title, meta_updated_at) = std::fs::read_to_string(path)
                 .ok()
                 .and_then(|content| {
                     content
@@ -868,14 +907,21 @@ impl SessionManager {
                 })
                 .map(|meta| (meta.title, Some(meta.updated_at)))
                 .unwrap_or((None, None));
-            // Cheap recency fallback when the meta line is missing or
-            // unparseable: the JSONL file's own mtime.
-            let updated_at = updated_at.or_else(|| {
-                std::fs::metadata(path)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
-                    .map(DateTime::<Utc>::from)
-            });
+            // Recency for the `session/list` sort. `SessionMeta.updated_at` is
+            // only rewritten on create / rename / summary rewrite — NOT on an
+            // ordinary message append — so an active chat's meta timestamp goes
+            // stale while its JSONL file mtime keeps advancing. Take the LATER
+            // of the two (codex P2) so recency tracks real writes; the file
+            // mtime alone also covers the missing / unparseable-meta case.
+            let file_mtime = std::fs::metadata(path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .map(DateTime::<Utc>::from);
+            let updated_at = match (meta_updated_at, file_mtime) {
+                (Some(meta_at), Some(mtime)) => Some(meta_at.max(mtime)),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            };
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
             out.push((session_key, count, title, updated_at));
@@ -1283,14 +1329,23 @@ impl SessionManager {
 
         let key_clone = key.clone();
         tokio::task::spawn_blocking(move || {
-            fn load_session_file(path: &Path, key: &SessionKey) -> Option<Session> {
+            // Parse a session file into its meta + an un-applied timeline
+            // (messages interleaved with rollback markers). The rollback drop
+            // is DEFERRED — the flat + per-user merge below applies markers
+            // against the COMBINED transcript, so a marker co-located with one
+            // layout still trims turns that live in the other (codex P1: a
+            // mixed flat/per-user layout must not resurrect rolled-back turns).
+            fn parse_session_file(
+                path: &Path,
+                key: &SessionKey,
+            ) -> Option<(SessionMeta, Vec<SessionTimelineItem>)> {
                 // Guard against oversized files to prevent OOM
-                if let Ok(meta) = std::fs::metadata(path) {
-                    if meta.len() > MAX_SESSION_FILE_SIZE {
+                if let Ok(file_meta) = std::fs::metadata(path) {
+                    if file_meta.len() > MAX_SESSION_FILE_SIZE {
                         warn!(
                             key = %key,
                             path = %path.display(),
-                            size = meta.len(),
+                            size = file_meta.len(),
                             limit = MAX_SESSION_FILE_SIZE,
                             "session file too large, skipping"
                         );
@@ -1315,13 +1370,17 @@ impl SessionManager {
                     return None;
                 }
 
-                // Assemble messages, applying any append-only rollback control
-                // records at their position in the log and gap-filling legacy
-                // `thread_id`s in-memory (M8.10). Files without control records
-                // parse identically to the prior single-pass load.
-                let messages = assemble_session_messages(lines);
+                Some((meta, parse_session_timeline(lines)))
+            }
 
-                Some(Session {
+            // Fold a single file's timeline into a `Session` (per-user only or
+            // legacy flat only — the marker application is unambiguous).
+            fn session_from(
+                meta: SessionMeta,
+                messages: Vec<Message>,
+                key: &SessionKey,
+            ) -> Session {
+                Session {
                     key: key.clone(),
                     parent_key: meta.parent_key.map(SessionKey),
                     topic: meta.topic,
@@ -1332,52 +1391,77 @@ impl SessionManager {
                     messages,
                     created_at: meta.created_at,
                     updated_at: meta.updated_at,
-                })
+                }
             }
 
             let flat = flat_path
                 .exists()
-                .then(|| load_session_file(&flat_path, &key_clone))
+                .then(|| parse_session_file(&flat_path, &key_clone))
                 .flatten();
             let per_user = per_user_path
                 .exists()
-                .then(|| load_session_file(&per_user_path, &key_clone))
+                .then(|| parse_session_file(&per_user_path, &key_clone))
                 .flatten();
 
             let merged = match (flat, per_user) {
-                (Some(flat), Some(per_user)) => {
-                    let mut merged_messages = Vec::with_capacity(
-                        flat.messages.len().saturating_add(per_user.messages.len()),
+                (Some((flat_meta, flat_timeline)), Some((per_user_meta, per_user_timeline))) => {
+                    // Merge the two timelines: dedup messages by fingerprint (a
+                    // message migrated into both layouts appears once), keep
+                    // EVERY rollback marker, then order by timestamp so each
+                    // marker lands after the messages it should trim
+                    // (message-before-marker on an exact tie). Folding the
+                    // combined, ordered timeline applies the drop across BOTH
+                    // files — the fix for the mixed-layout resurrection.
+                    let mut items: Vec<SessionTimelineItem> = Vec::with_capacity(
+                        flat_timeline.len().saturating_add(per_user_timeline.len()),
                     );
                     let mut seen = std::collections::HashSet::new();
 
-                    for message in flat.messages.into_iter().chain(per_user.messages) {
-                        let Ok(fingerprint) = serde_json::to_string(&message) else {
-                            continue;
-                        };
-                        if seen.insert(fingerprint) {
-                            merged_messages.push(message);
+                    for item in flat_timeline.into_iter().chain(per_user_timeline) {
+                        match &item {
+                            SessionTimelineItem::Message(message) => {
+                                let Ok(fingerprint) = serde_json::to_string(message.as_ref())
+                                else {
+                                    continue;
+                                };
+                                if seen.insert(fingerprint) {
+                                    items.push(item);
+                                }
+                            }
+                            SessionTimelineItem::Rollback { .. } => items.push(item),
                         }
                     }
-                    merged_messages.sort_by_key(|message| message.timestamp);
+                    // Stable sort: preserves flat-before-per-user order for
+                    // messages sharing a timestamp (matches the prior merge's
+                    // `sort_by_key(|m| m.timestamp)` stability).
+                    items.sort_by_key(|item| match item {
+                        SessionTimelineItem::Message(message) => (message.timestamp, 0u8),
+                        SessionTimelineItem::Rollback { at, .. } => (*at, 1u8),
+                    });
+                    let messages = fold_session_timeline(items);
 
                     Session {
                         key: key_clone.clone(),
-                        parent_key: per_user.parent_key.or(flat.parent_key),
-                        topic: per_user.topic.or(flat.topic),
-                        summary: per_user.summary.or(flat.summary),
-                        title: per_user.title.or(flat.title),
-                        title_manual: per_user.title_manual || flat.title_manual,
+                        parent_key: per_user_meta
+                            .parent_key
+                            .or(flat_meta.parent_key)
+                            .map(SessionKey),
+                        topic: per_user_meta.topic.or(flat_meta.topic),
+                        summary: per_user_meta.summary.or(flat_meta.summary),
+                        title: per_user_meta.title.or(flat_meta.title),
+                        title_manual: per_user_meta.title_manual || flat_meta.title_manual,
                         child_contracts: merge_child_contracts(
-                            flat.child_contracts,
-                            per_user.child_contracts,
+                            flat_meta.child_contracts,
+                            per_user_meta.child_contracts,
                         ),
-                        messages: merged_messages,
-                        created_at: flat.created_at.min(per_user.created_at),
-                        updated_at: flat.updated_at.max(per_user.updated_at),
+                        messages,
+                        created_at: flat_meta.created_at.min(per_user_meta.created_at),
+                        updated_at: flat_meta.updated_at.max(per_user_meta.updated_at),
                     }
                 }
-                (Some(session), None) | (None, Some(session)) => session,
+                (Some((meta, timeline)), None) | (None, Some((meta, timeline))) => {
+                    session_from(meta, fold_session_timeline(timeline), &key_clone)
+                }
                 (None, None) => return None,
             };
 
@@ -1743,9 +1827,11 @@ impl SessionManager {
             .join("sessions")
             .join(format!("{encoded_topic}.jsonl"));
 
-        // Co-locate the marker with the messages so `load_from_disk`'s per-file
-        // fold applies the drop against the right transcript: per-user
-        // (canonical) wins, then legacy flat.
+        // Write the marker to the canonical layout (per-user preferred, legacy
+        // flat as fallback). `load_from_disk` folds markers AFTER merging both
+        // layouts (by timestamp), so the drop trims the combined transcript
+        // even when the rolled-back turns live in the OTHER file — a
+        // single-file `SessionHandle::open` still applies it in log order.
         let target = if per_user_path.exists() {
             per_user_path
         } else if flat_path.exists() {
@@ -3042,6 +3128,116 @@ mod tests {
         }
     }
 
+    /// Codex P1: in a MIXED flat + per-user layout, the rollback marker is
+    /// co-located with ONE file (per-user preferred) but the drop is computed
+    /// over the MERGED transcript. If the rolled-back turns straddle the legacy
+    /// flat file, applying the marker per-file would resurrect them on the next
+    /// merge-load. The drop must be applied POST-MERGE.
+    #[tokio::test]
+    async fn rollback_trims_across_mixed_flat_and_per_user_layout_without_resurrection() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::with_profile("dspfac", "api", "mixed-rollback");
+
+        // Flat turns are older (legacy); the per-user turn is newer. The
+        // rollback marker (appended at `Utc::now()`) sorts after all of them.
+        let base = Utc::now() - chrono::Duration::minutes(10);
+        let msg = |content: &str, tid: &str, offset: i64| {
+            let role = if content.starts_with("turn") {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            };
+            let mut m = make_message(role, content);
+            m.client_message_id = Some(tid.to_string());
+            m.thread_id = Some(tid.to_string());
+            m.timestamp = base + chrono::Duration::milliseconds(offset);
+            m
+        };
+
+        // Legacy flat file: turns 1 & 2.
+        let flat_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "created_at": base,
+            "updated_at": base + chrono::Duration::milliseconds(3),
+        });
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        std::fs::write(
+            mgr.session_path(&key),
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                serde_json::to_string(&flat_meta).unwrap(),
+                serde_json::to_string(&msg("turn 1", "t1", 0)).unwrap(),
+                serde_json::to_string(&msg("reply 1", "t1", 1)).unwrap(),
+                serde_json::to_string(&msg("turn 2", "t2", 2)).unwrap(),
+                serde_json::to_string(&msg("reply 2", "t2", 3)).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        // Per-user file: turn 3 only.
+        let encoded_base = encode_path_component(key.base_key());
+        let per_user_dir = tmp
+            .path()
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions");
+        std::fs::create_dir_all(&per_user_dir).unwrap();
+        let per_user_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "created_at": base + chrono::Duration::milliseconds(4),
+            "updated_at": base + chrono::Duration::milliseconds(5),
+        });
+        std::fs::write(
+            per_user_dir.join("default.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&per_user_meta).unwrap(),
+                serde_json::to_string(&msg("turn 3", "t3", 4)).unwrap(),
+                serde_json::to_string(&msg("reply 3", "t3", 5)).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        // Merged load sees all 3 turns.
+        assert_eq!(
+            mgr.get_or_create(&key).await.messages.len(),
+            6,
+            "precondition: merged transcript = 3 turns (6 messages)"
+        );
+
+        // Roll back 2 turns: drops turn 3 (per-user) AND turn 2 (legacy flat).
+        // The marker lands in the per-user file (it exists) but must cover the
+        // flat turn on reload.
+        let dropped = mgr.rollback_last_n_user_turns(&key, 2).await.unwrap();
+        assert_eq!(dropped, 2);
+        {
+            let session = mgr.get_or_create(&key).await;
+            assert_eq!(session.messages.len(), 2, "in-memory: only turn 1 remains");
+            assert!(session.messages.iter().all(|m| m.content != "reply 2"));
+        }
+
+        // Reload from a FRESH manager (empty cache): load_from_disk re-merges
+        // flat + per-user and folds the marker post-merge. Turn 2 (flat) must
+        // NOT be resurrected.
+        let mut reload = SessionManager::open(tmp.path()).unwrap();
+        let session = reload.get_or_create(&key).await;
+        let contents: Vec<&String> = session.messages.iter().map(|m| &m.content).collect();
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "turn 1 only after reload; got {contents:?}"
+        );
+        assert!(
+            session.messages.iter().all(|m| m.content != "turn 2"),
+            "turn 2 (legacy flat) must not resurrect after a merge-reload: {contents:?}"
+        );
+        assert!(session.messages.iter().all(|m| m.content != "turn 3"));
+        assert_eq!(session.messages[0].content, "turn 1");
+    }
+
     #[tokio::test]
     async fn test_session_manager_clear() {
         let tmp = TempDir::new().unwrap();
@@ -3702,7 +3898,57 @@ mod tests {
             .find(|(id, ..)| id == "cli:meta-recency")
             .expect("session present");
         assert_eq!(row.2.as_deref(), Some("Recency Chat"));
-        assert_eq!(row.3, Some(updated), "updated_at read from SessionMeta");
+        // Recency is `max(meta.updated_at, file mtime)` (codex P2). The file was
+        // just written, so its mtime dominates the older meta timestamp; the
+        // surfaced recency is therefore at least the meta value.
+        let recency = row.3.expect("updated_at present");
+        assert!(
+            recency >= updated,
+            "recency must be at least the meta.updated_at; got {recency}"
+        );
+    }
+
+    /// Codex P2: `SessionMeta.updated_at` is stamped once at creation and is
+    /// NOT rewritten on ordinary message appends, so `session/list` recency read
+    /// straight from meta goes stale for active chats. Appending a message must
+    /// advance the list recency — the surfaced timestamp has to track the file's
+    /// real last-write time (mtime), not the frozen meta value.
+    #[tokio::test]
+    async fn list_recency_advances_when_a_message_is_appended() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "recency-append");
+
+        // Create the session: `meta.updated_at` is stamped here, once.
+        mgr.add_message(&key, make_message(MessageRole::User, "hi"))
+            .await
+            .unwrap();
+        let recency_before = mgr
+            .list_top_level_sessions_with_meta()
+            .into_iter()
+            .find(|(id, ..)| id == "cli:recency-append")
+            .and_then(|row| row.3)
+            .expect("recency present after create");
+
+        // Let the filesystem mtime clock advance, then append. The meta line
+        // (and its `updated_at`) is left untouched; only the file mtime moves.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        mgr.add_message(&key, make_message(MessageRole::Assistant, "there"))
+            .await
+            .unwrap();
+        let recency_after = mgr
+            .list_top_level_sessions_with_meta()
+            .into_iter()
+            .find(|(id, ..)| id == "cli:recency-append")
+            .and_then(|row| row.3)
+            .expect("recency present after append");
+
+        assert!(
+            recency_after > recency_before,
+            "appending a message must advance list recency; meta.updated_at is \
+             frozen at creation, so mtime must drive it — before={recency_before} \
+             after={recency_after}"
+        );
     }
 
     /// Regression guard for the O(N) hang. With 5 000 synthetic

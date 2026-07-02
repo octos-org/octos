@@ -12369,7 +12369,26 @@ async fn handle_session_rollback(
     let _ = orphans;
 
     // Turn projection reuses the exact hydrate helper over the trimmed threads.
-    let turns = collect_session_turns(&params.session_id, active_turns, &replayed, &threads).await;
+    // The `replayed` snapshot was taken PRE-trim, so it still carries lifecycle
+    // + `message/persisted` events for the just-rolled-back turns. Scope the
+    // projected turns to the SURVIVING threads (codex P2): a turn belongs to the
+    // trimmed thread iff its `thread_id` — surfaced from the ledger's
+    // `message/persisted` rows — is still present among the trimmed threads.
+    // Without this, `thread.turns` would leak lifecycle state for dropped turns
+    // even though `messages`/`threads` are trimmed.
+    let surviving_thread_ids: std::collections::HashSet<&str> = threads
+        .iter()
+        .map(|entry| entry.thread_id.as_str())
+        .collect();
+    let turns = collect_session_turns(&params.session_id, active_turns, &replayed, &threads)
+        .await
+        .into_iter()
+        .filter(|turn| {
+            turn.thread_id
+                .as_deref()
+                .is_some_and(|thread_id| surviving_thread_ids.contains(thread_id))
+        })
+        .collect::<Vec<_>>();
 
     let thread = SessionHydrateResult {
         session_id: params.session_id.clone(),
@@ -35772,6 +35791,99 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         assert!(frame.get("error").is_some(), "num_turns=0 must be rejected");
         assert_eq!(frame["error"]["data"]["kind"], "invalid_num_turns");
+    }
+
+    /// Codex P2: the ledger snapshot handed to `collect_session_turns` is taken
+    /// BEFORE the trim, so it still carries lifecycle + `message/persisted`
+    /// events for the rolled-back turns. The returned `thread.turns` must scope
+    /// to the SURVIVING threads — a dropped turn must not linger in the turn
+    /// projection even though its ledger rows persist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_excludes_dropped_turns_from_thread_turns() {
+        let session_id = SessionKey("local:rollback-turns-scope".into());
+        // Two persisted turns, thread-grouped under "t1" and "t2".
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+
+        // Full lifecycle for BOTH turns in the ledger, thread-linked to the
+        // persisted turns (thread_ids surfaced via `message/persisted.thread_id`
+        // are what `collect_session_turns` keys the projection on).
+        let turn_keep = TurnId::new(); // turn 1 -> thread "t1" (survives)
+        let turn_drop = TurnId::new(); // turn 2 -> thread "t2" (rolled back)
+        for (turn_id, thread_id, seq) in [(&turn_keep, "t1", 1_u64), (&turn_drop, "t2", 3_u64)] {
+            let _ = ledger.append_notification(UiNotification::TurnStarted(
+                octos_core::ui_protocol::TurnStartedEvent {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    timestamp: Utc::now(),
+                    topic: None,
+                },
+            ));
+            let _ = ledger.append_notification(UiNotification::MessagePersisted(
+                MessagePersistedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: Some(turn_id.clone()),
+                    thread_id: Some(thread_id.to_string()),
+                    seq,
+                    role: "user".into(),
+                    message_id: format!("{}:{seq}:0", session_id.0),
+                    client_message_id: None,
+                    source: MessagePersistedSource::User,
+                    cursor: UiCursor {
+                        stream: session_id.0.clone(),
+                        seq,
+                    },
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                    content: None,
+                },
+            ));
+            let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            }));
+        }
+
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-scope".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["dropped_turns"], 1);
+        let turns = frame["result"]["thread"]["turns"]
+            .as_array()
+            .expect("turns array");
+        let turn_ids: Vec<String> = turns
+            .iter()
+            .filter_map(|turn| turn["turn_id"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            turn_ids.contains(&turn_keep.0.to_string()),
+            "surviving turn 1 must remain in thread.turns; got {turn_ids:?}"
+        );
+        assert!(
+            !turn_ids.contains(&turn_drop.0.to_string()),
+            "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
