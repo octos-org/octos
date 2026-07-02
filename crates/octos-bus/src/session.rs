@@ -1420,8 +1420,21 @@ impl SessionManager {
                     for item in flat_timeline.into_iter().chain(per_user_timeline) {
                         match &item {
                             SessionTimelineItem::Message(message) => {
-                                let Ok(fingerprint) = serde_json::to_string(message.as_ref())
-                                else {
+                                // The dedup fingerprint must be synthesis-INDEPENDENT: a
+                                // legacy flat row (no persisted `thread_id`) and its
+                                // migrated per-user copy (a `thread_id` synthesized +
+                                // persisted by an earlier migration, possibly a
+                                // migration-added `client_message_id`) are the SAME
+                                // logical message. `thread_id` is only synthesized later
+                                // in `fold_session_timeline`, and neither field is content
+                                // identity, so normalize both to `None` before
+                                // fingerprinting. Otherwise the two copies fingerprint
+                                // differently, both survive, and a partial-migration
+                                // (stale flat + per-user) session doubles on reload.
+                                let mut ident = message.as_ref().clone();
+                                ident.thread_id = None;
+                                ident.client_message_id = None;
+                                let Ok(fingerprint) = serde_json::to_string(&ident) else {
                                     continue;
                                 };
                                 if seen.insert(fingerprint) {
@@ -3236,6 +3249,92 @@ mod tests {
         );
         assert!(session.messages.iter().all(|m| m.content != "turn 3"));
         assert_eq!(session.messages[0].content, "turn 1");
+    }
+
+    /// Codex follow-up on the P1 fix: the merge dedup fingerprint must be
+    /// synthesis-INDEPENDENT. A legacy flat row (no `thread_id`) and its migrated
+    /// per-user copy (a synthesized `thread_id`) are the SAME logical message;
+    /// fingerprinting the raw rows kept both and DOUBLED the transcript on reload
+    /// for partial-migration (stale flat + per-user) sessions.
+    #[tokio::test]
+    async fn mixed_layout_dedups_migrated_rows_despite_synthesized_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::with_profile("dspfac", "api", "partial-migration");
+
+        let base = Utc::now() - chrono::Duration::minutes(5);
+        // Same logical rows (identical role/content/timestamp). The flat copy has
+        // NO thread_id (legacy); the per-user copy carries a synthesized thread_id
+        // (migrated) — the only serialized difference between the two.
+        let row = |content: &str, offset: i64, thread_id: Option<&str>| {
+            let role = if content.starts_with("turn") {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            };
+            let mut m = make_message(role, content);
+            m.timestamp = base + chrono::Duration::milliseconds(offset);
+            m.thread_id = thread_id.map(|s| s.to_string());
+            m
+        };
+        let meta = |updated_ms: i64| {
+            serde_json::json!({
+                "schema_version": 1,
+                "session_key": key.0,
+                "created_at": base,
+                "updated_at": base + chrono::Duration::milliseconds(updated_ms),
+            })
+        };
+
+        // Legacy flat file: rows WITHOUT thread_id.
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        std::fs::write(
+            mgr.session_path(&key),
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&meta(1)).unwrap(),
+                serde_json::to_string(&row("turn 1", 0, None)).unwrap(),
+                serde_json::to_string(&row("reply 1", 1, None)).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        // Per-user file: the SAME rows, but with synthesized thread_ids (migrated).
+        let encoded_base = encode_path_component(key.base_key());
+        let per_user_dir = tmp
+            .path()
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions");
+        std::fs::create_dir_all(&per_user_dir).unwrap();
+        std::fs::write(
+            per_user_dir.join("default.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&meta(2)).unwrap(),
+                serde_json::to_string(&row("turn 1", 0, Some("t1"))).unwrap(),
+                serde_json::to_string(&row("reply 1", 1, Some("t1"))).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        // First access on an empty cache re-merges both layouts from disk.
+        let session = mgr.get_or_create(&key).await;
+        let contents: Vec<&String> = session.messages.iter().map(|m| &m.content).collect();
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "partial-migration session must dedup across layouts, not double: {contents:?}"
+        );
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|m| m.content == "turn 1")
+                .count(),
+            1,
+            "migrated 'turn 1' must appear exactly once: {contents:?}"
+        );
     }
 
     #[tokio::test]
