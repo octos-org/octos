@@ -358,6 +358,65 @@ pub(crate) fn synthesize_thread_ids(messages: &mut [Message]) {
     }
 }
 
+/// Append-only control records interleaved with `Message` lines in a session
+/// JSONL. Discriminated on `kind` so [`assemble_session_messages`] can tell
+/// them apart from `Message` rows — a persisted [`Message`] never carries a
+/// `kind` field, and an internally-tagged control record has no `role`, so the
+/// two decode paths are mutually exclusive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SessionControlRecord {
+    /// Conversation-only rewind marker: drop the last `num_turns` user turns
+    /// from the transcript accumulated up to this point in the log. Written by
+    /// [`SessionManager::rollback_last_n_user_turns`] and replayed on every
+    /// load (append-only, never a truncation).
+    Rollback { num_turns: u32, at: DateTime<Utc> },
+}
+
+/// Serialize a rollback control record to its single-line JSONL form.
+fn rollback_marker_line(num_turns: u32) -> Result<String> {
+    let record = SessionControlRecord::Rollback {
+        num_turns,
+        at: Utc::now(),
+    };
+    Ok(serde_json::to_string(&record)?)
+}
+
+/// Assemble the ordered `Message` list from a session JSONL's post-meta lines,
+/// applying any interleaved [`SessionControlRecord`] at its position in the
+/// log.
+///
+/// Control lines are recognized before the `Message` decode (they carry a
+/// `kind` discriminator a `Message` never has) and are NOT parsed as messages.
+/// A `rollback` record drops the last N user turns accumulated *so far* —
+/// applying it positionally (rather than after the whole file) is what makes
+/// rewind-then-continue survive a reload: turns appended after the marker are
+/// kept, turns before it are trimmed. `thread_id`s are synthesized for legacy
+/// rows before each drop and once at the end, so a file without any control
+/// record assembles exactly as it did pre-marker (a single synthesize pass over
+/// the full transcript).
+fn assemble_session_messages<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Message> {
+    let mut messages: Vec<Message> = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        if let Ok(control) = serde_json::from_str::<SessionControlRecord>(line) {
+            match control {
+                SessionControlRecord::Rollback { num_turns, .. } => {
+                    synthesize_thread_ids(&mut messages);
+                    crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+                }
+            }
+            continue;
+        }
+        if let Ok(message) = serde_json::from_str::<Message>(line) {
+            messages.push(message);
+        }
+        // Unparseable lines are skipped, matching the prior
+        // `filter_map(|line| serde_json::from_str(line).ok())` behavior.
+    }
+    synthesize_thread_ids(&mut messages);
+    messages
+}
+
 fn record_session_persist(outcome: &'static str) {
     counter!(
         "octos_session_persist_total",
@@ -685,6 +744,12 @@ const DEFAULT_MAX_SESSIONS: usize = 1000;
 /// Maximum session file size we'll load (10 MB). Prevents OOM on corrupted/adversarial files.
 const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// One row of the title/recency session listing:
+/// `(session_key, message_count, title, updated_at)`. `title` and `updated_at`
+/// are `None` for legacy files that pre-date those meta fields (with `updated_at`
+/// falling back to the JSONL mtime when available).
+pub type SessionTitleMetaRow = (String, usize, Option<String>, Option<DateTime<Utc>>);
+
 /// Manages sessions with in-memory LRU cache and JSONL disk persistence.
 ///
 /// Uses `lru::LruCache` for O(1) get/put with automatic eviction of the
@@ -736,6 +801,9 @@ impl SessionManager {
     /// `GET /sessions` endpoint to surface server-authoritative titles.
     pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(false)
+            .into_iter()
+            .map(|(id, count, title, _updated_at)| (id, count, title))
+            .collect()
     }
 
     /// List only top-level sessions — those whose topic is empty (the
@@ -758,38 +826,60 @@ impl SessionManager {
     /// pre-#617 sessions).
     pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(true)
+            .into_iter()
+            .map(|(id, count, title, _updated_at)| (id, count, title))
+            .collect()
+    }
+
+    /// Like [`Self::list_top_level_sessions_with_title`] but also returns each
+    /// session's recency timestamp — `SessionMeta.updated_at`, or the JSONL
+    /// file's mtime when the meta line is missing/unparseable, or `None` when
+    /// neither is available. Backs the `updated_at` field on the WS
+    /// `session/list` RPC so clients can sort by recency.
+    pub fn list_top_level_sessions_with_meta(&self) -> Vec<SessionTitleMetaRow> {
+        self.list_sessions_inner_with_title(true)
     }
 
     fn list_sessions_inner_with_title(
         &self,
         skip_internal_topics: bool,
-    ) -> Vec<(String, usize, Option<String>)> {
+    ) -> Vec<SessionTitleMetaRow> {
         // Reuse the path discovery from list_sessions_inner, but read each
         // file's first line to extract the title alongside the line count.
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
 
-        let push_with_title =
-            |path: &Path,
-             session_key: String,
-             seen: &mut std::collections::HashSet<String>,
-             out: &mut Vec<(String, usize, Option<String>)>| {
-                if seen.contains(&session_key) {
-                    return;
-                }
-                // Read just the first line for metadata; fall back to count_lines
-                // for the message count.
-                let title = std::fs::read_to_string(path).ok().and_then(|content| {
+        let push_with_title = |path: &Path,
+                               session_key: String,
+                               seen: &mut std::collections::HashSet<String>,
+                               out: &mut Vec<SessionTitleMetaRow>| {
+            if seen.contains(&session_key) {
+                return;
+            }
+            // Read just the first line for metadata (title + updated_at);
+            // fall back to count_lines for the message count.
+            let (title, updated_at) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| {
                     content
                         .lines()
                         .next()
                         .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
-                        .and_then(|meta| meta.title)
-                });
-                let count = Self::count_lines(path);
-                seen.insert(session_key.clone());
-                out.push((session_key, count, title));
-            };
+                })
+                .map(|meta| (meta.title, Some(meta.updated_at)))
+                .unwrap_or((None, None));
+            // Cheap recency fallback when the meta line is missing or
+            // unparseable: the JSONL file's own mtime.
+            let updated_at = updated_at.or_else(|| {
+                std::fs::metadata(path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .map(DateTime::<Utc>::from)
+            });
+            let count = Self::count_lines(path);
+            seen.insert(session_key.clone());
+            out.push((session_key, count, title, updated_at));
+        };
 
         if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
             for entry in entries.flatten() {
@@ -1225,14 +1315,11 @@ impl SessionManager {
                     return None;
                 }
 
-                let mut messages: Vec<Message> = lines
-                    .filter(|line| !line.trim().is_empty())
-                    .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-
-                // M8.10 PR #1: synthesize `thread_id` for legacy rows
-                // (pre-field). In-memory only.
-                synthesize_thread_ids(&mut messages);
+                // Assemble messages, applying any append-only rollback control
+                // records at their position in the log and gap-filling legacy
+                // `thread_id`s in-memory (M8.10). Files without control records
+                // parse identically to the prior single-pass load.
+                let messages = assemble_session_messages(lines);
 
                 Some(Session {
                     key: key.clone(),
@@ -1590,6 +1677,93 @@ impl SessionManager {
     /// stale post-write reads.
     pub fn invalidate_cache(&mut self, key: &SessionKey) {
         self.cache.pop(&key.0);
+    }
+
+    /// Roll back the last `num_turns` user turns for `key` (conversation-only
+    /// rewind): append an idempotent rollback marker to the session JSONL and
+    /// trim the in-memory transcript to match. Returns the number of user turns
+    /// actually dropped, clamped to the session's turn count.
+    ///
+    /// The marker is appended to the same on-disk file that holds the session's
+    /// messages (per-user layout preferred, legacy flat as fallback), so both
+    /// [`Self::load_from_disk`] and the per-user `SessionHandle` load path
+    /// replay the drop at the marker's log position on the next load. This is
+    /// what keeps the trim durable without truncating history. `num_turns == 0`
+    /// is a defensive no-op (the handler rejects it as `invalid_params`).
+    ///
+    /// Conversation-only: no git, worktree, or workspace file state is touched.
+    pub async fn rollback_last_n_user_turns(
+        &mut self,
+        key: &SessionKey,
+        num_turns: u32,
+    ) -> Result<u32> {
+        // Ensure the session is resident so the trim reflects the full
+        // (merged) on-disk transcript.
+        let _ = self.get_or_create(key).await;
+        let dropped = {
+            let session = self
+                .cache
+                .peek(&key.0)
+                .ok_or_else(|| eyre::eyre!("session not in cache after get_or_create: {key}"))?;
+            num_turns.min(crate::resume_policy::count_user_turns(&session.messages))
+        };
+        if dropped == 0 {
+            return Ok(0);
+        }
+        // Durable first: append the append-only marker to disk so a crash
+        // between here and the in-memory trim still replays identically on the
+        // next load.
+        self.append_rollback_marker(key, num_turns).await?;
+        // Trim the in-memory mirror to match the persisted state so the next
+        // turn continues from the trimmed transcript.
+        if let Some(session) = self.cache.get_mut(&key.0) {
+            crate::resume_policy::drop_last_n_user_turns(&mut session.messages, num_turns);
+            session.updated_at = Utc::now();
+        }
+        Ok(dropped)
+    }
+
+    /// Append a rollback control line to the on-disk JSONL for `key`. Chooses
+    /// the per-user layout file when present, else the legacy flat file; when
+    /// neither exists there is nothing on disk to trim on reload, so the append
+    /// is skipped (the in-memory trim is authoritative for a cache-only
+    /// session).
+    async fn append_rollback_marker(&self, key: &SessionKey, num_turns: u32) -> Result<()> {
+        let flat_path = self.session_path(key);
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let per_user_path = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+
+        // Co-locate the marker with the messages so `load_from_disk`'s per-file
+        // fold applies the drop against the right transcript: per-user
+        // (canonical) wins, then legacy flat.
+        let target = if per_user_path.exists() {
+            per_user_path
+        } else if flat_path.exists() {
+            flat_path
+        } else {
+            return Ok(());
+        };
+
+        let line = rollback_marker_line(num_turns)?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&target)?;
+            writeln!(file, "{line}")?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+        Ok(())
     }
 
     /// Scan the per-user layout for every JSONL belonging to `base_key` and
@@ -2338,14 +2512,10 @@ impl SessionHandle {
             return None;
         }
 
-        let mut messages: Vec<Message> = lines
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-
-        // M8.10 PR #1: synthesize `thread_id` for legacy rows that pre-date
-        // the field. In-memory only — nothing is rewritten on load.
-        synthesize_thread_ids(&mut messages);
+        // Assemble messages, replaying any append-only rollback control
+        // records at their log position so a rewind survives a per-user
+        // reload too (this path backs the next turn's `SessionHandle::open`).
+        let messages = assemble_session_messages(lines);
 
         debug!(key = %key, messages = messages.len(), "Loaded session from disk");
 
@@ -2824,6 +2994,51 @@ mod tests {
             assert_eq!(session.messages.len(), 2);
             assert_eq!(session.messages[0].content, "saved");
             assert_eq!(session.messages[1].content, "reply");
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_last_n_user_turns_trims_and_survives_reload() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "rollback-rt");
+
+        {
+            let mut mgr = SessionManager::open(tmp.path()).unwrap();
+            // Seed 3 user turns (user + assistant each) with persisted
+            // thread_ids so the drop can group them.
+            for n in 1..=3 {
+                let tid = format!("t{n}");
+                let mut user = make_message(MessageRole::User, &format!("turn {n}"));
+                user.client_message_id = Some(tid.clone());
+                user.thread_id = Some(tid.clone());
+                mgr.add_message(&key, user).await.unwrap();
+                let mut asst = make_message(MessageRole::Assistant, &format!("reply {n}"));
+                asst.thread_id = Some(tid.clone());
+                mgr.add_message(&key, asst).await.unwrap();
+            }
+
+            // Roll back the last user turn: appends the marker + trims memory.
+            let dropped = mgr.rollback_last_n_user_turns(&key, 1).await.unwrap();
+            assert_eq!(dropped, 1);
+
+            let session = mgr.get_or_create(&key).await;
+            assert_eq!(session.messages.len(), 4, "turns 1 & 2 remain in memory");
+            assert!(session.messages.iter().all(|m| m.content != "turn 3"));
+            assert!(session.messages.iter().all(|m| m.content != "reply 3"));
+        }
+
+        // A fresh manager reloads from disk; the append-only marker replays the
+        // trim (NOT a truncation — the dropped rows are still on disk).
+        {
+            let mut reload = SessionManager::open(tmp.path()).unwrap();
+            let session = reload.get_or_create(&key).await;
+            let contents: Vec<&String> = session.messages.iter().map(|m| &m.content).collect();
+            assert_eq!(
+                session.messages.len(),
+                4,
+                "rollback marker must survive reload; got {contents:?}"
+            );
+            assert!(session.messages.iter().all(|m| m.content != "turn 3"));
         }
     }
 
@@ -3456,6 +3671,38 @@ mod tests {
         let top = mgr.list_top_level_sessions();
         let ids: Vec<&str> = top.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["api:web-tasks"], "got {top:?}");
+    }
+
+    #[test]
+    fn list_top_level_sessions_with_meta_surfaces_updated_at() {
+        use chrono::TimeZone;
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        let user_dir = tmp.path().join("users/cli%3Ameta-recency/sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let updated = Utc.with_ymd_and_hms(2026, 6, 30, 8, 15, 0).unwrap();
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "cli:meta-recency",
+            "title": "Recency Chat",
+            "created_at": Utc.with_ymd_and_hms(2026, 6, 30, 8, 0, 0).unwrap(),
+            "updated_at": updated,
+        });
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+
+        let rows = mgr.list_top_level_sessions_with_meta();
+        let row = rows
+            .iter()
+            .find(|(id, ..)| id == "cli:meta-recency")
+            .expect("session present");
+        assert_eq!(row.2.as_deref(), Some("Recency Chat"));
+        assert_eq!(row.3, Some(updated), "updated_at read from SessionMeta");
     }
 
     /// Regression guard for the O(N) hang. With 5 000 synthetic

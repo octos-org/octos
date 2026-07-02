@@ -471,6 +471,73 @@ fn is_whitespace_only_assistant(msg: &Message) -> bool {
     true
 }
 
+/// Count the number of distinct user turns in `messages`.
+///
+/// A "user turn" is the message group sharing one `User` message's
+/// [`Message::thread_id`] (M8.10 thread grouping). System messages and the
+/// assistant/tool replies that inherit a turn's thread_id never start a new
+/// turn, so the count equals the number of distinct thread_ids rooted by a
+/// `User` message.
+pub(crate) fn count_user_turns(messages: &[Message]) -> u32 {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut count = 0_u32;
+    for msg in messages {
+        if matches!(msg.role, MessageRole::User) {
+            if let Some(tid) = msg.thread_id.as_deref() {
+                if seen.insert(tid) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Drop the last `n` user turns from `messages` in place, returning the number
+/// of turns actually removed (clamped to the transcript's turn count).
+///
+/// A user turn is the set of messages sharing one `User` message's
+/// [`Message::thread_id`] (M8.10). Removing the last `n` turns deletes those
+/// groups' user + assistant + tool messages — i.e. everything from the
+/// `n`-from-last user message onward. Leading `System` messages and any
+/// compaction-summary `System` message carry `thread_id == None`, are never
+/// part of a user turn, and always survive; dropping every user turn therefore
+/// returns the transcript to its pre-first-user state.
+///
+/// Deterministic and idempotent when driven by the append-only rollback marker:
+/// applied at the marker's position in the JSONL log, replaying the same log
+/// always yields the same trimmed transcript. `n == 0` is a no-op.
+pub(crate) fn drop_last_n_user_turns(messages: &mut Vec<Message>, n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    // Ordered, distinct thread_ids rooted by a `User` message.
+    let mut user_threads: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for msg in messages.iter() {
+        if matches!(msg.role, MessageRole::User) {
+            if let Some(tid) = msg.thread_id.clone() {
+                if seen.insert(tid.clone()) {
+                    user_threads.push(tid);
+                }
+            }
+        }
+    }
+    let drop_count = (n as usize).min(user_threads.len());
+    if drop_count == 0 {
+        return 0;
+    }
+    let to_drop: HashSet<String> = user_threads
+        .split_off(user_threads.len() - drop_count)
+        .into_iter()
+        .collect();
+    messages.retain(|msg| match msg.thread_id.as_deref() {
+        Some(tid) => !to_drop.contains(tid),
+        None => true,
+    });
+    drop_count as u32
+}
+
 /// Pass 4: collect content-replacement refs from tool results.
 ///
 /// Scans every tool-role message for file paths. Heuristic: parse the tool
@@ -1185,5 +1252,106 @@ mod tests {
         assert_eq!(outcome.messages.len(), 0);
         assert_eq!(outcome.report.input_len, 0);
         assert_eq!(outcome.report.output_len, 0);
+    }
+
+    fn user_in_thread(content: &str, thread: &str) -> Message {
+        let mut msg = user(content);
+        msg.client_message_id = Some(thread.into());
+        msg.thread_id = Some(thread.into());
+        msg
+    }
+
+    fn assistant_in_thread(content: &str, thread: &str) -> Message {
+        let mut msg = assistant_text(content);
+        msg.thread_id = Some(thread.into());
+        msg
+    }
+
+    fn system_msg(content: &str) -> Message {
+        let mut msg = user(content);
+        msg.role = MessageRole::System;
+        msg.client_message_id = None;
+        msg.thread_id = None;
+        msg
+    }
+
+    /// Build a 3-user-turn transcript with a leading system prompt.
+    fn three_turn_transcript() -> Vec<Message> {
+        vec![
+            system_msg("you are octos"),
+            user_in_thread("turn 1", "t1"),
+            assistant_in_thread("reply 1", "t1"),
+            user_in_thread("turn 2", "t2"),
+            assistant_in_thread("reply 2", "t2"),
+            user_in_thread("turn 3", "t3"),
+            assistant_in_thread("reply 3", "t3"),
+        ]
+    }
+
+    #[test]
+    fn drop_last_user_turn_removes_only_final_turn() {
+        let mut messages = three_turn_transcript();
+        let dropped = drop_last_n_user_turns(&mut messages, 1);
+        assert_eq!(dropped, 1);
+        // System + turns 1 & 2 survive; turn 3's user+assistant are gone.
+        assert_eq!(count_user_turns(&messages), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "you are octos".to_string(),
+                "turn 1".into(),
+                "reply 1".into(),
+                "turn 2".into(),
+                "reply 2".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_more_turns_than_exist_returns_to_pre_first_user_state() {
+        let mut messages = three_turn_transcript();
+        // n greater than the turn count clamps to 3 and leaves only the
+        // leading system message (the pre-first-user prefix).
+        let dropped = drop_last_n_user_turns(&mut messages, 9);
+        assert_eq!(dropped, 3);
+        assert_eq!(count_user_turns(&messages), 0);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, MessageRole::System));
+    }
+
+    #[test]
+    fn drop_preserves_interleaved_summary_system_message() {
+        // A compaction-summary System message (thread_id == None) sitting
+        // after turn 1 must survive a rollback of the last turn.
+        let mut messages = vec![
+            system_msg("base prompt"),
+            user_in_thread("turn 1", "t1"),
+            assistant_in_thread("reply 1", "t1"),
+            system_msg("summary of earlier context"),
+            user_in_thread("turn 2", "t2"),
+            assistant_in_thread("reply 2", "t2"),
+        ];
+        let dropped = drop_last_n_user_turns(&mut messages, 1);
+        assert_eq!(dropped, 1);
+        assert_eq!(count_user_turns(&messages), 1);
+        // Both system messages survive.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m.role, MessageRole::System))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn drop_zero_turns_is_noop() {
+        let mut messages = three_turn_transcript();
+        let before = messages.len();
+        assert_eq!(drop_last_n_user_turns(&mut messages, 0), 0);
+        assert_eq!(messages.len(), before);
     }
 }
