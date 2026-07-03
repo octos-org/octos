@@ -962,6 +962,9 @@ pub mod methods {
 
     /// UPCR-2026-009 `session/hydrate` — authoritative chat-state reload.
     pub const SESSION_HYDRATE: &str = "session/hydrate";
+    /// `session/rollback` — drops the last N user turns and returns the
+    /// trimmed transcript shaped like a `session/hydrate` result.
+    pub const SESSION_ROLLBACK: &str = "session/rollback";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
@@ -2703,6 +2706,24 @@ pub struct SessionHydrateResult {
     /// edge cases codex flagged on PR landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
+}
+
+// ----- `session/rollback` -----
+
+/// Params for `session/rollback`. Drops the last `num_turns` user turns from
+/// the named session and returns the trimmed transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRollbackParams {
+    pub session_id: SessionKey,
+    pub num_turns: u32,
+}
+
+/// Result for `session/rollback`. Contains how many turns were dropped and the
+/// trimmed session transcript, shaped identically to `SessionHydrateResult`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRollbackResult {
+    pub dropped_turns: u32,
+    pub thread: SessionHydrateResult,
 }
 
 // ----- UPCR-2026-010 `thread/graph/get` -----
