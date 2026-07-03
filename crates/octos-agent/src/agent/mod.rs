@@ -33,6 +33,7 @@ use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 use verifier::AgentVerifierConfig;
 
+pub use message_repair::normalize_tool_call_id;
 pub use realtime::RealtimeController;
 
 tokio::task_local! {
