@@ -36,6 +36,13 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "GEMINI_BASE_URL",
     "GOOGLE_API_KEY",
     "GOOGLE_BASE_URL",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "VERTEX_SA_JSON",
+    "VERTEX_BASE_URL",
+    "VERTEX_ACCESS_TOKEN",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
 ];
@@ -1062,6 +1069,56 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn profile_plugin_env_forwards_vertex_service_account_by_its_own_name() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let prev_google_credentials = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+        // SAFETY: serialized by `synthesis_env_lock`; this test verifies profile
+        // env forwarding without inheriting the developer/CI host's Google SDK env.
+        unsafe { std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS") };
+
+        let service_account = "{\"type\":\"service_account\",\"project_id\":\"mofa-test\"}";
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                env_vars: [
+                    ("VERTEX_SA_JSON".to_string(), service_account.to_string()),
+                    (
+                        "GOOGLE_CLOUD_LOCATION".to_string(),
+                        "us-central1".to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&("VERTEX_SA_JSON".to_string(), service_account.to_string())));
+        assert!(env.contains(&(
+            "GOOGLE_CLOUD_LOCATION".to_string(),
+            "us-central1".to_string()
+        )));
+        assert!(
+            !env.iter()
+                .any(|(key, _)| key == "GOOGLE_APPLICATION_CREDENTIALS")
+        );
+
+        // SAFETY: serialized by `synthesis_env_lock`.
+        if let Some(value) = prev_google_credentials {
+            unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", value) };
+        }
     }
 
     /// Mutex serializing build_synthesis_config env tests in this module.
