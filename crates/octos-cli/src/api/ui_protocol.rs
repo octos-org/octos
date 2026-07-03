@@ -17158,7 +17158,14 @@ fn appui_loop_assistant_reply_for_self_paced(
     match captured_response_content {
         Some(content) if !content.is_empty() => Some(content.to_owned()),
         Some(_) => None,
-        None => history_fallback,
+        // No capture (interrupt / agent error before EndTurn): use the
+        // history reply if present, else `Some("")`. Returning `Some("")`
+        // for a true no-reply is deliberate — the empty reply carries no
+        // `<<loop-next-in: …>>` sentinel, so `apply_self_paced_response`
+        // stamps the DEFAULT delay. The old `None` here parked the loop at
+        // `next_run_at_ms: None`, which the due-scan never visits again —
+        // one interrupted turn silently killed the loop.
+        None => Some(history_fallback.unwrap_or_default()),
     }
 }
 
@@ -24396,6 +24403,19 @@ mod tests {
         assert_eq!(
             blank_capture, None,
             "empty captured content must not stamp a default-delay reschedule via history fallback"
+        );
+
+        // A fire with NO capture and NO history reply (interrupt / agent
+        // error before anything persisted) must still reschedule: the
+        // picker yields an empty reply, which carries no sentinel, so the
+        // orchestrator stamps the DEFAULT delay. The old `None` here parked
+        // the loop at `next_run_at_ms: None` — permanently dead after one
+        // interrupted turn.
+        let reply_less = appui_loop_assistant_reply_for_self_paced(None, None);
+        assert_eq!(
+            reply_less.as_deref(),
+            Some(""),
+            "a reply-less fire must reschedule with the default delay, not kill the loop"
         );
     }
 

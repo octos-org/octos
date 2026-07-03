@@ -4854,19 +4854,35 @@ impl SessionActor {
                         .last()
                         .map(|(_, message)| message.content.clone())
                 };
-                if let Some(reply) = assistant_reply {
-                    if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
-                        &loop_id,
-                        &profile_id,
-                        &reply,
-                    ) {
-                        info!(
-                            session = %self.session_key,
-                            loop_id = %loop_id,
-                            error = %err.message,
-                            "apply_self_paced_response skipped"
-                        );
-                    }
+                // A reply-less fire (interrupt / agent error / empty content)
+                // still reschedules: the empty reply carries no
+                // `<<loop-next-in: …>>` sentinel, so the orchestrator applies
+                // the DEFAULT self-paced delay. Skipping here parked the loop
+                // at `next_run_at_ms: None`, which the due-scan never visits
+                // again — one failed turn silently killed the loop.
+                //
+                // Deliberate divergence from the AppUI path (codex round-1):
+                // AppUI captures the EndTurn payload and can distinguish a
+                // DELIBERATE blank reply (skip, #1134 contract) from a true
+                // no-reply (reschedule). This path has no capture —
+                // `process_inbound` doesn't persist empty assistant content
+                // and the history scan filters empties — so blank and error
+                // are indistinguishable here, and liveness wins: a blank
+                // loop turn retries at the default delay instead of dying.
+                // An explicit model stop should be a sentinel (follow-up),
+                // not an unpersistable blank.
+                let reply = assistant_reply.unwrap_or_default();
+                if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                    &loop_id,
+                    &profile_id,
+                    &reply,
+                ) {
+                    info!(
+                        session = %self.session_key,
+                        loop_id = %loop_id,
+                        error = %err.message,
+                        "apply_self_paced_response skipped"
+                    );
                 }
             }
             default_agent_orchestrator().mark_continuation_completed(
