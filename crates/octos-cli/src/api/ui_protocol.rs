@@ -4996,6 +4996,14 @@ where
         }
     }
 
+    // Let in-flight turns finalize (persist + ledger terminal) before the
+    // process exit cancels their tasks — see drain_connection_turns_for_shutdown.
+    drain_connection_turns_for_shutdown(
+        &active_turns,
+        &connection_turns,
+        STDIO_SHUTDOWN_TURN_DRAIN_MAX,
+    )
+    .await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -23824,6 +23832,100 @@ mod tests {
             "no request after the writer failure may be dispatched"
         );
         reset_stdio_dispatch_count_for_test();
+    }
+
+    /// Shutdown must WAIT for this connection's in-flight turns to finalize
+    /// instead of letting process exit cancel their tasks mid-write.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_waits_for_turn_finalization() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let session = SessionKey("local:drain-wait".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns
+            .lock()
+            .await
+            .insert(session.clone(), turn_id);
+        let remover = active_turns.clone();
+        let session_for_removal = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            remover.lock().await.remove(&session_for_removal);
+        });
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(drained, "drain must return once the turn finalizes");
+    }
+
+    /// A turn that never finalizes must not hang shutdown forever, and turns
+    /// owned by OTHER connections (the registry is process-global) must not
+    /// block this exit at all.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let foreign_abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            SessionKey("local:foreign".into()),
+            ActiveTurn {
+                turn_id: TurnId::new(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort: foreign_abort,
+            },
+        );
+        assert!(
+            drain_connection_turns_for_shutdown(
+                &active_turns,
+                &connection_turns,
+                std::time::Duration::from_secs(5),
+            )
+            .await,
+            "turns owned by other connections must not block shutdown"
+        );
+
+        let session = SessionKey("local:drain-stuck".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns.lock().await.insert(session, turn_id);
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(!drained, "drain must give up at the deadline");
     }
 
     #[tokio::test]
