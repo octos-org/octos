@@ -271,28 +271,29 @@ fn extract_abstract(content: &str) -> String {
 }
 
 /// Strip YAML frontmatter (`---` delimited), returning only the body.
+///
+/// Both fences must be bare `---` lines: `---abc` is not an opener, `----`
+/// is a horizontal rule rather than a closing fence, and an empty
+/// frontmatter block (`---\n---\n`) strips cleanly.
 fn strip_frontmatter(content: &str) -> &str {
     let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
+    let Some(after_opener) = trimmed.strip_prefix("---") else {
         return content;
+    };
+    let Some(rest) = after_opener
+        .strip_prefix("\r\n")
+        .or_else(|| after_opener.strip_prefix('\n'))
+    else {
+        return content;
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            return &rest[offset + line.len()..];
+        }
+        offset += line.len();
     }
-    let after_first = &trimmed[3..];
-    // Skip past the first newline after opening ---
-    let after_first = after_first
-        .strip_prefix('\r')
-        .unwrap_or(after_first)
-        .strip_prefix('\n')
-        .unwrap_or(after_first);
-    if let Some(end) = after_first.find("\n---") {
-        let body_start = end + 4; // skip "\n---"
-        after_first[body_start..]
-            .strip_prefix('\r')
-            .unwrap_or(&after_first[body_start..])
-            .strip_prefix('\n')
-            .unwrap_or(&after_first[body_start..])
-    } else {
-        content
-    }
+    content
 }
 
 #[cfg(test)]
@@ -438,6 +439,35 @@ mod tests {
     fn test_strip_frontmatter_no_frontmatter() {
         let content = "Just plain text.";
         assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_empty_frontmatter() {
+        assert_eq!(strip_frontmatter("---\n---\nBody here."), "Body here.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_requires_bare_opener_line() {
+        // "---abc" is a plain text line, not a frontmatter fence.
+        let content = "---abc\nnot frontmatter\n---\nBody";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_ignores_longer_dash_runs() {
+        // A "----" line is a horizontal rule / typo, not a closing fence.
+        let content = "---\nname: x\n----\nBody";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_crlf() {
+        assert_eq!(strip_frontmatter("---\r\nname: x\r\n---\r\nBody"), "Body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_closing_fence_at_eof() {
+        assert_eq!(strip_frontmatter("---\nname: x\n---"), "");
     }
 
     #[tokio::test]

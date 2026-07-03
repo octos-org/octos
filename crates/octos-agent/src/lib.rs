@@ -78,6 +78,7 @@ pub use agent::{
         SHELL_SPIRAL_VARIANT,
     },
     memory::MIN_EPISODE_SIMILARITY,
+    normalize_tool_call_id,
     realtime::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,

@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
+use octos_agent::normalize_tool_call_id;
 use octos_core::{Message, MessageRole, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -467,6 +468,13 @@ fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<P
 fn persist_tool_output_artifacts(data_dir: &Path, manager: &ContextManager) -> Result<(), String> {
     for (artifact_ref, bytes) in &manager.tool_output_artifacts {
         let path = context_ledger_artifact_path(data_dir, artifact_ref)?;
+        // Artifacts are content-addressed (sha256 in the ref), so an existing
+        // file is already current. Skipping it keeps snapshot persistence
+        // (which runs on every message commit) from rewriting every artifact
+        // the session has ever produced.
+        if path.exists() {
+            continue;
+        }
         atomic_write_bytes(&path, bytes)?;
     }
     Ok(())
@@ -630,6 +638,36 @@ fn remove_all_visual_markers(s: &str) -> String {
     out
 }
 
+/// Normalize raw provider tool-call ids on items IMPORTED from a persisted
+/// snapshot or a forked parent. Record-time normalization only covers
+/// freshly-recorded messages; a snapshot persisted by a pre-normalization
+/// daemon can carry raw ids (`toolu_*`, sanitized kimi ids, …) that would
+/// re-introduce the frame/vector id mismatch the record-time pass exists to
+/// prevent. No-op for already-normal ids.
+fn normalize_imported_tool_call_ids(items: Vec<TranscriptItem>) -> Vec<TranscriptItem> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            match &mut item.kind {
+                TranscriptItemKind::AssistantToolCall { call_id, .. } => {
+                    let normalized = normalize_tool_call_id(call_id);
+                    if *call_id != normalized {
+                        *call_id = normalized;
+                    }
+                }
+                TranscriptItemKind::ToolOutput { envelope } => {
+                    let normalized = normalize_tool_call_id(&envelope.tool_call_id);
+                    if envelope.tool_call_id != normalized {
+                        envelope.tool_call_id = normalized;
+                    }
+                }
+                _ => {}
+            }
+            item
+        })
+        .collect()
+}
+
 /// #1477: scrub the in-band `[[VISUAL:...]]` directive from items IMPORTED from
 /// a persisted snapshot or a forked parent. The record-time sanitizer in
 /// `record_message_with_source_ref` only covers freshly-recorded messages; items
@@ -716,8 +754,9 @@ impl ContextManager {
             .collect();
         // #1477: a forked parent's items bypass `record_message_with_source_ref`,
         // so scrub any in-band visual marker here too (see
-        // `sanitize_imported_visual_markers`).
-        let items = sanitize_imported_visual_markers(items);
+        // `sanitize_imported_visual_markers`) and normalize legacy raw
+        // tool-call ids for the same reason.
+        let items = normalize_imported_tool_call_ids(sanitize_imported_visual_markers(items));
         let next_item_seq = items
             .iter()
             .filter_map(|item| {
@@ -830,8 +869,9 @@ impl ContextManager {
         // `context_ledger_covers_history` will happily Load such a snapshot
         // instead of rebuilding — so `for_prompt` would re-emit the marker to
         // the model. Scrub it at the import boundary, the snapshot-side
-        // complement to the record-time sanitizer.
-        let items = sanitize_imported_visual_markers(items);
+        // complement to the record-time sanitizer. Same for legacy raw
+        // tool-call ids, which must import in the loop's normalized form.
+        let items = normalize_imported_tool_call_ids(sanitize_imported_visual_markers(items));
         let next_item_seq = items
             .iter()
             .filter_map(|item| item.id.as_str().strip_prefix("ctxitem_"))
@@ -1013,7 +1053,14 @@ impl ContextManager {
                 for tool_call in message.tool_calls.iter().flatten() {
                     ids.push(self.record_item_with_source_ref(
                         TranscriptItemKind::AssistantToolCall {
-                            call_id: tool_call.id.clone(),
+                            // Record-time normalization: the loop rewrites
+                            // provider ids (`toolu_*`, sanitized kimi ids, …)
+                            // to the canonical `call_` form in the prompt
+                            // vector; the transcript must store the same form
+                            // or the bridge's exact-id coverage comparison
+                            // breaks (the CompactAndRetry path records before
+                            // the loop's normalize pass runs).
+                            call_id: normalize_tool_call_id(&tool_call.id),
                             name: tool_call.name.clone(),
                             arguments: tool_call.arguments.clone(),
                         },
@@ -1052,6 +1099,10 @@ impl ContextManager {
             }
             MessageRole::Tool => {
                 if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+                    // Lookup + record under the loop's canonical id form —
+                    // stored AssistantToolCall items are normalized at
+                    // record time.
+                    let tool_call_id = normalize_tool_call_id(tool_call_id);
                     // #982: resolve the real tool_name from a prior
                     // AssistantToolCall transcript entry instead of
                     // burning the placeholder "unknown" into the
@@ -1060,7 +1111,7 @@ impl ContextManager {
                     // tool output, which means the envelope must carry
                     // the same tool_name the LLM saw.
                     let tool_name = self
-                        .tool_name_for_call_id(tool_call_id)
+                        .tool_name_for_call_id(&tool_call_id)
                         .unwrap_or_else(|| "unknown".to_owned());
                     ids.push(self.record_tool_output_with_source_ref(
                         tool_call_id,
@@ -1105,7 +1156,9 @@ impl ContextManager {
         raw_output: &str,
         source_ref: Option<TranscriptSourceRef>,
     ) -> TranscriptItemId {
-        let tool_call_id = tool_call_id.into();
+        // Same record-time normalization as `AssistantToolCall` recording —
+        // outputs must pair with calls under the loop's canonical id form.
+        let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
         let (model_visible_content, truncation_reason) = truncate_utf8(
@@ -1320,8 +1373,12 @@ impl ContextManager {
         let mut repaired_item_ids = Vec::new();
         let mut synthetic_item_ids = Vec::new();
         let mut truncated_item_ids = Vec::new();
-        let mut emitted_tool_calls = HashSet::new();
-        let mut emitted_tool_outputs = HashSet::new();
+        // Tool outputs are consumed by TRANSCRIPT ITEM ID, not by
+        // tool_call_id: index-based provider ids (kimi `functions.foo:0`,
+        // vllm `call_0`) legitimately repeat across turns, so a call must
+        // pair with the first unconsumed output at or after its own
+        // position rather than the first id match anywhere.
+        let mut consumed_tool_outputs: HashSet<TranscriptItemId> = HashSet::new();
         let mut index = 0;
 
         while index < self.items.len() {
@@ -1363,6 +1420,7 @@ impl ContextManager {
                     index += 1;
                 }
                 TranscriptItemKind::AssistantToolCall { .. } => {
+                    let group_start = index;
                     let mut source_item_ids = Vec::new();
                     let mut call_ids = Vec::new();
                     let mut calls = Vec::new();
@@ -1376,7 +1434,6 @@ impl ContextManager {
                         else {
                             break;
                         };
-                        emitted_tool_calls.insert(call_id.clone());
                         source_item_ids.push(item.id.clone());
                         call_ids.push(call_id.clone());
                         calls.push(ToolCall {
@@ -1409,17 +1466,40 @@ impl ContextManager {
                     ));
 
                     for call_id in call_ids {
-                        if let Some((tool_item_id, envelope)) =
-                            self.items.iter().find_map(|candidate| {
+                        // Positional pairing: the first UNCONSUMED output with
+                        // this call_id at or after the call group's own
+                        // position. Recording order guarantees outputs follow
+                        // their call, so an id reused by a later turn cannot
+                        // steal this group's output (and vice versa). The
+                        // search additionally stops at the NEXT call carrying
+                        // the same id: when THIS group's output is missing
+                        // entirely, it must synthesize rather than steal the
+                        // output that positionally belongs to that later call.
+                        let next_same_id_call = self.items[index..]
+                            .iter()
+                            .position(|candidate| {
+                                matches!(
+                                    &candidate.kind,
+                                    TranscriptItemKind::AssistantToolCall { call_id: later, .. }
+                                        if later == &call_id
+                                )
+                            })
+                            .map(|offset| index + offset)
+                            .unwrap_or(self.items.len());
+                        if let Some((tool_item_id, envelope)) = self.items
+                            [group_start..next_same_id_call]
+                            .iter()
+                            .find_map(|candidate| {
                                 let TranscriptItemKind::ToolOutput { envelope } = &candidate.kind
                                 else {
                                     return None;
                                 };
-                                (envelope.tool_call_id == call_id)
-                                    .then_some((candidate.id.clone(), envelope))
+                                (envelope.tool_call_id == call_id
+                                    && !consumed_tool_outputs.contains(&candidate.id))
+                                .then_some((candidate.id.clone(), envelope))
                             })
                         {
-                            emitted_tool_outputs.insert(call_id.clone());
+                            consumed_tool_outputs.insert(tool_item_id.clone());
                             let mut msg =
                                 message(MessageRole::Tool, envelope.model_visible_content.clone());
                             msg.tool_call_id = Some(call_id.clone());
@@ -1446,24 +1526,14 @@ impl ContextManager {
                         }
                     }
                 }
-                TranscriptItemKind::ToolOutput { envelope } => {
-                    if emitted_tool_outputs.contains(&envelope.tool_call_id) {
-                        index += 1;
-                        continue;
-                    }
-                    if emitted_tool_calls.contains(&envelope.tool_call_id) {
-                        let mut msg =
-                            message(MessageRole::Tool, envelope.model_visible_content.clone());
-                        msg.tool_call_id = Some(envelope.tool_call_id.clone());
-                        entries.push(PromptMessageEntry::tool_output(
-                            msg,
-                            item.id.clone(),
-                            envelope.tool_call_id.clone(),
-                        ));
-                        if envelope.truncation_reason.is_some() {
-                            truncated_item_ids.push(item.id.clone());
-                        }
-                    } else {
+                TranscriptItemKind::ToolOutput { .. } => {
+                    // Consumed outputs were already emitted adjacent to their
+                    // call group above. Anything else is an orphan (no call
+                    // recorded before it) or a surplus output for a call
+                    // already satisfied by an earlier item (duplicate provider
+                    // call ids) — emitting it would attach a second Tool row
+                    // for the same call_id, so drop it with evidence.
+                    if !consumed_tool_outputs.contains(&item.id) {
                         dropped_item_ids.push(item.id.clone());
                     }
                     index += 1;
@@ -1507,9 +1577,17 @@ impl ContextManager {
                     index += 1;
                 }
                 TranscriptItemKind::CompactionSummary { summary, .. } => {
+                    // User, not System: the agent loop's
+                    // `normalize_system_messages` rewrites every non-leading
+                    // System row before the prompt bridge compares this frame
+                    // against the loop vector, and any rewrite breaks the
+                    // bridge's contiguous coverage window (wholesale
+                    // re-recording of the transcript). A User row passes
+                    // through the loop untouched; the entry stays protected so
+                    // prompt trimming can never drop the summary.
                     entries.push(PromptMessageEntry::protected(
                         message(
-                            MessageRole::System,
+                            MessageRole::User,
                             format!("[Conversation summary]\n{summary}"),
                         ),
                         item.id.clone(),
@@ -1794,9 +1872,11 @@ fn first_removable_prompt_group(entries: &[PromptMessageEntry]) -> Option<(usize
         // target, and dropping the live request (e.g. a voice turn whose
         // protected compaction summary already fills the budget) would leave the
         // model answering nothing. See `voice_cap_keeps_current_request_*`.
+        // Protected User rows (e.g. the compaction summary) are context, not a
+        // later live request — they must not license trimming the current one.
         let has_later_user = entries[start + 1..]
             .iter()
-            .any(|entry| matches!(entry.message.role, MessageRole::User));
+            .any(|entry| !entry.protected && matches!(entry.message.role, MessageRole::User));
         if !has_later_user {
             return None;
         }
@@ -2088,15 +2168,15 @@ mod tests {
     #[test]
     fn prompt_normalization_synthesizes_missing_tool_output_and_drops_orphan() {
         let mut manager = ContextManager::new("s", None);
-        manager.record_message(&assistant_tool_call("call-1"));
-        manager.record_tool_output("orphan", "shell", "orphan output");
+        manager.record_message(&assistant_tool_call("call_1"));
+        manager.record_tool_output("call_orphan", "shell", "orphan output");
 
         let frame = manager.for_prompt(&PromptBuildPolicy::default());
 
         assert_eq!(frame.messages.len(), 2);
         assert_eq!(frame.messages[0].role, MessageRole::Assistant);
         assert_eq!(frame.messages[1].role, MessageRole::Tool);
-        assert_eq!(frame.messages[1].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(frame.messages[1].tool_call_id.as_deref(), Some("call_1"));
         assert!(frame.messages[1].content.contains("missing"));
         assert_eq!(frame.report.synthetic_item_ids.len(), 1);
         assert_eq!(frame.report.dropped_item_ids.len(), 1);
@@ -2180,6 +2260,259 @@ mod tests {
         assert!(
             !prompt.messages.iter().any(|m| m.content.contains("VISUAL")),
             "post-compaction prompt (incl. System summary) must be marker-free"
+        );
+    }
+
+    /// Tool-output artifacts are content-addressed (`tool-output/<sha>.txt`),
+    /// so an existing file is by definition current. Re-writing every
+    /// accumulated artifact on every snapshot persist turns each message
+    /// commit into O(session tool outputs) file writes.
+    #[test]
+    fn persist_skips_existing_content_addressed_artifacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = "coding:local:artifact-skip";
+        let mut manager = ContextManager::new(session_id, None);
+        manager.record_message(&assistant_tool_call("call_1"));
+        // Oversized output -> raw artifact sidecar.
+        manager.record_tool_output("call_1", "shell", &"y".repeat(20 * 1024));
+        persist_context_manager_snapshot(temp.path(), session_id, &manager).expect("first persist");
+
+        let artifact_ref = manager
+            .items()
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ToolOutput { envelope } => envelope.raw_artifact_ref.clone(),
+                _ => None,
+            })
+            .expect("raw artifact ref recorded");
+        let artifact_path = context_ledger_artifact_path(temp.path(), &artifact_ref)
+            .expect("artifact path resolves");
+        assert!(artifact_path.exists(), "first persist writes the artifact");
+
+        // Plant a sentinel: a second persist must SKIP the existing
+        // content-addressed file rather than rewrite it.
+        std::fs::write(&artifact_path, b"sentinel").expect("plant sentinel");
+        persist_context_manager_snapshot(temp.path(), session_id, &manager)
+            .expect("second persist");
+        assert_eq!(
+            std::fs::read(&artifact_path).expect("read artifact"),
+            b"sentinel",
+            "second persist must not rewrite an existing content-addressed artifact"
+        );
+    }
+
+    /// Index-based provider tool-call ids (kimi `functions.foo:0`, vllm
+    /// `call_0`) repeat the SAME `tool_call_id` in every assistant turn.
+    /// Pairing a call with the first matching output anywhere in the
+    /// transcript attaches turn 1's output to every later call and silently
+    /// drops the later real outputs. Pairing must be positional: each call
+    /// consumes the first unconsumed output at or after its own position.
+    #[test]
+    fn for_prompt_pairs_reused_tool_call_ids_positionally() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::user("first question"));
+        manager.record_message(&assistant_tool_call("call_0"));
+        manager.record_tool_output("call_0", "shell", "output for turn one");
+        manager.record_message(&Message::assistant("answer one"));
+        manager.record_message(&Message::user("second question"));
+        manager.record_message(&assistant_tool_call("call_0"));
+        manager.record_tool_output("call_0", "shell", "output for turn two");
+        manager.record_message(&Message::assistant("answer two"));
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+
+        let tool_outputs: Vec<&Message> = frame
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            tool_outputs.len(),
+            2,
+            "both real tool outputs must reach the prompt: {:#?}",
+            frame.messages
+        );
+        assert!(
+            tool_outputs[0].content.contains("turn one"),
+            "first call must pair with the first output (got {:?})",
+            tool_outputs[0].content
+        );
+        assert!(
+            tool_outputs[1].content.contains("turn two"),
+            "second call must pair with its own output, not a duplicate of turn one (got {:?})",
+            tool_outputs[1].content
+        );
+        assert!(
+            frame.report.synthetic_item_ids.is_empty(),
+            "no synthetic outputs should be fabricated when real outputs exist"
+        );
+        assert!(
+            frame.report.dropped_item_ids.is_empty(),
+            "no real output should be dropped when each call has exactly one output"
+        );
+    }
+
+    /// The agent loop's `normalize_tool_call_ids` rewrites provider ids
+    /// (`toolu_*`, kimi-style `functions_foo_0`, ...) to the canonical
+    /// `call_` form in the prompt vector before every model call. The
+    /// transcript must record ids in the SAME form, or the bridge's exact
+    /// coverage comparison between frame and vector re-records the
+    /// conversation as duplicates (raw ids can reach recording via the
+    /// CompactAndRetry path, which runs the bridge without the loop's
+    /// normalize pass).
+    #[test]
+    fn records_provider_tool_call_ids_in_loop_normal_form() {
+        let mut manager = ContextManager::new("s", None);
+        let mut msg = Message::assistant("");
+        msg.tool_calls = Some(vec![ToolCall {
+            id: "toolu_abc123".to_owned(),
+            name: "shell".to_owned(),
+            arguments: json!({}),
+            metadata: None,
+        }]);
+        manager.record_message(&msg);
+        manager.record_tool_output("toolu_abc123", "shell", "raw provider id output");
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let call_row = frame
+            .messages
+            .iter()
+            .find(|m| m.tool_calls.is_some())
+            .expect("call row present");
+        assert_eq!(
+            call_row.tool_calls.as_ref().unwrap()[0].id,
+            "call_abc123",
+            "recorded call id must match the loop's normalized form"
+        );
+        let tool_row = frame
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row present");
+        assert_eq!(
+            tool_row.tool_call_id.as_deref(),
+            Some("call_abc123"),
+            "recorded output id must match the loop's normalized form"
+        );
+        assert!(
+            tool_row.content.contains("raw provider id output"),
+            "call/output pairing must survive normalization"
+        );
+    }
+
+    /// Snapshots persisted by a pre-normalization daemon can hold raw
+    /// provider ids; importing them verbatim would re-introduce the
+    /// frame/vector id mismatch. The import boundary must normalize.
+    #[test]
+    fn from_snapshot_normalizes_legacy_raw_tool_call_ids() {
+        let mut manager = ContextManager::new("s", None);
+        let mut msg = Message::assistant("");
+        msg.tool_calls = Some(vec![ToolCall {
+            id: "toolu_legacy".to_owned(),
+            name: "shell".to_owned(),
+            arguments: json!({}),
+            metadata: None,
+        }]);
+        manager.record_message(&msg);
+        manager.record_tool_output("toolu_legacy", "shell", "legacy output");
+        let mut snapshot = manager.snapshot();
+        // Simulate a pre-fix snapshot by reverting the stored ids to the raw
+        // provider form.
+        for item in snapshot.items.iter_mut() {
+            match &mut item.kind {
+                TranscriptItemKind::AssistantToolCall { call_id, .. } => {
+                    *call_id = "toolu_legacy".to_owned();
+                }
+                TranscriptItemKind::ToolOutput { envelope } => {
+                    envelope.tool_call_id = "toolu_legacy".to_owned();
+                }
+                _ => {}
+            }
+        }
+
+        let loaded = ContextManager::from_snapshot(snapshot);
+        let frame = loaded.for_prompt(&PromptBuildPolicy::default());
+        let tool_row = frame
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row present");
+        assert_eq!(
+            tool_row.tool_call_id.as_deref(),
+            Some("call_legacy"),
+            "imported raw ids must be normalized at the snapshot boundary"
+        );
+        assert!(tool_row.content.contains("legacy output"));
+    }
+
+    /// Companion to the positional-pairing test: when an EARLIER call with a
+    /// reused id never got an output, it must synthesize — not steal the
+    /// output that positionally belongs to a LATER call with the same id.
+    #[test]
+    fn for_prompt_does_not_steal_later_output_for_missing_earlier_reused_id() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::user("first question"));
+        // This call's output was never recorded (tool aborted).
+        manager.record_message(&assistant_tool_call("call_0"));
+        manager.record_message(&Message::assistant("gave up"));
+        manager.record_message(&Message::user("second question"));
+        manager.record_message(&assistant_tool_call("call_0"));
+        manager.record_tool_output("call_0", "shell", "output for turn two");
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+
+        let tool_rows: Vec<&Message> = frame
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tool_rows.len(), 2, "one synthetic + one real output");
+        assert!(
+            tool_rows[0].content.contains("missing"),
+            "earlier missing-output call must synthesize, got {:?}",
+            tool_rows[0].content
+        );
+        assert!(
+            tool_rows[1].content.contains("turn two"),
+            "later call keeps its own output, got {:?}",
+            tool_rows[1].content
+        );
+        assert_eq!(frame.report.synthetic_item_ids.len(), 1);
+        assert!(
+            frame.report.dropped_item_ids.is_empty(),
+            "the real output must not be dropped: {:?}",
+            frame.report.dropped_item_ids
+        );
+    }
+
+    /// The agent loop's `normalize_system_messages` runs BEFORE the prompt
+    /// bridge and rewrites any non-leading System row (context rows like
+    /// `[Conversation summary]` are converted to User, instruction rows are
+    /// merged into `messages[0]`). A System-role summary row therefore
+    /// guarantees the bridge's contiguous coverage window match fails on the
+    /// first post-compaction turn, and the whole conversation is re-recorded
+    /// as source-less duplicates. Emit the summary as a protected User row so
+    /// the loop's normalization leaves it byte-identical.
+    #[test]
+    fn for_prompt_emits_compaction_summary_as_user_row() {
+        let mut manager = ContextManager::new("s", None);
+        for index in 0..6 {
+            manager.record_message(&Message::user(format!("u{index}")));
+            manager.record_message(&Message::assistant(format!("a{index}")));
+        }
+        manager.install_compaction_summary("older turns summarized", 2);
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let summary_row = frame
+            .messages
+            .iter()
+            .find(|m| m.content.contains("[Conversation summary]"))
+            .expect("summary row present");
+        assert_eq!(
+            summary_row.role,
+            MessageRole::User,
+            "compaction summary must render as a User row so the agent loop's \
+             system normalization cannot mutate it out of the bridge coverage window"
         );
     }
 
@@ -2293,21 +2626,21 @@ mod tests {
         let mut assistant = Message::assistant("I'll inspect both directories.");
         assistant.tool_calls = Some(vec![
             ToolCall {
-                id: "call-a".into(),
+                id: "call_a".into(),
                 name: "list_dir".into(),
                 arguments: json!({"path": "/tmp/a"}),
                 metadata: None,
             },
             ToolCall {
-                id: "call-b".into(),
+                id: "call_b".into(),
                 name: "list_dir".into(),
                 arguments: json!({"path": "/tmp/b"}),
                 metadata: None,
             },
         ]);
         manager.record_message(&assistant);
-        manager.record_tool_output("call-a", "list_dir", "Error: missing a");
-        manager.record_tool_output("call-b", "list_dir", "Error: missing b");
+        manager.record_tool_output("call_a", "list_dir", "Error: missing a");
+        manager.record_tool_output("call_b", "list_dir", "Error: missing b");
 
         let frame = manager.for_prompt(&PromptBuildPolicy::default());
 
@@ -2319,12 +2652,12 @@ mod tests {
             .as_ref()
             .expect("assistant message must keep tool calls");
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].id, "call-a");
-        assert_eq!(calls[1].id, "call-b");
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[1].id, "call_b");
         assert_eq!(frame.messages[1].role, MessageRole::Tool);
-        assert_eq!(frame.messages[1].tool_call_id.as_deref(), Some("call-a"));
+        assert_eq!(frame.messages[1].tool_call_id.as_deref(), Some("call_a"));
         assert_eq!(frame.messages[2].role, MessageRole::Tool);
-        assert_eq!(frame.messages[2].tool_call_id.as_deref(), Some("call-b"));
+        assert_eq!(frame.messages[2].tool_call_id.as_deref(), Some("call_b"));
         assert!(frame.report.synthetic_item_ids.is_empty());
         assert!(frame.report.dropped_item_ids.is_empty());
     }
@@ -2337,7 +2670,7 @@ mod tests {
             model_visible_max_bytes: 10,
         };
         let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
-        manager.record_tool_output("call-1", "shell", "0123456789abcdef");
+        manager.record_tool_output("call_1", "shell", "0123456789abcdef");
 
         let envelope = match &manager.items()[0].kind {
             TranscriptItemKind::ToolOutput { envelope } => envelope,
@@ -2361,7 +2694,7 @@ mod tests {
                 .starts_with("tool-output/sha256:")
         );
         let preview = envelope.ui_preview.as_ref().expect("ui preview link");
-        assert_eq!(preview.preview_ref, "appui/tool-output-preview/call-1");
+        assert_eq!(preview.preview_ref, "appui/tool-output-preview/call_1");
         assert_eq!(preview.content, envelope.model_visible_content);
         assert_eq!(preview.bytes, preview.content.len());
         assert!(envelope.raw_sha256.starts_with("sha256:"));
@@ -2373,11 +2706,11 @@ mod tests {
         // tool_name "unknown" into the envelope. The envelope now resolves
         // the real name from a prior AssistantToolCall transcript entry.
         let mut manager = ContextManager::new("s", None);
-        manager.record_message(&assistant_tool_call("call-7"));
+        manager.record_message(&assistant_tool_call("call_7"));
         let tool_message = {
             let mut message = Message::assistant("");
             message.role = MessageRole::Tool;
-            message.tool_call_id = Some("call-7".to_owned());
+            message.tool_call_id = Some("call_7".to_owned());
             message.content = "output for call-7".into();
             message
         };
@@ -2391,7 +2724,7 @@ mod tests {
                 _ => None,
             })
             .expect("recorded tool output");
-        assert_eq!(envelope.tool_call_id, "call-7");
+        assert_eq!(envelope.tool_call_id, "call_7");
         assert_eq!(envelope.tool_name, "shell");
     }
 
@@ -2402,12 +2735,12 @@ mod tests {
         // on its own. Verify the post-probe patch-up still wires the real
         // tool_name onto the merged envelope.
         let mut manager = ContextManager::new("s", None);
-        manager.record_persisted_message(&assistant_tool_call("call-9"), 0);
+        manager.record_persisted_message(&assistant_tool_call("call_9"), 0);
 
         let tool_message = {
             let mut message = Message::assistant("");
             message.role = MessageRole::Tool;
-            message.tool_call_id = Some("call-9".to_owned());
+            message.tool_call_id = Some("call_9".to_owned());
             message.content = "merged output for call-9".into();
             message
         };
@@ -2837,8 +3170,8 @@ mod tests {
             model_visible_max_bytes: 10,
         };
         let mut manager = ContextManager::new(session_id, None).with_tool_output_policy(policy);
-        manager.record_message(&assistant_tool_call("call-1"));
-        manager.record_tool_output("call-1", "shell", "0123456789abcdef");
+        manager.record_message(&assistant_tool_call("call_1"));
+        manager.record_tool_output("call_1", "shell", "0123456789abcdef");
 
         let envelope = match &manager.items()[1].kind {
             TranscriptItemKind::ToolOutput { envelope } => envelope,
@@ -2865,7 +3198,7 @@ mod tests {
             std::fs::read_to_string(&artifact_path).expect("read sidecar"),
             "0123456789abcdef"
         );
-        assert_eq!(preview_ref, "appui/tool-output-preview/call-1");
+        assert_eq!(preview_ref, "appui/tool-output-preview/call_1");
 
         let loaded = load_context_manager_snapshot(temp.path(), session_id)
             .expect("load snapshot")
@@ -2894,8 +3227,8 @@ mod tests {
         let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
         manager.record_message(&Message::system("system"));
         manager.record_message(&Message::user("recent user"));
-        manager.record_message(&assistant_tool_call("call-pressure"));
-        let tool_item_id = manager.record_tool_output("call-pressure", "shell", &"x".repeat(200));
+        manager.record_message(&assistant_tool_call("call_pressure"));
+        let tool_item_id = manager.record_tool_output("call_pressure", "shell", &"x".repeat(200));
 
         let frame = manager.for_prompt(&PromptBuildPolicy {
             max_prompt_token_estimate: Some(40),
@@ -2962,8 +3295,8 @@ mod tests {
         let mut assistant = Message::assistant("done");
         assistant.reasoning_content = Some("private reasoning".into());
         manager.record_message(&assistant);
-        manager.record_message(&assistant_tool_call("call-1"));
-        manager.record_tool_output("call-1", "shell", "secret tool output");
+        manager.record_message(&assistant_tool_call("call_1"));
+        manager.record_tool_output("call_1", "shell", "secret tool output");
         manager.record_item(
             TranscriptItemKind::ContextInjection {
                 label: "parent".into(),

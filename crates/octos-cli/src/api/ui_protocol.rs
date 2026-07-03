@@ -2307,27 +2307,29 @@ impl PromptContextManager for AppUiPromptContextBridge {
         if let Some(system) = runtime_system {
             // Re-apply the agent's runtime System prompt. Two cases:
             //
-            //   a) `frame.messages` leads with a System message
-            //      (e.g. a `[Conversation summary]` emitted by
-            //      `for_prompt`'s compaction path —
-            //      `context_manager.rs:1159`). Concatenate the runtime
-            //      System CONTENT into that existing System rather
-            //      than inserting a second one. We do this in-place to
-            //      avoid producing two consecutive `System` messages
-            //      because `normalize_system_messages` runs BEFORE
-            //      this bridge (`loop_compaction.rs:35`) — anything we
-            //      emit here goes straight to the provider, and
-            //      multi-System payloads are rejected by Anthropic
-            //      (single `system` field) and other providers.
+            //   a) `frame.messages` leads with a System message.
+            //      Concatenate the runtime System CONTENT into that
+            //      existing System rather than inserting a second one.
+            //      We do this in-place to avoid producing two
+            //      consecutive `System` messages because
+            //      `normalize_system_messages` runs BEFORE this bridge
+            //      (`loop_compaction.rs:35`) — anything we emit here
+            //      goes straight to the provider, and multi-System
+            //      payloads are rejected by Anthropic (single `system`
+            //      field) and other providers. Since compaction
+            //      summaries render as protected User rows (see
+            //      `for_prompt`'s CompactionSummary arm), this arm is
+            //      effectively a legacy guard.
             //
-            //   b) `frame.messages` does not lead with a System.
-            //      Insert the runtime System at index 0.
+            //   b) `frame.messages` does not lead with a System (the
+            //      normal case, including post-compaction where the
+            //      frame leads with the User-role summary). Insert the
+            //      runtime System at index 0.
             //
             // Safe to merge unconditionally because
             // `record_message_with_source_ref` early-returns for
             // `System` role (`context_manager.rs:752`) so the frame
-            // can only contain compaction summaries or no System at
-            // all — never the runtime System itself.
+            // never contains the runtime System itself.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
                     let existing = std::mem::take(&mut first.content);
@@ -12343,7 +12345,33 @@ async fn handle_session_rollback(
                 return;
             }
         };
+        let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
+        // Rebuild + persist the context ledger from the trimmed history.
+        // The ledger coverage check (`context_ledger_covers_history`) is a
+        // high-watermark `>=` — deliberately tolerant of bounded history
+        // slices — so a pre-rollback snapshot still "covers" the shrunken
+        // history and would be Loaded verbatim on the next turn, feeding the
+        // rolled-back turns straight back into the model prompt. Mirrors
+        // `reset_context_manager_from_history` on the session-actor path.
+        let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
+            params.session_id.to_string(),
+            None,
+            &session.messages,
+        );
+        rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        if let Err(error) = crate::context_manager::persist_context_manager_snapshot(
+            &data_dir,
+            &params.session_id.to_string(),
+            &rebuilt_context,
+        ) {
+            warn!(
+                session = %params.session_id,
+                %error,
+                "session/rollback: failed to persist rebuilt context ledger"
+            );
+        }
+        publish_appui_context_status(&params.session_id, &rebuilt_context);
         // Same message projection as `handle_session_hydrate` for a
         // non-negotiated client: seqs are the trimmed transcript's indices.
         let messages = session
@@ -35709,6 +35737,82 @@ ignore = []
             );
             assert!(session.messages.iter().all(|m| m.content != "turn 3"));
         }
+    }
+
+    /// A stale context ledger must not resurrect rolled-back turns. The
+    /// ledger coverage check is a high-watermark `>=` (deliberately
+    /// slice-tolerant, because turn paths pass bounded history slices), so
+    /// after a rollback shrinks durable history a pre-rollback ledger still
+    /// "covers" it, gets Loaded verbatim, and the next model prompt would
+    /// contain the very turns the user rewound away. `session/rollback` must
+    /// rebuild + persist the context ledger from the trimmed history.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rebuilds_context_ledger() {
+        let session_id = SessionKey("local:rollback-ctx-ledger".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        // Persist a pre-rollback context ledger exactly like a prior turn's
+        // prompt path would have.
+        let data_dir = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let data_dir = guard.data_dir();
+            let history = guard.get_or_create(&session_id).await.messages.clone();
+            let manager = crate::context_manager::ContextManager::from_session_history(
+                session_id.to_string(),
+                None,
+                &history,
+            );
+            crate::context_manager::persist_context_manager_snapshot(
+                &data_dir,
+                &session_id.to_string(),
+                &manager,
+            )
+            .expect("persist pre-rollback ledger");
+            data_dir
+        };
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-ctx".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // The next turn loads the ledger against the TRIMMED history; the
+        // dropped turn must not be visible in the resulting prompt frame.
+        let trimmed = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(&session_id).await.messages.clone()
+        };
+        assert!(trimmed.iter().all(|m| m.content != "turn 3"));
+        let (loaded, _status) = crate::context_manager::load_or_rebuild_context_manager(
+            &data_dir,
+            session_id.to_string(),
+            None,
+            &trimmed,
+        );
+        let frame = loaded.for_prompt(&crate::context_manager::PromptBuildPolicy::default());
+        assert!(
+            !frame
+                .messages
+                .iter()
+                .any(|m| m.content.contains("turn 3") || m.content.contains("reply 3")),
+            "rolled-back turns must not resurrect through a stale context ledger: {:#?}",
+            frame.messages
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

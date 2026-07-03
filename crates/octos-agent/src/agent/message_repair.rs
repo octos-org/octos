@@ -83,6 +83,22 @@ fn normalize_one_id(id: &str) -> String {
     format!("call_{stripped}")
 }
 
+/// Normalize a single provider tool-call id into the loop's canonical form —
+/// the same rewrite [`normalize_tool_call_ids`] applies across a prompt
+/// vector (empty ids pass through untouched, exactly like the vector pass,
+/// which only maps non-empty ids).
+///
+/// Public so transcript recorders (the CLI `ContextManager`) can normalize at
+/// record time: the durable transcript must be id-identical with the prompt
+/// vector after the loop's rewrite, or exact-match coverage comparison between
+/// the two re-records the conversation as duplicates.
+pub fn normalize_tool_call_id(id: &str) -> String {
+    if id.is_empty() {
+        return String::new();
+    }
+    normalize_one_id(id)
+}
+
 /// Merge all system messages into the first one so providers that require a
 /// single leading system message (e.g. Qwen) don't reject the request.
 ///
@@ -522,6 +538,35 @@ pub(crate) fn truncate_old_tool_results(messages: &mut [Message]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public single-id normalizer must agree with the vector pass
+    /// (`normalize_tool_call_ids`) on every id class — transcript recorders
+    /// rely on that equivalence for exact-id coverage matching.
+    #[test]
+    fn normalize_tool_call_id_matches_vector_pass_semantics() {
+        // Already-normal forms pass through.
+        assert_eq!(normalize_tool_call_id("call_abc"), "call_abc");
+        assert_eq!(normalize_tool_call_id("fc_abc"), "fc_abc");
+        // Known provider prefixes are stripped then call_-prefixed.
+        assert_eq!(normalize_tool_call_id("toolu_abc"), "call_abc");
+        assert_eq!(normalize_tool_call_id("chatcmpl-abc"), "call_abc");
+        // Moonshot's `call_function_*` already starts with `call_`, so BOTH
+        // the vector pass and this wrapper leave it untouched (the
+        // `call_function_` strip is unreachable for it) — equivalence with
+        // the vector pass is the property that matters here.
+        assert_eq!(
+            normalize_tool_call_id("call_function_abc"),
+            "call_function_abc"
+        );
+        // Unknown forms (e.g. sanitized kimi ids) get the prefix verbatim.
+        assert_eq!(
+            normalize_tool_call_id("functions_shell_0"),
+            "call_functions_shell_0"
+        );
+        // Empty ids pass through untouched, exactly like the vector pass
+        // (its id map only collects non-empty ids).
+        assert_eq!(normalize_tool_call_id(""), "");
+    }
 
     fn sys(content: &str) -> Message {
         Message {
