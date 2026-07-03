@@ -1001,6 +1001,29 @@ impl PluginTool {
             }
         }
 
+        // Host workspace metadata is opt-in. It is injected after path rewriting
+        // so it is treated as metadata, not as a file argument to normalize.
+        if self.tool_def.accepts_host_config_key("workspace_root") {
+            if let Some(obj) = effective_args.as_object_mut() {
+                if !obj.contains_key("workspace_root") {
+                    if let Some(root) =
+                        self.workspace_root_for_host_injection(effective_scope.as_deref())
+                    {
+                        obj.insert(
+                            "workspace_root".into(),
+                            serde_json::Value::String(root.to_string_lossy().into_owned()),
+                        );
+                        tracing::info!(
+                            plugin = %self.plugin_name,
+                            tool = %self.tool_def.name,
+                            workspace_root = %root.display(),
+                            "injected workspace_root into plugin args"
+                        );
+                    }
+                }
+            }
+        }
+
         // S2 plumbing: inject synthesis_config when the manifest opts in via
         // `x-octos-host-config-keys: ["synthesis_config"]` and the host has a
         // configured `SynthesisConfig`. The plugin still falls back to env if
@@ -1028,6 +1051,20 @@ impl PluginTool {
         }
 
         Ok(effective_args)
+    }
+
+    fn workspace_root_for_host_injection(
+        &self,
+        effective_scope: Option<&SessionScope>,
+    ) -> Option<PathBuf> {
+        if let Some(scope) = effective_scope {
+            return Some(scope.workspace().to_path_buf());
+        }
+        let work_dir = self.work_dir.as_deref()?;
+        if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
+            return work_dir.parent().map(Path::to_path_buf);
+        }
+        Some(work_dir.to_path_buf())
     }
 
     async fn detect_output_file(
@@ -3971,6 +4008,26 @@ mod tests {
         }
     }
 
+    fn notebook_source_def_with_workspace_root_opt_in() -> PluginToolDef {
+        PluginToolDef {
+            name: "source_import".to_string(),
+            description: "Import notebook source".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "workspace_root": {"type": "string"}
+                },
+                "x-octos-host-config-keys": ["workspace_root"]
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
     fn full_synthesis_config() -> SynthesisConfig {
         SynthesisConfig {
             endpoint: "https://api.deepseek.com/v1".to_string(),
@@ -4089,6 +4146,104 @@ mod tests {
         assert!(
             prepared["synthesis_config"].get("endpoint").is_none(),
             "host config must not be merged into caller-supplied synthesis_config",
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_injects_workspace_root_when_opted_in() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ToolContext {
+            session_scope: Some(Arc::new(scope)),
+            ..ToolContext::zero()
+        };
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_work_dir(skill_output);
+
+        let prepared = tool
+            .prepare_effective_args(&json!({"path": "docs/report.md"}), Some(&ctx))
+            .unwrap();
+
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_workspace_root_when_manifest_does_not_opt_in() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ToolContext {
+            session_scope: Some(Arc::new(scope)),
+            ..ToolContext::zero()
+        };
+        let mut def = notebook_source_def_with_workspace_root_opt_in();
+        def.input_schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        });
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+
+        let prepared = tool
+            .prepare_effective_args(&json!({"path": "docs/report.md"}), Some(&ctx))
+            .unwrap();
+
+        assert!(prepared.get("workspace_root").is_none());
+    }
+
+    #[test]
+    fn prepare_effective_args_does_not_overwrite_explicit_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ToolContext {
+            session_scope: Some(Arc::new(scope)),
+            ..ToolContext::zero()
+        };
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool
+            .prepare_effective_args(
+                &json!({
+                    "path": "docs/report.md",
+                    "workspace_root": "/caller/workspace"
+                }),
+                Some(&ctx),
+            )
+            .unwrap();
+
+        assert_eq!(prepared["workspace_root"], "/caller/workspace");
+    }
+
+    #[test]
+    fn prepare_effective_args_infers_workspace_root_from_skill_output_without_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_work_dir(skill_output);
+
+        let prepared = tool
+            .prepare_effective_args(&json!({"path": "docs/report.md"}), None)
+            .unwrap();
+
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref()
         );
     }
 
