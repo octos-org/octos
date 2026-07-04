@@ -584,6 +584,7 @@ pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
+    connection_profile_id: Option<&str>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -618,7 +619,38 @@ pub async fn list_sessions(
     // ids are already chat-bare. The process-wide walk below remains
     // as an admin / legacy fallback (still strips `<profile>:api:`
     // for legacy entries).
-    if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await {
+    //
+    // Resolve the profile data dir. The solo/stdio connection carries no
+    // HTTP routing header, so the header/identity + gateway resolver
+    // (`resolve_profile_data_dir`) returns `Err` there — pre-fix the
+    // per-profile `sessions/` dir was never scanned and the TUI
+    // `/resume` picker showed "No prior sessions" even with sessions on
+    // disk. When there is NO routing header we instead resolve from the
+    // connection's own frozen profile scope (`connection_profile_id`),
+    // mirroring how `session/hydrate` resolves its store for the same
+    // connection (`resolve_sessions_for_lookup` keys on
+    // `connection_profile_id`), so `session/list` scans the SAME
+    // directory the running session writes turns to.
+    //
+    // SECURITY / multi-tenant: `connection_profile_id` is the
+    // connection's frozen scope (authenticated identity / `session/open`),
+    // never a client-supplied per-request value — so this lists the
+    // connection's OWN sessions, not another tenant's. Whenever a
+    // `Host` / `X-Profile-Id` routing header IS present (hosted
+    // multi-tenant WS / gateway), or the connection is admin/unscoped, we
+    // keep the existing header + identity authorized resolution unchanged
+    // — Layer-2 authorization still applies, and a parent viewing a
+    // sub-account subdomain still lists the routed profile's sessions.
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let profile_data_dir = match connection_profile_id {
+        Some(pid) if routed_profile_id.is_none() => {
+            resolve_profile_data_dir_by_id(&state, pid).ok()
+        }
+        _ => resolve_profile_data_dir(&state, &headers, identity_ref)
+            .await
+            .ok(),
+    };
+    if let Some(profile_data_dir) = profile_data_dir {
         let profile_sessions = list_profile_sessions(&profile_data_dir);
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
@@ -4438,6 +4470,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Some(Extension(AuthIdentity::Admin)),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4449,6 +4482,88 @@ mod tests {
         assert!(
             list.iter().any(|s| s.id == "web-legacy-1"),
             "admin legacy path must still surface profiled sessions: {ids:?}"
+        );
+    }
+
+    /// Regression: `session/list` over a solo/stdio connection (no HTTP
+    /// headers, no gateway / `process_manager`) must resolve the profile
+    /// data dir from the connection's own `connection_profile_id` — the
+    /// same scope `session/hydrate` uses — and surface the sessions the
+    /// running session persists under `<profile>/data/sessions/`.
+    ///
+    /// Pre-fix, `list_sessions` only resolved the profile via HTTP
+    /// headers / identity (`resolve_profile_data_dir`), which returns
+    /// `Err` over stdio (no `resolve_api_port`), so the per-profile scan
+    /// was skipped and the TUI `/resume` picker showed "No prior
+    /// sessions" even with sessions on disk. With `state.sessions` also
+    /// `None` (the solo/stdio shape) the handler returned `503` instead
+    /// of the session list.
+    #[tokio::test]
+    async fn list_sessions_solo_connection_profile_surfaces_profile_sessions() {
+        use crate::profiles::{ProfileStore, UserProfile};
+
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(home.path()).unwrap();
+
+        // A profile whose sessions live at an explicit data dir — the
+        // directory the running solo/stdio session persists turns to.
+        let sessions_dir = home.path().join("dev-data");
+        let profile = UserProfile {
+            id: "dev".into(),
+            name: "dev".into(),
+            enabled: true,
+            data_dir: Some(sessions_dir.to_string_lossy().into_owned()),
+            parent_id: None,
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // Seed one chat session the way the WS / stdio turn handler writes
+        // it (bare `web-<id>` key under the per-profile data dir).
+        {
+            let mut mgr = octos_bus::SessionManager::open(&sessions_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-solo-1".to_string()),
+                Message::user("hi from solo"),
+            )
+            .await
+            .unwrap();
+            let mut reply = Message::assistant("hello from solo");
+            reply.thread_id = Some("turn-solo-1".to_string());
+            mgr.add_message(&SessionKey("web-solo-1".to_string()), reply)
+                .await
+                .unwrap();
+        }
+
+        // Exactly the solo/stdio shape: profile_store wired, but no
+        // process_manager (gateway) and no process-wide `sessions` store.
+        let state = std::sync::Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            ..AppState::empty_for_tests()
+        });
+
+        // connection_profile_id = "dev", empty headers, no identity — the
+        // frozen scope a solo stdio connection carries.
+        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        let session = list
+            .iter()
+            .find(|s| s.id == "web-solo-1")
+            .unwrap_or_else(|| panic!("solo profile session must be surfaced; got {ids:?}"));
+        // 1 meta line + 2 message lines = 3, matching the count contract
+        // the process-wide walk emits.
+        assert_eq!(session.message_count, 3);
+        assert!(
+            session.title.is_some(),
+            "resumable session must carry a title for the /resume picker"
         );
     }
 
@@ -5222,7 +5337,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5280,7 +5395,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);

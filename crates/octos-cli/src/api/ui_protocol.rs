@@ -4351,6 +4351,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    connection_profile_id,
                     id,
                     params,
                 )
@@ -4967,7 +4968,16 @@ where
                 }
             }
             UiCommand::SessionList(params) => {
-                handle_session_list(&ws, &state, &connection_headers, None, id, params).await;
+                handle_session_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionSnapshot(params) => {
                 handle_session_snapshot(&ws, &state, &connection_headers, None, id, params).await;
@@ -13182,12 +13192,18 @@ async fn handle_session_list(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
     id: String,
     _params: SessionListParams,
 ) {
     let identity_ext = identity.cloned().map(Extension);
-    let response =
-        super::handlers::list_sessions(State(state.clone()), headers.clone(), identity_ext).await;
+    let response = super::handlers::list_sessions(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        connection_profile_id,
+    )
+    .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
     // Collection endpoint — no addressable session id. Treat any
     // (unexpected) 404 as a generic resource-not-found rather than
