@@ -817,10 +817,20 @@ const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
 /// and the leading meta line never decode as a user `Message`, so they are
 /// skipped implicitly. Returns `None` when the session has no user message.
 ///
-/// Note: this is the raw last user line as persisted — rollback-marker folding
-/// (see [`fold_session_timeline`]) is NOT applied, which is acceptable for a
-/// listing preview and keeps the read O(tail) rather than O(transcript).
+/// Honors `/rewind`: a rolled-back session keeps its dropped rows on disk
+/// (removed only by [`fold_session_timeline`] at load), so previewing the raw
+/// last line could show a prompt hydrate no longer shows (codex P2). When a
+/// rollback marker is present the timeline is folded first; the common
+/// (unrewound) case stays a cheap O(tail) reverse scan.
 fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
+    // The rollback control record serializes as `{"kind":"rollback",…}`.
+    if content.contains("\"rollback\"") {
+        return assemble_session_messages(content.lines())
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .and_then(|message| last_prompt_preview(&message.content));
+    }
     for line in content.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -834,23 +844,29 @@ fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
         }
         if let Ok(message) = serde_json::from_str::<Message>(line) {
             if matches!(message.role, MessageRole::User) {
-                // Unwrap content-part JSON to visible text (codex P2) — a
-                // `[{"type":"text","text":"deploy app"}]` prompt would
-                // otherwise be shown as the raw serialized wrapper.
-                let text = content_display_text(&message.content);
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
+                if let Some(preview) = last_prompt_preview(&message.content) {
+                    return Some(preview);
                 }
-                return Some(octos_core::truncated_utf8(
-                    text,
-                    LAST_PROMPT_PREVIEW_BYTES,
-                    "…",
-                ));
             }
         }
     }
     None
+}
+
+/// Content-part-unwrapped, trimmed, byte-truncated preview of a user message's
+/// content, or `None` when it is empty. `[{"type":"text","text":"…"}]` content
+/// parts (codex P2) surface their inner text, never the raw JSON wrapper.
+fn last_prompt_preview(content: &str) -> Option<String> {
+    let text = content_display_text(content);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(
+        text,
+        LAST_PROMPT_PREVIEW_BYTES,
+        "…",
+    ))
 }
 
 /// Manages sessions with in-memory LRU cache and JSONL disk persistence.
@@ -4186,6 +4202,25 @@ mod tests {
             last_user_prompt_from_jsonl(&content).as_deref(),
             Some("deploy the app"),
             "content-part prompt must show its text, not raw JSON"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_honors_rollback_markers() {
+        // A /rewound session keeps the dropped rows on disk; the preview must
+        // reflect the FOLDED transcript (what hydrate shows), not the raw
+        // rolled-back tail (codex P2). Two user turns then a rollback of 1 →
+        // the last surviving user prompt is the FIRST turn.
+        let u1 = serde_json::to_string(&make_message(MessageRole::User, "first turn")).unwrap();
+        let a1 = serde_json::to_string(&make_message(MessageRole::Assistant, "reply one")).unwrap();
+        let u2 = serde_json::to_string(&make_message(MessageRole::User, "second turn")).unwrap();
+        let a2 = serde_json::to_string(&make_message(MessageRole::Assistant, "reply two")).unwrap();
+        let marker = rollback_marker_line(1).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{u1}\n{a1}\n{u2}\n{a2}\n{marker}\n");
+        assert_eq!(
+            last_user_prompt_from_jsonl(&content).as_deref(),
+            Some("first turn"),
+            "preview must honor the rollback marker (folded), not show the dropped 'second turn'"
         );
     }
 
