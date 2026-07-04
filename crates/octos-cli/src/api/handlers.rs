@@ -566,6 +566,14 @@ pub struct SessionInfo {
     /// most-recently-touched. None when neither source is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// Preview of the session's MOST RECENT user prompt, truncated (~100 bytes,
+    /// UTF-8 safe). Sourced by scanning the tail of the session JSONL for the
+    /// last user-role message (see
+    /// `octos_bus::SessionManager::list_top_level_sessions_with_meta`). Lets the
+    /// `/resume` picker show what each session was about. None for sessions with
+    /// no user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -675,7 +683,7 @@ pub async fn list_sessions(
         all.extend(
             sess.list_top_level_sessions_with_meta()
                 .into_iter()
-                .filter_map(|(id, count, title, updated_at)| {
+                .filter_map(|(id, count, title, updated_at, last_prompt)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
                         return None;
@@ -688,6 +696,7 @@ pub async fn list_sessions(
                         message_count: count,
                         title,
                         updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                        last_prompt,
                     })
                 }),
         );
@@ -755,7 +764,7 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
     };
     mgr.list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title, updated_at)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt)| {
             if is_internal_api_session_id(&id) {
                 return None;
             }
@@ -764,6 +773,7 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
                 message_count: count,
                 title,
                 updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                last_prompt,
             })
         })
         .collect()
@@ -3989,6 +3999,7 @@ mod tests {
             message_count: 42,
             title: None,
             updated_at: None,
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -4001,6 +4012,10 @@ mod tests {
             json.get("updated_at").is_none(),
             "None updated_at must be omitted from JSON"
         );
+        assert!(
+            json.get("last_prompt").is_none(),
+            "None last_prompt must be omitted from JSON"
+        );
     }
 
     #[test]
@@ -4010,6 +4025,7 @@ mod tests {
             message_count: 7,
             title: Some("My Pinned Chat".into()),
             updated_at: None,
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
@@ -4022,9 +4038,23 @@ mod tests {
             message_count: 3,
             title: None,
             updated_at: Some("2026-07-02T12:00:00+00:00".into()),
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
+    }
+
+    #[test]
+    fn session_info_serialize_includes_last_prompt() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 5,
+            title: None,
+            updated_at: None,
+            last_prompt: Some("what is the capital of France?".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["last_prompt"], "what is the capital of France?");
     }
 
     #[test]
@@ -4363,6 +4393,50 @@ mod tests {
         assert!(
             !sessions.iter().any(|s| s.id.starts_with("web-303")),
             "child-* fanouts must be filtered: {ids:?}"
+        );
+    }
+
+    /// The `/resume` picker previews each session by its most recent user
+    /// prompt. `list_profile_sessions` must surface `last_prompt` as the LAST
+    /// user message (not the first) for a session with ≥2 user turns — the
+    /// regression guard for the `session/list` `last_prompt` enrichment.
+    #[tokio::test]
+    async fn list_profile_sessions_surfaces_last_user_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            // First user turn + assistant reply.
+            mgr.add_message(
+                &SessionKey("web-501".to_string()),
+                octos_core::Message::user("first question"),
+            )
+            .await
+            .unwrap();
+            let mut a1 = octos_core::Message::assistant("first answer");
+            a1.thread_id = Some("turn-1".to_string());
+            mgr.add_message(&SessionKey("web-501".to_string()), a1)
+                .await
+                .unwrap();
+            // Second (most recent) user turn — this is the expected preview.
+            mgr.add_message(
+                &SessionKey("web-501".to_string()),
+                octos_core::Message::user("second question"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let sessions = list_profile_sessions(profile_data_dir);
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "web-501")
+            .expect("web-501 present");
+        assert_eq!(
+            session.last_prompt.as_deref(),
+            Some("second question"),
+            "last_prompt must be the MOST RECENT user message, not the first"
         );
     }
 
