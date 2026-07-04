@@ -158,20 +158,25 @@ fn default_session_schema() -> u32 {
 /// Trims whitespace, strips JSON content-array wrappers if present, and
 /// truncates to 50 Unicode characters at a UTF-8 boundary so the result
 /// is safe to persist and round-trip through serde.
-fn derive_title_from_message(content: &str) -> String {
+/// Unwrap `[{"type":"text","text":"…"}]`-shaped content (many UI clients send
+/// this) to its inner text; plain-string content passes through unchanged.
+/// Shared by title derivation and the last-prompt preview so neither surfaces
+/// raw content-part JSON.
+fn content_display_text(content: &str) -> String {
     let plain = content.trim();
-    // Many UI clients send `[{"type":"text","text":"..."}]`-shaped content;
-    // unwrap to the inner text part if so. Plain strings pass through.
-    let text = serde_json::from_str::<Vec<serde_json::Value>>(plain)
+    serde_json::from_str::<Vec<serde_json::Value>>(plain)
         .ok()
         .and_then(|parts| {
             parts
                 .into_iter()
                 .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
         })
-        .unwrap_or_else(|| plain.to_string());
-    let trimmed = text.trim();
-    trimmed
+        .unwrap_or_else(|| plain.to_string())
+}
+
+fn derive_title_from_message(content: &str) -> String {
+    content_display_text(content)
+        .trim()
         .chars()
         .take(50)
         .collect::<String>()
@@ -829,7 +834,11 @@ fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
         }
         if let Ok(message) = serde_json::from_str::<Message>(line) {
             if matches!(message.role, MessageRole::User) {
-                let text = message.content.trim();
+                // Unwrap content-part JSON to visible text (codex P2) — a
+                // `[{"type":"text","text":"deploy app"}]` prompt would
+                // otherwise be shown as the raw serialized wrapper.
+                let text = content_display_text(&message.content);
+                let text = text.trim();
                 if text.is_empty() {
                     continue;
                 }
@@ -4162,6 +4171,21 @@ mod tests {
             preview.len() <= LAST_PROMPT_PREVIEW_BYTES + '…'.len_utf8(),
             "preview must be capped near the byte budget; got {} bytes",
             preview.len()
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_unwraps_content_part_text() {
+        // codex P2: content-part user messages must surface the inner text,
+        // not the raw `[{"type":"text","text":"…"}]` wrapper.
+        let mut msg = make_message(MessageRole::User, "");
+        msg.content = r#"[{"type":"text","text":"deploy the app"}]"#.to_string();
+        let user_line = serde_json::to_string(&msg).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{user_line}\n");
+        assert_eq!(
+            last_user_prompt_from_jsonl(&content).as_deref(),
+            Some("deploy the app"),
+            "content-part prompt must show its text, not raw JSON"
         );
     }
 
