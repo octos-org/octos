@@ -332,6 +332,21 @@ impl ServeCommand {
                 %error,
                 "failed to configure durable agent supervisor store; continuing with in-process supervision only"
             );
+        } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+        {
+            // Solo-boot loop safety: restored loops must not silently resume
+            // firing model turns on a single-operator box. Park them paused;
+            // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
+            for (loop_id, session_id) in
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .pause_restored_loops_for_solo_boot()
+            {
+                tracing::info!(
+                    loop_id = %loop_id,
+                    session_id = %session_id.0,
+                    "solo boot: restored loop parked as paused (resume with /loop resume)"
+                );
+            }
         }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));

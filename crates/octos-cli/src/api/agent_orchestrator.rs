@@ -615,6 +615,33 @@ impl InProcessAgentOrchestrator {
         Ok(())
     }
 
+    /// Solo-boot loop safety. Loops restored from a PRIOR process's
+    /// supervisor store resume firing REAL model turns with nobody having
+    /// asked this process for them — a forgotten test loop can burn a turn
+    /// every interval for hours, invisible unless the operator reads the
+    /// server log. On a `--solo` (single local operator) boot the surprising
+    /// default is wrong: park every restored active loop as `paused` and let
+    /// the operator resume explicitly (`/loop resume <id>`). The transition
+    /// is persisted so the pause survives further restarts. Returns the
+    /// paused `(loop_id, session_id)` pairs so the caller can log them.
+    pub(crate) fn pause_restored_loops_for_solo_boot(&self) -> Vec<(String, SessionKey)> {
+        let mut state = self.state();
+        let state = &mut *state;
+        let supervisor_store = state.supervisor_store.as_ref();
+        let now = now_ms();
+        let mut paused = Vec::new();
+        for loop_record in state.loops.values_mut() {
+            if loop_record.status != "active" {
+                continue;
+            }
+            loop_record.status = "paused".to_owned();
+            loop_record.updated_at_ms = now;
+            persist_loop_state_with_store(supervisor_store, loop_record);
+            paused.push((loop_record.loop_id.clone(), loop_record.session_id.clone()));
+        }
+        paused
+    }
+
     pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Value {
         let now = now_ms();
         let mut state = self.state();
@@ -6280,6 +6307,62 @@ mod tests {
         assert_eq!(
             interrupt_after_close.data.expect("error data")["current_status"],
             json!("closed")
+        );
+    }
+
+    /// Solo-boot loop safety: an active loop restored from a prior
+    /// process's supervisor store must be parked `paused` (persisted), so a
+    /// forgotten loop cannot silently burn model turns unattended. The park
+    /// is idempotent across restarts because the transition is persisted.
+    #[test]
+    fn solo_boot_pause_parks_restored_active_loops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_dir = dir.path().join("supervisor");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "solo-loop-park");
+        {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            orchestrator
+                .configure_supervisor_store(&store_dir)
+                .expect("store");
+            orchestrator
+                .create_loop(LoopCreateRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    prompt: Some("keep poking".into()),
+                    command: None,
+                    interval_seconds: Some(60),
+                    mode: None,
+                })
+                .expect("create loop");
+        }
+
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay");
+        let paused = restarted.pause_restored_loops_for_solo_boot();
+        assert_eq!(paused.len(), 1, "the restored active loop must be parked");
+        assert_eq!(paused[0].1, session_id);
+        let listed = restarted
+            .list_loops(LoopListRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("loop list");
+        assert_eq!(
+            listed["loops"][0]["status"],
+            json!("paused"),
+            "parked loop must list as paused: {listed}"
+        );
+
+        // Persisted: a further restart re-parks nothing.
+        let third = InProcessAgentOrchestrator::default();
+        third
+            .configure_supervisor_store(&store_dir)
+            .expect("replay 2");
+        assert!(
+            third.pause_restored_loops_for_solo_boot().is_empty(),
+            "already-paused loops must not be re-parked"
         );
     }
 
