@@ -4511,6 +4511,62 @@ async fn ui_protocol_connection(
     let _ = writer_handle.await;
 }
 
+/// Cap on how long stdio shutdown waits for in-flight turns to finalize.
+const STDIO_SHUTDOWN_TURN_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait (bounded by `max`) until none of THIS connection's turns is still
+/// live in the process-global `active_turns` registry.
+///
+/// Stdin EOF ends the stdio loop, and returning from `stdio_connection`
+/// exits the process — dropping the runtime and CANCELLING any in-flight
+/// turn task mid-finalization (assistant persistence, usage records, the
+/// terminal `turn/completed` ledger append). The client is already gone so
+/// nothing new can start; draining briefly turns "the answer and the turn's
+/// terminal state were lost" into "the next hydrate shows the completed
+/// turn". Scoped to `connection_turns` so turns owned by other connections
+/// never block this exit, and terminal-but-not-yet-cleaned entries do not
+/// hold shutdown open. Returns `false` on deadline.
+async fn drain_connection_turns_for_shutdown(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    max: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    loop {
+        let owned = connection_turns.lock().await.clone();
+        let mut live: Vec<SessionKey> = Vec::new();
+        {
+            let active = active_turns.lock().await;
+            for (session_id, turn_id) in &owned {
+                let Some(turn) = active.get(session_id) else {
+                    continue;
+                };
+                if &turn.turn_id != turn_id {
+                    continue;
+                }
+                // Terminal entries stay registered until cleanup — the turn
+                // already finalized, so it must not hold shutdown open.
+                let state = turn.state.lock().await;
+                if !matches!(*state, TurnState::Terminal(_)) {
+                    live.push(session_id.clone());
+                }
+            }
+        }
+        if live.is_empty() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "octos::ui_protocol::stdio",
+                sessions = ?live,
+                "stdio shutdown: in-flight turns did not finalize before the drain deadline"
+            );
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
     stdio_connection_with_io(state, tokio::io::stdin(), tokio::io::stdout()).await
 }
