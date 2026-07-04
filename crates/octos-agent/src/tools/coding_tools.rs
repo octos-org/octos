@@ -94,11 +94,27 @@ where
             guard.push_str("\n--- stderr ---\n");
         }
         guard.push_str(&chunk);
-        if guard.len() > MAX_CAPTURE_BYTES * 2 {
-            let keep_from = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
-            let trimmed = guard[keep_from..].to_string();
-            *guard = format!("... (earlier output truncated)\n{trimmed}");
+        truncate_capture_in_place(&mut guard);
+    }
+}
+
+/// Trim an accumulating capture buffer to its last [`MAX_CAPTURE_BYTES`] once it
+/// grows past twice that, keeping the tail.
+///
+/// `len - MAX_CAPTURE_BYTES` is a raw BYTE offset that need not fall on a UTF-8
+/// char boundary — slicing there directly panics ("byte index N is not a char
+/// boundary") when a multibyte char (CJK/emoji) straddles it. Because this runs
+/// inside a `tokio::spawn`ed reader task, that panic silently kills the reader
+/// and the stream stops capturing. Advance the cut to the next char boundary
+/// first so the slice is always valid.
+fn truncate_capture_in_place(guard: &mut String) {
+    if guard.len() > MAX_CAPTURE_BYTES * 2 {
+        let mut keep_from = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
+        while keep_from < guard.len() && !guard.is_char_boundary(keep_from) {
+            keep_from += 1;
         }
+        let trimmed = guard[keep_from..].to_string();
+        *guard = format!("... (earlier output truncated)\n{trimmed}");
     }
 }
 
@@ -3367,6 +3383,30 @@ fn catalog_score(entry: &ToolCatalogEntry, query: &str, tokens: &[String]) -> i3
 mod tests {
     use super::*;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn truncate_capture_does_not_panic_on_multibyte_boundary() {
+        // Regression: `guard[len - MAX_CAPTURE_BYTES..]` sliced at a raw byte
+        // offset. A multibyte char straddling that offset panicked, silently
+        // killing the spawned reader task. Build a buffer whose cut point falls
+        // mid-'世' (3 bytes) and confirm the trim succeeds and stays valid UTF-8.
+        // An all-3-byte-char buffer: char boundaries are multiples of 3, and
+        // MAX_CAPTURE_BYTES (50_000) is not ≡ 0 (mod 3), so the raw cut offset
+        // `len - MAX_CAPTURE_BYTES` is guaranteed to fall mid-char.
+        let mut guard = "世".repeat(40_000); // 120_000 bytes, over the 2× trigger
+        let cut = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
+        assert!(
+            !guard.is_char_boundary(cut),
+            "test precondition: the raw cut offset must fall mid-char"
+        );
+
+        truncate_capture_in_place(&mut guard); // must not panic
+        assert!(guard.starts_with("... (earlier output truncated)\n"));
+        assert!(
+            guard.contains('世'),
+            "the kept tail must remain valid UTF-8"
+        );
+    }
 
     const CODEX_P0: &[&str] = &[
         "apply_patch",
