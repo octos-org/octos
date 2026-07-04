@@ -2496,12 +2496,32 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             mode: parsed.mode,
             interval_seconds: parsed.interval_seconds,
             status: "active".into(),
-            next_run_at_ms: parsed.interval_seconds.and_then(|seconds| {
-                i64::try_from(seconds)
-                    .ok()
-                    .and_then(|seconds| seconds.checked_mul(1_000))
-                    .and_then(|delay_ms| now.checked_add(delay_ms))
-            }),
+            // A fresh loop MUST carry a schedule cue or the due-scan never
+            // visits it. Fixed loops schedule now+interval (unchanged).
+            // Self-paced and maintenance loops previously started at
+            // `next_run_at_ms: None`, which the due-scan skips forever — so
+            // `/loop <prompt>` and bare `/loop` NEVER fired without a manual
+            // `loop/fire_now` (the model can only pick its
+            // `<<loop-next-in: …>>` delay after a first fire that never
+            // came). Give them the default self-paced delay as an initial
+            // cue: schedulable, model-paced thereafter. (Deliberately NOT
+            // due-now — a due-now first fire races a client that also seeds
+            // with `loop/fire_now`, enqueuing two first turns; the spec's
+            // "immediately fires once" is a separate follow-up that should
+            // enqueue the first fire from `create` itself.)
+            next_run_at_ms: parsed
+                .interval_seconds
+                .and_then(|seconds| {
+                    i64::try_from(seconds)
+                        .ok()
+                        .and_then(|seconds| seconds.checked_mul(1_000))
+                })
+                .or_else(|| {
+                    i64::try_from(SELF_PACED_DEFAULT_DELAY_SECONDS)
+                        .ok()
+                        .and_then(|seconds| seconds.checked_mul(1_000))
+                })
+                .and_then(|delay_ms| now.checked_add(delay_ms)),
             last_run_at_ms: None,
             expires_at_ms: now + LOOP_MAX_AGE_DAYS * 24 * 60 * 60 * 1_000,
             created_at_ms: now,
@@ -8681,6 +8701,68 @@ mod tests {
             drained[0].metadata.get("prompt").map(String::as_str),
             Some("check build health")
         );
+    }
+
+    /// UPCR-2026-021: "`/loop 5m /foo` creates a fixed loop and immediately
+    /// fires once", and a self-paced loop needs an INITIAL fire for the
+    /// model to select a delay at all. Every freshly created loop must be
+    /// due immediately — previously fixed loops waited a full interval and
+    /// self-paced/maintenance (`next_run_at_ms: None`) NEVER fired without
+    /// a manual `loop/fire_now`.
+    #[test]
+    fn created_loops_carry_a_schedule_cue_for_every_mode() {
+        // Every mode must get a non-None `next_run_at_ms` at create time or
+        // the due-scan never visits it. Self-paced and maintenance loops
+        // previously started at None and NEVER fired without a manual
+        // fire_now; they now schedule at the default self-paced delay (not
+        // due-now — that would race a client that also seeds fire_now).
+        // Fixed loops keep now+interval.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let cases: [(&str, Option<u64>, Option<&str>, Option<&str>); 3] = [
+            (
+                "fixed",
+                Some(120),
+                Some("check builds"),
+                Some("fixed_interval"),
+            ),
+            (
+                "selfpaced",
+                None,
+                Some("tend the garden"),
+                Some("self_paced"),
+            ),
+            ("maintenance", None, None, Some("maintenance")),
+        ];
+        for (tag, interval, prompt, mode) in cases {
+            let session_id =
+                SessionKey::with_profile("tenant-a", "api", &format!("loop-cue-{tag}"));
+            let created = orchestrator
+                .create_loop(LoopCreateRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    prompt: prompt.map(str::to_owned),
+                    command: None,
+                    interval_seconds: interval,
+                    mode: mode.map(str::to_owned),
+                })
+                .expect("create loop");
+            let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+            let state = orchestrator.state();
+            let loop_record = state.loops.get(&loop_id).expect("loop record");
+            let next = loop_record
+                .next_run_at_ms
+                .unwrap_or_else(|| panic!("{tag}: new loop must carry a schedule cue, not None"));
+            assert!(
+                next > now_ms(),
+                "{tag}: the cue is in the future (fixed=+interval, self-paced/maintenance=+default delay), not due-now (next={next})"
+            );
+            // The scheduled cue is bounded by the mode's expected delay.
+            let expected_ms = interval.unwrap_or(SELF_PACED_DEFAULT_DELAY_SECONDS) as i64 * 1_000;
+            assert!(
+                next <= now_ms() + expected_ms + 5_000,
+                "{tag}: cue within the expected delay window"
+            );
+        }
     }
 
     /// #1128 codex P1 acceptance: self-paced loops whose `next_run_at_ms`
