@@ -158,20 +158,25 @@ fn default_session_schema() -> u32 {
 /// Trims whitespace, strips JSON content-array wrappers if present, and
 /// truncates to 50 Unicode characters at a UTF-8 boundary so the result
 /// is safe to persist and round-trip through serde.
-fn derive_title_from_message(content: &str) -> String {
+/// Unwrap `[{"type":"text","text":"…"}]`-shaped content (many UI clients send
+/// this) to its inner text; plain-string content passes through unchanged.
+/// Shared by title derivation and the last-prompt preview so neither surfaces
+/// raw content-part JSON.
+fn content_display_text(content: &str) -> String {
     let plain = content.trim();
-    // Many UI clients send `[{"type":"text","text":"..."}]`-shaped content;
-    // unwrap to the inner text part if so. Plain strings pass through.
-    let text = serde_json::from_str::<Vec<serde_json::Value>>(plain)
+    serde_json::from_str::<Vec<serde_json::Value>>(plain)
         .ok()
         .and_then(|parts| {
             parts
                 .into_iter()
                 .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
         })
-        .unwrap_or_else(|| plain.to_string());
-    let trimmed = text.trim();
-    trimmed
+        .unwrap_or_else(|| plain.to_string())
+}
+
+fn derive_title_from_message(content: &str) -> String {
+    content_display_text(content)
+        .trim()
         .chars()
         .take(50)
         .collect::<String>()
@@ -787,7 +792,82 @@ const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// `(session_key, message_count, title, updated_at)`. `title` and `updated_at`
 /// are `None` for legacy files that pre-date those meta fields (with `updated_at`
 /// falling back to the JSONL mtime when available).
-pub type SessionTitleMetaRow = (String, usize, Option<String>, Option<DateTime<Utc>>);
+pub type SessionTitleMetaRow = (
+    String,
+    usize,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+);
+
+/// Byte budget for the `last_prompt` preview surfaced on `session/list`.
+/// UTF-8 safe truncation (see [`last_user_prompt_from_jsonl`]) keeps this a
+/// soft ~100-character cap; multibyte scripts yield fewer characters.
+const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
+
+/// Extract the text of the MOST RECENT user message from an already-loaded
+/// session JSONL transcript, truncated to [`LAST_PROMPT_PREVIEW_BYTES`].
+///
+/// Cheap by construction: the listing walk already loads the whole file into
+/// memory to parse the first (`SessionMeta`) line, so this reuses that same
+/// `content` string and adds no extra I/O. It scans lines from the tail and
+/// returns the first that decodes as a [`Message`] with `role == User`, so a
+/// typical transcript only decodes the trailing assistant/tool reply plus the
+/// last user line before short-circuiting. Control records (rollback markers)
+/// and the leading meta line never decode as a user `Message`, so they are
+/// skipped implicitly. Returns `None` when the session has no user message.
+///
+/// Honors `/rewind`: a rolled-back session keeps its dropped rows on disk
+/// (removed only by [`fold_session_timeline`] at load), so previewing the raw
+/// last line could show a prompt hydrate no longer shows (codex P2). When a
+/// rollback marker is present the timeline is folded first; the common
+/// (unrewound) case stays a cheap O(tail) reverse scan.
+fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
+    // The rollback control record serializes as `{"kind":"rollback",…}`.
+    if content.contains("\"rollback\"") {
+        return assemble_session_messages(content.lines())
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .and_then(|message| last_prompt_preview(&message.content));
+    }
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Cheap pre-filter: a serialized user `Message` always contains the
+        // `"role":"user"` token (role is the first field, lowercase-renamed).
+        // This lets us skip full JSON decode of large assistant/tool blobs.
+        if !line.contains("\"role\":\"user\"") {
+            continue;
+        }
+        if let Ok(message) = serde_json::from_str::<Message>(line) {
+            if matches!(message.role, MessageRole::User) {
+                if let Some(preview) = last_prompt_preview(&message.content) {
+                    return Some(preview);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Content-part-unwrapped, trimmed, byte-truncated preview of a user message's
+/// content, or `None` when it is empty. `[{"type":"text","text":"…"}]` content
+/// parts (codex P2) surface their inner text, never the raw JSON wrapper.
+fn last_prompt_preview(content: &str) -> Option<String> {
+    let text = content_display_text(content);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(
+        text,
+        LAST_PROMPT_PREVIEW_BYTES,
+        "…",
+    ))
+}
 
 /// Manages sessions with in-memory LRU cache and JSONL disk persistence.
 ///
@@ -841,7 +921,7 @@ impl SessionManager {
     pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(false)
             .into_iter()
-            .map(|(id, count, title, _updated_at)| (id, count, title))
+            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
             .collect()
     }
 
@@ -866,15 +946,21 @@ impl SessionManager {
     pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(true)
             .into_iter()
-            .map(|(id, count, title, _updated_at)| (id, count, title))
+            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
             .collect()
     }
 
     /// Like [`Self::list_top_level_sessions_with_title`] but also returns each
-    /// session's recency timestamp — `SessionMeta.updated_at`, or the JSONL
-    /// file's mtime when the meta line is missing/unparseable, or `None` when
-    /// neither is available. Backs the `updated_at` field on the WS
-    /// `session/list` RPC so clients can sort by recency.
+    /// session's recency timestamp and a preview of its most recent user
+    /// prompt:
+    /// - `updated_at`: `SessionMeta.updated_at`, or the JSONL file's mtime when
+    ///   the meta line is missing/unparseable (the LATER of the two when both
+    ///   exist), or `None` when neither is available. Backs the `updated_at`
+    ///   field on the WS `session/list` RPC so clients can sort by recency.
+    /// - `last_prompt`: the truncated text of the session's most recent
+    ///   user-role message (see [`last_user_prompt_from_jsonl`]), or `None`
+    ///   when the session has no user message. Backs the `last_prompt` field on
+    ///   `session/list` so the `/resume` picker can preview each session.
     pub fn list_top_level_sessions_with_meta(&self) -> Vec<SessionTitleMetaRow> {
         self.list_sessions_inner_with_title(true)
     }
@@ -895,13 +981,15 @@ impl SessionManager {
             if seen.contains(&session_key) {
                 return;
             }
-            // Read just the first line for metadata (title + updated_at);
-            // fall back to count_lines for the message count.
-            let (title, meta_updated_at) = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|content| {
-                    content
-                        .lines()
+            // Load the file once (the listing already pays this cost to parse
+            // the first `SessionMeta` line for the title) and reuse the same
+            // in-memory content for both the meta read and the `last_prompt`
+            // preview — no extra I/O beyond the single read.
+            let content = std::fs::read_to_string(path).ok();
+            let (title, meta_updated_at) = content
+                .as_deref()
+                .and_then(|c| {
+                    c.lines()
                         .next()
                         .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
                 })
@@ -922,9 +1010,12 @@ impl SessionManager {
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (None, None) => None,
             };
+            // Reuse the already-loaded `content` (no extra I/O) to preview the
+            // session's most recent user prompt for the `/resume` picker.
+            let last_prompt = content.as_deref().and_then(last_user_prompt_from_jsonl);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
-            out.push((session_key, count, title, updated_at));
+            out.push((session_key, count, title, updated_at, last_prompt));
         };
 
         if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
@@ -4049,6 +4140,97 @@ mod tests {
             recency >= updated,
             "recency must be at least the meta.updated_at; got {recency}"
         );
+    }
+
+    #[tokio::test]
+    async fn list_top_level_sessions_with_meta_surfaces_last_user_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "last-prompt");
+
+        // Two user turns with an assistant reply between; the MOST RECENT user
+        // message ("second question") is the expected `last_prompt` preview.
+        mgr.add_message(&key, make_message(MessageRole::User, "first question"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::Assistant, "first answer"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "second question"))
+            .await
+            .unwrap();
+
+        let rows = mgr.list_top_level_sessions_with_meta();
+        let row = rows
+            .iter()
+            .find(|(id, ..)| id == "cli:last-prompt")
+            .expect("session present");
+        // 5th tuple element = last_prompt.
+        assert_eq!(
+            row.4.as_deref(),
+            Some("second question"),
+            "last_prompt must be the MOST RECENT user message, not the first"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_truncates_long_prompt() {
+        let long = "x".repeat(250);
+        let user_line = serde_json::to_string(&make_message(MessageRole::User, &long)).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{user_line}\n");
+        let preview = last_user_prompt_from_jsonl(&content).expect("prompt present");
+        assert!(
+            preview.ends_with('…'),
+            "truncated preview must end with an ellipsis: {preview}"
+        );
+        assert!(
+            preview.len() <= LAST_PROMPT_PREVIEW_BYTES + '…'.len_utf8(),
+            "preview must be capped near the byte budget; got {} bytes",
+            preview.len()
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_unwraps_content_part_text() {
+        // codex P2: content-part user messages must surface the inner text,
+        // not the raw `[{"type":"text","text":"…"}]` wrapper.
+        let mut msg = make_message(MessageRole::User, "");
+        msg.content = r#"[{"type":"text","text":"deploy the app"}]"#.to_string();
+        let user_line = serde_json::to_string(&msg).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{user_line}\n");
+        assert_eq!(
+            last_user_prompt_from_jsonl(&content).as_deref(),
+            Some("deploy the app"),
+            "content-part prompt must show its text, not raw JSON"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_honors_rollback_markers() {
+        // A /rewound session keeps the dropped rows on disk; the preview must
+        // reflect the FOLDED transcript (what hydrate shows), not the raw
+        // rolled-back tail (codex P2). Two user turns then a rollback of 1 →
+        // the last surviving user prompt is the FIRST turn.
+        let u1 = serde_json::to_string(&make_message(MessageRole::User, "first turn")).unwrap();
+        let a1 = serde_json::to_string(&make_message(MessageRole::Assistant, "reply one")).unwrap();
+        let u2 = serde_json::to_string(&make_message(MessageRole::User, "second turn")).unwrap();
+        let a2 = serde_json::to_string(&make_message(MessageRole::Assistant, "reply two")).unwrap();
+        let marker = rollback_marker_line(1).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{u1}\n{a1}\n{u2}\n{a2}\n{marker}\n");
+        assert_eq!(
+            last_user_prompt_from_jsonl(&content).as_deref(),
+            Some("first turn"),
+            "preview must honor the rollback marker (folded), not show the dropped 'second turn'"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_returns_none_without_user_message() {
+        // Meta line + an assistant line only → no user message → None.
+        let assistant =
+            serde_json::to_string(&make_message(MessageRole::Assistant, "hi there")).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{assistant}\n");
+        assert_eq!(last_user_prompt_from_jsonl(&content), None);
     }
 
     /// Codex P2: `SessionMeta.updated_at` is stamped once at creation and is

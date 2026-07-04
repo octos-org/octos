@@ -1,0 +1,214 @@
+schema_version = 1
+
+[workspace]
+kind = "session"
+
+[version_control]
+provider = "git"
+auto_init = false
+trigger = "turn_end"
+fail_on_error = false
+
+[tracking]
+ignore = [
+    "tmp/**",
+    ".DS_Store",
+]
+
+[validation]
+on_turn_end = []
+on_source_change = []
+on_completion = []
+
+[artifacts]
+image_png = "**/*.png"
+podcast_audio = "**/podcast_full_*.*"
+primary_audio = "*.mp3"
+slides_pptx = "**/*.pptx"
+
+[spawn_tasks.deep_search]
+on_verify = []
+on_failure = ["notify_user:Deep search failed"]
+
+[[spawn_tasks.deep_search.on_completion]]
+id = "deep_search.primary_index"
+required = true
+kind = "file_exists"
+path = "${args.research_dir}/_search_results.md"
+
+[[spawn_tasks.deep_search.on_completion]]
+id = "deep_search.sources_warn"
+required = true
+soft_fail = true
+kind = "file_exists"
+path = "${args.research_dir}/01_source.md"
+
+[spawn_tasks.fm_tts]
+artifact = "primary_audio"
+on_verify = [
+    "file_exists:$artifact",
+    "file_size_min:$artifact:1024",
+]
+on_failure = ["notify_user:TTS generation failed"]
+
+[[spawn_tasks.fm_tts.on_completion]]
+kind = "audio_non_silent"
+glob = ""
+min_ratio = 0.30000001192092896
+source = "spawn_only_files"
+extension = "mp3"
+
+[spawn_tasks.fm_voice_save]
+on_verify = []
+on_failure = ["notify_user:Voice registration failed"]
+
+[[spawn_tasks.fm_voice_save.on_completion]]
+kind = "ominix_voice_exists"
+name_arg = "name"
+
+[[spawn_tasks.fm_voice_save.on_completion]]
+kind = "file_exists"
+path = "voice_profiles/${args.name}.wav"
+min_bytes = 1024
+
+[spawn_tasks.manage_skills]
+on_verify = []
+on_failure = ["notify_user:Skill install verification failed"]
+
+[[spawn_tasks.manage_skills.on_completion]]
+kind = "sha256_match"
+glob = "${args.skill_dir}/main"
+sha256 = "${args.expected_sha256}"
+
+[spawn_tasks.mofa_cards]
+on_verify = []
+on_failure = ["notify_user:Card generation failed"]
+
+[[spawn_tasks.mofa_cards.on_completion]]
+kind = "magic_bytes"
+glob = "**/*.png"
+format = "png"
+
+[spawn_tasks.mofa_comic]
+artifact = "image_png"
+on_verify = []
+on_failure = ["notify_user:Comic generation failed"]
+
+[[spawn_tasks.mofa_comic.on_completion]]
+kind = "file_exists"
+path = "${args.out}"
+min_bytes = 1024
+
+[[spawn_tasks.mofa_comic.on_completion]]
+kind = "magic_bytes"
+glob = ""
+format = "png"
+source = "spawn_only_files"
+extension = "png"
+
+[spawn_tasks.mofa_frame]
+artifact = "image_png"
+on_verify = []
+on_failure = ["notify_user:Frame extraction failed"]
+
+[[spawn_tasks.mofa_frame.on_completion]]
+kind = "magic_bytes"
+glob = ""
+format = "png"
+source = "spawn_only_files"
+extension = "png"
+
+[spawn_tasks.mofa_infographic]
+artifact = "image_png"
+on_verify = []
+on_failure = ["notify_user:Infographic generation failed"]
+
+[[spawn_tasks.mofa_infographic.on_completion]]
+kind = "file_exists"
+path = "${args.out}"
+min_bytes = 1024
+
+[[spawn_tasks.mofa_infographic.on_completion]]
+kind = "magic_bytes"
+glob = ""
+format = "png"
+source = "spawn_only_files"
+extension = "png"
+
+[spawn_tasks.mofa_publish]
+on_verify = []
+on_failure = ["notify_user:Publish probe failed"]
+
+[[spawn_tasks.mofa_publish.on_completion]]
+id = "mofa_publish.deploy_url_probe"
+required = false
+kind = "http_probe"
+url_template = "${output.deploy_url}"
+expected_status = 200
+expected_contains = "<!DOCTYPE"
+
+[spawn_tasks.mofa_slides]
+artifact = "slides_pptx"
+on_verify = []
+on_failure = ["notify_user:Slide generation failed"]
+
+[[spawn_tasks.mofa_slides.on_completion]]
+kind = "magic_bytes"
+glob = ""
+format = "pptx"
+source = "spawn_only_files"
+extension = "pptx"
+
+[spawn_tasks.podcast_generate]
+artifact = "podcast_audio"
+on_verify = [
+    "file_exists:$artifact",
+    "file_size_min:$artifact:4096",
+]
+on_failure = ["notify_user:Podcast generation failed"]
+
+[[spawn_tasks.podcast_generate.on_completion]]
+kind = "magic_bytes"
+glob = ""
+format = "mp3"
+source = "spawn_only_files"
+extension = "mp3"
+
+[[spawn_tasks.podcast_generate.on_completion]]
+kind = "audio_non_silent"
+glob = ""
+min_ratio = 0.30000001192092896
+source = "spawn_only_files"
+extension = "mp3"
+
+[spawn_tasks.synthesize_research]
+on_verify = []
+on_failure = ["notify_user:Research synthesis failed"]
+
+[[spawn_tasks.synthesize_research.on_completion]]
+id = "synthesize_research.primary_report"
+required = true
+kind = "file_exists"
+path = "${args.research_dir}/synthesis.md"
+min_bytes = 256
+
+[[spawn_tasks.synthesize_research.on_completion]]
+id = "synthesize_research.partials_warn"
+required = true
+soft_fail = true
+kind = "file_exists"
+path = "${args.research_dir}/_search_results.md"
+
+[spawn_tasks.voice_synthesize]
+artifact = "primary_audio"
+on_verify = [
+    "file_exists:$artifact",
+    "file_size_min:$artifact:1024",
+]
+on_failure = ["notify_user:Voice synthesis failed"]
+
+[[spawn_tasks.voice_synthesize.on_completion]]
+kind = "audio_non_silent"
+glob = ""
+min_ratio = 0.30000001192092896
+source = "spawn_only_files"
