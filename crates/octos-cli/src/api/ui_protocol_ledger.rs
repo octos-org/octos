@@ -639,8 +639,10 @@ impl UiProtocolLedger {
             String,
             octos_core::ui_protocol::TaskUpdatedEvent,
         > = std::collections::HashMap::new();
-        let mut started_turns: std::collections::HashMap<String, octos_core::TurnId> =
-            std::collections::HashMap::new();
+        let mut started_turns: std::collections::HashMap<
+            String,
+            (octos_core::TurnId, Option<String>),
+        > = std::collections::HashMap::new();
         let mut terminal_turns: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut agents: std::collections::HashMap<
@@ -656,7 +658,10 @@ impl UiProtocolLedger {
                     tasks.insert(task.task_id.to_string(), task.clone());
                 }
                 UiNotification::TurnStarted(turn) => {
-                    started_turns.insert(turn.turn_id.0.to_string(), turn.turn_id.clone());
+                    started_turns.insert(
+                        turn.turn_id.0.to_string(),
+                        (turn.turn_id.clone(), turn.topic.clone()),
+                    );
                 }
                 UiNotification::TurnCompleted(turn) => {
                     terminal_turns.insert(turn.turn_id.0.to_string());
@@ -682,13 +687,15 @@ impl UiProtocolLedger {
                 swept += 1;
             }
         }
-        for (key, turn_id) in started_turns {
+        for (key, (turn_id, topic)) in started_turns {
             if terminal_turns.contains(&key) {
                 continue;
             }
+            // Preserve the topic so topic-scoped replay filters still see the
+            // synthesized terminal for a topic-suffixed turn.
             self.append_notification(UiNotification::TurnError(TurnErrorEvent {
                 session_id: session_id.clone(),
-                topic: None,
+                topic,
                 turn_id,
                 code: "orphaned_by_restart".to_owned(),
                 message: "server restarted before this turn finished".to_owned(),
@@ -698,7 +705,7 @@ impl UiProtocolLedger {
         for (_, mut agent) in agents {
             if matches!(
                 agent.agent.status.as_str(),
-                "completed" | "failed" | "cancelled" | "closed"
+                "completed" | "failed" | "cancelled" | "closed" | "interrupted"
             ) {
                 continue;
             }
