@@ -2697,6 +2697,30 @@ impl Tool for SpawnTool {
                     task_ledger_path.as_deref(),
                 )
             });
+            // Cap refusal: `register_with_lineage` signals a per-session
+            // child-fanout rejection with an empty-string sentinel. Spawning
+            // anyway would run a detached worker that is invisible to
+            // `task/list` and uncancellable (`cancel("")` no-ops), and the
+            // terminal guard below would be armed under `""`. Refuse the
+            // spawn synchronously so the LLM sees the cap instead of a fake
+            // "started in background" handle. (`None` = no supervisor at all —
+            // the legacy untracked path — which stays allowed.)
+            if tracked_task_id.as_deref() == Some("") {
+                tracing::error!(
+                    label = %label,
+                    "background spawn register refused (child fanout cap); not spawning"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "[TASK LIMIT] Cannot spawn background subagent '{label}': this \
+                         session reached its background-task fanout cap. Wait for \
+                         running tasks to finish (or cancel them) before spawning more. \
+                         Do not retry immediately."
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             let tracked_child_session_key = tracked_task_id.as_ref().and_then(|task_id| {
                 self.task_supervisor
                     .as_ref()
@@ -3800,6 +3824,62 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// Cap refusal must refuse the SPAWN, not just the tracking. Regression:
+    /// `register_with_lineage` returns an empty-string sentinel when the
+    /// per-session child-fanout cap rejects the registration, and the
+    /// background branch spawned the detached worker anyway — untracked,
+    /// uncancellable, with the terminal guard armed under `""`.
+    #[tokio::test]
+    async fn test_background_spawn_refused_at_fanout_cap_does_not_spawn() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let supervisor = Arc::new(TaskSupervisor::new());
+        // Saturate the parent with ACTIVE (Spawned) children so the next
+        // register is refused.
+        for i in 0..crate::task_supervisor::MAX_CHILDREN_PER_PARENT {
+            let id = supervisor.register("busy", &format!("call-{i}"), Some("api:test-session"));
+            assert!(!id.is_empty(), "saturation register #{i} must succeed");
+        }
+
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_task_supervisor(
+            supervisor.clone(),
+            "api:test-session",
+            PathBuf::from("/tmp/tasks.jsonl"),
+        );
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Write a short answer",
+                "label": "over-cap spawn",
+                "mode": "background",
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a cap-refused background spawn must fail, not report started; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("[TASK LIMIT]"),
+            "the refusal must tell the LLM about the cap; got: {}",
+            result.output
+        );
+        // No untracked worker: the supervisor still holds exactly the cap.
+        assert_eq!(
+            supervisor.get_tasks_for_session("api:test-session").len(),
+            crate::task_supervisor::MAX_CHILDREN_PER_PARENT,
+            "the refused spawn must not register or run new work"
+        );
     }
 
     #[ignore = "Pre-migration test: the SpawnOnlyFiles-source MagicBytes validator \

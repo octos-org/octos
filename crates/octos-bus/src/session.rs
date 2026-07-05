@@ -1690,7 +1690,13 @@ impl SessionManager {
     /// Rewrite a session's JSONL file from the in-memory state.
     /// Uses atomic write-then-rename to avoid corruption on crash.
     /// Uses spawn_blocking to avoid blocking the async runtime.
+    ///
+    /// Serialises on the per-key persist lock so the whole-file rewrite
+    /// cannot interleave with (and erase) a canonical locked append or a
+    /// concurrent `SessionHandle` rewrite of the same key.
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
         let session = self
             .cache
             .peek(&key.0)
@@ -2147,6 +2153,30 @@ pub async fn persist_message_through_canonical_path(
     handle.add_message_with_seq(message).await
 }
 
+/// Upsert a durable child-session contract through the canonical locked
+/// path: per-key persist lock → FRESH open (latest disk state) → mutate →
+/// rewrite, all inside one critical section.
+///
+/// Contract writes are whole-file read-modify-write cycles (`rewrite`
+/// snapshots the in-memory session and renames over the file), so two
+/// concurrent writers that each open their own handle both read the same
+/// pre-state and the second rename silently erases the first's update.
+/// This is the production-documented fanout race: two children terminating
+/// together each stamp their terminal contract into the SHARED PARENT
+/// session; the loser's contract reverts to pre-terminal and the task is
+/// stuck un-Joined forever. Holding the per-key lock across open→rewrite
+/// makes the cycle atomic per session key.
+pub async fn upsert_child_contract_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    contract: ChildSessionContract,
+) -> Result<bool> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+    handle.upsert_child_contract_unlocked(contract).await
+}
+
 impl SessionHandle {
     /// Open or create a session handle for the given key.
     ///
@@ -2504,10 +2534,29 @@ impl SessionHandle {
     }
 
     /// Insert or update a durable child-session contract and persist it.
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]).
+    /// NOTE: the lock covers mutate→rewrite only; this handle's in-memory
+    /// state was snapshotted at open time, so a handle opened BEFORE a
+    /// concurrent writer committed will still rewrite from that stale
+    /// snapshot. Callers racing other writers must use
+    /// [`upsert_child_contract_through_canonical_path`], which holds the
+    /// lock across the fresh open as well.
     pub async fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> Result<bool> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.upsert_child_contract_unlocked(contract).await
+    }
+
+    /// Mutate + rewrite without taking the persist lock — the caller must
+    /// already hold it (see [`upsert_child_contract_through_canonical_path`]).
+    async fn upsert_child_contract_unlocked(
+        &mut self,
+        contract: ChildSessionContract,
+    ) -> Result<bool> {
         let existed = self.session.upsert_child_contract(contract);
         self.session.updated_at = Utc::now();
-        self.rewrite().await?;
+        self.rewrite_unlocked().await?;
         Ok(existed)
     }
 
@@ -2517,7 +2566,21 @@ impl SessionHandle {
     }
 
     /// Rewrite the session to disk (atomic write-then-rename).
+    ///
+    /// Serialises on the per-key persist lock so a whole-file rewrite cannot
+    /// interleave with the canonical locked append path
+    /// ([`persist_message_through_canonical_path`]) — an append committed
+    /// between an unlocked rewrite's snapshot and its rename was silently
+    /// erased by the rename.
     pub async fn rewrite(&self) -> Result<()> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.rewrite_unlocked().await
+    }
+
+    /// Snapshot-and-rename without taking the persist lock — the caller
+    /// must already hold it.
+    async fn rewrite_unlocked(&self) -> Result<()> {
         let meta = SessionMeta {
             schema_version: CURRENT_SESSION_SCHEMA,
             session_key: self.session.key.0.clone(),
@@ -3916,6 +3979,63 @@ mod tests {
         assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
         assert_eq!(contract.output_files, vec!["/tmp/report.md"]);
         assert!(contract.joined_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_canonical_contract_upserts_lose_no_updates() {
+        // The production fanout race: N children terminate together and each
+        // stamps its terminal contract into the SHARED parent session. A
+        // contract write is a whole-file read-modify-write (open snapshots
+        // the file, rewrite renames over it), so writers that read the same
+        // pre-state erase each other — the canonical path must hold the
+        // per-key persist lock across open→mutate→rewrite.
+        //
+        // On the single-threaded test runtime every future runs its
+        // synchronous open() before any rewrite lands, so WITHOUT the lock
+        // all 16 read the empty pre-state and exactly one contract survives
+        // — the loss is deterministic, not timing-dependent.
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "fanout-parent");
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "seed"))
+                .await
+                .unwrap();
+        }
+
+        let make_contract = |i: usize| ChildSessionContract {
+            task_id: format!("task-{i}"),
+            task_label: format!("worker {i}"),
+            parent_session_key: parent.to_string(),
+            child_session_key: child_session_key(&parent, &format!("task-{i}")).to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("deliver_result".to_string()),
+            terminal_state: Some(ChildSessionTerminalState::Completed),
+            join_state: Some(ChildSessionJoinState::Joined),
+            joined_at: Some(Utc::now()),
+            failure_action: None,
+            error: None,
+            output_files: vec![],
+        };
+
+        let futures = (0..16)
+            .map(|i| {
+                upsert_child_contract_through_canonical_path(tmp.path(), &parent, make_contract(i))
+            })
+            .collect::<Vec<_>>();
+        for result in futures::future::join_all(futures).await {
+            result.expect("every contract upsert must commit");
+        }
+
+        let reloaded = SessionHandle::open(tmp.path(), &parent);
+        assert_eq!(
+            reloaded.session().child_contracts.len(),
+            16,
+            "every concurrently-upserted contract must survive on disk (lost-update race)"
+        );
+        // The seeded message must survive the rewrites too.
+        assert_eq!(reloaded.session().messages.len(), 1);
     }
 
     #[tokio::test]
