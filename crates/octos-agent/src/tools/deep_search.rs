@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use reqwest::Client;
 use serde::Deserialize;
 
 use crate::harness_events::emit_registered_progress_event;
@@ -18,9 +17,14 @@ use crate::tools::TOOL_CTX;
 use super::web_search::WebSearchTool;
 use super::{Tool, ToolResult};
 
+/// Browser-like UA used for page fetches (some sites 403 non-browser agents).
+const DEEP_SEARCH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// Page-fetch timeout.
+const DEEP_SEARCH_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct DeepSearchTool {
     search: WebSearchTool,
-    client: Client,
     /// Research output base directory (e.g. ~/.octos/research/ or a sub-agent's research_dir).
     research_base: PathBuf,
 }
@@ -29,11 +33,6 @@ impl DeepSearchTool {
     pub fn new(research_base: impl Into<PathBuf>) -> Self {
         Self {
             search: WebSearchTool::new(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(15))
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                .build()
-                .unwrap_or_else(|_| Client::new()),
             research_base: research_base.into(),
         }
     }
@@ -225,24 +224,32 @@ fn emit_deep_research_progress(phase: &str, message: &str, progress: Option<f64>
 
 impl DeepSearchTool {
     async fn fetch_page(&self, url: &str, max_chars: usize) -> Result<String> {
-        // SSRF check
-        if let Ok(parsed) = reqwest::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                if super::ssrf::is_private_host(host) {
-                    return Ok(String::new());
-                }
-                let port = parsed.port_or_known_default().unwrap_or(443);
-                if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-                    for addr in addrs {
-                        if super::ssrf::is_private_ip(&addr.ip()) {
-                            return Ok(String::new());
-                        }
-                    }
-                }
-            }
-        }
+        // Best-effort fetch: an SSRF-blocked target (including a redirect hop
+        // to a private host) or any transport failure yields empty content,
+        // which the caller skips — one bad URL must not abort the batch.
+        Ok(self
+            .fetch_page_inner(url, max_chars)
+            .await
+            .unwrap_or_default())
+    }
 
-        let response = self.client.get(url).send().await.wrap_err("fetch failed")?;
+    async fn fetch_page_inner(&self, url: &str, max_chars: usize) -> Result<String> {
+        // SSRF is re-validated on EVERY redirect hop (the initial-URL-only
+        // check this replaced let an allowed URL 302 to 169.254.169.254 /
+        // 10.x through). `ssrf_safe_send` disables auto-redirects, re-checks +
+        // DNS-pins each hop, and re-issues the GET.
+        let response = super::ssrf::ssrf_safe_send(
+            url,
+            super::ssrf::SSRF_MAX_REDIRECTS,
+            |builder| {
+                builder
+                    .timeout(DEEP_SEARCH_FETCH_TIMEOUT)
+                    .user_agent(DEEP_SEARCH_USER_AGENT)
+            },
+            |client, current_url| client.get(current_url),
+        )
+        .await
+        .map_err(|e| eyre::eyre!("{e}"))?;
 
         if !response.status().is_success() {
             eyre::bail!("HTTP {}", response.status());
