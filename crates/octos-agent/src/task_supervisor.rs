@@ -1938,8 +1938,9 @@ impl TaskSupervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(parent_session_key);
             if already_poisoned {
-                // Diagnostic count for the error payload — live children,
-                // matching the semantics of the gating count below.
+                // Diagnostic count for the error payload — live children
+                // (status-active OR worker-still-running), matching the
+                // semantics of the gating count below.
                 let count = self
                     .tasks
                     .lock()
@@ -1947,7 +1948,7 @@ impl TaskSupervisor {
                     .values()
                     .filter(|task| {
                         task.parent_session_key.as_deref() == Some(parent_session_key)
-                            && task.status.is_active()
+                            && (task.status.is_active() || is_task_live(&task.id))
                     })
                     .count();
                 let error = RegisterTaskError::ChildFanoutExceeded {
@@ -1983,11 +1984,19 @@ impl TaskSupervisor {
                 // force-fail its active work. The cap's job is to bound
                 // runaway CONCURRENT fan-out; terminal children are done and
                 // hold no resources this cap protects.
+                //
+                // "Live" is status-active OR worker-still-running (codex P2):
+                // `cancel` flips the STATUS to Cancelled immediately, but the
+                // detached worker keeps executing until it observes the token
+                // — status alone would let a spawn→cancel-all→spawn cycle run
+                // 2× the cap concurrently. The process-global live-set
+                // (armed by `TaskTerminalGuard::new`, cleared on its Drop at
+                // every worker exit path) tracks actual worker liveness.
                 let count = tasks
                     .values()
                     .filter(|task| {
                         task.parent_session_key.as_deref() == Some(parent_session_key)
-                            && task.status.is_active()
+                            && (task.status.is_active() || is_task_live(&task.id))
                     })
                     .count();
                 let terminal = parent_terminal_check_tool_call_id
@@ -5636,6 +5645,35 @@ mod tests {
                 .all(|t| t.error.as_deref().is_none_or(|e| !e.contains("fanout"))),
             "no child may be force-failed with a fan-out reason on a healthy session"
         );
+    }
+
+    /// codex P2 on the active-only cap count: `cancel` flips a task's STATUS
+    /// to Cancelled immediately, but the detached worker keeps running until
+    /// it observes the token — a status-only count would let a session spawn
+    /// the cap, cancel everything, and spawn another cap while the first
+    /// workers still execute. A child whose worker is still LIVE (in the
+    /// process-global live-set armed by [`TaskTerminalGuard::new`]) must keep
+    /// counting toward the cap until the guard drops.
+    #[test]
+    fn cancelled_but_still_live_children_still_count_toward_cap() {
+        let parent_session = "api:cancel-bypass-parent";
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let mut guards = Vec::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("busy", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Arm the production liveness guard (worker "running"), then
+            // cancel: status flips Cancelled but the worker is still live.
+            guards.push(TaskTerminalGuard::new(supervisor.clone(), id.clone()));
+            let _ = supervisor.cancel(&id);
+        }
+
+        let err = supervisor
+            .try_register_with_input("busy", "call-bypass", Some(parent_session), None)
+            .expect_err("cancelled-but-still-LIVE workers must still bound the fan-out cap");
+        assert!(matches!(err, RegisterTaskError::ChildFanoutExceeded { .. }));
+        drop(guards);
     }
 
     /// The legacy `register_with_input` entry point keeps returning a

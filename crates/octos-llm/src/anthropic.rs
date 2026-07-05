@@ -334,6 +334,14 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
     // True while `out.last()` is the user-role message accumulating the
     // current run of consecutive tool_result blocks.
     let mut merging_tool_results = false;
+    // tool_use ids answerable by the NEXT emitted message (codex P2): a
+    // `tool_result` is only valid immediately after the assistant message
+    // that carries its `tool_use`. A Tool row whose id is not pending — the
+    // assistant row was trimmed/compacted away, the window starts mid-loop,
+    // or another message closed the window — must fall back to plain user
+    // text; Anthropic rejects orphan tool_result blocks outright.
+    let mut pending_tool_use_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for m in messages
         .iter()
@@ -343,41 +351,68 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
             octos_core::MessageRole::Assistant => {
                 merging_tool_results = false;
                 if let Some(content) = build_assistant_anthropic_content(m) {
+                    pending_tool_use_ids = m
+                        .tool_calls
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|tc| !tc.id.is_empty())
+                        .map(|tc| tc.id.clone())
+                        .collect();
                     out.push(AnthropicMessage {
                         role: "assistant",
                         content,
                     });
                 }
+                // A DROPPED (fully-empty) assistant row emits nothing, so the
+                // previously-emitted message is unchanged — leave the pending
+                // window as-is.
             }
-            octos_core::MessageRole::Tool => match anthropic_tool_result_block(m) {
-                Some(block) => {
-                    if merging_tool_results
-                        && let Some(AnthropicMessage {
-                            content: AnthropicContent::Parts(parts),
-                            ..
-                        }) = out.last_mut()
-                    {
-                        parts.push(block);
-                    } else {
+            octos_core::MessageRole::Tool => {
+                let block = m
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| pending_tool_use_ids.contains(*id))
+                    .and_then(|_| anthropic_tool_result_block(m));
+                match block {
+                    Some(block) => {
+                        // Consume the id: a duplicate result for the same
+                        // tool_use would also be rejected.
+                        if let Some(id) = m.tool_call_id.as_deref() {
+                            pending_tool_use_ids.remove(id);
+                        }
+                        if merging_tool_results
+                            && let Some(AnthropicMessage {
+                                content: AnthropicContent::Parts(parts),
+                                ..
+                            }) = out.last_mut()
+                        {
+                            parts.push(block);
+                        } else {
+                            out.push(AnthropicMessage {
+                                role: "user",
+                                content: AnthropicContent::Parts(vec![block]),
+                            });
+                            merging_tool_results = true;
+                        }
+                    }
+                    None => {
+                        // ID-less or orphan tool output: no pending tool_use
+                        // to pair with — plain user text for this row. This
+                        // also closes the pending window (the inserted text
+                        // message breaks the immediately-after adjacency).
+                        merging_tool_results = false;
+                        pending_tool_use_ids.clear();
                         out.push(AnthropicMessage {
                             role: "user",
-                            content: AnthropicContent::Parts(vec![block]),
+                            content: build_anthropic_content(m),
                         });
-                        merging_tool_results = true;
                     }
                 }
-                None => {
-                    // ID-less tool output: no valid tool_use_id to pair with,
-                    // fall back to plain user text for this row only.
-                    merging_tool_results = false;
-                    out.push(AnthropicMessage {
-                        role: "user",
-                        content: build_anthropic_content(m),
-                    });
-                }
-            },
+            }
             _ => {
                 merging_tool_results = false;
+                pending_tool_use_ids.clear();
                 out.push(AnthropicMessage {
                     role: "user",
                     content: build_anthropic_content(m),
@@ -893,6 +928,54 @@ mod tests {
         assert_eq!(out.len(), 2, "empty assistant row dropped: {body}");
         assert_eq!(out[0]["content"], "hi");
         assert_eq!(out[1]["content"], "still there?");
+    }
+
+    #[test]
+    fn orphan_tool_result_falls_back_to_plain_text() {
+        // codex P2: a Tool row whose matching assistant tool_use is NOT the
+        // immediately-preceding emitted message (compaction trimmed the
+        // assistant row, or the window starts mid-loop) must NOT serialize as
+        // a tool_result — Anthropic rejects orphan tool_result blocks. Fall
+        // back to plain user text, the pre-fix behaviour for these rows.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+
+        // Case 1: transcript starts with a Tool row (assistant trimmed away).
+        let mut orphan = msg(MessageRole::Tool, "stale output");
+        orphan.tool_call_id = Some("toolu_gone".into());
+        let messages = vec![orphan.clone(), msg(MessageRole::User, "continue")];
+        let config = ChatConfig::default();
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(
+            out[0]["content"], "stale output",
+            "orphan tool row must be plain text, not tool_result: {body}"
+        );
+
+        // Case 2: a user row between the assistant's tool_use and the Tool row
+        // closes the immediately-following window — the late result must fall
+        // back to text (a tool_result there would be orphaned).
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![tool_call(
+            "toolu_late",
+            "shell",
+            serde_json::json!({"command": "ls"}),
+        )]);
+        let mut late = msg(MessageRole::Tool, "late output");
+        late.tool_call_id = Some("toolu_late".into());
+        let messages = vec![
+            msg(MessageRole::User, "go"),
+            assistant,
+            msg(MessageRole::User, "interposed"),
+            late,
+        ];
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[3]["role"], "user");
+        assert_eq!(
+            out[3]["content"], "late output",
+            "a result outside the immediately-following window must be plain text: {body}"
+        );
     }
 
     #[test]
