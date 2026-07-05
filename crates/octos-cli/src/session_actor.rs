@@ -1452,10 +1452,25 @@ async fn persist_child_session_lifecycle(
                 error: None,
                 output_files: Vec::new(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path: a contract write is a whole-file
+            // read-modify-write, and every fanout child stamps the SHARED
+            // parent session — two children terminating together with their
+            // own stale handles silently erase each other's contract (the
+            // stuck-un-Joined race). The helper holds the per-key persist
+            // lock across open→mutate→rewrite.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
             Ok(parent_exists)
@@ -1515,10 +1530,23 @@ async fn persist_child_session_lifecycle(
                 error: payload.error.clone(),
                 output_files: payload.output_files.clone(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path — see the Spawned arm. This terminal arm
+            // is the production-documented race: two children completing
+            // together each rewrote the parent from a stale snapshot, and the
+            // loser's terminal contract reverted to pre-terminal.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(
                 payload.kind,
