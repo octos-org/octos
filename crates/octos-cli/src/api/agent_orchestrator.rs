@@ -1972,9 +1972,23 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     .is_none_or(|session_id| session_controls_target(session_id, &agent.session_id))
             })
             .filter(|agent| {
-                request.connection_profile_id.is_none()
-                    || agent.profile_id == scoped_profile_id
-                    || agent.session_id.profile_id().is_none()
+                // Scope by the agent's OWNER profile, exactly like the read
+                // path (`ensure_agent_control_scope`, which forbids
+                // `agent.profile_id != profile_id`). An unscoped (admin,
+                // `connection_profile_id == None`) connection sees every
+                // agent. A profile-scoped connection sees only agents it owns.
+                //
+                // P1 fix: the removed `|| agent.session_id.profile_id().is_none()`
+                // clause admitted EVERY bare-session (profile-less) agent to
+                // EVERY scoped connection. Because a bare session whose spawn
+                // did not thread a runtime profile resolves to `MAIN_PROFILE_ID`
+                // ("_main"), that leaked a `_main`/other-tenant agent's
+                // output_tail / task / cwd (see `autonomy_agent_json`) to a
+                // tenant-B connection — while the read RPCs would forbid the
+                // same agent. A bare-session agent owned by the caller already
+                // matches on `agent.profile_id == scoped_profile_id`; one that
+                // does not is out of scope and must not appear.
+                request.connection_profile_id.is_none() || agent.profile_id == scoped_profile_id
             })
             .map(autonomy_agent_json)
             .collect::<Vec<_>>();
@@ -6409,6 +6423,106 @@ mod tests {
             .expect("agent list");
         assert_eq!(result["agents"].as_array().expect("agents").len(), 1);
         assert_eq!(result["agents"][0]["agent_id"], json!("agent-b"));
+    }
+
+    #[test]
+    fn list_agents_does_not_leak_bare_session_agents_across_tenants() {
+        // P1: the old `agent.session_id.profile_id().is_none()` clause admitted
+        // EVERY bare-session (profile-less) agent to EVERY profile-scoped
+        // connection. A bare session whose spawn threaded no runtime profile
+        // resolves to `MAIN_PROFILE_ID` ("_main"), so tenant-B saw a `_main`
+        // agent's output_tail / task / cwd — even though the read path
+        // (`ensure_agent_control_scope`) would forbid the same agent.
+        let orchestrator = InProcessAgentOrchestrator::default();
+
+        // Bare-session agent owned by "_main".
+        let mut bare = sample_agent("bare-main", MAIN_PROFILE_ID);
+        bare.session_id = SessionKey::new("api", "bare-chat");
+        assert!(
+            bare.session_id.profile_id().is_none(),
+            "precondition: session must be profile-less"
+        );
+        // A genuine tenant-B agent.
+        let owned = sample_agent("owned-b", "tenant-b");
+
+        orchestrator
+            .state()
+            .agents
+            .insert(bare.agent_id.clone(), bare);
+        orchestrator
+            .state()
+            .agents
+            .insert(owned.agent_id.clone(), owned);
+
+        let result = orchestrator
+            .list_agents(AgentListRequest {
+                session_id: None,
+                profile_id: "tenant-b".into(),
+                connection_profile_id: Some("tenant-b".into()),
+            })
+            .expect("agent list");
+        let ids: Vec<&str> = result["agents"]
+            .as_array()
+            .expect("agents")
+            .iter()
+            .filter_map(|a| a["agent_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"owned-b"), "tenant-B must see its own agent");
+        assert!(
+            !ids.contains(&"bare-main"),
+            "tenant-B must NOT see a _main bare-session agent (cross-tenant leak)"
+        );
+    }
+
+    #[test]
+    fn list_agents_main_scoped_connection_still_sees_its_bare_session_agents() {
+        // Removing the leaky clause must not hide a connection's OWN
+        // bare-session agents: a `_main`-scoped connection still matches a
+        // `_main`-owned bare agent via `agent.profile_id == scoped_profile_id`.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut bare = sample_agent("bare-main", MAIN_PROFILE_ID);
+        bare.session_id = SessionKey::new("api", "bare-chat");
+
+        orchestrator
+            .state()
+            .agents
+            .insert(bare.agent_id.clone(), bare);
+
+        let result = orchestrator
+            .list_agents(AgentListRequest {
+                session_id: None,
+                profile_id: MAIN_PROFILE_ID.into(),
+                connection_profile_id: Some(MAIN_PROFILE_ID.into()),
+            })
+            .expect("agent list");
+        let agents = result["agents"].as_array().expect("agents");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["agent_id"], json!("bare-main"));
+    }
+
+    #[test]
+    fn list_agents_unscoped_admin_still_sees_bare_session_agents() {
+        // An unscoped (admin, `connection_profile_id == None`) connection is
+        // authorized for every profile and still sees bare-session agents.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut bare = sample_agent("bare-main", MAIN_PROFILE_ID);
+        bare.session_id = SessionKey::new("api", "bare-chat");
+
+        orchestrator
+            .state()
+            .agents
+            .insert(bare.agent_id.clone(), bare);
+
+        let result = orchestrator
+            .list_agents(AgentListRequest {
+                session_id: None,
+                profile_id: MAIN_PROFILE_ID.into(),
+                connection_profile_id: None,
+            })
+            .expect("agent list");
+        let agents = result["agents"].as_array().expect("agents");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["agent_id"], json!("bare-main"));
     }
 
     #[test]

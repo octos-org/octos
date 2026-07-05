@@ -4488,10 +4488,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
-                handle_router_set_mode(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_set_mode(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::RouterGetMetrics(params) => {
-                handle_router_get_metrics(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_get_metrics(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
         }
     }
@@ -5040,9 +5056,16 @@ where
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
+                // stdio is a local single-user transport with no authenticated
+                // tenant scope, so `connection_profile_id` is `None` (no
+                // cross-tenant enforcement); `connection_profile_id_owned`
+                // remains the resolution fallback. Only the hosted WS path,
+                // which carries an authenticated `connection_profile_id`,
+                // enforces the tenant gate.
                 handle_router_set_mode(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -5053,6 +5076,7 @@ where
                 handle_router_get_metrics(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -14434,14 +14458,68 @@ fn task_cancel_rpc_error(task_id: &TaskId, error: octos_agent::TaskCancelError) 
 fn resolve_router_for_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
-) -> Option<Arc<octos_llm::AdaptiveRouter>> {
+) -> Result<Option<Arc<octos_llm::AdaptiveRouter>>, RpcError> {
+    // Tenant-scope gate (P1). Without it the `session_id.profile_id()`-first
+    // precedence below lets a tenant-B connection pass a `session_id` that
+    // embeds tenant-A's profile and resolve — then `set_mode` mutate /
+    // `get_metrics` read — tenant-A's `AdaptiveRouter`. Placing the check
+    // inside the shared resolver protects BOTH router handlers by
+    // construction.
+    authorize_router_session_scope(session_id, connection_profile_id, routed_profile_id)?;
     let active_profile_id = session_id
         .profile_id()
         .map(ToOwned::to_owned)
         .or_else(|| routed_profile_id.map(ToOwned::to_owned));
-    let profile_runtime = resolve_session_profile_runtime(state, active_profile_id.as_deref())?;
-    profile_runtime.adaptive_router.clone()
+    Ok(
+        resolve_session_profile_runtime(state, active_profile_id.as_deref())
+            .and_then(|profile_runtime| profile_runtime.adaptive_router.clone()),
+    )
+}
+
+/// Tenant-scope gate for the router RPCs.
+///
+/// A hosted WS connection is authorized for its own authenticated
+/// `connection_profile_id` AND — on a per-tenant subdomain — the
+/// `routed_profile_id` that `is_authorized_for_profile` already cleared at
+/// upgrade time (an admin / parent account operating a tenant it owns; a
+/// forged `Host` for an unauthorized tenant 403s before this point, so a
+/// present `routed_profile_id` is always trustworthy). A `session_id` whose
+/// embedded profile is EITHER is in scope; a different tenant is rejected.
+///
+/// - An unscoped connection (`connection_profile_id == None` — bootstrap
+///   admin token / local solo) is authorized for every profile.
+/// - A bare (profile-less) `session_id` is authorized under the connection's
+///   auth, matching `validate_authenticated_session_scope`'s `None` arm.
+///
+/// This is deliberately a touch more permissive than the bare
+/// `validate_session_scope(session_id, None, connection_profile_id)` other
+/// handlers use (it also honours `routed_profile_id`): a router RPC on a
+/// hosted subdomain must not regress the authorized admin/parent access that
+/// existed before this gate landed, while a genuine cross-tenant `session_id`
+/// (matching neither authorized profile) is still rejected. `authenticated_
+/// scope_mismatch_error` tags the rejection `auth_scope_violation` so the
+/// handler emits the same 1008 close the other scope checks do.
+fn authorize_router_session_scope(
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+) -> Result<(), RpcError> {
+    let Some(connection_profile_id) = connection_profile_id else {
+        return Ok(());
+    };
+    let Some(session_profile) = session_id.profile_id() else {
+        return Ok(());
+    };
+    if session_profile == connection_profile_id || routed_profile_id == Some(session_profile) {
+        return Ok(());
+    }
+    Err(authenticated_scope_mismatch_error(
+        "session_id is outside the authorized profile scope",
+        connection_profile_id,
+        Some(session_profile),
+    ))
 }
 
 /// Wave4-A handler for `router/set_mode`. Parses `params.mode` into the
@@ -14454,6 +14532,7 @@ fn resolve_router_for_session(
 async fn handle_router_set_mode(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterSetModeParams,
@@ -14474,17 +14553,30 @@ async fn handle_router_set_mode(
             return;
         }
     };
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before touching another tenant's router.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     router.set_mode(mode);
     let result = octos_core::ui_protocol::RouterSetModeResult { mode: params.mode };
@@ -14508,22 +14600,36 @@ async fn handle_router_set_mode(
 async fn handle_router_get_metrics(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterGetMetricsParams,
 ) {
     let method = octos_core::ui_protocol::methods::ROUTER_GET_METRICS;
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before reading another tenant's router metrics.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     let status = router.adaptive_status();
     let result = octos_core::ui_protocol::RouterGetMetricsResult {
@@ -29585,6 +29691,87 @@ ignore = []
         // Drop the sender side so a pending recv resolves promptly; instead,
         // poll once with no wait to confirm the queue is empty.
         assert!(rx.try_recv().is_err(), "no close frame expected");
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_cross_tenant_session_id() {
+        // P1: a profile-scoped (tenant-B) connection must not resolve — and so
+        // must not be able to `set_mode` / read metrics on — a router for a
+        // `session_id` that embeds tenant-A's profile. The tenant gate fires
+        // BEFORE any ProfileRuntime lookup, so an empty test state suffices to
+        // prove the rejection. Without the gate this returned `Ok(None)` (and
+        // the handler would go on to resolve tenant-A's runtime).
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        // `AdaptiveRouter` is not `Debug`, so `.expect_err` on the `Ok` type
+        // does not compile — match instead.
+        let error = match resolve_router_for_session(&state, &session_a, Some("tenant-b"), None) {
+            Err(error) => error,
+            Ok(_) => panic!("cross-tenant router access must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_same_tenant() {
+        // Same-tenant scope passes the gate; with no ProfileRuntime registered
+        // in the empty test state the router resolves to `None` (`Ok(None)`) —
+        // NOT an error. Proves the gate is scope-only, not a blanket denial.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, Some("tenant-a"), None)
+            .expect("same-tenant scope must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_admin_connection_is_unscoped() {
+        // An unscoped (admin, `connection_profile_id == None`) connection is
+        // authorized for every profile — it passes the gate for any
+        // `session_id`, matching every other mutating RPC handler.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, None, None)
+            .expect("admin connection must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_authorized_routed_profile() {
+        // Codex P2: an OTP-admin / parent connection authorized for a tenant
+        // subdomain carries `connection_profile_id == <its own user id>` and
+        // `routed_profile_id == <tenant>` (is_authorized_for_profile cleared it
+        // at upgrade). The gate must NOT reject a session_id embedding the
+        // routed tenant — that access is authorized and predates the gate.
+        let state = Arc::new(AppState::empty_for_tests());
+        let tenant_session = SessionKey::with_profile("tenant-b", "api", "chat-1");
+        let resolved = resolve_router_for_session(
+            &state,
+            &tenant_session,
+            Some("admin-user"), // connection == the admin's own user id
+            Some("tenant-b"),   // routed == the authorized tenant subdomain
+        )
+        .expect("authorized routed profile must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_tenant_outside_routed_and_connection() {
+        // Even WITH a routed profile present, a session_id embedding a third
+        // tenant (neither the connection's own id nor the authorized routed
+        // tenant) is still rejected — the union does not become allow-any.
+        let state = Arc::new(AppState::empty_for_tests());
+        let other = SessionKey::with_profile("tenant-c", "api", "chat-1");
+        let error = match resolve_router_for_session(
+            &state,
+            &other,
+            Some("admin-user"),
+            Some("tenant-b"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a third-tenant session_id must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
     }
 
     /// Codex BLOCK regression (2026-05-13): with the writer channel at
