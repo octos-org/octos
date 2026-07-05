@@ -1474,16 +1474,21 @@ fn effective_allowed_tools(allowed_tools: &[String], disallowed_tools: &[String]
     }
     // Deny entries carry the same wildcard (`podcast_*`) and group
     // (`group:runtime`) semantics ToolPolicy enforces locally — prune with a
-    // deny-only policy (empty allow = allow everything not denied) instead of
-    // exact matching, so the effective set agrees with what the local policy
-    // would actually deny.
+    // deny-only policy (empty allow = allow everything not denied) so the
+    // effective set agrees with what the local policy would actually deny.
     let deny_only = ToolPolicy {
         deny: disallowed_tools.to_vec(),
         ..Default::default()
     };
     allowed_tools
         .iter()
-        .filter(|tool| deny_only.is_allowed(tool))
+        // Exact-contains AND policy matching: the allow-list may itself carry
+        // a group/wildcard entry, and `entry_matches` expands a denied group
+        // only against CONCRETE member names (the group string is not a member
+        // of itself) — so `group:runtime` denied verbatim would survive pure
+        // policy filtering. Contains catches identical entries; the policy
+        // catches concrete tools covered by a group/wildcard deny.
+        .filter(|tool| !disallowed_tools.contains(tool) && deny_only.is_allowed(tool))
         .cloned()
         .collect()
 }
@@ -5362,6 +5367,31 @@ PY
             ),
             vec!["grep".to_string()],
             "a wildcard deny entry must prune matching tools"
+        );
+    }
+
+    #[test]
+    fn effective_allowed_tools_prunes_a_group_entry_denied_verbatim() {
+        // Codex P1 (fold 3): the allow-list may itself carry a group entry
+        // (`tools: ["group:runtime"]`). `entry_matches` expands a denied group
+        // only against CONCRETE member names — the group string is not a
+        // member of itself — so pure policy filtering lets the denied group
+        // survive into the agent_mcp payload / preflight. The exact-contains
+        // check must prune identical entries too (as the pre-policy-semantics
+        // code did).
+        assert_eq!(
+            effective_allowed_tools(
+                &["group:runtime".to_string(), "read_file".to_string()],
+                &["group:runtime".to_string()],
+            ),
+            vec!["read_file".to_string()],
+            "a group entry denied verbatim must not survive the prune"
+        );
+        // Same belt-and-braces for a verbatim wildcard entry.
+        assert_eq!(
+            effective_allowed_tools(&["podcast_*".to_string()], &["podcast_*".to_string()]),
+            Vec::<String>::new(),
+            "a wildcard entry denied verbatim must not survive the prune"
         );
     }
 
