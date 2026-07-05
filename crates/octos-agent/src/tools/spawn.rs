@@ -1009,20 +1009,24 @@ fn default_mode() -> String {
 /// Returns an error when the id is set but does not exist in the registry —
 /// that's almost always a typo, and silently ignoring it would erase the
 /// manifest's safety envelope.
-/// Layer an `agent_definition_id` manifest onto the inline [`Input`].
 ///
-/// Returns `true` when the manifest's `disallowed_tools` pruned a
-/// previously **non-empty** `allowed_tools` down to empty. That signal is
-/// load-bearing for the P1 guard at the call site: an empty `allowed_tools`
-/// is treated downstream ([`ToolPolicy`]) as "allow every tool not denied",
-/// so a prune-to-empty must NOT silently fall through to full access — see
-/// [`reject_disallow_inverted_allow_list`].
+/// Returns the manifest's `disallowed_tools` (empty when there is no manifest
+/// or it declares none). The caller feeds this to
+/// [`build_subagent_tool_policy`] as a **deny-list**, which is the ONLY
+/// correct way to enforce it: removing entries from `allowed_tools` (the
+/// prior approach) breaks two ways — an allow-list pruned to empty is read by
+/// [`ToolPolicy`] as "allow every tool not denied" (a privilege INVERSION),
+/// and a one-time prune cannot cover tools a role template adds afterwards
+/// (a role could re-introduce a manifest-forbidden tool). A deny entry wins
+/// over any allow (including role-provided ones) and never empties the
+/// allow-list, so `allow:[shell] + deny:[shell]` → no tools (correct) and
+/// `allow:[] + deny:[shell]` → all-except-shell (correct).
 fn apply_agent_definition(
     input: &mut Input,
     registry: &crate::agents::AgentDefinitions,
-) -> Result<bool> {
+) -> Result<Vec<String>> {
     let Some(id) = input.agent_definition_id.as_deref() else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let def = registry.get(id).ok_or_else(|| {
         eyre::eyre!(
@@ -1032,25 +1036,14 @@ fn apply_agent_definition(
         )
     })?;
 
-    // Tool allow-list: manifest provides the default; inline takes
-    // precedence when it is non-empty. Manifest deny-list is merged into
-    // the inline `allowed_tools` as a removal step so a manifest that
-    // marks `shell` as disallowed cannot be re-enabled silently by
-    // inheriting the parent's default allow set.
+    // Tool allow-list: manifest provides the default; inline takes precedence
+    // when it is non-empty. The manifest's `disallowed_tools` is NOT applied
+    // here — it is returned and enforced as a policy deny-list so it also
+    // covers tools a role template contributes later (see the doc comment).
     if input.allowed_tools.is_empty() {
         input.allowed_tools = def.tools.clone();
     }
-    let mut disallow_emptied_allow_list = false;
-    if !def.disallowed_tools.is_empty() {
-        let had_allow_list = !input.allowed_tools.is_empty();
-        input
-            .allowed_tools
-            .retain(|name| !def.disallowed_tools.contains(name));
-        // A prune that consumes the ENTIRE allow-list is the dangerous case:
-        // the now-empty list would otherwise mean "allow all". Flag it so the
-        // caller can reject (unless a role template later refills the list).
-        disallow_emptied_allow_list = had_allow_list && input.allowed_tools.is_empty();
-    }
+    let disallowed_tools = def.disallowed_tools.clone();
 
     // Option-typed fields: manifest only applies when the inline slot is
     // None.
@@ -1081,38 +1074,7 @@ fn apply_agent_definition(
         );
     }
 
-    Ok(disallow_emptied_allow_list)
-}
-
-/// P1 guard: reject a spawn whose tool allow-list was pruned to empty by a
-/// manifest's `disallowed_tools`.
-///
-/// An empty `allowed_tools` is interpreted downstream by [`ToolPolicy`] as
-/// "allow every tool not explicitly denied" (see `policy.rs`: "Empty allow
-/// list = allow everything not denied"). So a manifest that lists, say,
-/// `tools: ["shell"]` + `disallowed_tools: ["shell"]` — or a caller that
-/// requests `allowed_tools: ["shell"]` against a manifest that forbids
-/// `shell` — would prune the allow-list to empty and thereby grant the
-/// subagent EVERY tool: the exact inverse of the intended restriction.
-///
-/// This is checked at the call site AFTER [`apply_role_template`], so a role
-/// template that legitimately refills the emptied list (leaving
-/// `allowed_tools` non-empty) is honoured and does not trip the guard.
-fn reject_disallow_inverted_allow_list(
-    input: &Input,
-    disallow_emptied_allow_list: bool,
-) -> Result<()> {
-    if disallow_emptied_allow_list && input.allowed_tools.is_empty() {
-        eyre::bail!(
-            "spawn: agent_definition_id '{}' disallows every tool in the \
-             allow-list (disallowed_tools pruned it to empty). An empty \
-             allow-list would grant the subagent ALL tools — the opposite of \
-             the intended restriction. Request at least one tool that is not \
-             in the manifest's disallowed_tools.",
-            input.agent_definition_id.as_deref().unwrap_or("?"),
-        );
-    }
-    Ok(())
+    Ok(disallowed_tools)
 }
 
 fn append_role_instructions(existing: Option<String>, role_prefix: &str) -> Option<String> {
@@ -1494,6 +1456,7 @@ async fn maybe_generate_inline_research_podcast(
 
 fn build_subagent_tool_policy(
     allowed_tools: Vec<String>,
+    disallowed_tools: Vec<String>,
     workflow: Option<&WorkflowMetadata>,
 ) -> ToolPolicy {
     let mut deny = vec!["spawn".to_string()];
@@ -1503,6 +1466,12 @@ fn build_subagent_tool_policy(
         // cannot double-deliver slides/site artifacts.
         deny.push("send_file".to_string());
     }
+    // A manifest's `disallowed_tools` is enforced here as a DENY-list. Deny
+    // wins over allow (see `ToolPolicy::evaluate`), so a forbidden tool is
+    // blocked even if it appears in `allow` (inline/manifest) OR was added by
+    // a role template — and, unlike an allow-list prune, this can never empty
+    // the allow-list into an accidental "allow all".
+    deny.extend(disallowed_tools);
     ToolPolicy {
         allow: allowed_tools,
         deny,
@@ -2032,13 +2001,12 @@ impl Tool for SpawnTool {
         // layer the manifest's fields onto the inline Input with "inline
         // wins" semantics. Unknown ids are a hard error — silently ignoring
         // them would let a typo erase the manifest's safety envelope.
-        let disallow_emptied_allow_list =
+        // The manifest's `disallowed_tools` becomes a policy DENY-list (below),
+        // not an allow-list prune — so it also covers tools a role template
+        // adds and can never invert an emptied allow-list into "allow all".
+        let manifest_disallowed_tools =
             apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
         let role_template = apply_role_template(&mut input)?;
-        // P1: a `disallowed_tools` prune that empties the allow-list must not
-        // invert into "allow all". Checked after the role template has had its
-        // chance to refill the list.
-        reject_disallow_inverted_allow_list(&input, disallow_emptied_allow_list)?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
@@ -2547,7 +2515,11 @@ impl Tool for SpawnTool {
             tools.clear_internal_hidden();
             ensure_subagent_tools_available(&tools, &allowed_tools)
                 .map_err(|error| eyre::eyre!(error))?;
-            let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
+            let policy = build_subagent_tool_policy(
+                allowed_tools,
+                manifest_disallowed_tools,
+                workflow.as_ref(),
+            );
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
@@ -3055,7 +3027,11 @@ impl Tool for SpawnTool {
                 tools.clear_internal_hidden();
                 let availability_check = ensure_subagent_tools_available(&tools, &allowed_tools)
                     .map_err(|error| eyre::eyre!(error));
-                let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
+                let policy = build_subagent_tool_policy(
+                    allowed_tools,
+                    manifest_disallowed_tools,
+                    workflow_metadata.as_ref(),
+                );
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
@@ -4365,7 +4341,10 @@ mod tests {
             progress: None,
         };
 
-        let policy = build_subagent_tool_policy(workflow.allowed_tools.clone(), Some(&workflow));
+        // Workflow-node spawn: no agent-definition manifest, so no
+        // manifest-level disallowed_tools deny-list.
+        let policy =
+            build_subagent_tool_policy(workflow.allowed_tools.clone(), Vec::new(), Some(&workflow));
 
         assert!(policy.deny.contains(&"spawn".to_string()));
         assert!(policy.deny.contains(&"send_file".to_string()));
@@ -5170,10 +5149,11 @@ PY
     }
 
     #[test]
-    fn should_let_inline_allowed_tools_override_manifest_allowed_tools() {
-        // When inline `allowed_tools` is non-empty it replaces the manifest
-        // list outright. The manifest's disallowed_tools still prune the
-        // result so a manifest cannot be silently bypassed.
+    fn manifest_disallowed_tools_are_denied_by_policy_not_pruned_from_allow_list() {
+        // inline [shell, grep] + manifest disallowed [shell]. The allow-list is
+        // NOT mutated (shell stays); apply_agent_definition returns the
+        // disallowed list, which build_subagent_tool_policy enforces as a
+        // DENY. Deny wins over allow → shell blocked, grep allowed.
         let mut registry = crate::agents::AgentDefinitions::new();
         registry.insert(
             "example",
@@ -5193,24 +5173,28 @@ PY
             "agent_definition_id": "example",
             "allowed_tools": ["shell", "grep"]
         }));
-        let flagged = apply_agent_definition(&mut input, &registry).expect("apply");
+        let disallowed = apply_agent_definition(&mut input, &registry).expect("apply");
 
-        // Inline list is kept, but manifest's disallow pruned `shell`.
+        assert_eq!(disallowed, vec!["shell".to_string()]);
+        // Inline list is kept verbatim — disallow is NOT a prune anymore.
         assert!(input.allowed_tools.contains(&"grep".to_string()));
-        assert!(!input.allowed_tools.contains(&"shell".to_string()));
-        // `grep` survives, so the allow-list is NOT emptied — no inversion.
+        assert!(input.allowed_tools.contains(&"shell".to_string()));
+
+        let policy = build_subagent_tool_policy(input.allowed_tools.clone(), disallowed, None);
         assert!(
-            !flagged,
-            "a non-empty post-prune allow-list must not flag the inversion guard"
+            !policy.is_allowed("shell"),
+            "manifest-disallowed shell must be denied by policy"
         );
+        assert!(policy.is_allowed("grep"), "grep must remain allowed");
     }
 
     #[test]
-    fn disallowed_tools_pruning_allow_list_to_empty_is_rejected_not_allow_all() {
-        // P1: a manifest that disallows every tool in the allow-list prunes it
-        // to empty. An empty `allowed_tools` means "allow ALL tools" to
-        // `ToolPolicy`, so proceeding would grant the subagent every tool —
-        // the inverse of the restriction. The spawn must be rejected instead.
+    fn manifest_forbidding_its_only_tool_grants_no_tools_not_allow_all() {
+        // P1 (the original finding): manifest tools:[shell] + disallowed:[shell]
+        // with no inline and no role. The OLD retain emptied the allow-list,
+        // which ToolPolicy reads as "allow ALL". Now the allow-list keeps
+        // [shell] (filled from def.tools, NOT pruned) and shell is denied, so
+        // the effective tool set is EMPTY — never allow-all.
         let mut registry = crate::agents::AgentDefinitions::new();
         registry.insert(
             "shell-then-forbid-shell",
@@ -5225,71 +5209,50 @@ PY
             .expect("parse"),
         );
 
-        // Manifest-only path: def.tools=[shell] filled in, then pruned to empty.
         let mut input = parse_spawn_input(serde_json::json!({
             "task": "do it",
             "agent_definition_id": "shell-then-forbid-shell"
         }));
-        let flagged = apply_agent_definition(&mut input, &registry).expect("apply");
-        assert!(flagged, "prune-to-empty must be flagged");
-        assert!(
-            input.allowed_tools.is_empty(),
-            "precondition: allow-list empty"
-        );
+        let disallowed = apply_agent_definition(&mut input, &registry).expect("apply");
+        assert_eq!(disallowed, vec!["shell".to_string()]);
 
-        // With no role template to refill the list, the guard must reject.
-        let err = reject_disallow_inverted_allow_list(&input, flagged).unwrap_err();
-        let msg = format!("{err:#}");
+        let policy = build_subagent_tool_policy(input.allowed_tools.clone(), disallowed, None);
+        assert!(!policy.is_allowed("shell"), "the forbidden tool is denied");
+        // The critical anti-inversion assertions: NOT allow-all.
         assert!(
-            msg.contains("grant the subagent ALL tools"),
-            "error must explain the allow-all inversion; got: {msg}"
+            !policy.is_allowed("read_file"),
+            "must NOT fall through to allow-all"
+        );
+        assert!(
+            !policy.is_allowed("web_fetch"),
+            "must NOT fall through to allow-all"
         );
     }
 
     #[test]
-    fn inline_only_all_requested_tools_disallowed_is_rejected() {
-        // The same inversion via the INLINE path: the caller requests only
-        // tools the manifest forbids, pruning the allow-list to empty.
-        let mut registry = crate::agents::AgentDefinitions::new();
-        registry.insert(
-            "forbids-shell",
-            crate::agents::AgentDefinition::from_json_str(
-                r#"{
-                    "name": "forbids-shell",
-                    "version": 1,
-                    "tools": ["read_file"],
-                    "disallowed_tools": ["shell"]
-                }"#,
-            )
-            .expect("parse"),
+    fn role_refill_cannot_reintroduce_a_manifest_disallowed_tool() {
+        // Codex P1: a spawn that ALSO supplies a `role` used to re-fill the
+        // emptied allow-list with the role's tool budget, re-introducing a
+        // manifest-forbidden tool. Because disallowed_tools is now a policy
+        // deny (not a one-time allow-list prune), a role-provided tool that
+        // overlaps the deny-list is still blocked — deny wins over allow.
+        //
+        // Simulates the post-`apply_role_template` state: the allow-list has
+        // been refilled with the role's tools (including the forbidden one).
+        let role_refilled_allow = vec![
+            "shell".to_string(),
+            "read_file".to_string(),
+            "edit_file".to_string(),
+        ];
+        let manifest_disallowed = vec!["shell".to_string()];
+
+        let policy = build_subagent_tool_policy(role_refilled_allow, manifest_disallowed, None);
+        assert!(
+            !policy.is_allowed("shell"),
+            "a role-provided tool must still be denied by the manifest's disallowed_tools"
         );
-
-        let mut input = parse_spawn_input(serde_json::json!({
-            "task": "do it",
-            "agent_definition_id": "forbids-shell",
-            "allowed_tools": ["shell"]
-        }));
-        let flagged = apply_agent_definition(&mut input, &registry).expect("apply");
-        assert!(flagged);
-        assert!(reject_disallow_inverted_allow_list(&input, flagged).is_err());
-    }
-
-    #[test]
-    fn reject_disallow_inverted_allow_list_permits_non_empty_and_unflagged() {
-        // The guard fires ONLY on the flagged prune-to-empty case: a non-empty
-        // allow-list (e.g. a role template refilled it) or an unflagged input
-        // (empty by "inherit default" semantics, not by pruning) both pass.
-        let mut refilled = parse_spawn_input(serde_json::json!({
-            "task": "x",
-            "agent_definition_id": "some-def",
-            "allowed_tools": ["read_file"]
-        }));
-        assert!(reject_disallow_inverted_allow_list(&refilled, true).is_ok());
-
-        refilled.allowed_tools.clear();
-        // Empty but NOT flagged as a prune-to-empty → legitimate "inherit"
-        // path, not the inversion — must pass.
-        assert!(reject_disallow_inverted_allow_list(&refilled, false).is_ok());
+        assert!(policy.is_allowed("read_file"));
+        assert!(policy.is_allowed("edit_file"));
     }
 
     #[test]
