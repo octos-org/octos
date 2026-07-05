@@ -1469,9 +1469,21 @@ async fn maybe_generate_inline_research_podcast(
 /// policy — doing so would lose the "deny also covers role-refilled tools"
 /// guarantee.
 fn effective_allowed_tools(allowed_tools: &[String], disallowed_tools: &[String]) -> Vec<String> {
+    if disallowed_tools.is_empty() {
+        return allowed_tools.to_vec();
+    }
+    // Deny entries carry the same wildcard (`podcast_*`) and group
+    // (`group:runtime`) semantics ToolPolicy enforces locally — prune with a
+    // deny-only policy (empty allow = allow everything not denied) instead of
+    // exact matching, so the effective set agrees with what the local policy
+    // would actually deny.
+    let deny_only = ToolPolicy {
+        deny: disallowed_tools.to_vec(),
+        ..Default::default()
+    };
     allowed_tools
         .iter()
-        .filter(|tool| !disallowed_tools.contains(tool))
+        .filter(|tool| deny_only.is_allowed(tool))
         .cloned()
         .collect()
 }
@@ -5324,6 +5336,32 @@ PY
         assert_eq!(
             effective_allowed_tools(&["grep".to_string()], &[]),
             vec!["grep".to_string()],
+        );
+    }
+
+    #[test]
+    fn effective_allowed_tools_prunes_with_policy_semantics_not_exact_match() {
+        // Codex P2 (fold 2): `disallowed_tools` entries carry the same
+        // wildcard/group semantics ToolPolicy enforces locally. An exact
+        // `contains` prune would let `shell` (denied via `group:runtime`) or
+        // `podcast_generate` (denied via `podcast_*`) reach the agent_mcp
+        // payload and the preflight — re-opening the bypass for exactly the
+        // deny spellings the local policy honors.
+        assert_eq!(
+            effective_allowed_tools(
+                &["shell".to_string(), "read_file".to_string()],
+                &["group:runtime".to_string()],
+            ),
+            vec!["read_file".to_string()],
+            "a group deny entry must prune its member tools"
+        );
+        assert_eq!(
+            effective_allowed_tools(
+                &["podcast_generate".to_string(), "grep".to_string()],
+                &["podcast_*".to_string()],
+            ),
+            vec!["grep".to_string()],
+            "a wildcard deny entry must prune matching tools"
         );
     }
 
