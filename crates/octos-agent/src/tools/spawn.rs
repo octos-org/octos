@@ -1009,12 +1009,20 @@ fn default_mode() -> String {
 /// Returns an error when the id is set but does not exist in the registry —
 /// that's almost always a typo, and silently ignoring it would erase the
 /// manifest's safety envelope.
+/// Layer an `agent_definition_id` manifest onto the inline [`Input`].
+///
+/// Returns `true` when the manifest's `disallowed_tools` pruned a
+/// previously **non-empty** `allowed_tools` down to empty. That signal is
+/// load-bearing for the P1 guard at the call site: an empty `allowed_tools`
+/// is treated downstream ([`ToolPolicy`]) as "allow every tool not denied",
+/// so a prune-to-empty must NOT silently fall through to full access — see
+/// [`reject_disallow_inverted_allow_list`].
 fn apply_agent_definition(
     input: &mut Input,
     registry: &crate::agents::AgentDefinitions,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(id) = input.agent_definition_id.as_deref() else {
-        return Ok(());
+        return Ok(false);
     };
     let def = registry.get(id).ok_or_else(|| {
         eyre::eyre!(
@@ -1032,10 +1040,16 @@ fn apply_agent_definition(
     if input.allowed_tools.is_empty() {
         input.allowed_tools = def.tools.clone();
     }
+    let mut disallow_emptied_allow_list = false;
     if !def.disallowed_tools.is_empty() {
+        let had_allow_list = !input.allowed_tools.is_empty();
         input
             .allowed_tools
             .retain(|name| !def.disallowed_tools.contains(name));
+        // A prune that consumes the ENTIRE allow-list is the dangerous case:
+        // the now-empty list would otherwise mean "allow all". Flag it so the
+        // caller can reject (unless a role template later refills the list).
+        disallow_emptied_allow_list = had_allow_list && input.allowed_tools.is_empty();
     }
 
     // Option-typed fields: manifest only applies when the inline slot is
@@ -1067,6 +1081,37 @@ fn apply_agent_definition(
         );
     }
 
+    Ok(disallow_emptied_allow_list)
+}
+
+/// P1 guard: reject a spawn whose tool allow-list was pruned to empty by a
+/// manifest's `disallowed_tools`.
+///
+/// An empty `allowed_tools` is interpreted downstream by [`ToolPolicy`] as
+/// "allow every tool not explicitly denied" (see `policy.rs`: "Empty allow
+/// list = allow everything not denied"). So a manifest that lists, say,
+/// `tools: ["shell"]` + `disallowed_tools: ["shell"]` — or a caller that
+/// requests `allowed_tools: ["shell"]` against a manifest that forbids
+/// `shell` — would prune the allow-list to empty and thereby grant the
+/// subagent EVERY tool: the exact inverse of the intended restriction.
+///
+/// This is checked at the call site AFTER [`apply_role_template`], so a role
+/// template that legitimately refills the emptied list (leaving
+/// `allowed_tools` non-empty) is honoured and does not trip the guard.
+fn reject_disallow_inverted_allow_list(
+    input: &Input,
+    disallow_emptied_allow_list: bool,
+) -> Result<()> {
+    if disallow_emptied_allow_list && input.allowed_tools.is_empty() {
+        eyre::bail!(
+            "spawn: agent_definition_id '{}' disallows every tool in the \
+             allow-list (disallowed_tools pruned it to empty). An empty \
+             allow-list would grant the subagent ALL tools — the opposite of \
+             the intended restriction. Request at least one tool that is not \
+             in the manifest's disallowed_tools.",
+            input.agent_definition_id.as_deref().unwrap_or("?"),
+        );
+    }
     Ok(())
 }
 
@@ -1987,8 +2032,13 @@ impl Tool for SpawnTool {
         // layer the manifest's fields onto the inline Input with "inline
         // wins" semantics. Unknown ids are a hard error — silently ignoring
         // them would let a typo erase the manifest's safety envelope.
-        apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
+        let disallow_emptied_allow_list =
+            apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
         let role_template = apply_role_template(&mut input)?;
+        // P1: a `disallowed_tools` prune that empties the allow-list must not
+        // invert into "allow all". Checked after the role template has had its
+        // chance to refill the list.
+        reject_disallow_inverted_allow_list(&input, disallow_emptied_allow_list)?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
@@ -5143,11 +5193,103 @@ PY
             "agent_definition_id": "example",
             "allowed_tools": ["shell", "grep"]
         }));
-        apply_agent_definition(&mut input, &registry).expect("apply");
+        let flagged = apply_agent_definition(&mut input, &registry).expect("apply");
 
         // Inline list is kept, but manifest's disallow pruned `shell`.
         assert!(input.allowed_tools.contains(&"grep".to_string()));
         assert!(!input.allowed_tools.contains(&"shell".to_string()));
+        // `grep` survives, so the allow-list is NOT emptied — no inversion.
+        assert!(
+            !flagged,
+            "a non-empty post-prune allow-list must not flag the inversion guard"
+        );
+    }
+
+    #[test]
+    fn disallowed_tools_pruning_allow_list_to_empty_is_rejected_not_allow_all() {
+        // P1: a manifest that disallows every tool in the allow-list prunes it
+        // to empty. An empty `allowed_tools` means "allow ALL tools" to
+        // `ToolPolicy`, so proceeding would grant the subagent every tool —
+        // the inverse of the restriction. The spawn must be rejected instead.
+        let mut registry = crate::agents::AgentDefinitions::new();
+        registry.insert(
+            "shell-then-forbid-shell",
+            crate::agents::AgentDefinition::from_json_str(
+                r#"{
+                    "name": "shell-then-forbid-shell",
+                    "version": 1,
+                    "tools": ["shell"],
+                    "disallowed_tools": ["shell"]
+                }"#,
+            )
+            .expect("parse"),
+        );
+
+        // Manifest-only path: def.tools=[shell] filled in, then pruned to empty.
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "do it",
+            "agent_definition_id": "shell-then-forbid-shell"
+        }));
+        let flagged = apply_agent_definition(&mut input, &registry).expect("apply");
+        assert!(flagged, "prune-to-empty must be flagged");
+        assert!(
+            input.allowed_tools.is_empty(),
+            "precondition: allow-list empty"
+        );
+
+        // With no role template to refill the list, the guard must reject.
+        let err = reject_disallow_inverted_allow_list(&input, flagged).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("grant the subagent ALL tools"),
+            "error must explain the allow-all inversion; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn inline_only_all_requested_tools_disallowed_is_rejected() {
+        // The same inversion via the INLINE path: the caller requests only
+        // tools the manifest forbids, pruning the allow-list to empty.
+        let mut registry = crate::agents::AgentDefinitions::new();
+        registry.insert(
+            "forbids-shell",
+            crate::agents::AgentDefinition::from_json_str(
+                r#"{
+                    "name": "forbids-shell",
+                    "version": 1,
+                    "tools": ["read_file"],
+                    "disallowed_tools": ["shell"]
+                }"#,
+            )
+            .expect("parse"),
+        );
+
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "do it",
+            "agent_definition_id": "forbids-shell",
+            "allowed_tools": ["shell"]
+        }));
+        let flagged = apply_agent_definition(&mut input, &registry).expect("apply");
+        assert!(flagged);
+        assert!(reject_disallow_inverted_allow_list(&input, flagged).is_err());
+    }
+
+    #[test]
+    fn reject_disallow_inverted_allow_list_permits_non_empty_and_unflagged() {
+        // The guard fires ONLY on the flagged prune-to-empty case: a non-empty
+        // allow-list (e.g. a role template refilled it) or an unflagged input
+        // (empty by "inherit default" semantics, not by pruning) both pass.
+        let mut refilled = parse_spawn_input(serde_json::json!({
+            "task": "x",
+            "agent_definition_id": "some-def",
+            "allowed_tools": ["read_file"]
+        }));
+        assert!(reject_disallow_inverted_allow_list(&refilled, true).is_ok());
+
+        refilled.allowed_tools.clear();
+        // Empty but NOT flagged as a prune-to-empty → legitimate "inherit"
+        // path, not the inversion — must pass.
+        assert!(reject_disallow_inverted_allow_list(&refilled, false).is_ok());
     }
 
     #[test]
