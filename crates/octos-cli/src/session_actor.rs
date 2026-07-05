@@ -706,13 +706,14 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            // Merge in place when the frame leads with a System (e.g.
-            // compaction summary). `normalize_system_messages` runs
-            // BEFORE this bridge in the agent loop
-            // (`loop_compaction.rs:35`), so multi-System payloads
-            // produced here would reach the provider unmerged.
-            // Anthropic in particular rejects them outright. See the
-            // AppUI analogue in `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // Merge in place when the frame leads with a System (legacy
+            // guard — compaction summaries now render as protected User
+            // rows). `normalize_system_messages` runs BEFORE this bridge
+            // in the agent loop (`loop_compaction.rs:35`), so
+            // multi-System payloads produced here would reach the
+            // provider unmerged. Anthropic in particular rejects them
+            // outright. See the AppUI analogue in
+            // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
             // for the rationale.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
@@ -1451,10 +1452,25 @@ async fn persist_child_session_lifecycle(
                 error: None,
                 output_files: Vec::new(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path: a contract write is a whole-file
+            // read-modify-write, and every fanout child stamps the SHARED
+            // parent session — two children terminating together with their
+            // own stale handles silently erase each other's contract (the
+            // stuck-un-Joined race). The helper holds the per-key persist
+            // lock across open→mutate→rewrite.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
             Ok(parent_exists)
@@ -1514,10 +1530,23 @@ async fn persist_child_session_lifecycle(
                 error: payload.error.clone(),
                 output_files: payload.output_files.clone(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path — see the Spawned arm. This terminal arm
+            // is the production-documented race: two children completing
+            // together each rewrote the parent from a stale snapshot, and the
+            // loser's terminal contract reverted to pre-terminal.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(
                 payload.kind,
@@ -4853,19 +4882,35 @@ impl SessionActor {
                         .last()
                         .map(|(_, message)| message.content.clone())
                 };
-                if let Some(reply) = assistant_reply {
-                    if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
-                        &loop_id,
-                        &profile_id,
-                        &reply,
-                    ) {
-                        info!(
-                            session = %self.session_key,
-                            loop_id = %loop_id,
-                            error = %err.message,
-                            "apply_self_paced_response skipped"
-                        );
-                    }
+                // A reply-less fire (interrupt / agent error / empty content)
+                // still reschedules: the empty reply carries no
+                // `<<loop-next-in: …>>` sentinel, so the orchestrator applies
+                // the DEFAULT self-paced delay. Skipping here parked the loop
+                // at `next_run_at_ms: None`, which the due-scan never visits
+                // again — one failed turn silently killed the loop.
+                //
+                // Deliberate divergence from the AppUI path (codex round-1):
+                // AppUI captures the EndTurn payload and can distinguish a
+                // DELIBERATE blank reply (skip, #1134 contract) from a true
+                // no-reply (reschedule). This path has no capture —
+                // `process_inbound` doesn't persist empty assistant content
+                // and the history scan filters empties — so blank and error
+                // are indistinguishable here, and liveness wins: a blank
+                // loop turn retries at the default delay instead of dying.
+                // An explicit model stop should be a sentinel (follow-up),
+                // not an unpersistable blank.
+                let reply = assistant_reply.unwrap_or_default();
+                if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                    &loop_id,
+                    &profile_id,
+                    &reply,
+                ) {
+                    info!(
+                        session = %self.session_key,
+                        loop_id = %loop_id,
+                        error = %err.message,
+                        "apply_self_paced_response skipped"
+                    );
                 }
             }
             default_agent_orchestrator().mark_continuation_completed(
@@ -9821,6 +9866,106 @@ mod tests {
             crate::context_manager::context_ledger_path(dir.path(), &session_key.to_string())
                 .exists(),
             "prompt-context preparation should persist the canonical context ledger"
+        );
+    }
+
+    /// Post-compaction coverage regression: the agent loop runs
+    /// `normalize_system_messages` BEFORE the bridge, converting any
+    /// non-leading `[Conversation summary]` System row into a
+    /// `[System note] ` User row. When the frame emitted that summary as a
+    /// System row, the bridge's contiguous coverage window never matched
+    /// again after the first compaction, and every TurnStart re-recorded the
+    /// entire retained conversation as source-less duplicates. The frame now
+    /// emits the summary as a User row, which the loop leaves untouched, so
+    /// TurnStart must record exactly ONE new item (the current user turn).
+    #[test]
+    fn session_actor_prompt_context_bridge_covers_frame_after_compaction() {
+        let session_key = SessionKey::new("cli", "context-post-compaction-coverage");
+        let history: Vec<Message> = (0..6)
+            .flat_map(|index| {
+                vec![
+                    test_message(MessageRole::User, format!("user turn {index}")),
+                    test_message(MessageRole::Assistant, format!("assistant turn {index}")),
+                ]
+            })
+            .collect();
+        let mut manager =
+            ContextManager::from_session_history(session_key.to_string(), None, &history);
+        manager.install_compaction_summary("older turns summarized", 4);
+        let item_count_before = manager.items().len();
+        let manager = Arc::new(StdMutex::new(manager));
+        let dir = tempfile::TempDir::new().unwrap();
+        let bridge = SessionActorPromptContextBridge::new(
+            session_key.clone(),
+            dir.path().to_path_buf(),
+            manager.clone(),
+        );
+
+        let request = PromptContextRequest {
+            phase: PromptContextPhase::TurnStart,
+            iteration: 1,
+            provider_name: "test".to_string(),
+            model_id: "large-context".to_string(),
+            context_window: 16_000,
+        };
+        // Build the turn-start vector the way the agent loop does: runtime
+        // System + the manager's own frame + the new user turn...
+        let frame_messages = {
+            let guard = manager.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .for_prompt(&SessionActorPromptContextBridge::prompt_policy(&request))
+                .messages
+        };
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(frame_messages);
+        prompt.push(test_message(MessageRole::User, "current request"));
+        // ...then apply the `normalize_system_messages` conversion rule that
+        // runs before the bridge (message_repair.rs): non-leading context
+        // System rows become `[System note] ` User rows. A User-role summary
+        // frame row makes this a no-op; a System-role regression would be
+        // rewritten here and blow the coverage window below.
+        for message in prompt.iter_mut().skip(1) {
+            if message.role == MessageRole::System
+                && (message.content.starts_with("[Conversation summary]")
+                    || message.content.starts_with("[Background task"))
+            {
+                message.role = MessageRole::User;
+                message.content = format!("[System note] {}", message.content);
+            }
+        }
+
+        let report = bridge
+            .prepare_prompt(request, &mut prompt)
+            .expect("context manager bridge should prepare prompt");
+
+        assert!(
+            !report.compaction_performed,
+            "small post-compaction transcript must not re-compact"
+        );
+        let item_count_after = manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items()
+            .len();
+        assert_eq!(
+            item_count_after,
+            item_count_before + 1,
+            "TurnStart must record exactly the current user turn; anything more \
+             means the frame failed coverage and was re-recorded as duplicates"
+        );
+        assert!(
+            prompt
+                .iter()
+                .any(|message| message.content.contains("[Conversation summary]")),
+            "summary must still reach the model prompt"
+        );
+        assert_eq!(
+            prompt
+                .iter()
+                .filter(|message| message.content == "user turn 4")
+                .count(),
+            1,
+            "retained history must not be duplicated in the outgoing prompt"
         );
     }
 

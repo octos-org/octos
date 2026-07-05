@@ -160,3 +160,4 @@ test_a2.md
 !e2e/fixtures/compat-test-skill/main
 tsconfig.tsbuildinfo
 .superpowers/
+.claude/scheduled_tasks.lock

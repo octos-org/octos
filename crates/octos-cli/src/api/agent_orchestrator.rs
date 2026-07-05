@@ -615,6 +615,33 @@ impl InProcessAgentOrchestrator {
         Ok(())
     }
 
+    /// Solo-boot loop safety. Loops restored from a PRIOR process's
+    /// supervisor store resume firing REAL model turns with nobody having
+    /// asked this process for them — a forgotten test loop can burn a turn
+    /// every interval for hours, invisible unless the operator reads the
+    /// server log. On a `--solo` (single local operator) boot the surprising
+    /// default is wrong: park every restored active loop as `paused` and let
+    /// the operator resume explicitly (`/loop resume <id>`). The transition
+    /// is persisted so the pause survives further restarts. Returns the
+    /// paused `(loop_id, session_id)` pairs so the caller can log them.
+    pub(crate) fn pause_restored_loops_for_solo_boot(&self) -> Vec<(String, SessionKey)> {
+        let mut state = self.state();
+        let state = &mut *state;
+        let supervisor_store = state.supervisor_store.as_ref();
+        let now = now_ms();
+        let mut paused = Vec::new();
+        for loop_record in state.loops.values_mut() {
+            if loop_record.status != "active" {
+                continue;
+            }
+            loop_record.status = "paused".to_owned();
+            loop_record.updated_at_ms = now;
+            persist_loop_state_with_store(supervisor_store, loop_record);
+            paused.push((loop_record.loop_id.clone(), loop_record.session_id.clone()));
+        }
+        paused
+    }
+
     pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Value {
         let now = now_ms();
         let mut state = self.state();
@@ -1945,9 +1972,23 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     .is_none_or(|session_id| session_controls_target(session_id, &agent.session_id))
             })
             .filter(|agent| {
-                request.connection_profile_id.is_none()
-                    || agent.profile_id == scoped_profile_id
-                    || agent.session_id.profile_id().is_none()
+                // Scope by the agent's OWNER profile, exactly like the read
+                // path (`ensure_agent_control_scope`, which forbids
+                // `agent.profile_id != profile_id`). An unscoped (admin,
+                // `connection_profile_id == None`) connection sees every
+                // agent. A profile-scoped connection sees only agents it owns.
+                //
+                // P1 fix: the removed `|| agent.session_id.profile_id().is_none()`
+                // clause admitted EVERY bare-session (profile-less) agent to
+                // EVERY scoped connection. Because a bare session whose spawn
+                // did not thread a runtime profile resolves to `MAIN_PROFILE_ID`
+                // ("_main"), that leaked a `_main`/other-tenant agent's
+                // output_tail / task / cwd (see `autonomy_agent_json`) to a
+                // tenant-B connection — while the read RPCs would forbid the
+                // same agent. A bare-session agent owned by the caller already
+                // matches on `agent.profile_id == scoped_profile_id`; one that
+                // does not is out of scope and must not appear.
+                request.connection_profile_id.is_none() || agent.profile_id == scoped_profile_id
             })
             .map(autonomy_agent_json)
             .collect::<Vec<_>>();
@@ -2469,12 +2510,32 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             mode: parsed.mode,
             interval_seconds: parsed.interval_seconds,
             status: "active".into(),
-            next_run_at_ms: parsed.interval_seconds.and_then(|seconds| {
-                i64::try_from(seconds)
-                    .ok()
-                    .and_then(|seconds| seconds.checked_mul(1_000))
-                    .and_then(|delay_ms| now.checked_add(delay_ms))
-            }),
+            // A fresh loop MUST carry a schedule cue or the due-scan never
+            // visits it. Fixed loops schedule now+interval (unchanged).
+            // Self-paced and maintenance loops previously started at
+            // `next_run_at_ms: None`, which the due-scan skips forever — so
+            // `/loop <prompt>` and bare `/loop` NEVER fired without a manual
+            // `loop/fire_now` (the model can only pick its
+            // `<<loop-next-in: …>>` delay after a first fire that never
+            // came). Give them the default self-paced delay as an initial
+            // cue: schedulable, model-paced thereafter. (Deliberately NOT
+            // due-now — a due-now first fire races a client that also seeds
+            // with `loop/fire_now`, enqueuing two first turns; the spec's
+            // "immediately fires once" is a separate follow-up that should
+            // enqueue the first fire from `create` itself.)
+            next_run_at_ms: parsed
+                .interval_seconds
+                .and_then(|seconds| {
+                    i64::try_from(seconds)
+                        .ok()
+                        .and_then(|seconds| seconds.checked_mul(1_000))
+                })
+                .or_else(|| {
+                    i64::try_from(SELF_PACED_DEFAULT_DELAY_SECONDS)
+                        .ok()
+                        .and_then(|seconds| seconds.checked_mul(1_000))
+                })
+                .and_then(|delay_ms| now.checked_add(delay_ms)),
             last_run_at_ms: None,
             expires_at_ms: now + LOOP_MAX_AGE_DAYS * 24 * 60 * 60 * 1_000,
             created_at_ms: now,
@@ -6283,6 +6344,62 @@ mod tests {
         );
     }
 
+    /// Solo-boot loop safety: an active loop restored from a prior
+    /// process's supervisor store must be parked `paused` (persisted), so a
+    /// forgotten loop cannot silently burn model turns unattended. The park
+    /// is idempotent across restarts because the transition is persisted.
+    #[test]
+    fn solo_boot_pause_parks_restored_active_loops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_dir = dir.path().join("supervisor");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "solo-loop-park");
+        {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            orchestrator
+                .configure_supervisor_store(&store_dir)
+                .expect("store");
+            orchestrator
+                .create_loop(LoopCreateRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    prompt: Some("keep poking".into()),
+                    command: None,
+                    interval_seconds: Some(60),
+                    mode: None,
+                })
+                .expect("create loop");
+        }
+
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay");
+        let paused = restarted.pause_restored_loops_for_solo_boot();
+        assert_eq!(paused.len(), 1, "the restored active loop must be parked");
+        assert_eq!(paused[0].1, session_id);
+        let listed = restarted
+            .list_loops(LoopListRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("loop list");
+        assert_eq!(
+            listed["loops"][0]["status"],
+            json!("paused"),
+            "parked loop must list as paused: {listed}"
+        );
+
+        // Persisted: a further restart re-parks nothing.
+        let third = InProcessAgentOrchestrator::default();
+        third
+            .configure_supervisor_store(&store_dir)
+            .expect("replay 2");
+        assert!(
+            third.pause_restored_loops_for_solo_boot().is_empty(),
+            "already-paused loops must not be re-parked"
+        );
+    }
+
     #[test]
     fn list_agents_uses_connection_profile_scope_value() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -6306,6 +6423,106 @@ mod tests {
             .expect("agent list");
         assert_eq!(result["agents"].as_array().expect("agents").len(), 1);
         assert_eq!(result["agents"][0]["agent_id"], json!("agent-b"));
+    }
+
+    #[test]
+    fn list_agents_does_not_leak_bare_session_agents_across_tenants() {
+        // P1: the old `agent.session_id.profile_id().is_none()` clause admitted
+        // EVERY bare-session (profile-less) agent to EVERY profile-scoped
+        // connection. A bare session whose spawn threaded no runtime profile
+        // resolves to `MAIN_PROFILE_ID` ("_main"), so tenant-B saw a `_main`
+        // agent's output_tail / task / cwd — even though the read path
+        // (`ensure_agent_control_scope`) would forbid the same agent.
+        let orchestrator = InProcessAgentOrchestrator::default();
+
+        // Bare-session agent owned by "_main".
+        let mut bare = sample_agent("bare-main", MAIN_PROFILE_ID);
+        bare.session_id = SessionKey::new("api", "bare-chat");
+        assert!(
+            bare.session_id.profile_id().is_none(),
+            "precondition: session must be profile-less"
+        );
+        // A genuine tenant-B agent.
+        let owned = sample_agent("owned-b", "tenant-b");
+
+        orchestrator
+            .state()
+            .agents
+            .insert(bare.agent_id.clone(), bare);
+        orchestrator
+            .state()
+            .agents
+            .insert(owned.agent_id.clone(), owned);
+
+        let result = orchestrator
+            .list_agents(AgentListRequest {
+                session_id: None,
+                profile_id: "tenant-b".into(),
+                connection_profile_id: Some("tenant-b".into()),
+            })
+            .expect("agent list");
+        let ids: Vec<&str> = result["agents"]
+            .as_array()
+            .expect("agents")
+            .iter()
+            .filter_map(|a| a["agent_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"owned-b"), "tenant-B must see its own agent");
+        assert!(
+            !ids.contains(&"bare-main"),
+            "tenant-B must NOT see a _main bare-session agent (cross-tenant leak)"
+        );
+    }
+
+    #[test]
+    fn list_agents_main_scoped_connection_still_sees_its_bare_session_agents() {
+        // Removing the leaky clause must not hide a connection's OWN
+        // bare-session agents: a `_main`-scoped connection still matches a
+        // `_main`-owned bare agent via `agent.profile_id == scoped_profile_id`.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut bare = sample_agent("bare-main", MAIN_PROFILE_ID);
+        bare.session_id = SessionKey::new("api", "bare-chat");
+
+        orchestrator
+            .state()
+            .agents
+            .insert(bare.agent_id.clone(), bare);
+
+        let result = orchestrator
+            .list_agents(AgentListRequest {
+                session_id: None,
+                profile_id: MAIN_PROFILE_ID.into(),
+                connection_profile_id: Some(MAIN_PROFILE_ID.into()),
+            })
+            .expect("agent list");
+        let agents = result["agents"].as_array().expect("agents");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["agent_id"], json!("bare-main"));
+    }
+
+    #[test]
+    fn list_agents_unscoped_admin_still_sees_bare_session_agents() {
+        // An unscoped (admin, `connection_profile_id == None`) connection is
+        // authorized for every profile and still sees bare-session agents.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut bare = sample_agent("bare-main", MAIN_PROFILE_ID);
+        bare.session_id = SessionKey::new("api", "bare-chat");
+
+        orchestrator
+            .state()
+            .agents
+            .insert(bare.agent_id.clone(), bare);
+
+        let result = orchestrator
+            .list_agents(AgentListRequest {
+                session_id: None,
+                profile_id: MAIN_PROFILE_ID.into(),
+                connection_profile_id: None,
+            })
+            .expect("agent list");
+        let agents = result["agents"].as_array().expect("agents");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["agent_id"], json!("bare-main"));
     }
 
     #[test]
@@ -8598,6 +8815,68 @@ mod tests {
             drained[0].metadata.get("prompt").map(String::as_str),
             Some("check build health")
         );
+    }
+
+    /// UPCR-2026-021: "`/loop 5m /foo` creates a fixed loop and immediately
+    /// fires once", and a self-paced loop needs an INITIAL fire for the
+    /// model to select a delay at all. Every freshly created loop must be
+    /// due immediately — previously fixed loops waited a full interval and
+    /// self-paced/maintenance (`next_run_at_ms: None`) NEVER fired without
+    /// a manual `loop/fire_now`.
+    #[test]
+    fn created_loops_carry_a_schedule_cue_for_every_mode() {
+        // Every mode must get a non-None `next_run_at_ms` at create time or
+        // the due-scan never visits it. Self-paced and maintenance loops
+        // previously started at None and NEVER fired without a manual
+        // fire_now; they now schedule at the default self-paced delay (not
+        // due-now — that would race a client that also seeds fire_now).
+        // Fixed loops keep now+interval.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let cases: [(&str, Option<u64>, Option<&str>, Option<&str>); 3] = [
+            (
+                "fixed",
+                Some(120),
+                Some("check builds"),
+                Some("fixed_interval"),
+            ),
+            (
+                "selfpaced",
+                None,
+                Some("tend the garden"),
+                Some("self_paced"),
+            ),
+            ("maintenance", None, None, Some("maintenance")),
+        ];
+        for (tag, interval, prompt, mode) in cases {
+            let session_id =
+                SessionKey::with_profile("tenant-a", "api", &format!("loop-cue-{tag}"));
+            let created = orchestrator
+                .create_loop(LoopCreateRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    prompt: prompt.map(str::to_owned),
+                    command: None,
+                    interval_seconds: interval,
+                    mode: mode.map(str::to_owned),
+                })
+                .expect("create loop");
+            let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+            let state = orchestrator.state();
+            let loop_record = state.loops.get(&loop_id).expect("loop record");
+            let next = loop_record
+                .next_run_at_ms
+                .unwrap_or_else(|| panic!("{tag}: new loop must carry a schedule cue, not None"));
+            assert!(
+                next > now_ms(),
+                "{tag}: the cue is in the future (fixed=+interval, self-paced/maintenance=+default delay), not due-now (next={next})"
+            );
+            // The scheduled cue is bounded by the mode's expected delay.
+            let expected_ms = interval.unwrap_or(SELF_PACED_DEFAULT_DELAY_SECONDS) as i64 * 1_000;
+            assert!(
+                next <= now_ms() + expected_ms + 5_000,
+                "{tag}: cue within the expected delay window"
+            );
+        }
     }
 
     /// #1128 codex P1 acceptance: self-paced loops whose `next_run_at_ms`

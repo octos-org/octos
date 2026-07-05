@@ -158,20 +158,25 @@ fn default_session_schema() -> u32 {
 /// Trims whitespace, strips JSON content-array wrappers if present, and
 /// truncates to 50 Unicode characters at a UTF-8 boundary so the result
 /// is safe to persist and round-trip through serde.
-fn derive_title_from_message(content: &str) -> String {
+/// Unwrap `[{"type":"text","text":"…"}]`-shaped content (many UI clients send
+/// this) to its inner text; plain-string content passes through unchanged.
+/// Shared by title derivation and the last-prompt preview so neither surfaces
+/// raw content-part JSON.
+fn content_display_text(content: &str) -> String {
     let plain = content.trim();
-    // Many UI clients send `[{"type":"text","text":"..."}]`-shaped content;
-    // unwrap to the inner text part if so. Plain strings pass through.
-    let text = serde_json::from_str::<Vec<serde_json::Value>>(plain)
+    serde_json::from_str::<Vec<serde_json::Value>>(plain)
         .ok()
         .and_then(|parts| {
             parts
                 .into_iter()
                 .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
         })
-        .unwrap_or_else(|| plain.to_string());
-    let trimmed = text.trim();
-    trimmed
+        .unwrap_or_else(|| plain.to_string())
+}
+
+fn derive_title_from_message(content: &str) -> String {
+    content_display_text(content)
+        .trim()
         .chars()
         .take(50)
         .collect::<String>()
@@ -787,7 +792,82 @@ const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// `(session_key, message_count, title, updated_at)`. `title` and `updated_at`
 /// are `None` for legacy files that pre-date those meta fields (with `updated_at`
 /// falling back to the JSONL mtime when available).
-pub type SessionTitleMetaRow = (String, usize, Option<String>, Option<DateTime<Utc>>);
+pub type SessionTitleMetaRow = (
+    String,
+    usize,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+);
+
+/// Byte budget for the `last_prompt` preview surfaced on `session/list`.
+/// UTF-8 safe truncation (see [`last_user_prompt_from_jsonl`]) keeps this a
+/// soft ~100-character cap; multibyte scripts yield fewer characters.
+const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
+
+/// Extract the text of the MOST RECENT user message from an already-loaded
+/// session JSONL transcript, truncated to [`LAST_PROMPT_PREVIEW_BYTES`].
+///
+/// Cheap by construction: the listing walk already loads the whole file into
+/// memory to parse the first (`SessionMeta`) line, so this reuses that same
+/// `content` string and adds no extra I/O. It scans lines from the tail and
+/// returns the first that decodes as a [`Message`] with `role == User`, so a
+/// typical transcript only decodes the trailing assistant/tool reply plus the
+/// last user line before short-circuiting. Control records (rollback markers)
+/// and the leading meta line never decode as a user `Message`, so they are
+/// skipped implicitly. Returns `None` when the session has no user message.
+///
+/// Honors `/rewind`: a rolled-back session keeps its dropped rows on disk
+/// (removed only by [`fold_session_timeline`] at load), so previewing the raw
+/// last line could show a prompt hydrate no longer shows (codex P2). When a
+/// rollback marker is present the timeline is folded first; the common
+/// (unrewound) case stays a cheap O(tail) reverse scan.
+fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
+    // The rollback control record serializes as `{"kind":"rollback",…}`.
+    if content.contains("\"rollback\"") {
+        return assemble_session_messages(content.lines())
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .and_then(|message| last_prompt_preview(&message.content));
+    }
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Cheap pre-filter: a serialized user `Message` always contains the
+        // `"role":"user"` token (role is the first field, lowercase-renamed).
+        // This lets us skip full JSON decode of large assistant/tool blobs.
+        if !line.contains("\"role\":\"user\"") {
+            continue;
+        }
+        if let Ok(message) = serde_json::from_str::<Message>(line) {
+            if matches!(message.role, MessageRole::User) {
+                if let Some(preview) = last_prompt_preview(&message.content) {
+                    return Some(preview);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Content-part-unwrapped, trimmed, byte-truncated preview of a user message's
+/// content, or `None` when it is empty. `[{"type":"text","text":"…"}]` content
+/// parts (codex P2) surface their inner text, never the raw JSON wrapper.
+fn last_prompt_preview(content: &str) -> Option<String> {
+    let text = content_display_text(content);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(
+        text,
+        LAST_PROMPT_PREVIEW_BYTES,
+        "…",
+    ))
+}
 
 /// Manages sessions with in-memory LRU cache and JSONL disk persistence.
 ///
@@ -841,7 +921,7 @@ impl SessionManager {
     pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(false)
             .into_iter()
-            .map(|(id, count, title, _updated_at)| (id, count, title))
+            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
             .collect()
     }
 
@@ -866,15 +946,21 @@ impl SessionManager {
     pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(true)
             .into_iter()
-            .map(|(id, count, title, _updated_at)| (id, count, title))
+            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
             .collect()
     }
 
     /// Like [`Self::list_top_level_sessions_with_title`] but also returns each
-    /// session's recency timestamp — `SessionMeta.updated_at`, or the JSONL
-    /// file's mtime when the meta line is missing/unparseable, or `None` when
-    /// neither is available. Backs the `updated_at` field on the WS
-    /// `session/list` RPC so clients can sort by recency.
+    /// session's recency timestamp and a preview of its most recent user
+    /// prompt:
+    /// - `updated_at`: `SessionMeta.updated_at`, or the JSONL file's mtime when
+    ///   the meta line is missing/unparseable (the LATER of the two when both
+    ///   exist), or `None` when neither is available. Backs the `updated_at`
+    ///   field on the WS `session/list` RPC so clients can sort by recency.
+    /// - `last_prompt`: the truncated text of the session's most recent
+    ///   user-role message (see [`last_user_prompt_from_jsonl`]), or `None`
+    ///   when the session has no user message. Backs the `last_prompt` field on
+    ///   `session/list` so the `/resume` picker can preview each session.
     pub fn list_top_level_sessions_with_meta(&self) -> Vec<SessionTitleMetaRow> {
         self.list_sessions_inner_with_title(true)
     }
@@ -895,13 +981,15 @@ impl SessionManager {
             if seen.contains(&session_key) {
                 return;
             }
-            // Read just the first line for metadata (title + updated_at);
-            // fall back to count_lines for the message count.
-            let (title, meta_updated_at) = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|content| {
-                    content
-                        .lines()
+            // Load the file once (the listing already pays this cost to parse
+            // the first `SessionMeta` line for the title) and reuse the same
+            // in-memory content for both the meta read and the `last_prompt`
+            // preview — no extra I/O beyond the single read.
+            let content = std::fs::read_to_string(path).ok();
+            let (title, meta_updated_at) = content
+                .as_deref()
+                .and_then(|c| {
+                    c.lines()
                         .next()
                         .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
                 })
@@ -922,9 +1010,12 @@ impl SessionManager {
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (None, None) => None,
             };
+            // Reuse the already-loaded `content` (no extra I/O) to preview the
+            // session's most recent user prompt for the `/resume` picker.
+            let last_prompt = content.as_deref().and_then(last_user_prompt_from_jsonl);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
-            out.push((session_key, count, title, updated_at));
+            out.push((session_key, count, title, updated_at, last_prompt));
         };
 
         if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
@@ -1599,7 +1690,13 @@ impl SessionManager {
     /// Rewrite a session's JSONL file from the in-memory state.
     /// Uses atomic write-then-rename to avoid corruption on crash.
     /// Uses spawn_blocking to avoid blocking the async runtime.
+    ///
+    /// Serialises on the per-key persist lock so the whole-file rewrite
+    /// cannot interleave with (and erase) a canonical locked append or a
+    /// concurrent `SessionHandle` rewrite of the same key.
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
         let session = self
             .cache
             .peek(&key.0)
@@ -2056,6 +2153,30 @@ pub async fn persist_message_through_canonical_path(
     handle.add_message_with_seq(message).await
 }
 
+/// Upsert a durable child-session contract through the canonical locked
+/// path: per-key persist lock → FRESH open (latest disk state) → mutate →
+/// rewrite, all inside one critical section.
+///
+/// Contract writes are whole-file read-modify-write cycles (`rewrite`
+/// snapshots the in-memory session and renames over the file), so two
+/// concurrent writers that each open their own handle both read the same
+/// pre-state and the second rename silently erases the first's update.
+/// This is the production-documented fanout race: two children terminating
+/// together each stamp their terminal contract into the SHARED PARENT
+/// session; the loser's contract reverts to pre-terminal and the task is
+/// stuck un-Joined forever. Holding the per-key lock across open→rewrite
+/// makes the cycle atomic per session key.
+pub async fn upsert_child_contract_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    contract: ChildSessionContract,
+) -> Result<bool> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+    handle.upsert_child_contract_unlocked(contract).await
+}
+
 impl SessionHandle {
     /// Open or create a session handle for the given key.
     ///
@@ -2413,10 +2534,29 @@ impl SessionHandle {
     }
 
     /// Insert or update a durable child-session contract and persist it.
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]).
+    /// NOTE: the lock covers mutate→rewrite only; this handle's in-memory
+    /// state was snapshotted at open time, so a handle opened BEFORE a
+    /// concurrent writer committed will still rewrite from that stale
+    /// snapshot. Callers racing other writers must use
+    /// [`upsert_child_contract_through_canonical_path`], which holds the
+    /// lock across the fresh open as well.
     pub async fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> Result<bool> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.upsert_child_contract_unlocked(contract).await
+    }
+
+    /// Mutate + rewrite without taking the persist lock — the caller must
+    /// already hold it (see [`upsert_child_contract_through_canonical_path`]).
+    async fn upsert_child_contract_unlocked(
+        &mut self,
+        contract: ChildSessionContract,
+    ) -> Result<bool> {
         let existed = self.session.upsert_child_contract(contract);
         self.session.updated_at = Utc::now();
-        self.rewrite().await?;
+        self.rewrite_unlocked().await?;
         Ok(existed)
     }
 
@@ -2426,7 +2566,21 @@ impl SessionHandle {
     }
 
     /// Rewrite the session to disk (atomic write-then-rename).
+    ///
+    /// Serialises on the per-key persist lock so a whole-file rewrite cannot
+    /// interleave with the canonical locked append path
+    /// ([`persist_message_through_canonical_path`]) — an append committed
+    /// between an unlocked rewrite's snapshot and its rename was silently
+    /// erased by the rename.
     pub async fn rewrite(&self) -> Result<()> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.rewrite_unlocked().await
+    }
+
+    /// Snapshot-and-rename without taking the persist lock — the caller
+    /// must already hold it.
+    async fn rewrite_unlocked(&self) -> Result<()> {
         let meta = SessionMeta {
             schema_version: CURRENT_SESSION_SCHEMA,
             session_key: self.session.key.0.clone(),
@@ -3828,6 +3982,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_canonical_contract_upserts_lose_no_updates() {
+        // The production fanout race: N children terminate together and each
+        // stamps its terminal contract into the SHARED parent session. A
+        // contract write is a whole-file read-modify-write (open snapshots
+        // the file, rewrite renames over it), so writers that read the same
+        // pre-state erase each other — the canonical path must hold the
+        // per-key persist lock across open→mutate→rewrite.
+        //
+        // On the single-threaded test runtime every future runs its
+        // synchronous open() before any rewrite lands, so WITHOUT the lock
+        // all 16 read the empty pre-state and exactly one contract survives
+        // — the loss is deterministic, not timing-dependent.
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "fanout-parent");
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "seed"))
+                .await
+                .unwrap();
+        }
+
+        let make_contract = |i: usize| ChildSessionContract {
+            task_id: format!("task-{i}"),
+            task_label: format!("worker {i}"),
+            parent_session_key: parent.to_string(),
+            child_session_key: child_session_key(&parent, &format!("task-{i}")).to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("deliver_result".to_string()),
+            terminal_state: Some(ChildSessionTerminalState::Completed),
+            join_state: Some(ChildSessionJoinState::Joined),
+            joined_at: Some(Utc::now()),
+            failure_action: None,
+            error: None,
+            output_files: vec![],
+        };
+
+        let futures = (0..16)
+            .map(|i| {
+                upsert_child_contract_through_canonical_path(tmp.path(), &parent, make_contract(i))
+            })
+            .collect::<Vec<_>>();
+        for result in futures::future::join_all(futures).await {
+            result.expect("every contract upsert must commit");
+        }
+
+        let reloaded = SessionHandle::open(tmp.path(), &parent);
+        assert_eq!(
+            reloaded.session().child_contracts.len(),
+            16,
+            "every concurrently-upserted contract must survive on disk (lost-update race)"
+        );
+        // The seeded message must survive the rewrites too.
+        assert_eq!(reloaded.session().messages.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
         let tmp = TempDir::new().unwrap();
         let parent = SessionKey::new("api", "web-parent");
@@ -4049,6 +4260,97 @@ mod tests {
             recency >= updated,
             "recency must be at least the meta.updated_at; got {recency}"
         );
+    }
+
+    #[tokio::test]
+    async fn list_top_level_sessions_with_meta_surfaces_last_user_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "last-prompt");
+
+        // Two user turns with an assistant reply between; the MOST RECENT user
+        // message ("second question") is the expected `last_prompt` preview.
+        mgr.add_message(&key, make_message(MessageRole::User, "first question"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::Assistant, "first answer"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "second question"))
+            .await
+            .unwrap();
+
+        let rows = mgr.list_top_level_sessions_with_meta();
+        let row = rows
+            .iter()
+            .find(|(id, ..)| id == "cli:last-prompt")
+            .expect("session present");
+        // 5th tuple element = last_prompt.
+        assert_eq!(
+            row.4.as_deref(),
+            Some("second question"),
+            "last_prompt must be the MOST RECENT user message, not the first"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_truncates_long_prompt() {
+        let long = "x".repeat(250);
+        let user_line = serde_json::to_string(&make_message(MessageRole::User, &long)).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{user_line}\n");
+        let preview = last_user_prompt_from_jsonl(&content).expect("prompt present");
+        assert!(
+            preview.ends_with('…'),
+            "truncated preview must end with an ellipsis: {preview}"
+        );
+        assert!(
+            preview.len() <= LAST_PROMPT_PREVIEW_BYTES + '…'.len_utf8(),
+            "preview must be capped near the byte budget; got {} bytes",
+            preview.len()
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_unwraps_content_part_text() {
+        // codex P2: content-part user messages must surface the inner text,
+        // not the raw `[{"type":"text","text":"…"}]` wrapper.
+        let mut msg = make_message(MessageRole::User, "");
+        msg.content = r#"[{"type":"text","text":"deploy the app"}]"#.to_string();
+        let user_line = serde_json::to_string(&msg).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{user_line}\n");
+        assert_eq!(
+            last_user_prompt_from_jsonl(&content).as_deref(),
+            Some("deploy the app"),
+            "content-part prompt must show its text, not raw JSON"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_honors_rollback_markers() {
+        // A /rewound session keeps the dropped rows on disk; the preview must
+        // reflect the FOLDED transcript (what hydrate shows), not the raw
+        // rolled-back tail (codex P2). Two user turns then a rollback of 1 →
+        // the last surviving user prompt is the FIRST turn.
+        let u1 = serde_json::to_string(&make_message(MessageRole::User, "first turn")).unwrap();
+        let a1 = serde_json::to_string(&make_message(MessageRole::Assistant, "reply one")).unwrap();
+        let u2 = serde_json::to_string(&make_message(MessageRole::User, "second turn")).unwrap();
+        let a2 = serde_json::to_string(&make_message(MessageRole::Assistant, "reply two")).unwrap();
+        let marker = rollback_marker_line(1).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{u1}\n{a1}\n{u2}\n{a2}\n{marker}\n");
+        assert_eq!(
+            last_user_prompt_from_jsonl(&content).as_deref(),
+            Some("first turn"),
+            "preview must honor the rollback marker (folded), not show the dropped 'second turn'"
+        );
+    }
+
+    #[test]
+    fn last_user_prompt_from_jsonl_returns_none_without_user_message() {
+        // Meta line + an assistant line only → no user message → None.
+        let assistant =
+            serde_json::to_string(&make_message(MessageRole::Assistant, "hi there")).unwrap();
+        let content = format!("{{\"session_key\":\"k\"}}\n{assistant}\n");
+        assert_eq!(last_user_prompt_from_jsonl(&content), None);
     }
 
     /// Codex P2: `SessionMeta.updated_at` is stamped once at creation and is

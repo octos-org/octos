@@ -484,14 +484,43 @@ fn load_store(path: &Path) -> Option<CronStore> {
 }
 
 /// Generate a short 8-char hex ID.
+///
+/// Derived from the RANDOM low bits of a v7 UUID (the `rand_b` field), not the
+/// timestamp prefix. The previous `format!("{:x}", …)[..8]` (a) dropped a
+/// leading-zero nibble because `{:x}` omits leading zeros, shifting the window,
+/// and (b) sliced the HIGH hex chars — the 48-bit millisecond timestamp — so it
+/// carried ZERO random bits and every job created within the same time window
+/// shared an id. Zero-pad to a full 32 hex chars and take the LOW 8 (the low
+/// 32 bits fall entirely inside v7's 62-bit random field).
 fn short_id() -> String {
     let id = uuid::Uuid::now_v7();
-    format!("{:x}", id.as_u128())[..8].to_string()
+    let hex = format!("{:032x}", id.as_u128());
+    hex[hex.len() - 8..].to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_id_is_unique_across_same_window_calls() {
+        // Regression: short_id() formatted the v7 UUID with `{:x}` (dropping a
+        // leading-zero nibble) and took the HIGH 8 hex chars — pure timestamp
+        // bits, ZERO random bits. Every job created within the same time window
+        // collided, so on_timer's id-keyed update marked BOTH and delete_after_run
+        // deleted a not-yet-due sibling. Rapid calls must now be distinct.
+        // 100 rapid calls: the buggy timestamp-only id yielded 1 distinct value
+        // (the ms window does not turn over in <1ms); the fix yields 100. A
+        // 100-sample 32-bit birthday-collision flake is ~1e-6, negligible.
+        let ids: std::collections::HashSet<String> = (0..100).map(|_| short_id()).collect();
+        assert_eq!(
+            ids.len(),
+            100,
+            "short_id must be collision-resistant for jobs created close in time; \
+             got {} distinct ids out of 100",
+            ids.len()
+        );
+    }
 
     fn make_service(
         dir: &std::path::Path,

@@ -2307,27 +2307,29 @@ impl PromptContextManager for AppUiPromptContextBridge {
         if let Some(system) = runtime_system {
             // Re-apply the agent's runtime System prompt. Two cases:
             //
-            //   a) `frame.messages` leads with a System message
-            //      (e.g. a `[Conversation summary]` emitted by
-            //      `for_prompt`'s compaction path —
-            //      `context_manager.rs:1159`). Concatenate the runtime
-            //      System CONTENT into that existing System rather
-            //      than inserting a second one. We do this in-place to
-            //      avoid producing two consecutive `System` messages
-            //      because `normalize_system_messages` runs BEFORE
-            //      this bridge (`loop_compaction.rs:35`) — anything we
-            //      emit here goes straight to the provider, and
-            //      multi-System payloads are rejected by Anthropic
-            //      (single `system` field) and other providers.
+            //   a) `frame.messages` leads with a System message.
+            //      Concatenate the runtime System CONTENT into that
+            //      existing System rather than inserting a second one.
+            //      We do this in-place to avoid producing two
+            //      consecutive `System` messages because
+            //      `normalize_system_messages` runs BEFORE this bridge
+            //      (`loop_compaction.rs:35`) — anything we emit here
+            //      goes straight to the provider, and multi-System
+            //      payloads are rejected by Anthropic (single `system`
+            //      field) and other providers. Since compaction
+            //      summaries render as protected User rows (see
+            //      `for_prompt`'s CompactionSummary arm), this arm is
+            //      effectively a legacy guard.
             //
-            //   b) `frame.messages` does not lead with a System.
-            //      Insert the runtime System at index 0.
+            //   b) `frame.messages` does not lead with a System (the
+            //      normal case, including post-compaction where the
+            //      frame leads with the User-role summary). Insert the
+            //      runtime System at index 0.
             //
             // Safe to merge unconditionally because
             // `record_message_with_source_ref` early-returns for
             // `System` role (`context_manager.rs:752`) so the frame
-            // can only contain compaction summaries or no System at
-            // all — never the runtime System itself.
+            // never contains the runtime System itself.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
                     let existing = std::mem::take(&mut first.content);
@@ -4349,6 +4351,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    connection_profile_id,
                     id,
                     params,
                 )
@@ -4485,10 +4488,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
-                handle_router_set_mode(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_set_mode(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::RouterGetMetrics(params) => {
-                handle_router_get_metrics(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_get_metrics(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
         }
     }
@@ -4507,6 +4526,62 @@ async fn ui_protocol_connection(
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
+}
+
+/// Cap on how long stdio shutdown waits for in-flight turns to finalize.
+const STDIO_SHUTDOWN_TURN_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait (bounded by `max`) until none of THIS connection's turns is still
+/// live in the process-global `active_turns` registry.
+///
+/// Stdin EOF ends the stdio loop, and returning from `stdio_connection`
+/// exits the process — dropping the runtime and CANCELLING any in-flight
+/// turn task mid-finalization (assistant persistence, usage records, the
+/// terminal `turn/completed` ledger append). The client is already gone so
+/// nothing new can start; draining briefly turns "the answer and the turn's
+/// terminal state were lost" into "the next hydrate shows the completed
+/// turn". Scoped to `connection_turns` so turns owned by other connections
+/// never block this exit, and terminal-but-not-yet-cleaned entries do not
+/// hold shutdown open. Returns `false` on deadline.
+async fn drain_connection_turns_for_shutdown(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    max: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    loop {
+        let owned = connection_turns.lock().await.clone();
+        let mut live: Vec<SessionKey> = Vec::new();
+        {
+            let active = active_turns.lock().await;
+            for (session_id, turn_id) in &owned {
+                let Some(turn) = active.get(session_id) else {
+                    continue;
+                };
+                if &turn.turn_id != turn_id {
+                    continue;
+                }
+                // Terminal entries stay registered until cleanup — the turn
+                // already finalized, so it must not hold shutdown open.
+                let state = turn.state.lock().await;
+                if !matches!(*state, TurnState::Terminal(_)) {
+                    live.push(session_id.clone());
+                }
+            }
+        }
+        if live.is_empty() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "octos::ui_protocol::stdio",
+                sessions = ?live,
+                "stdio shutdown: in-flight turns did not finalize before the drain deadline"
+            );
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
@@ -4909,7 +4984,16 @@ where
                 }
             }
             UiCommand::SessionList(params) => {
-                handle_session_list(&ws, &state, &connection_headers, None, id, params).await;
+                handle_session_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionSnapshot(params) => {
                 handle_session_snapshot(&ws, &state, &connection_headers, None, id, params).await;
@@ -4972,9 +5056,16 @@ where
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
+                // stdio is a local single-user transport with no authenticated
+                // tenant scope, so `connection_profile_id` is `None` (no
+                // cross-tenant enforcement); `connection_profile_id_owned`
+                // remains the resolution fallback. Only the hosted WS path,
+                // which carries an authenticated `connection_profile_id`,
+                // enforces the tenant gate.
                 handle_router_set_mode(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4985,6 +5076,7 @@ where
                 handle_router_get_metrics(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4994,6 +5086,14 @@ where
         }
     }
 
+    // Let in-flight turns finalize (persist + ledger terminal) before the
+    // process exit cancels their tasks — see drain_connection_turns_for_shutdown.
+    drain_connection_turns_for_shutdown(
+        &active_turns,
+        &connection_turns,
+        STDIO_SHUTDOWN_TURN_DRAIN_MAX,
+    )
+    .await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -12343,7 +12443,33 @@ async fn handle_session_rollback(
                 return;
             }
         };
+        let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
+        // Rebuild + persist the context ledger from the trimmed history.
+        // The ledger coverage check (`context_ledger_covers_history`) is a
+        // high-watermark `>=` — deliberately tolerant of bounded history
+        // slices — so a pre-rollback snapshot still "covers" the shrunken
+        // history and would be Loaded verbatim on the next turn, feeding the
+        // rolled-back turns straight back into the model prompt. Mirrors
+        // `reset_context_manager_from_history` on the session-actor path.
+        let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
+            params.session_id.to_string(),
+            None,
+            &session.messages,
+        );
+        rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        if let Err(error) = crate::context_manager::persist_context_manager_snapshot(
+            &data_dir,
+            &params.session_id.to_string(),
+            &rebuilt_context,
+        ) {
+            warn!(
+                session = %params.session_id,
+                %error,
+                "session/rollback: failed to persist rebuilt context ledger"
+            );
+        }
+        publish_appui_context_status(&params.session_id, &rebuilt_context);
         // Same message projection as `handle_session_hydrate` for a
         // non-negotiated client: seqs are the trimmed transcript's indices.
         let messages = session
@@ -13090,12 +13216,18 @@ async fn handle_session_list(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
     id: String,
     _params: SessionListParams,
 ) {
     let identity_ext = identity.cloned().map(Extension);
-    let response =
-        super::handlers::list_sessions(State(state.clone()), headers.clone(), identity_ext).await;
+    let response = super::handlers::list_sessions(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        connection_profile_id,
+    )
+    .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
     // Collection endpoint — no addressable session id. Treat any
     // (unexpected) 404 as a generic resource-not-found rather than
@@ -14326,14 +14458,68 @@ fn task_cancel_rpc_error(task_id: &TaskId, error: octos_agent::TaskCancelError) 
 fn resolve_router_for_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
-) -> Option<Arc<octos_llm::AdaptiveRouter>> {
+) -> Result<Option<Arc<octos_llm::AdaptiveRouter>>, RpcError> {
+    // Tenant-scope gate (P1). Without it the `session_id.profile_id()`-first
+    // precedence below lets a tenant-B connection pass a `session_id` that
+    // embeds tenant-A's profile and resolve — then `set_mode` mutate /
+    // `get_metrics` read — tenant-A's `AdaptiveRouter`. Placing the check
+    // inside the shared resolver protects BOTH router handlers by
+    // construction.
+    authorize_router_session_scope(session_id, connection_profile_id, routed_profile_id)?;
     let active_profile_id = session_id
         .profile_id()
         .map(ToOwned::to_owned)
         .or_else(|| routed_profile_id.map(ToOwned::to_owned));
-    let profile_runtime = resolve_session_profile_runtime(state, active_profile_id.as_deref())?;
-    profile_runtime.adaptive_router.clone()
+    Ok(
+        resolve_session_profile_runtime(state, active_profile_id.as_deref())
+            .and_then(|profile_runtime| profile_runtime.adaptive_router.clone()),
+    )
+}
+
+/// Tenant-scope gate for the router RPCs.
+///
+/// A hosted WS connection is authorized for its own authenticated
+/// `connection_profile_id` AND — on a per-tenant subdomain — the
+/// `routed_profile_id` that `is_authorized_for_profile` already cleared at
+/// upgrade time (an admin / parent account operating a tenant it owns; a
+/// forged `Host` for an unauthorized tenant 403s before this point, so a
+/// present `routed_profile_id` is always trustworthy). A `session_id` whose
+/// embedded profile is EITHER is in scope; a different tenant is rejected.
+///
+/// - An unscoped connection (`connection_profile_id == None` — bootstrap
+///   admin token / local solo) is authorized for every profile.
+/// - A bare (profile-less) `session_id` is authorized under the connection's
+///   auth, matching `validate_authenticated_session_scope`'s `None` arm.
+///
+/// This is deliberately a touch more permissive than the bare
+/// `validate_session_scope(session_id, None, connection_profile_id)` other
+/// handlers use (it also honours `routed_profile_id`): a router RPC on a
+/// hosted subdomain must not regress the authorized admin/parent access that
+/// existed before this gate landed, while a genuine cross-tenant `session_id`
+/// (matching neither authorized profile) is still rejected. `authenticated_
+/// scope_mismatch_error` tags the rejection `auth_scope_violation` so the
+/// handler emits the same 1008 close the other scope checks do.
+fn authorize_router_session_scope(
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+) -> Result<(), RpcError> {
+    let Some(connection_profile_id) = connection_profile_id else {
+        return Ok(());
+    };
+    let Some(session_profile) = session_id.profile_id() else {
+        return Ok(());
+    };
+    if session_profile == connection_profile_id || routed_profile_id == Some(session_profile) {
+        return Ok(());
+    }
+    Err(authenticated_scope_mismatch_error(
+        "session_id is outside the authorized profile scope",
+        connection_profile_id,
+        Some(session_profile),
+    ))
 }
 
 /// Wave4-A handler for `router/set_mode`. Parses `params.mode` into the
@@ -14346,6 +14532,7 @@ fn resolve_router_for_session(
 async fn handle_router_set_mode(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterSetModeParams,
@@ -14366,17 +14553,30 @@ async fn handle_router_set_mode(
             return;
         }
     };
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before touching another tenant's router.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     router.set_mode(mode);
     let result = octos_core::ui_protocol::RouterSetModeResult { mode: params.mode };
@@ -14400,22 +14600,36 @@ async fn handle_router_set_mode(
 async fn handle_router_get_metrics(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterGetMetricsParams,
 ) {
     let method = octos_core::ui_protocol::methods::ROUTER_GET_METRICS;
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before reading another tenant's router metrics.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     let status = router.adaptive_status();
     let result = octos_core::ui_protocol::RouterGetMetricsResult {
@@ -17066,7 +17280,14 @@ fn appui_loop_assistant_reply_for_self_paced(
     match captured_response_content {
         Some(content) if !content.is_empty() => Some(content.to_owned()),
         Some(_) => None,
-        None => history_fallback,
+        // No capture (interrupt / agent error before EndTurn): use the
+        // history reply if present, else `Some("")`. Returning `Some("")`
+        // for a true no-reply is deliberate — the empty reply carries no
+        // `<<loop-next-in: …>>` sentinel, so `apply_self_paced_response`
+        // stamps the DEFAULT delay. The old `None` here parked the loop at
+        // `next_run_at_ms: None`, which the due-scan never visits again —
+        // one interrupted turn silently killed the loop.
+        None => Some(history_fallback.unwrap_or_default()),
     }
 }
 
@@ -23798,6 +24019,100 @@ mod tests {
         reset_stdio_dispatch_count_for_test();
     }
 
+    /// Shutdown must WAIT for this connection's in-flight turns to finalize
+    /// instead of letting process exit cancel their tasks mid-write.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_waits_for_turn_finalization() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let session = SessionKey("local:drain-wait".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns
+            .lock()
+            .await
+            .insert(session.clone(), turn_id);
+        let remover = active_turns.clone();
+        let session_for_removal = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            remover.lock().await.remove(&session_for_removal);
+        });
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(drained, "drain must return once the turn finalizes");
+    }
+
+    /// A turn that never finalizes must not hang shutdown forever, and turns
+    /// owned by OTHER connections (the registry is process-global) must not
+    /// block this exit at all.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let foreign_abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            SessionKey("local:foreign".into()),
+            ActiveTurn {
+                turn_id: TurnId::new(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort: foreign_abort,
+            },
+        );
+        assert!(
+            drain_connection_turns_for_shutdown(
+                &active_turns,
+                &connection_turns,
+                std::time::Duration::from_secs(5),
+            )
+            .await,
+            "turns owned by other connections must not block shutdown"
+        );
+
+        let session = SessionKey("local:drain-stuck".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns.lock().await.insert(session, turn_id);
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(!drained, "drain must give up at the deadline");
+    }
+
     #[tokio::test]
     async fn stdio_ndjson_reader_accepts_max_size_frame_with_newline() {
         let mut input = vec![b'x'; MAX_TEXT_FRAME_BYTES];
@@ -24210,6 +24525,19 @@ mod tests {
         assert_eq!(
             blank_capture, None,
             "empty captured content must not stamp a default-delay reschedule via history fallback"
+        );
+
+        // A fire with NO capture and NO history reply (interrupt / agent
+        // error before anything persisted) must still reschedule: the
+        // picker yields an empty reply, which carries no sentinel, so the
+        // orchestrator stamps the DEFAULT delay. The old `None` here parked
+        // the loop at `next_run_at_ms: None` — permanently dead after one
+        // interrupted turn.
+        let reply_less = appui_loop_assistant_reply_for_self_paced(None, None);
+        assert_eq!(
+            reply_less.as_deref(),
+            Some(""),
+            "a reply-less fire must reschedule with the default delay, not kill the loop"
         );
     }
 
@@ -29363,6 +29691,87 @@ ignore = []
         // Drop the sender side so a pending recv resolves promptly; instead,
         // poll once with no wait to confirm the queue is empty.
         assert!(rx.try_recv().is_err(), "no close frame expected");
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_cross_tenant_session_id() {
+        // P1: a profile-scoped (tenant-B) connection must not resolve — and so
+        // must not be able to `set_mode` / read metrics on — a router for a
+        // `session_id` that embeds tenant-A's profile. The tenant gate fires
+        // BEFORE any ProfileRuntime lookup, so an empty test state suffices to
+        // prove the rejection. Without the gate this returned `Ok(None)` (and
+        // the handler would go on to resolve tenant-A's runtime).
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        // `AdaptiveRouter` is not `Debug`, so `.expect_err` on the `Ok` type
+        // does not compile — match instead.
+        let error = match resolve_router_for_session(&state, &session_a, Some("tenant-b"), None) {
+            Err(error) => error,
+            Ok(_) => panic!("cross-tenant router access must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_same_tenant() {
+        // Same-tenant scope passes the gate; with no ProfileRuntime registered
+        // in the empty test state the router resolves to `None` (`Ok(None)`) —
+        // NOT an error. Proves the gate is scope-only, not a blanket denial.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, Some("tenant-a"), None)
+            .expect("same-tenant scope must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_admin_connection_is_unscoped() {
+        // An unscoped (admin, `connection_profile_id == None`) connection is
+        // authorized for every profile — it passes the gate for any
+        // `session_id`, matching every other mutating RPC handler.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, None, None)
+            .expect("admin connection must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_authorized_routed_profile() {
+        // Codex P2: an OTP-admin / parent connection authorized for a tenant
+        // subdomain carries `connection_profile_id == <its own user id>` and
+        // `routed_profile_id == <tenant>` (is_authorized_for_profile cleared it
+        // at upgrade). The gate must NOT reject a session_id embedding the
+        // routed tenant — that access is authorized and predates the gate.
+        let state = Arc::new(AppState::empty_for_tests());
+        let tenant_session = SessionKey::with_profile("tenant-b", "api", "chat-1");
+        let resolved = resolve_router_for_session(
+            &state,
+            &tenant_session,
+            Some("admin-user"), // connection == the admin's own user id
+            Some("tenant-b"),   // routed == the authorized tenant subdomain
+        )
+        .expect("authorized routed profile must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_tenant_outside_routed_and_connection() {
+        // Even WITH a routed profile present, a session_id embedding a third
+        // tenant (neither the connection's own id nor the authorized routed
+        // tenant) is still rejected — the union does not become allow-any.
+        let state = Arc::new(AppState::empty_for_tests());
+        let other = SessionKey::with_profile("tenant-c", "api", "chat-1");
+        let error = match resolve_router_for_session(
+            &state,
+            &other,
+            Some("admin-user"),
+            Some("tenant-b"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a third-tenant session_id must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
     }
 
     /// Codex BLOCK regression (2026-05-13): with the writer channel at
@@ -35709,6 +36118,82 @@ ignore = []
             );
             assert!(session.messages.iter().all(|m| m.content != "turn 3"));
         }
+    }
+
+    /// A stale context ledger must not resurrect rolled-back turns. The
+    /// ledger coverage check is a high-watermark `>=` (deliberately
+    /// slice-tolerant, because turn paths pass bounded history slices), so
+    /// after a rollback shrinks durable history a pre-rollback ledger still
+    /// "covers" it, gets Loaded verbatim, and the next model prompt would
+    /// contain the very turns the user rewound away. `session/rollback` must
+    /// rebuild + persist the context ledger from the trimmed history.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rebuilds_context_ledger() {
+        let session_id = SessionKey("local:rollback-ctx-ledger".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        // Persist a pre-rollback context ledger exactly like a prior turn's
+        // prompt path would have.
+        let data_dir = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let data_dir = guard.data_dir();
+            let history = guard.get_or_create(&session_id).await.messages.clone();
+            let manager = crate::context_manager::ContextManager::from_session_history(
+                session_id.to_string(),
+                None,
+                &history,
+            );
+            crate::context_manager::persist_context_manager_snapshot(
+                &data_dir,
+                &session_id.to_string(),
+                &manager,
+            )
+            .expect("persist pre-rollback ledger");
+            data_dir
+        };
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-ctx".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // The next turn loads the ledger against the TRIMMED history; the
+        // dropped turn must not be visible in the resulting prompt frame.
+        let trimmed = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(&session_id).await.messages.clone()
+        };
+        assert!(trimmed.iter().all(|m| m.content != "turn 3"));
+        let (loaded, _status) = crate::context_manager::load_or_rebuild_context_manager(
+            &data_dir,
+            session_id.to_string(),
+            None,
+            &trimmed,
+        );
+        let frame = loaded.for_prompt(&crate::context_manager::PromptBuildPolicy::default());
+        assert!(
+            !frame
+                .messages
+                .iter()
+                .any(|m| m.content.contains("turn 3") || m.content.contains("reply 3")),
+            "rolled-back turns must not resurrect through a stale context ledger: {:#?}",
+            frame.messages
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

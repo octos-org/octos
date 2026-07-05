@@ -854,7 +854,12 @@ impl Agent {
                 let mut loop_detector = LoopDetector::new(12);
                 let mut turn_ledger = self.new_turn_ledger();
 
-                loop {
+                // Labeled so the loop-detector recovery arms below can re-enter
+                // the AGENT loop (skip tool execution for this spiraling
+                // response), not merely the inner `for tc in &response.tool_calls`
+                // loop — an unlabeled `continue` there fell through to
+                // `handle_tool_use` and executed the spiraling tools anyway.
+                'agent_loop: loop {
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -1138,7 +1143,7 @@ impl Agent {
                                                 warn!(
                                                     "shell spiral fired pre-execution; injected recovery notice into latest shell Tool and continuing for LLM summary"
                                                 );
-                                                continue;
+                                                continue 'agent_loop;
                                             }
                                         }
                                         let terminal_content = if matches!(
@@ -1213,7 +1218,7 @@ impl Agent {
                                             warn!(
                                                 "loop detected — injected synthetic tool results with warning and continuing for ONE more iteration"
                                             );
-                                            continue;
+                                            continue 'agent_loop;
                                         }
                                         Err(_) => {
                                             warn!(
@@ -6500,6 +6505,103 @@ printf '{"output":"voice saved","success":true}\n'
             total_calls >= 5,
             "expected at least 5 LLM calls (4 to trigger first detection + \
              1 recovery iteration); got {total_calls}"
+        );
+    }
+
+    /// LLM mock that always calls a named tool, so the loop detector fires
+    /// repeatedly on a tool whose EXECUTION count the test can observe.
+    struct CountingAlwaysNamedToolProvider {
+        calls: AtomicUsize,
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingAlwaysNamedToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loopy".to_string(),
+                    name: self.tool_name.to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
+        // Regression: the loop-detector `continue` after injecting synthetic
+        // results must re-enter the AGENT loop, not merely the inner
+        // `for tc in &response.tool_calls` loop. When it bound to the `for`,
+        // control fell through to `handle_tool_use` and the spiraling tool
+        // EXECUTED anyway (extra side effects + a duplicate tool_call_id row),
+        // defeating the detector's "inject a warning, do NOT call the tools"
+        // contract.
+        //
+        // With the same-tool provider the detector trips on the 4th call, so:
+        //   - iterations 1..=3 execute the tool  (3 executions)
+        //   - iteration 4 (FIRST fire) injects synthetic results and re-enters
+        //     the loop WITHOUT executing
+        //   - iteration 5 (SECOND fire) terminates before executing
+        // ⇒ executions == total_llm_calls - 2. The buggy fall-through executed
+        // on the first-fire iteration too (executions == total_llm_calls - 1).
+        let dir = tempfile::tempdir().unwrap();
+        let exec_count = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingAlwaysNamedToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_name: "loopy_tool",
+        });
+        let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "loopy_tool",
+            output: "looped",
+            calls: exec_count.clone(),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let result = agent
+            .process_message("please loop", &[], vec![])
+            .await
+            .expect("process_message should return Ok even when the loop terminates");
+        assert_eq!(result.content, loop_detected_terminal_message());
+
+        let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+        let executions = exec_count.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            executions,
+            total_calls - 2,
+            "the spiraling tool must NOT execute on the first-fire (synthetic-\
+             injection) iteration; got {executions} executions across \
+             {total_calls} LLM calls (buggy fall-through would be {})",
+            total_calls - 1
         );
     }
 
