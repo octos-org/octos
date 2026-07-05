@@ -224,20 +224,15 @@ fn emit_deep_research_progress(phase: &str, message: &str, progress: Option<f64>
 
 impl DeepSearchTool {
     async fn fetch_page(&self, url: &str, max_chars: usize) -> Result<String> {
-        // Best-effort fetch: an SSRF-blocked target (including a redirect hop
-        // to a private host) or any transport failure yields empty content,
-        // which the caller skips — one bad URL must not abort the batch.
-        Ok(self
-            .fetch_page_inner(url, max_chars)
-            .await
-            .unwrap_or_default())
-    }
-
-    async fn fetch_page_inner(&self, url: &str, max_chars: usize) -> Result<String> {
         // SSRF is re-validated on EVERY redirect hop (the initial-URL-only
         // check this replaced let an allowed URL 302 to 169.254.169.254 /
         // 10.x through). `ssrf_safe_send` disables auto-redirects, re-checks +
         // DNS-pins each hop, and re-issues the GET.
+        //
+        // Failures (SSRF-blocked, transport error, non-2xx, body-read) return
+        // Err so the caller's save loop records an error artifact for the
+        // skipped source — collapsing them to Ok("") would silently drop
+        // 403/500 pages from the research index.
         let response = super::ssrf::ssrf_safe_send(
             url,
             super::ssrf::SSRF_MAX_REDIRECTS,

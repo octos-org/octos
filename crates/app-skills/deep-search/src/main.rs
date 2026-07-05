@@ -1768,8 +1768,11 @@ async fn ssrf_safe_get(url: &str) -> Result<reqwest::Response, String> {
             .timeout(Duration::from_secs(15))
             .user_agent(FETCH_USER_AGENT)
             .redirect(reqwest::redirect::Policy::none());
-        for addr in &addrs {
-            builder = builder.resolve(&host, *addr);
+        // Pin ALL validated addresses at once: `resolve()` in a loop replaces
+        // the per-host override each call, pinning only the last address (and
+        // failing if it happens to be unreachable).
+        if !addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &addrs);
         }
         let client = builder
             .build()

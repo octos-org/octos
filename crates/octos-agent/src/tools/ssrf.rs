@@ -122,8 +122,15 @@ where
         // Per-hop client: caller config, redirects OFF, DNS pinned.
         let mut builder =
             configure(reqwest::Client::builder()).redirect(reqwest::redirect::Policy::none());
-        for addr in &check.resolved_addrs {
-            builder = builder.resolve(&host, *addr);
+        // Pin ALL validated addresses in a SINGLE override. `resolve()` called
+        // in a loop REPLACES the entry each time (reqwest keys `dns_overrides`
+        // by host), so a loop would pin only the LAST address — and if that one
+        // is unreachable (e.g. an IPv6 answer on an IPv4-only host) the fetch
+        // fails even though another validated address would have worked.
+        // `resolve_to_addrs` installs the whole list at once. (Empty for a
+        // literal-IP host — leave reqwest's own resolution in place then.)
+        if !check.resolved_addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
         }
         let client = builder
             .build()
