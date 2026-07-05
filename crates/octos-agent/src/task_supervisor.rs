@@ -1938,12 +1938,17 @@ impl TaskSupervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(parent_session_key);
             if already_poisoned {
+                // Diagnostic count for the error payload — live children,
+                // matching the semantics of the gating count below.
                 let count = self
                     .tasks
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && task.status.is_active()
+                    })
                     .count();
                 let error = RegisterTaskError::ChildFanoutExceeded {
                     parent_session_key: parent_session_key.to_string(),
@@ -1971,9 +1976,19 @@ impl TaskSupervisor {
             // continue to hit the cap path as before.
             let (current_count, parent_terminal_status) = {
                 let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Count LIVE children only. `tasks` is never pruned, so an
+                // unfiltered count is the session's lifetime total — a
+                // long-lived session that merely completed `cap` tasks over
+                // its life would trip the cap, poison the key forever, and
+                // force-fail its active work. The cap's job is to bound
+                // runaway CONCURRENT fan-out; terminal children are done and
+                // hold no resources this cap protects.
                 let count = tasks
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && task.status.is_active()
+                    })
                     .count();
                 let terminal = parent_terminal_check_tool_call_id
                     .filter(|tcid| !tcid.is_empty())
@@ -5585,6 +5600,42 @@ mod tests {
             .try_register_with_input("tts", "call-other-1", Some("api:other-parent"), None)
             .expect("other parents stay unaffected by a poisoned peer");
         assert!(!other.is_empty());
+    }
+
+    /// The fan-out cap bounds LIVE children, not the session's lifetime
+    /// total. Regression: the cap count had no `is_active()` filter and
+    /// `tasks` is never pruned, so a long-lived session that merely
+    /// COMPLETED `MAX_CHILDREN_PER_PARENT` background tasks over its life
+    /// (tts / podcast / pipeline nodes) tripped the cap on the next
+    /// register — poisoning the session key forever and force-failing
+    /// every currently-active legitimate task.
+    #[test]
+    fn completed_children_do_not_count_toward_fanout_cap() {
+        let parent_session = "api:long-lived-parent";
+        let supervisor = TaskSupervisor::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("tts", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Every child finishes cleanly — the session is long-lived,
+            // not runaway.
+            supervisor.mark_completed(&id, Vec::new());
+        }
+
+        let id = supervisor
+            .try_register_with_input("tts", "call-after-long-life", Some(parent_session), None)
+            .expect("a session with only COMPLETED children must not trip the fan-out cap");
+        assert!(!id.is_empty());
+
+        // And the session must not have been poisoned or had work
+        // force-failed by the register above.
+        let tasks = supervisor.get_tasks_for_session(parent_session);
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.error.as_deref().is_none_or(|e| !e.contains("fanout"))),
+            "no child may be force-failed with a fan-out reason on a healthy session"
+        );
     }
 
     /// The legacy `register_with_input` entry point keeps returning a

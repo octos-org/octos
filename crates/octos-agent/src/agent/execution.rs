@@ -745,6 +745,51 @@ impl Agent {
                     Some(effective_args.clone()),
                     bg_originating_thread_id.clone(),
                 );
+                // Cap refusal: the legacy register entry points signal a
+                // per-session child-fanout rejection with an empty-string
+                // sentinel. Spawning anyway would run a worker that is
+                // invisible to `task/list`, uncancellable (`cancel("")`
+                // no-ops), and hand the LLM a task_handle with an empty id —
+                // the cap would bound tracking, not execution. Refuse the
+                // call synchronously instead, mirroring the policy-deny
+                // early-return above (chip clear included).
+                if task_id.is_empty() {
+                    tracing::error!(
+                        tool = %tc_name,
+                        "spawn_only register refused (child fanout cap); not spawning"
+                    );
+                    let cap_msg = format!(
+                        "[TASK LIMIT] Cannot start background task '{tc_name}': this \
+                         session reached its background-task fanout cap. Wait for \
+                         running tasks to finish (or cancel them) before starting more. \
+                         Do not retry immediately."
+                    );
+                    reporter.report(ProgressEvent::ToolCompleted {
+                        name: tc_name.clone(),
+                        tool_id: tc_id.clone(),
+                        success: false,
+                        output_preview: octos_core::truncated_utf8(&cap_msg, 200, "..."),
+                        duration: tool_start.elapsed(),
+                    });
+                    return (
+                        Message {
+                            role: MessageRole::Tool,
+                            content: cap_msg,
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: Some(tc_id),
+                            reasoning_content: None,
+                            client_message_id: None,
+                            thread_id: None,
+                            timestamp: chrono::Utc::now(),
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 tools.mark_spawn_only_invoked();
                 let bg_supervisor = tools.supervisor();
                 // F004 B2: bridge supervised runtime-state transitions onto
