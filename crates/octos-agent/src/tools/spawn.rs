@@ -1454,6 +1454,28 @@ async fn maybe_generate_inline_research_podcast(
     }
 }
 
+/// The EFFECTIVE allow-list for the two consumers that cannot apply the local
+/// [`ToolPolicy`] deny-list: `allowed_tools` with every manifest-`disallowed`
+/// tool removed.
+///
+/// - The `agent_mcp` dispatch payload — the REMOTE agent runs its own tool
+///   loop and only ever sees this list, so an unfiltered list would grant it a
+///   manifest-forbidden tool (the local deny-list never reaches it).
+/// - The availability preflight — a manifest-forbidden tool must not gate the
+///   spawn on host availability, since the policy denies it regardless.
+///
+/// The in-process ToolPolicy path deliberately keeps the FULL `allowed_tools`
+/// and relies on deny-wins, so this helper must NOT be used to build that
+/// policy — doing so would lose the "deny also covers role-refilled tools"
+/// guarantee.
+fn effective_allowed_tools(allowed_tools: &[String], disallowed_tools: &[String]) -> Vec<String> {
+    allowed_tools
+        .iter()
+        .filter(|tool| !disallowed_tools.contains(tool))
+        .cloned()
+        .collect()
+}
+
 fn build_subagent_tool_policy(
     allowed_tools: Vec<String>,
     disallowed_tools: Vec<String>,
@@ -2021,6 +2043,14 @@ impl Tool for SpawnTool {
         };
 
         let allowed_tools = input.allowed_tools.clone();
+        // Effective allow-list = `allowed_tools` minus the manifest's
+        // `disallowed_tools`, for the two consumers that cannot apply the local
+        // deny-list policy: the `agent_mcp` dispatch payload (codex P1) and the
+        // availability preflight (codex P2). See [`effective_allowed_tools`].
+        // The local ToolPolicy path below keeps the FULL `allowed_tools` and
+        // relies on deny-wins.
+        let effective_allowed_tools =
+            effective_allowed_tools(&allowed_tools, &manifest_disallowed_tools);
         let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
         let is_agent_mcp = input.backend == "agent_mcp";
@@ -2061,7 +2091,14 @@ impl Tool for SpawnTool {
                 "task": task_desc,
                 "label": label,
                 "role": input.role,
-                "allowed_tools": allowed_tools,
+                // The remote agent runs its own tool loop and never sees the
+                // local ToolPolicy, so hand it the already-pruned allow-list
+                // (deny-list applied) rather than the raw `allowed_tools`.
+                // Also forward `disallowed_tools` so a remote that honors an
+                // explicit deny-list can enforce it even if a role template
+                // there re-expands the allow-list.
+                "allowed_tools": effective_allowed_tools,
+                "disallowed_tools": manifest_disallowed_tools,
                 "workflow": workflow.clone(),
                 "additional_instructions": input.additional_instructions,
             });
@@ -2513,7 +2550,10 @@ impl Tool for SpawnTool {
             // tool; routing through a dispatcher adds latency without
             // value once we are already in a spawned context.
             tools.clear_internal_hidden();
-            ensure_subagent_tools_available(&tools, &allowed_tools)
+            // Preflight against the EFFECTIVE (post-deny) allow-list: a tool
+            // the manifest forbids must not gate the spawn on availability,
+            // since the policy below denies it regardless (codex P2).
+            ensure_subagent_tools_available(&tools, &effective_allowed_tools)
                 .map_err(|error| eyre::eyre!(error))?;
             let policy = build_subagent_tool_policy(
                 allowed_tools,
@@ -3025,8 +3065,12 @@ impl Tool for SpawnTool {
                 // dispatcher targets directly without going through
                 // `mofa_make`.
                 tools.clear_internal_hidden();
-                let availability_check = ensure_subagent_tools_available(&tools, &allowed_tools)
-                    .map_err(|error| eyre::eyre!(error));
+                // Preflight against the EFFECTIVE (post-deny) allow-list —
+                // mirror the sync path so a manifest-forbidden tool that is
+                // absent from this registry does not fail the spawn (codex P2).
+                let availability_check =
+                    ensure_subagent_tools_available(&tools, &effective_allowed_tools)
+                        .map_err(|error| eyre::eyre!(error));
                 let policy = build_subagent_tool_policy(
                     allowed_tools,
                     manifest_disallowed_tools,
@@ -5253,6 +5297,223 @@ PY
         );
         assert!(policy.is_allowed("read_file"));
         assert!(policy.is_allowed("edit_file"));
+    }
+
+    #[test]
+    fn effective_allowed_tools_prunes_manifest_disallowed_from_the_list() {
+        // Codex P1: the list handed to the agent_mcp dispatch payload (and the
+        // preflight) must be `allowed_tools` MINUS the manifest's disallowed
+        // tools — the remote agent never runs the local deny-list policy.
+        //
+        // Both-allowed-and-disallowed → nothing survives. (An empty list on
+        // the wire means "no explicit tools", NOT "allow all" — that inversion
+        // only bites the in-process ToolPolicy, which keeps the full list.)
+        assert!(
+            effective_allowed_tools(&["shell".to_string()], &["shell".to_string()]).is_empty(),
+            "a tool that is both allowed and disallowed must not reach the remote"
+        );
+        // Mixed: only the non-disallowed tool survives.
+        assert_eq!(
+            effective_allowed_tools(
+                &["read_file".to_string(), "shell".to_string()],
+                &["shell".to_string()],
+            ),
+            vec!["read_file".to_string()],
+        );
+        // No disallow → identity.
+        assert_eq!(
+            effective_allowed_tools(&["grep".to_string()], &[]),
+            vec!["grep".to_string()],
+        );
+    }
+
+    #[test]
+    fn preflight_does_not_reject_a_disallowed_but_unavailable_tool() {
+        // Codex P2: once `disallowed_tools` stopped pruning `allowed_tools`,
+        // the availability preflight (run on the FULL allow-list) would fail a
+        // spawn for a manifest-forbidden tool that isn't installed on the host
+        // — even though the policy denies it anyway. Preflighting the EFFECTIVE
+        // (post-deny) set fixes that.
+        let tools = ToolRegistry::with_builtins("/tmp");
+        let allowed = vec!["shell".to_string(), "podcast_generate".to_string()];
+        let disallowed = vec!["podcast_generate".to_string()];
+
+        // The OLD ordering (preflight on the raw allow-list) rejects the spawn
+        // because `podcast_generate` is not available on this host:
+        assert!(
+            ensure_subagent_tools_available(&tools, &allowed).is_err(),
+            "sanity: the unfiltered allow-list still trips the missing-tool guard"
+        );
+        // The FIX: preflight the EFFECTIVE set — the forbidden-and-missing tool
+        // is gone, so the otherwise-valid `shell`-only spawn is admitted.
+        let effective = effective_allowed_tools(&allowed, &disallowed);
+        ensure_subagent_tools_available(&tools, &effective)
+            .expect("a disallowed-and-missing tool must not fail the preflight");
+    }
+
+    #[tokio::test]
+    async fn agent_mcp_dispatch_payload_sends_effective_allow_list_not_the_raw_one() {
+        // Codex P1 (wiring guard): the `agent_mcp` dispatch payload is the ONLY
+        // tool list the remote agent ever sees — it never runs the local
+        // deny-list ToolPolicy. If the payload carried the RAW `allowed_tools`,
+        // a manifest that both allows and forbids `shell` would still grant the
+        // remote `shell`, bypassing the deny-list fix. Drive a real spawn
+        // through a recording backend and assert the payload carries the
+        // EFFECTIVE (post-deny) allow-list, plus the deny-list for a remote
+        // that can honor it.
+        use crate::tools::mcp_agent::McpAgentBackend;
+        use std::sync::Mutex;
+
+        struct RecordingBackend {
+            seen: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+        #[async_trait]
+        impl McpAgentBackend for RecordingBackend {
+            fn backend_label(&self) -> &'static str {
+                "local"
+            }
+            fn endpoint_label(&self) -> String {
+                "recording".to_string()
+            }
+            async fn dispatch(&self, request: DispatchRequest) -> DispatchResponse {
+                *self.seen.lock().unwrap() = Some(request.task.clone());
+                DispatchResponse {
+                    outcome: DispatchOutcome::Success,
+                    output: "recorded".to_string(),
+                    files_to_send: Vec::new(),
+                    error: None,
+                    context_contract: None,
+                }
+            }
+        }
+
+        let mut registry = crate::agents::AgentDefinitions::new();
+        registry.insert(
+            "example",
+            crate::agents::AgentDefinition::from_json_str(
+                r#"{
+                    "name": "example",
+                    "version": 1,
+                    "tools": ["shell", "grep"],
+                    "disallowed_tools": ["shell"]
+                }"#,
+            )
+            .expect("parse manifest"),
+        );
+        let mut ctx = crate::tools::ToolContext::zero();
+        ctx.agent_definitions = Arc::new(registry);
+
+        let seen = Arc::new(Mutex::new(None));
+        let backend: SharedBackend = Arc::new(RecordingBackend { seen: seen.clone() });
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_mcp_agent_backend(backend, Some("run_task".to_string()));
+
+        // Return value is irrelevant (post-dispatch validation may FAIL the
+        // artifact) — the payload is captured at dispatch time, before any of
+        // that runs.
+        let _ = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "do it",
+                    "agent_definition_id": "example",
+                    "allowed_tools": ["shell", "grep"],
+                    "backend": "agent_mcp",
+                    "mode": "sync"
+                }),
+            )
+            .await;
+
+        let payload = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the recording backend must have been dispatched to");
+        let allowed: Vec<&str> = payload
+            .get("allowed_tools")
+            .and_then(|v| v.as_array())
+            .expect("payload carries allowed_tools")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            allowed,
+            vec!["grep"],
+            "agent_mcp payload must send the EFFECTIVE allow-list (shell pruned), not the raw one"
+        );
+        // The deny-list is also forwarded so a remote that honors an explicit
+        // deny-list can enforce it even if a role template there re-expands.
+        let disallowed: Vec<&str> = payload
+            .get("disallowed_tools")
+            .and_then(|v| v.as_array())
+            .expect("payload carries disallowed_tools")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(disallowed, vec!["shell"]);
+    }
+
+    #[tokio::test]
+    async fn sync_spawn_admits_a_disallowed_but_unavailable_tool_via_effective_preflight() {
+        // Codex P2 (wiring guard): the builtin sync spawn path preflights tool
+        // availability. Before the fix it checked the RAW allow-list, so a
+        // manifest that forbids an uninstalled tool (`podcast_generate`) failed
+        // the whole spawn with "required tool(s) not available" — even though
+        // the deny-list blocks that tool anyway. After the fix it preflights
+        // the EFFECTIVE set, so the otherwise-valid `shell`-only spawn runs.
+        let mut registry = crate::agents::AgentDefinitions::new();
+        registry.insert(
+            "forbids-missing",
+            crate::agents::AgentDefinition::from_json_str(
+                r#"{
+                    "name": "forbids-missing",
+                    "version": 1,
+                    "tools": ["shell", "podcast_generate"],
+                    "disallowed_tools": ["podcast_generate"]
+                }"#,
+            )
+            .expect("parse manifest"),
+        );
+        let mut ctx = crate::tools::ToolContext::zero();
+        ctx.agent_definitions = Arc::new(registry);
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "do it",
+                    "agent_definition_id": "forbids-missing",
+                    "allowed_tools": ["shell", "podcast_generate"],
+                    "mode": "sync"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.output.contains("required tool(s) not available"),
+            "a disallowed-and-missing tool must not fail the sync spawn preflight; got: {}",
+            result.output
+        );
+        assert!(
+            result.success,
+            "the shell-only spawn should run to completion: {}",
+            result.output
+        );
     }
 
     #[test]
