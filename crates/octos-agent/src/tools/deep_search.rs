@@ -166,6 +166,7 @@ impl Tool for DeepSearchTool {
 
         let mut saved_count = 0u32;
         let mut saved_files = Vec::new();
+        let mut failed_files: Vec<String> = Vec::new();
         for (i, (url, page)) in urls.iter().zip(pages.iter()).enumerate() {
             let filename = format!("{:02}_{}.md", i + 1, host_slug(url));
             let filepath = dir.join(&filename);
@@ -192,8 +193,20 @@ impl Tool for DeepSearchTool {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    // `fetch_page` now propagates 403/500, transport, and
+                    // body-read failures (it no longer swallows them to an
+                    // empty string). Persist the error artifact AND surface it
+                    // in the returned index — otherwise a failed (or all-failed)
+                    // crawl hands the agent an index that silently omits the
+                    // source, with no path or reason to inspect.
                     let err_content = format!("---\nurl: {url}\nerror: {e}\n---\n");
                     let _ = tokio::fs::write(&filepath, &err_content).await;
+                    failed_files.push(format!("  - {} ({url}): {e}", filepath.display()));
+                    output.push_str(&format!("## Source [{}]: {url} — FETCH FAILED\n", i + 1));
+                    output.push_str(&format!(
+                        "_Error: {e}. Saved error artifact: {}_\n\n---\n\n",
+                        filepath.display()
+                    ));
                 }
             }
         }
@@ -204,6 +217,7 @@ impl Tool for DeepSearchTool {
             dir.display(),
             saved_files.join("\n")
         ));
+        output.push_str(&render_failed_sources_block(&failed_files));
 
         emit_deep_research_progress("completion", "Deep search complete", Some(1.0));
 
@@ -272,6 +286,22 @@ fn slugify(s: &str) -> String {
         }
     }
     slug.trim_matches('-').to_string()
+}
+
+/// Render the "failed sources" tail appended to the research index when one or
+/// more crawls fail. Each entry names the saved error-artifact path and the
+/// failure reason so the agent can locate and read it. Empty when nothing
+/// failed. Pure, so the failed-source surfacing is unit-testable without a
+/// live crawl.
+fn render_failed_sources_block(failed_files: &[String]) -> String {
+    if failed_files.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n{} source(s) failed to fetch (error artifacts saved for inspection):\n{}\n",
+        failed_files.len(),
+        failed_files.join("\n")
+    )
 }
 
 /// Extract a short slug from a URL's hostname.
@@ -365,6 +395,23 @@ mod tests {
     #[test]
     fn test_extract_urls_empty() {
         assert!(extract_urls("no urls here").is_empty());
+    }
+
+    #[test]
+    fn failed_sources_block_lists_path_and_reason_and_is_empty_when_none() {
+        // Codex P2: once `fetch_page` propagates fetch errors, a failed crawl
+        // must surface the saved error-artifact path AND the reason in the
+        // returned index — not silently omit the source. No failures → no tail.
+        assert!(render_failed_sources_block(&[]).is_empty());
+
+        let block = render_failed_sources_block(&[
+            "  - /r/01_example-com.md (https://example.com): HTTP 403".to_string(),
+            "  - /r/02_other-com.md (https://other.com): read body failed".to_string(),
+        ]);
+        assert!(block.contains("2 source(s) failed"), "block: {block}");
+        assert!(block.contains("/r/01_example-com.md"), "block: {block}");
+        assert!(block.contains("HTTP 403"), "block: {block}");
+        assert!(block.contains("https://other.com"), "block: {block}");
     }
 
     #[tokio::test]
