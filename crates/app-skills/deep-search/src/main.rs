@@ -1725,24 +1725,97 @@ async fn fetch_pages_parallel(
     results.into_iter().flatten().collect()
 }
 
+/// Browser-like UA (some sites 403 non-browser agents).
+const FETCH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Max redirects followed by [`ssrf_safe_get`].
+const FETCH_MAX_REDIRECTS: usize = 10;
+
+/// GET a URL with SSRF re-validated + DNS-pinned on EVERY redirect hop.
+///
+/// The shared `reqwest::Client` follows redirects by default WITHOUT
+/// re-checking the target, so an allowed URL that 30x-redirects to a private
+/// host (169.254.169.254 / 10.x / …) would be fetched unchecked. This builds
+/// a per-hop client with auto-redirects disabled and DNS pinned to the
+/// validated addresses, and follows `Location` manually. Fails closed on DNS
+/// error. (This binary ships its own SSRF copy — it cannot depend on
+/// octos-agent's `ssrf::ssrf_safe_send`.)
+async fn ssrf_safe_get(url: &str) -> Result<reqwest::Response, String> {
+    let mut current = url.to_string();
+
+    for _ in 0..FETCH_MAX_REDIRECTS {
+        let parsed = url::Url::parse(&current).map_err(|_| "invalid URL".to_string())?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?
+            .to_string();
+        if is_private_host(&host) {
+            return Err("blocked: private/internal host".to_string());
+        }
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        // Fail closed on DNS error (rebinding variant: fail at check time,
+        // succeed at fetch time).
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("DNS resolution failed (fail-closed): {e}"))?
+            .collect();
+        for addr in &addrs {
+            if is_private_ip(&addr.ip()) {
+                return Err("blocked: host resolves to a private IP".to_string());
+            }
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent(FETCH_USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none());
+        // Pin ALL validated addresses at once: `resolve()` in a loop replaces
+        // the per-host override each call, pinning only the last address (and
+        // failing if it happens to be unreachable).
+        if !addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &addrs);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+
+        let response = client
+            .get(&current)
+            .send()
+            .await
+            .map_err(|e| format!("fetch failed: {e}"))?;
+
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| "redirect with no Location header".to_string())?;
+        current = parsed
+            .join(location)
+            .map_err(|_| format!("invalid redirect URL: {location}"))?
+            .to_string();
+    }
+
+    Err(format!("too many redirects (max {FETCH_MAX_REDIRECTS})"))
+}
+
 async fn fetch_page(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
     max_chars: usize,
 ) -> Result<(String, Vec<String>), String> {
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            if is_private_host(host) {
-                return Ok((String::new(), vec![]));
-            }
-        }
-    }
-
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("fetch failed: {e}"))?;
+    // Best-effort: an SSRF-blocked target (including a redirect hop to a
+    // private host) or any transport failure yields empty content, which
+    // `fetch_pages_parallel` skips. Redirects are re-validated per hop by
+    // `ssrf_safe_get` (the previous initial-host-only check let an allowed URL
+    // 302 to a private host through).
+    let response = match ssrf_safe_get(url).await {
+        Ok(response) => response,
+        Err(_) => return Ok((String::new(), vec![])),
+    };
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }

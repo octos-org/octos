@@ -297,6 +297,15 @@ impl Tool for BrowserTool {
                     ..Default::default()
                 });
             }
+            // KNOWN RESIDUAL (tracked separately): this validates only the
+            // INITIAL navigation URL. Headless Chrome then follows HTTP 30x,
+            // <meta refresh>, and JS `location=` redirects internally with no
+            // per-hop SSRF re-check, so an allowed page that redirects to a
+            // private host is still reachable. Unlike the reqwest-based tools
+            // (deep_search / mcp_agent), the fix here needs CDP request
+            // interception (`Fetch.enable` / `Network.setRequestInterception`)
+            // to re-validate every navigation — a larger change that needs
+            // real-browser validation and is out of scope for this SSRF pass.
         }
 
         // Resolve timeout from config, falling back to constructor value

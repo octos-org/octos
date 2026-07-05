@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use reqwest::Client;
 use serde::Deserialize;
 
 use crate::harness_events::emit_registered_progress_event;
@@ -18,9 +17,14 @@ use crate::tools::TOOL_CTX;
 use super::web_search::WebSearchTool;
 use super::{Tool, ToolResult};
 
+/// Browser-like UA used for page fetches (some sites 403 non-browser agents).
+const DEEP_SEARCH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// Page-fetch timeout.
+const DEEP_SEARCH_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct DeepSearchTool {
     search: WebSearchTool,
-    client: Client,
     /// Research output base directory (e.g. ~/.octos/research/ or a sub-agent's research_dir).
     research_base: PathBuf,
 }
@@ -29,11 +33,6 @@ impl DeepSearchTool {
     pub fn new(research_base: impl Into<PathBuf>) -> Self {
         Self {
             search: WebSearchTool::new(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(15))
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                .build()
-                .unwrap_or_else(|_| Client::new()),
             research_base: research_base.into(),
         }
     }
@@ -167,6 +166,7 @@ impl Tool for DeepSearchTool {
 
         let mut saved_count = 0u32;
         let mut saved_files = Vec::new();
+        let mut failed_files: Vec<String> = Vec::new();
         for (i, (url, page)) in urls.iter().zip(pages.iter()).enumerate() {
             let filename = format!("{:02}_{}.md", i + 1, host_slug(url));
             let filepath = dir.join(&filename);
@@ -193,8 +193,20 @@ impl Tool for DeepSearchTool {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    // `fetch_page` now propagates 403/500, transport, and
+                    // body-read failures (it no longer swallows them to an
+                    // empty string). Persist the error artifact AND surface it
+                    // in the returned index — otherwise a failed (or all-failed)
+                    // crawl hands the agent an index that silently omits the
+                    // source, with no path or reason to inspect.
                     let err_content = format!("---\nurl: {url}\nerror: {e}\n---\n");
                     let _ = tokio::fs::write(&filepath, &err_content).await;
+                    failed_files.push(format!("  - {} ({url}): {e}", filepath.display()));
+                    output.push_str(&format!("## Source [{}]: {url} — FETCH FAILED\n", i + 1));
+                    output.push_str(&format!(
+                        "_Error: {e}. Saved error artifact: {}_\n\n---\n\n",
+                        filepath.display()
+                    ));
                 }
             }
         }
@@ -205,6 +217,7 @@ impl Tool for DeepSearchTool {
             dir.display(),
             saved_files.join("\n")
         ));
+        output.push_str(&render_failed_sources_block(&failed_files));
 
         emit_deep_research_progress("completion", "Deep search complete", Some(1.0));
 
@@ -225,24 +238,27 @@ fn emit_deep_research_progress(phase: &str, message: &str, progress: Option<f64>
 
 impl DeepSearchTool {
     async fn fetch_page(&self, url: &str, max_chars: usize) -> Result<String> {
-        // SSRF check
-        if let Ok(parsed) = reqwest::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                if super::ssrf::is_private_host(host) {
-                    return Ok(String::new());
-                }
-                let port = parsed.port_or_known_default().unwrap_or(443);
-                if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-                    for addr in addrs {
-                        if super::ssrf::is_private_ip(&addr.ip()) {
-                            return Ok(String::new());
-                        }
-                    }
-                }
-            }
-        }
-
-        let response = self.client.get(url).send().await.wrap_err("fetch failed")?;
+        // SSRF is re-validated on EVERY redirect hop (the initial-URL-only
+        // check this replaced let an allowed URL 302 to 169.254.169.254 /
+        // 10.x through). `ssrf_safe_send` disables auto-redirects, re-checks +
+        // DNS-pins each hop, and re-issues the GET.
+        //
+        // Failures (SSRF-blocked, transport error, non-2xx, body-read) return
+        // Err so the caller's save loop records an error artifact for the
+        // skipped source — collapsing them to Ok("") would silently drop
+        // 403/500 pages from the research index.
+        let response = super::ssrf::ssrf_safe_send(
+            url,
+            super::ssrf::SSRF_MAX_REDIRECTS,
+            |builder| {
+                builder
+                    .timeout(DEEP_SEARCH_FETCH_TIMEOUT)
+                    .user_agent(DEEP_SEARCH_USER_AGENT)
+            },
+            |client, current_url| client.get(current_url),
+        )
+        .await
+        .map_err(|e| eyre::eyre!("{e}"))?;
 
         if !response.status().is_success() {
             eyre::bail!("HTTP {}", response.status());
@@ -270,6 +286,22 @@ fn slugify(s: &str) -> String {
         }
     }
     slug.trim_matches('-').to_string()
+}
+
+/// Render the "failed sources" tail appended to the research index when one or
+/// more crawls fail. Each entry names the saved error-artifact path and the
+/// failure reason so the agent can locate and read it. Empty when nothing
+/// failed. Pure, so the failed-source surfacing is unit-testable without a
+/// live crawl.
+fn render_failed_sources_block(failed_files: &[String]) -> String {
+    if failed_files.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n{} source(s) failed to fetch (error artifacts saved for inspection):\n{}\n",
+        failed_files.len(),
+        failed_files.join("\n")
+    )
 }
 
 /// Extract a short slug from a URL's hostname.
@@ -363,6 +395,23 @@ mod tests {
     #[test]
     fn test_extract_urls_empty() {
         assert!(extract_urls("no urls here").is_empty());
+    }
+
+    #[test]
+    fn failed_sources_block_lists_path_and_reason_and_is_empty_when_none() {
+        // Codex P2: once `fetch_page` propagates fetch errors, a failed crawl
+        // must surface the saved error-artifact path AND the reason in the
+        // returned index — not silently omit the source. No failures → no tail.
+        assert!(render_failed_sources_block(&[]).is_empty());
+
+        let block = render_failed_sources_block(&[
+            "  - /r/01_example-com.md (https://example.com): HTTP 403".to_string(),
+            "  - /r/02_other-com.md (https://other.com): read body failed".to_string(),
+        ]);
+        assert!(block.contains("2 source(s) failed"), "block: {block}");
+        assert!(block.contains("/r/01_example-com.md"), "block: {block}");
+        assert!(block.contains("HTTP 403"), "block: {block}");
+        assert!(block.contains("https://other.com"), "block: {block}");
     }
 
     #[tokio::test]

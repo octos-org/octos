@@ -143,6 +143,40 @@ async fn boot_fake_http_server(
     (url, join)
 }
 
+/// Boot a tiny HTTP server that answers every request with a 302 redirect to
+/// `location`. Used to prove the HTTP MCP backend refuses to follow a
+/// redirect (whose target would bypass the SSRF check).
+async fn boot_fake_redirect_server(location: &str) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("http://{}/", addr);
+    let location = location.to_string();
+
+    let join = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let location = location.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), socket.read(&mut buf)).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (url, join)
+}
+
 /// Spawn a unique task/session id pair so repeated test runs do not
 /// collide in the supervisor's ledger.
 fn unique_ids() -> (String, String) {
@@ -217,6 +251,46 @@ async fn should_dispatch_to_remote_mcp_agent_and_return_contract_artifact() {
     assert_eq!(
         response.files_to_send,
         vec![PathBuf::from("/tmp/remote.md")]
+    );
+}
+
+#[tokio::test]
+async fn remote_mcp_agent_refuses_to_follow_redirect() {
+    // P1 SSRF: reqwest's default redirect policy would resolve + connect to a
+    // redirect target WITHOUT re-running the SSRF check (and the DNS pin only
+    // covers the original host). The backend disables auto-redirects and fails
+    // closed on any 3xx — proven here with a live 302 → the AWS metadata IP.
+    let (url, join) = boot_fake_redirect_server("http://169.254.169.254/latest/meta-data/").await;
+
+    let config = McpAgentBackendConfig::Remote {
+        url,
+        auth_header: None,
+        extra_headers: HashMap::new(),
+        connect_timeout_secs: Some(2),
+        read_timeout_secs: Some(2),
+        dispatch_timeout_secs: Some(5),
+    };
+    let backend = HttpMcpAgent::from_config(&config)
+        .expect("build http backend")
+        .with_loopback_allowed_for_tests();
+    let response = backend
+        .dispatch(DispatchRequest::new(
+            "run_task",
+            serde_json::json!({"task": "hi"}),
+        ))
+        .await;
+    join.abort();
+
+    assert_eq!(
+        response.outcome,
+        DispatchOutcome::SsrfBlocked,
+        "a redirect must be refused (not followed to the unvalidated target); got: {}",
+        response.output
+    );
+    assert!(
+        response.output.contains("redirect"),
+        "error should explain the refused redirect; got: {}",
+        response.output
     );
 }
 
