@@ -2644,6 +2644,28 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             }
             LoopControlKind::Resume => {
                 loop_record.status = "active".into();
+                // Re-arm the schedule if it was cleared. A self-paced /
+                // maintenance loop paused between its due-fire (which sets
+                // `next_run_at_ms = None`, agent_orchestrator ~3046) and the
+                // continuation that would re-stamp it (`apply_self_paced_
+                // response`) is left with `next_run_at_ms = None` — and BOTH
+                // due-scans (`due_loop_targets_with_filter` and
+                // `enqueue_due_loop_continuations`) skip a `None` next-run
+                // forever, so the resumed loop would never fire again.
+                // Re-arm to `now + interval` (or `now`, due immediately, for a
+                // pure self-paced loop with no interval) so resume always
+                // yields a schedulable loop. A still-valid future next-run is
+                // left untouched — resume respects the existing schedule.
+                if loop_record.next_run_at_ms.is_none() {
+                    loop_record.next_run_at_ms = Some(
+                        loop_record
+                            .interval_seconds
+                            .and_then(|seconds| i64::try_from(seconds).ok())
+                            .and_then(|seconds| seconds.checked_mul(1_000))
+                            .and_then(|delay_ms| now.checked_add(delay_ms))
+                            .unwrap_or(now),
+                    );
+                }
                 loop_record.updated_at_ms = now;
                 persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
                 Ok(json!({
@@ -6595,6 +6617,62 @@ mod tests {
         assert_eq!(
             err.data.expect("error data")["kind"],
             json!(kinds::LOOP_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn resume_rearms_next_run_for_a_loop_interrupted_mid_fire() {
+        // P2 (tri-repo #1529): a self-paced loop paused between its due-fire
+        // (which sets next_run_at_ms = None) and the continuation that would
+        // re-stamp it is left unschedulable — both due-scans skip a None
+        // next-run. Resume must re-arm it.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-resume");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("keep going".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Simulate the interrupted-mid-fire state: next_run cleared, paused.
+        {
+            let mut state = orchestrator.state();
+            let record = state.loops.get_mut(&loop_id).expect("loop record");
+            record.next_run_at_ms = None;
+            record.status = "paused".into();
+        }
+
+        let resumed = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id: loop_id.clone(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::Resume,
+            })
+            .expect("resume");
+        assert_eq!(resumed["status"], json!("active"));
+        assert!(
+            resumed["loop"]["next_run_at_ms"].is_i64(),
+            "resume must re-arm next_run_at_ms so the loop is schedulable again; got {}",
+            resumed["loop"]["next_run_at_ms"]
+        );
+
+        // And the re-armed loop is actually due (now, since it has no interval).
+        let due = orchestrator
+            .state()
+            .loops
+            .get(&loop_id)
+            .unwrap()
+            .next_run_at_ms;
+        assert!(
+            due.is_some_and(|n| n <= now_ms() + 1_000),
+            "re-armed to fire promptly"
         );
     }
 
