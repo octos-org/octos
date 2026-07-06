@@ -1252,6 +1252,16 @@ impl InProcessAgentOrchestrator {
         Option<GoalDispatchInFlightGuard>,
     ) {
         let mut state = self.state();
+        // Defer ENTIRELY if a turn is already in flight for this session —
+        // before draining anything. The enqueue suppression only covers
+        // goal/loop DUE-scans; a pre-queued loop / ChildCompleted / External
+        // continuation would otherwise still be popped here, run concurrently
+        // with the other subsystem's turn, AND its returned guard's drop would
+        // clear that turn's marker (codex re-review). Checking first, under
+        // the same lock, makes the whole claim generation-safe.
+        if state.in_flight_goal_sessions.contains(session_id) {
+            return (Vec::new(), None);
+        }
         let kept = Self::drain_ready_continuations_locked(
             &mut state,
             session_id,
@@ -10810,6 +10820,75 @@ mod tests {
 
         drop(guard);
         assert!(!orchestrator.is_goal_dispatch_in_flight(&session_id));
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+    }
+
+    #[test]
+    fn drain_and_claim_does_not_pop_a_pre_queued_continuation_while_in_flight() {
+        // P1 (tri-repo #1529, codex re-review): the enqueue suppression only
+        // covers DUE-scans; a LoopFire (or ChildCompleted / External) already
+        // QUEUED before the session was marked in-flight would still be popped
+        // by the drain, run concurrently with the other subsystem's turn, and
+        // its guard's drop would clear that turn's marker. The atomic
+        // drain-and-claim must DEFER entirely — pop nothing — while a turn is
+        // already in flight, leaving the queued item for the next dispatch.
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "pre-queued-defer");
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check health".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+        orchestrator.force_loop_due_for_test(&loop_id);
+        // Queue a LoopFire BEFORE marking in-flight.
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1, "a due loop must queue one LoopFire");
+        let queued_before = orchestrator.pending_continuation_count_for_test();
+        assert!(queued_before >= 1);
+
+        // Now a turn is in flight (e.g. an AppUI goal turn on the same session).
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        let (drained, guard) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            drained.is_empty() && guard.is_none(),
+            "must defer — not pop the pre-queued LoopFire — while in flight"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            queued_before,
+            "the pre-queued LoopFire must remain queued for the next dispatch"
+        );
+
+        // Clearing the marker lets the queued LoopFire drain normally.
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        let (drained_after, guard_after) = orchestrator
+            .drain_and_claim_ready_continuation_for_session(
+                &session_id,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+        assert!(
+            !drained_after.is_empty() && guard_after.is_some(),
+            "after the other turn ends, the queued LoopFire drains and claims"
+        );
+        drop(guard_after);
         orchestrator.clear_goal_dispatch_in_flight(&session_id);
     }
 }
