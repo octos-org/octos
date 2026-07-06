@@ -2736,6 +2736,20 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     SystemTime::now(),
                 )
                 .with_loop_id(loop_id.clone())
+                // Identity-only dedupe key SHARED with the scheduled
+                // due-tick enqueue (`enqueue_due_loop_continuations`).
+                // The auto-derived key folds metadata in, and the two
+                // paths' metadata differs (`scheduled_for_ms`,
+                // resolved-vs-record maintenance prompt), so a manual
+                // fire_now racing the tick used to enqueue a SECOND
+                // LoopFire for the same due moment. With the shared
+                // key the later path collapses as a Duplicate while a
+                // fire is pending.
+                .with_dedupe_key(loop_fire_dedupe_key(
+                    "coding-autonomy",
+                    &profile_id,
+                    &loop_id,
+                ))
                 .with_metadata("prompt", resolved_prompt)
                 .with_metadata("prompt_source", prompt_source_label);
                 let outcome = enqueue_and_persist_continuation(&mut state, continuation);
@@ -3092,6 +3106,18 @@ fn enqueue_due_loop_continuations(
             MasterContinuationReason::LoopFire,
             SystemTime::now(),
         )
+        // Identity-only dedupe key SHARED with the manual fire_now
+        // enqueue (`control_loop` FireNow arm) so the two paths racing
+        // over one due moment collapse to ONE pending LoopFire instead
+        // of double-firing. `scheduled_for_ms` stays observability
+        // metadata below — it must NOT split the key, and distinct due
+        // moments still fire because a claimed key leaves
+        // `pending_by_key`.
+        .with_dedupe_key(loop_fire_dedupe_key(
+            "coding-autonomy",
+            &fire.profile_id,
+            &fire.loop_id,
+        ))
         .with_loop_id(fire.loop_id)
         .with_metadata("prompt", fire.prompt)
         .with_metadata("prompt_source", prompt_source_label)
@@ -3844,6 +3870,25 @@ fn enqueue_agent_terminal_continuations(
 /// strangler double-delivery or repeated terminal marks.
 fn child_completed_dedupe_key(group_id: &str, session_id: &str, agent_id: &str) -> String {
     format!("child/{group_id}/{session_id}/{agent_id}")
+}
+
+/// Explicit `LoopFire` dedupe key shared by BOTH enqueue paths — the
+/// manual `control_loop(FireNow)` arm and the scheduled
+/// `enqueue_due_loop_continuations` tick. Keyed ONLY on stable identity
+/// (group + profile + loop_id): the auto-derived `stable_dedupe_key`
+/// folds every metadata pair into the key, and the two paths' metadata
+/// deliberately differs (`scheduled_for_ms` exists only on the tick;
+/// maintenance loops resolve prompt / prompt_source at fire time vs the
+/// legacy "record" label), so a fire_now racing the tick used to MISS
+/// `pending_by_key` and enqueue a SECOND LoopFire — two turns for one
+/// due moment. The identity key makes whichever path lands second
+/// collapse as a Duplicate while a fire is pending-and-unclaimed.
+/// Distinct due moments are unaffected: LoopFire is not `External`, so
+/// a CLAIMED (drained) key leaves `pending_by_key` immediately and the
+/// next due moment re-enqueues freely (see the recently-claimed guard
+/// scoping in `master_continuation_scheduler.rs`).
+fn loop_fire_dedupe_key(group_id: &str, profile_id: &str, loop_id: &str) -> String {
+    format!("loop_fire/{group_id}/{profile_id}/{loop_id}")
 }
 
 fn agent_continuation_group_id(agent: &AutonomyAgentRecord) -> String {
@@ -8893,6 +8938,155 @@ mod tests {
             drained[0].metadata.get("prompt").map(String::as_str),
             Some("check build health")
         );
+    }
+
+    /// A manual `loop/fire_now` racing the scheduled due-tick must not
+    /// double-fire the loop. The two enqueue paths historically derived
+    /// DIFFERENT auto keys — the tick folds `scheduled_for_ms` into the
+    /// continuation metadata (and maintenance loops resolve a different
+    /// prompt / prompt_source at fire time) — so `pending_by_key` missed
+    /// and BOTH continuations queued: two LoopFire turns for one due
+    /// moment. Both paths must share one identity-only dedupe key so the
+    /// second enqueue collapses onto the pending fire.
+    #[test]
+    fn fire_now_racing_scheduled_due_tick_collapses_to_one_loop_fire() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-firenow-race");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check build health".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+        orchestrator.force_loop_due_for_test(&loop_id);
+
+        // The scheduled tick claims the due moment first…
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1);
+
+        // …then the racing manual fire_now lands before the queued
+        // continuation is claimed. FireNow skips the schedule gate
+        // (`decide_fire` only applies `next_due` to `ScheduledDue`),
+        // so only the queue's dedupe stands between this and a
+        // second turn for the same due moment.
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                loop_id: loop_id.clone(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("fire_now");
+        assert_eq!(
+            fired["fire"]["duplicate"].as_bool(),
+            Some(true),
+            "fire_now must collapse onto the pending scheduled fire, got: {fired}"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "one due moment must enqueue exactly ONE LoopFire continuation"
+        );
+        // #1138 semantics extend across paths: the deduplicated
+        // fire must not burn the safety budget a second time.
+        assert_eq!(
+            orchestrator
+                .state()
+                .loops
+                .get(&loop_id)
+                .expect("loop record")
+                .fires_used,
+            1,
+            "a deduplicated fire_now must not increment fires_used"
+        );
+    }
+
+    /// Over-dedupe guard for the shared LoopFire key: the identity-only
+    /// key must only collapse enqueues while a fire is PENDING. Once the
+    /// pending continuation is claimed (drained), the key leaves
+    /// `pending_by_key` — LoopFire is not `External`, so no
+    /// recently-claimed guard applies — and the next genuine due
+    /// moment, scheduled or manual, must enqueue a fresh continuation.
+    #[test]
+    fn distinct_due_moments_still_enqueue_distinct_loop_fires() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-distinct-fires");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check build health".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Due moment 1: scheduled tick queues, then the turn claims it.
+        orchestrator.force_loop_due_for_test(&loop_id);
+        assert_eq!(
+            orchestrator.tick_due_loops_for_session(
+                &session_id,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+            ),
+            1
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+
+        // Due moment 2: a manual fire_now after the claim is a genuine
+        // new fire, not a duplicate of the already-claimed one.
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                loop_id: loop_id.clone(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("fire_now");
+        assert_eq!(
+            fired["fire"]["duplicate"].as_bool(),
+            Some(false),
+            "fire_now after the prior fire was claimed must queue fresh, got: {fired}"
+        );
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::LoopFire);
+
+        // Due moment 3: the next scheduled tick also queues fresh.
+        orchestrator.force_loop_due_for_test(&loop_id);
+        assert_eq!(
+            orchestrator.tick_due_loops_for_session(
+                &session_id,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+            ),
+            1,
+            "a later scheduled due moment must enqueue its own continuation"
+        );
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
     }
 
     /// UPCR-2026-021: "`/loop 5m /foo` creates a fixed loop and immediately
