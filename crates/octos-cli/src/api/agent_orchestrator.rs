@@ -1579,6 +1579,33 @@ impl InProcessAgentOrchestrator {
         self.state().in_flight_goal_sessions.contains(session_id)
     }
 
+    /// ATOMICALLY claim the in-flight marker for `session_id`: if it is not
+    /// already set, insert it and return a clearing guard; if another dispatch
+    /// already holds it, return `None`. The check-and-set happens under a
+    /// SINGLE state-lock acquisition, so — unlike a separate
+    /// `is_goal_dispatch_in_flight` check followed by a later mark — two
+    /// subsystems racing to claim the same session cannot both succeed
+    /// (#1529, codex re-review: the mark must be atomic with the claim to
+    /// close the check-then-mark window). The caller drains and runs the turn
+    /// while holding the guard; dropping it releases the marker.
+    pub(crate) fn try_goal_dispatch_in_flight_guard(
+        &'static self,
+        session_id: SessionKey,
+    ) -> Option<GoalDispatchInFlightGuard> {
+        {
+            let mut state = self.state();
+            if state.in_flight_goal_sessions.contains(&session_id) {
+                return None;
+            }
+            state.in_flight_goal_sessions.insert(session_id.clone());
+        }
+        Some(GoalDispatchInFlightGuard {
+            orchestrator: self,
+            session_id,
+            disarmed: false,
+        })
+    }
+
     /// #1140 codex P1 re-review #4 — RAII drop-guard for the
     /// in-flight marker. Use this from the AppUI tick path so the
     /// marker is cleared on ANY exit path (cancellation,
@@ -10614,5 +10641,39 @@ mod tests {
             !orchestrator.is_goal_dispatch_in_flight(&session_id),
             "clearing the marker must let dispatch resume"
         );
+    }
+
+    #[test]
+    fn try_goal_dispatch_in_flight_guard_claims_atomically_and_releases_on_drop() {
+        // P2 (tri-repo #1529, codex re-review): the claim must be atomic — a
+        // SECOND claimant while a turn is in flight must get None (so it skips
+        // instead of draining a concurrent turn), and dropping the guard must
+        // release the marker so the next dispatch can claim it. Uses the
+        // process-global singleton because the guard captures 'static self.
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "try-claim-atomic");
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+
+        let first = orchestrator.try_goal_dispatch_in_flight_guard(session_id.clone());
+        assert!(first.is_some(), "the first claim must succeed");
+        assert!(orchestrator.is_goal_dispatch_in_flight(&session_id));
+        // A concurrent claimant is refused while the first holds the marker.
+        assert!(
+            orchestrator
+                .try_goal_dispatch_in_flight_guard(session_id.clone())
+                .is_none(),
+            "a second claim while a turn is in flight must be refused"
+        );
+
+        drop(first);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "dropping the guard must release the marker"
+        );
+        // After release a fresh claim succeeds again.
+        let again = orchestrator.try_goal_dispatch_in_flight_guard(session_id.clone());
+        assert!(again.is_some(), "a claim after release must succeed");
+        drop(again);
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
     }
 }
