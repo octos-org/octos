@@ -182,6 +182,18 @@ fn compute_batch_timeout_secs(
 /// Returns `None` when `files` is empty — the caller MUST suppress the
 /// follow-up notification in that case so we never persist an empty
 /// "produced files:" stub. Token-budget invariant (M10 Phase 4): paths
+/// Whether a Satisfied spawn_only contract's delivery counts as a FAILURE.
+///
+/// `delivery` encodes the background-notification outcome:
+/// - `None` — no background sender is wired (chat mode). The contract is
+///   Satisfied and there is simply nowhere to deliver the notification; this
+///   is NOT a failure. (The bug this fixes recorded it as Failed.)
+/// - `Some(true)` — a sender ran and persisted the result. Success.
+/// - `Some(false)` — a sender ran and genuinely failed to persist. Failure.
+fn satisfied_delivery_is_failure(delivery: Option<bool>) -> bool {
+    delivery == Some(false)
+}
+
 /// only, never file contents.
 ///
 /// `workspace_root`, when supplied, is used to convert absolute paths
@@ -1165,30 +1177,44 @@ impl Agent {
                                     } else {
                                         r.output.clone()
                                     };
-                                    let result_persisted = if let Some(ref sender) = bg_sender {
-                                        sender(BackgroundResultPayload {
-                                            task_label: bg_name.clone(),
-                                            content: bubble_content,
-                                            kind: BackgroundResultKind::Notification,
-                                            media: output_files.clone(),
-                                            envelope_media: vec![],
-                                            originating_thread_id: bg_originating_thread_id.clone(),
-                                            task_id: Some(task_id.clone()),
-                                            originating_client_message_id:
-                                                bg_originating_client_message_id.clone(),
-                                            tool_call_id: Some(bg_tc_id.clone()),
-                                            // C1 step 3: contract-Satisfied success path
-                                            // (mark_completed below).
-                                            terminal_status: Some(
-                                                crate::task_supervisor::TaskStatus::Completed,
-                                            ),
-                                        })
-                                        .await
+                                    // `None` = no background channel is wired
+                                    // (chat mode): the contract is Satisfied and
+                                    // there is simply nowhere to deliver the
+                                    // notification — that is NOT a failure.
+                                    // `Some(false)` = a sender ran and genuinely
+                                    // failed to persist. Keeping these apart
+                                    // stops a Satisfied chat-mode contract from
+                                    // being recorded as Failed.
+                                    let delivery = if let Some(ref sender) = bg_sender {
+                                        Some(
+                                            sender(BackgroundResultPayload {
+                                                task_label: bg_name.clone(),
+                                                content: bubble_content,
+                                                kind: BackgroundResultKind::Notification,
+                                                media: output_files.clone(),
+                                                envelope_media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
+                                                task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: contract-Satisfied success path
+                                                // (mark_completed below).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Completed,
+                                                ),
+                                            })
+                                            .await,
+                                        )
                                     } else {
-                                        false
+                                        None
                                     };
 
-                                    if result_persisted {
+                                    // A Satisfied contract is a success unless a
+                                    // wired sender actually failed to persist.
+                                    let delivery_failed = satisfied_delivery_is_failure(delivery);
+                                    if !delivery_failed {
                                         // Workspace contract already verified
                                         // the declared artifacts. Trust it —
                                         // the supervisor's job is to record
@@ -2571,8 +2597,29 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 mod tests {
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
-        satisfied_completion_content, should_auto_send_tool_files,
+        satisfied_completion_content, satisfied_delivery_is_failure, should_auto_send_tool_files,
     };
+
+    #[test]
+    fn satisfied_contract_in_chat_mode_is_not_a_failure() {
+        // P2 (tri-repo #1529): a Satisfied spawn_only contract in chat mode
+        // (no background sender: delivery == None) was recorded as Failed
+        // because "no channel to notify" was conflated with "sender failed to
+        // persist". None and Some(true) are BOTH success; only Some(false) —
+        // a wired sender that actually failed — is a failure.
+        assert!(
+            !satisfied_delivery_is_failure(None),
+            "chat mode (no background sender) must not be a failure"
+        );
+        assert!(
+            !satisfied_delivery_is_failure(Some(true)),
+            "a delivered result is a success"
+        );
+        assert!(
+            satisfied_delivery_is_failure(Some(false)),
+            "a wired sender that failed to persist is a real failure"
+        );
+    }
 
     #[test]
     fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
