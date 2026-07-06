@@ -2278,73 +2278,55 @@ impl Agent {
                 .collect();
 
             // UPCR-2026-023: a human-wait batch (`tool_timeout == None`) awaits
-            // `join_all` DIRECTLY, with no `tokio::time::timeout` wrap, so the
-            // human-wait tool task is never detached by a fired ceiling. It is
-            // unblocked by the user answering or by a turn interrupt/abort
-            // (which drains the pending question). All other batches keep the
-            // finite ceiling. `Ok(Vec<JoinResult>)` is mapped identically in
-            // both arms.
-            let join_outcome = match tool_timeout {
-                Some(dur) => tokio::time::timeout(dur, futures::future::join_all(handles))
+            // `join_all` DIRECTLY, with no timeout wrap, so the human-wait
+            // tool task is never detached by a fired ceiling. It is unblocked
+            // by the user answering or by a turn interrupt/abort (which drains
+            // the pending question).
+            //
+            // All other batches share ONE absolute deadline, but each handle
+            // is raced against it INDIVIDUALLY (`tokio::time::timeout_at`): a
+            // call that already resolved keeps its REAL result even when a
+            // sibling overruns the ceiling — only the still-pending calls get
+            // the synthetic "timed out" message (success=false, so the
+            // spawn_only synth-ack gate in loop_runner still suppresses the
+            // fabricated "Background work started" bubble for them). The
+            // previous shape — one `timeout()` wrapped around the whole
+            // `join_all` — dropped the joined future on expiry and fabricated
+            // a timeout message for EVERY call, discarding the real output of
+            // calls (including spawn_only acks) that had already completed.
+            // `timeout_at` polls the inner handle before the timer, so a
+            // handle that completed by the time we reach it yields its result
+            // even at/past the deadline. Timed-out tasks are NOT aborted —
+            // they keep running detached for cleanup, exactly as before.
+            match tool_timeout {
+                Some(dur) => {
+                    let deadline = tokio::time::Instant::now() + dur;
+                    let elapsed_secs = dur.as_secs();
+                    let mut results: Vec<ToolCallResult> =
+                        Vec::with_capacity(response.tool_calls.len());
+                    for (handle, tc) in handles.into_iter().zip(response.tool_calls.iter()) {
+                        match tokio::time::timeout_at(deadline, handle).await {
+                            Ok(Ok(result)) => results.push(result),
+                            Ok(Err(e)) => results.push(panic_result(tc, &e.to_string())),
+                            Err(_elapsed) => {
+                                tracing::error!(
+                                    timeout_secs = elapsed_secs,
+                                    tool = %tc.name,
+                                    tool_id = %tc.id,
+                                    "tool execution timed out -- spawned task continues running for cleanup"
+                                );
+                                results.push(timed_out_result(tc, elapsed_secs));
+                            }
+                        }
+                    }
+                    results
+                }
+                None => futures::future::join_all(handles)
                     .await
-                    .map_err(|_| ()),
-                None => Ok(futures::future::join_all(handles).await),
-            };
-
-            match join_outcome {
-                Ok(results) => results
                     .into_iter()
                     .zip(response.tool_calls.iter())
                     .map(|(r, tc)| r.unwrap_or_else(|e| panic_result(tc, &e.to_string())))
                     .collect(),
-                Err(()) => {
-                    // Only reachable when `tool_timeout` was `Some` (a `None`
-                    // human-wait batch always yields `Ok`), so the seconds are
-                    // present for the diagnostic / synthetic-result message.
-                    let elapsed_secs = tool_timeout_secs.unwrap_or(0);
-                    tracing::error!(
-                        timeout_secs = elapsed_secs,
-                        tool_count = response.tool_calls.len(),
-                        tools = %tool_names.join(", "),
-                        "tool execution timed out -- spawned tasks continue running for cleanup"
-                    );
-                    let messages: Vec<Message> = response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| Message {
-                            role: MessageRole::Tool,
-                            content: format!(
-                                "Tool '{}' timed out after {} seconds",
-                                tc.name, elapsed_secs
-                            ),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: Some(tc.id.clone()),
-                            reasoning_content: None,
-                            client_message_id: None,
-                            thread_id: None,
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .collect();
-                    // Batch-wide timeout: every tool in the batch failed.
-                    // Surface the success bit (false for all) so the
-                    // spawn_only synth-ack gate in loop_runner can suppress
-                    // the fabricated "Background work started" bubble
-                    // without depending on content-prefix matching.
-                    let success_by_id: Vec<(String, bool)> = response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| (tc.id.clone(), false))
-                        .collect();
-                    return Ok((
-                        messages,
-                        vec![],
-                        vec![],
-                        TokenUsage::default(),
-                        Vec::new(),
-                        success_by_id,
-                    ));
-                }
             }
         };
 
@@ -2488,27 +2470,7 @@ impl Agent {
                         tool_id = %tool_call.id,
                         "serial tool execution timed out"
                     );
-                    (
-                        Message {
-                            role: MessageRole::Tool,
-                            content: format!(
-                                "Tool '{}' timed out after {} seconds",
-                                tool_call.name, elapsed_secs
-                            ),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: Some(tool_call.id.clone()),
-                            reasoning_content: None,
-                            client_message_id: None,
-                            thread_id: None,
-                            timestamp: chrono::Utc::now(),
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                        false,
-                        None,
-                    )
+                    timed_out_result(tool_call, elapsed_secs)
                 }
             };
 
@@ -2536,6 +2498,36 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
             content: format!(
                 "Tool '{}' cancelled due to earlier sibling error in the same batch. Re-issue this call on the next turn if still needed.",
                 tool_call.name
+            ),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tool_call.id.clone()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        },
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        None,
+    )
+}
+
+/// Build a synthetic tool-result message for a call that was still pending
+/// when the batch deadline fired (parallel dispatch) or whose own wrap
+/// expired (serial dispatch). `success` is `false` so the spawn_only
+/// synth-ack gate in loop_runner can suppress the fabricated "Background
+/// work started" bubble without content-prefix matching. The spawned task
+/// itself is NOT aborted — it keeps running detached for cleanup.
+fn timed_out_result(tool_call: &octos_core::ToolCall, elapsed_secs: u64) -> ToolCallResult {
+    (
+        Message {
+            role: MessageRole::Tool,
+            content: format!(
+                "Tool '{}' timed out after {} seconds",
+                tool_call.name, elapsed_secs
             ),
             media: vec![],
             tool_calls: None,
@@ -2967,5 +2959,186 @@ mod tests {
             /* interactive_default */ 120,
         );
         assert_eq!(secs, Some(1800));
+    }
+
+    // ------------------------------------------------------------------
+    // Parallel batch timeout must NOT discard already-completed results.
+    // ------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_core::{AgentId, ToolCall};
+    use octos_llm::{
+        ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage, ToolSpec,
+    };
+    use octos_memory::EpisodeStore;
+
+    use crate::agent::{Agent, AgentConfig};
+    use crate::tools::{Tool, ToolRegistry, ToolResult};
+
+    /// `execute_tools` never talks to the LLM, so the provider only has to
+    /// satisfy the trait bounds (mirrors loop_runner's `InertProvider`).
+    struct NoChatProvider;
+
+    #[async_trait]
+    impl LlmProvider for NoChatProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            unreachable!("execute_tools must not call the provider");
+        }
+
+        fn model_id(&self) -> &str {
+            "inert"
+        }
+
+        fn provider_name(&self) -> &str {
+            "inert"
+        }
+    }
+
+    /// Completes immediately with a distinctive real output.
+    struct InstantTool;
+
+    #[async_trait]
+    impl Tool for InstantTool {
+        fn name(&self) -> &str {
+            "fast_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that completes immediately"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "FAST_TOOL_REAL_OUTPUT".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Sleeps far past the batch ceiling so the batch timeout always fires
+    /// while this call is still pending.
+    struct SleepingTool;
+
+    #[async_trait]
+    impl Tool for SleepingTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that outlives the batch timeout"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(ToolResult {
+                output: "SLOW_TOOL_REAL_OUTPUT".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_keep_completed_call_results_when_batch_timeout_fires() {
+        // Regression: the parallel dispatch used to wrap the WHOLE `join_all`
+        // in one `tokio::time::timeout`; when the ceiling fired, every call in
+        // the batch — including ones that had already resolved — was replaced
+        // by a synthetic "timed out" message, discarding real output.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(InstantTool);
+        tools.register(SleepingTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("batch-timeout"), provider, tools, memory).with_config(
+            AgentConfig {
+                // Neither test tool is in LONG_RUNNING_TOOLS and no call
+                // requests `timeout_secs`, so this 1s interactive default is
+                // the whole batch's ceiling (see compute_batch_timeout_secs).
+                default_interactive_tool_timeout_secs: 1,
+                tool_timeout_secs: 1,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                tool_call("call_fast", "fast_tool"),
+                tool_call("call_slow", "slow_tool"),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, _files_modified, _files_to_send, _tokens, _structured, success_by_id) =
+            agent
+                .execute_tools(&response)
+                .await
+                .expect("execute_tools must not error on a batch timeout");
+
+        // 1:1 mapping in LLM call order is preserved.
+        assert_eq!(messages.len(), 2, "one result message per tool call");
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_fast"));
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_slow"));
+
+        // The fast call COMPLETED before the ceiling fired: its REAL output
+        // must survive, not be overwritten by a fabricated timeout message.
+        assert!(
+            messages[0].content.contains("FAST_TOOL_REAL_OUTPUT"),
+            "completed call's real output was discarded: {:?}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("timed out"),
+            "completed call must not carry a synthetic timeout message: {:?}",
+            messages[0].content
+        );
+
+        // The still-pending slow call gets the synthetic timeout message in
+        // the existing (pinned) format.
+        assert_eq!(
+            messages[1].content,
+            "Tool 'slow_tool' timed out after 1 seconds"
+        );
+
+        // Per-call success bits follow the same split.
+        assert!(
+            success_by_id.contains(&("call_fast".to_string(), true)),
+            "completed call must keep success=true: {success_by_id:?}"
+        );
+        assert!(
+            success_by_id.contains(&("call_slow".to_string(), false)),
+            "timed-out call must report success=false: {success_by_id:?}"
+        );
     }
 }
