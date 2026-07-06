@@ -1919,6 +1919,17 @@ impl SessionManager {
         // Ensure the session is resident so the trim reflects the full
         // (merged) on-disk transcript.
         let _ = self.get_or_create(key).await;
+        // Serialise the count-read + marker-append + trim under the per-key
+        // persist lock — the SAME lock the rewrite / canonical-append paths
+        // hold (#1528). Without it this read-then-append raced a concurrent
+        // `rewrite`, which snapshots the pre-marker message vec and renames
+        // over the file, silently ERASING the appended rollback marker; and a
+        // concurrent append could land between the turn-count read and the
+        // marker write, computing the marker's `num_turns` against a stale
+        // transcript. `append_rollback_marker` takes no lock itself, so
+        // holding it here does not re-enter.
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
         let dropped = {
             let session = self
                 .cache
