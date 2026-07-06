@@ -379,40 +379,52 @@ impl CronService {
 
         let now_ms = Utc::now().timestamp_millis();
 
-        // Collect due jobs
+        // Reserve-then-fire: collect due jobs AND advance their schedule
+        // state in ONE synchronous critical section, BEFORE any await.
+        //
+        // The old fire-then-advance ordering double-fired: while
+        // `execute_job` was awaiting the bus send, the store still held
+        // the firing job's past-due `next_run_at_ms`. Any concurrent
+        // `arm_timer` (add_job / remove_job / enable_job) read that stale
+        // value, computed a zero delay, aborted this task mid-fire (so
+        // the advance below never ran), and spawned a zero-delay sleeper
+        // that re-collected the SAME still-due job and fired it again.
+        //
+        // Advancing under the same lock that collects means no other
+        // task can ever observe a job as due once it has been reserved
+        // for this tick: a concurrent arm_timer sees the post-advance
+        // (future) next_run and arms a future-dated timer. Even if this
+        // task is aborted before or during the sends, the job is not
+        // re-fired and its next occurrence stays scheduled — cron
+        // semantics reserve the NEXT slot regardless of this fire's
+        // outcome.
         let due_jobs: Vec<CronJob> = {
-            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            store
-                .jobs
-                .iter()
-                .filter(|j| j.is_due(now_ms))
-                .cloned()
-                .collect()
-        };
-
-        for job in &due_jobs {
-            self.execute_job(job).await;
-        }
-
-        // Update state
-        {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut due = Vec::new();
             let mut to_delete = Vec::new();
 
             for stored_job in &mut store.jobs {
-                if due_jobs.iter().any(|d| d.id == stored_job.id) {
-                    stored_job.state.last_run_at_ms = Some(now_ms);
-                    stored_job.state.last_status = Some("ok".into());
+                if !stored_job.is_due(now_ms) {
+                    continue;
+                }
+                due.push(stored_job.clone());
 
-                    if stored_job.delete_after_run {
-                        to_delete.push(stored_job.id.clone());
-                    } else {
-                        stored_job.compute_next_run(now_ms);
-                    }
+                stored_job.state.last_run_at_ms = Some(now_ms);
+                stored_job.state.last_status = Some("ok".into());
+
+                if stored_job.delete_after_run {
+                    to_delete.push(stored_job.id.clone());
+                } else {
+                    stored_job.compute_next_run(now_ms);
                 }
             }
 
             store.jobs.retain(|j| !to_delete.contains(&j.id));
+            due
+        };
+
+        for job in &due_jobs {
+            self.execute_job(job).await;
         }
 
         if let Err(e) = self.save_store_async().await {
@@ -831,6 +843,155 @@ mod tests {
             )
             .unwrap();
         assert!(!every_job.delete_after_run);
+    }
+
+    /// Poll `cond` until true or panic after 5s. Condition-polling (not a
+    /// blind sleep): under-waiting is impossible, over-waiting is bounded.
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Regression: re-arming the timer while a job is mid-fire must not
+    /// fire that job a second time.
+    ///
+    /// Forcing the window deterministically: the bus channel has capacity
+    /// 1 and two jobs are due. `on_timer` collects both, `send(J1)`
+    /// succeeds (fire #1, fills the channel), `send(J2)` parks — holding
+    /// `on_timer` open BEFORE it advances `next_run_at_ms` (the buggy
+    /// fire-then-advance ordering). J1's stored `next_run_at_ms` is still
+    /// past-due, pinned for as long as the test leaves the channel full.
+    /// A concurrent `add_job` then runs `arm_timer`, which reads that
+    /// stale past-due value, computes delay 0, aborts the parked timer
+    /// task (killing it before the advance ever happens), and spawns a
+    /// zero-delay sleeper that re-collects the still-due J1 and fires it
+    /// AGAIN. The test only starts draining after the original timer
+    /// task is provably dead (`AbortHandle::is_finished`), so the
+    /// interleaving is fixed, not timing-dependent.
+    #[tokio::test]
+    async fn should_fire_due_job_exactly_once_when_rearm_races_mid_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity 1: first send succeeds, second send blocks.
+        let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
+        let service =
+            std::sync::Arc::new(CronService::new(dir.path().join("cron.json"), tx.clone()));
+
+        let payload = |msg: &str| CronPayload {
+            message: msg.into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+        };
+
+        // Added while stopped, so arm_timer no-ops until start().
+        let j1 = service
+            .add_job(
+                "first".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("a"),
+            )
+            .unwrap();
+        let j2 = service
+            .add_job(
+                "second".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("b"),
+            )
+            .unwrap();
+
+        // Backdate both jobs (as if their interval elapsed) so they are
+        // due the moment the service starts.
+        let past_ms = Utc::now().timestamp_millis() - 60_000;
+        {
+            let mut store = service.store.lock().unwrap();
+            for job in store.jobs.iter_mut() {
+                job.state.next_run_at_ms = Some(past_ms);
+            }
+        }
+
+        service.start();
+
+        // J1's fire is in the channel (capacity 1 -> 0) and the timer
+        // task is parked on J2's send, mid-fire.
+        wait_until("first fire enqueued and timer parked mid-fire", || {
+            tx.capacity() == 0
+        })
+        .await;
+
+        // Capture the parked timer task so its death is observable.
+        let timer_abort = {
+            let guard = service.timer_handle.lock().await;
+            guard
+                .as_ref()
+                .expect("timer task must be armed while mid-fire")
+                .abort_handle()
+        };
+
+        // Concurrent schedule mutation mid-fire: add_job -> arm_timer.
+        service
+            .add_job(
+                "third".into(),
+                CronSchedule::Every { every_ms: 600_000 },
+                payload("c"),
+            )
+            .unwrap();
+
+        // Only drain once the original timer task is dead, so it can
+        // never resume and advance next_run itself: the double-fire
+        // ordering is forced, not raced.
+        wait_until("mid-fire timer task aborted by re-arm", || {
+            timer_abort.is_finished()
+        })
+        .await;
+
+        // Drain: first message must already be there; then collect until
+        // the bus goes quiet for 500ms.
+        let mut msgs = Vec::new();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("first fire must arrive")
+            .expect("bus channel closed unexpectedly");
+        msgs.push(first);
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            msgs.push(msg);
+        }
+
+        let j1_fires = msgs.iter().filter(|m| m.chat_id == j1.id).count();
+        assert_eq!(
+            j1_fires,
+            1,
+            "job {} must fire exactly once across a concurrent re-arm, got {} fires \
+             (fired messages: {:?})",
+            j1.id,
+            j1_fires,
+            msgs.iter().map(|m| m.chat_id.clone()).collect::<Vec<_>>()
+        );
+
+        // Requirement (2): the fired jobs' next occurrence is scheduled
+        // (advanced past the stale backdated value), not perpetually due.
+        let jobs = service.list_jobs();
+        for id in [&j1.id, &j2.id] {
+            let next = jobs
+                .iter()
+                .find(|j| &j.id == id)
+                .expect("job must still exist")
+                .state
+                .next_run_at_ms;
+            assert!(
+                next.is_some_and(|t| t > past_ms),
+                "job {id} must have its next occurrence scheduled, got {next:?}"
+            );
+        }
+
+        service.stop().await;
     }
 
     #[test]

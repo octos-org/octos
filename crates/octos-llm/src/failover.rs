@@ -5,6 +5,7 @@
 //! Each provider has a circuit breaker that degrades after repeated failures
 //! and resets on success.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -16,6 +17,7 @@ use octos_core::Message;
 use tracing::{info, warn};
 
 use crate::config::ChatConfig;
+use crate::error::LlmError;
 use crate::provider::LlmProvider;
 use crate::retry::RetryProvider;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
@@ -31,7 +33,9 @@ struct ProviderSlot {
 /// Tries providers in order, skipping degraded ones (failure count >= threshold).
 /// On retriable error, moves to the next provider. On success, resets the
 /// provider's failure count.
-/// Default wall-clock timeout for an entire `chat()` call across all providers.
+/// Default per-lane timeout for a single provider attempt (that provider's
+/// internal retries included). A lane that exceeds it is recorded as failed
+/// and the chain fails over to the next lane.
 const DEFAULT_MAX_REQUEST_DURATION: Duration = Duration::from_secs(120);
 
 pub struct ProviderChain {
@@ -41,7 +45,11 @@ pub struct ProviderChain {
     /// Index of the last provider that returned a successful response.
     /// Used by `report_late_failure` to penalize the correct provider.
     last_success_index: AtomicU32,
-    /// Wall-clock timeout for the entire chain (retry + failover included).
+    /// Per-lane wall-clock timeout for a single provider attempt (that
+    /// provider's internal retries included). A lane that hangs past it is
+    /// recorded as failed — so `pick_start` stops re-selecting it — and the
+    /// chain fails over. Total chain time is bounded by
+    /// `slots.len()` x this duration.
     max_request_duration: Option<Duration>,
 }
 
@@ -75,7 +83,8 @@ impl ProviderChain {
         self
     }
 
-    /// Set the wall-clock timeout for the entire chain. `None` disables the cap.
+    /// Set the per-lane timeout for a single provider attempt. `None`
+    /// disables the cap.
     pub fn with_max_request_duration(mut self, duration: Option<Duration>) -> Self {
         self.max_request_duration = duration;
         self
@@ -112,6 +121,32 @@ impl ProviderChain {
         }
     }
 
+    /// Await a single lane's request, capped by `max_request_duration`.
+    ///
+    /// A lane that exceeds the cap yields a typed `LlmErrorKind::Timeout`
+    /// error attributed to that lane. The caller's `Err` arm then treats it
+    /// like any other retriable failure: the lane's failure count is
+    /// incremented (so `pick_start` stops re-selecting a hung lane) and the
+    /// chain fails over to the next lane within the same call.
+    async fn with_lane_timeout<T>(
+        &self,
+        provider_name: &str,
+        fut: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match self.max_request_duration {
+            Some(dur) => match tokio::time::timeout(dur, fut).await {
+                Ok(result) => result,
+                Err(_) => Err(LlmError::timeout(format!(
+                    "no response after {:.0}s",
+                    dur.as_secs_f64()
+                ))
+                .with_provider(provider_name)
+                .into()),
+            },
+            None => fut.await,
+        }
+    }
+
     async fn chat_inner(
         &self,
         messages: &[Message],
@@ -130,7 +165,14 @@ impl ProviderChain {
                 continue;
             }
 
-            match slot.provider.chat(messages, tools, config).await {
+            let result = self
+                .with_lane_timeout(
+                    slot.provider.provider_name(),
+                    slot.provider.chat(messages, tools, config),
+                )
+                .await;
+
+            match result {
                 Ok(mut response) => {
                     self.record_success(idx);
                     response.provider_index = Some(idx);
@@ -184,16 +226,11 @@ impl LlmProvider for ProviderChain {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let fut = self.chat_inner(messages, tools, config);
-        match self.max_request_duration {
-            Some(dur) => tokio::time::timeout(dur, fut).await.map_err(|_| {
-                eyre::eyre!(
-                    "ProviderChain timed out after {:.0}s (all retries + failovers)",
-                    dur.as_secs_f64()
-                )
-            })?,
-            None => fut.await,
-        }
+        // The per-lane timeout lives inside `chat_inner` (around each
+        // provider await) so a hung lane is attributed via
+        // `record_failure(idx)` and the chain can still fail over to a
+        // healthy lane within this same call.
+        self.chat_inner(messages, tools, config).await
     }
 
     async fn chat_stream(
@@ -213,7 +250,17 @@ impl LlmProvider for ProviderChain {
                 continue;
             }
 
-            match slot.provider.chat_stream(messages, tools, config).await {
+            // Cap stream *initialization* per lane; consuming the returned
+            // stream is unaffected. A hung init is recorded below and the
+            // chain fails over like any other retriable error.
+            let result = self
+                .with_lane_timeout(
+                    slot.provider.provider_name(),
+                    slot.provider.chat_stream(messages, tools, config),
+                )
+                .await;
+
+            match result {
                 Ok(stream) => {
                     self.record_success(idx);
                     return Ok(self.stream_with_provider_index(idx, stream));
@@ -322,6 +369,33 @@ mod tests {
 
         fn model_id(&self) -> &str {
             "success-model"
+        }
+
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+    }
+
+    /// Provider whose `chat()` never resolves — simulates a hung lane
+    /// (e.g. a TCP connection that accepts but never responds).
+    struct HangingProvider {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for HangingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            std::future::pending::<()>().await;
+            unreachable!("hanging provider never resolves")
+        }
+
+        fn model_id(&self) -> &str {
+            "hang-model"
         }
 
         fn provider_name(&self) -> &str {
@@ -439,5 +513,90 @@ mod tests {
 
         // Now should route to fallback (primary is degraded)
         assert_eq!(chain.provider_name(), "fallback");
+    }
+
+    #[tokio::test]
+    async fn should_failover_to_healthy_lane_when_chat_hangs() {
+        let chain = ProviderChain::new(vec![
+            Arc::new(HangingProvider { name: "hung" }),
+            Arc::new(SuccessProvider { name: "fallback" }),
+        ])
+        .with_max_request_duration(Some(Duration::from_millis(50)));
+
+        let result = chain
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .expect("chain must fail over past the hung lane and succeed");
+        assert_eq!(result.content.as_deref(), Some("ok"));
+        assert_eq!(result.provider_index, Some(1));
+        assert_eq!(
+            chain.slots[0].failures.load(Ordering::Relaxed),
+            1,
+            "hung lane must be recorded as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_skip_hung_lane_when_failure_threshold_crossed() {
+        let chain = ProviderChain::new(vec![
+            Arc::new(HangingProvider { name: "hung" }),
+            Arc::new(SuccessProvider { name: "fallback" }),
+        ])
+        .with_failure_threshold(2)
+        .with_max_request_duration(Some(Duration::from_millis(50)));
+
+        // Two hangs cross the threshold and degrade the lane.
+        let _ = chain.chat(&[], &[], &ChatConfig::default()).await;
+        let _ = chain.chat(&[], &[], &ChatConfig::default()).await;
+        assert!(
+            chain.slots[0].failures.load(Ordering::Relaxed) >= 2,
+            "each hang must increment the lane's failure count"
+        );
+
+        // pick_start must now skip the hung lane entirely.
+        assert_eq!(chain.provider_name(), "fallback");
+
+        // The next call goes straight to the healthy lane: no new timeout
+        // failure is recorded on the hung lane.
+        let before = chain.slots[0].failures.load(Ordering::Relaxed);
+        let result = chain
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .expect("degraded lane must be skipped, healthy lane succeeds");
+        assert_eq!(result.provider_index, Some(1));
+        assert_eq!(
+            chain.slots[0].failures.load(Ordering::Relaxed),
+            before,
+            "degraded lane must not be re-awaited"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_failover_stream_init_when_chat_stream_hangs() {
+        let chain = ProviderChain::new(vec![
+            Arc::new(HangingProvider { name: "hung" }),
+            Arc::new(SuccessProvider { name: "fallback" }),
+        ])
+        .with_max_request_duration(Some(Duration::from_millis(50)));
+
+        // Guard with a generous outer timeout so a regression fails the
+        // test instead of hanging the suite forever.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            chain.chat_stream(&[], &[], &ChatConfig::default()),
+        )
+        .await
+        .expect("chat_stream must not hang when a lane hangs");
+
+        let mut stream = result.expect("stream must fail over to the healthy lane");
+        assert_eq!(
+            chain.slots[0].failures.load(Ordering::Relaxed),
+            1,
+            "hung stream init must be recorded as failed"
+        );
+        match stream.next().await {
+            Some(StreamEvent::ProviderIndex(idx)) => assert_eq!(idx, 1),
+            other => panic!("expected ProviderIndex(1) first, got {other:?}"),
+        }
     }
 }

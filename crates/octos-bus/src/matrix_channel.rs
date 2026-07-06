@@ -1402,8 +1402,19 @@ async fn handle_transaction(
         };
 
         if state.inbound_tx.send(inbound).await.is_err() {
-            warn!("inbound channel closed while processing Matrix transaction");
-            break;
+            warn!(
+                txn_id,
+                "inbound channel closed while processing Matrix transaction; \
+                 returning 500 so the homeserver retries"
+            );
+            // The dedup check above already recorded this txn_id as seen.
+            // Forget it so the homeserver's retry of the same transaction is
+            // accepted instead of being dropped as a duplicate. Events
+            // enqueued before this failure may be delivered again on retry —
+            // at-least-once beats acking a dropped message with 200 OK
+            // (which the appservice spec treats as "processed, never retry").
+            state.dedup.forget(&txn_id);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "{}").into_response();
         }
     }
 
@@ -3918,6 +3929,86 @@ mod tests {
 
         let msg = inbound_rx.try_recv().unwrap();
         assert_eq!(msg.content, "retry should still deliver");
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_enqueue_failure_returns_500_and_does_not_poison_txn_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Close the inbound channel by dropping the receiver so every
+        // enqueue fails. The homeserver must NOT be told 200 OK (which
+        // means "processed, never retry") for a message we dropped.
+        let (closed_tx, closed_rx) = mpsc::channel::<InboundMessage>(16);
+        drop(closed_rx);
+
+        let state = make_test_state(closed_tx);
+        let dedup = state.dedup.clone();
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:elsewhere.org",
+                "room_id": "!room:localhost",
+                "event_id": "$ev_enqueue_fail",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "must not be acked when dropped"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_enqueue_fail?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed enqueue must not be acked with 200 OK"
+        );
+
+        // The failed transaction must not be recorded as processed:
+        // the homeserver retries the same txn_id, and that retry must be
+        // accepted, not dropped as a duplicate. Simulate the retry against
+        // a healthy inbound channel sharing the same dedup cache.
+        let (retry_tx, mut retry_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut retry_state = make_test_state(retry_tx);
+        retry_state.dedup = dedup;
+
+        let retry_app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(retry_state);
+
+        let retry_req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_enqueue_fail?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let retry_resp = retry_app.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::OK);
+
+        let msg = retry_rx
+            .try_recv()
+            .expect("retried transaction must be delivered, not deduped");
+        assert_eq!(msg.content, "must not be acked when dropped");
     }
 
     #[tokio::test]

@@ -2014,6 +2014,39 @@ pub async fn serve_file(
     .await
 }
 
+/// Read a file's bytes through an `O_NOFOLLOW` open (Unix) so a symlink leaf
+/// swapped in after a path was validated cannot redirect the read. On
+/// non-Unix, re-checks `symlink_metadata` before reading (best-effort, still
+/// racy but matches the platform's capabilities). The blocking I/O runs on a
+/// blocking thread.
+async fn read_file_no_follow(path: std::path::PathBuf) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 async fn serve_file_impl(
     data_dir: &std::path::Path,
     filename: &str,
@@ -2026,7 +2059,14 @@ async fn serve_file_impl(
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
-    let data = match tokio::fs::read(&path).await {
+    // Read through an O_NOFOLLOW open rather than `tokio::fs::read(&path)`:
+    // `resolve_scoped_download_path` canonicalizes + containment-checks the
+    // path, but the final read still races that check — a leaf swapped to a
+    // symlink after resolution (time-of-check) would be followed by a plain
+    // read (time-of-use), serving an off-tenant / out-of-workspace file
+    // (e.g. a symlink to /etc/passwd). O_NOFOLLOW makes the open fail closed
+    // on a symlink leaf.
+    let data = match read_file_no_follow(path.clone()).await {
         Ok(d) => d,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -3984,6 +4024,42 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_file_no_follow_reads_regular_file_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("doc.pdf");
+        std::fs::write(&file, b"%PDF-1.7 body bytes").unwrap();
+        let bytes = read_file_no_follow(file).await.unwrap();
+        assert_eq!(bytes, b"%PDF-1.7 body bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_no_follow_rejects_a_symlink_leaf() {
+        // P2 (tri-repo #1529): a served path whose leaf is a symlink (e.g.
+        // swapped in after resolve_scoped_download_path canonicalized it)
+        // must NOT be followed — O_NOFOLLOW fails the open closed instead of
+        // serving the off-tenant target.
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, "off-tenant secret").unwrap();
+        let link = dir.path().join("served.pdf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_file_no_follow(link).await.unwrap_err();
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the symlink leaf must be rejected at open, not silently followed"
+        );
+        // The target's content must never be returned.
+        assert!(
+            read_file_no_follow(dir.path().join("served.pdf"))
+                .await
+                .is_err()
+        );
+    }
 
     // Legacy `POST /api/chat` REST tests (chat_request_*, chat_response_*)
     // were retired with the handler in the cleanup follow-up to PR #908.

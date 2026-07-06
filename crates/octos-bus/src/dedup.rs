@@ -62,6 +62,17 @@ impl MessageDedup {
         }
     }
 
+    /// Remove an ID from the cache so a later delivery is treated as new.
+    ///
+    /// [`is_duplicate`](Self::is_duplicate) records an ID at check time. If
+    /// processing then fails and the platform will retry the same ID (e.g. a
+    /// Matrix transaction nacked with a non-2xx status), the entry must be
+    /// forgotten or the retry would be dropped as a duplicate.
+    pub fn forget(&self, id: &str) {
+        let mut cache = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        cache.pop(id);
+    }
+
     /// Number of entries currently in the cache.
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -129,6 +140,16 @@ mod tests {
 
         // "a" was evicted, so it's no longer a duplicate
         assert!(!dedup.is_duplicate("a"));
+    }
+
+    #[test]
+    fn should_accept_id_again_after_forget() {
+        let dedup = MessageDedup::new();
+        assert!(!dedup.is_duplicate("msg-1"));
+        dedup.forget("msg-1");
+        // Forgotten — treated as new again, then deduped as usual.
+        assert!(!dedup.is_duplicate("msg-1"));
+        assert!(dedup.is_duplicate("msg-1"));
     }
 
     #[test]

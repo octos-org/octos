@@ -10661,6 +10661,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
+    // Cross-subsystem occupancy (#1529): a session actor draining a
+    // continuation turn for this session marks it in-flight but has no entry
+    // in this connection's `active_turns` map. Without this check the serve
+    // tick would drain + spawn a SECOND concurrent turn on the same session
+    // while the actor's turn runs. The actor clears the marker (RAII guard)
+    // when its turn ends, so the next tick re-dispatches normally.
+    if default_agent_orchestrator().is_goal_dispatch_in_flight(&session_id) {
+        return false;
+    }
 
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
