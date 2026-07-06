@@ -1219,8 +1219,74 @@ impl InProcessAgentOrchestrator {
         max_items: usize,
     ) -> Vec<QueuedMasterContinuation> {
         let mut state = self.state();
+        Self::drain_ready_continuations_locked(
+            &mut state,
+            session_id,
+            profile_id,
+            runtime_state,
+            max_items,
+        )
+    }
+
+    /// Atomic drain-and-claim for the cross-subsystem occupancy race (#1529).
+    /// Runs the enqueue + pop AND the in-flight claim under a SINGLE state
+    /// lock, returning the drained continuations plus a clearing guard when
+    /// anything was drained. This is the only way to claim without a race
+    /// window: setting the marker BEFORE the drain self-suppresses the
+    /// session's own due-goal enqueue (which skips in-flight sessions);
+    /// setting it AFTER the drain releases the lock in between, letting a
+    /// concurrent AppUI tick re-enqueue and spawn a duplicate turn for the
+    /// same due goal (both caught by codex re-review). Because the marker is
+    /// set in the same lock scope as the pop, once this returns a continuation
+    /// no other subsystem can re-enqueue for the session until the guard drops
+    /// at the end of the turn. A session already in-flight drains nothing (its
+    /// enqueue is suppressed) → the caller defers.
+    pub(crate) fn drain_and_claim_ready_continuation_for_session(
+        &'static self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        runtime_state: MasterContinuationRuntimeState,
+        max_items: usize,
+    ) -> (
+        Vec<QueuedMasterContinuation>,
+        Option<GoalDispatchInFlightGuard>,
+    ) {
+        let mut state = self.state();
+        let kept = Self::drain_ready_continuations_locked(
+            &mut state,
+            session_id,
+            profile_id,
+            runtime_state,
+            max_items,
+        );
+        let guard = if kept.is_empty() {
+            None
+        } else {
+            state.in_flight_goal_sessions.insert(session_id.clone());
+            Some(GoalDispatchInFlightGuard {
+                orchestrator: self,
+                session_id: session_id.clone(),
+                disarmed: false,
+            })
+        };
+        (kept, guard)
+    }
+
+    /// Enqueue due continuations for `(session, profile)` and drain up to
+    /// `max_items` schedulable ones — the shared body of
+    /// [`Self::drain_ready_continuations_for_session`] and
+    /// [`Self::drain_and_claim_ready_continuation_for_session`], run under a
+    /// caller-held state lock so the latter can claim the in-flight marker
+    /// atomically with the pop.
+    fn drain_ready_continuations_locked(
+        state: &mut AutonomyRuntimeState,
+        session_id: &SessionKey,
+        profile_id: &str,
+        runtime_state: MasterContinuationRuntimeState,
+        max_items: usize,
+    ) -> Vec<QueuedMasterContinuation> {
         let now = now_ms();
-        enqueue_due_loop_continuations(&mut state, session_id, profile_id, runtime_state, now);
+        enqueue_due_loop_continuations(state, session_id, profile_id, runtime_state, now);
         // #1129 codex P1 follow-up: active goals whose
         // `last_continued_at_ms + GOAL_MIN_CONTINUATION_INTERVAL_MS`
         // is past must also be re-queued here. Previously the only
@@ -1228,7 +1294,7 @@ impl InProcessAgentOrchestrator {
         // (which had just stamped `last_continued_at_ms = now`,
         // tripping the min-delay gate), so an active goal only ran
         // its initial continuation and never recurred.
-        enqueue_due_goal_continuations(&mut state, session_id, profile_id, runtime_state, now);
+        enqueue_due_goal_continuations(state, session_id, profile_id, runtime_state, now);
         // #1150 codex P2 follow-up to #1145: `pending_continuation_is_schedulable`
         // gates which sessions `due_loop_targets` surfaces, but the
         // scheduler's drain pops by `(session_key, profile)` without
@@ -1268,7 +1334,7 @@ impl InProcessAgentOrchestrator {
                 break;
             }
             for item in drained {
-                if pending_continuation_is_schedulable(&state, &item) {
+                if pending_continuation_is_schedulable(&*state, &item) {
                     kept.push(item);
                 } else {
                     // #1159 codex P2 follow-up: only TOMBSTONE drops whose
@@ -1281,7 +1347,7 @@ impl InProcessAgentOrchestrator {
                     // same dedupe_key, and a Completed tombstone would
                     // make `upsert_continuation` silently drop the new
                     // Queued event because Completed outranks Queued.
-                    if stale_drop_should_tombstone(&state, &item)
+                    if stale_drop_should_tombstone(&*state, &item)
                         && let Some(store) = state.supervisor_store.as_ref()
                     {
                         let _ = store.record_continuation_completed(
@@ -10679,5 +10745,71 @@ mod tests {
             "pre-setting the marker suppresses the owner's due-goal enqueue \
              (which is why the actor reads, not sets, before draining)"
         );
+    }
+
+    #[test]
+    fn drain_and_claim_sets_marker_atomically_and_defers_when_already_in_flight() {
+        // P1 (tri-repo #1529, codex re-review): the actor drains AND claims the
+        // in-flight marker under ONE state lock. A due goal must (1) enqueue +
+        // drain (the claim does NOT suppress the owner's own enqueue, because
+        // the marker is set AFTER the pop in the same lock) and leave the
+        // marker SET via the returned guard; and (2) when the session is
+        // already in-flight, drain NOTHING and yield NO guard (defer).
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "drain-and-claim");
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "atomic claim goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+
+        // (1) Due + not in-flight: drains a continuation AND claims the marker.
+        let (drained, guard) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(!drained.is_empty(), "a due goal must drain a continuation");
+        assert!(guard.is_some(), "draining must claim the in-flight marker");
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "the marker is set while the guard is held"
+        );
+
+        // (2) While in-flight, a concurrent drain-and-claim yields nothing and
+        // no guard — the second dispatcher defers instead of double-running.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+        let (drained2, guard2) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            drained2.is_empty() && guard2.is_none(),
+            "an already-in-flight session must drain nothing and yield no guard"
+        );
+
+        drop(guard);
+        assert!(!orchestrator.is_goal_dispatch_in_flight(&session_id));
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
     }
 }

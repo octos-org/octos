@@ -4810,23 +4810,25 @@ impl SessionActor {
             .profile_id()
             .unwrap_or(MAIN_PROFILE_ID)
             .to_owned();
-        // Cross-subsystem occupancy (#1529), reverse direction: if an AppUI
-        // serve tick already holds the in-flight marker for this session (it
-        // marks in-flight for its goal turns), defer — don't drain a second
-        // turn. This is a READ only: it does NOT set the marker, so the
-        // drain's internal `enqueue_due_goal_continuations` (which skips
-        // in-flight sessions) still enqueues the actor's own due goal turn
-        // (claiming the marker BEFORE the drain suppressed that enqueue and
-        // wedged recurring goal dispatch — codex re-review).
-        if default_agent_orchestrator().is_goal_dispatch_in_flight(&self.session_key) {
-            return false;
-        }
-        let continuations = default_agent_orchestrator().drain_ready_continuations_for_session(
-            &self.session_key,
-            &profile_id,
-            runtime_state,
-            1,
-        );
+        // Cross-subsystem occupancy (#1529): drain AND claim the in-flight
+        // marker under a SINGLE state lock (see
+        // `drain_and_claim_ready_continuation_for_session`). This is the only
+        // race-free ordering — setting the marker before the drain
+        // self-suppresses the actor's own due-goal enqueue; setting it after
+        // the drain opens a window for a concurrent AppUI tick to re-enqueue
+        // and spawn a duplicate turn (both caught by codex re-review). A
+        // session already in-flight (an AppUI goal turn running) drains
+        // nothing and yields no guard, so the actor defers. The guard is held
+        // across the whole turn and clears the marker on ANY exit at the end
+        // of the loop iteration, suppressing the AppUI due-scan/drain until
+        // the turn completes.
+        let (continuations, _in_flight_guard) = default_agent_orchestrator()
+            .drain_and_claim_ready_continuation_for_session(
+                &self.session_key,
+                &profile_id,
+                runtime_state,
+                1,
+            );
         let drained = !continuations.is_empty();
         for continuation in continuations {
             info!(
@@ -4835,16 +4837,6 @@ impl SessionActor {
                 reason = master_continuation_reason_name(&continuation.reason),
                 "draining queued master continuation into session actor"
             );
-            // Cross-subsystem occupancy (#1529), forward direction: mark
-            // in-flight AFTER the drain's enqueue+pop (so the actor's own
-            // due-goal enqueue above was NOT suppressed) but BEFORE the first
-            // await below (the LoopFire `pre_assistant_count` history lookup),
-            // held for the whole turn. This suppresses the AppUI due-scan and
-            // makes its drain skip while the turn runs, so the two subsystems
-            // can't spawn concurrent turns on this session. The RAII guard
-            // clears the marker on ANY exit at the end of this iteration.
-            let _in_flight_guard = default_agent_orchestrator()
-                .goal_dispatch_in_flight_guard(self.session_key.clone());
             // #1131 — `GoalWrapUp` is the final goal turn under
             // budget exhaustion. Treat it as a goal turn for runtime
             // accounting so per-turn elapsed time is still recorded;
