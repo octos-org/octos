@@ -1569,6 +1569,16 @@ impl InProcessAgentOrchestrator {
         self.state().in_flight_goal_sessions.remove(session_id);
     }
 
+    /// True when a continuation turn for `session_id` is currently in flight
+    /// (the in-flight marker is set). The due-scan already excludes such
+    /// sessions; this accessor lets a SECOND dispatch surface — the AppUI
+    /// serve tick — also skip a session whose continuation turn is running in
+    /// the session actor, closing the cross-subsystem drain race where both
+    /// spawn a concurrent turn on the same session (#1529).
+    pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
+        self.state().in_flight_goal_sessions.contains(session_id)
+    }
+
     /// #1140 codex P1 re-review #4 — RAII drop-guard for the
     /// in-flight marker. Use this from the AppUI tick path so the
     /// marker is cleared on ANY exit path (cancellation,
@@ -10578,6 +10588,31 @@ mod tests {
         assert!(
             due_after.iter().any(|(s, _)| s == &session_id),
             "after clearing in-flight, goal must be due again (got {due_after:?})",
+        );
+    }
+
+    #[test]
+    fn is_goal_dispatch_in_flight_reflects_mark_and_clear() {
+        // P2 (tri-repo #1529): the accessor the AppUI serve tick reads to skip
+        // a session whose continuation turn is already running in the session
+        // actor (which marks in-flight for the turn's duration). Closing the
+        // cross-subsystem drain race relies on this reflecting the marker set
+        // by mark_goal_dispatch_in_flight / the RAII guard.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "in-flight-accessor");
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a session with no in-flight turn must read false"
+        );
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a marked session must read true so the AppUI tick skips it"
+        );
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "clearing the marker must let dispatch resume"
         );
     }
 }

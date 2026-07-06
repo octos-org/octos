@@ -4810,6 +4810,15 @@ impl SessionActor {
             .profile_id()
             .unwrap_or(MAIN_PROFILE_ID)
             .to_owned();
+        // Cross-subsystem occupancy (#1529): if a continuation turn for this
+        // session is already in flight elsewhere (the AppUI serve tick marks
+        // in-flight when IT dispatches a goal turn), don't drain a second one
+        // here. The queue pop is atomic so a single queued continuation can't
+        // double-run, but this also stops the actor from starting a turn
+        // concurrent with an AppUI turn already underway.
+        if default_agent_orchestrator().is_goal_dispatch_in_flight(&self.session_key) {
+            return false;
+        }
         let continuations = default_agent_orchestrator().drain_ready_continuations_for_session(
             &self.session_key,
             &profile_id,
@@ -4862,6 +4871,15 @@ impl SessionActor {
                 None
             };
             let synthetic = self.synthetic_master_continuation_inbound(&continuation);
+            // Cross-subsystem occupancy (#1529): mark this session in-flight
+            // for the duration of the continuation turn so a concurrent AppUI
+            // serve tick (`maybe_spawn_appui_master_continuation_runner`) and
+            // the due-scan both skip it — otherwise both drain + spawn a
+            // SECOND turn on the same session state. The RAII guard clears the
+            // marker on ANY exit (return / error / panic) at the end of this
+            // iteration, so the next tick re-dispatches normally.
+            let _in_flight_guard = default_agent_orchestrator()
+                .goal_dispatch_in_flight_guard(self.session_key.clone());
             self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
                 .await;
             // If this fire was a self-paced or maintenance loop, peek at
