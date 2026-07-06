@@ -21,13 +21,16 @@ const CURRENT_SESSION_SCHEMA: u32 = 1;
 /// `message/persisted` notification dispatches through.
 ///
 /// Strict-ordering invariant: `add_message_with_seq` calls observers
-/// synchronously after the in-memory append, with the registry global lock
-/// held in [`set_message_commit_observer`]. Two concurrent commits to the
-/// same session serialize on the `&mut self` borrow of `SessionManager` /
-/// `SessionHandle`, so observer fires preserve commit order per session.
+/// synchronously after the in-memory append. Two concurrent commits to the
+/// same session key serialize on the per-key persist lock (see
+/// `persist_lock_for`) — independent writers (separate `SessionHandle`s,
+/// the canonical persist helper, a `SessionManager`) all contend on the
+/// same lock, so observer fires preserve commit order per session.
 ///
-/// The seq passed to the observer is the row's index in `Session::messages`
-/// after the append (`messages.len() - 1`).
+/// The seq passed to the observer is the row's index in the durable
+/// transcript: on the `SessionHandle` path it is read back from the
+/// on-disk file under the persist lock; on the `SessionManager` path it is
+/// the merged in-memory mirror's `messages.len() - 1` after the append.
 ///
 /// Errors raised by an observer are logged and dropped: the durable commit
 /// has already happened, and the observer is best-effort fan-out for
@@ -1258,7 +1261,33 @@ impl SessionManager {
     }
 
     /// Add a message to a session, persist it, and return its committed sequence.
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]) so a
+    /// concurrent writer on the same key cannot interleave between the disk
+    /// append and the seq derivation. The lock is NOT reentrant: a caller
+    /// that already holds it must use
+    /// [`Self::add_message_with_seq_unlocked`] instead.
     pub async fn add_message_with_seq(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<usize> {
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        self.add_message_with_seq_unlocked(key, message).await
+    }
+
+    /// Append + seq derivation without taking the persist lock — the caller
+    /// must already hold it (see [`persist_lock_for`]).
+    ///
+    /// The committed seq is derived from this manager's in-memory mirror:
+    /// the manager's transcript is the MERGED flat + per-user view assembled
+    /// at load time (see [`Self::load_from_disk`]), so the merged mirror —
+    /// not a single file's row count — is the closest authority the manager
+    /// has. The lock still guarantees the append and the len-read are atomic
+    /// against every other locked writer (canonical appends, rewrites,
+    /// rollback markers) on the same key.
+    async fn add_message_with_seq_unlocked(
         &mut self,
         key: &SessionKey,
         mut message: Message,
@@ -2115,11 +2144,19 @@ pub struct SessionHandle {
 /// Without serialisation, both observe `len = N`, both append, both return
 /// `seq = N` — duplicate seqs that break watcher correlation.
 ///
-/// This map gives `persist_message_through_canonical_path` a per-key Tokio
-/// mutex so all writes for the same `SessionKey.0` serialise. The mutex is
-/// scoped to the session_key string (NOT the file path) so callers reaching
+/// This map gives `persist_message_through_canonical_path` — and every other
+/// session write path: `SessionManager::add_message_with_seq`,
+/// `SessionHandle::add_message_with_seq`, the `rewrite`s,
+/// `rollback_last_n_user_turns`, and the child-contract upserts — a per-key
+/// Tokio mutex so all writes for the same `SessionKey.0` serialise. The mutex
+/// is scoped to the session_key string (NOT the file path) so callers reaching
 /// the canonical per-user JSONL via different code paths still contend on
 /// the same lock.
+///
+/// The mutex is NOT reentrant. Methods that need to run inside an
+/// already-held lock use the `_unlocked` variants
+/// (`add_message_with_seq_unlocked`, `rewrite_unlocked`,
+/// `upsert_child_contract_unlocked`).
 ///
 /// Memory note: entries leak forever, one per active session_key. In a long-
 /// lived bus process this grows with active distinct sessions; given
@@ -2161,7 +2198,10 @@ pub async fn persist_message_through_canonical_path(
     let lock = persist_lock_for(key);
     let _guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
-    handle.add_message_with_seq(message).await
+    // `_unlocked`: this function already holds the per-key persist lock and
+    // the tokio mutex is not reentrant — calling the locking
+    // `add_message_with_seq` here would deadlock.
+    handle.add_message_with_seq_unlocked(message).await
 }
 
 /// Upsert a durable child-session contract through the canonical locked
@@ -2480,7 +2520,23 @@ impl SessionHandle {
     }
 
     /// Add a message to the session, persist it, and return its committed sequence.
-    pub async fn add_message_with_seq(&mut self, mut message: Message) -> Result<usize> {
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]) so a
+    /// concurrent writer on the same key — another `SessionHandle`, the
+    /// canonical [`persist_message_through_canonical_path`] helper, or a
+    /// rewrite — cannot interleave between the disk append and the seq
+    /// derivation. The lock is NOT reentrant: a caller that already holds it
+    /// (the canonical helper) must use
+    /// [`Self::add_message_with_seq_unlocked`] instead.
+    pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.add_message_with_seq_unlocked(message).await
+    }
+
+    /// Append + seq derivation without taking the persist lock — the caller
+    /// must already hold it (see [`persist_message_through_canonical_path`]).
+    async fn add_message_with_seq_unlocked(&mut self, mut message: Message) -> Result<usize> {
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles set via update_title elsewhere are preserved.
@@ -2523,7 +2579,32 @@ impl SessionHandle {
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
         record_session_persist("committed");
-        let committed_seq = self.session.messages.len().saturating_sub(1);
+        // Derive the committed sequence from the ON-DISK transcript, not
+        // from this handle's in-memory mirror. The caller holds the per-key
+        // persist lock, so no other writer can append between our disk
+        // write and this read-back — but THIS handle's mirror may be stale
+        // relative to rows other writers committed after it was opened
+        // (e.g. a long-lived actor handle racing the canonical persist
+        // path). Two such writers each pushing onto their own stale mirror
+        // both returned the same seq for different durable rows.
+        // `load_from_file` runs the same assembly a reload uses (meta line
+        // + rollback-marker replay), so the returned seq is exactly the
+        // index the appended row has in the durable transcript; under the
+        // lock our row is the last one. Falls back to the mirror length if
+        // the read-back fails: the row already committed, and a post-commit
+        // read failure must not turn the call into an error.
+        let path = self.session_path();
+        let key = self.session.key.clone();
+        let disk_len = tokio::task::spawn_blocking(move || {
+            Self::load_from_file(&path, &key).map(|on_disk| on_disk.messages.len())
+        })
+        .await
+        .ok()
+        .flatten();
+        let committed_seq = match disk_len {
+            Some(len) if len > 0 => len - 1,
+            _ => self.session.messages.len().saturating_sub(1),
+        };
         // Post-commit observer fan-out: fires AFTER the disk write
         // returned Ok AND after the in-memory mirror was updated. A
         // commit failure (`append_to_disk` Err) returns above without
@@ -4047,6 +4128,80 @@ mod tests {
         );
         // The seeded message must survive the rewrites too.
         assert_eq!(reloaded.session().messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_assign_distinct_seqs_when_concurrent_appends_race_same_key() {
+        // Seq-assignment race: `SessionHandle::add_message_with_seq` derived
+        // the committed seq from its OWN in-memory mirror length, with no
+        // per-key serialisation between the disk append and the len read.
+        // Independent writers (direct pre-opened handles racing the canonical
+        // locked path) each hold a mirror snapshotted at the same pre-state,
+        // so they all compute the SAME seq for different durable rows.
+        //
+        // Determinism: the 8 direct handles are opened at the 1-message
+        // pre-state BEFORE the race starts. Each direct future appends its
+        // row and then pushes onto its own mirror — every one of those
+        // mirrors has len 1 regardless of blocking-pool timing, so WITHOUT
+        // the per-key lock + disk-derived seq all 8 direct writers return
+        // seq 1. The duplicate is deterministic, not timing-dependent.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "seq-race");
+        {
+            let mut seed = SessionHandle::open(tmp.path(), &key);
+            seed.add_message(make_message(MessageRole::User, "seed"))
+                .await
+                .unwrap();
+        }
+
+        // 8 independent handles, each mirroring the seeded pre-state.
+        let mut direct_handles: Vec<SessionHandle> = (0..8)
+            .map(|_| SessionHandle::open(tmp.path(), &key))
+            .collect();
+        let direct_futures = direct_handles
+            .iter_mut()
+            .enumerate()
+            .map(|(i, handle)| {
+                let msg = make_message(MessageRole::User, &format!("direct-{i}"));
+                async move { handle.add_message_with_seq(msg).await }
+            })
+            .collect::<Vec<_>>();
+        // 8 canonical-path persists racing the direct handles on the same key.
+        let canonical_futures = (0..8)
+            .map(|i| {
+                persist_message_through_canonical_path(
+                    tmp.path(),
+                    &key,
+                    make_message(MessageRole::User, &format!("canonical-{i}")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let (direct_seqs, canonical_seqs) = tokio::join!(
+            futures::future::join_all(direct_futures),
+            futures::future::join_all(canonical_futures),
+        );
+
+        let mut seqs = Vec::new();
+        for result in direct_seqs.into_iter().chain(canonical_seqs) {
+            seqs.push(result.expect("every concurrent append must commit"));
+        }
+
+        let unique: std::collections::BTreeSet<usize> = seqs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            seqs.len(),
+            "concurrent appends to the same key must commit distinct seqs; got {seqs:?}"
+        );
+        let expected: std::collections::BTreeSet<usize> = (1..=16).collect();
+        assert_eq!(
+            unique, expected,
+            "committed seqs must form the contiguous set 1..=16; got {seqs:?}"
+        );
+
+        // Every row must be durably visible on a reload too.
+        let reloaded = SessionHandle::open(tmp.path(), &key);
+        assert_eq!(reloaded.session().messages.len(), 17);
     }
 
     #[tokio::test]
