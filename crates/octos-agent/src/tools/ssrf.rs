@@ -72,6 +72,94 @@ pub(crate) async fn check_ssrf(url: &str) -> Option<String> {
     check_ssrf_with_addrs(url).await.err()
 }
 
+/// Maximum redirects [`ssrf_safe_send`] follows before failing.
+pub(crate) const SSRF_MAX_REDIRECTS: usize = 10;
+
+/// Send an HTTP request with SSRF protection re-applied to EVERY hop.
+///
+/// Default reqwest redirect-following resolves and connects to redirect
+/// targets WITHOUT re-running the SSRF check, so an allowed public URL that
+/// 30x-redirects to `169.254.169.254` / `10.x` / any private host is
+/// followed unchecked. This helper closes that gap: it disables reqwest's
+/// automatic redirects and follows them manually, re-validating (and
+/// DNS-pinning) each hop.
+///
+/// For each hop it: validates + DNS-resolves the current URL (fail-closed on
+/// DNS error), builds a per-hop client with `redirect(Policy::none())` and
+/// `.resolve()` pinned to the validated addresses (defeats the DNS-rebinding
+/// TOCTOU between check and connect), then sends. A 3xx response with a
+/// `Location` header re-enters the loop against the resolved target; any
+/// other status returns the response.
+///
+/// - `configure` layers caller-specific base client config (timeouts,
+///   user-agent) onto the builder; the redirect policy and DNS pins are
+///   always applied on top and cannot be overridden.
+/// - `build_request` builds the per-hop request (method, body, headers)
+///   against the pinned client and current URL. It is invoked once per hop,
+///   so a POST body is re-sent on each redirect.
+pub(crate) async fn ssrf_safe_send<F, G>(
+    initial_url: &str,
+    max_redirects: usize,
+    configure: F,
+    build_request: G,
+) -> Result<reqwest::Response, String>
+where
+    F: Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    G: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+{
+    let mut current_url = initial_url.to_string();
+
+    for _ in 0..max_redirects {
+        // Validate + resolve the CURRENT hop (fail-closed on DNS error).
+        let check = check_ssrf_with_addrs(&current_url).await?;
+
+        let parsed = reqwest::Url::parse(&current_url).map_err(|_| "Invalid URL".to_string())?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?
+            .to_string();
+
+        // Per-hop client: caller config, redirects OFF, DNS pinned.
+        let mut builder =
+            configure(reqwest::Client::builder()).redirect(reqwest::redirect::Policy::none());
+        // Pin ALL validated addresses in a SINGLE override. `resolve()` called
+        // in a loop REPLACES the entry each time (reqwest keys `dns_overrides`
+        // by host), so a loop would pin only the LAST address — and if that one
+        // is unreachable (e.g. an IPv6 answer on an IPv4-only host) the fetch
+        // fails even though another validated address would have worked.
+        // `resolve_to_addrs` installs the whole list at once. (Empty for a
+        // literal-IP host — leave reqwest's own resolution in place then.)
+        if !check.resolved_addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+
+        let response = build_request(&client, &current_url)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| "Redirect with no Location header".to_string())?;
+        // Resolve relative redirects against the current URL.
+        current_url = parsed
+            .join(location)
+            .map_err(|_| format!("Invalid redirect URL: {location}"))?
+            .to_string();
+    }
+
+    Err(format!("Too many redirects (max {max_redirects})"))
+}
+
 /// Check if a hostname is private/internal (string check + IP parse).
 pub fn is_private_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
@@ -85,13 +173,32 @@ pub fn is_private_host(host: &str) -> bool {
 }
 
 /// Check if an IP address is in a private/internal range.
+/// SSRF-relevant IPv4 ranges that are NOT routable public internet but which
+/// `Ipv4Addr::is_private()`/`is_link_local()` do not cover. The std predicates
+/// for these (`is_shared`, `is_benchmarking`, `is_reserved`, …) are all
+/// nightly-only, so match the octets explicitly.
+fn is_special_purpose_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    // Shared address space / CGNAT 100.64.0.0/10 (RFC 6598) — routes to ISP
+    // carrier-grade NAT infrastructure.
+    (a == 100 && (64..=127).contains(&b))
+        // IETF protocol assignments 192.0.0.0/24 (RFC 6890).
+        || v4.octets()[..3] == [192, 0, 0]
+        // Benchmarking 198.18.0.0/15 (RFC 2544).
+        || (a == 198 && (b == 18 || b == 19))
+        // Multicast 224.0.0.0/4 and reserved/future 240.0.0.0/4 (RFC 1112),
+        // plus the limited-broadcast 255.255.255.255 that 240/4 subsumes.
+        || a >= 224
+}
+
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-                || v4.is_private()     // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local()  // 169.254/16 (AWS metadata)
-                || v4.is_unspecified() // 0.0.0.0
+            v4.is_loopback()                 // 127.0.0.0/8
+                || v4.is_private()           // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()        // 169.254/16 (AWS metadata)
+                || v4.is_unspecified()       // 0.0.0.0
+                || is_special_purpose_v4(v4) // CGNAT/benchmark/reserved/multicast
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()           // ::1
@@ -104,13 +211,9 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
                 // Site-local fec0::/10 (deprecated RFC 3879, still routable)
                 || (v6.segments()[0] & 0xffc0) == 0xfec0
                 // IPv4-mapped ::ffff:x.x.x.x
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
                 // IPv4-compatible ::x.x.x.x (deprecated RFC 4291)
-                || v6.to_ipv4().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
+                || v6.to_ipv4().is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
         }
     }
 }
@@ -218,6 +321,35 @@ mod tests {
     }
 
     #[test]
+    fn test_private_host_special_purpose_ranges() {
+        // CGNAT / shared address space (RFC 6598) — the carrier-grade-NAT
+        // range that routes to ISP infrastructure, previously un-blocked.
+        assert!(is_private_host("100.64.0.1"), "CGNAT low edge");
+        assert!(is_private_host("100.100.100.100"), "CGNAT middle");
+        assert!(is_private_host("100.127.255.255"), "CGNAT high edge");
+        // Just OUTSIDE the /10 must stay public (100.64/10 boundaries).
+        assert!(!is_private_host("100.63.255.255"), "below CGNAT is public");
+        assert!(!is_private_host("100.128.0.0"), "above CGNAT is public");
+        // IETF protocol assignments (RFC 6890) 192.0.0.0/24.
+        assert!(is_private_host("192.0.0.1"));
+        assert!(!is_private_host("192.0.1.1"), "192.0.1/24 is public");
+        // Benchmarking (RFC 2544) 198.18.0.0/15.
+        assert!(is_private_host("198.18.0.1"));
+        assert!(is_private_host("198.19.255.255"));
+        assert!(
+            !is_private_host("198.20.0.0"),
+            "above benchmarking is public"
+        );
+        // Reserved / future use (RFC 1112) 240.0.0.0/4 + limited broadcast.
+        assert!(is_private_host("240.0.0.1"));
+        assert!(is_private_host("255.255.255.255"));
+        // IPv4 multicast 224.0.0.0/4 as a literal host.
+        assert!(is_private_host("224.0.0.1"));
+        // Mapped/compat forms of CGNAT must be blocked too (defense in depth).
+        assert!(is_private_host("::ffff:100.64.0.1"), "mapped CGNAT");
+    }
+
+    #[test]
     fn test_private_ip_check() {
         assert!(is_private_ip(&"127.0.0.1".parse().unwrap()));
         assert!(is_private_ip(&"10.0.0.1".parse().unwrap()));
@@ -289,6 +421,29 @@ mod tests {
         assert!(
             result.is_some(),
             "IPv4-mapped IPv6 private should be blocked"
+        );
+    }
+
+    // --- ssrf_safe_send tests ---
+
+    #[tokio::test]
+    async fn ssrf_safe_send_blocks_private_initial_url() {
+        // Every hop is SSRF-checked, including hop 0. A private initial URL is
+        // rejected BEFORE any socket is opened — the error is the SSRF "private"
+        // message, not a connection error (which is how this distinguishes a
+        // wired-in check from a check that was accidentally dropped from the
+        // loop).
+        let result = ssrf_safe_send(
+            "http://127.0.0.1:9/",
+            SSRF_MAX_REDIRECTS,
+            |builder| builder,
+            |client, url| client.get(url),
+        )
+        .await;
+        assert!(result.is_err(), "private initial URL must be blocked");
+        assert!(
+            result.unwrap_err().contains("private"),
+            "must be blocked by the SSRF check, not a connection error"
         );
     }
 }

@@ -706,13 +706,14 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            // Merge in place when the frame leads with a System (e.g.
-            // compaction summary). `normalize_system_messages` runs
-            // BEFORE this bridge in the agent loop
-            // (`loop_compaction.rs:35`), so multi-System payloads
-            // produced here would reach the provider unmerged.
-            // Anthropic in particular rejects them outright. See the
-            // AppUI analogue in `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // Merge in place when the frame leads with a System (legacy
+            // guard — compaction summaries now render as protected User
+            // rows). `normalize_system_messages` runs BEFORE this bridge
+            // in the agent loop (`loop_compaction.rs:35`), so
+            // multi-System payloads produced here would reach the
+            // provider unmerged. Anthropic in particular rejects them
+            // outright. See the AppUI analogue in
+            // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
             // for the rationale.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
@@ -1451,10 +1452,25 @@ async fn persist_child_session_lifecycle(
                 error: None,
                 output_files: Vec::new(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path: a contract write is a whole-file
+            // read-modify-write, and every fanout child stamps the SHARED
+            // parent session — two children terminating together with their
+            // own stale handles silently erase each other's contract (the
+            // stuck-un-Joined race). The helper holds the per-key persist
+            // lock across open→mutate→rewrite.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
             Ok(parent_exists)
@@ -1514,10 +1530,23 @@ async fn persist_child_session_lifecycle(
                 error: payload.error.clone(),
                 output_files: payload.output_files.clone(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path — see the Spawned arm. This terminal arm
+            // is the production-documented race: two children completing
+            // together each rewrote the parent from a stale snapshot, and the
+            // loser's terminal contract reverted to pre-terminal.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(
                 payload.kind,
@@ -3814,6 +3843,7 @@ impl ActorFactory {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -4359,6 +4389,14 @@ struct SessionActor {
     /// cleared at the end. `None` outside command handling — `send_reply`
     /// then falls back to legacy behavior (stamping no thread_id).
     current_command_cmid: Option<String>,
+
+    /// Total tokens (input + output) attributed to the MOST RECENT turn run
+    /// by `process_inbound`. Set on every LLM turn; read by
+    /// `maybe_advance_goal_runtime_after_turn` so a goal continuation's token
+    /// budget is charged the turn's real usage instead of a hardcoded 0
+    /// (which let a goal recur past its token budget). Reset to 0 at the top
+    /// of each turn so a failed/no-response turn charges nothing.
+    last_turn_total_tokens: u64,
 }
 
 impl SessionActor {
@@ -4772,12 +4810,25 @@ impl SessionActor {
             .profile_id()
             .unwrap_or(MAIN_PROFILE_ID)
             .to_owned();
-        let continuations = default_agent_orchestrator().drain_ready_continuations_for_session(
-            &self.session_key,
-            &profile_id,
-            runtime_state,
-            1,
-        );
+        // Cross-subsystem occupancy (#1529): drain AND claim the in-flight
+        // marker under a SINGLE state lock (see
+        // `drain_and_claim_ready_continuation_for_session`). This is the only
+        // race-free ordering — setting the marker before the drain
+        // self-suppresses the actor's own due-goal enqueue; setting it after
+        // the drain opens a window for a concurrent AppUI tick to re-enqueue
+        // and spawn a duplicate turn (both caught by codex re-review). A
+        // session already in-flight (an AppUI goal turn running) drains
+        // nothing and yields no guard, so the actor defers. The guard is held
+        // across the whole turn and clears the marker on ANY exit at the end
+        // of the loop iteration, suppressing the AppUI due-scan/drain until
+        // the turn completes.
+        let (continuations, _in_flight_guard) = default_agent_orchestrator()
+            .drain_and_claim_ready_continuation_for_session(
+                &self.session_key,
+                &profile_id,
+                runtime_state,
+                1,
+            );
         let drained = !continuations.is_empty();
         for continuation in continuations {
             info!(
@@ -4853,19 +4904,35 @@ impl SessionActor {
                         .last()
                         .map(|(_, message)| message.content.clone())
                 };
-                if let Some(reply) = assistant_reply {
-                    if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
-                        &loop_id,
-                        &profile_id,
-                        &reply,
-                    ) {
-                        info!(
-                            session = %self.session_key,
-                            loop_id = %loop_id,
-                            error = %err.message,
-                            "apply_self_paced_response skipped"
-                        );
-                    }
+                // A reply-less fire (interrupt / agent error / empty content)
+                // still reschedules: the empty reply carries no
+                // `<<loop-next-in: …>>` sentinel, so the orchestrator applies
+                // the DEFAULT self-paced delay. Skipping here parked the loop
+                // at `next_run_at_ms: None`, which the due-scan never visits
+                // again — one failed turn silently killed the loop.
+                //
+                // Deliberate divergence from the AppUI path (codex round-1):
+                // AppUI captures the EndTurn payload and can distinguish a
+                // DELIBERATE blank reply (skip, #1134 contract) from a true
+                // no-reply (reschedule). This path has no capture —
+                // `process_inbound` doesn't persist empty assistant content
+                // and the history scan filters empties — so blank and error
+                // are indistinguishable here, and liveness wins: a blank
+                // loop turn retries at the default delay instead of dying.
+                // An explicit model stop should be a sentinel (follow-up),
+                // not an unpersistable blank.
+                let reply = assistant_reply.unwrap_or_default();
+                if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                    &loop_id,
+                    &profile_id,
+                    &reply,
+                ) {
+                    info!(
+                        session = %self.session_key,
+                        loop_id = %loop_id,
+                        error = %err.message,
+                        "apply_self_paced_response skipped"
+                    );
                 }
             }
             default_agent_orchestrator().mark_continuation_completed(
@@ -4888,13 +4955,11 @@ impl SessionActor {
     /// continuation only when the runtime stays idle AND the per-goal
     /// policy still allows another fire.
     ///
-    /// Token tracking is wired through the goal record's `tokens_used`
-    /// only when the orchestrator-level `record_goal_turn` is called
-    /// with a non-zero `tokens_consumed`. The per-turn LLM token usage
-    /// is currently still attributed via existing audit paths; surfacing
-    /// it into this hook is a deliberate follow-up so the first
-    /// production cut closes the recurrence + budget-state-machine
-    /// bullets cleanly without restructuring `process_inbound`.
+    /// The goal record's `tokens_used` is charged this turn's real token
+    /// usage (`last_turn_total_tokens`, set by `process_inbound` from the LLM
+    /// response's input+output tokens — the same per-turn total the AppUI
+    /// dispatch path attributes). Passing 0 here previously let the token
+    /// budget gate never trip, so a goal recurred past its token budget.
     #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
@@ -4902,8 +4967,14 @@ impl SessionActor {
         goal_turn_start: Instant,
     ) {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
+        let tokens_consumed = self.last_turn_total_tokens;
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(&self.session_key, profile_id, 0, elapsed_seconds);
+        orchestrator.record_goal_turn(
+            &self.session_key,
+            profile_id,
+            tokens_consumed,
+            elapsed_seconds,
+        );
         // Capture the most recent assistant turn's text content to feed
         // the completion-sentinel detector. Reading from the durable
         // session handle keeps the wiring narrow — `process_inbound`
@@ -8725,6 +8796,10 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // Reset per-turn token accounting so a turn that fails / produces no
+        // response charges 0 to the goal budget (set to the real usage below
+        // once the LLM response is in hand).
+        self.last_turn_total_tokens = 0;
         // Consecutive-recovery cap reset
         // (feat/spawn-only-failure-feedback-loop): user-initiated turns
         // break the "recovery chain" — once the user re-engages we no
@@ -9067,6 +9142,11 @@ impl SessionActor {
         if let Ok(Ok(ref cr)) = result {
             self.record_usage_event(cr, client_message_id.as_deref(), None)
                 .await;
+            // Attribute this turn's real token usage so a goal continuation
+            // charges its budget correctly (read by
+            // `maybe_advance_goal_runtime_after_turn`).
+            self.last_turn_total_tokens = u64::from(cr.token_usage.input_tokens)
+                .saturating_add(u64::from(cr.token_usage.output_tokens));
         }
 
         match result {
@@ -9821,6 +9901,106 @@ mod tests {
             crate::context_manager::context_ledger_path(dir.path(), &session_key.to_string())
                 .exists(),
             "prompt-context preparation should persist the canonical context ledger"
+        );
+    }
+
+    /// Post-compaction coverage regression: the agent loop runs
+    /// `normalize_system_messages` BEFORE the bridge, converting any
+    /// non-leading `[Conversation summary]` System row into a
+    /// `[System note] ` User row. When the frame emitted that summary as a
+    /// System row, the bridge's contiguous coverage window never matched
+    /// again after the first compaction, and every TurnStart re-recorded the
+    /// entire retained conversation as source-less duplicates. The frame now
+    /// emits the summary as a User row, which the loop leaves untouched, so
+    /// TurnStart must record exactly ONE new item (the current user turn).
+    #[test]
+    fn session_actor_prompt_context_bridge_covers_frame_after_compaction() {
+        let session_key = SessionKey::new("cli", "context-post-compaction-coverage");
+        let history: Vec<Message> = (0..6)
+            .flat_map(|index| {
+                vec![
+                    test_message(MessageRole::User, format!("user turn {index}")),
+                    test_message(MessageRole::Assistant, format!("assistant turn {index}")),
+                ]
+            })
+            .collect();
+        let mut manager =
+            ContextManager::from_session_history(session_key.to_string(), None, &history);
+        manager.install_compaction_summary("older turns summarized", 4);
+        let item_count_before = manager.items().len();
+        let manager = Arc::new(StdMutex::new(manager));
+        let dir = tempfile::TempDir::new().unwrap();
+        let bridge = SessionActorPromptContextBridge::new(
+            session_key.clone(),
+            dir.path().to_path_buf(),
+            manager.clone(),
+        );
+
+        let request = PromptContextRequest {
+            phase: PromptContextPhase::TurnStart,
+            iteration: 1,
+            provider_name: "test".to_string(),
+            model_id: "large-context".to_string(),
+            context_window: 16_000,
+        };
+        // Build the turn-start vector the way the agent loop does: runtime
+        // System + the manager's own frame + the new user turn...
+        let frame_messages = {
+            let guard = manager.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .for_prompt(&SessionActorPromptContextBridge::prompt_policy(&request))
+                .messages
+        };
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(frame_messages);
+        prompt.push(test_message(MessageRole::User, "current request"));
+        // ...then apply the `normalize_system_messages` conversion rule that
+        // runs before the bridge (message_repair.rs): non-leading context
+        // System rows become `[System note] ` User rows. A User-role summary
+        // frame row makes this a no-op; a System-role regression would be
+        // rewritten here and blow the coverage window below.
+        for message in prompt.iter_mut().skip(1) {
+            if message.role == MessageRole::System
+                && (message.content.starts_with("[Conversation summary]")
+                    || message.content.starts_with("[Background task"))
+            {
+                message.role = MessageRole::User;
+                message.content = format!("[System note] {}", message.content);
+            }
+        }
+
+        let report = bridge
+            .prepare_prompt(request, &mut prompt)
+            .expect("context manager bridge should prepare prompt");
+
+        assert!(
+            !report.compaction_performed,
+            "small post-compaction transcript must not re-compact"
+        );
+        let item_count_after = manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items()
+            .len();
+        assert_eq!(
+            item_count_after,
+            item_count_before + 1,
+            "TurnStart must record exactly the current user turn; anything more \
+             means the frame failed coverage and was re-recorded as duplicates"
+        );
+        assert!(
+            prompt
+                .iter()
+                .any(|message| message.content.contains("[Conversation summary]")),
+            "summary must still reach the model prompt"
+        );
+        assert_eq!(
+            prompt
+                .iter()
+                .filter(|message| message.content == "user turn 4")
+                .count(),
+            1,
+            "retained history must not be duplicated in the outgoing prompt"
         );
     }
 
@@ -11550,6 +11730,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11630,6 +11811,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11707,6 +11889,110 @@ mod tests {
             "internal master-continuation prompt must not leak into chat history: {:?}",
             session.messages
         );
+        drop(tx);
+        handle.abort();
+    }
+
+    /// #1529 P2 — a goal continuation drained by the SESSION ACTOR must
+    /// charge the goal's `tokens_used` the turn's REAL token usage.
+    ///
+    /// End-to-end: an active goal enqueues a `GoalContinue` continuation;
+    /// the actor's periodic tick drains it into `process_inbound`, which
+    /// stamps `last_turn_total_tokens` from the LLM response's
+    /// input+output tokens; the post-turn hook
+    /// (`maybe_advance_goal_runtime_after_turn`) then passes that value to
+    /// `record_goal_turn`. Before the fix the hook passed a hardcoded 0,
+    /// so `tokens_used` never advanced on the CLI/session-actor path and
+    /// the token-budget gate never tripped.
+    ///
+    /// The goal is registered under `MAIN_PROFILE_ID` because the actor's
+    /// drain loop resolves its goal profile as
+    /// `session_key.profile_id().unwrap_or(MAIN_PROFILE_ID)` and the bare
+    /// `cli:{tag}` test key has no profile segment — `record_goal_turn`
+    /// silently no-ops on a profile mismatch.
+    #[cfg(feature = "api")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // `make_response` carries TokenUsage { input: 50, output: 10 } —
+        // the turn's real total is 60 tokens.
+        let provider = Arc::new(DelayedMockProvider::new(
+            "goal-token-test",
+            vec![(Duration::ZERO, make_response("advancing the goal"))],
+        ));
+        let (tx, _out_rx, handle, _session_mgr) =
+            setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
+        let session_id = test_session_key(dir.path());
+
+        let orchestrator = default_agent_orchestrator();
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: MAIN_PROFILE_ID.into(),
+                objective: "keep the build green".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Pre-condition: nothing accounted before the actor runs the turn.
+        let (tokens_before, continuations_before, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_before, 0);
+        assert_eq!(continuations_before, 0);
+
+        // Cross the actor's continuation tick so it drains the queued
+        // GoalContinue into process_inbound (which calls the provider).
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            if provider.call_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert!(
+            provider.call_count.load(Ordering::Relaxed) > 0,
+            "periodic actor tick must drain the queued goal continuation into process_inbound"
+        );
+
+        // The post-turn accountant runs after process_inbound returns, and
+        // the tail of process_inbound does REAL blocking I/O (the session
+        // JSONL append runs on the spawn_blocking pool) that the paused
+        // virtual clock cannot fast-forward. Wait for it in small bounded
+        // REAL-time slices: each slice parks the runtime on the blocking
+        // pool, so the actor's I/O completion (a real wakeup) gets CPU
+        // time. Bounded at 500 x 2ms = 1s real time; typically a couple of
+        // slices suffice.
+        let mut counters = None;
+        for _ in 0..500 {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(2));
+            })
+            .await
+            .unwrap();
+            let current = orchestrator
+                .goal_counters_for_test(&session_id)
+                .expect("goal still exists");
+            if current.1 >= 1 {
+                counters = Some(current);
+                break;
+            }
+        }
+        let (tokens_used, continuations_used, _window) =
+            counters.expect("goal turn must be recorded within the polling window");
+        assert_eq!(
+            continuations_used, 1,
+            "exactly one goal turn should be accounted"
+        );
+        assert_eq!(
+            tokens_used, 60,
+            "goal budget must be charged the turn's real usage \
+             (50 input + 10 output tokens), not a hardcoded 0"
+        );
+
         drop(tx);
         handle.abort();
     }
@@ -11791,6 +12077,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11924,6 +12211,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12053,6 +12341,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12154,6 +12443,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12254,6 +12544,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -17678,6 +17969,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
             usage_ledger: None,
             usage_profile_id: "test-profile".to_string(),
         };

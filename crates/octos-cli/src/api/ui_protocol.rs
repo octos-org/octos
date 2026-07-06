@@ -36,31 +36,31 @@ use octos_core::ui_protocol::{
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionSnapshotParams, SessionStatusGetParams,
-    SessionTasksListParams, SessionTitleSetParams, SessionWorkspaceGetParams,
-    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
-    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
-    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
-    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
-    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
-    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
-    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
-    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord, UiArtifactPaneItem,
-    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
-    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
+    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
+    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
+    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
+    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
+    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
     UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
     progress_kinds, thread_status,
@@ -2307,27 +2307,29 @@ impl PromptContextManager for AppUiPromptContextBridge {
         if let Some(system) = runtime_system {
             // Re-apply the agent's runtime System prompt. Two cases:
             //
-            //   a) `frame.messages` leads with a System message
-            //      (e.g. a `[Conversation summary]` emitted by
-            //      `for_prompt`'s compaction path —
-            //      `context_manager.rs:1159`). Concatenate the runtime
-            //      System CONTENT into that existing System rather
-            //      than inserting a second one. We do this in-place to
-            //      avoid producing two consecutive `System` messages
-            //      because `normalize_system_messages` runs BEFORE
-            //      this bridge (`loop_compaction.rs:35`) — anything we
-            //      emit here goes straight to the provider, and
-            //      multi-System payloads are rejected by Anthropic
-            //      (single `system` field) and other providers.
+            //   a) `frame.messages` leads with a System message.
+            //      Concatenate the runtime System CONTENT into that
+            //      existing System rather than inserting a second one.
+            //      We do this in-place to avoid producing two
+            //      consecutive `System` messages because
+            //      `normalize_system_messages` runs BEFORE this bridge
+            //      (`loop_compaction.rs:35`) — anything we emit here
+            //      goes straight to the provider, and multi-System
+            //      payloads are rejected by Anthropic (single `system`
+            //      field) and other providers. Since compaction
+            //      summaries render as protected User rows (see
+            //      `for_prompt`'s CompactionSummary arm), this arm is
+            //      effectively a legacy guard.
             //
-            //   b) `frame.messages` does not lead with a System.
-            //      Insert the runtime System at index 0.
+            //   b) `frame.messages` does not lead with a System (the
+            //      normal case, including post-compaction where the
+            //      frame leads with the User-role summary). Insert the
+            //      runtime System at index 0.
             //
             // Safe to merge unconditionally because
             // `record_message_with_source_ref` early-returns for
             // `System` role (`context_manager.rs:752`) so the frame
-            // can only contain compaction summaries or no System at
-            // all — never the runtime System itself.
+            // never contains the runtime System itself.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
                     let existing = std::mem::take(&mut first.content);
@@ -4268,6 +4270,19 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionRollback(params) => {
+                handle_session_rollback(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4336,6 +4351,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    connection_profile_id,
                     id,
                     params,
                 )
@@ -4472,10 +4488,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
-                handle_router_set_mode(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_set_mode(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::RouterGetMetrics(params) => {
-                handle_router_get_metrics(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_get_metrics(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
         }
     }
@@ -4494,6 +4526,62 @@ async fn ui_protocol_connection(
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
+}
+
+/// Cap on how long stdio shutdown waits for in-flight turns to finalize.
+const STDIO_SHUTDOWN_TURN_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait (bounded by `max`) until none of THIS connection's turns is still
+/// live in the process-global `active_turns` registry.
+///
+/// Stdin EOF ends the stdio loop, and returning from `stdio_connection`
+/// exits the process — dropping the runtime and CANCELLING any in-flight
+/// turn task mid-finalization (assistant persistence, usage records, the
+/// terminal `turn/completed` ledger append). The client is already gone so
+/// nothing new can start; draining briefly turns "the answer and the turn's
+/// terminal state were lost" into "the next hydrate shows the completed
+/// turn". Scoped to `connection_turns` so turns owned by other connections
+/// never block this exit, and terminal-but-not-yet-cleaned entries do not
+/// hold shutdown open. Returns `false` on deadline.
+async fn drain_connection_turns_for_shutdown(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    max: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    loop {
+        let owned = connection_turns.lock().await.clone();
+        let mut live: Vec<SessionKey> = Vec::new();
+        {
+            let active = active_turns.lock().await;
+            for (session_id, turn_id) in &owned {
+                let Some(turn) = active.get(session_id) else {
+                    continue;
+                };
+                if &turn.turn_id != turn_id {
+                    continue;
+                }
+                // Terminal entries stay registered until cleanup — the turn
+                // already finalized, so it must not hold shutdown open.
+                let state = turn.state.lock().await;
+                if !matches!(*state, TurnState::Terminal(_)) {
+                    live.push(session_id.clone());
+                }
+            }
+        }
+        if live.is_empty() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "octos::ui_protocol::stdio",
+                sessions = ?live,
+                "stdio shutdown: in-flight turns did not finalize before the drain deadline"
+            );
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
@@ -4829,6 +4917,19 @@ where
                 )
                 .await;
             }
+            UiCommand::SessionRollback(params) => {
+                handle_session_rollback(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4883,7 +4984,16 @@ where
                 }
             }
             UiCommand::SessionList(params) => {
-                handle_session_list(&ws, &state, &connection_headers, None, id, params).await;
+                handle_session_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionSnapshot(params) => {
                 handle_session_snapshot(&ws, &state, &connection_headers, None, id, params).await;
@@ -4946,9 +5056,16 @@ where
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
+                // stdio is a local single-user transport with no authenticated
+                // tenant scope, so `connection_profile_id` is `None` (no
+                // cross-tenant enforcement); `connection_profile_id_owned`
+                // remains the resolution fallback. Only the hosted WS path,
+                // which carries an authenticated `connection_profile_id`,
+                // enforces the tenant gate.
                 handle_router_set_mode(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4959,6 +5076,7 @@ where
                 handle_router_get_metrics(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4968,6 +5086,14 @@ where
         }
     }
 
+    // Let in-flight turns finalize (persist + ledger terminal) before the
+    // process exit cancels their tasks — see drain_connection_turns_for_shutdown.
+    drain_connection_turns_for_shutdown(
+        &active_turns,
+        &connection_turns,
+        STDIO_SHUTDOWN_TURN_DRAIN_MAX,
+    )
+    .await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -8211,6 +8337,7 @@ fn validate_session_ingress_command_scope(
         UiCommand::TaskArtifactList(params) => params.session_id.clone(),
         UiCommand::TaskArtifactRead(params) => params.session_id.clone(),
         UiCommand::SessionHydrate(params) => params.session_id.clone(),
+        UiCommand::SessionRollback(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
         UiCommand::SessionSnapshot(params) => {
@@ -10534,6 +10661,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
+    // Cross-subsystem occupancy (#1529): a session actor draining a
+    // continuation turn for this session marks it in-flight but has no entry
+    // in this connection's `active_turns` map. Without this check the serve
+    // tick would drain + spawn a SECOND concurrent turn on the same session
+    // while the actor's turn runs. The actor clears the marker (RAII guard)
+    // when its turn ends, so the next tick re-dispatches normally.
+    if default_agent_orchestrator().is_goal_dispatch_in_flight(&session_id) {
+        return false;
+    }
 
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
@@ -12228,6 +12364,212 @@ fn hydrate_replays_tool_payload(envelope: &Envelope) -> bool {
     )
 }
 
+/// `session/rollback` — conversation-only rewind. Drops the last `num_turns`
+/// user turns from the session (persisted + in-memory), persists an idempotent
+/// append-only marker, and returns the trimmed thread projected exactly like
+/// `session/hydrate` (messages + threads + turns + cursor).
+///
+/// Scoped / resolved identically to [`handle_session_hydrate`]. Rejected when a
+/// turn is in progress for the session (rewinding under an active turn would
+/// race the writer). NOTHING outside the conversation transcript is touched —
+/// no git, worktree, or workspace file state.
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_rollback(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionRollbackParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_ROLLBACK;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // `num_turns` must be >= 1 — a zero-turn rollback is a no-op the client
+    // should never send.
+    if params.num_turns < 1 {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: num_turns must be >= 1"))
+                .with_data(json!({ "kind": "invalid_num_turns" })),
+        );
+        return;
+    }
+
+    // Snapshot the ledger once for the trimmed-thread projection's cursor +
+    // turn overlay (mirrors the hydrate handler).
+    let (replayed, head_cursor) = match ledger.snapshot_with_cursor(&params.session_id, None) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    // Guard: refuse to rewind while a turn is in flight for this session.
+    // Detected via the same process-global active-turn registry the
+    // turn/hydrate handlers consult. Checked before taking the sessions lock so
+    // we never hold two locks at once.
+    if active_turn_sessions(active_turns)
+        .await
+        .contains(&params.session_id)
+    {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: a turn is in progress; interrupt it before rolling back"
+            ))
+            .with_data(json!({ "kind": "turn_in_progress" })),
+        );
+        return;
+    }
+
+    // Apply the rollback (marker + in-memory trim) and project the trimmed
+    // thread while holding the sessions lock, so the projection reflects the
+    // post-trim snapshot.
+    let (dropped_turns, messages, threads, orphans) = {
+        let mut sessions_guard = sessions.lock().await;
+        // Reject unknown sessions per the hydrate error model — we do NOT
+        // auto-create on rollback.
+        if !sessions_guard.session_known(&params.session_id) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        let dropped_turns = match sessions_guard
+            .rollback_last_n_user_turns(&params.session_id, params.num_turns)
+            .await
+        {
+            Ok(dropped) => dropped,
+            Err(error) => {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: {error}")),
+                );
+                return;
+            }
+        };
+        let data_dir = sessions_guard.data_dir();
+        let session = sessions_guard.get_or_create(&params.session_id).await;
+        // Rebuild + persist the context ledger from the trimmed history.
+        // The ledger coverage check (`context_ledger_covers_history`) is a
+        // high-watermark `>=` — deliberately tolerant of bounded history
+        // slices — so a pre-rollback snapshot still "covers" the shrunken
+        // history and would be Loaded verbatim on the next turn, feeding the
+        // rolled-back turns straight back into the model prompt. Mirrors
+        // `reset_context_manager_from_history` on the session-actor path.
+        let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
+            params.session_id.to_string(),
+            None,
+            &session.messages,
+        );
+        rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        if let Err(error) = crate::context_manager::persist_context_manager_snapshot(
+            &data_dir,
+            &params.session_id.to_string(),
+            &rebuilt_context,
+        ) {
+            warn!(
+                session = %params.session_id,
+                %error,
+                "session/rollback: failed to persist rebuilt context ledger"
+            );
+        }
+        publish_appui_context_status(&params.session_id, &rebuilt_context);
+        // Same message projection as `handle_session_hydrate` for a
+        // non-negotiated client: seqs are the trimmed transcript's indices.
+        let messages = session
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(seq, msg)| HydratedMessage {
+                seq: seq as u64,
+                role: msg.role.as_str().to_owned(),
+                content: msg.content.clone(),
+                turn_id: None,
+                thread_id: msg.thread_id.clone(),
+                client_message_id: msg.client_message_id.clone(),
+                persisted_at: msg.timestamp,
+                message_id: None,
+                source: None,
+                media: msg.media.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (threads, orphans) = build_thread_graph_entries(session);
+        (dropped_turns, messages, threads, orphans)
+    };
+    let _ = orphans;
+
+    // Turn projection reuses the exact hydrate helper over the trimmed threads.
+    // The `replayed` snapshot was taken PRE-trim, so it still carries lifecycle
+    // + `message/persisted` events for the just-rolled-back turns. Scope the
+    // projected turns to the SURVIVING threads (codex P2): a turn belongs to the
+    // trimmed thread iff its `thread_id` — surfaced from the ledger's
+    // `message/persisted` rows — is still present among the trimmed threads.
+    // Without this, `thread.turns` would leak lifecycle state for dropped turns
+    // even though `messages`/`threads` are trimmed.
+    let surviving_thread_ids: std::collections::HashSet<&str> = threads
+        .iter()
+        .map(|entry| entry.thread_id.as_str())
+        .collect();
+    let turns = collect_session_turns(&params.session_id, active_turns, &replayed, &threads)
+        .await
+        .into_iter()
+        .filter(|turn| {
+            turn.thread_id
+                .as_deref()
+                .is_some_and(|thread_id| surviving_thread_ids.contains(thread_id))
+        })
+        .collect::<Vec<_>>();
+
+    let thread = SessionHydrateResult {
+        session_id: params.session_id.clone(),
+        cursor: head_cursor,
+        context: None,
+        context_state: None,
+        messages: Some(messages),
+        threads: Some(threads),
+        turns: Some(turns),
+        pending_approvals: None,
+        pending_questions: None,
+        replayed_envelopes: None,
+        replayed_tool_envelopes: None,
+    };
+    let result = SessionRollbackResult {
+        dropped_turns,
+        thread,
+    };
+    send_serialized_rpc_result(ws, id, method, result);
+}
+
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
 async fn handle_thread_graph_get(
     ws: &WsConnection,
@@ -12909,12 +13251,18 @@ async fn handle_session_list(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
     id: String,
     _params: SessionListParams,
 ) {
     let identity_ext = identity.cloned().map(Extension);
-    let response =
-        super::handlers::list_sessions(State(state.clone()), headers.clone(), identity_ext).await;
+    let response = super::handlers::list_sessions(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        connection_profile_id,
+    )
+    .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
     // Collection endpoint — no addressable session id. Treat any
     // (unexpected) 404 as a generic resource-not-found rather than
@@ -14145,14 +14493,68 @@ fn task_cancel_rpc_error(task_id: &TaskId, error: octos_agent::TaskCancelError) 
 fn resolve_router_for_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
-) -> Option<Arc<octos_llm::AdaptiveRouter>> {
+) -> Result<Option<Arc<octos_llm::AdaptiveRouter>>, RpcError> {
+    // Tenant-scope gate (P1). Without it the `session_id.profile_id()`-first
+    // precedence below lets a tenant-B connection pass a `session_id` that
+    // embeds tenant-A's profile and resolve — then `set_mode` mutate /
+    // `get_metrics` read — tenant-A's `AdaptiveRouter`. Placing the check
+    // inside the shared resolver protects BOTH router handlers by
+    // construction.
+    authorize_router_session_scope(session_id, connection_profile_id, routed_profile_id)?;
     let active_profile_id = session_id
         .profile_id()
         .map(ToOwned::to_owned)
         .or_else(|| routed_profile_id.map(ToOwned::to_owned));
-    let profile_runtime = resolve_session_profile_runtime(state, active_profile_id.as_deref())?;
-    profile_runtime.adaptive_router.clone()
+    Ok(
+        resolve_session_profile_runtime(state, active_profile_id.as_deref())
+            .and_then(|profile_runtime| profile_runtime.adaptive_router.clone()),
+    )
+}
+
+/// Tenant-scope gate for the router RPCs.
+///
+/// A hosted WS connection is authorized for its own authenticated
+/// `connection_profile_id` AND — on a per-tenant subdomain — the
+/// `routed_profile_id` that `is_authorized_for_profile` already cleared at
+/// upgrade time (an admin / parent account operating a tenant it owns; a
+/// forged `Host` for an unauthorized tenant 403s before this point, so a
+/// present `routed_profile_id` is always trustworthy). A `session_id` whose
+/// embedded profile is EITHER is in scope; a different tenant is rejected.
+///
+/// - An unscoped connection (`connection_profile_id == None` — bootstrap
+///   admin token / local solo) is authorized for every profile.
+/// - A bare (profile-less) `session_id` is authorized under the connection's
+///   auth, matching `validate_authenticated_session_scope`'s `None` arm.
+///
+/// This is deliberately a touch more permissive than the bare
+/// `validate_session_scope(session_id, None, connection_profile_id)` other
+/// handlers use (it also honours `routed_profile_id`): a router RPC on a
+/// hosted subdomain must not regress the authorized admin/parent access that
+/// existed before this gate landed, while a genuine cross-tenant `session_id`
+/// (matching neither authorized profile) is still rejected. `authenticated_
+/// scope_mismatch_error` tags the rejection `auth_scope_violation` so the
+/// handler emits the same 1008 close the other scope checks do.
+fn authorize_router_session_scope(
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+) -> Result<(), RpcError> {
+    let Some(connection_profile_id) = connection_profile_id else {
+        return Ok(());
+    };
+    let Some(session_profile) = session_id.profile_id() else {
+        return Ok(());
+    };
+    if session_profile == connection_profile_id || routed_profile_id == Some(session_profile) {
+        return Ok(());
+    }
+    Err(authenticated_scope_mismatch_error(
+        "session_id is outside the authorized profile scope",
+        connection_profile_id,
+        Some(session_profile),
+    ))
 }
 
 /// Wave4-A handler for `router/set_mode`. Parses `params.mode` into the
@@ -14165,6 +14567,7 @@ fn resolve_router_for_session(
 async fn handle_router_set_mode(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterSetModeParams,
@@ -14185,17 +14588,30 @@ async fn handle_router_set_mode(
             return;
         }
     };
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before touching another tenant's router.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     router.set_mode(mode);
     let result = octos_core::ui_protocol::RouterSetModeResult { mode: params.mode };
@@ -14219,22 +14635,36 @@ async fn handle_router_set_mode(
 async fn handle_router_get_metrics(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterGetMetricsParams,
 ) {
     let method = octos_core::ui_protocol::methods::ROUTER_GET_METRICS;
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before reading another tenant's router metrics.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     let status = router.adaptive_status();
     let result = octos_core::ui_protocol::RouterGetMetricsResult {
@@ -16885,7 +17315,14 @@ fn appui_loop_assistant_reply_for_self_paced(
     match captured_response_content {
         Some(content) if !content.is_empty() => Some(content.to_owned()),
         Some(_) => None,
-        None => history_fallback,
+        // No capture (interrupt / agent error before EndTurn): use the
+        // history reply if present, else `Some("")`. Returning `Some("")`
+        // for a true no-reply is deliberate — the empty reply carries no
+        // `<<loop-next-in: …>>` sentinel, so `apply_self_paced_response`
+        // stamps the DEFAULT delay. The old `None` here parked the loop at
+        // `next_run_at_ms: None`, which the due-scan never visits again —
+        // one interrupted turn silently killed the loop.
+        None => Some(history_fallback.unwrap_or_default()),
     }
 }
 
@@ -23338,6 +23775,7 @@ mod tests {
                 "node_id": "design",
             }),
             methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
+            methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
             methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
             methods::TURN_STATE_GET => json!({
                 "session_id": session_id,
@@ -23614,6 +24052,100 @@ mod tests {
             "no request after the writer failure may be dispatched"
         );
         reset_stdio_dispatch_count_for_test();
+    }
+
+    /// Shutdown must WAIT for this connection's in-flight turns to finalize
+    /// instead of letting process exit cancel their tasks mid-write.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_waits_for_turn_finalization() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let session = SessionKey("local:drain-wait".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns
+            .lock()
+            .await
+            .insert(session.clone(), turn_id);
+        let remover = active_turns.clone();
+        let session_for_removal = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            remover.lock().await.remove(&session_for_removal);
+        });
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(drained, "drain must return once the turn finalizes");
+    }
+
+    /// A turn that never finalizes must not hang shutdown forever, and turns
+    /// owned by OTHER connections (the registry is process-global) must not
+    /// block this exit at all.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let foreign_abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            SessionKey("local:foreign".into()),
+            ActiveTurn {
+                turn_id: TurnId::new(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort: foreign_abort,
+            },
+        );
+        assert!(
+            drain_connection_turns_for_shutdown(
+                &active_turns,
+                &connection_turns,
+                std::time::Duration::from_secs(5),
+            )
+            .await,
+            "turns owned by other connections must not block shutdown"
+        );
+
+        let session = SessionKey("local:drain-stuck".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns.lock().await.insert(session, turn_id);
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(!drained, "drain must give up at the deadline");
     }
 
     #[tokio::test]
@@ -24028,6 +24560,19 @@ mod tests {
         assert_eq!(
             blank_capture, None,
             "empty captured content must not stamp a default-delay reschedule via history fallback"
+        );
+
+        // A fire with NO capture and NO history reply (interrupt / agent
+        // error before anything persisted) must still reschedule: the
+        // picker yields an empty reply, which carries no sentinel, so the
+        // orchestrator stamps the DEFAULT delay. The old `None` here parked
+        // the loop at `next_run_at_ms: None` — permanently dead after one
+        // interrupted turn.
+        let reply_less = appui_loop_assistant_reply_for_self_paced(None, None);
+        assert_eq!(
+            reply_less.as_deref(),
+            Some(""),
+            "a reply-less fire must reschedule with the default delay, not kill the loop"
         );
     }
 
@@ -29181,6 +29726,87 @@ ignore = []
         // Drop the sender side so a pending recv resolves promptly; instead,
         // poll once with no wait to confirm the queue is empty.
         assert!(rx.try_recv().is_err(), "no close frame expected");
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_cross_tenant_session_id() {
+        // P1: a profile-scoped (tenant-B) connection must not resolve — and so
+        // must not be able to `set_mode` / read metrics on — a router for a
+        // `session_id` that embeds tenant-A's profile. The tenant gate fires
+        // BEFORE any ProfileRuntime lookup, so an empty test state suffices to
+        // prove the rejection. Without the gate this returned `Ok(None)` (and
+        // the handler would go on to resolve tenant-A's runtime).
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        // `AdaptiveRouter` is not `Debug`, so `.expect_err` on the `Ok` type
+        // does not compile — match instead.
+        let error = match resolve_router_for_session(&state, &session_a, Some("tenant-b"), None) {
+            Err(error) => error,
+            Ok(_) => panic!("cross-tenant router access must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_same_tenant() {
+        // Same-tenant scope passes the gate; with no ProfileRuntime registered
+        // in the empty test state the router resolves to `None` (`Ok(None)`) —
+        // NOT an error. Proves the gate is scope-only, not a blanket denial.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, Some("tenant-a"), None)
+            .expect("same-tenant scope must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_admin_connection_is_unscoped() {
+        // An unscoped (admin, `connection_profile_id == None`) connection is
+        // authorized for every profile — it passes the gate for any
+        // `session_id`, matching every other mutating RPC handler.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, None, None)
+            .expect("admin connection must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_authorized_routed_profile() {
+        // Codex P2: an OTP-admin / parent connection authorized for a tenant
+        // subdomain carries `connection_profile_id == <its own user id>` and
+        // `routed_profile_id == <tenant>` (is_authorized_for_profile cleared it
+        // at upgrade). The gate must NOT reject a session_id embedding the
+        // routed tenant — that access is authorized and predates the gate.
+        let state = Arc::new(AppState::empty_for_tests());
+        let tenant_session = SessionKey::with_profile("tenant-b", "api", "chat-1");
+        let resolved = resolve_router_for_session(
+            &state,
+            &tenant_session,
+            Some("admin-user"), // connection == the admin's own user id
+            Some("tenant-b"),   // routed == the authorized tenant subdomain
+        )
+        .expect("authorized routed profile must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_tenant_outside_routed_and_connection() {
+        // Even WITH a routed profile present, a session_id embedding a third
+        // tenant (neither the connection's own id nor the authorized routed
+        // tenant) is still rejected — the union does not become allow-any.
+        let state = Arc::new(AppState::empty_for_tests());
+        let other = SessionKey::with_profile("tenant-c", "api", "chat-1");
+        let error = match resolve_router_for_session(
+            &state,
+            &other,
+            Some("admin-user"),
+            Some("tenant-b"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a third-tenant session_id must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
     }
 
     /// Codex BLOCK regression (2026-05-13): with the writer channel at
@@ -35389,6 +36015,402 @@ ignore = []
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(10),
         });
+    }
+
+    /// Open a disk-backed `SessionManager` and persist `turns` user turns
+    /// (user + assistant each, thread-grouped) so `session/rollback` has a real
+    /// JSONL to append its marker to and reload from. Returns the state plus the
+    /// live `TempDir` — the caller must keep it alive for the test's duration.
+    async fn prg_state_with_persisted_turns(
+        session_id: &SessionKey,
+        turns: usize,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+        let manager = Arc::new(tokio::sync::Mutex::new(manager));
+        {
+            let mut guard = manager.lock().await;
+            for n in 1..=turns {
+                let tid = format!("t{n}");
+                let now = Utc::now() + chrono::Duration::milliseconds((n as i64) * 2);
+                let user = Message {
+                    role: MessageRole::User,
+                    content: format!("turn {n}"),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    client_message_id: Some(tid.clone()),
+                    thread_id: Some(tid.clone()),
+                    timestamp: now,
+                };
+                guard
+                    .add_message(session_id, user)
+                    .await
+                    .expect("persist user");
+                let asst = Message {
+                    role: MessageRole::Assistant,
+                    content: format!("reply {n}"),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    client_message_id: None,
+                    thread_id: Some(tid.clone()),
+                    timestamp: now + chrono::Duration::milliseconds(1),
+                };
+                guard
+                    .add_message(session_id, asst)
+                    .await
+                    .expect("persist assistant");
+            }
+        }
+        let state = Arc::new(AppState {
+            sessions: Some(manager),
+            ..AppState::empty_for_tests()
+        });
+        (state, tmp)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_drops_last_turn_and_returns_trimmed_thread() {
+        let session_id = SessionKey("local:rollback-1".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb1".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "rb1");
+        let result = &frame["result"];
+        assert_eq!(result["dropped_turns"], 1);
+        let thread = &result["thread"];
+        assert_eq!(thread["session_id"], session_id.to_string());
+        assert!(thread["cursor"].is_object());
+        let messages = thread["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            4,
+            "turns 1 & 2 remain after dropping turn 3"
+        );
+        assert!(messages.iter().all(|m| m["content"] != "turn 3"));
+        assert!(messages.iter().all(|m| m["content"] != "reply 3"));
+        let threads = thread["threads"].as_array().expect("threads array");
+        assert_eq!(threads.len(), 2);
+        assert!(thread["turns"].is_array());
+        assert!(
+            !thread
+                .as_object()
+                .unwrap()
+                .contains_key("replayed_tool_envelopes"),
+            "rollback hydrate projection must preserve legacy omission semantics for tool replay"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_survives_reload_from_disk() {
+        let session_id = SessionKey("local:rollback-reload".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb2".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // Evict the cache and reload from disk: the append-only marker replays
+        // the trim (it was persisted, not truncated).
+        {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.invalidate_cache(&session_id);
+            let session = guard.get_or_create(&session_id).await;
+            assert_eq!(
+                session.messages.len(),
+                4,
+                "rollback marker must survive a disk reload"
+            );
+            assert!(session.messages.iter().all(|m| m.content != "turn 3"));
+        }
+    }
+
+    /// A stale context ledger must not resurrect rolled-back turns. The
+    /// ledger coverage check is a high-watermark `>=` (deliberately
+    /// slice-tolerant, because turn paths pass bounded history slices), so
+    /// after a rollback shrinks durable history a pre-rollback ledger still
+    /// "covers" it, gets Loaded verbatim, and the next model prompt would
+    /// contain the very turns the user rewound away. `session/rollback` must
+    /// rebuild + persist the context ledger from the trimmed history.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rebuilds_context_ledger() {
+        let session_id = SessionKey("local:rollback-ctx-ledger".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        // Persist a pre-rollback context ledger exactly like a prior turn's
+        // prompt path would have.
+        let data_dir = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let data_dir = guard.data_dir();
+            let history = guard.get_or_create(&session_id).await.messages.clone();
+            let manager = crate::context_manager::ContextManager::from_session_history(
+                session_id.to_string(),
+                None,
+                &history,
+            );
+            crate::context_manager::persist_context_manager_snapshot(
+                &data_dir,
+                &session_id.to_string(),
+                &manager,
+            )
+            .expect("persist pre-rollback ledger");
+            data_dir
+        };
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-ctx".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // The next turn loads the ledger against the TRIMMED history; the
+        // dropped turn must not be visible in the resulting prompt frame.
+        let trimmed = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(&session_id).await.messages.clone()
+        };
+        assert!(trimmed.iter().all(|m| m.content != "turn 3"));
+        let (loaded, _status) = crate::context_manager::load_or_rebuild_context_manager(
+            &data_dir,
+            session_id.to_string(),
+            None,
+            &trimmed,
+        );
+        let frame = loaded.for_prompt(&crate::context_manager::PromptBuildPolicy::default());
+        assert!(
+            !frame
+                .messages
+                .iter()
+                .any(|m| m.content.contains("turn 3") || m.content.contains("reply 3")),
+            "rolled-back turns must not resurrect through a stale context ledger: {:#?}",
+            frame.messages
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rejects_when_turn_in_progress() {
+        let session_id = SessionKey("local:rollback-busy".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        // Insert a synthetic in-flight turn, exactly as handle_turn_start would.
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let dummy_handle = tokio::spawn(async {});
+        {
+            let mut guard = active_turns.lock().await;
+            guard.insert(
+                session_id.clone(),
+                ActiveTurn {
+                    turn_id: TurnId::new(),
+                    state: Arc::new(TokioMutex::new(TurnState::Active)),
+                    interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+                    abort: dummy_handle.abort_handle(),
+                },
+            );
+        }
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb3".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(
+            frame.get("error").is_some(),
+            "rollback under an active turn must error: {frame}"
+        );
+        assert_eq!(frame["error"]["data"]["kind"], "turn_in_progress");
+        // The transcript must be untouched (6 messages = 3 turns).
+        {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let session = guard.get_or_create(&session_id).await;
+            assert_eq!(session.messages.len(), 6, "no trim under an active turn");
+        }
+        active_turns.lock().await.remove(&session_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rejects_zero_num_turns() {
+        let session_id = SessionKey("local:rollback-zero".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb0".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 0,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(frame.get("error").is_some(), "num_turns=0 must be rejected");
+        assert_eq!(frame["error"]["data"]["kind"], "invalid_num_turns");
+    }
+
+    /// Codex P2: the ledger snapshot handed to `collect_session_turns` is taken
+    /// BEFORE the trim, so it still carries lifecycle + `message/persisted`
+    /// events for the rolled-back turns. The returned `thread.turns` must scope
+    /// to the SURVIVING threads — a dropped turn must not linger in the turn
+    /// projection even though its ledger rows persist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_excludes_dropped_turns_from_thread_turns() {
+        let session_id = SessionKey("local:rollback-turns-scope".into());
+        // Two persisted turns, thread-grouped under "t1" and "t2".
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+
+        // Full lifecycle for BOTH turns in the ledger, thread-linked to the
+        // persisted turns (thread_ids surfaced via `message/persisted.thread_id`
+        // are what `collect_session_turns` keys the projection on).
+        let turn_keep = TurnId::new(); // turn 1 -> thread "t1" (survives)
+        let turn_drop = TurnId::new(); // turn 2 -> thread "t2" (rolled back)
+        for (turn_id, thread_id, seq) in [(&turn_keep, "t1", 1_u64), (&turn_drop, "t2", 3_u64)] {
+            let _ = ledger.append_notification(UiNotification::TurnStarted(
+                octos_core::ui_protocol::TurnStartedEvent {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    timestamp: Utc::now(),
+                    topic: None,
+                },
+            ));
+            let _ = ledger.append_notification(UiNotification::MessagePersisted(
+                MessagePersistedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: Some(turn_id.clone()),
+                    thread_id: Some(thread_id.to_string()),
+                    seq,
+                    role: "user".into(),
+                    message_id: format!("{}:{seq}:0", session_id.0),
+                    client_message_id: None,
+                    source: MessagePersistedSource::User,
+                    cursor: UiCursor {
+                        stream: session_id.0.clone(),
+                        seq,
+                    },
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                    content: None,
+                },
+            ));
+            let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            }));
+        }
+
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-scope".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["dropped_turns"], 1);
+        let turns = frame["result"]["thread"]["turns"]
+            .as_array()
+            .expect("turns array");
+        let turn_ids: Vec<String> = turns
+            .iter()
+            .filter_map(|turn| turn["turn_id"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            turn_ids.contains(&turn_keep.0.to_string()),
+            "surviving turn 1 must remain in thread.turns; got {turn_ids:?}"
+        );
+        assert!(
+            !turn_ids.contains(&turn_drop.0.to_string()),
+            "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

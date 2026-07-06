@@ -182,19 +182,33 @@ impl HybridIndex {
             return; // Already indexed
         }
 
-        // HNSW capacity warnings
-        let at_capacity = self.ids.len() >= HNSW_CAPACITY;
-        if at_capacity {
-            tracing::warn!(
-                "HNSW index at capacity ({HNSW_CAPACITY}), indexing {episode_id} in BM25 only — consider rebuilding with a larger capacity"
-            );
-        } else if self.ids.len() >= HNSW_CAPACITY * 80 / 100 {
-            tracing::warn!(
-                "HNSW index at {}% capacity ({}/{}) — consider rebuilding with a larger capacity",
-                self.ids.len() * 100 / HNSW_CAPACITY,
-                self.ids.len(),
-                HNSW_CAPACITY
-            );
+        // HNSW capacity gate. Count actual HNSW points (parity with
+        // `add_embedding`), not total indexed docs: BM25-only and tombstoned
+        // docs occupy `ids` without occupying HNSW slots, so a doc-count gate
+        // would silently stop vectorizing every new episode once the store
+        // passes 10k docs even with an empty vector index.
+        let hnsw_points = self
+            .hnsw
+            .as_ref()
+            .map(|hnsw| hnsw.get_nb_point())
+            .unwrap_or(0);
+        let at_capacity = hnsw_points >= HNSW_CAPACITY;
+        // Capacity warnings only concern inserts that would actually touch
+        // HNSW — a BM25-only insert neither consumes nor is affected by
+        // vector-slot pressure.
+        if embedding.is_some() {
+            if at_capacity {
+                tracing::warn!(
+                    "HNSW index at capacity ({HNSW_CAPACITY}), indexing {episode_id} in BM25 only — consider rebuilding with a larger capacity"
+                );
+            } else if hnsw_points >= HNSW_CAPACITY * 80 / 100 {
+                tracing::warn!(
+                    "HNSW index at {}% capacity ({}/{}) — consider rebuilding with a larger capacity",
+                    hnsw_points * 100 / HNSW_CAPACITY,
+                    hnsw_points,
+                    HNSW_CAPACITY
+                );
+            }
         }
 
         let doc_idx = self.ids.len();
@@ -746,6 +760,35 @@ mod tests {
             index.hnsw.as_ref().map(|h| h.get_nb_point()),
             Some(HNSW_CAPACITY),
             "HNSW point count must NOT grow past capacity — saturation invariant for vector_fetch_count"
+        );
+    }
+
+    #[test]
+    fn insert_vectorizes_when_hnsw_has_room_despite_many_bm25_docs() {
+        // The insert-side HNSW gate must count actual HNSW points (like
+        // `add_embedding` does), not total indexed docs: a store can exceed
+        // HNSW_CAPACITY in BM25-only docs while the vector index is empty.
+        // Gating on doc count silently stops vectorizing new episodes for
+        // any >10k-episode store even though HNSW has full capacity left.
+        let mut index = HybridIndex::new(4);
+        for i in 0..HNSW_CAPACITY {
+            index.insert(&format!("bm25-{i}"), "text", None);
+        }
+        index.insert("with-embedding", "vector text", Some(&[1.0, 0.0, 0.0, 0.0]));
+
+        let idx = index
+            .ids
+            .iter()
+            .position(|id| id == "with-embedding")
+            .expect("doc indexed");
+        assert!(
+            index.has_embedding[idx],
+            "insert must vectorize when the HNSW index itself has room"
+        );
+        assert_eq!(
+            index.hnsw.as_ref().map(|h| h.get_nb_point()),
+            Some(1),
+            "the embedding must actually land in HNSW"
         );
     }
 
