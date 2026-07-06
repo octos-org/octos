@@ -3843,6 +3843,7 @@ impl ActorFactory {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -4388,6 +4389,14 @@ struct SessionActor {
     /// cleared at the end. `None` outside command handling — `send_reply`
     /// then falls back to legacy behavior (stamping no thread_id).
     current_command_cmid: Option<String>,
+
+    /// Total tokens (input + output) attributed to the MOST RECENT turn run
+    /// by `process_inbound`. Set on every LLM turn; read by
+    /// `maybe_advance_goal_runtime_after_turn` so a goal continuation's token
+    /// budget is charged the turn's real usage instead of a hardcoded 0
+    /// (which let a goal recur past its token budget). Reset to 0 at the top
+    /// of each turn so a failed/no-response turn charges nothing.
+    last_turn_total_tokens: u64,
 }
 
 impl SessionActor {
@@ -4933,13 +4942,11 @@ impl SessionActor {
     /// continuation only when the runtime stays idle AND the per-goal
     /// policy still allows another fire.
     ///
-    /// Token tracking is wired through the goal record's `tokens_used`
-    /// only when the orchestrator-level `record_goal_turn` is called
-    /// with a non-zero `tokens_consumed`. The per-turn LLM token usage
-    /// is currently still attributed via existing audit paths; surfacing
-    /// it into this hook is a deliberate follow-up so the first
-    /// production cut closes the recurrence + budget-state-machine
-    /// bullets cleanly without restructuring `process_inbound`.
+    /// The goal record's `tokens_used` is charged this turn's real token
+    /// usage (`last_turn_total_tokens`, set by `process_inbound` from the LLM
+    /// response's input+output tokens — the same per-turn total the AppUI
+    /// dispatch path attributes). Passing 0 here previously let the token
+    /// budget gate never trip, so a goal recurred past its token budget.
     #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
@@ -4947,8 +4954,14 @@ impl SessionActor {
         goal_turn_start: Instant,
     ) {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
+        let tokens_consumed = self.last_turn_total_tokens;
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(&self.session_key, profile_id, 0, elapsed_seconds);
+        orchestrator.record_goal_turn(
+            &self.session_key,
+            profile_id,
+            tokens_consumed,
+            elapsed_seconds,
+        );
         // Capture the most recent assistant turn's text content to feed
         // the completion-sentinel detector. Reading from the durable
         // session handle keeps the wiring narrow — `process_inbound`
@@ -8770,6 +8783,10 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // Reset per-turn token accounting so a turn that fails / produces no
+        // response charges 0 to the goal budget (set to the real usage below
+        // once the LLM response is in hand).
+        self.last_turn_total_tokens = 0;
         // Consecutive-recovery cap reset
         // (feat/spawn-only-failure-feedback-loop): user-initiated turns
         // break the "recovery chain" — once the user re-engages we no
@@ -9112,6 +9129,11 @@ impl SessionActor {
         if let Ok(Ok(ref cr)) = result {
             self.record_usage_event(cr, client_message_id.as_deref(), None)
                 .await;
+            // Attribute this turn's real token usage so a goal continuation
+            // charges its budget correctly (read by
+            // `maybe_advance_goal_runtime_after_turn`).
+            self.last_turn_total_tokens = u64::from(cr.token_usage.input_tokens)
+                .saturating_add(u64::from(cr.token_usage.output_tokens));
         }
 
         match result {
@@ -11695,6 +11717,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11775,6 +11798,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11936,6 +11960,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12069,6 +12094,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12198,6 +12224,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12299,6 +12326,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12399,6 +12427,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -17823,6 +17852,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
             usage_ledger: None,
             usage_profile_id: "test-profile".to_string(),
         };
