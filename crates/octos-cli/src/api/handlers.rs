@@ -4155,6 +4155,8 @@ mod tests {
         assert_eq!(json["timestamp"], "2025-01-01T00:00:00Z");
         // None thread_id must be omitted so legacy clients keep round-tripping.
         assert!(json.get("thread_id").is_none());
+        // Empty media must be omitted for the same legacy wire-shape reason.
+        assert!(json.get("media").is_none());
     }
 
     #[test]

@@ -37182,6 +37182,10 @@ ignore = []
             !result.contains_key("replayed_envelopes"),
             "envelopes are a messages-list dedup key; omit when messages aren't requested",
         );
+        assert!(
+            !result.contains_key("replayed_tool_envelopes"),
+            "tool envelopes are also messages-list replay state; omit when messages aren't requested",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
