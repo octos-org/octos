@@ -173,13 +173,32 @@ pub fn is_private_host(host: &str) -> bool {
 }
 
 /// Check if an IP address is in a private/internal range.
+/// SSRF-relevant IPv4 ranges that are NOT routable public internet but which
+/// `Ipv4Addr::is_private()`/`is_link_local()` do not cover. The std predicates
+/// for these (`is_shared`, `is_benchmarking`, `is_reserved`, …) are all
+/// nightly-only, so match the octets explicitly.
+fn is_special_purpose_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    // Shared address space / CGNAT 100.64.0.0/10 (RFC 6598) — routes to ISP
+    // carrier-grade NAT infrastructure.
+    (a == 100 && (64..=127).contains(&b))
+        // IETF protocol assignments 192.0.0.0/24 (RFC 6890).
+        || v4.octets()[..3] == [192, 0, 0]
+        // Benchmarking 198.18.0.0/15 (RFC 2544).
+        || (a == 198 && (b == 18 || b == 19))
+        // Multicast 224.0.0.0/4 and reserved/future 240.0.0.0/4 (RFC 1112),
+        // plus the limited-broadcast 255.255.255.255 that 240/4 subsumes.
+        || a >= 224
+}
+
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-                || v4.is_private()     // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local()  // 169.254/16 (AWS metadata)
-                || v4.is_unspecified() // 0.0.0.0
+            v4.is_loopback()                 // 127.0.0.0/8
+                || v4.is_private()           // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()        // 169.254/16 (AWS metadata)
+                || v4.is_unspecified()       // 0.0.0.0
+                || is_special_purpose_v4(v4) // CGNAT/benchmark/reserved/multicast
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()           // ::1
@@ -192,13 +211,9 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
                 // Site-local fec0::/10 (deprecated RFC 3879, still routable)
                 || (v6.segments()[0] & 0xffc0) == 0xfec0
                 // IPv4-mapped ::ffff:x.x.x.x
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
                 // IPv4-compatible ::x.x.x.x (deprecated RFC 4291)
-                || v6.to_ipv4().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
+                || v6.to_ipv4().is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
         }
     }
 }
@@ -303,6 +318,35 @@ mod tests {
         assert!(!is_private_host("1.1.1.1"));
         assert!(!is_private_host("example.com"));
         assert!(!is_private_host("2001:4860:4860::8888"));
+    }
+
+    #[test]
+    fn test_private_host_special_purpose_ranges() {
+        // CGNAT / shared address space (RFC 6598) — the carrier-grade-NAT
+        // range that routes to ISP infrastructure, previously un-blocked.
+        assert!(is_private_host("100.64.0.1"), "CGNAT low edge");
+        assert!(is_private_host("100.100.100.100"), "CGNAT middle");
+        assert!(is_private_host("100.127.255.255"), "CGNAT high edge");
+        // Just OUTSIDE the /10 must stay public (100.64/10 boundaries).
+        assert!(!is_private_host("100.63.255.255"), "below CGNAT is public");
+        assert!(!is_private_host("100.128.0.0"), "above CGNAT is public");
+        // IETF protocol assignments (RFC 6890) 192.0.0.0/24.
+        assert!(is_private_host("192.0.0.1"));
+        assert!(!is_private_host("192.0.1.1"), "192.0.1/24 is public");
+        // Benchmarking (RFC 2544) 198.18.0.0/15.
+        assert!(is_private_host("198.18.0.1"));
+        assert!(is_private_host("198.19.255.255"));
+        assert!(
+            !is_private_host("198.20.0.0"),
+            "above benchmarking is public"
+        );
+        // Reserved / future use (RFC 1112) 240.0.0.0/4 + limited broadcast.
+        assert!(is_private_host("240.0.0.1"));
+        assert!(is_private_host("255.255.255.255"));
+        // IPv4 multicast 224.0.0.0/4 as a literal host.
+        assert!(is_private_host("224.0.0.1"));
+        // Mapped/compat forms of CGNAT must be blocked too (defense in depth).
+        assert!(is_private_host("::ffff:100.64.0.1"), "mapped CGNAT");
     }
 
     #[test]
