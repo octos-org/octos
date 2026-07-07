@@ -10,19 +10,25 @@ The fastest way to a working assistant, on the supported platforms (macOS Apple 
 
 ```bash
 # 1. Install
-brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
+npm install -g @octos-org/octos
 
-# 2. Choose your AI provider and models (interactive)
+# 2. Choose your AI provider and a model (interactive — pick a real
+#    model name; some providers reject the "auto" default)
 octos init
 
-# 3. Sign in to the provider — or paste its API key; stored securely
-octos auth login
+# 3. Sign in to that provider — or paste its API key; stored securely
+octos auth login --provider deepseek    # use the provider you chose above
 
 # 4. Start your agent with password-free local sign-in
 octos serve --solo
 ```
 
 Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
+
+> Homebrew users: `brew install octos-org/tap/octos` works too, but the
+> current formula builds without the embedded web app (`/app/` returns
+> `web_bundle_missing`) — use npm or the installer script below if you want
+> the browser app.
 
 Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [Option 2](#option-2-self-hosted-local-only) below:
 
@@ -36,7 +42,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 | Symptom | Fix |
 |---|---|
 | The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
-| The agent doesn't reply | No provider credential yet — run `octos auth login` (or export the provider's API key env var before `octos serve`, or add the key in the dashboard settings). |
+| The agent doesn't reply | No provider credential yet — run `octos auth login --provider <name>` (or export the provider's API key env var, or add the key in the dashboard settings). An `invalid model` error means the provider rejected the configured model name — re-run `octos init` and pick a real one (e.g. `deepseek-v4-flash`). |
 | Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
 
 ### The pieces
@@ -138,7 +144,7 @@ brew install octos-org/tap/octos
 npm install -g @octos-org/octos
 ```
 
-Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
+The npm package installs the full release bundle — the `octos` server (with the web app and dashboard embedded) and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. The Homebrew formula currently builds from source without the embedded web app / dashboard SPAs. Unlike `install.sh`, neither sets up a background service; run `octos serve` yourself.
 
 Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
 
