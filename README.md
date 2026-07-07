@@ -2,6 +2,50 @@
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
+Octos is your own AI assistant, running on your own computer. Install one small program, paste an API key from any major AI provider (Anthropic, OpenAI, Gemini, DeepSeek, …), and chat with an agent that can run code, browse the web, remember things, schedule jobs, and build documents — from your browser, your terminal, or apps like Telegram, WhatsApp, and Discord. Everything stays on your machine.
+
+## Start here
+
+The fastest way to a working assistant (macOS/Linux with [Homebrew](https://brew.sh), or any platform with [Node](https://nodejs.org)):
+
+```bash
+# 1. Install
+brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
+
+# 2. Pick your AI provider and paste its API key (interactive)
+octos init
+
+# 3. Start your agent with password-free local sign-in
+octos serve --solo
+```
+
+Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
+
+Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [Option 2](#option-2-self-hosted-local-only) below:
+
+```bash
+# macOS / Linux
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
+```
+
+### If something looks wrong
+
+| Symptom | Fix |
+|---|---|
+| The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
+| The agent doesn't reply | No AI key configured yet — run `octos init`, or add a provider in the dashboard settings. |
+| Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
+
+### The pieces
+
+- **octos** (this repo) — the server. It owns the agent, models, tools, and memory. Install this first.
+- **The web app** — already built in: open `/app/` on your server (chat, voice, projects, slides, admin). Its source lives at [octos-web](https://github.com/octos-org/octos-web) if you want to hack on the client itself.
+- **[octos-tui](https://github.com/octos-org/octos-tui)** — an optional terminal client, in the spirit of Claude Code.
+
+**Stuck?** [Documentation](https://octos-org.github.io/octos/) · [Issues](https://github.com/octos-org/octos/issues)
+
+---
+
 **Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
 
 31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
@@ -12,9 +56,9 @@ Octos is an open-source AI agent platform that lets you run your own AI system o
 
 You can think of it as the **backend operating system for AI agents**. Instead of building a new chatbot stack for every use case, you configure Octos profiles with their own prompts, models, tools, and channels, then manage them from one control plane.
 
-The important part for new users is that Octos can be used in three distinct ways:
+Beyond the quick local setup above, Octos can be deployed three ways:
 
-1. **Octos Cloud signup** — the easiest path; create an account, choose a node name, and run the generated setup command on your device.
+1. **Octos Cloud signup** — create an account, choose a node name, and run the generated setup command on your device (the signup link comes from your Octos Cloud operator).
 2. **Self-hosted local** — run Octos only on your own machine or local network.
 3. **Self-hosted cloud + tenant pair** — run your own public VPS plus your own tenant device for internet-accessible remote use.
 
@@ -41,7 +85,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 
 ## Choose a setup path
 
-All three paths are valid. The easiest is Octos Cloud signup, but the self-hosted modes are first-class as well.
+If you just want an assistant on your own machine, you already have it — the [Start here](#start-here) steps above are Option 2 in its simplest form. The paths below matter when you want a managed signup, a background service, or public internet access.
 
 | Option | Machines involved | Public internet access | Who manages the infrastructure | Best fit |
 | --- | --- | --- | --- | --- |
@@ -57,7 +101,7 @@ Visual overview:
 
 This is the easiest way to get started.
 
-1. Go to the Octos Cloud signup page.
+1. Go to the Octos Cloud signup page (your Octos Cloud operator provides the portal link — every cloud host deployed with `scripts/cloud-host-deploy.sh` serves one).
 2. Register with your email.
 3. Choose a custom node name.
 4. Run the generated setup command on your device.
