@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use colored::Colorize;
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
@@ -77,6 +77,119 @@ pub struct ChatCommand {
     /// byte-for-byte.
     #[arg(long)]
     pub profile: Option<String>,
+
+    /// FULL AUTONOMY ("yolo"): bypass all approvals AND the sandbox — the
+    /// agent can edit any file and run any command with network access,
+    /// without asking. Equivalent to `--sandbox danger-full-access`. Only
+    /// safe on a local single-user box you trust; risks data loss.
+    ///
+    /// `octos chat` is inherently local single-user, so this resolves through
+    /// the solo runtime mode. The `--yolo` alias is hidden for brevity.
+    #[arg(
+        long = "dangerously-bypass-approvals-and-sandbox",
+        visible_alias = "yolo",
+        default_value_t = false
+    )]
+    pub dangerously_bypass_approvals_and_sandbox: bool,
+
+    /// Sandbox / filesystem reach (codex parity). One of `read-only`,
+    /// `workspace-write` (default), or `danger-full-access`. Mutually
+    /// exclusive with a non-danger combination of `--yolo`.
+    #[arg(long, value_enum)]
+    pub sandbox: Option<ChatSandboxMode>,
+
+    /// When to ask for command approval (codex parity). `ask` (default)
+    /// prompts for risky commands; `never` fails them closed at the tool
+    /// boundary instead of prompting.
+    #[arg(long, value_enum)]
+    pub ask_for_approval: Option<ChatApprovalMode>,
+}
+
+/// `--sandbox` choices, mirroring codex's sandbox modes and octos's
+/// [`PermissionProfile`](octos_agent::PermissionProfile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChatSandboxMode {
+    /// Read-only workspace access; write/edit tools fail.
+    ReadOnly,
+    /// Read/write inside the workspace (default).
+    WorkspaceWrite,
+    /// No sandbox, host filesystem, network on, approvals never ("yolo").
+    DangerFullAccess,
+}
+
+/// `--ask-for-approval` choices, mirroring codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChatApprovalMode {
+    /// Prompt for approval on risky commands (default).
+    Ask,
+    /// Never prompt; risky commands fail closed at the tool boundary.
+    Never,
+}
+
+/// Resolve the chat session's [`EffectivePermissions`] from the CLI flags.
+///
+/// yolo GAP #3 — codex parity. Precedence and conflict rules:
+///   * `--yolo` (a.k.a. `--dangerously-bypass-approvals-and-sandbox`) and
+///     `--sandbox danger-full-access` both select the dangerous profile.
+///   * `--yolo` combined with an explicit NON-danger `--sandbox` is
+///     contradictory and errors (fail closed).
+///   * `--ask-for-approval` overrides the approval policy, EXCEPT it may not
+///     contradict the dangerous profile (which is always `never`).
+///
+/// `octos chat` is inherently local single-user, so the dangerous profile is
+/// resolved through [`RuntimeMode::Solo`](octos_agent::RuntimeMode) — a
+/// legitimate use of solo here, unlike the multi-tenant `serve` path.
+pub fn resolve_chat_permissions(
+    yolo: bool,
+    sandbox: Option<ChatSandboxMode>,
+    approval: Option<ChatApprovalMode>,
+) -> Result<octos_agent::EffectivePermissions> {
+    use octos_agent::{ApprovalPolicy, EffectivePermissions, PermissionProfile, RuntimeMode};
+
+    // Determine the requested profile, folding `--yolo` and `--sandbox`
+    // together and rejecting contradictions.
+    let profile = match (yolo, sandbox) {
+        // `--yolo` alone, or `--yolo`/`--sandbox danger-full-access` agreeing.
+        (true, None) | (true, Some(ChatSandboxMode::DangerFullAccess)) => {
+            PermissionProfile::DangerFullAccess
+        }
+        // `--yolo` with a non-danger sandbox is contradictory.
+        (true, Some(other)) => {
+            return Err(eyre!(
+                "--dangerously-bypass-approvals-and-sandbox (--yolo) conflicts with \
+                 --sandbox {:?}: yolo implies danger-full-access",
+                other
+            ));
+        }
+        (false, Some(ChatSandboxMode::ReadOnly)) => PermissionProfile::ReadOnly,
+        (false, Some(ChatSandboxMode::WorkspaceWrite)) | (false, None) => {
+            PermissionProfile::WorkspaceWrite
+        }
+        (false, Some(ChatSandboxMode::DangerFullAccess)) => PermissionProfile::DangerFullAccess,
+    };
+
+    // `octos chat` is local single-user; the dangerous profile is legitimately
+    // resolved via Solo. `for_runtime` still centralizes the danger gate.
+    let mut permissions = EffectivePermissions::for_runtime(profile, RuntimeMode::Solo)
+        .map_err(|err| eyre!("{err}"))?;
+
+    // Apply an explicit `--ask-for-approval` override, guarding against a
+    // contradiction with the always-`never` dangerous profile.
+    if let Some(approval) = approval {
+        let requested = match approval {
+            ChatApprovalMode::Ask => ApprovalPolicy::Ask,
+            ChatApprovalMode::Never => ApprovalPolicy::Never,
+        };
+        if permissions.is_dangerous() && requested != ApprovalPolicy::Never {
+            return Err(eyre!(
+                "--ask-for-approval ask conflicts with danger-full-access, \
+                 which never asks for approval"
+            ));
+        }
+        permissions = permissions.with_approval_policy(requested);
+    }
+
+    Ok(permissions)
 }
 
 /// Exit commands.
@@ -264,9 +377,40 @@ impl ChatCommand {
             profile_source_label
         );
 
-        // Create tool registry (with sandbox if configured)
-        let sandbox = octos_agent::create_sandbox(&config.sandbox);
-        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+        // yolo GAP #3: resolve the effective permissions from the CLI flags
+        // (codex parity: --yolo / --sandbox / --ask-for-approval). `octos
+        // chat` is inherently local single-user, so a dangerous profile
+        // legitimately resolves through RuntimeMode::Solo.
+        //
+        // Guardrails PRESERVED in yolo (codex parity): hooks
+        // `before_tool_call` deny still runs (wired further below); `ToolPolicy`
+        // deny lists still apply (resolved per-provider below); SSRF +
+        // `BLOCKED_ENV_VARS` are untouched (enforced inside the tools/sandbox
+        // regardless of profile). yolo only relaxes the approval prompt, the
+        // shell command policy (SafePolicy→AllowAll), the filesystem scope
+        // (workspace→host), and the sandbox (off) — nothing else.
+        let permissions = resolve_chat_permissions(
+            self.dangerously_bypass_approvals_and_sandbox,
+            self.sandbox,
+            self.ask_for_approval,
+        )?;
+        if permissions.is_dangerous() {
+            // Codex-style one-line RED warning on stderr.
+            eprintln!(
+                "{}",
+                "⚠ full access — can edit any file and run commands with network, \
+                 without approval; risk of data loss"
+                    .red()
+                    .bold()
+            );
+        }
+
+        // Create tool registry under the resolved permissions. The sandbox is
+        // derived from the config default with the permission profile applied
+        // (a dangerous profile disables the sandbox and forces network on).
+        let effective_sandbox_config = permissions.apply_to_sandbox(&config.sandbox);
+        let sandbox = octos_agent::create_sandbox(&effective_sandbox_config);
+        let mut tools = ToolRegistry::with_builtins_and_permissions(&cwd, sandbox, permissions);
 
         // Open tool config store for user-customizable tool defaults
         let tool_config = std::sync::Arc::new(
@@ -386,6 +530,14 @@ impl ChatCommand {
                 Err(e) => eprintln!("Warning: skill MCP initialization failed: {e}"),
             }
         }
+
+        // yolo GAP #2/#3: plugin tools are registered directly on `tools`
+        // above (chat does not go through `rebind_cwd_with_permissions`), so
+        // thread the session approval context into them here. Under `never` a
+        // high-risk plugin fails closed; under danger-full-access it
+        // auto-allows — matching the shell/coding tools built with the same
+        // permissions.
+        tools.apply_permissions_to_plugin_tools(permissions);
 
         // Pipeline tool (DOT-based multi-step workflows, with plugin access).
         // Section B (codex review follow-up): propagate
@@ -563,7 +715,19 @@ impl ChatCommand {
         // `octos-core` drops the entry and logs a warning per skip.
         let canonical_skill_dirs: Vec<PathBuf> =
             octos_core::canonicalize_skill_read_zones(&plugin_dirs);
-        let session_scope = {
+        // yolo GAP #3: mirror the serve path (session.rs) — a
+        // danger-full-access session resolves to `FilesystemScope::Host` and
+        // the file tools deliberately keep their absolute-host reach. They
+        // PREFER an attached `ctx.session_scope` over their `filesystem_scope`,
+        // so attaching a solo scope here would silently re-fence a session the
+        // operator explicitly opened up. Leave the scope unset under Host.
+        let session_scope = if permissions.filesystem_scope.is_host() {
+            tracing::debug!(
+                "skipping SessionScope: --yolo/danger-full-access grants Host \
+                 filesystem access — file tools must keep their host reach"
+            );
+            None
+        } else {
             let base = SessionScope::solo(absolute_cwd.clone(), Vec::new()).expect(
                 "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
             );
@@ -577,7 +741,7 @@ impl ChatCommand {
                     SessionScope::solo(absolute_cwd.clone(), Vec::new())
                         .expect("absolutized cwd still valid")
                 });
-            Arc::new(scope)
+            Some(Arc::new(scope))
         };
 
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
@@ -588,8 +752,10 @@ impl ChatCommand {
             .with_profile(profile_arc.clone())
             .with_file_state_cache(file_state_cache)
             .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator)
-            .with_session_scope(session_scope);
+            .with_subagent_summary_generator(subagent_summary_generator);
+        if let Some(session_scope) = session_scope {
+            agent = agent.with_session_scope(session_scope);
+        }
 
         // M8.3: if the profile declares a system_prompt_template, try to
         // read it relative to `~/.octos/profiles/<name>/`. The path is a
@@ -952,6 +1118,132 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    // ---- yolo GAP #3: chat permission flags → EffectivePermissions ----
+
+    use octos_agent::{ApprovalPolicy, PermissionProfile};
+
+    #[test]
+    fn should_yield_danger_full_access_when_yolo_flag_set() {
+        // `--yolo` / `--dangerously-bypass-approvals-and-sandbox` maps onto
+        // the codex "danger full access" profile: no approvals, no sandbox,
+        // host filesystem, network on.
+        let perms = resolve_chat_permissions(true, None, None)
+            .expect("--yolo must resolve to danger_full_access");
+        assert_eq!(
+            perms.permission_profile,
+            PermissionProfile::DangerFullAccess
+        );
+        assert_eq!(perms.approval_policy, ApprovalPolicy::Never);
+        assert!(perms.is_dangerous());
+    }
+
+    #[test]
+    fn should_yield_workspace_write_never_when_sandbox_and_approval_flags_set() {
+        // Codex parity: `--sandbox workspace-write --ask-for-approval never`
+        // yields exactly that pair (workspace-write profile, approvals never)
+        // WITHOUT escalating to host/danger.
+        let perms = resolve_chat_permissions(
+            false,
+            Some(ChatSandboxMode::WorkspaceWrite),
+            Some(ChatApprovalMode::Never),
+        )
+        .expect("explicit sandbox + approval flags must resolve");
+        assert_eq!(perms.permission_profile, PermissionProfile::WorkspaceWrite);
+        assert_eq!(perms.approval_policy, ApprovalPolicy::Never);
+        assert!(!perms.is_dangerous());
+    }
+
+    #[test]
+    fn should_default_to_workspace_write_ask_when_no_flags() {
+        let perms =
+            resolve_chat_permissions(false, None, None).expect("no flags is the plain default");
+        assert_eq!(perms.permission_profile, PermissionProfile::WorkspaceWrite);
+        assert_eq!(perms.approval_policy, ApprovalPolicy::Ask);
+    }
+
+    #[test]
+    fn should_map_sandbox_read_only_and_danger_variants() {
+        let ro = resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+        assert_eq!(ro.permission_profile, PermissionProfile::ReadOnly);
+
+        // `--sandbox danger-full-access` is the long-form of `--yolo`.
+        let danger =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::DangerFullAccess), None).unwrap();
+        assert_eq!(
+            danger.permission_profile,
+            PermissionProfile::DangerFullAccess
+        );
+        assert!(danger.is_dangerous());
+    }
+
+    #[test]
+    fn should_reject_conflicting_yolo_and_non_danger_sandbox() {
+        // `--yolo` plus an explicit non-danger `--sandbox` is contradictory;
+        // fail closed rather than silently pick one.
+        let err = resolve_chat_permissions(true, Some(ChatSandboxMode::ReadOnly), None)
+            .expect_err("conflicting flags must error");
+        assert!(
+            err.to_string().contains("sandbox"),
+            "error should explain the sandbox conflict; got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_approval_override_on_danger_sandbox() {
+        // DangerFullAccess implies approvals=never; an explicit
+        // `--ask-for-approval ask` alongside it is contradictory.
+        let err = resolve_chat_permissions(
+            false,
+            Some(ChatSandboxMode::DangerFullAccess),
+            Some(ChatApprovalMode::Ask),
+        )
+        .expect_err("ask-for-approval=ask cannot combine with danger-full-access");
+        assert!(err.to_string().contains("approval"));
+    }
+
+    #[test]
+    fn should_parse_yolo_alias_and_sandbox_flags_via_clap() {
+        // Prove the clap wiring: the hidden `--yolo` alias, the long form,
+        // and both value-enum flags parse into the expected fields.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let yolo = Wrap::parse_from(["prog", "--yolo"]).chat;
+        assert!(yolo.dangerously_bypass_approvals_and_sandbox);
+        let perms = resolve_chat_permissions(
+            yolo.dangerously_bypass_approvals_and_sandbox,
+            yolo.sandbox,
+            yolo.ask_for_approval,
+        )
+        .unwrap();
+        assert!(perms.is_dangerous());
+
+        let long = Wrap::parse_from(["prog", "--dangerously-bypass-approvals-and-sandbox"]).chat;
+        assert!(long.dangerously_bypass_approvals_and_sandbox);
+
+        let explicit = Wrap::parse_from([
+            "prog",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+        ])
+        .chat;
+        assert_eq!(explicit.sandbox, Some(ChatSandboxMode::WorkspaceWrite));
+        assert_eq!(explicit.ask_for_approval, Some(ChatApprovalMode::Never));
+
+        // Default: neither flag present.
+        let bare = Wrap::parse_from(["prog"]).chat;
+        assert!(!bare.dangerously_bypass_approvals_and_sandbox);
+        assert_eq!(bare.sandbox, None);
+        assert_eq!(bare.ask_for_approval, None);
+    }
 
     #[test]
     fn test_resolve_provider_policy_model_id_match() {

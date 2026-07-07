@@ -5749,6 +5749,26 @@ pub(crate) fn supports_local_solo_profile_create(state: &AppState) -> bool {
         && state.user_store.is_some()
 }
 
+/// Whether this server is a genuine local single-user box that may opt into
+/// dangerous permission profiles ("yolo" / `danger_full_access`, approvals
+/// `never`, network `allow`).
+///
+/// SECURITY KEYSTONE (yolo GAP #1): this requires the explicit `--solo`
+/// opt-in (`solo_login_enabled`) IN ADDITION TO `deployment_mode == Local`.
+/// Bare Local mode is NOT sufficient — a hosted fleet daemon runs Local mode
+/// behind a Caddy reverse proxy, so mapping Local unconditionally onto the
+/// dangerous `RuntimeMode::Solo` would let a proxied client be talked into
+/// full host access even though the daemon's *solo login* is separately
+/// gated off. Tying the dangerous-profile relaxation to the SAME opt-in that
+/// gates `profile/local/create` (see [`supports_local_solo_profile_create`])
+/// removes that asymmetry: a fleet config that never sets `--solo` can reach
+/// neither surface. Unlike the solo-login predicate this does NOT require the
+/// profile/user stores, because a dangerous session runtime is bootstrapped
+/// independently of the no-password login primitive.
+fn local_solo_danger_allowed(state: &AppState) -> bool {
+    state.solo_login_enabled && state.deployment_mode == crate::config::DeploymentMode::Local
+}
+
 fn local_profile_error(kind: &str, message: impl Into<String>) -> RpcError {
     RpcError::invalid_params(message).with_data(json!({ "kind": kind }))
 }
@@ -6182,7 +6202,12 @@ fn permission_profile_supported_selections(
     // sessions get `permission_profile_disallowed` from `set`, so the
     // list must omit the dead option rather than render it as a
     // selectable profile.
-    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    //
+    // SECURITY KEYSTONE (yolo GAP #1): additionally require the `--solo`
+    // opt-in — a Caddy-fronted fleet daemon runs Local mode but must NOT
+    // advertise `danger_full_access` as selectable, mirroring the same gate
+    // in `permission_selection_allowed` / `effective_permissions_for_session`.
+    let server_is_local = local_solo_danger_allowed(state);
     let session_is_non_solo_scoped = session_id_encodes_non_solo_scope(session_id);
     if server_is_local && !session_is_non_solo_scoped {
         profiles.push(Selection {
@@ -6446,7 +6471,11 @@ fn permission_selection_allowed(
         Some("solo") => true,
         _ => false,
     };
-    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    // SECURITY KEYSTONE (yolo GAP #1): the relax path requires the explicit
+    // `--solo` opt-in, NOT bare Local mode. A Caddy-fronted fleet daemon runs
+    // Local mode, so `deployment_mode == Local` alone is not a safe proxy for
+    // "single-user box" — see `local_solo_danger_allowed`.
+    let server_is_local = local_solo_danger_allowed(state);
     // #1162: defense-in-depth. A session whose key encodes a non-solo
     // tenant scope (e.g. `coding:tenant:m12-negative`) MUST tighten the
     // gate even when the client omitted the `runtime_mode` override.
@@ -6476,8 +6505,17 @@ fn effective_permissions_for_session(
         Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
         Mode::DangerFullAccess => octos_agent::PermissionProfile::DangerFullAccess,
     };
+    // SECURITY KEYSTONE (yolo GAP #1): map Local onto the dangerous-capable
+    // `RuntimeMode::Solo` ONLY when the operator opted in via `--solo`.
+    // Without the opt-in, a Local server resolves as `RuntimeMode::Local`, so
+    // `EffectivePermissions::for_runtime` rejects `danger_full_access` (a
+    // Caddy-fronted fleet daemon can never bootstrap a dangerous session
+    // runtime). See `local_solo_danger_allowed`.
     let runtime_mode = match state.deployment_mode {
-        crate::config::DeploymentMode::Local => octos_agent::RuntimeMode::Solo,
+        crate::config::DeploymentMode::Local if local_solo_danger_allowed(state) => {
+            octos_agent::RuntimeMode::Solo
+        }
+        crate::config::DeploymentMode::Local => octos_agent::RuntimeMode::Local,
         crate::config::DeploymentMode::Tenant => octos_agent::RuntimeMode::Tenant,
         crate::config::DeploymentMode::Cloud => octos_agent::RuntimeMode::Cloud,
     };
@@ -25000,7 +25038,15 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: Local + the explicit `--solo` opt-in is what permits
+        // danger; bare Local no longer does (see
+        // `danger_full_access_requires_solo_opt_in_on_local_server`). This
+        // test exercises the deployment-mode / runtime_mode-override gates on
+        // top of that opt-in, so enable it here.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
         let session_id = SessionKey("local:permission-profile-test".into());
         let listed = permission_profile_list_result(
             &local,
@@ -25101,6 +25147,147 @@ ignore = []
         );
     }
 
+    /// SECURITY KEYSTONE (yolo GAP #1): a Local-mode server WITHOUT the
+    /// `--solo` opt-in (`solo_login_enabled == false`) must reject
+    /// `danger_full_access` — a Caddy-fronted fleet daemon runs Local mode,
+    /// so bare `deployment_mode == Local` is NOT a safe proxy for a
+    /// single-user box. Mirrors `solo_create_403_when_opt_in_disabled` and
+    /// the agent-crate `dangerous_profile_requires_solo_runtime`. Once the
+    /// operator opts in, the same request succeeds.
+    #[test]
+    fn danger_full_access_requires_solo_opt_in_on_local_server() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        // Local mode, NO --solo opt-in (empty_for_tests: solo_login_enabled=false).
+        let local_no_solo = AppState::empty_for_tests();
+        assert_eq!(
+            local_no_solo.deployment_mode,
+            crate::config::DeploymentMode::Local
+        );
+        assert!(!local_no_solo.solo_login_enabled);
+        let session_id = SessionKey("local:yolo-solo-gate".into());
+
+        let denied = permission_profile_set_result(
+            &local_no_solo,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect_err("danger must be refused on a Local server without the --solo opt-in");
+        assert_eq!(denied.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            denied.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+
+        // The list must not advertise a dead option either.
+        let listed = permission_profile_list_result(
+            &local_no_solo,
+            octos_core::ui_protocol::PermissionProfileListParams {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(
+            !listed
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "a Local server without --solo must NOT advertise danger_full_access",
+        );
+
+        // Same server WITH the opt-in enabled: danger is allowed.
+        let local_solo = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
+        let allowed = permission_profile_set_result(
+            &local_solo,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect("Local + --solo opt-in should allow danger_full_access");
+        assert_eq!(allowed.session_id, session_id);
+
+        let listed_solo = permission_profile_list_result(
+            &local_solo,
+            octos_core::ui_protocol::PermissionProfileListParams {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(
+            listed_solo
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "a Local server WITH --solo must advertise danger_full_access",
+        );
+    }
+
+    /// GAP #1 follow-through: `effective_permissions_for_session` must map
+    /// Local → Solo ONLY when the `--solo` opt-in is set. Without it, a
+    /// stored `danger_full_access` selection resolves through
+    /// `RuntimeMode::Local`, which `EffectivePermissions::for_runtime`
+    /// rejects — so a fleet daemon cannot bootstrap a dangerous session
+    /// runtime even if a selection was somehow persisted.
+    #[test]
+    fn effective_permissions_rejects_danger_without_solo_opt_in() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSelection,
+        };
+
+        let session_id = SessionKey("local:yolo-effective-gate".into());
+        // Persist a dangerous selection directly in the store (bypassing the
+        // set gate) to prove the resolution path is independently guarded.
+        session_permission_profiles().set(
+            session_id.clone(),
+            PermissionProfileSelection {
+                mode: Mode::DangerFullAccess,
+                network: Network::Allow,
+            },
+            Some(octos_agent::ApprovalPolicy::Never),
+        );
+
+        let local_no_solo = AppState::empty_for_tests();
+        let err = effective_permissions_for_session(&local_no_solo, &session_id)
+            .expect_err("no --solo opt-in ⇒ Local resolves as RuntimeMode::Local, danger rejected");
+        assert_eq!(err.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+
+        let local_solo = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
+        let permissions = effective_permissions_for_session(&local_solo, &session_id)
+            .expect("Local + --solo resolves danger_full_access");
+        assert!(permissions.is_dangerous());
+        assert_eq!(
+            permissions.approval_policy,
+            octos_agent::ApprovalPolicy::Never
+        );
+        // The session key is unique to this test, so the process-global store
+        // holds no cross-test state — no explicit cleanup needed.
+    }
+
     /// Codex P1 follow-up to #1086: when a Local server receives an
     /// explicit `runtime_mode: "local"` override, that value must NOT be
     /// treated as solo-relaxed. `local` is the multi-profile-but-local
@@ -25113,7 +25300,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: enable the `--solo` opt-in so this test isolates the
+        // runtime_mode-override tighten-only behaviour (the opt-in gate itself
+        // is covered by `danger_full_access_requires_solo_opt_in_on_local_server`).
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
         let session_id = SessionKey("local:permission-profile-local-override".into());
 
         let local_override_denied = permission_profile_set_result(
@@ -25207,7 +25400,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: enable the `--solo` opt-in so the "solo override still
+        // relaxes" sanity assertions below reach the relaxed path; the stray
+        // overrides must still fail closed regardless.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
         let session_id = SessionKey("local:unrecognized-runtime-mode".into());
 
         for stray_override in [
@@ -25294,7 +25493,14 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: enable the `--solo` opt-in so a denial here is
+        // attributable to the tenant/cloud SCOPE marker rather than to the
+        // missing opt-in (which would deny every case trivially and hide the
+        // scope-gate regression this test guards).
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         for (label, session_id) in [
             // profile_id-slot markers (`with_profile` shape).
@@ -25397,7 +25603,12 @@ ignore = []
     fn danger_full_access_omitted_from_list_for_tenant_scoped_session_per_1162() {
         use octos_core::ui_protocol::{PermissionProfileListParams, PermissionProfileMode as Mode};
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: the "solo-scoped session keeps danger in the list"
+        // assertion requires the `--solo` opt-in to be on.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         let tenant_session = SessionKey::with_profile("tenant-a", "api", "m12-negative");
         let tenant_listing = permission_profile_list_result(
@@ -25449,7 +25660,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: these cases assert danger is STILL allowed (chat-id
+        // text is not a structural scope signal), so the `--solo` opt-in must
+        // be on for the relaxed path to be reachable.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         for raw_session_id in [
             // chat-id contains `cloud-migration` / `tenant-demo` — must NOT
@@ -25527,7 +25744,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: the "solo-scoped session keeps allowing danger" branch
+        // requires the `--solo` opt-in; the tenant-override rejection holds
+        // regardless.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         // Solo-scoped session_id on Local + no override → existing relaxed
         // path keeps allowing danger_full_access. The new gate must not
