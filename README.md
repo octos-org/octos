@@ -4,7 +4,7 @@
 
 **Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
 
-31MB static binary. ~140 REST endpoints. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
+31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
 
 ## What is Octos?
 
@@ -22,18 +22,22 @@ The important part for new users is that Octos can be used in three distinct way
 
 Most agentic systems are single-tenant chat assistants — one user, one model, one conversation at a time. Octos is different:
 
-- **API-first Agentic OS**: ~140 REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks, SSE). Any frontend — web, mobile, CLI, CI/CD — can be built on top.
+- **API-first Agentic OS**: 80+ REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks) plus **UI Protocol v1** — a JSON-RPC contract over WebSocket and stdio for interactive clients. Any frontend — web, mobile, CLI, CI/CD — can be built on top.
 - **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile is a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts.
 - **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime, with bounded concurrency for fleet stability.
 - **Swarm dispatcher**: Fan contracts to N sub-agents, aggregate artifacts, gate through validator, roll up cost — wired into `/api/swarm/dispatch`.
 - **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, lane scoring, circuit breakers.
 - **LRU tool deferral**: ~15 active tools for fast LLM reasoning, ~50 on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
 - **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
-- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, Matrix, Feishu.
+- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, DingTalk, Matrix, Feishu.
 - **Sticky thread_id + committed_seq**: Every SSE event is bound to a thread; replay is deterministic by committed sequence number (M8.10).
 - **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction, three-tier).
+- **Autonomy loops & goals**: `/loop` runs fixed-interval or self-paced maintenance loops; goals continue across turns with checkpointed continuations — the agent keeps working between your messages.
+- **Session time-travel**: `session/rollback` RPC with resume/rewind checkpoint pickers in both clients; every session can be rolled back to any prior user turn.
+- **Live reasoning**: streams the model's thinking as it happens, with per-session `/thinking` effort control.
+- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, and an OMiniX runtime provider for local ASR/TTS.
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
-- **Sandbox isolation**: bwrap + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
+- **Sandbox isolation**: bwrap + Landlock/seccomp + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
 ## Choose a setup path
 
@@ -98,7 +102,7 @@ brew install octos-org/tap/octos
 npm install -g @octos-org/octos
 ```
 
-Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `voice`, `clock`, `weather`) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
+Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, `skill-evolve`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
 
 Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
 
@@ -316,9 +320,23 @@ octos chat
 # Multi-channel gateway
 octos gateway
 
-# Web dashboard + REST API
+# Web dashboard + REST API + UI Protocol
 octos serve
+octos serve --solo     # same, plus password-free local login for the web app
+octos serve --stdio    # UI Protocol over stdio (how octos-tui embeds a backend)
 ```
+
+The full CLI surface (see `octos help`):
+
+| Command | Purpose |
+|---|---|
+| `chat` / `gateway` / `serve` | the three runtime modes |
+| `init` / `status` / `doctor` | workspace init, node status, environment diagnostics |
+| `auth` / `account` / `admin` | provider login (OAuth/PKCE), sub-accounts, tenant & tunnel admin |
+| `channels` / `cron` / `skills` | messaging channels, scheduled jobs, skill install/remove |
+| `mcp-serve` | run octos as an MCP server, so outer orchestrators can drive it as a sub-agent |
+| `office` | PPTX/DOCX/XLSX manipulation from the shell |
+| `update` / `clean` / `completions` / `docs` | release check, cache cleanup, shell completions, doc generation |
 
 For a repo-local tenant deploy (builds from source, sets up the same service + tunnel as `install.sh`), use `scripts/local-tenant-deploy.sh --full`.
 
@@ -347,6 +365,14 @@ Use this when:
 
 Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
 
+## Clients and the UI Protocol
+
+Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC contract carried on WebSocket (`/api/ui-protocol/ws`) or stdio (`octos serve --stdio`). It covers session open with cursor replay, streamed turns, durable persistence events, tool activity, approvals, background tasks, and rollback. The protocol spec is the contract: server and clients release independently against it.
+
+- **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, sites, and the admin dashboard. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys.
+- **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
+- **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
+
 ## Documentation
 
 📖 **[Full Documentation](https://octos-org.github.io/octos/)** — installation, configuration, channels, providers, memory, skills, advanced features, and more.
@@ -365,7 +391,7 @@ Skip it when you just need the CLI — `cargo install --path crates/octos-cli --
 
 ## Architecture
 
-10 `octos-*` crates + 14 app-skill crates + 1 platform-skill crate (25 workspace members total). The runtime auto-installs only the 9 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
+12 `octos-*` crates + 13 app-skill crates + 1 platform-skill crate (26 workspace members total). The runtime auto-installs only the 8 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
 
 ```
 octos-cli   (CLI entrypoint, REST API server, dashboard, config watcher, wizard)
@@ -378,23 +404,25 @@ octos-agent (agent loop, tool registry, MCP, hooks, three-tier compaction,
    ├─ octos-memory    (long-term + episodic + HNSW vector + BM25 hybrid search)
    ├─ octos-pipeline  (DOT-graph workflows, per-node model, bounded fan-out)
    ├─ octos-plugin    (skill manifest, discovery, gating, lifecycle, protocol v2)
-   ├─ octos-sandbox   (platform sandbox helper binary)
+   ├─ octos-sandbox   (platform sandbox helper binary — bwrap/Landlock/seccomp)
    ├─ octos-swarm     (PM/swarm dispatcher, ledger, topology, validator gate)
+   ├─ octos-diagnostics (shared doctor diagnostics + update planning)
+   ├─ octos-dora-mcp  (compat re-export of the dora bridge in octos-agent)
    └─ octos-core      (Task, Message, Error types — no internal deps)
 
 Runtime view:
-  octos serve (control plane + dashboard, ~140 REST endpoints)
+  octos serve (control plane + dashboard, 80+ REST endpoints + UI Protocol WS)
     ├── Profile A → gateway process (Telegram, WhatsApp)
     ├── Profile B → gateway process (Feishu, Slack, Matrix)
     └── Profile C → gateway process (CLI)
          │
          ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, Moonshot, …)
          │   └── AdaptiveRouter → ProviderChain → RetryProvider
-         ├── Tool Registry (~50 built-in + plugins + 9 app-skills)
+         ├── Tool Registry (~50 built-in + plugins + 8 app-skills)
          │   └── LRU Deferral (~15 active, activate on demand)
          ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
          ├── Swarm Dispatcher (fan-out → aggregate → validator gate → cost rollup)
-         ├── Sandbox (bwrap / sandbox-exec / Docker / AppContainer)
+         ├── Sandbox (bwrap / Landlock+seccomp / sandbox-exec / Docker / AppContainer)
          ├── Session Store (JSONL, LRU cache, three-tier compaction, thread_id)
          ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
          └── Skills (bundled + installable from octos-hub)
