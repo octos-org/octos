@@ -2,20 +2,23 @@
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
-Octos is your own AI assistant, running on your own computer. Install one small program, paste an API key from any major AI provider (Anthropic, OpenAI, Gemini, DeepSeek, …), and chat with an agent that can run code, browse the web, remember things, schedule jobs, and build documents — from your browser, your terminal, or apps like Telegram, WhatsApp, and Discord. Everything stays on your machine.
+Octos is your own AI assistant, running on your own computer. Install one small program, connect any major AI provider (Anthropic, OpenAI, Gemini, DeepSeek, …), and chat with an agent that can run code, browse the web, remember things, schedule jobs, and build documents — from your browser, your terminal, or apps like Telegram, WhatsApp, and Discord. Your sessions, memory, and data stay on your machine — prompts go only to the AI provider you choose.
 
 ## Start here
 
-The fastest way to a working assistant (macOS/Linux with [Homebrew](https://brew.sh), or any platform with [Node](https://nodejs.org)):
+The fastest way to a working assistant, on the supported platforms (macOS Apple Silicon, Linux x86-64/arm64, Windows x64):
 
 ```bash
 # 1. Install
 brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
 
-# 2. Pick your AI provider and paste its API key (interactive)
+# 2. Choose your AI provider and models (interactive)
 octos init
 
-# 3. Start your agent with password-free local sign-in
+# 3. Sign in to the provider — or paste its API key; stored securely
+octos auth login
+
+# 4. Start your agent with password-free local sign-in
 octos serve --solo
 ```
 
@@ -33,7 +36,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 | Symptom | Fix |
 |---|---|
 | The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
-| The agent doesn't reply | No AI key configured yet — run `octos init`, or add a provider in the dashboard settings. |
+| The agent doesn't reply | No provider credential yet — run `octos auth login` (or export the provider's API key env var before `octos serve`, or add the key in the dashboard settings). |
 | Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
 
 ### The pieces
