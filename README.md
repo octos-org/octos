@@ -102,7 +102,7 @@ brew install octos-org/tap/octos
 npm install -g @octos-org/octos
 ```
 
-Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, `skill-evolve`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
+Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
 
 Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
 
@@ -369,7 +369,7 @@ Skip it when you just need the CLI — `cargo install --path crates/octos-cli --
 
 Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC contract carried on WebSocket (`/api/ui-protocol/ws`) or stdio (`octos serve --stdio`). It covers session open with cursor replay, streamed turns, durable persistence events, tool activity, approvals, background tasks, and rollback. The protocol spec is the contract: server and clients release independently against it.
 
-- **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, sites, and the admin dashboard. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys.
+- **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
 - **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
 - **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
 
