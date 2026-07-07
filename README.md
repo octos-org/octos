@@ -41,9 +41,9 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 
 ### The pieces
 
-- **octos** (this repo) — the server. It owns the agent, models, tools, and memory. Install this first.
-- **The web app** — already built in: open `/app/` on your server (chat, voice, projects, slides, admin). Its source lives at [octos-web](https://github.com/octos-org/octos-web) if you want to hack on the client itself.
-- **[octos-tui](https://github.com/octos-org/octos-tui)** — an optional terminal client, in the spirit of Claude Code.
+- **octos** (this repo) — the **kernel**: the agent runtime, LLM providers, tools, sandbox, memory, channels, and the API everything else speaks. Install this first — then live in a client:
+- **[octos-web](https://github.com/octos-org/octos-web)** — the full app experience in the browser (chat, voice, projects, slides, admin, and the hosted multi-tenant signup). A build ships inside the server — open `/app/`.
+- **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal experience, in the spirit of Claude Code.
 
 **Stuck?** [Documentation](https://octos-org.github.io/octos/) · [Issues](https://github.com/octos-org/octos/issues)
 
@@ -61,7 +61,7 @@ You can think of it as the **backend operating system for AI agents**. Instead o
 
 Beyond the quick local setup above, Octos can be deployed three ways:
 
-1. **Octos Cloud signup** — create an account, choose a node name, and run the generated setup command on your device (the signup link comes from your Octos Cloud operator).
+1. **Octos Cloud signup** — a hosted multi-tenant account; the signup experience belongs to the web client (see the [octos-web README](https://github.com/octos-org/octos-web#octos-cloud)).
 2. **Self-hosted local** — run Octos only on your own machine or local network.
 3. **Self-hosted cloud + tenant pair** — run your own public VPS plus your own tenant device for internet-accessible remote use.
 
@@ -92,7 +92,7 @@ If you just want an assistant on your own machine, you already have it — the [
 
 | Option | Machines involved | Public internet access | Who manages the infrastructure | Best fit |
 | --- | --- | --- | --- | --- |
-| **1. Octos Cloud signup** | Your device + Octos Cloud | Yes | Octos Cloud + you | Fastest path |
+| **1. Octos Cloud signup** | Your device + Octos Cloud | Yes | Octos Cloud + you | Hosted accounts — [guide in octos-web](https://github.com/octos-org/octos-web#octos-cloud) |
 | **2. Self-hosted local-only** | One machine | No | You | Local/private use |
 | **3. Self-hosted cloud + tenant pair** | Your VPS + your device | Yes | You | Full self-hosting with remote access |
 
@@ -102,26 +102,15 @@ Visual overview:
 
 ### Option 1: Sign up on Octos Cloud
 
-This is the easiest way to get started.
+Octos Cloud is the hosted, multi-tenant way in: register with your email on an
+operator's portal, pick a node name, and run one generated setup command on
+your device. The signup and account experience is part of the **web client** —
+the walkthrough lives in the
+[octos-web README (Octos Cloud)](https://github.com/octos-org/octos-web#octos-cloud).
 
-1. Go to the Octos Cloud signup page (your Octos Cloud operator provides the portal link — every cloud host deployed with `scripts/cloud-host-deploy.sh` serves one).
-2. Register with your email.
-3. Choose a custom node name.
-4. Run the generated setup command on your device.
-
-That setup command is personalized for your machine and includes the values needed to connect your device to the Octos cloud relay. After setup, your Octos instance is accessible on the public internet under your node name.
-
-When you click `Send Code` on the portal, check your Spam folder if the email does not arrive right away. It is also a good idea to add the Octos sending domain/address to your address book so future login and setup emails are delivered reliably.
-
-After signup, the portal shows your node details, public URL, and the setup command to run on your device:
-
-<img src="images/octos-reg-ss.png" alt="Octos Cloud signup response" width="50%" />
-
-This path is the best choice if you want:
-
-- the fastest time to first working system
-- public access without running your own VPS
-- a hosted signup and tunnel flow
+This repo's side of that story is the **server infrastructure** an operator
+runs to offer it: see [Option 3](#option-3-self-hosted-cloud--tenant-pair)
+for deploying the cloud host (portal, relay, wildcard TLS) yourself.
 
 ### Option 2: Self-hosted local-only
 
