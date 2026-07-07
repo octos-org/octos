@@ -161,3 +161,9 @@ test_a2.md
 tsconfig.tsbuildinfo
 .superpowers/
 .claude/scheduled_tasks.lock
+
+# Runtime data dirs accidentally committed once (#200) — never track
+.crew/
+**/.crew/
+# Stray Astro scaffold guard (no Astro project in this repo)
+.astro/
