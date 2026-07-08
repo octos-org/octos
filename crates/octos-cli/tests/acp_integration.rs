@@ -59,6 +59,56 @@ impl octos_llm::LlmProvider for MockLlm {
     }
 }
 
+/// A `MockLlm` that returns a per-call assistant reply and records, for every
+/// `chat()` call, the full set of message *contents* it was handed (system +
+/// accumulated history + the current user turn). The integration test inspects
+/// these snapshots to prove multi-turn history accumulates across prompts.
+struct RecordingLlm {
+    /// One entry per `chat()` call: the `content` of every incoming message.
+    seen: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Assistant reply text keyed by call index (0-based); falls back to a
+    /// generic reply if the call index is beyond the vec.
+    replies: Vec<String>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl octos_llm::LlmProvider for RecordingLlm {
+    async fn chat(
+        &self,
+        messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        let idx = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen
+            .lock()
+            .await
+            .push(messages.iter().map(|m| m.content.clone()).collect());
+        let reply = self
+            .replies
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("reply-{idx}"));
+        Ok(octos_llm::ChatResponse {
+            content: Some(reply),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn provider_name(&self) -> &str {
+        "recording-mock"
+    }
+
+    fn model_id(&self) -> &str {
+        "recording-1"
+    }
+}
+
 /// Pull the text out of an assistant-message `session/update`, if that's what it
 /// is.
 fn agent_message_text(update: &SessionUpdate) -> Option<String> {
@@ -158,5 +208,128 @@ async fn should_stream_assistant_message_and_end_turn_when_driven_through_acp_in
     assert!(
         assistant_texts.iter().any(|t| t.contains(reply)),
         "expected an AgentMessageChunk containing {reply:?}; recorded updates: {recorded:?}"
+    );
+}
+
+/// Multi-turn history must ACCUMULATE across prompts: turn N's `process_message`
+/// must see the messages from all earlier turns. This is driven over the real
+/// ACP handler wiring (`initialize -> session/new -> prompt x3`) with a
+/// `RecordingLlm` that snapshots the messages it is handed each turn.
+///
+/// `ConversationResponse.messages` for a text-only (no-tool) `EndTurn` is just
+/// the turn's user message (the assistant's final text is streamed live and
+/// carried in `content`, not re-persisted as a history `Message`), so history
+/// accumulation is observable via the USER turns surviving.
+///
+/// The buggy `*h = resp.messages` (replace) only surfaces from the THIRD turn:
+/// after turn 1 the stored history is [user1] and after turn 2 it is REPLACED
+/// by [user2], dropping user1 — so turn 3 would no longer see user1. A
+/// two-prompt drive can't catch it (turn 2 still sees user1 under the bug); we
+/// therefore drive three prompts and assert turn 3 still sees user1, and that
+/// the incoming message count grows every turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_accumulate_conversation_history_across_multiple_prompts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    // Distinct, greppable replies so we can assert turn-1 content survives.
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
+        seen: seen.clone(),
+        replies: vec![
+            "ASSISTANT_ONE".to_string(),
+            "ASSISTANT_TWO".to_string(),
+            "ASSISTANT_THREE".to_string(),
+        ],
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory = TestAgentFactory::new(llm, memory_dir, cwd.clone());
+    let transport = OctosAcpAgentTransport::new(factory);
+
+    let prompt_cwd = cwd.clone();
+
+    Client
+        .builder()
+        .name("octos-acp-history-client")
+        .on_receive_notification(
+            async move |_notif: SessionNotification,
+                        _cx: ConnectionTo<agent_client_protocol::Agent>| { Ok(()) },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            transport,
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                    .block_task()
+                    .await?;
+                let session_id = new_session.session_id;
+
+                for user in ["USER_ONE", "USER_TWO", "USER_THREE"] {
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new(user))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert!(
+                        matches!(prompt.stop_reason, StopReason::EndTurn),
+                        "each turn should EndTurn; got {:?}",
+                        prompt.stop_reason
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect("ACP client run should complete cleanly");
+
+    let snapshots = seen.lock().await;
+    assert_eq!(
+        snapshots.len(),
+        3,
+        "exactly one chat() call per prompt turn"
+    );
+
+    // Flatten each turn's incoming messages into one blob for content checks.
+    let blob = |i: usize| snapshots[i].join("\n");
+
+    // Turn 1 sees only turn-1's user prompt (no prior turns).
+    assert!(blob(0).contains("USER_ONE"), "turn 1 sees its own user msg");
+    assert!(
+        !blob(0).contains("USER_TWO"),
+        "turn 1 cannot see a future turn's user msg"
+    );
+
+    // Turn 3 MUST still see turn-1's user prompt — the core regression:
+    // replacing (instead of appending) history drops user1 by turn 3.
+    let t3 = blob(2);
+    assert!(
+        t3.contains("USER_ONE"),
+        "turn 3 must still see turn 1's user msg; history was dropped. turn-3 messages: {:?}",
+        snapshots[2]
+    );
+    assert!(
+        t3.contains("USER_TWO"),
+        "turn 3 must also see turn 2's user msg. turn-3 messages: {:?}",
+        snapshots[2]
+    );
+    assert!(t3.contains("USER_THREE"), "turn 3 sees its own user msg");
+
+    // The accumulated history the LLM receives grows every turn (one extra
+    // user message per turn): [sys, u1] -> [sys, u1, u2] -> [sys, u1, u2, u3].
+    assert!(
+        snapshots[0].len() < snapshots[1].len() && snapshots[1].len() < snapshots[2].len(),
+        "incoming message count must grow across turns: {} < {} < {}",
+        snapshots[0].len(),
+        snapshots[1].len(),
+        snapshots[2].len()
     );
 }

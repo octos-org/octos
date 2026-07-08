@@ -426,10 +426,15 @@ impl AcpCommand {
 
 /// Build the `initialize` response advertising octos's agent capabilities.
 ///
-/// Echoes the client's requested protocol version (per ACP the agent replies
-/// with a version it supports; we mirror V1's behaviour by echoing the client
-/// version, which the crate's `InitializeResponse::new` takes directly).
+/// Per ACP the agent must reply with a protocol version it actually supports —
+/// NOT whatever the client requested. This handler implements v1 only, so we
+/// echo the client's version only when it is a version we support (V1);
+/// otherwise (a newer/unknown version) we reply with the latest version we do
+/// support (`ProtocolVersion::LATEST`, currently V1) rather than falsely
+/// advertising support for the requested one.
 fn build_initialize_response(req: &InitializeRequest) -> InitializeResponse {
+    use agent_client_protocol::schema::ProtocolVersion;
+
     // Prompt capabilities: octos consumes plain text prompt blocks today.
     // Image/audio/embedded-context are left false (v1 extracts text only).
     let prompt = PromptCapabilities::new();
@@ -437,7 +442,13 @@ fn build_initialize_response(req: &InitializeRequest) -> InitializeResponse {
         // We accept `session/load` no better than `session/new` today, so do
         // NOT advertise loadSession (leave it false / default).
         .prompt_capabilities(prompt);
-    InitializeResponse::new(req.protocol_version).agent_capabilities(caps)
+
+    let negotiated = if req.protocol_version == ProtocolVersion::V1 {
+        req.protocol_version
+    } else {
+        ProtocolVersion::LATEST
+    };
+    InitializeResponse::new(negotiated).agent_capabilities(caps)
 }
 
 /// Handle `session/new`: build a fresh octos agent and register it.
@@ -515,6 +526,13 @@ fn handle_prompt(
         )));
     };
 
+    // Clear any stale cancel flag from a previous cancelled turn SYNCHRONOUSLY
+    // on the dispatch loop, before spawning the turn. The turn runs in a
+    // spawned task, so any `session/cancel` dispatched AFTER this handler
+    // returns (i.e. for THIS turn) must win — resetting here (not inside the
+    // spawned task) guarantees a later cancel's `store(true)` is not clobbered.
+    session.shutdown.store(false, Ordering::Release);
+
     cx.clone()
         .spawn(run_prompt_turn(session, req, cx, responder))
 }
@@ -533,7 +551,17 @@ async fn run_prompt_turn_deferred(
         map.get(&session_id).cloned()
     };
     match session {
-        Some(session) => run_prompt_turn(session, req, cx, responder).await,
+        Some(session) => {
+            // Reset the stale cancel flag before running the turn. This path is
+            // rare (taken only when the session map was contended at handler
+            // time), and unlike `handle_prompt` the reset here happens inside
+            // the spawned task rather than synchronously on the dispatch loop —
+            // so a `session/cancel` racing the very first poll could still be
+            // clobbered. Best-effort for the contended path; the common path
+            // (`handle_prompt`) resets synchronously and closes the race.
+            session.shutdown.store(false, Ordering::Release);
+            run_prompt_turn(session, req, cx, responder).await
+        }
         None => responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
             "unknown session id: {}",
             session_id.0
@@ -549,9 +577,11 @@ async fn run_prompt_turn(
     cx: ConnectionTo<Client>,
     responder: agent_client_protocol::Responder<PromptResponse>,
 ) -> std::result::Result<(), AcpError> {
-    // Fresh turn: clear any stale cancel flag from a previous cancelled turn.
-    session.shutdown.store(false, Ordering::Release);
-
+    // NOTE: the stale-cancel-flag reset does NOT happen here. It is done
+    // synchronously on the dispatch loop in `handle_prompt` (and in
+    // `run_prompt_turn_deferred` for the rare contended path) BEFORE this turn
+    // is spawned, so a `session/cancel` dispatched for this turn correctly wins
+    // instead of being clobbered by a reset in this spawned task.
     let user_text = extract_prompt_text(&req.prompt);
     let history = { session.history.lock().await.clone() };
 
@@ -570,11 +600,16 @@ async fn run_prompt_turn(
     let cancelled = session.shutdown.load(Ordering::Acquire);
     let response = match outcome {
         Ok(resp) => {
-            // Persist the full turn (user + assistant + tool messages) so the
-            // next prompt sees the context.
+            // Persist this turn's messages (user + assistant + tool messages).
+            // `ConversationResponse.messages` is THIS-TURN-ONLY (the user
+            // message at front + the assistant/tool messages produced this
+            // turn); it does NOT include prior history. The stored history
+            // still holds the earlier turns (we only cloned it above, never
+            // cleared it), so APPEND — replacing would drop every earlier turn
+            // and the agent would forget context after the second prompt.
             {
                 let mut h = session.history.lock().await;
-                *h = resp.messages.clone();
+                h.extend(resp.messages);
             }
             // Distinguish a client-driven cancel from a natural end-of-turn.
             let stop_reason = if cancelled {
@@ -638,9 +673,12 @@ fn new_session_id() -> SessionId {
 ///
 /// octos's agent loop consumes a single text prompt; we concatenate the text of
 /// every `ContentBlock::Text` (and the text payload of embedded text
-/// resources), joining multiple blocks with newlines. Non-text blocks (image,
-/// audio, resource links) are skipped in v1 — we advertise text-only prompt
-/// capabilities at `initialize`.
+/// resources), joining multiple blocks with newlines. `ContentBlock::ResourceLink`
+/// is BASELINE ACP prompt content (file/context attachments), so we surface each
+/// link as a `[Resource: <title|name> (<uri>)]` reference (plus its description on
+/// the next line, if any) rather than dropping it. Binary non-text blocks (image,
+/// audio) are still skipped in v1 — we advertise text-only prompt capabilities at
+/// `initialize`.
 fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in blocks {
@@ -653,8 +691,20 @@ fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
                     parts.push(tr.text.clone());
                 }
             }
-            // Non-text blocks (image, audio, resource links) and any future
-            // variants are not consumed by the text-only agent loop. `ContentBlock`
+            // Resource links are baseline ACP prompt content (file/context
+            // attachments). Surface the reference as usable context text so a
+            // prompt made entirely of links still reaches octos with content.
+            ContentBlock::ResourceLink(link) => {
+                let label = link.title.as_deref().unwrap_or(&link.name);
+                let mut part = format!("[Resource: {label} ({})]", link.uri);
+                if let Some(desc) = &link.description {
+                    part.push('\n');
+                    part.push_str(desc);
+                }
+                parts.push(part);
+            }
+            // Remaining non-text blocks (image, audio) and any future variants
+            // are not consumed by the text-only agent loop. `ContentBlock`
             // is `#[non_exhaustive]`, so a catch-all is required.
             _ => {}
         }
@@ -1007,6 +1057,40 @@ mod tests {
     }
 
     #[test]
+    fn should_include_resource_link_reference_when_prompt_has_resource_link() {
+        use agent_client_protocol::schema::v1::ResourceLink;
+        // A resource link with a title + description: the reference (title +
+        // uri) and the description must both surface in the extracted text.
+        let link = ResourceLink::new("main.rs", "file:///repo/src/main.rs")
+            .title("Main entrypoint")
+            .description("The program entrypoint");
+        let blocks = vec![ContentBlock::ResourceLink(link)];
+        let text = extract_prompt_text(&blocks);
+        assert!(
+            text.contains("file:///repo/src/main.rs"),
+            "resource-link uri must be surfaced; got {text:?}"
+        );
+        assert!(
+            text.contains("Main entrypoint"),
+            "resource-link title must be surfaced; got {text:?}"
+        );
+        assert!(
+            text.contains("The program entrypoint"),
+            "resource-link description must be surfaced; got {text:?}"
+        );
+    }
+
+    #[test]
+    fn should_use_resource_link_name_when_title_absent() {
+        use agent_client_protocol::schema::v1::ResourceLink;
+        // No title -> fall back to the link name; no description -> single line.
+        let link = ResourceLink::new("notes.txt", "file:///repo/notes.txt");
+        let blocks = vec![ContentBlock::ResourceLink(link)];
+        let text = extract_prompt_text(&blocks);
+        assert_eq!(text, "[Resource: notes.txt (file:///repo/notes.txt)]");
+    }
+
+    #[test]
     fn should_extract_from_string_convertible_block_via_from_impl() {
         // The crate provides `From<Into<String>> for ContentBlock` (Text). This
         // is the ergonomic path used by the reporter mapping above.
@@ -1021,12 +1105,27 @@ mod tests {
     fn should_build_initialize_response_echoing_protocol_version_and_advertising_text_prompt() {
         let req = InitializeRequest::new(ProtocolVersion::V1);
         let resp = build_initialize_response(&req);
+        // We support V1, so a V1 request is echoed back as V1.
         assert_eq!(resp.protocol_version, ProtocolVersion::V1);
         // Text-only prompt capabilities: image/audio/embedded_context all false.
         assert!(!resp.agent_capabilities.prompt_capabilities.image);
         assert!(!resp.agent_capabilities.prompt_capabilities.audio);
         // We do not advertise loadSession in v1.
         assert!(!resp.agent_capabilities.load_session);
+    }
+
+    #[test]
+    fn should_downgrade_to_latest_supported_version_when_client_requests_newer() {
+        // A client requesting a newer/unsupported protocol version must NOT get
+        // that version echoed back (that would falsely advertise support this
+        // v1-only handler doesn't implement). We reply with the latest version
+        // we actually support (`ProtocolVersion::LATEST`, currently V1).
+        let newer = ProtocolVersion::from(2u16);
+        assert_ne!(newer, ProtocolVersion::V1, "sanity: 2 is not V1");
+        let req = InitializeRequest::new(newer);
+        let resp = build_initialize_response(&req);
+        assert_eq!(resp.protocol_version, ProtocolVersion::LATEST);
+        assert_eq!(resp.protocol_version, ProtocolVersion::V1);
     }
 
     #[test]
@@ -1044,5 +1143,297 @@ mod tests {
     fn should_accept_silent_reporter_as_progress_reporter() {
         let reporter: Arc<dyn ProgressReporter> = Arc::new(SilentReporter);
         reporter.report(ProgressEvent::Thinking { iteration: 1 });
+    }
+
+    // ---- Cancellation-race coverage (Fix: move the stale-flag reset onto the
+    // dispatch loop). These drive the REAL handler wiring in-process (the same
+    // `spawn_acp_agent` `octos acp` uses), so the reset relocation from
+    // `run_prompt_turn` to `handle_prompt` is exercised end to end. ----
+
+    /// A `MockLlm` whose FIRST `chat()` blocks on a barrier until the test
+    /// releases it (announcing entry first), so the test can deliver a
+    /// `session/cancel` while the turn is genuinely in flight. Later calls
+    /// return immediately. Always returns `EndTurn` — the turn's `Cancelled`
+    /// outcome must come from the shutdown flag surviving into the turn, not
+    /// from the LLM.
+    struct BarrierLlm {
+        calls: std::sync::atomic::AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for BarrierLlm {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Announce that the turn is executing, then wait for the test
+                // to deliver the cancel and release us.
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn provider_name(&self) -> &str {
+            "barrier-mock"
+        }
+        fn model_id(&self) -> &str {
+            "barrier-1"
+        }
+    }
+
+    /// Factory that hands every session an agent backed by a caller-supplied
+    /// `LlmProvider` (so we can inject the `BarrierLlm`). Mirrors
+    /// `TestAgentFactory` but takes the provider by `Arc` so the barrier
+    /// handles are shared with the test.
+    struct InjectedLlmFactory {
+        llm: Arc<dyn octos_llm::LlmProvider>,
+        memory_dir: PathBuf,
+        default_cwd: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionAgentFactory for InjectedLlmFactory {
+        fn default_cwd(&self) -> &std::path::Path {
+            &self.default_cwd
+        }
+        async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
+            let memory = Arc::new(EpisodeStore::open(&self.memory_dir).await?);
+            let tools = ToolRegistry::with_builtins_and_sandbox(
+                &cwd,
+                create_sandbox(&octos_agent::SandboxConfig::default()),
+            );
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let agent = Agent::new(
+                AgentId::new("acp-cancel-test"),
+                self.llm.clone(),
+                tools,
+                memory,
+            )
+            .with_shutdown(shutdown.clone());
+            Ok((Arc::new(agent), shutdown))
+        }
+    }
+
+    /// Test transport: expose the octos ACP agent (backed by `factory`) as a
+    /// `ConnectTo<Client>` so an in-process client can drive it.
+    struct CancelTestTransport {
+        factory: InjectedLlmFactory,
+    }
+
+    impl agent_client_protocol::ConnectTo<Client> for CancelTestTransport {
+        async fn connect_to(
+            self,
+            client: impl agent_client_protocol::ConnectTo<AcpAgentRole> + 'static,
+        ) -> std::result::Result<(), AcpError> {
+            let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+            spawn_acp_agent(Arc::new(self.factory), sessions, client).await
+        }
+    }
+
+    /// A `session/cancel` delivered WHILE the turn is in flight must yield
+    /// `StopReason::Cancelled`. With the reset moved onto the dispatch loop
+    /// (`handle_prompt`), the cancel that arrives after the prompt is accepted
+    /// sets the flag and it survives into the turn, which reports `Cancelled`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_report_cancelled_when_session_cancel_arrives_during_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(BarrierLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let transport = CancelTestTransport {
+            factory: InjectedLlmFactory {
+                llm,
+                memory_dir,
+                default_cwd: cwd.clone(),
+            },
+        };
+
+        let stop_reason: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+        let stop_for_main = stop_reason.clone();
+        let prompt_cwd = cwd.clone();
+
+        Client
+            .builder()
+            .name("octos-acp-cancel-client")
+            .on_receive_notification(
+                async move |_notif: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        ))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+
+                    // Concurrently: once the turn is executing, deliver a cancel,
+                    // then release the barrier so the LLM call returns.
+                    let cancel_conn = connection.clone();
+                    let cancel_sid = session_id.clone();
+                    let canceller = tokio::spawn(async move {
+                        entered.notified().await;
+                        cancel_conn
+                            .send_notification(CancelNotification::new(cancel_sid))
+                            .expect("send cancel");
+                        release.notify_one();
+                    });
+
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new("hello"),
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    canceller.await.expect("canceller joins");
+                    *stop_for_main.lock().await = Some(prompt.stop_reason);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("ACP client run completes");
+
+        let got = *stop_reason.lock().await;
+        assert!(
+            matches!(got, Some(StopReason::Cancelled)),
+            "cancel during the turn must yield Cancelled, got {got:?}"
+        );
+    }
+
+    /// After a turn is cancelled, a FRESH prompt on the same session (no cancel)
+    /// must return `EndTurn` — proving the stale-flag reset was RELOCATED onto
+    /// `handle_prompt` (run before each turn spawns), not simply deleted. If the
+    /// reset were gone entirely, the stale `true` from the cancelled turn would
+    /// leak and wrongly report `Cancelled` again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_report_end_turn_for_fresh_prompt_after_prior_turn_was_cancelled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(BarrierLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let transport = CancelTestTransport {
+            factory: InjectedLlmFactory {
+                llm,
+                memory_dir,
+                default_cwd: cwd.clone(),
+            },
+        };
+
+        let second_stop: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+        let second_for_main = second_stop.clone();
+        let prompt_cwd = cwd.clone();
+
+        Client
+            .builder()
+            .name("octos-acp-cancel-then-fresh-client")
+            .on_receive_notification(
+                async move |_notif: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        ))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+
+                    // Turn 1: cancel it mid-flight (as in the test above).
+                    let cancel_conn = connection.clone();
+                    let cancel_sid = session_id.clone();
+                    let canceller = tokio::spawn(async move {
+                        entered.notified().await;
+                        cancel_conn
+                            .send_notification(CancelNotification::new(cancel_sid))
+                            .expect("send cancel");
+                        release.notify_one();
+                    });
+                    let first = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new("first"),
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    canceller.await.expect("canceller joins");
+                    assert!(
+                        matches!(first.stop_reason, StopReason::Cancelled),
+                        "sanity: turn 1 should be Cancelled, got {:?}",
+                        first.stop_reason
+                    );
+
+                    // Turn 2: no cancel. The BarrierLlm only blocks its FIRST call,
+                    // so this returns immediately. Must be EndTurn — the stale flag
+                    // from turn 1 must have been reset before turn 2 spawned.
+                    let second = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new("second"),
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    *second_for_main.lock().await = Some(second.stop_reason);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("ACP client run completes");
+
+        let got = *second_stop.lock().await;
+        assert!(
+            matches!(got, Some(StopReason::EndTurn)),
+            "fresh prompt after a cancelled turn must be EndTurn (reset relocated, \
+             not deleted), got {got:?}"
+        );
     }
 }
