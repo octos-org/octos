@@ -2,13 +2,14 @@
 
 ## 概述
 
-octos 是一个包含 15 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
+octos 是一个包含 14 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
 
 **工作区成员**：
-- **6 个核心 crate**：octos-core、octos-memory、octos-llm、octos-agent、octos-bus、octos-cli
-- **1 个流水线 crate**：octos-pipeline
-- **7 个应用技能 crate**：news、deep-search、deep-crawl、send-email、account-manager、time、weather
-- **1 个平台技能 crate**：asr
+- **分层核心**：`octos-core`（共享类型）→ `octos-memory` + `octos-llm` → `octos-agent`（agent 循环、工具、沙箱、MCP、压缩）→ `octos-cli`（命令、配置、serve/API）。
+- **与 octos-agent 并列**：`octos-bus`（14 个渠道、会话、合并、cron）、`octos-pipeline`（DOT 图工作流）、`octos-plugin`（插件/技能 SDK）、`octos-swarm`（多 agent 契约创作）、`octos-sandbox`、`octos-diagnostics`（支撑 `octos doctor`）、`octos-dora-mcp`。
+- **内置技能**：`app-skills`（news、deep-search、deep-crawl、send-email、account-manager、skill-evolve、harness 启动器）与 `platform-skills`（语音 ASR/TTS）。
+
+（Web SPA 与终端客户端分别位于独立的 `octos-web` 和 `octos-tui` 仓库，通过 UI Protocol 与 `octos serve` 通信。）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

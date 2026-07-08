@@ -2,13 +2,14 @@
 
 ## Overview
 
-octos is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 14-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 **Workspace members**:
-- **6 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli
-- **1 pipeline crate**: octos-pipeline
-- **7 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather
-- **1 platform-skill crate**: asr
+- **Layered core**: `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API).
+- **Alongside octos-agent**: `octos-bus` (14 channels, sessions, coalescing, cron), `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-diagnostics` (powers `octos doctor`), `octos-dora-mcp`.
+- **Bundled skills**: `app-skills` (news, deep-search, deep-crawl, send-email, account-manager, skill-evolve, harness starters) and `platform-skills` (voice ASR/TTS).
+
+(The web SPA and terminal client live in the separate `octos-web` and `octos-tui` repositories and talk to `octos serve` over the UI Protocol.)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
