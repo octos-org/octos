@@ -2698,9 +2698,22 @@ fn recover_shell_retry(
         .filter(|content| !is_successful_shell_output(content))
         .count();
 
-    shell_results
-        .iter()
-        .find(|content| is_diff_like_shell_output(content))
+    // Every recovery arm below is gated on `failed_shells` because this is a
+    // shell-SPIRAL detector: it only intervenes when the model is stuck
+    // retrying failing shell calls, not when it is deliberately running a
+    // streak of successful commands. DiffLikeSuccess must be gated too —
+    // otherwise a legitimate turn that runs `git diff`/`git show` >= threshold
+    // times (all exit 0) is short-circuited, surfacing the raw diff as the
+    // assistant answer and terminating the turn before the model can reply. A
+    // genuine stuck-on-identical-success loop is caught by the separate
+    // loop-detector, not here. `>= 1` mirrors the UsefulSuccess sibling.
+    (failed_shells >= 1)
+        .then(|| {
+            shell_results
+                .iter()
+                .find(|content| is_diff_like_shell_output(content))
+        })
+        .flatten()
         .map(|content| ShellRetryRecovery {
             kind: ShellRetryRecoveryKind::DiffLikeSuccess,
             content: strip_success_exit_suffix(content),
@@ -4489,6 +4502,54 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
         assert!(recovered.content.contains("diff --git"));
         assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
+        // P2 (tri-repo #1529): DiffLikeSuccess used to fire whenever ANY recent
+        // shell result was diff-like, regardless of failures. A legitimate turn
+        // that runs `git diff` >= threshold times (all exit 0) is NOT a spiral
+        // and must NOT be short-circuited into surfacing the raw diff as the
+        // assistant answer. Build a 4-shell all-success diff streak and assert
+        // recovery does not fire.
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n\nExit code: 0";
+        let mut messages = vec![Message::user("show me every diff")];
+        for i in 0..4 {
+            let id = format!("call_diff_{i}");
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+            messages.push(Message {
+                role: MessageRole::Tool,
+                content: diff.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        assert!(
+            recover_shell_retry(&messages, 4).is_none(),
+            "an all-success diff streak must not trigger shell-spiral recovery"
+        );
     }
 
     #[test]

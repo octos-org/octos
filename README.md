@@ -2,9 +2,57 @@
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
+Octos is your own AI assistant, running on your own computer. Install one small program, connect any major AI provider (Anthropic, OpenAI, Gemini, DeepSeek, …), and chat with an agent that can run code, browse the web, remember things, schedule jobs, and build documents — from your browser, your terminal, or apps like Telegram, WhatsApp, and Discord. Your sessions, memory, and data stay on your machine — prompts go only to the AI provider you choose.
+
+## Start here
+
+The fastest way to a working assistant, on the supported platforms (macOS Apple Silicon, Linux x86-64/arm64, Windows x64):
+
+```bash
+# 1. Install
+brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
+
+# 2. Choose your AI provider and a model (interactive — pick a real
+#    model name; some providers reject the "auto" default)
+octos init
+
+# 3. Sign in to that provider — or paste its API key; stored securely
+octos auth login --provider deepseek    # use the provider you chose above
+
+# 4. Start your agent with password-free local sign-in
+octos serve --solo
+```
+
+Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
+
+Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [Option 2](#option-2-self-hosted-local-only) below:
+
+```bash
+# macOS / Linux
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
+```
+
+### If something looks wrong
+
+| Symptom | Fix |
+|---|---|
+| The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
+| The agent doesn't reply | No provider credential yet — run `octos auth login --provider <name>` (or export the provider's API key env var, or add the key in the dashboard settings). An `invalid model` error means the provider rejected the configured model name — re-run `octos init` and pick a real one (e.g. `deepseek-v4-flash`). |
+| Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
+
+### The pieces
+
+- **octos** (this repo) — the **kernel**: the agent runtime, LLM providers, tools, sandbox, memory, channels, and the API everything else speaks. Install this first — then live in a client:
+- **[octos-web](https://github.com/octos-org/octos-web)** — the full app experience in the browser (chat, voice, projects, slides, admin, and the hosted multi-tenant signup). A build ships inside the server — open `/app/`.
+- **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal experience, in the spirit of Claude Code.
+
+**Stuck?** [Documentation](https://octos-org.github.io/octos/) · [Issues](https://github.com/octos-org/octos/issues)
+
+---
+
 **Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
 
-31MB static binary. ~140 REST endpoints. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
+31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
 
 ## What is Octos?
 
@@ -12,9 +60,9 @@ Octos is an open-source AI agent platform that lets you run your own AI system o
 
 You can think of it as the **backend operating system for AI agents**. Instead of building a new chatbot stack for every use case, you configure Octos profiles with their own prompts, models, tools, and channels, then manage them from one control plane.
 
-The important part for new users is that Octos can be used in three distinct ways:
+Beyond the quick local setup above, Octos can be deployed three ways:
 
-1. **Octos Cloud signup** — the easiest path; create an account, choose a node name, and run the generated setup command on your device.
+1. **Octos Cloud signup** — a hosted multi-tenant account at [octos.cloud](https://octos.cloud); the signup experience belongs to the web client (see the [octos-web README](https://github.com/octos-org/octos-web#octos-cloud)).
 2. **Self-hosted local** — run Octos only on your own machine or local network.
 3. **Self-hosted cloud + tenant pair** — run your own public VPS plus your own tenant device for internet-accessible remote use.
 
@@ -22,26 +70,30 @@ The important part for new users is that Octos can be used in three distinct way
 
 Most agentic systems are single-tenant chat assistants — one user, one model, one conversation at a time. Octos is different:
 
-- **API-first Agentic OS**: ~140 REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks, SSE). Any frontend — web, mobile, CLI, CI/CD — can be built on top.
+- **API-first Agentic OS**: 80+ REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks) plus **UI Protocol v1** — a JSON-RPC contract over WebSocket and stdio for interactive clients. Any frontend — web, mobile, CLI, CI/CD — can be built on top.
 - **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile is a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts.
 - **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime, with bounded concurrency for fleet stability.
 - **Swarm dispatcher**: Fan contracts to N sub-agents, aggregate artifacts, gate through validator, roll up cost — wired into `/api/swarm/dispatch`.
 - **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, lane scoring, circuit breakers.
 - **LRU tool deferral**: ~15 active tools for fast LLM reasoning, ~50 on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
 - **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
-- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, Matrix, Feishu.
+- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, DingTalk, Matrix, Feishu.
 - **Sticky thread_id + committed_seq**: Every SSE event is bound to a thread; replay is deterministic by committed sequence number (M8.10).
 - **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction, three-tier).
+- **Autonomy loops & goals**: `/loop` runs fixed-interval or self-paced maintenance loops; goals continue across turns with checkpointed continuations — the agent keeps working between your messages.
+- **Session time-travel**: `session/rollback` RPC with resume/rewind checkpoint pickers in both clients; every session can be rolled back to any prior user turn.
+- **Live reasoning**: streams the model's thinking as it happens, with per-session `/thinking` effort control.
+- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, and an OMiniX runtime provider for local ASR/TTS.
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
-- **Sandbox isolation**: bwrap + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
+- **Sandbox isolation**: bwrap + Landlock/seccomp + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
 ## Choose a setup path
 
-All three paths are valid. The easiest is Octos Cloud signup, but the self-hosted modes are first-class as well.
+If you just want an assistant on your own machine, you already have it — the [Start here](#start-here) steps above are Option 2 in its simplest form. The paths below matter when you want a managed signup, a background service, or public internet access.
 
 | Option | Machines involved | Public internet access | Who manages the infrastructure | Best fit |
 | --- | --- | --- | --- | --- |
-| **1. Octos Cloud signup** | Your device + Octos Cloud | Yes | Octos Cloud + you | Fastest path |
+| **1. Octos Cloud signup** | Your device + Octos Cloud | Yes | Octos Cloud + you | Hosted accounts — [guide in octos-web](https://github.com/octos-org/octos-web#octos-cloud) |
 | **2. Self-hosted local-only** | One machine | No | You | Local/private use |
 | **3. Self-hosted cloud + tenant pair** | Your VPS + your device | Yes | You | Full self-hosting with remote access |
 
@@ -51,26 +103,15 @@ Visual overview:
 
 ### Option 1: Sign up on Octos Cloud
 
-This is the easiest way to get started.
+Octos Cloud is the hosted, multi-tenant way in: register with your email at
+[octos.cloud](https://octos.cloud) (or a self-hosted operator's portal), pick a
+node name, and run one generated setup command on your device. The signup and account experience is part of the **web client** —
+the walkthrough lives in the
+[octos-web README (Octos Cloud)](https://github.com/octos-org/octos-web#octos-cloud).
 
-1. Go to the Octos Cloud signup page.
-2. Register with your email.
-3. Choose a custom node name.
-4. Run the generated setup command on your device.
-
-That setup command is personalized for your machine and includes the values needed to connect your device to the Octos cloud relay. After setup, your Octos instance is accessible on the public internet under your node name.
-
-When you click `Send Code` on the portal, check your Spam folder if the email does not arrive right away. It is also a good idea to add the Octos sending domain/address to your address book so future login and setup emails are delivered reliably.
-
-After signup, the portal shows your node details, public URL, and the setup command to run on your device:
-
-<img src="images/octos-reg-ss.png" alt="Octos Cloud signup response" width="50%" />
-
-This path is the best choice if you want:
-
-- the fastest time to first working system
-- public access without running your own VPS
-- a hosted signup and tunnel flow
+This repo's side of that story is the **server infrastructure** an operator
+runs to offer it: see [Option 3](#option-3-self-hosted-cloud--tenant-pair)
+for deploying the cloud host (portal, relay, wildcard TLS) yourself.
 
 ### Option 2: Self-hosted local-only
 
@@ -98,7 +139,7 @@ brew install octos-org/tap/octos
 npm install -g @octos-org/octos
 ```
 
-Both install the full release bundle — the `octos` server and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `voice`, `clock`, `weather`) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
+Both install the full release bundle — the `octos` server (with the web app and dashboard embedded) and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
 
 Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
 
@@ -316,9 +357,23 @@ octos chat
 # Multi-channel gateway
 octos gateway
 
-# Web dashboard + REST API
+# Web dashboard + REST API + UI Protocol
 octos serve
+octos serve --solo     # same, plus password-free local login for the web app
+octos serve --stdio    # UI Protocol over stdio (how octos-tui embeds a backend)
 ```
+
+The full CLI surface (see `octos help`):
+
+| Command | Purpose |
+|---|---|
+| `chat` / `gateway` / `serve` | the three runtime modes |
+| `init` / `status` / `doctor` | workspace init, node status, environment diagnostics |
+| `auth` / `account` / `admin` | provider login (OAuth/PKCE), sub-accounts, tenant & tunnel admin |
+| `channels` / `cron` / `skills` | messaging channels, scheduled jobs, skill install/remove |
+| `mcp-serve` | run octos as an MCP server, so outer orchestrators can drive it as a sub-agent |
+| `office` | PPTX/DOCX/XLSX manipulation from the shell |
+| `update` / `clean` / `completions` / `docs` | release check, cache cleanup, shell completions, doc generation |
 
 For a repo-local tenant deploy (builds from source, sets up the same service + tunnel as `install.sh`), use `scripts/local-tenant-deploy.sh --full`.
 
@@ -347,6 +402,14 @@ Use this when:
 
 Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
 
+## Clients and the UI Protocol
+
+Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC contract carried on WebSocket (`/api/ui-protocol/ws`) or stdio (`octos serve --stdio`). It covers session open with cursor replay, streamed turns, durable persistence events, tool activity, approvals, background tasks, and rollback. The protocol spec is the contract: server and clients release independently against it.
+
+- **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
+- **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
+- **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
+
 ## Documentation
 
 📖 **[Full Documentation](https://octos-org.github.io/octos/)** — installation, configuration, channels, providers, memory, skills, advanced features, and more.
@@ -365,7 +428,7 @@ Skip it when you just need the CLI — `cargo install --path crates/octos-cli --
 
 ## Architecture
 
-10 `octos-*` crates + 14 app-skill crates + 1 platform-skill crate (25 workspace members total). The runtime auto-installs only the 9 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
+12 `octos-*` crates + 13 app-skill crates + 1 platform-skill crate (26 workspace members total). The runtime auto-installs only the 8 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
 
 ```
 octos-cli   (CLI entrypoint, REST API server, dashboard, config watcher, wizard)
@@ -378,23 +441,25 @@ octos-agent (agent loop, tool registry, MCP, hooks, three-tier compaction,
    ├─ octos-memory    (long-term + episodic + HNSW vector + BM25 hybrid search)
    ├─ octos-pipeline  (DOT-graph workflows, per-node model, bounded fan-out)
    ├─ octos-plugin    (skill manifest, discovery, gating, lifecycle, protocol v2)
-   ├─ octos-sandbox   (platform sandbox helper binary)
+   ├─ octos-sandbox   (platform sandbox helper binary — bwrap/Landlock/seccomp)
    ├─ octos-swarm     (PM/swarm dispatcher, ledger, topology, validator gate)
+   ├─ octos-diagnostics (shared doctor diagnostics + update planning)
+   ├─ octos-dora-mcp  (compat re-export of the dora bridge in octos-agent)
    └─ octos-core      (Task, Message, Error types — no internal deps)
 
 Runtime view:
-  octos serve (control plane + dashboard, ~140 REST endpoints)
+  octos serve (control plane + dashboard, 80+ REST endpoints + UI Protocol WS)
     ├── Profile A → gateway process (Telegram, WhatsApp)
     ├── Profile B → gateway process (Feishu, Slack, Matrix)
     └── Profile C → gateway process (CLI)
          │
          ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, Moonshot, …)
          │   └── AdaptiveRouter → ProviderChain → RetryProvider
-         ├── Tool Registry (~50 built-in + plugins + 9 app-skills)
+         ├── Tool Registry (~50 built-in + plugins + 8 app-skills)
          │   └── LRU Deferral (~15 active, activate on demand)
          ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
          ├── Swarm Dispatcher (fan-out → aggregate → validator gate → cost rollup)
-         ├── Sandbox (bwrap / sandbox-exec / Docker / AppContainer)
+         ├── Sandbox (bwrap / Landlock+seccomp / sandbox-exec / Docker / AppContainer)
          ├── Session Store (JSONL, LRU cache, three-tier compaction, thread_id)
          ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
          └── Skills (bundled + installable from octos-hub)
