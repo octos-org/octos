@@ -91,8 +91,21 @@ impl MemoryCommand {
                         let id = if id.starts_with("^m") {
                             id.to_string()
                         } else {
-                            format!("^m{}", id.trim_start_matches("m"))
+                            format!("^m{}", id.trim_start_matches('m'))
                         };
+                        // Fail fast on malformed ids: the consolidator only
+                        // recognizes ^m + 6 chars of [a-z2-7]; anything else
+                        // would silently degrade into an unmatchable
+                        // free-text pending note.
+                        let suffix = &id[2..];
+                        if suffix.len() != 6
+                            || !suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+                        {
+                            eyre::bail!(
+                                "invalid entry id '{id}': expected ^m followed by 6 chars of \
+                                 [a-z2-7] (as shown in your Long-term Memory)"
+                            );
+                        }
                         format!("id:{id}")
                     }
                     None => text.join(" "),

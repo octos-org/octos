@@ -350,56 +350,8 @@ pub async fn run_consolidation(
     // must hide its candidates NOW, not when the budget resets — otherwise
     // the raw priority note also keeps spinning the fast lane.
     if !params.allow_merge {
-        let mut plan = ApplyPlan::default();
-        let mut working = entries.clone();
-        let mut parked_any = false;
-        for note in &batch.notes {
-            if !note.is_free_text_forget() {
-                continue;
-            }
-            let mut candidates: Vec<PendingCandidate> =
-                pending::compute_candidates(&note.content, &working)
-                    .into_iter()
-                    .filter_map(|(entry_id, _)| {
-                        working
-                            .iter()
-                            .find(|e| e.id == entry_id)
-                            .map(|e| PendingCandidate {
-                                entry_id,
-                                content_hash: e.content_hash(),
-                                interim_archived: false,
-                            })
-                    })
-                    .collect();
-            if note.sensitive {
-                for cand in &mut candidates {
-                    if let Some(pos) = working.iter().position(|e| e.id == cand.entry_id) {
-                        plan.archive_appends.push(working[pos].text.clone());
-                        working.remove(pos);
-                        cand.interim_archived = true;
-                    }
-                }
-            }
-            let expires_at =
-                note.created_at + Duration::days(i64::from(params.pending_confirm_days));
-            plan.pending_rewrites.push((
-                note.path.clone(),
-                note.render_pending(&candidates, &expires_at),
-            ));
-            outcome.pending_notes.push(PendingStatus {
-                note_id: note.id.clone(),
-                state: PendingState::Created,
-                candidate_ids: candidates.iter().map(|c| c.entry_id.clone()).collect(),
-                sensitive: note.sensitive,
-                expires_at: Some(expires_at),
-            });
-            parked_any = true;
-        }
-        if parked_any {
-            plan.final_entries = working.clone();
-            apply::apply_plan(memory_dir, params.today, &plan)?;
-            entries = working;
-        }
+        entries =
+            park_free_text_forgets(memory_dir, params, &batch, &entries, &mut outcome, false)?;
     }
 
     // --- 3. skip early when nothing is consumable ------------------------
@@ -494,7 +446,15 @@ pub async fn run_consolidation(
     ];
 
     outcome.provider_attempts += 1;
-    let response = provider.chat(&messages, &[], &config).await?;
+    let response = match provider.chat(&messages, &[], &config).await {
+        Ok(response) => response,
+        Err(e) => {
+            // A sensitive ask must hide its data even when the merge never
+            // happens — park before surfacing the transport error.
+            park_free_text_forgets(memory_dir, params, &batch, &entries, &mut outcome, true)?;
+            return Err(e);
+        }
+    };
     accumulate_usage(&mut outcome.token_usage, &response.usage);
     let content = response.content.unwrap_or_default();
 
@@ -505,7 +465,20 @@ pub async fn run_consolidation(
             messages.push(Message::assistant(content));
             messages.push(Message::user(prompt::corrective_message(&first_err)));
             outcome.provider_attempts += 1;
-            let retry = provider.chat(&messages, &[], &config).await?;
+            let retry = match provider.chat(&messages, &[], &config).await {
+                Ok(retry) => retry,
+                Err(e) => {
+                    park_free_text_forgets(
+                        memory_dir,
+                        params,
+                        &batch,
+                        &entries,
+                        &mut outcome,
+                        true,
+                    )?;
+                    return Err(e);
+                }
+            };
             accumulate_usage(&mut outcome.token_usage, &retry.usage);
             let retry_content = retry.content.unwrap_or_default();
             match ops::parse_model_output(&retry_content) {
@@ -514,6 +487,8 @@ pub async fn run_consolidation(
                     finish_failed(
                         &mut outcome,
                         memory_dir,
+                        params,
+                        &entries,
                         &batch,
                         &waiting,
                         format!("model output unparseable after one re-ask: {second_err}"),
@@ -586,6 +561,8 @@ pub async fn run_consolidation(
             finish_failed(
                 &mut outcome,
                 memory_dir,
+                params,
+                &entries,
                 &batch,
                 &waiting,
                 format!("merge rejected: {reason}"),
@@ -683,6 +660,8 @@ pub async fn run_consolidation(
             finish_failed(
                 &mut outcome,
                 memory_dir,
+                params,
+                &entries,
                 &batch,
                 &remaining,
                 format!(
@@ -862,6 +841,8 @@ pub async fn run_consolidation(
         finish_failed(
             &mut outcome,
             memory_dir,
+            params,
+            &entries,
             &batch,
             &waiting,
             format!(
@@ -946,15 +927,96 @@ fn protected_paths(batch: &StagingBatch) -> HashSet<PathBuf> {
 
 /// Common tail for every rejected merge: record the failure for quarantine
 /// tracking and surface the still-waiting pending notes.
+/// Rust-only parking of free-text host forget notes (no provider): bind
+/// candidates, interim-archive sensitive ones, persist the pending note.
+/// Used by the budget-exhausted path and by merge-FAILURE paths so a
+/// sensitive ask hides its data even when the merge never succeeds.
+/// Returns the entries list after any interim hiding.
+fn park_free_text_forgets(
+    memory_dir: &Path,
+    params: &ConsolidateParams,
+    batch: &StagingBatch,
+    entries: &[Entry],
+    outcome: &mut ConsolidateOutcome,
+    sensitive_only: bool,
+) -> Result<Vec<Entry>> {
+    let mut plan = ApplyPlan::default();
+    let mut working = entries.to_vec();
+    let mut parked_any = false;
+    for note in &batch.notes {
+        if !note.is_free_text_forget() {
+            continue;
+        }
+        if sensitive_only && !note.sensitive {
+            continue;
+        }
+        // Already surfaced as Created this run? Skip double-parking.
+        if outcome
+            .pending_notes
+            .iter()
+            .any(|p| p.note_id == note.id && p.state == PendingState::Created)
+        {
+            continue;
+        }
+        let mut candidates: Vec<PendingCandidate> =
+            pending::compute_candidates(&note.content, &working)
+                .into_iter()
+                .filter_map(|(entry_id, _)| {
+                    working
+                        .iter()
+                        .find(|e| e.id == entry_id)
+                        .map(|e| PendingCandidate {
+                            entry_id,
+                            content_hash: e.content_hash(),
+                            interim_archived: false,
+                        })
+                })
+                .collect();
+        if note.sensitive {
+            for cand in &mut candidates {
+                if let Some(pos) = working.iter().position(|e| e.id == cand.entry_id) {
+                    plan.archive_appends.push(working[pos].text.clone());
+                    working.remove(pos);
+                    cand.interim_archived = true;
+                }
+            }
+        }
+        let expires_at = note.created_at + Duration::days(i64::from(params.pending_confirm_days));
+        plan.pending_rewrites.push((
+            note.path.clone(),
+            note.render_pending(&candidates, &expires_at),
+        ));
+        outcome.pending_notes.push(PendingStatus {
+            note_id: note.id.clone(),
+            state: PendingState::Created,
+            candidate_ids: candidates.iter().map(|c| c.entry_id.clone()).collect(),
+            sensitive: note.sensitive,
+            expires_at: Some(expires_at),
+        });
+        parked_any = true;
+    }
+    if parked_any {
+        plan.final_entries = working.clone();
+        apply::apply_plan(memory_dir, params.today, &plan)?;
+    }
+    Ok(working)
+}
+
 fn finish_failed(
     outcome: &mut ConsolidateOutcome,
     memory_dir: &Path,
+    params: &ConsolidateParams,
+    entries: &[Entry],
     batch: &StagingBatch,
     waiting: &[NoteFile],
     reason: String,
 ) -> Result<()> {
     outcome.errors.push(reason);
     outcome.merge_applied = false;
+    // A sensitive ask must hide its data even when the merge failed — park
+    // it now (Rust-only) instead of leaving the candidates live until some
+    // later successful run.
+    park_free_text_forgets(memory_dir, params, batch, entries, outcome, true)?;
     for note in waiting {
         outcome
             .pending_notes
@@ -2642,6 +2704,44 @@ mod tests {
         assert!(
             !spoof.exists(),
             "a body-spoofed model note quoting deleted content must be scrubbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_park_sensitive_forget_when_merge_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "Sensitive location detail. (updated: 2026-06-01) ^msenstv";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        let note = write_note(
+            memory_dir,
+            "01fg-sens",
+            "host",
+            "forget",
+            "forget the sensitive location detail",
+            true,
+        );
+        // A model fact keeps the batch dirty; the merge fails twice.
+        write_note(memory_dir, "02fact", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&["GARBAGE", "GARBAGE"]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(!outcome.merge_applied);
+
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("^msenstv"),
+            "sensitive candidates must hide even when the merge fails: {memory}"
+        );
+        let note_text = std::fs::read_to_string(&note).unwrap();
+        assert!(
+            note_text.contains("candidates:") && note_text.contains("interim_archived"),
+            "the ask must be parked with its binding: {note_text}"
         );
     }
 }

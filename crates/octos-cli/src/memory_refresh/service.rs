@@ -482,16 +482,33 @@ pub(crate) fn has_priority_note(data_dir: &Path) -> bool {
         if file.take(16 * 1024).read_to_string(&mut head).is_err() {
             continue;
         }
+        // Only the fenced FRONTMATTER counts — untrusted note bodies could
+        // contain these literals and must not steer the fast lane.
+        let Some(fm) = frontmatter_of(&head) else {
+            continue;
+        };
         // Already-parked pending-confirm notes wait on a HUMAN, not on the
         // fast lane — re-running every debounce would only spin.
-        if head.contains("expires_at:") || head.contains("candidates:") {
+        if fm.contains("expires_at:") || fm.contains("candidates:") {
             continue;
         }
-        if head.contains("origin: host") || head.contains("kind: user_request") {
+        if fm.lines().any(|l| l.trim() == "origin: host")
+            || fm.lines().any(|l| l.trim() == "kind: user_request")
+        {
             return true;
         }
     }
     false
+}
+
+/// The fenced frontmatter region of a staging note, when present.
+fn frontmatter_of(content: &str) -> Option<&str> {
+    let after = content.strip_prefix("---")?;
+    let rest = after
+        .strip_prefix("\r\n")
+        .or_else(|| after.strip_prefix('\n'))?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
 }
 
 /// One consolidation pass: budget-gated engine run + quarantine mover +
