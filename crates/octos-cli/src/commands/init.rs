@@ -955,10 +955,31 @@ impl Executable for InitCommand {
             // Model selection — show from catalog if available (disk or the
             // embedded compile-time copy). Without catalog entries there is
             // NO default: "auto" is not a real model on any provider API
-            // (#1541 item 3), so manual entry requires an explicit name.
-            let catalog_models = catalog.get(info.name);
-            let default_model = match catalog_models.and_then(|m| m.first().cloned()) {
-                Some(default) => default,
+            // (#1541 item 3), so manual entry requires an explicit name and
+            // is FINAL — no second confirm prompt after it (codex: a
+            // fall-through re-prompt consumed the next piped stdin answer,
+            // writing e.g. the env-var reply as the model).
+            let model = match catalog.get(info.name).filter(|m| !m.is_empty()) {
+                Some(models) => {
+                    println!();
+                    println!("Available models for {} (from catalog):", info.display);
+                    for (i, m) in models.iter().enumerate() {
+                        let rec = if i == 0 { " (recommended)" } else { "" };
+                        println!("  - {}{}", m, rec);
+                    }
+                    let default_model = models[0].clone();
+                    println!();
+                    print!("Model [{}]: ", default_model);
+                    io::stdout().flush()?;
+
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    if input.trim().is_empty() {
+                        default_model
+                    } else {
+                        input.trim().to_string()
+                    }
+                }
                 None => {
                     println!();
                     println!(
@@ -968,26 +989,6 @@ impl Executable for InitCommand {
                     let mut stdin = io::stdin().lock();
                     read_required_model(&mut stdin, info.display)?
                 }
-            };
-
-            println!();
-            if let Some(models) = catalog_models {
-                println!("Available models for {} (from catalog):", info.display);
-                for (i, m) in models.iter().enumerate() {
-                    let rec = if i == 0 { " (recommended)" } else { "" };
-                    println!("  - {}{}", m, rec);
-                }
-            }
-            println!();
-            print!("Model [{}]: ", default_model);
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let model = if input.trim().is_empty() {
-                default_model
-            } else {
-                input.trim().to_string()
             };
 
             // API key env var
