@@ -174,13 +174,18 @@ fn plan_system_write_paths_with(
         SCRATCH_ROOTS
             .iter()
             .map(|root| Path::new(root).join(&unique))
-            // Keep a candidate only if it is NOT under cwd. `path_contains(dir,
-            // sub)` is `sub.starts_with(dir)`, so containment must read
-            // "candidate under cwd" (dir = cwd_canon). The reversed form asked
-            // "is cwd under the candidate", which accepted a `/tmp/scratch`
-            // candidate when the read-only cwd IS `/tmp` — re-enabling writes
-            // inside the workspace (codex round-5 P1).
-            .find(|candidate| !path_contains(&cwd_canon, &canonicalize(candidate)))
+            // Keep a candidate only if it is DISJOINT from cwd in canonical
+            // space — reject overlap in BOTH directions:
+            //   * candidate UNDER cwd (`cwd == /tmp`, candidate `/tmp/scratch`)
+            //     → scratch inside the read-only workspace (codex round-5 P1);
+            //   * candidate an ANCESTOR of cwd (`cwd == /tmp/scratch/work`)
+            //     → write-granting the ancestor re-permits writes to cwd
+            //     (codex round-6 P1).
+            // `path_contains(dir, sub)` is `sub.starts_with(dir)`.
+            .find(|candidate| {
+                let cand = canonicalize(candidate);
+                !path_contains(&cwd_canon, &cand) && !path_contains(&cand, &cwd_canon)
+            })
     } else {
         None
     };
@@ -978,6 +983,28 @@ mod write_grant_plan_tests {
             plan2.scratch_dir, None,
             "no scratch may live inside the read-only cwd when all roots resolve under it"
         );
+    }
+
+    #[test]
+    fn should_not_place_scratch_as_an_ancestor_of_a_read_only_cwd() {
+        // codex round-6 P1: overlap must be rejected in BOTH directions. When the
+        // read-only cwd is nested UNDER the PID-derived scratch candidate — e.g.
+        // `/tmp/octos-sandbox-ro.<pid>/work` — that candidate is an ANCESTOR of
+        // cwd; write-granting it re-permits writes to the read-only workspace.
+        // The selected scratch must never contain cwd.
+        let ancestor = format!("/tmp/octos-sandbox-ro.{}", std::process::id());
+        let cwd = PathBuf::from(format!("{ancestor}/work"));
+        let plan = plan_system_write_paths_with(&cwd, false, |p: &Path| p.to_path_buf());
+        if let Some(scratch) = &plan.scratch_dir {
+            assert!(
+                !cwd.starts_with(scratch),
+                "scratch {scratch:?} must NOT be an ancestor of the read-only cwd {cwd:?}"
+            );
+            assert!(
+                !scratch.starts_with(&cwd),
+                "scratch {scratch:?} must NOT be inside the read-only cwd {cwd:?}"
+            );
+        }
     }
 
     #[test]
