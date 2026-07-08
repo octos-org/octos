@@ -716,12 +716,49 @@ async fn test_06_send_file_sandbox_escape() {
     use octos_agent::tools::SendFileTool;
 
     let sandbox = TempDir::new().unwrap();
+
+    // The "secret" must live OUTSIDE every root `SendFileTool` allowlists.
+    // That set is { base_dir, /tmp, upload_root, extra_allowed_dirs } — and
+    // /tmp is allowlisted UNCONDITIONALLY (skill outputs land there). So the
+    // escape target cannot sit under /tmp; if it does, the send is *correctly*
+    // permitted and asserting `!success` tests the wrong thing. This bit us
+    // when the repo/cwd lived under /tmp (audit finding F1): the old test put
+    // the secret under `current_dir()`, which was inside the /tmp allowlist,
+    // so the tool rightly allowed it and the test failed spuriously.
+    //
+    // Anchor the outside dir to the first candidate proven not under /tmp
+    // (HOME, then the crate source dir); skip if the whole environment is
+    // /tmp-rooted (nothing is genuinely "outside" then).
+    let tmp_canon =
+        std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let is_under_tmp = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .map(|c| c.starts_with(&tmp_canon))
+            .unwrap_or(true)
+    };
+    let outside_root = [
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists() && !is_under_tmp(p));
+
+    let Some(outside_root) = outside_root else {
+        eprintln!(
+            "[sandbox-abs] SKIP: no filesystem root outside the /tmp allowlist \
+             in this environment (repo/HOME both under /tmp); the escape guard \
+             is exercised by the traversal case in CI where the repo is not /tmp-rooted"
+        );
+        return;
+    };
+
     let outside = tempfile::Builder::new()
         .prefix("octos-pipeline-send-file-outside-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(&outside_root)
         .unwrap();
 
-    // Create a "secret" file outside the sandbox
+    // Create a "secret" file outside the sandbox (and outside /tmp).
     let secret = outside.path().join("credentials.json");
     std::fs::write(&secret, r#"{"api_key": "sk-secret"}"#).unwrap();
 
