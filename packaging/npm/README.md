@@ -33,7 +33,7 @@ macOS Intel is not supported (no prebuilt build is published).
 
 ```bash
 # Homebrew
-brew install octos-org/tap/octos
+brew install octos-org/octos/octos
 
 # Shell installer (sets up octos serve as a service)
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
