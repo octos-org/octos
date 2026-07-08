@@ -208,16 +208,60 @@ impl Entry {
 
     /// Whitespace-folded lines of the entry (for LINE-EXACT scrub matching).
     /// Empty folds are dropped.
+    /// Bookkeeping-stripped folded content lines — the scrub-set shape.
+    /// Stamps and id tokens are metadata: the same fact under another
+    /// id/date must still match the scrub.
     pub fn folded_lines(&self) -> Vec<String> {
-        self.text
-            .lines()
-            .map(fold_whitespace)
-            .filter(|l| !l.is_empty())
-            .collect()
+        content_folded_lines(&self.text)
     }
 }
 
 /// Collapse runs of whitespace to single spaces and trim.
+/// Strip engine bookkeeping from arbitrary text: every `^m<6 of [a-z2-7]>`
+/// id token, all `(updated: …)` / `(imported: …)` stamp groups, and the
+/// `(unverified)` marker. Used so content comparisons (scrubs, add-back
+/// guards) see the FACT, not its metadata.
+pub(super) fn strip_bookkeeping(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'^'
+            && bytes.get(i + 1) == Some(&b'm')
+            && i + 8 <= bytes.len()
+            && bytes[i + 2..i + 8]
+                .iter()
+                .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+        {
+            i += 8;
+            continue;
+        }
+        let ch_len = text[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
+    }
+    for marker in ["(updated:", "(imported:"] {
+        while let Some(start) = out.find(marker) {
+            let end = out[start..]
+                .find(')')
+                .map(|e| start + e + 1)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "");
+        }
+    }
+    out.replace("(unverified)", "")
+}
+
+/// Whitespace-folded, bookkeeping-stripped, non-empty lines of `text` —
+/// the canonical shape for content-level scrub comparisons.
+pub(super) fn content_folded_lines(text: &str) -> Vec<String> {
+    strip_bookkeeping(text)
+        .lines()
+        .map(fold_whitespace)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 pub fn fold_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

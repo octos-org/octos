@@ -40,8 +40,12 @@ impl ScrubTarget {
         if line.contains(&self.entry_id) {
             return true;
         }
-        let folded = fold_whitespace(line);
-        !folded.is_empty() && self.folded_lines.contains(&folded)
+        // Content-level comparison: the candidate line is stripped of
+        // bookkeeping exactly like the stored scrub lines, so the same
+        // fact under another id/stamp still matches.
+        super::entry::content_folded_lines(line)
+            .first()
+            .is_some_and(|folded| self.folded_lines.contains(folded))
     }
 }
 
@@ -214,6 +218,52 @@ fn rewrite_block_file(
     Ok(())
 }
 
+/// Injectable daily-note files (`YYYY-MM-DD.md`) in the memory root —
+/// they feed `get_injectable_context` and must honor hard-delete scrubs.
+fn daily_note_files(memory_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(memory_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).wrap_err("failed to read memory dir"),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let is_date = stem.len() == 10
+            && stem.chars().enumerate().all(|(i, c)| match i {
+                4 | 7 => c == '-',
+                _ => c.is_ascii_digit(),
+            });
+        if is_date && path.extension().is_some_and(|e| e == "md") {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// Line-scrub one daily-note file; delete it when nothing is left.
+fn scrub_daily_note(path: &Path, scrubs: &[ScrubTarget]) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| !scrubs.iter().any(|s| s.line_matches(line)))
+        .collect();
+    let mut out = kept.join("\n");
+    if out.trim().is_empty() {
+        remove_file_if_exists(path)?;
+        return Ok(());
+    }
+    out.push('\n');
+    if out != content {
+        atomic_write(path, &out)?;
+    }
+    Ok(())
+}
+
 /// True when the file's FRONTMATTER declares `origin: host`. Only the
 /// fenced header counts — untrusted note bodies could contain the literal
 /// and must not gain scrub immunity.
@@ -292,6 +342,10 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
         }
         for path in list_md_files(&memory_dir.join("bank").join("entities"))? {
             rewrite_block_file(&path, &[], &plan.hard_deletes, false)?;
+        }
+        // Daily notes are injected into prompts too — scrub them.
+        for path in daily_note_files(memory_dir)? {
+            scrub_daily_note(&path, &plan.hard_deletes)?;
         }
 
         for dir in ["notes", "extract"] {
@@ -498,6 +552,9 @@ pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> R
     }
     for path in list_md_files(&memory_dir.join("bank").join("entities"))? {
         rewrite_block_file(&path, &[], &targets, false)?;
+    }
+    for path in daily_note_files(memory_dir)? {
+        scrub_daily_note(&path, &targets)?;
     }
     for dir in ["notes", "extract"] {
         for path in list_md_files(&memory_dir.join("staging").join(dir))? {

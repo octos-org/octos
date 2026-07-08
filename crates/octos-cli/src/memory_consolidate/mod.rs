@@ -3235,4 +3235,55 @@ mod tests {
             outcome.errors
         );
     }
+
+    #[tokio::test]
+    async fn should_scrub_daily_notes_and_bookkeeping_variant_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret_line = "The vault code is 9137.";
+        write_memory(
+            memory_dir,
+            &[
+                &format!("{secret_line} (updated: 2026-06-01) ^msecret"),
+                // Same FACT under a different id and stamp.
+                &format!("{secret_line} (updated: 2026-05-15) ^mcopyaa"),
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        // The secret also sits in an injectable daily note.
+        std::fs::write(
+            memory_dir.join("2026-07-07.md"),
+            format!("## 2026-07-07\n\n{secret_line}\nharmless other line\n"),
+        )
+        .unwrap();
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("9137"),
+            "bookkeeping-variant copies must be scrubbed too: {memory}"
+        );
+        assert!(memory.contains("^mcccccc"));
+        let note = std::fs::read_to_string(memory_dir.join("2026-07-07.md")).unwrap();
+        assert!(
+            !note.contains("9137"),
+            "daily notes are injectable and must be scrubbed"
+        );
+        assert!(note.contains("harmless other line"));
+    }
 }
