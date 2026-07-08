@@ -174,7 +174,13 @@ fn plan_system_write_paths_with(
         SCRATCH_ROOTS
             .iter()
             .map(|root| Path::new(root).join(&unique))
-            .find(|candidate| !path_contains(&canonicalize(candidate), &cwd_canon))
+            // Keep a candidate only if it is NOT under cwd. `path_contains(dir,
+            // sub)` is `sub.starts_with(dir)`, so containment must read
+            // "candidate under cwd" (dir = cwd_canon). The reversed form asked
+            // "is cwd under the candidate", which accepted a `/tmp/scratch`
+            // candidate when the read-only cwd IS `/tmp` — re-enabling writes
+            // inside the workspace (codex round-5 P1).
+            .find(|candidate| !path_contains(&cwd_canon, &canonicalize(candidate)))
     } else {
         None
     };
@@ -943,6 +949,35 @@ mod write_grant_plan_tests {
             return Path::new("/tmp").join(rest);
         }
         p.to_path_buf()
+    }
+
+    #[test]
+    fn should_not_place_scratch_inside_a_read_only_temp_root_cwd() {
+        // codex round-5 P1: when the read-only cwd IS a temp root (`/tmp`), a
+        // `/tmp/octos-sandbox-ro.<pid>` scratch candidate is UNDER cwd. The
+        // reversed containment ("is cwd under the candidate") wrongly accepted
+        // it — then it was created, write-granted, and TMPDIR-exported, so the
+        // read-only workspace became writable. The scratch must never be inside
+        // cwd; when every scratch root resolves under cwd, there is no scratch.
+        let cwd = Path::new("/tmp");
+
+        // Identity canonicalizer: `/var/tmp/...` is genuinely outside `/tmp`, so
+        // a scratch is available there — but it must NOT be the `/tmp/...` one.
+        let plan = plan_system_write_paths_with(cwd, false, |p: &Path| p.to_path_buf());
+        if let Some(scratch) = &plan.scratch_dir {
+            assert!(
+                !scratch.starts_with(cwd),
+                "scratch {scratch:?} must NOT be inside the read-only cwd {cwd:?}"
+            );
+        }
+
+        // With `/var/tmp` collapsing to `/tmp`, EVERY scratch root resolves under
+        // cwd → no scratch may be placed inside the read-only workspace.
+        let plan2 = plan_system_write_paths_with(cwd, false, var_tmp_is_tmp);
+        assert_eq!(
+            plan2.scratch_dir, None,
+            "no scratch may live inside the read-only cwd when all roots resolve under it"
+        );
     }
 
     #[test]
