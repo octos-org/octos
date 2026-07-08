@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 use eyre::{Result, WrapErr};
 
-use super::entry::{Entry, fold_whitespace, render_memory_md, sha256_hex, split_blocks};
+use super::entry::{Entry, render_memory_md, sha256_hex, split_blocks};
 use super::staging::NoteFile;
 
 /// One hard-deleted entry's scrub set.
@@ -699,6 +699,7 @@ pub fn apply_expiry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_consolidate::entry::fold_whitespace;
     use crate::memory_consolidate::staging::parse_note;
 
     fn entry(id: &str, text: &str) -> Entry {
