@@ -377,6 +377,109 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
 ///
 /// Shared by the preset path (config built via [`build_config`]) and the
 /// custom path (config built via [`SelectedProvider::to_json`]) so both flows
+/// Outcome of the init-time API-key capture offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCaptureOutcome {
+    /// The user pasted a key; it was saved to the global auth store.
+    Saved,
+    /// The user pressed Enter to skip.
+    Skipped,
+}
+
+/// Core of the init-time key capture: read one line from `reader`; empty
+/// input skips, anything else is trimmed and saved to `store` as a
+/// `paste_token` credential for `provider` — byte-for-byte the same
+/// credential shape `octos auth login --provider <name>` stores, so
+/// `Config::get_api_key` (auth store first, env second) resolves it for
+/// chat/serve/gateway without any exported env var.
+///
+/// Extracted from the interactive wrapper for testability (injected reader).
+fn capture_api_key_from_reader(
+    provider: &str,
+    store: &mut crate::auth::AuthStore,
+    reader: &mut dyn std::io::BufRead,
+) -> Result<KeyCaptureOutcome> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let token = line.trim();
+    if token.is_empty() {
+        return Ok(KeyCaptureOutcome::Skipped);
+    }
+    store.set(
+        provider,
+        crate::auth::AuthCredential {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            provider: provider.to_string(),
+            auth_method: "paste_token".to_string(),
+        },
+    )?;
+    Ok(KeyCaptureOutcome::Saved)
+}
+
+/// Init-time credential offer, mirroring the runtime resolution order:
+/// env var set → done; global auth store already holds a credential →
+/// done; otherwise, on a TTY, offer to paste the key now (Enter skips).
+/// Non-interactive runs keep the old export hint.
+fn offer_api_key_capture(provider: &str, api_key_env: &str) {
+    use std::io::IsTerminal as _;
+
+    if std::env::var(api_key_env).is_ok() {
+        println!("{} {} is set", "✓".green(), api_key_env);
+        return;
+    }
+
+    let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+    let store = crate::auth::AuthStore::at(&auth_home);
+    if let Ok(ref s) = store {
+        if s.get(provider).is_some() {
+            println!(
+                "{} credential for {} already saved (octos auth login)",
+                "✓".green(),
+                provider
+            );
+            return;
+        }
+    }
+
+    println!("{} {} is not set", "Warning:".yellow(), api_key_env);
+
+    let captured = match store {
+        Ok(mut s) if std::io::stdin().is_terminal() && !provider.is_empty() => {
+            println!(
+                "Paste your {} API key now to save it securely (Enter to skip):",
+                provider
+            );
+            print!("> ");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let mut stdin = std::io::stdin().lock();
+            capture_api_key_from_reader(provider, &mut s, &mut stdin)
+                .unwrap_or(KeyCaptureOutcome::Skipped)
+        }
+        _ => KeyCaptureOutcome::Skipped,
+    };
+
+    match captured {
+        KeyCaptureOutcome::Saved => {
+            println!(
+                "{} Key saved for {} — chat/serve will use it (auth store)",
+                "✓".green(),
+                provider
+            );
+            println!();
+        }
+        KeyCaptureOutcome::Skipped => {
+            println!();
+            println!("Set it later with:");
+            println!("  octos auth login --provider {provider}");
+            println!("  # or: export {}=your-api-key", api_key_env);
+            println!();
+        }
+    }
+}
+
 /// produce an identical, fully-bootstrapped octos home.
 fn write_init_files(
     config_dir: PathBuf,
@@ -402,16 +505,18 @@ fn write_init_files(
     println!("{}", config_str);
     println!();
 
-    // Check if API key is set
-    if std::env::var(&api_key_env).is_err() {
-        println!("{} {} is not set", "Warning:".yellow(), api_key_env);
-        println!();
-        println!("Set it with:");
-        println!("  export {}=your-api-key", api_key_env);
-        println!();
-    } else {
-        println!("{} {} is set", "✓".green(), api_key_env);
-    }
+    // Credential check. Resolution order at runtime is auth store first,
+    // then env var (`Config::get_api_key`), so mirror that here — and when
+    // NEITHER holds a credential, offer to capture the key on the spot
+    // through the same global auth store `octos auth login` writes (#1541:
+    // init used to stop at "export it yourself", leaving a fresh setup
+    // that cannot actually reach the provider).
+    let provider_name = config
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    offer_api_key_capture(&provider_name, &api_key_env);
 
     // Create .gitignore if it doesn't exist
     let gitignore_path = config_dir.join(".gitignore");
@@ -856,6 +961,60 @@ mod tests {
             .iter()
             .find(|provider| provider.name == name)
             .unwrap_or_else(|| panic!("missing provider: {name}"))
+    }
+
+    // #1541: `octos init` offers to capture the API key right after the
+    // provider choice, storing it through the SAME global auth store that
+    // `octos auth login` writes and `Config::get_api_key` reads first —
+    // instead of stopping at "Warning: X is not set, export it yourself".
+
+    #[test]
+    fn should_save_pasted_key_to_auth_store_when_input_nonempty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        let mut input = std::io::Cursor::new(b"sk-test-abc123\n".to_vec());
+
+        let outcome = capture_api_key_from_reader("deepseek", &mut store, &mut input).unwrap();
+
+        assert_eq!(outcome, KeyCaptureOutcome::Saved);
+        let cred = store.get("deepseek").expect("credential saved");
+        assert_eq!(cred.access_token, "sk-test-abc123");
+        assert_eq!(cred.auth_method, "paste_token");
+        // Durable: a fresh store handle at the same auth_home sees it (the
+        // whole point — chat/serve resolve the GLOBAL store, not process env).
+        let reopened = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.get("deepseek").map(|c| c.access_token.as_str()),
+            Some("sk-test-abc123")
+        );
+    }
+
+    #[test]
+    fn should_skip_without_writing_when_input_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+
+        let outcome = capture_api_key_from_reader("deepseek", &mut store, &mut input).unwrap();
+
+        assert_eq!(outcome, KeyCaptureOutcome::Skipped);
+        assert!(store.get("deepseek").is_none());
+        assert!(
+            !tmp.path().join("auth.json").exists(),
+            "an empty paste must not create/touch auth.json"
+        );
+    }
+
+    #[test]
+    fn should_trim_whitespace_when_key_pasted_with_newline_or_spaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        let mut input = std::io::Cursor::new(b"  sk-padded-key  \n".to_vec());
+
+        let outcome = capture_api_key_from_reader("kimi", &mut store, &mut input).unwrap();
+
+        assert_eq!(outcome, KeyCaptureOutcome::Saved);
+        assert_eq!(store.get("kimi").unwrap().access_token, "sk-padded-key");
     }
 
     #[test]
