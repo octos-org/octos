@@ -3164,4 +3164,75 @@ mod tests {
             outcome.pending_notes
         );
     }
+
+    #[tokio::test]
+    async fn should_scrub_shared_line_from_surviving_entry_when_hard_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret_line = "The vault code is 9137.";
+        write_memory(
+            memory_dir,
+            &[
+                &format!("{secret_line}\nKept in the red notebook. (updated: 2026-06-01) ^msecret"),
+                &format!("{secret_line}\nAlso likes tea. (updated: 2026-06-02) ^msharer"),
+            ],
+        );
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("9137"),
+            "the shared secret line must leave MEMORY.md entirely: {memory}"
+        );
+        assert!(
+            memory.contains("Also likes tea.") && memory.contains("^msharer"),
+            "the surviving entry keeps its other content"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_add_back_when_copy_carries_stale_id_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "The vault code is 9137. (updated: 2026-06-01) ^msecret";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+
+        // Verbatim copy INCLUDING the old ^m token and stamp.
+        let reply = r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"},{"op":"add","section":null,"text":"The vault code is 9137. (updated: 2026-06-01) ^msecret","sources":[]}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#;
+        let provider = ScriptedProvider::new(&[reply, reply]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(
+            !outcome.merge_applied,
+            "verbatim add-back with stale id token must be rejected: {:?}",
+            outcome.errors
+        );
+    }
 }

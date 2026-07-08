@@ -583,12 +583,40 @@ pub fn validate(output: &ModelOutput, ctx: &ValidationCtx) -> Result<ValidatedOp
     // hard-deleted target's folded lines rejects the whole merge.
     // Compare CONTENT with bookkeeping stripped: the deleted line carries
     // its `(updated:)` stamp and `^m` id while a re-added copy would not.
+    // Strip every `^m<6 of [a-z2-7]>` token: the prompt shows entry ids,
+    // so a verbatim-copied line can carry the OLD token — folding it
+    // un-stripped would defeat the equality check.
+    fn strip_all_id_tokens(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'^'
+                && i + 7 < bytes.len() + 1
+                && bytes.get(i + 1) == Some(&b'm')
+                && bytes[i + 2..]
+                    .iter()
+                    .take(6)
+                    .filter(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+                    .count()
+                    == 6
+            {
+                i += 8;
+                continue;
+            }
+            // Safe: we only skip full ASCII token bytes above.
+            let ch_len = text[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&text[i..i + ch_len]);
+            i += ch_len;
+        }
+        out
+    }
     let strip_fold = |id: &str, text: &str| -> Vec<String> {
         let entry = super::entry::Entry {
             id: id.to_string(),
             text: text.to_string(),
         };
-        super::pending::strippable_entry_text(&entry)
+        strip_all_id_tokens(&super::pending::strippable_entry_text(&entry))
             .lines()
             .map(super::entry::fold_whitespace)
             .filter(|l| !l.is_empty())

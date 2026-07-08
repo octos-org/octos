@@ -382,7 +382,43 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
     }
 
     // --- step 3: MEMORY.md -------------------------------------------------
-    write_memory_md(memory_dir, &plan.final_entries, !has_hard_deletes)?;
+    // The scrub set applies to the PRIMARY file too: another live/restored
+    // entry can carry an exact line of the deleted entry (shared facts) —
+    // publishing final_entries unfiltered would keep the sensitive line in
+    // MEMORY.md after the confirmation.
+    let final_entries: Vec<super::entry::Entry> = if has_hard_deletes {
+        plan.final_entries
+            .iter()
+            .filter_map(|entry| {
+                let kept: Vec<&str> = entry
+                    .text
+                    .lines()
+                    .filter(|line| !plan.hard_deletes.iter().any(|t| t.line_matches(line)))
+                    .collect();
+                if kept.is_empty() {
+                    return None;
+                }
+                let text = kept.join("\n");
+                // An entry reduced to bookkeeping only carries no content.
+                if super::pending::strippable_entry_text(&super::entry::Entry {
+                    id: entry.id.clone(),
+                    text: text.clone(),
+                })
+                .trim()
+                .is_empty()
+                {
+                    return None;
+                }
+                Some(super::entry::Entry {
+                    id: entry.id.clone(),
+                    text,
+                })
+            })
+            .collect()
+    } else {
+        plan.final_entries.clone()
+    };
+    write_memory_md(memory_dir, &final_entries, !has_hard_deletes)?;
 
     // --- step 4: consume request notes + restored archive blocks ---------
     if has_hard_deletes {
