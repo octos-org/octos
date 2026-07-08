@@ -617,12 +617,15 @@ async fn run_prompt_turn(
                 // back to what the agent SAID — mirroring the chat REPL, which
                 // also pushes `response.content` as an assistant message. Guard
                 // against double-append for turns where messages already ends
-                // with that assistant reply.
+                // with that assistant reply. Skip entirely on a CANCELLED turn:
+                // `content` there is a partial/aborted stream, and persisting it
+                // would condition the next prompt on a reply the client never
+                // completed.
                 let already_persisted = matches!(
                     h.last(),
                     Some(last) if last.role == octos_core::MessageRole::Assistant && last.content == assistant_reply
                 );
-                if !assistant_reply.is_empty() && !already_persisted {
+                if !cancelled && !assistant_reply.is_empty() && !already_persisted {
                     h.push(octos_core::Message {
                         role: octos_core::MessageRole::Assistant,
                         content: assistant_reply,
@@ -1185,16 +1188,23 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        /// One entry per `chat()` call: the `content` of every incoming message,
+        /// so a test can assert what history a later turn was handed.
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     #[async_trait::async_trait]
     impl octos_llm::LlmProvider for BarrierLlm {
         async fn chat(
             &self,
-            _messages: &[octos_core::Message],
+            messages: &[octos_core::Message],
             _tools: &[octos_llm::ToolSpec],
             _config: &octos_llm::ChatConfig,
         ) -> eyre::Result<octos_llm::ChatResponse> {
+            self.seen
+                .lock()
+                .await
+                .push(messages.iter().map(|m| m.content.clone()).collect());
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // Announce that the turn is executing, then wait for the test
@@ -1285,6 +1295,7 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             entered: entered.clone(),
             release: release.clone(),
+            seen: Arc::new(Mutex::new(Vec::new())),
         });
         let transport = CancelTestTransport {
             factory: InjectedLlmFactory {
@@ -1370,10 +1381,12 @@ mod tests {
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(BarrierLlm {
             calls: std::sync::atomic::AtomicUsize::new(0),
             entered: entered.clone(),
             release: release.clone(),
+            seen: seen.clone(),
         });
         let transport = CancelTestTransport {
             factory: InjectedLlmFactory {
@@ -1459,6 +1472,23 @@ mod tests {
             matches!(got, Some(StopReason::EndTurn)),
             "fresh prompt after a cancelled turn must be EndTurn (reset relocated, \
              not deleted), got {got:?}"
+        );
+
+        // codex round-3 regression: the CANCELLED turn's aborted assistant reply
+        // ("done") must NOT be persisted into history, so the fresh second turn's
+        // chat() must not see it. Without the `!cancelled` guard, the partial
+        // reply leaks into the next prompt's context.
+        let snapshots = seen.lock().await;
+        assert!(
+            snapshots.len() >= 2,
+            "both turns reached the LLM: {} calls",
+            snapshots.len()
+        );
+        assert!(
+            !snapshots[1].iter().any(|c| c.contains("done")),
+            "the cancelled turn's aborted assistant reply must NOT persist into the \
+             next prompt's history; turn-2 messages: {:?}",
+            snapshots[1]
         );
     }
 }
