@@ -15971,6 +15971,11 @@ async fn run_native_code_review_turn(
     let memory_store = session_runtime.profile.memory.clone();
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
+    // UPCR follow-up to #1561: refresh named prompt segments (memory) on
+    // the cached session agent BEFORE snapshotting — WS turns build a
+    // fresh request agent from this snapshot and never run the cached
+    // agent's own turn-start refresh.
+    session_runtime.agent.refresh_prompt_segments().await;
     let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
     let review_dispatch_policy = Arc::new(octos_agent::DispatchPolicy::from_agent_gates(
         profile_runtime.tool_policy.clone(),
@@ -17694,6 +17699,10 @@ async fn run_standalone_turn(
     // dynamic context — none of which the session prompt should
     // supplant. The session prompt is workflow-specific guidance that
     // augments rather than replaces.
+    // Same refresh-before-snapshot rule as the review path: the cached
+    // agent's memory segment must be current before the per-turn agent
+    // clones its prompt.
+    session_runtime.agent.refresh_prompt_segments().await;
     let agent_snapshot = session_runtime.agent.system_prompt_snapshot();
     let system_prompt_base = match session_id.topic().and_then(|topic| {
         crate::project_templates::read_session_prompt(&session_runtime.profile.data_dir, topic)

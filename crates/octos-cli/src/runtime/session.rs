@@ -524,14 +524,17 @@ impl SessionRuntime {
             octos_agent::MEMORY_SEGMENT_NAME,
             octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
         );
-        // Refresh is unconditional — reading CURRENT memory each turn is
-        // correct even when the capture layer is opted out; the flag only
-        // controls the capture-policy teaching text inside the segment.
-        agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-            profile.memory_store.clone(),
-            profile.memory_inject_tokens,
-            profile.memory_refresh_enabled,
-        )));
+        // Contract parity with chat.rs: `memory.refresh.enabled = false`
+        // means NO per-turn memory re-read — the segment stays as seeded
+        // at session bootstrap. Default-on makes disabled an explicit
+        // opt-out.
+        if profile.memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                profile.memory_store.clone(),
+                profile.memory_inject_tokens,
+                true,
+            )));
+        }
 
         // M11-F regression fix REG-3: propagate the profile-scope
         // [`octos_agent::HookExecutor`] onto the per-session agent.
@@ -845,7 +848,7 @@ mod tests {
             memory,
             memory_store,
             memory_inject_tokens: 2500,
-            memory_refresh_enabled: false,
+            memory_refresh_enabled: true,
             memory_refresh: None,
             tool_config,
             cron_service: None,
@@ -1472,7 +1475,7 @@ mod tests {
             memory,
             memory_store,
             memory_inject_tokens: 2500,
-            memory_refresh_enabled: false,
+            memory_refresh_enabled: true,
             memory_refresh: None,
             tool_config,
             cron_service: None,
@@ -1530,7 +1533,7 @@ mod tests {
             memory,
             memory_store,
             memory_inject_tokens: 2500,
-            memory_refresh_enabled: false,
+            memory_refresh_enabled: true,
             memory_refresh: None,
             tool_config,
             cron_service: None,
@@ -1616,7 +1619,7 @@ mod tests {
             memory,
             memory_store,
             memory_inject_tokens: 2500,
-            memory_refresh_enabled: false,
+            memory_refresh_enabled: true,
             memory_refresh: None,
             tool_config,
             cron_service: None,

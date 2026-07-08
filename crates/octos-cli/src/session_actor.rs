@@ -3748,15 +3748,19 @@ impl ActorFactory {
         // profile bootstrap = forever). This builder is synchronous, so
         // the segment is not pre-seeded: the provider composes it during
         // the turn-start refresh, which runs BEFORE the first model call.
-        // Registered unconditionally — with refresh disabled the segment
-        // still renders (without the capture-policy text); it only
-        // re-renders when the fingerprint changes.
-        if let Some(ref memory_store) = self.memory_store {
-            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-                memory_store.clone(),
-                self.memory_inject_tokens,
-                self.memory_refresh_enabled,
-            )));
+        // Contract parity with chat.rs: registration is gated on
+        // `memory.refresh.enabled` — disabled means NO per-turn memory
+        // re-read (default-on makes disabled an explicit opt-out).
+        if self.memory_refresh_enabled {
+            if let Some(ref memory_store) = self.memory_store {
+                agent.add_prompt_segment_provider(Arc::new(
+                    octos_agent::MemorySegmentProvider::new(
+                        memory_store.clone(),
+                        self.memory_inject_tokens,
+                        true,
+                    ),
+                ));
+            }
         }
 
         if let Some(ref embedder) = self.embedder {
