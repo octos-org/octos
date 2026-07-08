@@ -45,9 +45,17 @@ struct Args {
     #[arg(long, default_value = "octos.default")]
     profile: String,
 
-    /// Working directory (granted read-write access).
+    /// Working directory. Granted read-write access by default; granted
+    /// read-only access when `--readonly-cwd` is set (used by
+    /// `--sandbox read-only`, which must stop shell writes to the workspace).
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
+
+    /// Grant the working directory READ-ONLY access instead of read-write.
+    /// This is what a read-only permission profile requires so shell commands
+    /// (`touch newfile`) cannot mutate the workspace.
+    #[arg(long)]
+    readonly_cwd: bool,
 
     /// Paths to grant read-only access to (repeatable).
     #[arg(long = "allow-read")]
@@ -133,7 +141,7 @@ fn run_passthrough(args: &Args) -> eyre::Result<u8> {
 
 #[cfg(target_os = "linux")]
 fn probe_linux() -> eyre::Result<()> {
-    apply_linux_landlock(&std::env::current_dir()?, &[])?;
+    apply_linux_landlock(&std::env::current_dir()?, &[], true)?;
     apply_linux_seccomp(false)?;
     Ok(())
 }
@@ -155,7 +163,7 @@ fn run_linux_sandboxed(args: &Args) -> eyre::Result<u8> {
         command.env_remove(var);
     }
 
-    apply_linux_landlock(&args.cwd, &args.allow_read)
+    apply_linux_landlock(&args.cwd, &args.allow_read, !args.readonly_cwd)
         .wrap_err("failed to apply Landlock policy")?;
     apply_linux_seccomp(args.allow_network).wrap_err("failed to apply seccomp policy")?;
 
@@ -163,7 +171,11 @@ fn run_linux_sandboxed(args: &Args) -> eyre::Result<u8> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_landlock(cwd: &std::path::Path, extra_read_paths: &[PathBuf]) -> eyre::Result<()> {
+fn apply_linux_landlock(
+    cwd: &std::path::Path,
+    extra_read_paths: &[PathBuf],
+    cwd_write: bool,
+) -> eyre::Result<()> {
     use eyre::{WrapErr, bail};
     use landlock::{
         ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
@@ -201,13 +213,19 @@ fn apply_linux_landlock(cwd: &std::path::Path, extra_read_paths: &[PathBuf]) -> 
         .canonicalize()
         .wrap_err_with(|| format!("failed to canonicalize cwd {}", cwd.display()))?;
 
+    // Grant the workspace read-write by default, or read-only when the caller
+    // requested `--readonly-cwd` (a read-only permission profile). Read-only
+    // means shell commands can traverse/read the workspace but cannot mutate
+    // it — closing the `--sandbox read-only` shell-write hole (codex P1).
+    let cwd_access = if cwd_write { write_access } else { read_access };
+
     let mut created = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
         .create()?
         .add_rules(path_beneath_rules(SYSTEM_READ_PATHS, read_access))?
         .add_rules(path_beneath_rules(SYSTEM_EXEC_PATHS, exec_access))?
         .add_rules(path_beneath_rules(SYSTEM_WRITE_PATHS, write_access))?
-        .add_rules(path_beneath_rules([cwd.as_path()], write_access))?;
+        .add_rules(path_beneath_rules([cwd.as_path()], cwd_access))?;
 
     for path in extra_read_paths {
         created = created.add_rules(path_beneath_rules([path.as_path()], read_access))?;
@@ -302,14 +320,27 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
     )
     .wrap_err("failed to create AppContainer profile")?;
 
-    // 2. Grant read-write access to working directory
+    // 2. Grant access to the working directory. Read-write by default, or
+    //    read-only when `--readonly-cwd` is set (a read-only permission
+    //    profile) so shell commands cannot mutate the workspace (codex P1).
     if args.cwd.exists() {
+        let cwd_access = if args.readonly_cwd {
+            AccessMask::FILE_GENERIC_READ
+        } else {
+            AccessMask(AccessMask::FILE_GENERIC_READ.0 | AccessMask::FILE_GENERIC_WRITE.0)
+        };
         acl::grant_to_package(
             ResourcePath::Directory(args.cwd.clone()),
             &profile.sid,
-            AccessMask(AccessMask::FILE_GENERIC_READ.0 | AccessMask::FILE_GENERIC_WRITE.0),
+            cwd_access,
         )
-        .wrap_err_with(|| format!("failed to grant rw to {}", args.cwd.display()))?;
+        .wrap_err_with(|| {
+            format!(
+                "failed to grant {} to {}",
+                if args.readonly_cwd { "ro" } else { "rw" },
+                args.cwd.display()
+            )
+        })?;
     }
 
     // 3. Grant read-only access to additional paths

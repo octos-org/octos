@@ -247,7 +247,13 @@ impl EffectivePermissions {
         // leaves the inherited (writable) sandbox untouched.
         if !self.file_access.allows_write() {
             sandbox.workspace_write = false;
-            sandbox.docker.mount_mode = MountMode::ReadOnly;
+            // Docker: NARROW a read-write mount to read-only, but never WIDEN
+            // a fully-isolated `None` mount (no project access at all) up to
+            // `ReadOnly` — that would grant read access the operator withheld
+            // (codex P1 regression). Only ReadWrite -> ReadOnly is a narrowing.
+            if sandbox.docker.mount_mode == MountMode::ReadWrite {
+                sandbox.docker.mount_mode = MountMode::ReadOnly;
+            }
         }
         sandbox
     }
@@ -534,6 +540,35 @@ mod tests {
         assert_eq!(
             sandbox.docker.mount_mode,
             crate::sandbox::MountMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn should_not_widen_docker_none_mount_to_read_only_when_read_only_profile() {
+        // P1 (codex) regression guard: an inherited Docker config with
+        // `MountMode::None` means the container has NO project access at all
+        // (fully isolated). Downgrading it to `ReadOnly` for a read-only
+        // profile would WIDEN access (none -> read), a security regression.
+        // Only `ReadWrite` may be narrowed to `ReadOnly`; `None` stays `None`.
+        let base = SandboxConfig {
+            enabled: true,
+            mode: SandboxMode::Docker,
+            allow_network: false,
+            docker: crate::sandbox::DockerConfig {
+                mount_mode: crate::sandbox::MountMode::None,
+                ..Default::default()
+            },
+            ..SandboxConfig::default()
+        };
+        let sandbox = EffectivePermissions::read_only().apply_to_sandbox(&base);
+
+        // workspace_write is still forced false (read-only intent preserved).
+        assert!(!sandbox.workspace_write);
+        // But the mount mode must NOT be widened from None to ReadOnly.
+        assert_eq!(
+            sandbox.docker.mount_mode,
+            crate::sandbox::MountMode::None,
+            "None (fully isolated) must not be widened to ReadOnly by a read-only profile"
         );
     }
 

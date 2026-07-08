@@ -114,6 +114,49 @@ impl Sandbox for MacosSandbox {
             String::new()
         };
 
+        // Choose a scratch temp dir for TMPDIR/TEMP/TMP.
+        //
+        // - Writable workspace: keep the historical `<cwd>/tmp` (covered by the
+        //   cwd file-write* grant above).
+        // - Read-only workspace (P2, codex): NEVER create or point TMPDIR under
+        //   the workspace — that would mutate it BEFORE sandbox-exec even runs.
+        //   Use a private dir OUTSIDE the workspace and grant SBPL write to
+        //   THAT instead, so read-only truly means no workspace mutation while
+        //   tools that need scratch space (Python tempfile, compilers) still
+        //   work.
+        let user_tmp = if self.workspace_write {
+            cwd.join("tmp")
+        } else {
+            std::env::temp_dir().join(format!("octos-sandbox-ro.{}", std::process::id()))
+        };
+        // Create the scratch dir. For the writable case this lives inside the
+        // (writable) workspace; for the read-only case it is outside it.
+        let _ = std::fs::create_dir_all(&user_tmp);
+
+        // For the read-only case, grant SBPL file-write* to the external temp
+        // dir's real path so scratch writes succeed there (not in the
+        // workspace). The path is validated for SBPL metacharacters; if it is
+        // unexpectedly unsafe we simply omit the grant (fail-closed: scratch
+        // writes fail rather than the profile being injectable).
+        let external_tmp_write_rule = if self.workspace_write {
+            String::new()
+        } else {
+            let real_tmp = std::fs::canonicalize(&user_tmp)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| user_tmp.to_string_lossy().to_string());
+            if real_tmp
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+            {
+                tracing::error!(
+                    "external temp dir contains SBPL metacharacters, omitting write grant"
+                );
+                String::new()
+            } else {
+                format!("(allow file-write* (subpath \"{real_tmp}\"))\n")
+            }
+        };
+
         let profile = format!(
             r#"(version 1)
 (deny default)
@@ -128,20 +171,17 @@ impl Sandbox for MacosSandbox {
 (allow file-ioctl)
 {read_rules}
 (allow file-write* (literal "/dev/null"))
-{workspace_write_rule}{network_rule}
+{workspace_write_rule}{external_tmp_write_rule}{network_rule}
 "#,
             read_rules = read_rules,
             workspace_write_rule = workspace_write_rule,
+            external_tmp_write_rule = external_tmp_write_rule,
             network_rule = network_rule,
         );
 
-        // Create a per-user tmp dir inside the workspace so programs that
-        // need temp files (Python tempfile, compilers, etc.) still work.
-        let user_tmp = cwd.join("tmp");
-        let _ = std::fs::create_dir_all(&user_tmp);
-
         let mut cmd = Command::new("sandbox-exec");
-        // Redirect TMPDIR/TEMP/TMP to the per-user tmp inside the workspace
+        // Redirect TMPDIR/TEMP/TMP to the chosen scratch dir (inside cwd when
+        // writable, outside the workspace when read-only).
         cmd.env("TMPDIR", &user_tmp);
         cmd.env("TEMP", &user_tmp);
         cmd.env("TMP", &user_tmp);
@@ -581,6 +621,122 @@ mod tests {
         assert!(
             profile.contains(&format!(r#"(allow file-write* (subpath "{real_cwd}"))"#)),
             "writable profile must grant file-write* to the workspace, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_not_create_tmp_under_cwd_when_workspace_write_disabled() {
+        // P2 (codex): with workspace_write=false, wrap_command must NOT create
+        // `<cwd>/tmp` (a workspace mutation that happens BEFORE sandbox-exec
+        // even starts) nor point TMPDIR/TEMP/TMP under the workspace. The temp
+        // dir must live OUTSIDE the read-only workspace.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+
+        // The wrapper must not have created a tmp dir inside the workspace.
+        assert!(
+            !cwd.join("tmp").exists(),
+            "read-only wrapper must NOT create <cwd>/tmp before sandbox-exec"
+        );
+
+        // TMPDIR/TEMP/TMP must point OUTSIDE the workspace cwd.
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            if let Some(Some(val)) = envs.get(key) {
+                assert!(
+                    !std::path::Path::new(val).starts_with(cwd),
+                    "{key} must not point inside the read-only workspace, got {val}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_grant_sbpl_write_to_external_tmp_when_workspace_write_disabled() {
+        // P2 (codex): the out-of-workspace temp dir that TMPDIR points at must
+        // itself be granted file-write* in the SBPL profile, otherwise tools
+        // that need scratch space break under a read-only workspace.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        let tmpdir = envs
+            .get("TMPDIR")
+            .and_then(|v| v.clone())
+            .expect("TMPDIR must be set");
+        // Canonicalize because SBPL subpath rules use real paths.
+        let real_tmp = std::fs::canonicalize(&tmpdir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(tmpdir);
+        assert!(
+            profile.contains(&format!(r#"(allow file-write* (subpath "{real_tmp}"))"#)),
+            "external temp dir must be granted file-write* in SBPL, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn should_not_leave_tmp_dir_in_workspace_after_read_only_run() {
+        // P2 (codex) end-to-end: running a command under a read-only workspace
+        // must leave NO `<cwd>/tmp` behind (the workspace stays untouched).
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            workspace_write: false,
+        };
+        let mut cmd = sb.wrap_command("echo hello; :", cwd);
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !cwd.join("tmp").exists(),
+            "read-only run must not create <cwd>/tmp, stdout={stdout}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

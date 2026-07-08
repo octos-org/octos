@@ -66,6 +66,56 @@ fn linux_sandbox_allows_cwd_write_and_blocks_sibling_write() {
 }
 
 #[test]
+fn linux_sandbox_readonly_cwd_blocks_cwd_write() {
+    // P1 (codex): with `--readonly-cwd` the helper must grant the workspace
+    // cwd READ-ONLY, so `touch newfile` inside the cwd fails (the
+    // `--sandbox read-only` shell-write hole). Reads inside the cwd still work.
+    require_linux_sandbox_supported();
+
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!("linux-sandbox-ro-test-{}", std::process::id()));
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // A pre-existing file we should still be able to READ under read-only cwd.
+    let existing = work.join("existing.txt");
+    std::fs::write(&existing, "readable\n").unwrap();
+    let new_file = work.join("newfile.txt");
+
+    // Reading the existing file must succeed (exit 0); creating a new file must
+    // fail; and after the attempt the new file must NOT exist.
+    let script = format!(
+        "cat '{}' >/dev/null && if touch '{}' 2>/dev/null; then exit 43; else test ! -e '{}'; fi",
+        existing.display(),
+        new_file.display(),
+        new_file.display(),
+    );
+
+    let status = Command::new(helper())
+        .arg("--cwd")
+        .arg(&work)
+        .arg("--readonly-cwd")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .status()
+        .expect("octos-sandbox --readonly-cwd command should run");
+
+    assert!(
+        status.success(),
+        "read-only cwd must allow reads but block writes"
+    );
+    assert!(
+        !new_file.exists(),
+        "Landlock read-only cwd must block workspace writes"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn linux_sandbox_blocks_internet_socket_when_network_disabled() {
     require_linux_sandbox_supported();
 

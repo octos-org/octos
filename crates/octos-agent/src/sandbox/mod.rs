@@ -263,6 +263,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
+                    workspace_write: config.workspace_write,
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -289,6 +290,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
+                    workspace_write: config.workspace_write,
                 })
             }
             #[cfg(not(windows))]
@@ -328,6 +330,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 profile_name: config.profile_name.clone(),
+                workspace_write: config.workspace_write,
             });
         }
     }
@@ -339,6 +342,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 profile_name: config.profile_name.clone(),
+                workspace_write: config.workspace_write,
             });
         }
     }
