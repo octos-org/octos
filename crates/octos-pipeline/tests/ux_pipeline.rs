@@ -736,27 +736,32 @@ async fn test_06_send_file_sandbox_escape() {
             .map(|c| c.starts_with(&tmp_canon))
             .unwrap_or(true)
     };
-    let outside_root = [
+    // Probe candidate roots by actually creating the temp dir — a root may be
+    // non-/tmp yet unwritable (sandboxed / read-only-HOME CI), so selection
+    // must not commit to it before the create succeeds (codex review).
+    let outside = [
         std::env::var_os("HOME").map(std::path::PathBuf::from),
         Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
     ]
     .into_iter()
     .flatten()
-    .find(|p| p.exists() && !is_under_tmp(p));
+    .filter(|p| p.exists() && !is_under_tmp(p))
+    .find_map(|root| {
+        tempfile::Builder::new()
+            .prefix("octos-pipeline-send-file-outside-")
+            .tempdir_in(&root)
+            .ok()
+    });
 
-    let Some(outside_root) = outside_root else {
+    let Some(outside) = outside else {
         eprintln!(
-            "[sandbox-abs] SKIP: no filesystem root outside the /tmp allowlist \
-             in this environment (repo/HOME both under /tmp); the escape guard \
-             is exercised by the traversal case in CI where the repo is not /tmp-rooted"
+            "[sandbox-abs] SKIP: no writable filesystem root outside the /tmp \
+             allowlist in this environment (repo/HOME both under /tmp or \
+             unwritable); the escape guard is exercised in CI where the repo \
+             is not /tmp-rooted"
         );
         return;
     };
-
-    let outside = tempfile::Builder::new()
-        .prefix("octos-pipeline-send-file-outside-")
-        .tempdir_in(&outside_root)
-        .unwrap();
 
     // Create a "secret" file outside the sandbox (and outside /tmp).
     let secret = outside.path().join("credentials.json");
