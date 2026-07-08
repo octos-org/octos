@@ -352,6 +352,71 @@ pub async fn run_consolidation(
     if !params.allow_merge {
         entries =
             park_free_text_forgets(memory_dir, params, &batch, &entries, &mut outcome, false)?;
+        // Id-bound forgets carry complete host authority — execute them
+        // Rust-side on live, unfrozen entries so `forget --id --sensitive`
+        // is honored NOW instead of when the budget resets. Ids that are
+        // pending-note candidates keep the full hash-verified confirmation
+        // flow of a merged run (their entries are already hidden when
+        // sensitive, so nothing stays exposed).
+        let frozen_ids: HashSet<String> = waiting
+            .iter()
+            .flat_map(|w| w.candidates.as_deref().unwrap_or_default())
+            .map(|c| c.entry_id.clone())
+            .collect();
+        let mut plan = ApplyPlan::default();
+        let mut working = entries.clone();
+        let mut executed_notes: Vec<usize> = Vec::new();
+        for (i, note) in batch.notes.iter().enumerate() {
+            if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
+                continue;
+            }
+            let named = note.named_entry_ids();
+            if named.is_empty() {
+                continue;
+            }
+            let targets: Vec<usize> = named
+                .iter()
+                .filter_map(|id| {
+                    if frozen_ids.contains(id) {
+                        return None;
+                    }
+                    working.iter().position(|e| &e.id == id)
+                })
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            let all_named_covered = named
+                .iter()
+                .all(|id| working.iter().any(|e| &e.id == id) && !frozen_ids.contains(id));
+            for pos in targets.into_iter().rev() {
+                let entry = working.remove(pos);
+                plan.hard_deletes.push(ScrubTarget {
+                    entry_id: entry.id.clone(),
+                    folded_lines: entry.folded_lines(),
+                    authorizing_note: note.path.clone(),
+                    originating_pending: Vec::new(),
+                });
+                outcome.hard_deleted.push(entry.id.clone());
+            }
+            if all_named_covered {
+                executed_notes.push(i);
+            }
+        }
+        if !plan.hard_deletes.is_empty() {
+            plan.final_entries = working.clone();
+            apply::apply_plan(memory_dir, params.today, &plan)?;
+            entries = working;
+            // Fully-honored notes were consumed by the apply (authorizing
+            // note deletion); drop them from the batch.
+            for i in executed_notes.into_iter().rev() {
+                let note = batch.notes.remove(i);
+                outcome.dropped.push((
+                    note.id.clone(),
+                    "executed under budget exhaustion (id-bound host authority)".to_string(),
+                ));
+            }
+        }
     }
 
     // --- 3. skip early when nothing is consumable ------------------------
@@ -768,7 +833,11 @@ pub async fn run_consolidation(
     // byte-identically and schedule the note files for deletion.
     for (entry_id, block) in &restores {
         if working.iter().any(|e| e.id == *entry_id) {
-            continue; // already restored by a previous crashed run
+            // Already restored by a previous crashed run — but that run may
+            // have died before step 4 removed the archive copy; schedule
+            // the removal again (idempotent: absent blocks no-op).
+            plan.archive_block_removals.push(block.clone());
+            continue;
         }
         working.push(Entry {
             id: entry_id.clone(),
@@ -2743,5 +2812,104 @@ mod tests {
             note_text.contains("candidates:") && note_text.contains("interim_archived"),
             "the ask must be parked with its binding: {note_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn should_execute_id_bound_sensitive_forget_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "Sensitive live secret. (updated: 2026-06-01) ^mlivsec";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        let note = write_note(
+            memory_dir,
+            "01fg-exact",
+            "host",
+            "forget",
+            "delete id:^mlivsec",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let mut p = params(memory_dir);
+        p.allow_merge = false;
+        let outcome = run_consolidation(provider.clone(), &p).await.unwrap();
+
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "id-bound authority needs no merge"
+        );
+        assert!(outcome.hard_deleted.contains(&"^mlivsec".to_string()));
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("^mlivsec"),
+            "exact sensitive forget must execute under budget exhaustion: {memory}"
+        );
+        assert!(memory.contains("^mcccccc"));
+        assert!(!note.exists(), "the honored note is consumed");
+    }
+
+    #[tokio::test]
+    async fn should_remove_leftover_archive_copy_when_restore_already_happened() {
+        // Crash window: a confirmation run restored the unconfirmed interim
+        // candidate into MEMORY.md but died before removing its archive
+        // copy. The recovered confirmation must still remove that block.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let confirmed = "Confirmed target. (updated: 2026-06-01) ^mtarget";
+        let restored = "Restored survivor. (updated: 2026-06-02) ^msurviv";
+        // Crash state: survivor is LIVE again AND its copy is still archived.
+        write_memory(
+            memory_dir,
+            &[restored, "Keeps bonsai. (updated: 2026-06-03) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(
+            memory_dir.join("archive/2026-06.md"),
+            format!("{confirmed}\n\n{restored}\n"),
+        )
+        .unwrap();
+        write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget those things",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^mtarget","content_hash":"{}","interim_archived":true}},{{"entry_id":"^msurviv","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex(confirmed),
+                sha256_hex(restored)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        let confirm = write_note(
+            memory_dir,
+            "02fg-confirm",
+            "host",
+            "forget",
+            "yes: id:^mtarget",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^mtarget","authorized_by":"02fg-confirm"}],"consumed_ids":["02fg-confirm"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+        assert!(!confirm.exists());
+
+        let archived =
+            std::fs::read_to_string(memory_dir.join("archive/2026-06.md")).unwrap_or_default();
+        assert!(!archived.contains("^mtarget"), "confirmed target scrubbed");
+        assert!(
+            !archived.contains("^msurviv"),
+            "the already-restored survivor's archive copy must be removed too: {archived}"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(memory.contains("^msurviv"), "survivor stays live");
     }
 }
