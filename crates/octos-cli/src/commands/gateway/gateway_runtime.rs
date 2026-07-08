@@ -1140,17 +1140,19 @@ impl GatewayRuntime {
         // struct — a local binding would drop (and kill the sweep) the
         // moment construction returns.
         let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
             crate::memory_refresh::MemoryRefreshService::try_start(
                 data_dir.clone(),
                 memory_store.clone(),
                 crate::memory_refresh::resolve_refresh_provider(
                     &config,
                     llm.clone(),
-                    config
-                        .memory
-                        .as_ref()
-                        .and_then(|m| m.refresh.as_ref())
-                        .and_then(|r| r.extract_model.as_deref()),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
                 ),
                 crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
             )

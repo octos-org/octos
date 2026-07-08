@@ -37,6 +37,17 @@ pub struct RefreshKnobs {
     pub max_extract_input_tokens: usize,
     /// Token budget for the CURRENT MEMORY block shown to the extractor.
     pub max_inject_tokens: usize,
+    /// Daily consolidation-run budget per profile.
+    pub max_consolidations_per_day: u32,
+    /// Fast-lane cadence: host / user_request notes trigger a
+    /// consolidation at this interval instead of waiting for the main tick.
+    pub debounce: Duration,
+    /// Durable MEMORY.md size cap enforced by the consolidator.
+    pub max_memory_file_tokens: usize,
+    /// Auto-archive age for really-stamped entries.
+    pub unused_days: u32,
+    /// Pending-confirm forget lifetime.
+    pub pending_confirm_days: u32,
 }
 
 const MAX_EXTRACT_INPUT_BYTES: usize = 512 * 1024;
@@ -77,6 +88,8 @@ pub(crate) struct RefreshState {
     pub extractions_today: u32,
     #[serde(default)]
     pub tokens_today: u64,
+    #[serde(default)]
+    pub consolidations_today: u32,
     /// Per session key: the file snapshots actually READ last time.
     #[serde(default)]
     pub watermarks: std::collections::BTreeMap<String, Vec<FileSnap>>,
@@ -110,6 +123,7 @@ impl RefreshState {
             self.date = today.to_string();
             self.extractions_today = 0;
             self.tokens_today = 0;
+            self.consolidations_today = 0;
         }
     }
 }
@@ -143,6 +157,7 @@ impl MemoryRefreshService {
         data_dir: PathBuf,
         memory_store: Arc<MemoryStore>,
         provider: Arc<dyn LlmProvider>,
+        consolidate_provider: Arc<dyn LlmProvider>,
         knobs: RefreshKnobs,
     ) -> Option<Self> {
         let lock_file = match acquire_refresh_lock(&data_dir) {
@@ -169,30 +184,63 @@ impl MemoryRefreshService {
             let mut backoff_until: Option<tokio::time::Instant> = None;
             let mut ticker = tokio::time::interval(knobs.interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Fast lane: host / user_request notes deserve minutes-scale
+            // consolidation, not the next main tick.
+            let mut fast_ticker = tokio::time::interval(knobs.debounce.max(Duration::from_secs(5)));
+            fast_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
+                let full_pass = tokio::select! {
+                    _ = ticker.tick() => true,
+                    _ = fast_ticker.tick() => false,
+                };
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                let priority = !full_pass && has_priority_note(&data_dir);
                 if let Some(until) = backoff_until {
                     if tokio::time::Instant::now() < until {
-                        continue;
-                    }
-                    backoff_until = None;
-                }
-                match run_extraction_pass(&data_dir, &memory_store, provider.as_ref(), &knobs).await
-                {
-                    Ok(report) => {
-                        consecutive_failures = 0;
-                        if report.extracted > 0 || report.skipped_budget {
-                            tracing::info!(
-                                extracted = report.extracted,
-                                candidates = report.candidates,
-                                skipped_budget = report.skipped_budget,
-                                "memory extraction pass complete"
-                            );
+                        // Backoff throttles the failing EXTRACTION path; a
+                        // host remember/forget written meanwhile still gets
+                        // its consolidation-only fast lane.
+                        if !priority {
+                            continue;
                         }
+                    } else {
+                        backoff_until = None;
                     }
+                }
+                if !full_pass && !priority {
+                    continue;
+                }
+                let full_pass = full_pass && backoff_until.is_none();
+                let pass = async {
+                    // Consolidation must run even when extraction fails —
+                    // staged remember/forget notes may not wait behind an
+                    // unrelated broken session. First error wins the report.
+                    let extract_result = if full_pass {
+                        run_extraction_pass(&data_dir, &memory_store, provider.as_ref(), &knobs)
+                            .await
+                            .map(|report| {
+                                if report.extracted > 0 || report.skipped_budget {
+                                    tracing::info!(
+                                        extracted = report.extracted,
+                                        candidates = report.candidates,
+                                        skipped_budget = report.skipped_budget,
+                                        "memory extraction pass complete"
+                                    );
+                                }
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    let consolidate_result =
+                        run_consolidation_pass(&data_dir, consolidate_provider.clone(), &knobs)
+                            .await;
+                    extract_result?;
+                    consolidate_result
+                };
+                match pass.await {
+                    Ok(()) => consecutive_failures = 0,
                     Err(e) => {
                         consecutive_failures += 1;
                         let wait = backoff_after(consecutive_failures);
@@ -200,7 +248,7 @@ impl MemoryRefreshService {
                         tracing::warn!(
                             failures = consecutive_failures,
                             backoff_secs = wait.as_secs(),
-                            "memory extraction pass failed: {e:#}"
+                            "memory refresh pass failed: {e:#}"
                         );
                     }
                 }
@@ -255,6 +303,7 @@ pub async fn run_once(
     data_dir: &Path,
     memory_store: &Arc<MemoryStore>,
     provider: &dyn LlmProvider,
+    consolidate_provider: Arc<dyn LlmProvider>,
     knobs: &RefreshKnobs,
 ) -> Result<PassReport> {
     let Some(_lock) = acquire_refresh_lock(data_dir)? else {
@@ -265,7 +314,13 @@ pub async fn run_once(
             holder.trim()
         );
     };
-    run_extraction_pass(data_dir, memory_store, provider, knobs).await
+    // Consolidation runs even when extraction fails — staged host notes
+    // must apply regardless; the extraction error is surfaced after.
+    let extract_result = run_extraction_pass(data_dir, memory_store, provider, knobs).await;
+    let consolidate_result = run_consolidation_pass(data_dir, consolidate_provider, knobs).await;
+    let report = extract_result?;
+    consolidate_result?;
+    Ok(report)
 }
 
 /// Status snapshot for `octos memory status`.
@@ -284,13 +339,14 @@ pub async fn refresh_status(data_dir: &Path, memory_store: &Arc<MemoryStore>) ->
         Err(e) => format!("unknown ({e})"),
     };
     format!(
-        "sweep: {}\npending notes: {}\npending extractions: {}\nbudget {}: {} extractions, {} tokens\ntracked sessions: {}",
+        "sweep: {}\npending notes: {}\npending extractions: {}\nbudget {}: {} extractions, {} tokens, {} consolidations\ntracked sessions: {}",
         lock_holder,
         memory_store.count_staging_notes().await,
         memory_store.count_staging_extractions().await,
         state.date,
         state.extractions_today,
         state.tokens_today,
+        state.consolidations_today,
         state.watermarks.len(),
     )
 }
@@ -400,6 +456,170 @@ pub(crate) async fn run_extraction_pass(
 
     state.save(&state_path)?;
     Ok(report)
+}
+
+/// Cheap scan: does staging hold a host-authored or user_request note?
+/// (Fast-lane trigger; reads at most the first 512 bytes per note.)
+pub(crate) fn has_priority_note(data_dir: &Path) -> bool {
+    let notes_dir = data_dir.join("memory").join("staging").join("notes");
+    let Ok(entries) = std::fs::read_dir(&notes_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "md") {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        use std::io::Read;
+        let mut head = String::new();
+        // 16KB covers the whole frontmatter even when a parked note's
+        // `candidates:` JSON is long (it precedes `expires_at:` in the
+        // render order — a short prefix would misread parked notes as
+        // fast-lane triggers and spin every debounce).
+        if file.take(16 * 1024).read_to_string(&mut head).is_err() {
+            continue;
+        }
+        // Only the fenced FRONTMATTER counts — untrusted note bodies could
+        // contain these literals and must not steer the fast lane.
+        let Some(fm) = frontmatter_of(&head) else {
+            continue;
+        };
+        // Already-parked pending-confirm notes wait on a HUMAN, not on the
+        // fast lane — re-running every debounce would only spin.
+        if fm.contains("expires_at:") || fm.contains("candidates:") {
+            continue;
+        }
+        if fm.lines().any(|l| l.trim() == "origin: host")
+            || fm.lines().any(|l| l.trim() == "kind: user_request")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The fenced frontmatter region of a staging note, when present.
+fn frontmatter_of(content: &str) -> Option<&str> {
+    let after = content.strip_prefix("---")?;
+    let rest = after
+        .strip_prefix("\r\n")
+        .or_else(|| after.strip_prefix('\n'))?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+/// One consolidation pass: budget-gated engine run + quarantine mover +
+/// pending/error surfacing. Token spend and run counts share the same
+/// daily state as extraction.
+pub(crate) async fn run_consolidation_pass(
+    data_dir: &Path,
+    provider: Arc<dyn LlmProvider>,
+    knobs: &RefreshKnobs,
+) -> Result<()> {
+    let state_path = data_dir.join("memory").join("refresh_state.json");
+    let mut state = RefreshState::load(&state_path);
+    state.roll_date(&chrono::Local::now().format("%Y-%m-%d").to_string());
+    // An exhausted budget disables the MERGE, not the whole engine: the
+    // no-provider phases (pending expiry, satisfied-forget consumption,
+    // crash-recovery re-hide) must keep running or pending_confirm_days
+    // would not be honored on busy profiles.
+    let allow_merge = state.consolidations_today < knobs.max_consolidations_per_day
+        && state.tokens_today < knobs.max_daily_tokens;
+
+    let mut params = crate::memory_consolidate::ConsolidateParams::new(data_dir.join("memory"));
+    params.max_memory_file_tokens = knobs.max_memory_file_tokens;
+    params.unused_days = knobs.unused_days;
+    params.pending_confirm_days = knobs.pending_confirm_days;
+    params.allow_merge = allow_merge;
+
+    // Pre-capture the staging payload size: a successful merge deletes
+    // consumed files, so a post-hoc scan would under-charge zero-usage
+    // providers for the prompt's staging content.
+    let mut staging_bytes_before: u64 = 0;
+    for dir in ["notes", "extract"] {
+        if let Ok(entries) = std::fs::read_dir(data_dir.join("memory/staging").join(dir)) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    staging_bytes_before += meta.len();
+                }
+            }
+        }
+    }
+
+    let outcome = crate::memory_consolidate::run_consolidation(provider, &params).await?;
+
+    if outcome.skipped_clean {
+        return Ok(());
+    }
+    // Charge budgets only for ACTUAL work (provider spend or an applied
+    // merge/INIT). A parked pending-confirm note keeps returning
+    // `skipped_clean == false` purely to stay surfaced; charging those
+    // no-op checks would drain the daily cap and block the eventual
+    // confirmation.
+    let mut spent =
+        (outcome.token_usage.input_tokens as u64) + (outcome.token_usage.output_tokens as u64);
+    if outcome.provider_attempts > 0 && spent == 0 {
+        // Estimator fallback (parity with extraction): some providers
+        // report zero usage; a merge call still spent real tokens —
+        // roughly the memory file (in the prompt AND regenerated in the
+        // reply) plus the staging payload.
+        let memory_md =
+            std::fs::read_to_string(data_dir.join("memory").join("MEMORY.md")).unwrap_or_default();
+        let estimate =
+            2 * octos_memory::estimate_tokens(&memory_md) as u64 + staging_bytes_before / 4;
+        spent = estimate.max(1);
+    }
+    // Failed/rejected merges spent provider calls too — charging them is
+    // what stops a bad staged note from retrying every tick for free.
+    let did_work = outcome.merge_applied
+        || outcome.init_performed
+        || outcome.provider_attempts > 0
+        || spent > 0;
+    if did_work {
+        state.consolidations_today += 1;
+        state.tokens_today = state.tokens_today.saturating_add(spent);
+    }
+
+    // Quarantine mover: the engine only signals; the service relocates so
+    // repeat offenders leave the batch.
+    if !outcome.quarantine_candidates.is_empty() {
+        let quarantine_dir = data_dir.join("memory").join("staging").join("quarantine");
+        let _ = std::fs::create_dir_all(&quarantine_dir);
+        for path in &outcome.quarantine_candidates {
+            if let Some(name) = path.file_name() {
+                match std::fs::rename(path, quarantine_dir.join(name)) {
+                    Ok(()) => tracing::warn!(file = %path.display(), "staging file quarantined"),
+                    Err(e) => {
+                        tracing::warn!(file = %path.display(), "failed to quarantine: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    for pending in &outcome.pending_notes {
+        tracing::info!(?pending, "memory forget request pending confirmation");
+    }
+    for err in &outcome.errors {
+        tracing::warn!("memory consolidation reported: {err}");
+    }
+    if outcome.merge_applied || outcome.init_performed {
+        tracing::info!(
+            init = outcome.init_performed,
+            added = outcome.added.len(),
+            updated = outcome.updated.len(),
+            superseded = outcome.superseded.len(),
+            archived = outcome.archived.len(),
+            hard_deleted = outcome.hard_deleted.len(),
+            consumed = outcome.consumed_staging_files,
+            "memory consolidation applied"
+        );
+    }
+    state.save(&state_path)?;
+    Ok(())
 }
 
 /// Re-stat every snapshot file; true when nothing changed since pre-read.
@@ -553,6 +773,11 @@ mod tests {
             interval: Duration::from_secs(1800),
             max_extract_input_tokens: 24_000,
             max_inject_tokens: 2_500,
+            max_consolidations_per_day: 12,
+            debounce: Duration::from_secs(90),
+            max_memory_file_tokens: 8_000,
+            unused_days: 30,
+            pending_confirm_days: 7,
         }
     }
 
@@ -709,6 +934,453 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(third.is_some(), "lock must release on drop");
+    }
+
+    struct OpsProvider {
+        response: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpsProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: Some(self.response.clone()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "ops-model"
+        }
+        fn provider_name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_consolidate_extraction_into_memory_md_when_full_pipeline_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(
+            dir.path(),
+            "tg:900",
+            "I live in Vancouver and prefer dark mode",
+        )
+        .await;
+
+        // Extraction provider proposes one fact; consolidation provider
+        // turns it into an add op consuming the extraction item.
+        let extract = ScriptedProvider {
+            response:
+                r#"{"items":[{"kind":"fact","content":"lives in Vancouver","evidence":[0]}]}"#
+                    .to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let knobs = knobs_for_test();
+        let report = run_extraction_pass(dir.path(), &store, &extract, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(report.extracted, 1);
+
+        // The engine addresses staging items by <file-stem>#<index>.
+        let extract_dir = dir.path().join("memory/staging/extract");
+        let mut entries = std::fs::read_dir(&extract_dir).unwrap();
+        let stem = entries
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ops = OpsProvider {
+            response: format!(
+                r#"{{"ops":[{{"op":"add","section":null,"text":"Lives in Vancouver (updated: 2026-07-08)","sources":["{stem}#0"]}}],"consumed_ids":["{stem}#0"],"dropped":[]}}"#
+            ),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        run_consolidation_pass(dir.path(), Arc::new(ops), &knobs)
+            .await
+            .unwrap();
+
+        let memory_md =
+            std::fs::read_to_string(dir.path().join("memory/MEMORY.md")).unwrap_or_default();
+        assert!(
+            memory_md.contains("Lives in Vancouver"),
+            "consolidation must land in MEMORY.md: {memory_md}"
+        );
+        assert_eq!(
+            store.count_staging_extractions().await,
+            0,
+            "consumed staging must be deleted"
+        );
+        // Budgets accounted.
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert_eq!(state.consolidations_today, 1);
+    }
+
+    #[tokio::test]
+    async fn should_skip_consolidation_when_daily_cap_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A pending note exists, but the cap is exhausted.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Model,
+                kind: octos_memory::NoteKind::Fact,
+                content: "some fact".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        RefreshState {
+            date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            consolidations_today: 12,
+            ..Default::default()
+        }
+        .save(&state_path)
+        .unwrap();
+
+        let ops = OpsProvider {
+            response: "{}".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ops = Arc::new(ops);
+        run_consolidation_pass(dir.path(), ops.clone(), &knobs_for_test())
+            .await
+            .unwrap();
+        assert_eq!(
+            ops.calls.load(Ordering::SeqCst),
+            0,
+            "budget-capped pass must not call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_detect_priority_notes_for_fast_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        assert!(!has_priority_note(dir.path()));
+
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Model,
+                kind: octos_memory::NoteKind::Fact,
+                content: "ordinary fact".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !has_priority_note(dir.path()),
+            "model facts are not fast-lane"
+        );
+
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Host,
+                kind: octos_memory::NoteKind::Forget,
+                content: "forget my old address".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(has_priority_note(dir.path()), "host notes are fast-lane");
+    }
+
+    #[tokio::test]
+    async fn should_not_charge_budget_for_pending_only_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A free-text host forget with nothing to bind to: the engine parks
+        // it (or leaves it pending) without provider work.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Host,
+                kind: octos_memory::NoteKind::Forget,
+                content: "forget something that matches no entry".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+
+        let ops = Arc::new(OpsProvider {
+            response: r#"{"ops":[],"consumed_ids":[],"dropped":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let knobs = knobs_for_test();
+        // Several fast-lane style re-checks.
+        for _ in 0..5 {
+            run_consolidation_pass(dir.path(), ops.clone(), &knobs)
+                .await
+                .unwrap();
+        }
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert!(
+            state.consolidations_today <= 1,
+            "pending-only checks must not drain the daily cap (got {})",
+            state.consolidations_today
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_fast_lane_already_parked_pending_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes_dir = dir.path().join("memory/staging/notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        // A parked pending-confirm note: host forget already stamped with
+        // candidates + expires_at by the engine.
+        std::fs::write(
+            notes_dir.join("0abc-parked.md"),
+            "---\norigin: host\nkind: forget\ncreated_at: 2026-07-08T00:00:00Z\ncandidates: []\nexpires_at: 2026-07-15T00:00:00Z\n---\n\nforget my old address\n",
+        )
+        .unwrap();
+        assert!(
+            !has_priority_note(dir.path()),
+            "parked notes wait on a human, not the fast lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_honor_pending_expiry_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        std::fs::create_dir_all(memory_dir.join("staging/notes")).unwrap();
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        // An interim-archived candidate whose pending note expired long ago.
+        let secret = "Sensitive detail. (updated: 2026-01-01) ^msenstv";
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "Keeps bonsai. (updated: 2026-01-02) ^mcccccc\n",
+        )
+        .unwrap();
+        std::fs::write(memory_dir.join("archive/2026-01.md"), format!("{secret}\n")).unwrap();
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(secret.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        std::fs::write(
+            memory_dir.join("staging/notes/01fg-expired.md"),
+            format!(
+                "---\norigin: host\nkind: forget\ncreated_at: 2026-01-01T00:00:00+00:00\nsensitive: true\ncandidates: [{{\"entry_id\":\"^msenstv\",\"content_hash\":\"{hash}\",\"interim_archived\":true}}]\nexpires_at: 2026-01-08T00:00:00+00:00\n---\n\nforget the sensitive detail\n"
+            ),
+        )
+        .unwrap();
+        // Budget exhausted.
+        RefreshState {
+            date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            consolidations_today: 12,
+            ..Default::default()
+        }
+        .save(&dir.path().join("memory").join("refresh_state.json"))
+        .unwrap();
+
+        let ops = Arc::new(OpsProvider {
+            response: "{}".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        run_consolidation_pass(dir.path(), ops.clone(), &knobs_for_test())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ops.calls.load(Ordering::SeqCst),
+            0,
+            "no provider spend over budget"
+        );
+        assert!(
+            !memory_dir.join("staging/notes/01fg-expired.md").exists(),
+            "expired pending note must be processed despite the budget"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("^msenstv"),
+            "expiry must restore the interim-archived candidate: {memory}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_fast_lane_when_expires_at_beyond_short_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes_dir = dir.path().join("memory/staging/notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        // Long candidates JSON pushes expires_at past a 512-byte prefix.
+        let candidates: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    r#"{{"entry_id":"^mcand{i:02}","content_hash":"{}","interim_archived":false}}"#,
+                    "a".repeat(64)
+                )
+            })
+            .collect();
+        std::fs::write(
+            notes_dir.join("0abc-parked-long.md"),
+            format!(
+                "---\norigin: host\nkind: forget\ncreated_at: 2026-07-08T00:00:00Z\ncandidates: [{}]\nexpires_at: 2026-07-15T00:00:00Z\n---\n\nforget a lot of things\n",
+                candidates.join(",")
+            ),
+        )
+        .unwrap();
+        assert!(
+            !has_priority_note(dir.path()),
+            "a parked note with long candidate metadata must not spin the fast lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_consolidate_staged_notes_when_extraction_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A poisoned session makes extraction fail…
+        seed_session(dir.path(), "tg:500", "broken").await;
+        // …while a host remember note waits in staging.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Host,
+                kind: octos_memory::NoteKind::UserRequest,
+                content: "remember: the deploy password rotates monthly".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+
+        let extract = ScriptedProvider {
+            response: "NOT JSON".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let notes_dir = dir.path().join("memory/staging/notes");
+        let note_name = std::fs::read_dir(&notes_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ops = Arc::new(OpsProvider {
+            response: format!(
+                r#"{{"ops":[{{"op":"add","section":null,"text":"Deploy password rotates monthly.","sources":["{note_name}"]}}],"consumed_ids":["{note_name}"],"dropped":[]}}"#
+            ),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let knobs = knobs_for_test();
+        let err = run_once(dir.path(), &store, &extract, ops.clone(), &knobs).await;
+        assert!(err.is_err(), "extraction failure must still surface");
+        assert!(
+            ops.calls.load(Ordering::SeqCst) >= 1,
+            "consolidation must run despite the extraction failure"
+        );
+        let memory =
+            std::fs::read_to_string(dir.path().join("memory/MEMORY.md")).unwrap_or_default();
+        assert!(
+            memory.contains("Deploy password rotates monthly"),
+            "the staged host note must be applied: {memory}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_charge_budget_when_merge_fails_with_zero_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A model fact note makes the batch dirty; the ops provider returns
+        // garbage (merge fails after the re-ask) with zero reported usage.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Model,
+                kind: octos_memory::NoteKind::Fact,
+                content: "bad batch".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        let ops = Arc::new(OpsProvider {
+            response: "GARBAGE".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        run_consolidation_pass(dir.path(), ops.clone(), &knobs_for_test())
+            .await
+            .unwrap();
+        assert!(ops.calls.load(Ordering::SeqCst) >= 1);
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert!(
+            state.consolidations_today >= 1 && state.tokens_today > 0,
+            "failed zero-usage merges must be charged: {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_charge_staging_payload_when_zero_usage_merge_consumes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A large-ish note the merge will consume (deleting the file).
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Model,
+                kind: octos_memory::NoteKind::Fact,
+                content: format!("prefers dark mode. {}", "detail ".repeat(600)),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        let notes_dir = dir.path().join("memory/staging/notes");
+        let note_name = std::fs::read_dir(&notes_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let ops = Arc::new(OpsProvider {
+            response: format!(
+                r#"{{"ops":[{{"op":"add","section":null,"text":"Prefers dark mode.","sources":["{note_name}"]}}],"consumed_ids":["{note_name}"],"dropped":[]}}"#
+            ),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        run_consolidation_pass(dir.path(), ops, &knobs_for_test())
+            .await
+            .unwrap();
+
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert!(
+            state.tokens_today >= 1_000,
+            "the consumed staging payload must be charged (pre-capture): {}",
+            state.tokens_today
+        );
     }
 
     #[test]
