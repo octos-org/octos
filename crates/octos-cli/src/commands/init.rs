@@ -418,22 +418,52 @@ fn capture_api_key_from_reader(
     Ok(KeyCaptureOutcome::Saved)
 }
 
-/// Init-time credential offer, mirroring the runtime resolution order:
-/// env var set → done; global auth store already holds a credential →
-/// done; otherwise, on a TTY, offer to paste the key now (Enter skips).
-/// Non-interactive runs keep the old export hint.
-fn offer_api_key_capture(provider: &str, api_key_env: &str) {
-    use std::io::IsTerminal as _;
+/// Preflight decision for the init-time credential offer, mirroring the
+/// runtime resolution order in `Config::get_api_key`: a set env var or a
+/// non-expired stored credential means the setup already works; anything
+/// else (nothing stored, or only an EXPIRED credential — which
+/// `get_api_key` rejects) warrants the capture offer. Extracted for
+/// testability (codex: an expired OAuth credential must not suppress the
+/// offer and then fail at runtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCapturePreflight {
+    EnvSet,
+    ValidStoredCredential,
+    Offer,
+}
 
-    if std::env::var(api_key_env).is_ok() {
-        println!("{} {} is set", "✓".green(), api_key_env);
-        return;
+fn key_capture_preflight(
+    env_set: bool,
+    stored: Option<&crate::auth::AuthCredential>,
+) -> KeyCapturePreflight {
+    if env_set {
+        return KeyCapturePreflight::EnvSet;
     }
+    match stored {
+        Some(cred) if !cred.is_expired() => KeyCapturePreflight::ValidStoredCredential,
+        _ => KeyCapturePreflight::Offer,
+    }
+}
+
+/// Init-time credential offer, mirroring the runtime resolution order:
+/// env var set → done; global auth store already holds a NON-EXPIRED
+/// credential → done; otherwise, on an interactive TTY run, offer to
+/// paste the key now (Enter skips). Non-interactive runs (`--defaults`,
+/// flag-driven custom, no TTY) keep the old export hint — they must
+/// never block on a read (codex: `--defaults` is documented to skip
+/// interactive prompts).
+fn offer_api_key_capture(provider: &str, api_key_env: &str, interactive: bool) {
+    use std::io::IsTerminal as _;
 
     let auth_home = crate::config_context::resolve_config_context(None).auth_home;
     let store = crate::auth::AuthStore::at(&auth_home);
-    if let Ok(ref s) = store {
-        if s.get(provider).is_some() {
+    let stored = store.as_ref().ok().and_then(|s| s.get(provider));
+    match key_capture_preflight(std::env::var(api_key_env).is_ok(), stored) {
+        KeyCapturePreflight::EnvSet => {
+            println!("{} {} is set", "✓".green(), api_key_env);
+            return;
+        }
+        KeyCapturePreflight::ValidStoredCredential => {
             println!(
                 "{} credential for {} already saved (octos auth login)",
                 "✓".green(),
@@ -441,12 +471,13 @@ fn offer_api_key_capture(provider: &str, api_key_env: &str) {
             );
             return;
         }
+        KeyCapturePreflight::Offer => {}
     }
 
     println!("{} {} is not set", "Warning:".yellow(), api_key_env);
 
     let captured = match store {
-        Ok(mut s) if std::io::stdin().is_terminal() && !provider.is_empty() => {
+        Ok(mut s) if interactive && std::io::stdin().is_terminal() && !provider.is_empty() => {
             println!(
                 "Paste your {} API key now to save it securely (Enter to skip):",
                 provider
@@ -486,6 +517,7 @@ fn write_init_files(
     config_path: PathBuf,
     config: Value,
     api_key_env: String,
+    interactive: bool,
 ) -> Result<()> {
     // Create directory
     std::fs::create_dir_all(&config_dir)
@@ -516,7 +548,7 @@ fn write_init_files(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    offer_api_key_capture(&provider_name, &api_key_env);
+    offer_api_key_capture(&provider_name, &api_key_env, interactive);
 
     // Create .gitignore if it doesn't exist
     let gitignore_path = config_dir.join(".gitignore");
@@ -737,7 +769,14 @@ impl Executable for InitCommand {
         // selection flow entirely.
         if let Some(custom) = custom_flag_selection {
             let api_key_env = custom.api_key_env.clone();
-            return write_init_files(config_dir, config_path, custom.to_json(), api_key_env);
+            // Flag-driven: documented to run without prompts.
+            return write_init_files(
+                config_dir,
+                config_path,
+                custom.to_json(),
+                api_key_env,
+                false,
+            );
         }
 
         // Load model catalog for hints
@@ -810,6 +849,7 @@ impl Executable for InitCommand {
                             config_path,
                             custom.to_json(),
                             api_key_env,
+                            true,
                         );
                     }
                     _ => {
@@ -911,7 +951,9 @@ impl Executable for InitCommand {
 
         let config = build_config(info, &model, &api_key_env, api_selection);
 
-        write_init_files(config_dir, config_path, config, api_key_env)
+        // `--defaults` is documented to skip interactive prompts — the
+        // credential-capture offer must not block on a read there.
+        write_init_files(config_dir, config_path, config, api_key_env, !self.defaults)
     }
 }
 
@@ -1002,6 +1044,45 @@ mod tests {
         assert!(
             !tmp.path().join("auth.json").exists(),
             "an empty paste must not create/touch auth.json"
+        );
+    }
+
+    #[test]
+    fn should_offer_capture_when_stored_credential_is_expired() {
+        // codex fold: an expired OAuth credential must NOT suppress the
+        // offer — Config::get_api_key rejects expired credentials, so
+        // treating one as "configured" reports a working setup that
+        // fails at runtime.
+        let expired = crate::auth::AuthCredential {
+            access_token: "stale".into(),
+            refresh_token: None,
+            expires_at: Some(chrono::DateTime::from_timestamp(1, 0).unwrap()), // long expired
+            provider: "openai".into(),
+            auth_method: "oauth".into(),
+        };
+        assert_eq!(
+            key_capture_preflight(false, Some(&expired)),
+            KeyCapturePreflight::Offer
+        );
+
+        let valid = crate::auth::AuthCredential {
+            access_token: "fresh".into(),
+            refresh_token: None,
+            expires_at: None, // paste tokens never expire
+            provider: "deepseek".into(),
+            auth_method: "paste_token".into(),
+        };
+        assert_eq!(
+            key_capture_preflight(false, Some(&valid)),
+            KeyCapturePreflight::ValidStoredCredential
+        );
+        assert_eq!(
+            key_capture_preflight(true, None),
+            KeyCapturePreflight::EnvSet
+        );
+        assert_eq!(
+            key_capture_preflight(false, None),
+            KeyCapturePreflight::Offer
         );
     }
 
