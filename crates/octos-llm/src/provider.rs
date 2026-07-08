@@ -1,5 +1,7 @@
 //! LLM provider trait.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_trait::async_trait;
 use eyre::Result;
 use octos_core::Message;
@@ -7,6 +9,20 @@ use octos_core::Message;
 use crate::config::ChatConfig;
 use crate::context;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
+
+static ALLOW_INSECURE: AtomicBool = AtomicBool::new(false);
+
+/// Set process-wide TLS certificate verification bypass.
+/// Call once as the first statement of each command's `run_async()`,
+/// before any HTTP client is built.
+pub fn set_allow_insecure(v: bool) {
+    ALLOW_INSECURE.store(v, Ordering::Release);
+}
+
+/// Returns true if TLS certificate verification is globally disabled.
+pub fn allow_insecure() -> bool {
+    ALLOW_INSECURE.load(Ordering::Acquire)
+}
 
 /// Trait for LLM providers.
 ///
@@ -137,6 +153,7 @@ pub fn build_http_client(timeout_secs: u64, connect_timeout_secs: u64) -> reqwes
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .danger_accept_invalid_certs(allow_insecure())
         .build()
         .expect("failed to build HTTP client")
 }
@@ -175,5 +192,18 @@ mod tests {
     fn test_build_http_client_succeeds() {
         let _client = build_http_client(30, 10);
         // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn should_return_false_by_default_when_flag_not_set() {
+        set_allow_insecure(false);
+        assert!(!allow_insecure());
+    }
+
+    #[test]
+    fn should_return_true_after_set_allow_insecure() {
+        set_allow_insecure(true);
+        assert!(allow_insecure());
+        set_allow_insecure(false);
     }
 }
