@@ -313,6 +313,7 @@ pub async fn run_consolidation(
     // future merge (the gates forbid dropping or pending it).
     let mut batch = batch;
     let mut satisfied: Vec<usize> = Vec::new();
+    let mut scrub_deleted_paths: Vec<PathBuf> = Vec::new();
     for (i, note) in batch.notes.iter().enumerate() {
         if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
             continue;
@@ -354,10 +355,14 @@ pub async fn run_consolidation(
         // without a merge, and the model could never satisfy them (they
         // are in neither entries nor interim).
         for id in &archived_only {
-            if apply::scrub_archived_only_target(memory_dir, id)? {
+            let (found, deleted_staging) = apply::scrub_archived_only_target(memory_dir, id)?;
+            if found {
                 outcome.hard_deleted.push(id.clone());
                 tracing::info!(id, "archived-only forget target scrubbed");
             }
+            // Collected here; pruned from the batch after the loop (we are
+            // iterating batch.notes right now).
+            scrub_deleted_paths.extend(deleted_staging);
         }
         // The note is consumed only when nothing it names is still alive
         // (live ids keep it in the batch for the merge's hard_delete).
@@ -373,6 +378,17 @@ pub async fn run_consolidation(
             "already satisfied: no named entry exists (completed by a prior run)".to_string(),
         ));
         tracing::info!(note = %note.path.display(), "satisfied forget note consumed");
+    }
+    // Disk-scrubbed staging must leave the in-memory batch too, or the
+    // merge prompt would still ship the deleted content. (After the
+    // index-based satisfied removal — retain() shifts positions.)
+    if !scrub_deleted_paths.is_empty() {
+        let scrubbed: HashSet<&PathBuf> = scrub_deleted_paths.iter().collect();
+        batch.notes.retain(|n| !scrubbed.contains(&n.path));
+        batch.extractions.retain(|e| !scrubbed.contains(&e.path));
+        batch
+            .parse_failures
+            .retain(|(p, _, _)| !scrubbed.contains(p));
     }
 
     // --- 2.7 sensitive-first isolation (before ANY provider call) ---------
@@ -1034,6 +1050,7 @@ fn execute_id_bound_forgets(
     let mut plan = ApplyPlan::default();
     let mut working = entries.to_vec();
     let mut executed_notes: Vec<usize> = Vec::new();
+    let mut satisfied_no_op: Vec<usize> = Vec::new();
     for (i, note) in batch.notes.iter().enumerate() {
         if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
             continue;
@@ -1059,6 +1076,23 @@ fn execute_id_bound_forgets(
         targets.sort_unstable_by(|a, b| b.cmp(a));
         targets.dedup();
         if targets.is_empty() {
+            // Nothing left to execute — but if every named id is already
+            // gone everywhere (a sibling note deleted it earlier in THIS
+            // loop), the ask is honored: consume the note or its body
+            // would still ride the merge prompt.
+            let mut all_gone = !named.is_empty();
+            for id in &named {
+                if frozen_ids.contains(id)
+                    || working.iter().any(|e| &e.id == id)
+                    || apply::archive_names_id(memory_dir, id)?
+                {
+                    all_gone = false;
+                    break;
+                }
+            }
+            if all_gone {
+                satisfied_no_op.push(i);
+            }
             continue;
         }
         // Covered = frozen nowhere AND either being executed now (live) or
@@ -1102,9 +1136,21 @@ fn execute_id_bound_forgets(
         plan.final_entries = working.clone();
         let report = apply::apply_plan(memory_dir, params.today, &plan)?;
         // Fully-honored notes were consumed by the apply (authorizing note
-        // deletion); drop them from the batch.
-        for i in executed_notes.into_iter().rev() {
+        // deletion); drop them from the batch — together with duplicates
+        // whose named ids a sibling already deleted this run (their files
+        // must go too, or the ask would reappear next run).
+        let mut consumed: Vec<(usize, bool)> = executed_notes
+            .into_iter()
+            .map(|i| (i, false))
+            .chain(satisfied_no_op.into_iter().map(|i| (i, true)))
+            .collect();
+        consumed.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        consumed.dedup_by_key(|(i, _)| *i);
+        for (i, delete_file) in consumed {
             let note = batch.notes.remove(i);
+            if delete_file {
+                apply::remove_file_if_exists(&note.path)?;
+            }
             outcome.dropped.push((
                 note.id.clone(),
                 "executed Rust-side (id-bound host authority)".to_string(),
@@ -3577,6 +3623,105 @@ mod tests {
         assert!(
             memory_dir.join("staging/notes/01req.md").exists(),
             "the request stays durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_consume_duplicate_sensitive_notes_naming_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &[
+                "Sensitive live secret. (updated: 2026-06-01) ^mlivsec",
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        let a = write_note(
+            memory_dir,
+            "01fg-a",
+            "host",
+            "forget",
+            "delete id:^mlivsec",
+            true,
+        );
+        let b = write_note(
+            memory_dir,
+            "02fg-b",
+            "host",
+            "forget",
+            "delete id:^mlivsec",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "no prompt may carry either note body"
+        );
+        assert!(outcome.hard_deleted.contains(&"^mlivsec".to_string()));
+        assert!(!a.exists() && !b.exists(), "both duplicate asks consumed");
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(!memory.contains("^mlivsec"));
+    }
+
+    #[tokio::test]
+    async fn should_prune_staging_scrubbed_by_archived_only_forget() {
+        // An archived-only forget disk-deletes a model note exact-quoting
+        // the archived line; the later merge prompt must not contain it.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let archived_line = "Old archived secret.";
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(
+            memory_dir.join("archive/2026-05.md"),
+            format!("{archived_line} (updated: 2026-05-01) ^marcsec\n"),
+        )
+        .unwrap();
+        write_note(
+            memory_dir,
+            "01fg-arc",
+            "host",
+            "forget",
+            "delete id:^marcsec",
+            true,
+        );
+        write_note(
+            memory_dir,
+            "02quoter",
+            "model",
+            "fact",
+            &format!("Overheard:\n{archived_line}"),
+            false,
+        );
+        write_note(memory_dir, "03clean", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["03clean"]}],"consumed_ids":["03clean"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+        assert_eq!(provider.call_count(), 1);
+        let prompt_text: String = provider
+            .call_messages(0)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("Old archived secret"),
+            "archived-only scrubbed staging must not ride the merge prompt"
         );
     }
 }

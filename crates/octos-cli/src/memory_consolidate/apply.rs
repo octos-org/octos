@@ -545,7 +545,13 @@ pub(super) fn archive_names_id(memory_dir: &Path, entry_id: &str) -> Result<bool
 /// complete without a merge: remove every archive block naming the id,
 /// line-scrub bank copies, delete backups, and whole-file-delete staging
 /// copies. Returns false when no archive block names the id.
-pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> Result<bool> {
+/// Returns (found, disk-deleted staging paths). The caller must prune the
+/// deleted paths from any in-memory batch or their content would still be
+/// rendered into the merge prompt.
+pub(super) fn scrub_archived_only_target(
+    memory_dir: &Path,
+    entry_id: &str,
+) -> Result<(bool, Vec<PathBuf>)> {
     // Collect the folded lines of every archived version first — they form
     // the scrub set for bank/staging copies.
     let mut folded_lines: Vec<String> = Vec::new();
@@ -563,7 +569,7 @@ pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> R
         }
     }
     if !found {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
     let target = ScrubTarget {
         entry_id: entry_id.to_string(),
@@ -573,6 +579,7 @@ pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> R
     };
     let targets = [target];
 
+    let mut deleted_staging: Vec<PathBuf> = Vec::new();
     delete_backups(memory_dir)?;
     for path in archive_files(memory_dir)? {
         rewrite_block_file(&path, &[], &targets, true)?;
@@ -596,10 +603,11 @@ pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> R
             }
             if staging_file_matches(&content, &targets) {
                 remove_file_if_exists(&path)?;
+                deleted_staging.push(path);
             }
         }
     }
-    Ok(true)
+    Ok((true, deleted_staging))
 }
 
 /// Outcome of processing one expired pending note.
