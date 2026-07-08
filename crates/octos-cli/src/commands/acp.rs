@@ -1478,17 +1478,19 @@ mod tests {
         // ("done") must NOT be persisted into history, so the fresh second turn's
         // chat() must not see it. Without the `!cancelled` guard, the partial
         // reply leaks into the next prompt's context.
+        //
+        // Select the fresh turn by the "second" user prompt it carries — a
+        // cancelled first turn may retry (stream fallback while the shutdown flag
+        // is set), so it is NOT necessarily snapshot index 1 (codex round-4).
         let snapshots = seen.lock().await;
+        let fresh = snapshots
+            .iter()
+            .find(|snap| snap.iter().any(|c| c.contains("second")))
+            .expect("the fresh second prompt must have reached the LLM");
         assert!(
-            snapshots.len() >= 2,
-            "both turns reached the LLM: {} calls",
-            snapshots.len()
-        );
-        assert!(
-            !snapshots[1].iter().any(|c| c.contains("done")),
+            !fresh.iter().any(|c| c.contains("done")),
             "the cancelled turn's aborted assistant reply must NOT persist into the \
-             next prompt's history; turn-2 messages: {:?}",
-            snapshots[1]
+             fresh prompt's history; fresh-turn messages: {fresh:?}"
         );
     }
 }
