@@ -282,6 +282,14 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
                 }
                 let content = std::fs::read_to_string(&path)
                     .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+                // ALL host notes are durable asks with their own lifecycle
+                // (consumption / pending-confirm / expiry) — whole-file
+                // scrub-deleting one that merely quotes a deleted line
+                // would orphan its parked candidates (binding written in
+                // step 2.5) or silently drop the ask.
+                if dir == "notes" && content.contains("origin: host") {
+                    continue;
+                }
                 if staging_file_matches(&content, &plan.hard_deletes) {
                     remove_file_if_exists(&path)?;
                     report.scrub_deleted_staging.push(path);

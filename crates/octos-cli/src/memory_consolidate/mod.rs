@@ -144,6 +144,10 @@ pub struct ConsolidateOutcome {
     pub quarantine_candidates: Vec<PathBuf>,
     /// Combined provider usage (both calls when a re-ask happened).
     pub token_usage: TokenUsage,
+    /// Number of provider chat() calls this run made (0 on skip/no-merge
+    /// paths). Lets the caller charge budgets for FAILED merges whose
+    /// providers report zero usage.
+    pub provider_attempts: u32,
     /// Everything that went wrong, human-readable. A rejected merge shows up
     /// here with `merge_applied == false` while staging stays intact.
     pub errors: Vec<String>,
@@ -315,18 +319,18 @@ pub async fn run_consolidation(
                 archived_only.push(id.clone());
             }
         }
-        if !archived_only.is_empty() && !any_alive {
-            // Id-bound host authority is complete without a merge: execute
-            // the scrub deterministically Rust-side.
-            for id in &archived_only {
-                if apply::scrub_archived_only_target(memory_dir, id)? {
-                    outcome.hard_deleted.push(id.clone());
-                    tracing::info!(id, "archived-only forget target scrubbed");
-                }
+        // Archived-only ids are scrubbed immediately regardless of the
+        // note's OTHER targets: id-bound host authority is complete
+        // without a merge, and the model could never satisfy them (they
+        // are in neither entries nor interim).
+        for id in &archived_only {
+            if apply::scrub_archived_only_target(memory_dir, id)? {
+                outcome.hard_deleted.push(id.clone());
+                tracing::info!(id, "archived-only forget target scrubbed");
             }
-            satisfied.push(i);
-            continue;
         }
+        // The note is consumed only when nothing it names is still alive
+        // (live ids keep it in the batch for the merge's hard_delete).
         if !any_alive {
             satisfied.push(i);
         }
@@ -432,6 +436,7 @@ pub async fn run_consolidation(
         Message::user(user_message),
     ];
 
+    outcome.provider_attempts += 1;
     let response = provider.chat(&messages, &[], &config).await?;
     accumulate_usage(&mut outcome.token_usage, &response.usage);
     let content = response.content.unwrap_or_default();
@@ -442,6 +447,7 @@ pub async fn run_consolidation(
             // Exactly ONE corrective re-ask, then abort keeping staging.
             messages.push(Message::assistant(content));
             messages.push(Message::user(prompt::corrective_message(&first_err)));
+            outcome.provider_attempts += 1;
             let retry = provider.chat(&messages, &[], &config).await?;
             accumulate_usage(&mut outcome.token_usage, &retry.usage);
             let retry_content = retry.content.unwrap_or_default();
@@ -2365,6 +2371,96 @@ mod tests {
         assert!(
             !confirm.exists(),
             "confirm note must be consumed as satisfied despite stale pending metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_handle_mixed_live_and_archived_ids_in_one_forget_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &[
+                "Live secret. (updated: 2026-06-01) ^mlivsec",
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(
+            memory_dir.join("archive/2026-05.md"),
+            "Old archived secret. (updated: 2026-05-01) ^marcsec\n",
+        )
+        .unwrap();
+        write_note(
+            memory_dir,
+            "01fg-mixed",
+            "host",
+            "forget",
+            "delete id:^mlivsec and id:^marcsec",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^mlivsec","authorized_by":"01fg-mixed"}],"consumed_ids":["01fg-mixed"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.merge_applied,
+            "mixed note must be satisfiable: {:?}",
+            outcome.errors
+        );
+        assert!(outcome.hard_deleted.contains(&"^marcsec".to_string()));
+        assert!(outcome.hard_deleted.contains(&"^mlivsec".to_string()));
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(!memory.contains("^mlivsec"));
+        let archived =
+            std::fs::read_to_string(memory_dir.join("archive/2026-05.md")).unwrap_or_default();
+        assert!(
+            !archived.contains("^marcsec"),
+            "archived-only id scrubbed: {archived}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_scrub_host_notes_when_they_quote_deleted_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "The vault code is 9137. (updated: 2026-06-01) ^msecret";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+        // A separate free-text host forget QUOTING the deleted line.
+        let quoting = write_note(
+            memory_dir,
+            "02fg-quoting",
+            "host",
+            "forget",
+            "also forget that The vault code is 9137.",
+            false,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+        assert!(
+            quoting.exists(),
+            "a host ask must survive the content scrub (its own lifecycle consumes it)"
         );
     }
 }

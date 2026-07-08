@@ -647,6 +647,13 @@ fn validate_consumption(output: &ModelOutput, ctx: &ValidationCtx) -> Result<(),
         // ops are rejected) and wedge consolidation.
         if note.origin == NoteOrigin::Host && note.kind == NoteKind::Forget {
             for named in note.named_entry_ids() {
+                // Ids that exist in neither MEMORY.md nor interim were
+                // already handled Rust-side (archived-only scrub /
+                // satisfied recovery) — the model cannot and need not
+                // hard_delete them.
+                if ctx.entry(&named).is_none() && !ctx.interim.contains_key(&named) {
+                    continue;
+                }
                 let honored = output.ops.iter().any(|op| {
                     matches!(op, Op::HardDelete { id: target, authorized_by: auth }
                     if *target == named

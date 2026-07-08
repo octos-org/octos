@@ -530,7 +530,7 @@ pub(crate) async fn run_consolidation_pass(
     // confirmation.
     let mut spent =
         (outcome.token_usage.input_tokens as u64) + (outcome.token_usage.output_tokens as u64);
-    if outcome.merge_applied && spent == 0 {
+    if outcome.provider_attempts > 0 && spent == 0 {
         // Estimator fallback (parity with extraction): some providers
         // report zero usage; a merge call still spent real tokens —
         // roughly the memory file (in the prompt AND regenerated in the
@@ -549,7 +549,12 @@ pub(crate) async fn run_consolidation_pass(
         }
         spent = estimate.max(1);
     }
-    let did_work = outcome.merge_applied || outcome.init_performed || spent > 0;
+    // Failed/rejected merges spent provider calls too — charging them is
+    // what stops a bad staged note from retrying every tick for free.
+    let did_work = outcome.merge_applied
+        || outcome.init_performed
+        || outcome.provider_attempts > 0
+        || spent > 0;
     if did_work {
         state.consolidations_today += 1;
         state.tokens_today = state.tokens_today.saturating_add(spent);
@@ -1274,6 +1279,38 @@ mod tests {
         assert!(
             memory.contains("Deploy password rotates monthly"),
             "the staged host note must be applied: {memory}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_charge_budget_when_merge_fails_with_zero_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A model fact note makes the batch dirty; the ops provider returns
+        // garbage (merge fails after the re-ask) with zero reported usage.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Model,
+                kind: octos_memory::NoteKind::Fact,
+                content: "bad batch".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        let ops = Arc::new(OpsProvider {
+            response: "GARBAGE".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        run_consolidation_pass(dir.path(), ops.clone(), &knobs_for_test())
+            .await
+            .unwrap();
+        assert!(ops.calls.load(Ordering::SeqCst) >= 1);
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert!(
+            state.consolidations_today >= 1 && state.tokens_today > 0,
+            "failed zero-usage merges must be charged: {state:?}"
         );
     }
 
