@@ -39,7 +39,11 @@ jobs:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Base the formula-bump branch on main (a release event otherwise checks
+      # out the tag commit, which would make the PR diff/auto-merge messy).
       - uses: actions/checkout@v6
+        with:
+          ref: main
 
       - name: Download unix bundles for the tag
         run: |
