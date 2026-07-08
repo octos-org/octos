@@ -192,6 +192,29 @@ pub fn resolve_chat_permissions(
     Ok(permissions)
 }
 
+/// Bind every loaded [`octos_agent::plugins::PluginTool`] in `tools` to the
+/// resolved chat working directory.
+///
+/// yolo GAP #4: unlike `octos serve` (whose `SessionRuntime::bootstrap`
+/// calls `rebind_plugin_work_dirs`), `octos chat` loads plugins with
+/// `work_dir: None` and never rebinds them. `PluginTool::execute` derives
+/// its `current_dir`/`OCTOS_WORK_DIR` from `ctx.session_scope` ONLY when its
+/// own `work_dir` is unset — and under a Host-scope (`--yolo`) session the
+/// scope is deliberately omitted (so host-reaching file tools keep host
+/// access). With BOTH `work_dir: None` and `session_scope: None`, plugins run
+/// in the process LAUNCH directory instead of the requested `--cwd`, breaking
+/// relative plugin inputs/outputs.
+///
+/// Binding the work_dir at registration (via the registry's existing
+/// [`ToolRegistry::rebind_plugin_work_dirs`] path) fixes the Host case while
+/// staying a no-op for the Workspace case — there `work_dir` == `cwd` ==
+/// `scope.workspace()`, and `execute` prefers `work_dir` first, so the
+/// resolved directory is unchanged. Only plugin working directory is
+/// affected; the Host-scope decision for FILE tools is untouched.
+fn bind_chat_plugin_work_dirs(tools: &mut ToolRegistry, cwd: &std::path::Path) {
+    tools.rebind_plugin_work_dirs(cwd);
+}
+
 /// Exit commands.
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 
@@ -703,6 +726,20 @@ impl ChatCommand {
                 .wrap_err("failed to absolutize --cwd: current_dir() unavailable")?
                 .join(&cwd)
         };
+
+        // yolo GAP #4: bind every loaded `PluginTool` to the resolved chat
+        // cwd. Chat loads plugins with `work_dir: None` and does NOT go
+        // through `SessionRuntime::rebind_plugin_work_dirs`, so under a
+        // Host-scope (`--yolo`) session — where `session_scope` is left
+        // `None` so file tools keep host reach — `PluginTool::execute`
+        // would derive its `current_dir`/`OCTOS_WORK_DIR` from neither the
+        // scope nor a work_dir and fall back to the process LAUNCH dir,
+        // breaking relative plugin inputs/outputs under `--cwd`. Binding the
+        // work_dir here fixes the Host case and is a no-op behavioural change
+        // for Workspace scope (where `work_dir` == `scope.workspace()` ==
+        // `absolute_cwd` already). See `bind_chat_plugin_work_dirs`.
+        bind_chat_plugin_work_dirs(&mut tools, &absolute_cwd);
+
         // PR-A: thread the per-profile plugin install directories
         // through to the scope so `read_file` can reach the SKILL.md
         // content the agent's system prompt auto-injects.
@@ -1466,6 +1503,90 @@ mod tests {
             "build_run_pipeline_tool with `embedder = None` must not \
              attach one — otherwise legacy callers that never configured \
              an embedder would observe a behaviour change."
+        );
+    }
+
+    /// yolo GAP #4 (codex P2): a `PluginTool` loaded for a chat session with
+    /// an explicit cwd must be BOUND to that cwd, so `PluginTool::execute`
+    /// runs the plugin in `--cwd` even when the session scope is omitted
+    /// (Host/yolo). Before the fix, chat loaded plugins with `work_dir: None`
+    /// and never rebound them, so a Host-scope session (scope `None`) left the
+    /// plugin's `work_dir` `None` → the plugin ran in the process launch dir.
+    ///
+    /// This test replicates chat's plugin-load path (loader `work_dir: None`,
+    /// mirroring `run_async`), then applies the chat cwd-binding helper the
+    /// yolo path uses, and asserts the loaded plugin's `work_dir` == the
+    /// resolved cwd. Removing the `bind_chat_plugin_work_dirs` call makes this
+    /// fail (RED), pinning the fix.
+    #[cfg(unix)]
+    #[test]
+    fn should_bind_plugin_work_dir_to_cwd_for_host_scope_chat_session() {
+        use octos_agent::plugins::PluginTool;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Plugin fixture: manifest + executable (mirrors loader.rs tests).
+        let root = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = root.path().join("demo-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        let manifest = r#"{
+            "name": "demo-plugin",
+            "version": "1.0",
+            "tools": [{"name": "demo_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
+        }"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("demo-plugin");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho ok").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The resolved chat cwd (the `--cwd` the operator passed).
+        let cwd = root.path().join("work-here");
+        std::fs::create_dir(&cwd).unwrap();
+
+        // Load exactly as chat's `run_async` does: `work_dir: None`.
+        let mut tools = ToolRegistry::new();
+        let result = octos_agent::PluginLoader::load_into_with_options(
+            &mut tools,
+            &[root.path().to_path_buf()],
+            &[],
+            octos_agent::PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: None,
+            },
+        )
+        .expect("plugin load");
+        assert_eq!(result.tool_count, 1, "fixture must register one tool");
+
+        // Sanity: straight off the loader (chat's pre-fix state) the tool is
+        // UNBOUND — this is the gap that breaks Host-scope plugin cwd.
+        let unbound = tools
+            .get("demo_tool")
+            .and_then(|t| {
+                t.as_any()
+                    .downcast_ref::<PluginTool>()
+                    .map(|p| p.work_dir().is_none())
+            })
+            .expect("demo_tool is a PluginTool");
+        assert!(unbound, "precondition: loader leaves plugin work_dir unset");
+
+        // Apply the chat cwd-binding (the fix run_async performs before it
+        // constructs the agent). This is the ONLY step under test.
+        bind_chat_plugin_work_dirs(&mut tools, &cwd);
+
+        let bound = tools
+            .get("demo_tool")
+            .and_then(|t| {
+                t.as_any()
+                    .downcast_ref::<PluginTool>()
+                    .map(|p| p.work_dir().map(|d| d.to_path_buf()))
+            })
+            .expect("demo_tool is a PluginTool");
+        assert_eq!(
+            bound.as_deref(),
+            Some(cwd.as_path()),
+            "chat must bind the plugin work_dir to --cwd so Host-scope (yolo) \
+             sessions run plugins in --cwd, not the process launch dir"
         );
     }
 

@@ -249,6 +249,18 @@ impl PluginTool {
         self.auto_approve_high_risk
     }
 
+    /// The construction-time working directory bound to this tool (`None`
+    /// when unbound). Mirrors the public [`Self::with_work_dir`] setter.
+    ///
+    /// Load-bearing for the chat/session cwd-rebind: a Host-scope ("yolo")
+    /// session omits `session_scope`, so `execute` derives the plugin's
+    /// `current_dir`/`OCTOS_WORK_DIR` from `work_dir` alone — it MUST be
+    /// bound to the resolved `--cwd`, not left `None` (else plugins run in
+    /// the process launch dir). Callers assert this to prove the binding.
+    pub fn work_dir(&self) -> Option<&Path> {
+        self.work_dir.as_deref()
+    }
+
     /// S2 plumbing: set the synthesis LLM provider config injected into the
     /// plugin's args. Only honoured when the tool's manifest opts in via
     /// `x-octos-host-config-keys: ["synthesis_config"]`.

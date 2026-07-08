@@ -67,6 +67,19 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub allow_network: bool,
 
+    /// Whether shell/exec commands may write to the workspace cwd
+    /// (default: true).
+    ///
+    /// When `false`, the workspace is mounted/bound read-only for the
+    /// shell sandbox: macOS omits the `file-write*` grant for the cwd,
+    /// bwrap `--ro-bind`s it, and Docker mounts it `ro`. This is what a
+    /// read-only permission profile sets so `--sandbox read-only` stops
+    /// shell writes (`touch newfile`), not just the native file tools.
+    /// The `default_enabled` (true) default preserves backward-compatible
+    /// writable behaviour for configs that never set this field.
+    #[serde(default = "default_enabled")]
+    pub workspace_write: bool,
+
     /// Docker-specific settings (used when mode = "docker").
     #[serde(default)]
     pub docker: DockerConfig,
@@ -110,6 +123,7 @@ impl Default for SandboxConfig {
             enabled: true,
             mode: SandboxMode::Auto,
             allow_network: false,
+            workspace_write: true,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,
@@ -240,6 +254,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::None => Box::new(NoSandbox),
         SandboxMode::Bwrap => Box::new(BwrapSandbox {
             allow_network: config.allow_network,
+            workspace_write: config.workspace_write,
         }),
         SandboxMode::Landlock => {
             #[cfg(target_os = "linux")]
@@ -261,6 +276,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::Macos => Box::new(MacosSandbox {
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
+            workspace_write: config.workspace_write,
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: config.docker.clone(),
@@ -294,6 +310,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             return Box::new(MacosSandbox {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
+                workspace_write: config.workspace_write,
             });
         }
     }
@@ -303,6 +320,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         if bwrap_works() {
             return Box::new(BwrapSandbox {
                 allow_network: config.allow_network,
+                workspace_write: config.workspace_write,
             });
         }
         if linux_container_sandbox_available() {
@@ -597,6 +615,7 @@ mod tests {
             enabled: true,
             mode: SandboxMode::None,
             allow_network: false,
+            workspace_write: true,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,

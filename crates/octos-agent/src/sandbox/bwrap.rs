@@ -9,6 +9,11 @@ use super::{BLOCKED_ENV_VARS, Sandbox};
 /// Linux sandbox using bubblewrap (bwrap).
 pub struct BwrapSandbox {
     pub(crate) allow_network: bool,
+    /// When `false`, the working directory is bound read-only
+    /// (`--ro-bind`) so shell commands cannot mutate the workspace.
+    /// Default constructions use `true` (read-write `--bind`) to preserve
+    /// the historical writable-workspace behaviour.
+    pub(crate) workspace_write: bool,
 }
 
 impl Sandbox for BwrapSandbox {
@@ -27,9 +32,16 @@ impl Sandbox for BwrapSandbox {
             }
         }
 
-        // Read-write bind the working directory
+        // Bind the working directory. Read-write by default; read-only when
+        // the permission profile denies workspace writes (`--sandbox
+        // read-only`), so shell commands cannot mutate the workspace.
         let cwd_str = cwd.to_string_lossy();
-        cmd.arg("--bind").arg(&*cwd_str).arg(&*cwd_str);
+        let workspace_bind = if self.workspace_write {
+            "--bind"
+        } else {
+            "--ro-bind"
+        };
+        cmd.arg(workspace_bind).arg(&*cwd_str).arg(&*cwd_str);
 
         // Bind /tmp for scratch space
         cmd.arg("--tmpfs").arg("/tmp");
@@ -59,6 +71,7 @@ mod tests {
     fn test_bwrap_sandbox_command() {
         let sb = BwrapSandbox {
             allow_network: false,
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -76,6 +89,7 @@ mod tests {
     fn test_bwrap_sandbox_env_sanitization() {
         let sb = BwrapSandbox {
             allow_network: false,
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp"));
         let removed: Vec<String> = cmd
@@ -98,9 +112,65 @@ mod tests {
     }
 
     #[test]
+    fn should_ro_bind_workspace_when_workspace_write_disabled() {
+        // P1 (codex): a read-only permission profile must bind the workspace
+        // read-only so shell commands cannot write to it.
+        let sb = BwrapSandbox {
+            allow_network: false,
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("touch newfile", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        // The workspace is bound with --ro-bind, not the read-write --bind.
+        let ws_bind_idx = args
+            .iter()
+            .position(|a| a == "/tmp/ws")
+            .expect("workspace path must be bound");
+        assert!(
+            ws_bind_idx >= 1,
+            "workspace bind must have a flag before it"
+        );
+        assert_eq!(
+            args[ws_bind_idx - 1],
+            "--ro-bind",
+            "read-only profile must --ro-bind the workspace, args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn should_rw_bind_workspace_when_workspace_write_enabled() {
+        let sb = BwrapSandbox {
+            allow_network: false,
+            workspace_write: true,
+        };
+        let cmd = sb.wrap_command("touch newfile", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        // The FIRST occurrence of the workspace path is the workspace bind
+        // (system dirs bound before it never match /tmp/ws).
+        let ws_bind_idx = args
+            .iter()
+            .position(|a| a == "/tmp/ws")
+            .expect("workspace path must be bound");
+        assert_eq!(
+            args[ws_bind_idx - 1],
+            "--bind",
+            "writable profile must --bind (rw) the workspace, args: {args:?}"
+        );
+    }
+
+    #[test]
     fn test_bwrap_sandbox_allows_network() {
         let sb = BwrapSandbox {
             allow_network: true,
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp"));
         let args: Vec<_> = cmd

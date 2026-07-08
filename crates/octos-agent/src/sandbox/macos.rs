@@ -12,6 +12,11 @@ pub struct MacosSandbox {
     /// When non-empty, restrict file-read* to these paths + cwd.
     /// Empty = allow all reads (backward compatible).
     pub(crate) read_allow_paths: Vec<String>,
+    /// When `false`, the workspace cwd is NOT granted `file-write*`
+    /// (read-only workspace for shell). `/dev/null` stays writable so
+    /// shell redirections and git still work. Default constructions use
+    /// `true` to preserve the historical writable-workspace behaviour.
+    pub(crate) workspace_write: bool,
 }
 
 impl Sandbox for MacosSandbox {
@@ -98,6 +103,17 @@ impl Sandbox for MacosSandbox {
             rules.join("\n")
         };
 
+        // Workspace write rule. When `workspace_write` is false (read-only
+        // permission profile), OMIT the cwd `file-write*` grant so shell
+        // commands cannot mutate the workspace — `(deny default)` then denies
+        // the write. `/dev/null` stays writable regardless so shell
+        // redirections and git internals still function.
+        let workspace_write_rule = if self.workspace_write {
+            format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd)
+        } else {
+            String::new()
+        };
+
         let profile = format!(
             r#"(version 1)
 (deny default)
@@ -112,11 +128,10 @@ impl Sandbox for MacosSandbox {
 (allow file-ioctl)
 {read_rules}
 (allow file-write* (literal "/dev/null"))
-(allow file-write* (subpath "{cwd}"))
-{network_rule}
+{workspace_write_rule}{network_rule}
 "#,
             read_rules = read_rules,
-            cwd = real_cwd,
+            workspace_write_rule = workspace_write_rule,
             network_rule = network_rule,
         );
 
@@ -154,6 +169,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: true,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -190,6 +206,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/\x01bad"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -210,6 +227,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         // Parentheses, backslash, and quote should all be rejected
         for path in &[
@@ -238,6 +256,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -257,6 +276,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo ok", Path::new("/Users/test/project"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -269,6 +289,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/evil\x7Fpath"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -283,6 +304,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -310,6 +332,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/custom/path".to_string()],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
@@ -349,6 +372,7 @@ mod tests {
                 "/evil\")\n(allow file-write* (subpath \"/\"))".to_string(),
                 "/another/safe".to_string(),
             ],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -384,6 +408,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/path/with(parens)".to_string()],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -411,6 +436,7 @@ mod tests {
                 "/path/with\x7Fdel".to_string(),
                 "/valid/path".to_string(),
             ],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -447,6 +473,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec![],
+            workspace_write: true,
         };
         let mut cmd = sb.wrap_command(
             "touch /tmp/sandbox_escape_test_file 2>&1; echo exit=$?",
@@ -471,6 +498,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec![],
+            workspace_write: true,
         };
         let mut cmd = sb.wrap_command("touch test_file && echo ok", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -483,6 +511,100 @@ mod tests {
         assert!(
             cwd.join("test_file").exists(),
             "file should be created inside cwd"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_omit_workspace_write_rule_when_workspace_write_disabled() {
+        // P1 (codex): under a read-only profile the SBPL profile must NOT
+        // grant file-write* to the workspace cwd (so shell cannot write),
+        // while still permitting /dev/null writes.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("touch newfile", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains(&format!(r#"(allow file-write* (subpath "{real_cwd}"))"#)),
+            "read-only profile must NOT grant file-write* to the workspace, profile:\n{profile}"
+        );
+        // /dev/null stays writable for shell redirections / git internals.
+        assert!(
+            profile.contains(r#"(allow file-write* (literal "/dev/null"))"#),
+            "/dev/null must stay writable even when workspace is read-only"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_grant_workspace_write_rule_when_workspace_write_enabled() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+        };
+        let cmd = sb.wrap_command("touch newfile", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            profile.contains(&format!(r#"(allow file-write* (subpath "{real_cwd}"))"#)),
+            "writable profile must grant file-write* to the workspace, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn should_block_write_inside_cwd_when_workspace_write_disabled() {
+        // End-to-end proof: a read-only sandbox denies `touch newfile` even
+        // inside the workspace cwd (the P1 footgun: shell writing under
+        // `--sandbox read-only`).
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            workspace_write: false,
+        };
+        let mut cmd = sb.wrap_command("touch newfile 2>&1; echo exit=$?", cwd);
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !cwd.join("newfile").exists(),
+            "read-only sandbox must block workspace writes, stdout={stdout}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -501,6 +623,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/nonexistent/path".to_string()],
+            workspace_write: true,
         };
         let real_secret =
             std::fs::canonicalize(&secret_file).unwrap_or_else(|_| secret_file.clone());
