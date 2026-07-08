@@ -1055,11 +1055,28 @@ fn execute_id_bound_forgets(
         if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
             continue;
         }
-        if sensitive_only && !note.sensitive {
-            continue;
-        }
         let named = note.named_entry_ids();
         if named.is_empty() {
+            continue;
+        }
+        // The sensitive filter gates EXECUTION, not satisfaction: a
+        // non-sensitive sibling whose ids a sensitive note just deleted
+        // must still be consumed here (nothing is left for a merge to
+        // hard_delete — the validator would wedge on it).
+        if sensitive_only && !note.sensitive {
+            let mut all_gone = true;
+            for id in &named {
+                if frozen_ids.contains(id)
+                    || working.iter().any(|e| &e.id == id)
+                    || apply::archive_names_id(memory_dir, id)?
+                {
+                    all_gone = false;
+                    break;
+                }
+            }
+            if all_gone {
+                satisfied_no_op.push(i);
+            }
             continue;
         }
         let mut targets: Vec<usize> = named
@@ -1132,13 +1149,28 @@ fn execute_id_bound_forgets(
             executed_notes.push(i);
         }
     }
-    if !plan.hard_deletes.is_empty() {
-        plan.final_entries = working.clone();
-        let report = apply::apply_plan(memory_dir, params.today, &plan)?;
+    if !plan.hard_deletes.is_empty() || !satisfied_no_op.is_empty() {
+        if !plan.hard_deletes.is_empty() {
+            plan.final_entries = working.clone();
+            let report = apply::apply_plan(memory_dir, params.today, &plan)?;
+            // The scrub may have disk-deleted OTHER staging files quoting
+            // the removed entry — prune them from the in-memory batch too,
+            // or the later merge prompt would still ship the scrubbed
+            // content (and validators would demand consumption of
+            // vanished files).
+            if !report.scrub_deleted_staging.is_empty() {
+                let scrubbed: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
+                batch.notes.retain(|n| !scrubbed.contains(&n.path));
+                batch.extractions.retain(|e| !scrubbed.contains(&e.path));
+                batch
+                    .parse_failures
+                    .retain(|(p, _, _)| !scrubbed.contains(p));
+            }
+        }
         // Fully-honored notes were consumed by the apply (authorizing note
-        // deletion); drop them from the batch — together with duplicates
-        // whose named ids a sibling already deleted this run (their files
-        // must go too, or the ask would reappear next run).
+        // deletion); drop them from the batch — together with siblings
+        // whose named ids were already deleted this run (their files must
+        // go too, or the ask would reappear next run).
         let mut consumed: Vec<(usize, bool)> = executed_notes
             .into_iter()
             .map(|i| (i, false))
@@ -1155,18 +1187,6 @@ fn execute_id_bound_forgets(
                 note.id.clone(),
                 "executed Rust-side (id-bound host authority)".to_string(),
             ));
-        }
-        // The scrub may have disk-deleted OTHER staging files quoting the
-        // removed entry — prune them from the in-memory batch too, or the
-        // later merge prompt would still ship the scrubbed content (and
-        // validators would demand consumption of vanished files).
-        if !report.scrub_deleted_staging.is_empty() {
-            let scrubbed: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
-            batch.notes.retain(|n| !scrubbed.contains(&n.path));
-            batch.extractions.retain(|e| !scrubbed.contains(&e.path));
-            batch
-                .parse_failures
-                .retain(|(p, _, _)| !scrubbed.contains(p));
         }
     }
     Ok(working)
@@ -3723,5 +3743,48 @@ mod tests {
             !prompt_text.contains("Old archived secret"),
             "archived-only scrubbed staging must not ride the merge prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn should_consume_non_sensitive_sibling_when_sensitive_deletes_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &[
+                "Sensitive live secret. (updated: 2026-06-01) ^mlivsec",
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        let sens = write_note(
+            memory_dir,
+            "01fg-sens",
+            "host",
+            "forget",
+            "delete id:^mlivsec",
+            true,
+        );
+        let plain = write_note(
+            memory_dir,
+            "02fg-plain",
+            "host",
+            "forget",
+            "delete id:^mlivsec",
+            false,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(outcome.hard_deleted.contains(&"^mlivsec".to_string()));
+        assert!(
+            !sens.exists() && !plain.exists(),
+            "both siblings consumed — the non-sensitive one must not wedge the validator"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(!memory.contains("^mlivsec"));
     }
 }

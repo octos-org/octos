@@ -700,7 +700,13 @@ fn validate_consumption(output: &ModelOutput, ctx: &ValidationCtx) -> Result<(),
             }
             continue;
         }
-        let is_protected = note.origin == NoteOrigin::Host || note.kind == NoteKind::UserRequest;
+        // HOST-authored notes are the hard-protected class. A MODEL-captured
+        // user_request (memory_note tool) is durable against quarantine but
+        // must stay consumable: it carries no delete authority, so a
+        // forget-phrased ask could otherwise never be validly consumed and
+        // would spin the fast lane forever. Dropping it requires a reason,
+        // which the outcome surfaces (the host CLI is the delete path).
+        let is_protected = note.origin == NoteOrigin::Host;
         if is_protected {
             if !consumed.contains(id) {
                 return Err(format!(
@@ -1285,21 +1291,46 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_merge_when_user_request_note_dropped() {
+    fn should_reject_merge_when_host_request_note_dropped() {
         let mut fx = Fixture::default();
         fx.notes
-            .push(note("m1", "model", "user_request", "remember my birthday"));
+            .push(note("h1", "host", "user_request", "remember my birthday"));
         let out = ModelOutput {
             ops: vec![],
             consumed_ids: vec![],
             dropped: vec![Dropped {
-                id: "m1".into(),
+                id: "h1".into(),
                 reason: "seems unimportant".into(),
             }],
             pending: vec![],
         };
         let err = fx.validate(&out).unwrap_err();
         assert!(err.contains("never be silently dropped"), "got: {err}");
+    }
+
+    #[test]
+    fn should_allow_dropping_model_user_request_with_reason() {
+        // Model-captured user_requests carry no delete authority — a
+        // forget-phrased ask could never be validly consumed, so dropping
+        // WITH a surfaced reason must be legal (the host CLI is the
+        // delete path).
+        let mut fx = Fixture::default();
+        fx.notes.push(note(
+            "m1",
+            "model",
+            "user_request",
+            "user asked to forget the address",
+        ));
+        let out = ModelOutput {
+            ops: vec![],
+            consumed_ids: vec![],
+            dropped: vec![Dropped {
+                id: "m1".into(),
+                reason: "forget requests need host confirmation (octos memory forget)".into(),
+            }],
+            pending: vec![],
+        };
+        assert!(fx.validate(&out).is_ok());
     }
 
     #[test]
