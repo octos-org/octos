@@ -53,6 +53,10 @@ pub struct ProcessManager {
     /// `OCTOS_PLUGINS_REQUIRE_SIGNED=1` in its env so its `Config::from_file`
     /// OR-merges the flag onto whatever the profile JSON declared.
     host_plugins_require_signed: bool,
+    /// Host-level `memory.max_inject_tokens` that spawned gateways inherit
+    /// via `OCTOS_MEMORY_MAX_INJECT_TOKENS` (field-level: a profile's own
+    /// explicit value wins; the env only fills the gap).
+    host_max_inject_tokens: Option<usize>,
 }
 
 struct GatewayProcess {
@@ -135,6 +139,7 @@ impl ProcessManager {
             admin_token: None,
             self_ref: std::sync::Mutex::new(None),
             host_plugins_require_signed: false,
+            host_max_inject_tokens: None,
         }
     }
 
@@ -144,6 +149,14 @@ impl ProcessManager {
     /// permissive path).
     pub fn with_host_plugins_require_signed(mut self, require_signed: bool) -> Self {
         self.host_plugins_require_signed = require_signed;
+        self
+    }
+
+    /// Mirror the host's `memory.max_inject_tokens` onto every spawned
+    /// gateway via `OCTOS_MEMORY_MAX_INJECT_TOKENS`, so profiles that omit
+    /// the memory block inherit the host injection budget.
+    pub fn with_host_max_inject_tokens(mut self, max_inject_tokens: Option<usize>) -> Self {
+        self.host_max_inject_tokens = max_inject_tokens;
         self
     }
 
@@ -388,6 +401,17 @@ impl ProcessManager {
                 );
                 continue;
             }
+            // Same reservation for the host memory budget: profiles override
+            // it via their own `memory` config block, not by spoofing the
+            // host-controlled env var.
+            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+                tracing::warn!(
+                    profile = %profile.id,
+                    var = %key,
+                    "skipping profile env var that would override host memory budget"
+                );
+                continue;
+            }
             cmd.env(key, value);
         }
 
@@ -398,6 +422,9 @@ impl ProcessManager {
         // var onto whatever the profile JSON declares.
         if self.host_plugins_require_signed {
             cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
+        }
+        if let Some(n) = self.host_max_inject_tokens {
+            cmd.env("OCTOS_MEMORY_MAX_INJECT_TOKENS", n.to_string());
         }
 
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");

@@ -440,10 +440,15 @@ impl ProfileRuntime {
                 config.plugins.require_signed = true;
             }
         }
-        // Host memory settings apply when the profile doesn't override them
-        // (same host-default pattern as plugins/voice).
-        if config.memory.is_none() {
-            config.memory = host_memory.cloned();
+        // Host memory settings apply field-by-field when the profile doesn't
+        // override them (same host-default pattern as plugins/voice). A
+        // profile serialized with an empty `memory: {}` block must still
+        // inherit the host budget.
+        if let Some(host) = host_memory {
+            let mem = config.memory.get_or_insert_with(Default::default);
+            if mem.max_inject_tokens.is_none() {
+                mem.max_inject_tokens = host.max_inject_tokens;
+            }
         }
 
         // Step 2: resolve the provider name. `config_from_profile`

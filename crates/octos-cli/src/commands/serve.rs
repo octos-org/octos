@@ -527,7 +527,10 @@ impl ServeCommand {
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
                 // gateway's effective `plugins.require_signed`.
-                .with_host_plugins_require_signed(config.plugins.require_signed),
+                .with_host_plugins_require_signed(config.plugins.require_signed)
+                .with_host_max_inject_tokens(
+                    config.memory.as_ref().and_then(|m| m.max_inject_tokens),
+                ),
         );
         process_manager.set_self_ref();
 
