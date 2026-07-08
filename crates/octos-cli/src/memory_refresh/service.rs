@@ -387,6 +387,41 @@ pub(crate) async fn run_extraction_pass(
 
     // Eligible = user-facing, idle long enough, young enough, and changed
     // since the snapshots we last read.
+    // Pre-upgrade cursor backfill — INDEPENDENT of extraction eligibility
+    // (idle windows, age caps, budgets): a watermarked session without a
+    // cursor was fully consumed by a pre-cursor sweep; stamp it before
+    // anything can make the session a candidate, or its next append would
+    // fall back to prior=0 and re-feed the whole history. Sessions whose
+    // files already changed since the old watermark accept a one-time
+    // full re-read (we cannot know the consumed prefix).
+    for session in manager.list_for_analysis() {
+        if session.internal || session.files.is_empty() {
+            continue;
+        }
+        if state.extracted_counts.contains_key(&session.key.0) {
+            continue;
+        }
+        let snaps: Vec<FileSnap> = session
+            .files
+            .iter()
+            .map(|f| FileSnap::of(&f.path, f.modified, f.len))
+            .collect();
+        if state.watermarks.get(&session.key.0) != Some(&snaps) {
+            continue;
+        }
+        if let Some(transcript) = manager.export_transcript(&session.key).await {
+            // Pre-read snapshot rule: a turn appended DURING this read
+            // would be stamped consumed without extraction.
+            if snapshots_current(&snaps) {
+                let fp = transcript_prefix_fingerprint(&transcript, transcript.len());
+                state
+                    .extracted_counts
+                    .insert(session.key.0.clone(), (transcript.len(), fp));
+                state.save(&state_path)?;
+            }
+        }
+    }
+
     let mut candidates: Vec<(octos_bus::AnalysisSession, Vec<FileSnap>, SystemTime)> = Vec::new();
     for session in manager.list_for_analysis() {
         if session.internal || session.files.is_empty() {
@@ -415,28 +450,6 @@ pub(crate) async fn run_extraction_pass(
             .map(|f| FileSnap::of(&f.path, f.modified, f.len))
             .collect();
         if state.watermarks.get(&session.key.0) == Some(&snaps) {
-            // Pre-upgrade backfill: this session was fully consumed by a
-            // sweep from BEFORE delta cursors existed. Without a cursor,
-            // the next append would fall back to prior=0 and re-feed the
-            // whole history (re-learning facts deleted since). Stamp the
-            // cursor now, without extraction — that content was already
-            // extracted by the old code.
-            if !state.extracted_counts.contains_key(&session.key.0) {
-                if let Some(transcript) = manager.export_transcript(&session.key).await {
-                    // Pre-read snapshot rule (same as the watermark
-                    // advance): a turn appended DURING this read would be
-                    // stamped consumed without extraction and skipped
-                    // forever. Leave the cursor unset; the changed file
-                    // makes the session a candidate next pass.
-                    if snapshots_current(&snaps) {
-                        let fp = transcript_prefix_fingerprint(&transcript, transcript.len());
-                        state
-                            .extracted_counts
-                            .insert(session.key.0.clone(), (transcript.len(), fp));
-                        state.save(&state_path)?;
-                    }
-                }
-            }
             continue;
         }
         candidates.push((session, snaps, newest));
@@ -671,9 +684,27 @@ fn transcript_prefix_fingerprint(transcript: &[(usize, Message)], n: usize) -> S
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for (_, msg) in &transcript[..n.min(transcript.len())] {
+        // Every field build_input_lines consumes: rewrites that change
+        // only tool linkage (rollback/migration) must invalidate the
+        // cursor too, or a changed sanitized prefix would be skipped.
         hasher.update(msg.role.as_str().as_bytes());
         hasher.update([0u8]);
         hasher.update(msg.content.as_bytes());
+        hasher.update([0u8]);
+        if let Some(id) = &msg.tool_call_id {
+            hasher.update(id.as_bytes());
+        }
+        hasher.update([0u8]);
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                hasher.update(call.id.as_bytes());
+                hasher.update([1u8]);
+                hasher.update(call.name.as_bytes());
+                hasher.update([1u8]);
+                hasher.update(call.arguments.to_string().as_bytes());
+                hasher.update([1u8]);
+            }
+        }
         hasher.update([0x1e]);
     }
     format!("{:x}", hasher.finalize())
@@ -1668,6 +1699,46 @@ mod tests {
         assert!(
             transcript_part.contains("fish") && !transcript_part.contains("oolong"),
             "post-backfill append is delta-only: {transcript_part}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_backfill_cursor_even_when_session_not_extraction_eligible() {
+        // The backfill must not depend on idle windows: a pre-upgrade
+        // session that is TOO FRESH for extraction still gets its cursor
+        // stamped, so an append right after upgrade feeds only the delta.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:504", "pre-upgrade fact: tea is oolong").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        // First pass with normal knobs consumes the session + watermark.
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        // Simulate pre-upgrade state: cursor dropped, watermark kept.
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let mut state = RefreshState::load(&state_path);
+        state.extracted_counts.clear();
+        state.save(&state_path).unwrap();
+
+        // Pass with a LONG idle requirement: the session is not
+        // extraction-eligible, but the backfill must still stamp it.
+        let mut strict = knobs_for_test();
+        strict.min_idle = std::time::Duration::from_secs(3600);
+        run_extraction_pass(dir.path(), &store, &provider, &strict)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert!(
+            state.extracted_counts.contains_key("api:504"),
+            "backfill is independent of extraction eligibility: {:?}",
+            state.extracted_counts
         );
     }
 
