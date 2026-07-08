@@ -93,17 +93,16 @@ pub(crate) struct RefreshState {
     /// Per session key: the file snapshots actually READ last time.
     #[serde(default)]
     pub watermarks: std::collections::BTreeMap<String, Vec<FileSnap>>,
-    /// Per session key: (transcript messages CONSUMED, total session-file
-    /// bytes at consume time). Later sweeps feed only the delta —
-    /// re-reading history would re-learn facts the user has since
-    /// hard-deleted (they are gone from CURRENT MEMORY, so the "do not
-    /// re-extract" instruction cannot see them) and would re-spend tokens
-    /// on every old turn. The byte total detects REWRITES (fork /
-    /// truncation / replacement): any shrink resets the cursor; a
-    /// same-or-longer rewrite with equal message count is the same
-    /// residual the (mtime,len) watermark design already accepts.
+    /// Per session key: (transcript messages CONSUMED, fingerprint of that
+    /// consumed prefix). Later sweeps feed only the delta — re-reading
+    /// history would re-learn facts the user has since hard-deleted (they
+    /// are gone from CURRENT MEMORY, so the "do not re-extract"
+    /// instruction cannot see them) and would re-spend tokens on every
+    /// old turn. The FINGERPRINT (not file bytes) detects rewrites:
+    /// rollback-and-continue can grow the file while replacing folded
+    /// messages below the cursor — any prefix change resets it.
     #[serde(default)]
-    pub extracted_counts: std::collections::BTreeMap<String, (usize, u64)>,
+    pub extracted_counts: std::collections::BTreeMap<String, (usize, String)>,
     /// Per session key: consecutive extraction failures (skip at cap).
     #[serde(default)]
     pub failures: std::collections::BTreeMap<String, u32>,
@@ -416,6 +415,21 @@ pub(crate) async fn run_extraction_pass(
             .map(|f| FileSnap::of(&f.path, f.modified, f.len))
             .collect();
         if state.watermarks.get(&session.key.0) == Some(&snaps) {
+            // Pre-upgrade backfill: this session was fully consumed by a
+            // sweep from BEFORE delta cursors existed. Without a cursor,
+            // the next append would fall back to prior=0 and re-feed the
+            // whole history (re-learning facts deleted since). Stamp the
+            // cursor now, without extraction — that content was already
+            // extracted by the old code.
+            if !state.extracted_counts.contains_key(&session.key.0) {
+                if let Some(transcript) = manager.export_transcript(&session.key).await {
+                    let fp = transcript_prefix_fingerprint(&transcript, transcript.len());
+                    state
+                        .extracted_counts
+                        .insert(session.key.0.clone(), (transcript.len(), fp));
+                    state.save(&state_path)?;
+                }
+            }
             continue;
         }
         candidates.push((session, snaps, newest));
@@ -433,7 +447,6 @@ pub(crate) async fn run_extraction_pass(
             break;
         }
         let key = session.key.clone();
-        let total_bytes: u64 = snaps.iter().map(|s| s.len).sum();
         let outcome = extract_one_session(
             &manager,
             memory_store,
@@ -441,7 +454,6 @@ pub(crate) async fn run_extraction_pass(
             knobs,
             &key,
             newest,
-            total_bytes,
             &mut state,
         )
         .await;
@@ -646,6 +658,20 @@ fn snapshots_current(snaps: &[FileSnap]) -> bool {
 }
 
 /// Extract one session; returns Ok(true) when a staging artifact was written.
+/// Stable fingerprint of the first `n` transcript messages — the delta
+/// cursor's validity check. Any change below the cursor resets it.
+fn transcript_prefix_fingerprint(transcript: &[(usize, Message)], n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (_, msg) in &transcript[..n.min(transcript.len())] {
+        hasher.update(msg.role.as_str().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(msg.content.as_bytes());
+        hasher.update([0x1e]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 async fn extract_one_session(
     manager: &SessionManager,
     memory_store: &Arc<MemoryStore>,
@@ -653,7 +679,6 @@ async fn extract_one_session(
     knobs: &RefreshKnobs,
     key: &octos_core::SessionKey,
     newest: SystemTime,
-    total_bytes: u64,
     state: &mut RefreshState,
 ) -> Result<bool> {
     let Some(transcript) = manager.export_transcript(key).await else {
@@ -661,15 +686,16 @@ async fn extract_one_session(
         return Ok(false);
     };
     // Delta extraction: skip messages consumed by earlier sweeps. The
-    // cursor is valid only for a GROWN file with at least as many
-    // messages — a shorter transcript OR shrunken byte total means the
-    // session was rewritten (fork, truncation, replacement): start over.
+    // cursor is valid only when the consumed PREFIX is byte-identical —
+    // fork/truncation/rollback-and-continue all change it and reset the
+    // cursor to a full re-read.
     let prior = state
         .extracted_counts
         .get(&key.0)
-        .copied()
-        .filter(|&(n, bytes)| n <= transcript.len() && bytes <= total_bytes)
-        .map(|(n, _)| n)
+        .filter(|(n, fp)| {
+            *n <= transcript.len() && *fp == transcript_prefix_fingerprint(&transcript, *n)
+        })
+        .map(|(n, _)| *n)
         .unwrap_or(0);
     // Build lines over the FULL transcript (tool-call names for result
     // filtering can live in already-consumed messages), then keep only
@@ -681,9 +707,13 @@ async fn extract_one_session(
         .collect();
     if lines.is_empty() {
         // Nothing extractable in the delta; remember we consumed it.
-        state
-            .extracted_counts
-            .insert(key.0.clone(), (transcript.len(), total_bytes));
+        state.extracted_counts.insert(
+            key.0.clone(),
+            (
+                transcript.len(),
+                transcript_prefix_fingerprint(&transcript, transcript.len()),
+            ),
+        );
         return Ok(false);
     }
     let rendered = render_transcript(
@@ -756,9 +786,13 @@ async fn extract_one_session(
         // The no-op gate firing is the expected common case — the delta
         // was consumed (nothing worth staging), so advance the cursor or
         // these turns would be re-fed and re-charged every later sweep.
-        state
-            .extracted_counts
-            .insert(key.0.clone(), (transcript.len(), total_bytes));
+        state.extracted_counts.insert(
+            key.0.clone(),
+            (
+                transcript.len(),
+                transcript_prefix_fingerprint(&transcript, transcript.len()),
+            ),
+        );
         return Ok(false);
     }
     memory_store
@@ -767,9 +801,13 @@ async fn extract_one_session(
     // Only now is the extraction durable — advancing earlier would let a
     // failed write mark these turns consumed and the retry would skip
     // them forever.
-    state
-        .extracted_counts
-        .insert(key.0.clone(), (transcript.len(), total_bytes));
+    state.extracted_counts.insert(
+        key.0.clone(),
+        (
+            transcript.len(),
+            transcript_prefix_fingerprint(&transcript, transcript.len()),
+        ),
+    );
     Ok(true)
 }
 
@@ -1530,6 +1568,99 @@ mod tests {
         assert!(
             prompts.contains("Miso"),
             "rewritten session must re-extract from the top: {prompts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reset_cursor_when_prefix_rewritten_but_longer() {
+        // Rollback-and-continue: the transcript ends up AT LEAST as long
+        // with different content below the cursor. Byte/length checks
+        // can't see it — the prefix fingerprint must.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:502", "original statement one").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+
+        // Replace with DIFFERENT content of the same+greater length.
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("api:502".to_string());
+        mgr.clear(&key).await.unwrap();
+        drop(mgr);
+        seed_session(dir.path(), "api:502", "replacement statement alpha").await;
+        seed_session(dir.path(), "api:502", "replacement statement beta").await;
+        provider.prompts.lock().unwrap().clear();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let prompts = provider.prompts.lock().unwrap().concat();
+        assert!(
+            prompts.contains("replacement statement alpha"),
+            "rewritten prefix must reset the cursor: {prompts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_backfill_cursor_for_pre_upgrade_watermarks() {
+        // A session fully consumed by a pre-cursor sweep (watermark set,
+        // no cursor) must get a cursor stamped WITHOUT re-extraction, so
+        // the next append feeds only the delta.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:503", "ancient fact: tea is oolong").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+
+        // Simulate the pre-upgrade state: watermark kept, cursor dropped.
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let mut state = RefreshState::load(&state_path);
+        state.extracted_counts.clear();
+        state.save(&state_path).unwrap();
+
+        // Clean pass (watermark matches): backfills without extraction.
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert!(
+            state.extracted_counts.contains_key("api:503"),
+            "cursor backfilled on the clean pass: {:?}",
+            state.extracted_counts
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "no extra extraction"
+        );
+
+        // The next append feeds only the delta.
+        seed_session(dir.path(), "api:503", "new fact: shell is fish").await;
+        provider.prompts.lock().unwrap().clear();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let prompts = provider.prompts.lock().unwrap().concat();
+        let transcript_part = prompts.split("TRANSCRIPT of session").nth(1).unwrap_or("");
+        assert!(
+            transcript_part.contains("fish") && !transcript_part.contains("oolong"),
+            "post-backfill append is delta-only: {transcript_part}"
         );
     }
 
