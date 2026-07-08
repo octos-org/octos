@@ -460,6 +460,12 @@ pub(crate) fn has_priority_note(data_dir: &Path) -> bool {
         if file.take(512).read_to_string(&mut head).is_err() {
             continue;
         }
+        // Already-parked pending-confirm notes (the engine stamps
+        // `expires_at:` when it parks them) wait on a HUMAN, not on the
+        // fast lane — re-running every debounce would only spin.
+        if head.contains("expires_at:") {
+            continue;
+        }
         if head.contains("origin: host") || head.contains("kind: user_request") {
             return true;
         }
@@ -494,10 +500,18 @@ pub(crate) async fn run_consolidation_pass(
     if outcome.skipped_clean {
         return Ok(());
     }
-    state.consolidations_today += 1;
+    // Charge budgets only for ACTUAL work (provider spend or an applied
+    // merge/INIT). A parked pending-confirm note keeps returning
+    // `skipped_clean == false` purely to stay surfaced; charging those
+    // no-op checks would drain the daily cap and block the eventual
+    // confirmation.
     let spent =
         (outcome.token_usage.input_tokens as u64) + (outcome.token_usage.output_tokens as u64);
-    state.tokens_today = state.tokens_today.saturating_add(spent);
+    let did_work = outcome.merge_applied || outcome.init_performed || spent > 0;
+    if did_work {
+        state.consolidations_today += 1;
+        state.tokens_today = state.tokens_today.saturating_add(spent);
+    }
 
     // Quarantine mover: the engine only signals; the service relocates so
     // repeat offenders leave the batch.
@@ -1020,6 +1034,61 @@ mod tests {
             .await
             .unwrap();
         assert!(has_priority_note(dir.path()), "host notes are fast-lane");
+    }
+
+    #[tokio::test]
+    async fn should_not_charge_budget_for_pending_only_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A free-text host forget with nothing to bind to: the engine parks
+        // it (or leaves it pending) without provider work.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Host,
+                kind: octos_memory::NoteKind::Forget,
+                content: "forget something that matches no entry".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+
+        let ops = Arc::new(OpsProvider {
+            response: r#"{"ops":[],"consumed_ids":[],"dropped":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let knobs = knobs_for_test();
+        // Several fast-lane style re-checks.
+        for _ in 0..5 {
+            run_consolidation_pass(dir.path(), ops.clone(), &knobs)
+                .await
+                .unwrap();
+        }
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert!(
+            state.consolidations_today <= 1,
+            "pending-only checks must not drain the daily cap (got {})",
+            state.consolidations_today
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_fast_lane_already_parked_pending_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes_dir = dir.path().join("memory/staging/notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        // A parked pending-confirm note: host forget already stamped with
+        // candidates + expires_at by the engine.
+        std::fs::write(
+            notes_dir.join("0abc-parked.md"),
+            "---\norigin: host\nkind: forget\ncreated_at: 2026-07-08T00:00:00Z\ncandidates: []\nexpires_at: 2026-07-15T00:00:00Z\n---\n\nforget my old address\n",
+        )
+        .unwrap();
+        assert!(
+            !has_priority_note(dir.path()),
+            "parked notes wait on a human, not the fast lane"
+        );
     }
 
     #[test]
