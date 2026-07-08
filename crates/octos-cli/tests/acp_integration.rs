@@ -349,3 +349,72 @@ async fn should_accumulate_conversation_history_across_multiple_prompts() {
         snapshots[2].len()
     );
 }
+
+/// Regression: `octos acp` speaks ACP JSON-RPC on stdout, so NOTHING else may be
+/// written there — a single stray log line makes strict clients (Zed) reject the
+/// whole stream with a `-32700` parse error. octos's tracing previously defaulted
+/// to stdout for no-log-dir commands; this drives the REAL binary through
+/// `initialize` + `session/new` (which loads config → emits startup logs) and
+/// asserts every stdout line is valid JSON.
+#[test]
+fn should_emit_only_valid_json_on_stdout_when_running_acp() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_octos"))
+        .args([
+            "acp",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-chat",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+        ])
+        .env("RUST_LOG", "info") // force startup logging so a leak would show
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn octos acp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    // initialize + session/new — the latter triggers config load (the logs that
+    // used to leak). No LLM call, so no provider key is needed.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{}}}\n")
+        .unwrap();
+    stdin
+        .write_all(format!("{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\",\"mcpServers\":[]}}}}\n", tmp.path().to_str().unwrap()).as_bytes())
+        .unwrap();
+    stdin.flush().unwrap();
+
+    // Read stdout in a thread; stop after a couple of responses or a short wait.
+    let stdout = child.stdout.take().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+            if lines.len() >= 2 {
+                break;
+            }
+        }
+        lines
+    });
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = child.kill();
+    let lines = handle.join().unwrap_or_default();
+
+    assert!(
+        !lines.is_empty(),
+        "octos acp should have emitted at least the initialize/session responses on stdout"
+    );
+    for line in &lines {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
+            panic!("non-JSON line on the ACP stdout stream (would -32700 in Zed): {line:?} ({e})")
+        });
+    }
+}
