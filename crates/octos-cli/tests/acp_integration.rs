@@ -362,6 +362,15 @@ fn should_emit_only_valid_json_on_stdout_when_running_acp() {
     use std::process::{Command, Stdio};
 
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Fully isolate the child from the developer/CI account: its data, config,
+    // and auth dirs resolve to temp subdirs so the test can neither read nor
+    // mutate real user state (codex). A fresh config home also still exercises
+    // startup logging under RUST_LOG=info, so a stdout leak would surface.
+    let home = tmp.path().join("home");
+    let config = tmp.path().join("config");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_octos"))
         .args([
             "acp",
@@ -373,6 +382,9 @@ fn should_emit_only_valid_json_on_stdout_when_running_acp() {
             tmp.path().to_str().unwrap(),
         ])
         .env("RUST_LOG", "info") // force startup logging so a leak would show
+        .env("HOME", &home)
+        .env("OCTOS_HOME", &data)
+        .env("OCTOS_CONFIG_DIR", &config)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -406,6 +418,7 @@ fn should_emit_only_valid_json_on_stdout_when_running_acp() {
     });
     std::thread::sleep(std::time::Duration::from_secs(3));
     let _ = child.kill();
+    let _ = child.wait(); // reap the child so it can't linger as a zombie
     let lines = handle.join().unwrap_or_default();
 
     assert!(
