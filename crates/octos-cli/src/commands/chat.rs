@@ -309,6 +309,11 @@ impl ChatCommand {
         );
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        if memory_refresh_enabled {
+            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+        }
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -606,12 +611,24 @@ impl ChatCommand {
         }
 
         // Inject the token-capped memory block (long-term memory + daily
-        // notes + bank summary; omissions are disclosed to the model).
+        // notes + bank summary; omissions are disclosed to the model) as a
+        // replaceable named segment between bootstrap and skill fragments.
+        // With memory refresh on, the capture policy rides the same segment
+        // and a provider re-renders it when MEMORY.md changes on disk or
+        // the date rolls over (one stat per turn otherwise).
         let max_inject =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let memory_ctx = memory_store.get_injectable_context(max_inject).await;
-        if !memory_ctx.is_empty() {
-            agent.append_system_prompt(&memory_ctx);
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, memory_refresh_enabled),
+        );
+        if memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                memory_store.clone(),
+                max_inject,
+                true,
+            )));
         }
 
         // Inject skill prompt fragments

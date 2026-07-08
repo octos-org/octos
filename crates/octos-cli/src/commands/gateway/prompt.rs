@@ -21,6 +21,7 @@ pub async fn build_system_prompt(
     skills_loader: &SkillsLoader,
     tool_config: &octos_agent::ToolConfigStore,
     max_inject_tokens: usize,
+    memory_capture_policy: bool,
 ) -> String {
     let compiled = include_str!("../../prompts/gateway_default.txt");
     let runtime = super::super::load_prompt("gateway", compiled);
@@ -64,11 +65,13 @@ pub async fn build_system_prompt(
     }
 
     // Append the token-capped memory block (long-term memory + daily notes
-    // + bank summary; omissions are disclosed to the model).
+    // + bank summary; omissions are disclosed to the model), plus the
+    // capture-policy teaching block when memory refresh is enabled.
     let memory_ctx = memory_store.get_injectable_context(max_inject_tokens).await;
-    if !memory_ctx.is_empty() {
+    let memory_segment = octos_agent::compose_memory_segment(&memory_ctx, memory_capture_policy);
+    if !memory_segment.is_empty() {
         prompt.push_str("\n\n");
-        prompt.push_str(&memory_ctx);
+        prompt.push_str(&memory_segment);
     }
 
     // Append always-on skills

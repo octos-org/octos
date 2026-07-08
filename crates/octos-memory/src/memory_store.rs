@@ -149,6 +149,11 @@ impl MemoryStore {
         Ok(Self { memory_dir })
     }
 
+    /// Path to `MEMORY.md` (for cheap change detection by callers).
+    pub fn memory_md_path(&self) -> PathBuf {
+        self.memory_dir.join("MEMORY.md")
+    }
+
     /// Read long-term memory (`MEMORY.md`). Returns empty string if missing.
     pub async fn read_long_term(&self) -> Result<String> {
         let path = self.memory_dir.join("MEMORY.md");
@@ -491,6 +496,156 @@ impl MemoryStore {
     fn today_path(&self) -> PathBuf {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         self.memory_dir.join(format!("{date}.md"))
+    }
+
+    // --- Staging notes (memory-refresh capture layer) ---
+
+    /// Path to `staging/notes/`.
+    fn staging_notes_dir(&self) -> PathBuf {
+        self.memory_dir.join("staging").join("notes")
+    }
+
+    /// Write one append-only staging note; returns its path.
+    ///
+    /// Notes are the capture layer of the memory-refresh design: untrusted
+    /// input for the consolidation pass (design PR-4), NEVER injected into
+    /// prompts. One `create_new` file per note — concurrent sessions can
+    /// never clobber each other. The note id is the uuidv7 filename stem.
+    pub async fn write_staging_note(&self, note: &StagingNote) -> Result<PathBuf> {
+        let dir = self.staging_notes_dir();
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .wrap_err("failed to create staging notes directory")?;
+
+        let slug_source: String = note.content.chars().take(48).collect();
+        let file_name = format!(
+            "{}-{}.md",
+            uuid::Uuid::now_v7().simple(),
+            octos_core::safe_filename(slug_source.trim())
+        );
+        let path = dir.join(file_name);
+        let rendered = note.render();
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .wrap_err("failed to create staging note (name collision?)")?;
+        {
+            use tokio::io::AsyncWriteExt;
+            file.write_all(rendered.as_bytes())
+                .await
+                .wrap_err("failed to write staging note")?;
+            file.flush()
+                .await
+                .wrap_err("failed to flush staging note")?;
+        }
+        Ok(path)
+    }
+
+    /// Number of pending staging notes (for status surfacing).
+    pub async fn count_staging_notes(&self) -> usize {
+        let mut count = 0;
+        if let Ok(mut entries) = tokio::fs::read_dir(self.staging_notes_dir()).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().is_some_and(|e| e == "md") {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+/// Who authored a staging note. `Host` notes come from paths with no model
+/// in the loop (slash command / CLI) and are the only notes that can later
+/// authorize destructive memory operations; the `memory_note` tool always
+/// stamps `Model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteOrigin {
+    Model,
+    Host,
+}
+
+impl NoteOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            NoteOrigin::Model => "model",
+            NoteOrigin::Host => "host",
+        }
+    }
+}
+
+/// What a staging note captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteKind {
+    /// The user explicitly asked to remember/forget/update something
+    /// (recorded by the model; still untrusted).
+    UserRequest,
+    /// Fresh evidence contradicts an existing memory entry.
+    Correction,
+    /// Durable knowledge the model judged worth keeping.
+    Fact,
+    /// A host-authored forget request (never writable by the model).
+    Forget,
+}
+
+impl NoteKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            NoteKind::UserRequest => "user_request",
+            NoteKind::Correction => "correction",
+            NoteKind::Fact => "fact",
+            NoteKind::Forget => "forget",
+        }
+    }
+}
+
+/// A capture-layer staging note awaiting consolidation.
+#[derive(Debug, Clone)]
+pub struct StagingNote {
+    pub origin: NoteOrigin,
+    pub kind: NoteKind,
+    pub content: String,
+    /// Session the note was captured in, when known.
+    pub session_key: Option<String>,
+    /// Marks a host forget note as sensitive (hard-delete path in PR-4).
+    pub sensitive: bool,
+    /// Stable id (`^m…`) of the MEMORY.md entry this note contradicts.
+    pub replaces_id: Option<String>,
+}
+
+impl StagingNote {
+    /// Render as frontmatter + body. String values are JSON-encoded so
+    /// multi-line / CJK / quote-bearing content can't corrupt the header.
+    fn render(&self) -> String {
+        let mut fm = String::from("---\n");
+        fm.push_str(&format!("origin: {}\n", self.origin.as_str()));
+        fm.push_str(&format!("kind: {}\n", self.kind.as_str()));
+        fm.push_str(&format!(
+            "created_at: {}\n",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        if let Some(key) = &self.session_key {
+            fm.push_str(&format!(
+                "session_key: {}\n",
+                serde_json::to_string(key).unwrap_or_default()
+            ));
+        }
+        if self.sensitive {
+            fm.push_str("sensitive: true\n");
+        }
+        if let Some(id) = &self.replaces_id {
+            fm.push_str(&format!(
+                "replaces_id: {}\n",
+                serde_json::to_string(id).unwrap_or_default()
+            ));
+        }
+        fm.push_str("---\n\n");
+        fm.push_str(&self.content);
+        fm.push('\n');
+        fm
     }
 }
 
@@ -1045,6 +1200,83 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).await.unwrap();
         assert_eq!(store.get_injectable_context(2500).await, "");
+    }
+
+    // --- staging notes ---
+
+    fn fact_note(content: &str) -> StagingNote {
+        StagingNote {
+            origin: NoteOrigin::Model,
+            kind: NoteKind::Fact,
+            content: content.to_string(),
+            session_key: Some("tg:123".to_string()),
+            sensitive: false,
+            replaces_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_write_frontmatter_and_body_when_staging_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let mut note = fact_note("user prefers dark mode");
+        note.replaces_id = Some("^m4k2ab".to_string());
+        let path = store.write_staging_note(&note).await.unwrap();
+
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(text.starts_with("---\n"));
+        assert!(text.contains("origin: model"));
+        assert!(text.contains("kind: fact"));
+        assert!(text.contains("session_key: \"tg:123\""));
+        assert!(text.contains("replaces_id: \"^m4k2ab\""));
+        assert!(text.ends_with("user prefers dark mode\n"));
+        assert!(!text.contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn should_create_distinct_files_when_notes_have_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let note = fact_note("duplicate content");
+        let a = store.write_staging_note(&note).await.unwrap();
+        let b = store.write_staging_note(&note).await.unwrap();
+        assert_ne!(a, b);
+        assert_eq!(store.count_staging_notes().await, 2);
+    }
+
+    #[tokio::test]
+    async fn should_handle_cjk_content_when_naming_staging_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let note = fact_note("用户偏好深色模式，且住在温哥华");
+        let path = store.write_staging_note(&note).await.unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.len() <= 255, "filename too long: {name}");
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(text.contains("用户偏好深色模式"));
+    }
+
+    #[tokio::test]
+    async fn should_mark_sensitive_when_host_forget_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let note = StagingNote {
+            origin: NoteOrigin::Host,
+            kind: NoteKind::Forget,
+            content: "forget my wifi password".to_string(),
+            session_key: None,
+            sensitive: true,
+            replaces_id: None,
+        };
+        let path = store.write_staging_note(&note).await.unwrap();
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(text.contains("origin: host"));
+        assert!(text.contains("kind: forget"));
+        assert!(text.contains("sensitive: true"));
     }
 
     #[tokio::test]

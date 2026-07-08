@@ -449,6 +449,9 @@ impl ProfileRuntime {
             if mem.max_inject_tokens.is_none() {
                 mem.max_inject_tokens = host.max_inject_tokens;
             }
+            if mem.refresh.is_none() {
+                mem.refresh = host.refresh.clone();
+            }
         }
 
         // Step 2: resolve the provider name. `config_from_profile`
@@ -712,6 +715,9 @@ impl ProfileRuntime {
         // session inherits the same memory_store.
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+        }
 
         // REG-7 follow-up: register `run_pipeline` at profile scope so
         // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
@@ -934,6 +940,8 @@ impl ProfileRuntime {
         let skills_loader = build_account_skills_loader(data_dir);
         let max_inject_tokens =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
@@ -942,6 +950,7 @@ impl ProfileRuntime {
             &skills_loader,
             &tool_config,
             max_inject_tokens,
+            memory_refresh_enabled,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {

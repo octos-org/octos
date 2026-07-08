@@ -2,6 +2,13 @@
   "provider": "anthropic",
   "model": "claude-sonnet-4-20250514",
 
+  "memory": {
+    "max_inject_tokens": 2500,
+    "refresh": {
+      "enabled": false
+    }
+  },
+
   "sub_providers": [
     {
       "key": "cheap",
