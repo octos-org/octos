@@ -11,6 +11,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use super::AppState;
+use super::acp_websocket::acp_websocket_handler;
+use super::acp;
 use super::admin;
 use super::admin_audit;
 use super::admin_setup;
@@ -106,7 +108,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/solo", post(solo_auth::solo_login))
         .route("/api/auth/solo/create", post(solo_auth::solo_create))
         .route("/api/auth/logout", post(auth_handlers::logout));
-
     // Chat + status API (existing)
     //
     // Transport history:
@@ -740,6 +741,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/session_ingress/ws/{session_id}",
             get(session_ingress::ws_handler),
         )
+        .route("/acp", get(acp::acp_websocket_handler))
         .merge(webhook_routes)
         .merge(version_routes)
         .merge(internal_routes);
