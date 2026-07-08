@@ -227,7 +227,22 @@ Octos 通过将工具分为**活跃**和**延迟**两组来管理庞大的工具
 
 ### 事件
 
-四个生命周期事件，每个都有特定的载荷：
+十个生命周期事件。只有三个 **`before_*`** 事件可以拒绝（exit 1）；其余事件均为只读观察（非零退出会被记录，但不会阻断操作）。
+
+| 事件 | 触发时机 | 可拒绝 |
+|-------|---------------|----------|
+| `before_tool_call` | 每次工具执行之前 | ✅ |
+| `after_tool_call` | 每次工具执行之后 | — |
+| `before_llm_call` | 每次 LLM API 调用之前 | ✅ |
+| `after_llm_call` | 每次成功的 LLM 响应之后 | — |
+| `before_spawn_verify` | 派生子 agent 的验证步骤之前 | ✅ |
+| `on_spawn_verify` | 派生子 agent 的验证步骤时 | — |
+| `on_spawn_complete` | 派生（后台）任务完成时 | — |
+| `on_spawn_failure` | 派生任务失败时 | — |
+| `on_turn_end` | 一轮 agent 结束时 | — |
+| `on_resume` | 会话/轮次恢复时（如客户端重连后） | — |
+
+四个核心事件携带最丰富的载荷（如下所示）；spawn/turn/resume 事件携带相关的任务/会话标识符，外加 `event`、`session_id` 和 `profile_id`。
 
 #### `before_tool_call`
 
@@ -505,10 +520,24 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 | 命令 | 说明 |
 |---------|-------------|
-| `/new` | 分支对话（创建复制最近 10 条消息的新会话） |
+| `/new [name]` | 新建会话（裸 `/new` 会清空当前会话）；`/new slides <name>` / `/new site <preset>` 脚手架生成项目 |
+| `/clear` | 清空当前会话历史 |
+| `/s`、`/switch <name>` | 切换到具名会话 |
+| `/sessions` | 列出本聊天的会话 |
+| `/back`、`/b` | 切换到上一个活跃会话 |
+| `/delete`、`/d` | 删除当前会话 |
 | `/config` | 查看和修改工具配置 |
 | `/queue` | 查看或更改队列模式 |
+| `/thinking` | 查看或设置推理强度（取决于传输通道） |
+| `/router`、`/adaptive` | 查看或更改路由/自适应模式 |
+| `/soul` | 查看或编辑 profile 的 SOUL（人格） |
+| `/skills` | 内联列出/安装/移除技能 |
+| `/status` | 显示会话/运行时状态 |
+| `/upload` | 向对话附加文件 |
+| `/help` | 列出当前传输通道可用的命令 |
 | `/exit`、`/quit`、`:q` | 退出聊天（仅 CLI 模式） |
+
+具体命令集因传输通道（CLI、网关渠道、Web、TUI）而异。Matrix 管理房间额外提供定时（`/schedule`、`/schedules`、`/unschedule`）与多机器人（`/createbot`、`/deletebot`、`/listbots`、`/allbots`、`/bothelp`）命令——见[网关与频道](./channels.md)。
 
 ### 聊天中切换提供商
 

@@ -227,7 +227,22 @@ Hooks are shell commands that run at agent lifecycle events. Each hook receives 
 
 ### Events
 
-Four lifecycle events, each with a specific payload:
+Ten lifecycle events. Only the three **`before_*`** events can deny (exit 1); every other event is observe-only (a non-zero exit is logged but does not block).
+
+| Event | When it fires | Can deny |
+|-------|---------------|----------|
+| `before_tool_call` | Before each tool execution | ✅ |
+| `after_tool_call` | After each tool execution | — |
+| `before_llm_call` | Before each LLM API call | ✅ |
+| `after_llm_call` | After each successful LLM response | — |
+| `before_spawn_verify` | Before a spawned sub-agent's verify step | ✅ |
+| `on_spawn_verify` | At a spawned sub-agent's verify step | — |
+| `on_spawn_complete` | When a spawned (background) task completes | — |
+| `on_spawn_failure` | When a spawned task fails | — |
+| `on_turn_end` | When an agent turn finishes | — |
+| `on_resume` | When a session/turn resumes (e.g. after a client reconnect) | — |
+
+The four core events carry the richest payloads (shown below); the spawn/turn/resume events carry the relevant task/session identifiers plus `event`, `session_id`, and `profile_id`.
 
 #### `before_tool_call`
 
@@ -505,10 +520,24 @@ When the conversation exceeds the LLM's context window, older messages are autom
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Fork the conversation (creates a new session copying the last 10 messages) |
+| `/new [name]` | New session (bare `/new` clears the current session); `/new slides <name>` / `/new site <preset>` scaffold a project |
+| `/clear` | Wipe the current session's history |
+| `/s`, `/switch <name>` | Switch to a named session |
+| `/sessions` | List sessions for this chat |
+| `/back`, `/b` | Switch to the previously active session |
+| `/delete`, `/d` | Delete the current session |
 | `/config` | View and modify tool configuration |
 | `/queue` | View or change queue mode |
+| `/thinking` | View or set the reasoning-effort level (transport-dependent) |
+| `/router`, `/adaptive` | View or change the routing/adaptive mode |
+| `/soul` | View or edit the profile's SOUL (personality) |
+| `/skills` | List / install / remove skills inline |
+| `/status` | Show session/runtime status |
+| `/upload` | Attach a file to the conversation |
+| `/help` | List the commands available on the current transport |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
+
+The exact set varies by transport (CLI, gateway channel, web, TUI). Matrix management rooms add scheduling (`/schedule`, `/schedules`, `/unschedule`) and multi-bot (`/createbot`, `/deletebot`, `/listbots`, `/allbots`, `/bothelp`) commands — see [Gateway & Channels](./channels.md).
 
 ### In-Chat Provider Switching
 
