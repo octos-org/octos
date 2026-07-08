@@ -1100,6 +1100,29 @@ impl GatewayRuntime {
                 tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
             }
 
+            // Background memory-refresh sweep: the flock arbitrates when a
+            // serve daemon also owns this profile dir; the binding lives
+            // for the gateway's lifetime so drop stops the sweep.
+            let _memory_refresh =
+                if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+                    crate::memory_refresh::MemoryRefreshService::try_start(
+                        data_dir.clone(),
+                        memory_store.clone(),
+                        crate::memory_refresh::resolve_refresh_provider(
+                            &config,
+                            llm.clone(),
+                            config
+                                .memory
+                                .as_ref()
+                                .and_then(|m| m.refresh.as_ref())
+                                .and_then(|r| r.extract_model.as_deref()),
+                        ),
+                        crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+                    )
+                } else {
+                    None
+                };
+
             // Runtime model switching tool
             tools.register(crate::tools::SwitchModelTool::new(
                 swappable.clone(),

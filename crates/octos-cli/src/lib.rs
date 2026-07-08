@@ -26,6 +26,7 @@ pub mod cron_tool;
 pub mod gateway_dispatcher;
 #[cfg(feature = "api")]
 pub mod login_allowlist;
+pub mod memory_refresh;
 #[cfg(feature = "api")]
 pub mod monitor;
 #[cfg(feature = "api")]
