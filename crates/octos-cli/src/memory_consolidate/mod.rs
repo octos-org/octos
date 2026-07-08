@@ -424,6 +424,19 @@ pub async fn run_consolidation(
                 &mut outcome,
                 sensitive_only,
             )?;
+            // Confirmations of parked pending forgets are deterministic
+            // (hash-bound host authority) — the merge budget must not
+            // defer them.
+            if !params.allow_merge {
+                entries = confirm_pending_forgets_rust_side(
+                    memory_dir,
+                    params,
+                    &mut batch,
+                    &mut waiting,
+                    &entries,
+                    &mut outcome,
+                )?;
+            }
         }
     }
 
@@ -1215,6 +1228,172 @@ fn execute_id_bound_forgets(
                 "executed Rust-side (id-bound host authority)".to_string(),
             ));
         }
+    }
+    Ok(working)
+}
+
+/// Rust-side confirmation of pending forgets (no provider): an id-bound
+/// host forget naming a FROZEN id is the user's hash-bound confirmation of
+/// a parked pending note. Deterministic, so an exhausted merge budget must
+/// not defer it. Mirrors section 7's semantics: verify EVERY candidate of
+/// an affected pending note, hard-delete the confirmed ids, restore the
+/// unconfirmed interim ones byte-identically, delete the pending + confirm
+/// notes. Any hash mismatch → no destructive action (left for a merged
+/// run, which also recomputes bindings).
+#[allow(clippy::too_many_lines)]
+fn confirm_pending_forgets_rust_side(
+    memory_dir: &Path,
+    params: &ConsolidateParams,
+    batch: &mut StagingBatch,
+    waiting: &mut Vec<NoteFile>,
+    entries: &[Entry],
+    outcome: &mut ConsolidateOutcome,
+) -> Result<Vec<Entry>> {
+    let mut working = entries.to_vec();
+    let mut plan = ApplyPlan::default();
+    let mut consumed_confirms: Vec<(PathBuf, String)> = Vec::new();
+    let mut confirmed_pending_ids: HashSet<String> = HashSet::new();
+
+    for note in &batch.notes {
+        if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
+            continue;
+        }
+        let named = note.named_entry_ids();
+        if named.is_empty() {
+            continue;
+        }
+        // Affected pending notes = waiting notes holding any named id.
+        let affected: Vec<&NoteFile> = waiting
+            .iter()
+            .filter(|w| {
+                w.candidates
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| named.iter().any(|n| n == &c.entry_id))
+            })
+            .collect();
+        if affected.is_empty() {
+            continue;
+        }
+        // Verify every candidate of every affected pending note.
+        let mut interim_texts: HashMap<String, String> = HashMap::new();
+        let mut restores: HashMap<String, String> = HashMap::new();
+        let mut verified = true;
+        for w in &affected {
+            for cand in w.candidates.as_deref().unwrap_or_default() {
+                let confirmed = named.iter().any(|n| n == &cand.entry_id);
+                if cand.interim_archived {
+                    match find_archive_block_by_hash(memory_dir, &cand.content_hash)? {
+                        Some((_, block)) => {
+                            if confirmed {
+                                interim_texts.insert(cand.entry_id.clone(), block);
+                            } else {
+                                restores.insert(cand.entry_id.clone(), block);
+                            }
+                        }
+                        None => {
+                            verified = false;
+                        }
+                    }
+                } else if confirmed {
+                    let live = working.iter().find(|e| e.id == cand.entry_id);
+                    if live.is_none_or(|e| e.content_hash() != cand.content_hash) {
+                        verified = false;
+                    }
+                }
+                if !verified {
+                    break;
+                }
+            }
+            if !verified {
+                break;
+            }
+        }
+        if !verified {
+            // Left for a merged run (which also recomputes bindings).
+            continue;
+        }
+        // A restore target that is itself confirmed stays deleted.
+        restores.retain(|id, _| !named.iter().any(|n| n == id));
+
+        let affected_paths: Vec<PathBuf> = affected.iter().map(|w| w.path.clone()).collect();
+        let affected_ids: Vec<String> = affected.iter().map(|w| w.id.clone()).collect();
+        for id in &named {
+            let text = match working.iter().position(|e| &e.id == id) {
+                Some(pos) => working.remove(pos).text,
+                None => match interim_texts.get(id) {
+                    Some(text) => text.clone(),
+                    // Named id unknown here (e.g. already gone) — the
+                    // executor/satisfied passes own that case.
+                    None => continue,
+                },
+            };
+            let scrub_entry = Entry {
+                id: id.clone(),
+                text,
+            };
+            plan.hard_deletes.push(ScrubTarget {
+                entry_id: id.clone(),
+                folded_lines: scrub_entry.folded_lines(),
+                authorizing_note: note.path.clone(),
+                originating_pending: affected_paths.clone(),
+            });
+            outcome.hard_deleted.push(id.clone());
+        }
+        for (entry_id, block) in &restores {
+            if working.iter().any(|e| e.id == *entry_id) {
+                plan.archive_block_removals.push(block.clone());
+                continue;
+            }
+            working.push(Entry {
+                id: entry_id.clone(),
+                text: block.clone(),
+            });
+            plan.archive_block_removals.push(block.clone());
+        }
+        for w in &affected {
+            plan.pending_deletes.push(w.path.clone());
+            outcome
+                .pending_notes
+                .push(pending_status(w, PendingState::Confirmed));
+        }
+        confirmed_pending_ids.extend(affected_ids);
+        consumed_confirms.push((note.path.clone(), note.id.clone()));
+    }
+
+    if plan.hard_deletes.is_empty() {
+        return Ok(working);
+    }
+    plan.final_entries = working.clone();
+    let report = apply::apply_plan(memory_dir, params.today, &plan)?;
+
+    // Post-apply bookkeeping mirrors execute_id_bound_forgets: prune
+    // scrub-deleted staging, consume the confirm notes by identity, drop
+    // the confirmed pending notes from `waiting`, and re-read the
+    // published entries (the apply scrubs shared lines out of survivors).
+    if !report.scrub_deleted_staging.is_empty() {
+        let scrubbed: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
+        batch.notes.retain(|n| !scrubbed.contains(&n.path));
+        batch.extractions.retain(|e| !scrubbed.contains(&e.path));
+        batch
+            .parse_failures
+            .retain(|(p, _, _)| !scrubbed.contains(p));
+    }
+    for (path, note_id) in consumed_confirms {
+        batch.notes.retain(|n| n.path != path);
+        outcome.dropped.push((
+            note_id,
+            "confirmed pending forget Rust-side (id-bound host authority)".to_string(),
+        ));
+    }
+    waiting.retain(|w| !confirmed_pending_ids.contains(&w.id));
+    let published = std::fs::read_to_string(memory_dir.join("MEMORY.md"))
+        .wrap_err("failed to re-read MEMORY.md after Rust-side confirmation")?;
+    if let entry::ParsedMemory::Entries(parsed) =
+        entry::parse_memory_md(&published).map_err(|e| eyre::eyre!(e))?
+    {
+        working = parsed;
     }
     Ok(working)
 }
@@ -3230,7 +3409,10 @@ mod tests {
             memory_dir,
             &["Live target. (updated: 2026-06-01) ^mlivsec", frozen_entry],
         );
-        // ^mfrozen is a candidate of a waiting pending note → frozen.
+        // ^mfrozen is a candidate of a waiting pending note → frozen. Its
+        // binding hash is STALE (the entry changed since parking), so the
+        // Rust-side confirmation path refuses destructive action and the
+        // id is genuinely deferred to a merged run.
         write_pending_note(
             memory_dir,
             "01fg-parked",
@@ -3238,7 +3420,7 @@ mod tests {
             false,
             &format!(
                 r#"[{{"entry_id":"^mfrozen","content_hash":"{}","interim_archived":false}}]"#,
-                sha256_hex(frozen_entry)
+                sha256_hex("An older version of the frozen entry. ^mfrozen")
             ),
             "2026-07-20T10:00:00+00:00",
         );
@@ -3916,6 +4098,83 @@ mod tests {
         assert!(
             memory.contains("Likes tea."),
             "keeper's fact landed: {memory}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_confirm_pending_forget_when_budget_exhausted() {
+        // A parked sensitive pending (two interim candidates) + the user's
+        // id-bound confirmation for ONE of them, arriving while the merge
+        // budget is exhausted: the confirmation is deterministic and must
+        // execute now — confirmed id scrubbed, the other candidate
+        // restored, both note files consumed, zero provider calls.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let confirmed = "Confirmed target. (updated: 2026-06-01) ^mtarget";
+        let survivor = "Restored survivor. (updated: 2026-06-02) ^msurviv";
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-03) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(
+            memory_dir.join("archive/2026-06.md"),
+            format!("{confirmed}\n\n{survivor}\n"),
+        )
+        .unwrap();
+        let parked = write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget those things",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^mtarget","content_hash":"{}","interim_archived":true}},{{"entry_id":"^msurviv","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex(confirmed),
+                sha256_hex(survivor)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        let confirm = write_note(
+            memory_dir,
+            "02fg-confirm",
+            "host",
+            "forget",
+            "yes: id:^mtarget",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let mut p = params(memory_dir);
+        p.allow_merge = false;
+        let outcome = run_consolidation(provider.clone(), &p).await.unwrap();
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(outcome.hard_deleted.contains(&"^mtarget".to_string()));
+        assert!(!parked.exists(), "confirmed pending note consumed");
+        assert!(!confirm.exists(), "confirm note consumed");
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("^msurviv"),
+            "unconfirmed candidate restored: {memory}"
+        );
+        assert!(!memory.contains("^mtarget"));
+        let archived =
+            std::fs::read_to_string(memory_dir.join("archive/2026-06.md")).unwrap_or_default();
+        assert!(
+            !archived.contains("^mtarget"),
+            "confirmed target scrubbed from archive"
+        );
+        assert!(
+            !archived.contains("^msurviv"),
+            "restored block removed from archive"
+        );
+        assert!(
+            outcome
+                .pending_notes
+                .iter()
+                .any(|pn| pn.note_id == "01fg-parked" && pn.state == PendingState::Confirmed),
+            "{:?}",
+            outcome.pending_notes
         );
     }
 }
