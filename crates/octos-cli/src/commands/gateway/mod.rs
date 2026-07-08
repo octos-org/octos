@@ -298,6 +298,7 @@ mod tests {
                 base_data_dir.join("subagent-out"),
             )),
             host_plugins: Default::default(),
+            host_memory: None,
         };
 
         let factory = builder.build("botfather--researcher").await.unwrap();

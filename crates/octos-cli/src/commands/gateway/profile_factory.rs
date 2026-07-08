@@ -540,6 +540,12 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// can mandate strict signing even when individual profile JSONs omit
     /// the flag. Mirrors `ProfileRuntime::bootstrap_with_host_plugins`.
     pub(super) host_plugins: crate::config::PluginsConfig,
+    /// Host-level memory settings from the gateway's resolved config (which
+    /// already applied the config-beats-env precedence in
+    /// `Config::from_file`). Routed child profiles that omit `memory` fall
+    /// back to this, NOT to a re-read of the ambient env var, so they follow
+    /// the exact precedence of the main actor.
+    pub(super) host_memory: Option<crate::config::MemoryConfig>,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -569,6 +575,14 @@ impl ProfileActorFactoryBuilder {
         if self.host_plugins.require_signed {
             profile_config.plugins.require_signed = true;
         }
+        // Host memory settings apply field-by-field when the child profile
+        // doesn't override them (same pattern as bootstrap_with_host_plugins).
+        if let Some(host) = self.host_memory.as_ref() {
+            let mem = profile_config.memory.get_or_insert_with(Default::default);
+            if mem.max_inject_tokens.is_none() {
+                mem.max_inject_tokens = host.max_inject_tokens;
+            }
+        }
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -580,13 +594,9 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
-        // Routed child-bot actors are built in-process from the profile
-        // JSON, so the host budget arrives via the ProcessManager-set env
-        // var rather than Config::from_file's merge.
-        let max_inject_tokens =
-            crate::config::MemoryConfig::effective_max_inject_tokens_with_host_env(
-                effective_profile.config.memory.as_ref(),
-            );
+        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
+            profile_config.memory.as_ref(),
+        );
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
@@ -1240,6 +1250,7 @@ mod tests {
                 effective_octos_home.join("subagent-out"),
             )),
             host_plugins: Default::default(),
+            host_memory: None,
         };
 
         // The child-profile pipeline root MUST be effective_octos_home — the

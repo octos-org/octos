@@ -1406,6 +1406,10 @@ impl GatewayRuntime {
                     // plugin policy so child profiles inherit the
                     // strict-signing gate even when their JSON omits it.
                     host_plugins: config.plugins.clone(),
+                    // The gateway's own config already encodes the correct
+                    // host precedence (explicit config beats the
+                    // ProcessManager env var via merge_env_memory_policy).
+                    host_memory: config.memory.clone(),
                 });
 
         // Start config watcher for hot-reload
