@@ -361,7 +361,14 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
         }
     };
 
-    let model = prompt_model("auto", &fetched_models)?;
+    let model = if fetched_models.is_empty() {
+        // The /models probe found nothing — require an explicit name
+        // instead of the old invalid "auto" default (#1541 item 3).
+        let mut stdin = io::stdin().lock();
+        read_required_model(&mut stdin, "the custom provider")?
+    } else {
+        prompt_model(&fetched_models[0].clone(), &fetched_models)?
+    };
 
     Ok(SelectedProvider {
         provider: CUSTOM_PROVIDER_NAME.to_string(),
@@ -620,50 +627,105 @@ fn write_init_files(
     Ok(())
 }
 
-/// Load models from model_catalog.json, grouped by provider.
-fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
-    let mut result = BTreeMap::new();
+/// The repo's model catalog, baked in at compile time so INSTALLED
+/// binaries (brew/npm/installer bundles ship no model_catalog.json on
+/// disk) still offer real model names in `octos init` — pre-fix, every
+/// provider fell into manual entry whose "auto" default is rejected by
+/// real APIs (#1541 item 3).
+const EMBEDDED_MODEL_CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../model_catalog.json"
+));
 
-    // Try common locations for model_catalog.json
+/// Parse a model_catalog.json payload into provider → model-name lists.
+fn parse_catalog_content(content: &str) -> BTreeMap<String, Vec<String>> {
+    let mut result: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
+            for model in models {
+                if let Some(provider_model) = model.get("provider").and_then(|p| p.as_str()) {
+                    let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        result
+                            .entry(parts[0].to_string())
+                            .or_insert_with(Vec::new)
+                            .push(parts[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// The embedded catalog, parsed (compile-time fallback for installs).
+fn embedded_catalog_models() -> BTreeMap<String, Vec<String>> {
+    parse_catalog_content(EMBEDDED_MODEL_CATALOG)
+}
+
+/// Read a model name, re-prompting until non-empty — there is NO silent
+/// default: "auto" is not a real model on any current provider API and
+/// writing it produced a config that 400s on the first turn.
+fn read_required_model(
+    reader: &mut dyn std::io::BufRead,
+    provider_display: &str,
+) -> Result<String> {
+    for _ in 0..16 {
+        print!("Model (e.g. the provider's current model name): ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    eyre::bail!(
+        "a model name is required for {provider_display} — check the provider's docs for current model names"
+    )
+}
+
+/// Resolve the non-interactive (`--defaults`) model for a provider:
+/// hardcoded knowns, then the catalog's first entry. Anything else is an
+/// error — `--defaults` must never silently write "auto".
+fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) -> Result<String> {
+    match provider {
+        "openai" => return Ok("gpt-4.1-mini".to_string()),
+        "anthropic" => return Ok("claude-sonnet-4-20250514".to_string()),
+        _ => {}
+    }
+    if let Some(first) = catalog.get(provider).and_then(|m| m.first()) {
+        return Ok(first.clone());
+    }
+    eyre::bail!(
+        "no known default model for provider '{provider}' — run `octos init` interactively and enter a model name"
+    )
+}
+
+/// Load models from model_catalog.json, grouped by provider — from the
+/// usual disk locations first (repo/dev flows), else the embedded
+/// compile-time copy (installed binaries ship no catalog file).
+fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
     let candidates = [
-        // Next to the binary
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("model_catalog.json"))),
-        // Workspace root (for development)
-        std::env::current_exe().ok().and_then(|p| {
-            p.parent()?
-                .parent()?
-                .parent()
-                .map(|d| d.join("model_catalog.json"))
-        }),
-        // Current directory
+        dirs::home_dir().map(|d| d.join(".octos").join("model_catalog.json")),
         Some(PathBuf::from("model_catalog.json")),
     ];
 
     for candidate in candidates.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&candidate) {
-            if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
-                    for model in models {
-                        if let Some(provider_model) = model.get("provider").and_then(|p| p.as_str())
-                        {
-                            let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
-                            if parts.len() == 2 {
-                                result
-                                    .entry(parts[0].to_string())
-                                    .or_insert_with(Vec::new)
-                                    .push(parts[1].to_string());
-                            }
-                        }
-                    }
-                    break;
-                }
+            let parsed = parse_catalog_content(&content);
+            if !parsed.is_empty() {
+                return parsed;
             }
         }
     }
 
-    result
+    embedded_catalog_models()
 }
 
 /// Auto-detect provider from available environment variables.
@@ -786,14 +848,7 @@ impl Executable for InitCommand {
             // Auto-detect from env vars, or prompt if none found
             let idx = detect_from_env().unwrap_or(0); // fallback to first (openai)
             let info = &PROVIDERS[idx];
-            let default_model = catalog
-                .get(info.name)
-                .and_then(|m| m.first().cloned())
-                .unwrap_or_else(|| match info.name {
-                    "openai" => "gpt-4.1-mini".to_string(),
-                    "anthropic" => "claude-sonnet-4-20250514".to_string(),
-                    _ => "auto".to_string(),
-                });
+            let default_model = default_model_for(info.name, &catalog)?;
             (
                 idx,
                 default_model,
@@ -897,11 +952,23 @@ impl Executable for InitCommand {
                 selection
             };
 
-            // Model selection — show from catalog if available
+            // Model selection — show from catalog if available (disk or the
+            // embedded compile-time copy). Without catalog entries there is
+            // NO default: "auto" is not a real model on any provider API
+            // (#1541 item 3), so manual entry requires an explicit name.
             let catalog_models = catalog.get(info.name);
-            let default_model = catalog_models
-                .and_then(|m| m.first().cloned())
-                .unwrap_or_else(|| "auto".to_string());
+            let default_model = match catalog_models.and_then(|m| m.first().cloned()) {
+                Some(default) => default,
+                None => {
+                    println!();
+                    println!(
+                        "No catalog models found for {}. Enter model name manually:",
+                        info.display
+                    );
+                    let mut stdin = io::stdin().lock();
+                    read_required_model(&mut stdin, info.display)?
+                }
+            };
 
             println!();
             if let Some(models) = catalog_models {
@@ -910,11 +977,6 @@ impl Executable for InitCommand {
                     let rec = if i == 0 { " (recommended)" } else { "" };
                     println!("  - {}{}", m, rec);
                 }
-            } else {
-                println!(
-                    "No catalog models found for {}. Enter model name manually:",
-                    info.display
-                );
             }
             println!();
             print!("Model [{}]: ", default_model);
@@ -1045,6 +1107,51 @@ mod tests {
             !tmp.path().join("auth.json").exists(),
             "an empty paste must not create/touch auth.json"
         );
+    }
+
+    // #1541 item 3: installed binaries ship no model_catalog.json on disk,
+    // so every provider fell into manual entry whose default — "auto" — is
+    // rejected by real APIs (DeepSeek 400s on it). The catalog is now
+    // embedded as a compile-time fallback, manual entry requires an explicit
+    // model name, and --defaults errors instead of silently writing "auto".
+
+    #[test]
+    fn should_resolve_models_from_embedded_catalog_when_no_disk_file() {
+        let models = embedded_catalog_models();
+        let deepseek = models
+            .get("deepseek")
+            .expect("deepseek in embedded catalog");
+        assert!(
+            deepseek.iter().any(|m| m.starts_with("deepseek-")),
+            "embedded catalog offers a real deepseek model, got {deepseek:?}"
+        );
+        assert!(models.contains_key("openai"), "openai present too");
+    }
+
+    #[test]
+    fn should_require_nonempty_model_when_no_catalog_default() {
+        // skips blank lines until a real name is typed…
+        let mut input = std::io::Cursor::new(b"\n\n  deepseek-v4-flash \n".to_vec());
+        let model = read_required_model(&mut input, "DeepSeek").unwrap();
+        assert_eq!(model, "deepseek-v4-flash");
+        // …and EOF without a name is an error, never a silent "auto".
+        let mut empty = std::io::Cursor::new(b"\n\n".to_vec());
+        let err = read_required_model(&mut empty, "DeepSeek").unwrap_err();
+        assert!(
+            err.to_string().contains("model"),
+            "err names the model: {err}"
+        );
+    }
+
+    #[test]
+    fn should_error_defaults_when_provider_has_no_known_model() {
+        // --defaults must never write "auto": known hardcoded + catalog
+        // providers resolve; anything else errors with guidance.
+        let catalog = embedded_catalog_models();
+        assert!(default_model_for("anthropic", &catalog).is_ok());
+        assert!(default_model_for("deepseek", &catalog).is_ok());
+        let err = default_model_for("no-such-provider", &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("model"), "guidance in {err}");
     }
 
     #[test]
