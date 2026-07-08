@@ -44,22 +44,22 @@ const VIDEO_CALL_NOTE: &str =
 ///   prepends [`VIDEO_CALL_NOTE`] so a real-time camera frame isn't mistaken
 ///   for an uploaded file — applied whether or not the spoken turn was
 ///   transcribed into non-empty text.
-/// - With empty `user_content` and media present (but not a video call), the
-///   legacy `[User sent an image]` placeholder is kept.
+/// - With empty `user_content` and image media present (but not a video call),
+///   the legacy `[User sent an image]` placeholder is kept.
 /// - Any per-turn `prompt_summary` is appended, mirroring the previous
 ///   behaviour.
 ///
 /// Pure (no task-locals) so it is unit-testable in isolation.
 fn compose_turn_user_content(
     user_content: &str,
-    has_media: bool,
+    has_image: bool,
     is_video_call: bool,
     prompt_summary: Option<&str>,
 ) -> String {
     let base_content = if user_content.is_empty() {
         if is_video_call {
             VIDEO_CALL_NOTE.to_string()
-        } else if has_media {
+        } else if has_image {
             "[User sent an image]".to_string()
         } else {
             String::new()
@@ -791,7 +791,7 @@ impl Agent {
                     .flatten();
                 let content = compose_turn_user_content(
                     user_content,
-                    !media.is_empty(),
+                    has_image,
                     live_video && has_image,
                     summary.as_deref(),
                 );
@@ -3141,6 +3141,12 @@ mod tests {
         // No image and not flagged → plain transcript passes through.
         let out = compose_turn_user_content("hello there", false, false, None);
         assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn should_not_call_empty_non_image_media_an_image() {
+        let out = compose_turn_user_content("", false, false, None);
+        assert_eq!(out, "");
     }
 
     #[test]

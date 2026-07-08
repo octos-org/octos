@@ -2131,7 +2131,7 @@ struct AppUiLoopPromptScratch {
 /// transcript is untouched — so older turns are trimmed (recent-first kept,
 /// any compaction summary preserved) to keep the spoken-turn prefill small.
 /// Override via `OCTOS_VOICE_MAX_PROMPT_TOKENS`.
-const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 3000;
+const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 8000;
 
 struct AppUiPromptContextBridge {
     session_id: SessionKey,
@@ -2403,6 +2403,18 @@ fn record_appui_context_manager_message(
             error = %error,
             "failed to persist appui context manager snapshot"
         );
+    }
+}
+
+fn replace_voice_user_message_content(messages: &mut [Message], transcript: Option<&str>) {
+    let Some(transcript) = transcript.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Some(message) = messages
+        .iter_mut()
+        .find(|message| message.role == MessageRole::User)
+    {
+        message.content = transcript.to_owned();
     }
 }
 
@@ -18804,8 +18816,56 @@ async fn run_standalone_turn(
         had_audio_input,
         "voice_turn: STT result"
     );
+    if !asr_media.is_empty() && !had_audio_input {
+        let mut no_speech_metadata = UiProgressMetadata::new("voice_no_speech");
+        no_speech_metadata.message = Some("no speech detected".to_owned());
+        no_speech_metadata.extra.insert(
+            "client_message_id".to_owned(),
+            Value::String(turn_id.0.to_string()),
+        );
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::ProgressUpdated(UiProgressEvent::new(
+                session_id.clone(),
+                Some(turn_id.clone()),
+                no_speech_metadata,
+            )),
+        );
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+            None,
+        )
+        .await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
     if had_audio_input {
         let joined = voice_transcripts.join("\n");
+        let mut transcript_metadata = UiProgressMetadata::new("voice_transcript");
+        transcript_metadata.message = Some(joined.clone());
+        transcript_metadata
+            .extra
+            .insert("transcript".to_owned(), Value::String(joined.clone()));
+        transcript_metadata.extra.insert(
+            "client_message_id".to_owned(),
+            Value::String(turn_id.0.to_string()),
+        );
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::ProgressUpdated(UiProgressEvent::new(
+                session_id.clone(),
+                Some(turn_id.clone()),
+                transcript_metadata,
+            )),
+        );
         prompt = if prompt.trim().is_empty() {
             joined
         } else {
@@ -18838,6 +18898,7 @@ async fn run_standalone_turn(
         // the agent into calling `voice_transcribe` / exploring the workspace.
         turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
     }
+    let voice_user_content_for_persist = had_audio_input.then(|| voice_transcripts.join("\n"));
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
@@ -18990,6 +19051,10 @@ async fn run_standalone_turn(
                 };
                 let _ = visual_directive_tx.send(visual_directive);
                 let _ = exit_directive_tx.send(exit_requested);
+                replace_voice_user_message_content(
+                    &mut response.messages,
+                    voice_user_content_for_persist.as_deref(),
+                );
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -37526,6 +37591,19 @@ ignore = []
             parsed.get("thread_id").is_none(),
             "unbound reporter must not stamp thread_id (legacy compat): {parsed}"
         );
+    }
+
+    #[test]
+    fn voice_user_message_persist_uses_transcript_not_prompt_scaffolding() {
+        let mut messages = vec![
+            Message::user("帮我记住我喜欢乌龙茶\n\n[语音模式:用口语化中文、一两句话简短回答]"),
+            Message::assistant("记住了。"),
+        ];
+
+        replace_voice_user_message_content(&mut messages, Some("帮我记住我喜欢乌龙茶"));
+
+        assert_eq!(messages[0].content, "帮我记住我喜欢乌龙茶");
+        assert_eq!(messages[1].content, "记住了。");
     }
 
     // ========================================================================
