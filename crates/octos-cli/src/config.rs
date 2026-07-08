@@ -661,6 +661,34 @@ impl MemoryConfig {
     }
 }
 
+/// Field-level host→profile memory inheritance (in-process runtimes: the
+/// profile bootstrap and the actor factory). A profile that says nothing
+/// inherits the host block wholesale; a profile block present only for
+/// knobs (tri-state `enabled` unset) still inherits the host's
+/// enabled/disabled decision — under DEFAULT-ON semantics dropping it
+/// would bypass a host-level opt-out.
+pub fn merge_host_memory_into_profile(
+    config: &mut Option<MemoryConfig>,
+    host_memory: Option<&MemoryConfig>,
+) {
+    let Some(host) = host_memory else {
+        return;
+    };
+    let mem = config.get_or_insert_with(Default::default);
+    if mem.max_inject_tokens.is_none() {
+        mem.max_inject_tokens = host.max_inject_tokens;
+    }
+    if mem.refresh.is_none() {
+        mem.refresh = host.refresh.clone();
+    } else if let (Some(profile_refresh), Some(host_refresh)) =
+        (mem.refresh.as_mut(), host.refresh.as_ref())
+    {
+        if profile_refresh.enabled.is_none() {
+            profile_refresh.enabled = host_refresh.enabled;
+        }
+    }
+}
+
 /// Email sending configuration for the `send_email` tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmailConfig {
@@ -2835,6 +2863,48 @@ mod tests {
             MemoryConfig::effective_max_inject_tokens(Some(&on)),
             octos_memory::DEFAULT_MAX_INJECT_TOKENS
         );
+    }
+
+    #[test]
+    fn should_inherit_host_opt_out_when_profile_refresh_is_knobs_only() {
+        // Host explicitly disabled; profile block exists only for knobs.
+        let host = MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut profile = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                min_idle_minutes: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut profile, Some(&host));
+        assert!(
+            !MemoryConfig::refresh_enabled(profile.as_ref()),
+            "knobs-only profile blocks must inherit the host opt-out"
+        );
+        // The profile's own knob survives the merge.
+        assert_eq!(profile.unwrap().refresh.unwrap().min_idle_minutes, Some(5));
+
+        // An explicit profile decision beats the host.
+        let mut explicit = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut explicit, Some(&host));
+        assert!(MemoryConfig::refresh_enabled(explicit.as_ref()));
+
+        // Absent profile memory inherits the host block wholesale.
+        let mut absent: Option<MemoryConfig> = None;
+        merge_host_memory_into_profile(&mut absent, Some(&host));
+        assert!(!MemoryConfig::refresh_enabled(absent.as_ref()));
     }
 
     #[test]
