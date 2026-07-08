@@ -101,7 +101,7 @@ pub fn write_memory_md(memory_dir: &Path, entries: &[Entry], backup: bool) -> Re
     atomic_write(&path, &render_memory_md(entries))
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<bool> {
+pub(super) fn remove_file_if_exists(path: &Path) -> Result<bool> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -170,16 +170,28 @@ pub fn find_archive_block_by_hash(
 
 /// Rewrite one block file: drop exact blocks in `block_removals`, drop lines
 /// matching any scrub target, delete the file entirely when nothing is left.
+///
+/// `drop_blocks_naming_id`: for ARCHIVE files, any block carrying a
+/// hard-deleted entry's `^m…` id token is an archived VERSION of that
+/// entry — older versions have lines that differ from the current entry
+/// text, so line-exact scrubbing would leave sensitive remnants. Such
+/// blocks are removed whole. Bank entity pages keep line-exact scrubbing
+/// (their blocks are not entry versions; whole-block removal would be
+/// collateral).
 fn rewrite_block_file(
     path: &Path,
     block_removals: &[String],
     scrubs: &[ScrubTarget],
+    drop_blocks_naming_id: bool,
 ) -> Result<()> {
     let content = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read {}", path.display()))?;
     let mut kept_blocks: Vec<String> = Vec::new();
     for block in split_blocks(&content) {
         if block_removals.contains(&block) {
+            continue;
+        }
+        if drop_blocks_naming_id && scrubs.iter().any(|s| block.contains(&s.entry_id)) {
             continue;
         }
         let kept: Vec<&str> = block
@@ -212,31 +224,64 @@ fn staging_file_matches(content: &str, scrubs: &[ScrubTarget]) -> bool {
 }
 
 /// Execute the apply order.
+///
+/// Crash-safety invariants the ordering guarantees:
+/// - The hash-bound pending metadata (step 0) is durable BEFORE any entry
+///   is hidden from MEMORY.md — a crash can never orphan interim-archived
+///   candidates without their binding record.
+/// - Archived/interim content is appended (step 2) BEFORE the entries
+///   leave MEMORY.md (step 3) — content is never in neither place; a
+///   crash between the two leaves a duplicate, which re-runs tolerate
+///   (appends are skipped when the identical block already exists).
+/// - The authorizing forget note (step 4) outlives the MEMORY.md write —
+///   a crash before publication leaves the durable request in staging and
+///   the next run re-plans the delete; a re-run whose target id is
+///   already gone treats the note as satisfied (see the orchestrator).
+/// - Restored blocks leave the archive (step 4) only AFTER they are back
+///   in MEMORY.md.
 pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Result<ApplyReport> {
     let mut report = ApplyReport::default();
     let has_hard_deletes = !plan.hard_deletes.is_empty();
+    if !has_hard_deletes && !plan.archive_block_removals.is_empty() {
+        // Restores can only originate from confirmations (which imply hard
+        // deletes) — reaching here is a plan-construction bug.
+        eyre::bail!("archive block removals without hard deletes");
+    }
 
-    // --- step 1: hard-delete scrub ------------------------------------
+    // --- step 0: persist pending bindings -------------------------------
+    for (path, content) in &plan.pending_rewrites {
+        atomic_write(path, content)?;
+    }
+
+    // --- step 1: hard-delete content scrub -------------------------------
+    // (Content copies only. The authorizing/pending NOTE files are the
+    // durable record of the request and are deleted in step 4, after the
+    // new MEMORY.md is published.)
     if has_hard_deletes {
-        for target in &plan.hard_deletes {
-            remove_file_if_exists(&target.authorizing_note)?;
-            for pending in &target.originating_pending {
-                remove_file_if_exists(pending)?;
-            }
-        }
         // Backups deleted outright — a .bak must never outlive the entry it
         // preserves.
         delete_backups(memory_dir)?;
 
         for path in archive_files(memory_dir)? {
-            rewrite_block_file(&path, &plan.archive_block_removals, &plan.hard_deletes)?;
+            // Whole-block removal for blocks naming the deleted id: an
+            // archived OLDER version's lines differ from the current entry
+            // text, so line-exact scrubbing would leave remnants.
+            rewrite_block_file(&path, &[], &plan.hard_deletes, true)?;
         }
         for path in list_md_files(&memory_dir.join("bank").join("entities"))? {
-            rewrite_block_file(&path, &[], &plan.hard_deletes)?;
+            rewrite_block_file(&path, &[], &plan.hard_deletes, false)?;
         }
 
         for dir in ["notes", "extract"] {
             for path in list_md_files(&memory_dir.join("staging").join(dir))? {
+                // The request notes themselves survive until step 4.
+                let is_request_note = plan
+                    .hard_deletes
+                    .iter()
+                    .any(|t| t.authorizing_note == path || t.originating_pending.contains(&path));
+                if is_request_note {
+                    continue;
+                }
                 let content = std::fs::read_to_string(&path)
                     .wrap_err_with(|| format!("failed to read {}", path.display()))?;
                 if staging_file_matches(&content, &plan.hard_deletes) {
@@ -245,16 +290,9 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
                 }
             }
         }
-    } else if !plan.archive_block_removals.is_empty() {
-        // Restores can only originate from confirmations (which imply hard
-        // deletes) — reaching here is a plan-construction bug.
-        eyre::bail!("archive block removals without hard deletes");
     }
 
-    // --- step 2: MEMORY.md ---------------------------------------------
-    write_memory_md(memory_dir, &plan.final_entries, !has_hard_deletes)?;
-
-    // --- step 3: archive appends ----------------------------------------
+    // --- step 2: archive appends (before MEMORY.md loses the entries) ----
     if !plan.archive_appends.is_empty() {
         let dir = memory_dir.join("archive");
         std::fs::create_dir_all(&dir)
@@ -268,29 +306,45 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
             }
         };
         let mut blocks = split_blocks(&existing);
-        blocks.extend(plan.archive_appends.iter().cloned());
+        for block in &plan.archive_appends {
+            // Duplicate guard: a crash between append and the MEMORY.md
+            // write re-plans the same append on the next run.
+            if !blocks.contains(block) {
+                blocks.push(block.clone());
+            }
+        }
         let mut out = blocks.join("\n\n");
         out.push('\n');
         atomic_write(&path, &out)?;
     }
 
-    // --- step 4: staging cleanup ----------------------------------------
-    let scrubbed: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
-    for path in &plan.consumed_files {
-        if !scrubbed.contains(path) {
-            remove_file_if_exists(path)?;
+    // --- step 3: MEMORY.md -------------------------------------------------
+    write_memory_md(memory_dir, &plan.final_entries, !has_hard_deletes)?;
+
+    // --- step 4: consume request notes + restored archive blocks ---------
+    if has_hard_deletes {
+        for target in &plan.hard_deletes {
+            remove_file_if_exists(&target.authorizing_note)?;
+            for pending in &target.originating_pending {
+                remove_file_if_exists(pending)?;
+            }
+        }
+        if !plan.archive_block_removals.is_empty() {
+            for path in archive_files(memory_dir)? {
+                rewrite_block_file(&path, &plan.archive_block_removals, &[], false)?;
+            }
         }
     }
     for path in &plan.pending_deletes {
         remove_file_if_exists(path)?;
     }
-    for (path, content) in &plan.pending_rewrites {
-        // A pending note that quoted a hard-deleted entry line was already
-        // whole-file-deleted in step 1 — do not resurrect it.
-        if scrubbed.contains(path) {
-            continue;
+
+    // --- step 5: staging cleanup ----------------------------------------
+    let scrubbed: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
+    for path in &plan.consumed_files {
+        if !scrubbed.contains(path) {
+            remove_file_if_exists(path)?;
         }
-        atomic_write(path, content)?;
     }
 
     Ok(report)
@@ -373,7 +427,7 @@ pub fn apply_expiry(
     }
     // 2. Remove restored blocks from their archive files.
     for (path, block) in archive_removals {
-        rewrite_block_file(&path, std::slice::from_ref(&block), &[])?;
+        rewrite_block_file(&path, std::slice::from_ref(&block), &[], false)?;
     }
     // 3. Delete the pending note (content scrubbed by deletion; the caller
     //    surfaces only the note id for sensitive notes).
@@ -513,10 +567,12 @@ mod tests {
             "Old fact. (updated: 2026-01-01) ^molder1\n\nOlder fact. (updated: 2025-12-01) ^molder2\n"
         );
 
-        // Appending again keeps existing blocks.
+        // Re-applying the same plan (crash-window re-run: archive appended
+        // but MEMORY.md not yet published) must NOT duplicate blocks.
         apply_plan(memory_dir, today(), &plan).unwrap();
         let archived2 = std::fs::read_to_string(memory_dir.join("archive/2026-07.md")).unwrap();
-        assert_eq!(archived2.matches("Old fact.").count(), 2);
+        assert_eq!(archived2.matches("Old fact.").count(), 1);
+        assert_eq!(archived, archived2);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use octos_llm::{ChatConfig, LlmProvider, TokenUsage};
 use apply::{ApplyPlan, ScrubTarget, find_archive_block_by_hash};
 use entry::{Entry, ParsedMemory, estimate_tokens, render_memory_md};
 use ops::{CheckedOp, ValidationCtx};
-use staging::{NoteFile, PendingCandidate, StagingBatch};
+use staging::{NoteFile, NoteKind, NoteOrigin, PendingCandidate, StagingBatch};
 
 /// A staging file that participated in this many consecutive failed batches
 /// is signalled for quarantine (the CALLER moves it; host/user_request notes
@@ -227,6 +227,46 @@ pub async fn run_consolidation(
         } else {
             waiting.push(note.clone());
         }
+    }
+
+    // --- 2.5 consume already-satisfied id-bound forgets -------------------
+    // Crash recovery: the apply order deletes the authorizing note only
+    // AFTER the new MEMORY.md is published. A crash in between leaves an
+    // id-bound forget note whose target no longer exists anywhere — the
+    // request was completed. Without this, the note would wedge every
+    // future merge (the gates forbid dropping or pending it).
+    let mut batch = batch;
+    let mut satisfied: Vec<usize> = Vec::new();
+    for (i, note) in batch.notes.iter().enumerate() {
+        if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
+            continue;
+        }
+        let named = note.named_entry_ids();
+        if named.is_empty() {
+            continue;
+        }
+        let any_alive = named.iter().any(|id| {
+            entries.iter().any(|e| &e.id == id)
+                || waiting.iter().any(|w| {
+                    w.candidates
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|c| &c.entry_id == id)
+                })
+        });
+        if !any_alive {
+            satisfied.push(i);
+        }
+    }
+    for i in satisfied.into_iter().rev() {
+        let note = batch.notes.remove(i);
+        apply::remove_file_if_exists(&note.path)?;
+        outcome.dropped.push((
+            note.id.clone(),
+            "already satisfied: no named entry exists (completed by a prior run)".to_string(),
+        ));
+        tracing::info!(note = %note.path.display(), "satisfied forget note consumed");
     }
 
     // --- 3. skip early when nothing is consumable ------------------------
@@ -1808,6 +1848,95 @@ mod tests {
         assert!(
             !note_path.exists(),
             "dropped-with-reason files are consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_consume_satisfied_forget_note_when_target_already_gone() {
+        // Crash-window recovery: MEMORY.md was published without the entry,
+        // but the authorizing id-bound note survived. The note must be
+        // consumed pre-merge (zero provider calls) instead of wedging every
+        // future batch.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        let note_path = write_note(
+            memory_dir,
+            "01fg-satisfied",
+            "host",
+            "forget",
+            "confirmed delete of id:^mzzzzzz",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let params = params(memory_dir);
+        let outcome = run_consolidation(provider.clone(), &params).await.unwrap();
+
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "satisfied note must not need a merge"
+        );
+        assert!(!note_path.exists(), "satisfied note must be consumed");
+        assert!(
+            outcome
+                .dropped
+                .iter()
+                .any(|(id, reason)| id == "01fg-satisfied" && reason.contains("satisfied")),
+            "outcome must surface the completion: {:?}",
+            outcome.dropped
+        );
+        // The untouched entry survives byte-identically.
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(memory.contains("^mcccccc"));
+    }
+
+    #[tokio::test]
+    async fn should_remove_whole_archived_block_when_older_version_scrubbed() {
+        // An archived OLDER version of a hard-deleted entry has lines that
+        // differ from the current text; line-exact scrubbing would leave
+        // those sensitive remnants behind. The whole block must go.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let current = "Wifi password is hunter2. (updated: 2026-07-01) ^msecret";
+        write_memory(
+            memory_dir,
+            &[current, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(
+            memory_dir.join("archive/2026-05.md"),
+            "Old wifi password was letmein99.\nRouter in the hallway closet. (updated: 2026-05-01) ^msecret\n\nUnrelated archived fact. (updated: 2026-04-01) ^mother1\n",
+        )
+        .unwrap();
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#,
+        ]);
+        let params = params(memory_dir);
+        let outcome = run_consolidation(provider, &params).await.unwrap();
+        assert_eq!(outcome.hard_deleted, vec!["^msecret"]);
+
+        let archived = std::fs::read_to_string(memory_dir.join("archive/2026-05.md")).unwrap();
+        assert!(
+            !archived.contains("letmein99") && !archived.contains("hallway closet"),
+            "older archived version must be removed whole: {archived}"
+        );
+        assert!(
+            archived.contains("^mother1"),
+            "unrelated archived block must survive"
         );
     }
 }
