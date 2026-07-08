@@ -1100,7 +1100,7 @@ fn execute_id_bound_forgets(
     }
     if !plan.hard_deletes.is_empty() {
         plan.final_entries = working.clone();
-        apply::apply_plan(memory_dir, params.today, &plan)?;
+        let report = apply::apply_plan(memory_dir, params.today, &plan)?;
         // Fully-honored notes were consumed by the apply (authorizing note
         // deletion); drop them from the batch.
         for i in executed_notes.into_iter().rev() {
@@ -1109,6 +1109,18 @@ fn execute_id_bound_forgets(
                 note.id.clone(),
                 "executed Rust-side (id-bound host authority)".to_string(),
             ));
+        }
+        // The scrub may have disk-deleted OTHER staging files quoting the
+        // removed entry — prune them from the in-memory batch too, or the
+        // later merge prompt would still ship the scrubbed content (and
+        // validators would demand consumption of vanished files).
+        if !report.scrub_deleted_staging.is_empty() {
+            let scrubbed: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
+            batch.notes.retain(|n| !scrubbed.contains(&n.path));
+            batch.extractions.retain(|e| !scrubbed.contains(&e.path));
+            batch
+                .parse_failures
+                .retain(|(p, _, _)| !scrubbed.contains(p));
         }
     }
     Ok(working)
@@ -3476,6 +3488,95 @@ mod tests {
         assert!(
             outside.path().join("precious.bak").exists(),
             "the scrub must not follow symlinks out of the memory tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_prune_scrubbed_staging_from_merge_prompt() {
+        // A sensitive id-bound forget executes Rust-side; a model note
+        // quoting the secret is disk-scrubbed by that apply. The later
+        // merge (forced by a clean second note) must not ship the quoting
+        // note's content to the provider.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret_line = "The vault code is 9137.";
+        write_memory(
+            memory_dir,
+            &[
+                &format!("{secret_line} (updated: 2026-06-01) ^msecret"),
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        write_note(
+            memory_dir,
+            "01fg-exact",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+        // The quote is a full exact line (the scrub contract is line-exact;
+        // substring embeds are the documented paraphrase residual).
+        write_note(
+            memory_dir,
+            "02quoter",
+            "model",
+            "fact",
+            &format!("Overheard this:\n{secret_line}"),
+            false,
+        );
+        write_note(memory_dir, "03clean", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["03clean"]}],"consumed_ids":["03clean"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+        assert_eq!(provider.call_count(), 1);
+        let prompt_text: String = provider
+            .call_messages(0)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("9137"),
+            "scrubbed staging content must not ride the merge prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_consuming_host_request_without_applying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_note(
+            memory_dir,
+            "01req",
+            "host",
+            "user_request",
+            "remember that I deploy on Fridays",
+            false,
+        );
+
+        // ops:[] but consumed — a silent drop of an explicit ask.
+        let reply = r#"{"ops":[],"consumed_ids":["01req"],"dropped":[]}"#;
+        let provider = ScriptedProvider::new(&[reply, reply]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(
+            !outcome.merge_applied,
+            "unapplied consumption must be rejected"
+        );
+        assert!(
+            memory_dir.join("staging/notes/01req.md").exists(),
+            "the request stays durable"
         );
     }
 }

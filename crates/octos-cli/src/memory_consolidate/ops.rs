@@ -708,6 +708,32 @@ fn validate_consumption(output: &ModelOutput, ctx: &ValidationCtx) -> Result<(),
                      be silently dropped"
                 ));
             }
+            // Consumption must be BACKED by an accepted op: `ops: []` with
+            // the note in consumed_ids would delete the request file while
+            // changing nothing — silently dropping an explicit user ask.
+            let applied = output.ops.iter().any(|op| match op {
+                Op::Add { sources, .. } => sources.iter().any(|s| s == id),
+                Op::Update { sources, .. } => sources.iter().any(|s| s == id),
+                Op::Supersede { sources, .. } => sources.iter().any(|s| s == id),
+                Op::Archive { sources, .. } => sources.iter().any(|s| s == id),
+                // A hard_delete covering an id this forget note names
+                // applies it too (two notes can name the same id; one op
+                // honors both — only one can be the cited authorizer).
+                Op::HardDelete {
+                    id: target,
+                    authorized_by,
+                } => {
+                    authorized_by == id
+                        || (note.kind == NoteKind::Forget
+                            && note.named_entry_ids().iter().any(|n| n == target))
+                }
+            });
+            if !applied {
+                return Err(format!(
+                    "host/user_request note '{id}' is consumed but no op cites it — \
+                     a user ask may not be consumed without being applied"
+                ));
+            }
         } else if !consumed.contains(id) && !dropped.contains(id) {
             return Err(format!(
                 "staging note '{id}' is neither consumed nor dropped-with-reason"
@@ -1281,10 +1307,15 @@ mod tests {
         let mut fx = Fixture::default();
         fx.notes
             .push(note("h1", "host", "forget", "forget id:^maaaaaa"));
-        // Consumed, but no hard_delete op emitted.
+        // Consumed, but no hard_delete op emitted — the applied-consumption
+        // gate fires first (no op cites the note at all).
         let out = output(vec![], &["h1"]);
         let err = fx.validate(&out).unwrap_err();
-        assert!(err.contains("no hard_delete op honors it"), "got: {err}");
+        assert!(
+            err.contains("consumed without being applied")
+                || err.contains("no hard_delete op honors it"),
+            "got: {err}"
+        );
     }
 
     #[test]
