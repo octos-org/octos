@@ -1,11 +1,10 @@
 {
   "provider": "anthropic",
   "model": "claude-sonnet-4-20250514",
-
   "memory": {
     "max_inject_tokens": 2500,
     "refresh": {
-      "enabled": false,
+      "enabled": true,
       "extract_model": null,
       "min_idle_minutes": 30,
       "max_session_age_days": 10,
@@ -22,7 +21,6 @@
       "pending_confirm_days": 7
     }
   },
-
   "sub_providers": [
     {
       "key": "cheap",

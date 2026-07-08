@@ -550,9 +550,11 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemoryRefreshConfig {
     /// Master switch for the capture layer + read-side refresh + the
-    /// background extraction sweep.
+    /// background extraction sweep. DEFAULT-ON: `None` means enabled —
+    /// automatic memory is the product behavior; set `false` (or
+    /// `OCTOS_MEMORY_REFRESH_ENABLED=0`) to opt out.
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
 
     /// Model key for the extraction pass (unset → the profile's provider).
     #[serde(default)]
@@ -649,10 +651,13 @@ impl MemoryConfig {
     }
 
     /// Whether automatic memory refreshing (capture + read refresh) is on.
+    /// DEFAULT-ON: an absent memory/refresh block (or an unset `enabled`)
+    /// means enabled; only an explicit `false` opts out.
     pub fn refresh_enabled(config: Option<&MemoryConfig>) -> bool {
         config
             .and_then(|m| m.refresh.as_ref())
-            .is_some_and(|r| r.enabled)
+            .and_then(|r| r.enabled)
+            .unwrap_or(true)
     }
 }
 
@@ -1218,11 +1223,17 @@ fn merge_env_memory_policy(config: &mut Config) {
         }
     }
     // Same field-level rule for the refresh switch: the env only fills the
-    // gap when the loaded config says nothing about `memory.refresh`.
+    // gap when the loaded config says nothing about `memory.refresh.enabled`
+    // (block absent OR the tri-state left unset). With the DEFAULT-ON
+    // semantics the OFF direction matters most: a host that disabled
+    // memory mirrors `OCTOS_MEMORY_REFRESH_ENABLED=0` to spawned
+    // subprocesses, and that must beat the child's default-on. An explicit
+    // `enabled` in the config file still wins over the env.
     if config
         .memory
         .as_ref()
         .and_then(|m| m.refresh.as_ref())
+        .and_then(|r| r.enabled)
         .is_none()
     {
         if let Ok(v) = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED") {
@@ -1230,13 +1241,12 @@ fn merge_env_memory_policy(config: &mut Config) {
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
-            if on {
-                config.memory.get_or_insert_with(Default::default).refresh =
-                    Some(MemoryRefreshConfig {
-                        enabled: true,
-                        ..Default::default()
-                    });
-            }
+            config
+                .memory
+                .get_or_insert_with(Default::default)
+                .refresh
+                .get_or_insert_with(Default::default)
+                .enabled = Some(on);
         }
     }
 }
@@ -2801,24 +2811,59 @@ mod tests {
     // --- memory refresh flag ---
 
     #[test]
-    fn should_default_refresh_off_when_memory_absent_or_empty() {
-        assert!(!MemoryConfig::refresh_enabled(None));
+    fn should_default_refresh_on_when_memory_absent_or_empty() {
+        // DEFAULT-ON: automatic memory is the product behavior; absence of
+        // config means enabled.
+        assert!(MemoryConfig::refresh_enabled(None));
         let empty: MemoryConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(!MemoryConfig::refresh_enabled(Some(&empty)));
+        assert!(MemoryConfig::refresh_enabled(Some(&empty)));
         let refresh_empty: MemoryConfig =
             serde_json::from_value(serde_json::json!({"refresh": {}})).unwrap();
-        assert!(!MemoryConfig::refresh_enabled(Some(&refresh_empty)));
+        assert!(MemoryConfig::refresh_enabled(Some(&refresh_empty)));
     }
 
     #[test]
-    fn should_enable_refresh_when_config_sets_it() {
-        let cfg: MemoryConfig =
+    fn should_disable_refresh_only_when_explicitly_false() {
+        let off: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": false}})).unwrap();
+        assert!(!MemoryConfig::refresh_enabled(Some(&off)));
+        let on: MemoryConfig =
             serde_json::from_value(serde_json::json!({"refresh": {"enabled": true}})).unwrap();
-        assert!(MemoryConfig::refresh_enabled(Some(&cfg)));
+        assert!(MemoryConfig::refresh_enabled(Some(&on)));
         // max_inject_tokens keeps its default independently.
         assert_eq!(
-            MemoryConfig::effective_max_inject_tokens(Some(&cfg)),
+            MemoryConfig::effective_max_inject_tokens(Some(&on)),
             octos_memory::DEFAULT_MAX_INJECT_TOKENS
         );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_let_env_disable_refresh_when_config_silent() {
+        // Host mirroring: OCTOS_MEMORY_REFRESH_ENABLED=0 must beat the
+        // child's default-on when the config file says nothing.
+        let prev = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED").ok();
+        unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", "0") };
+
+        let mut config = Config::default();
+        merge_env_memory_policy(&mut config);
+        assert!(!MemoryConfig::refresh_enabled(config.memory.as_ref()));
+
+        // An explicit config value wins over the env.
+        let mut explicit = Config::default();
+        explicit.memory = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_env_memory_policy(&mut explicit);
+        assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", v) },
+            None => unsafe { std::env::remove_var("OCTOS_MEMORY_REFRESH_ENABLED") },
+        }
     }
 }
