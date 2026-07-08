@@ -554,7 +554,7 @@ Bot: Current model: deepseek/deepseek-chat
        - anthropic (default: claude-sonnet-4-20250514) [ready]
        - openai (default: gpt-4o) [ready]
        - deepseek (default: deepseek-chat) [ready]
-       - gemini (default: gemini-2.0-flash) [ready]
+       - gemini (default: gemini-2.5-flash) [ready]
        ...
 ```
 

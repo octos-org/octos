@@ -132,7 +132,7 @@ octos chat --model qwen-max         # -> dashscope
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
@@ -156,7 +156,7 @@ octos chat --model qwen-max         # -> dashscope
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]

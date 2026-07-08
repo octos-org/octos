@@ -132,7 +132,7 @@ The `api_type` field forces a specific wire format when a provider uses a non-st
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
@@ -156,7 +156,7 @@ Configure a priority-ordered fallback chain. If the primary provider fails, the 
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]

@@ -251,7 +251,7 @@ pub struct CreateParams {
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints (OpenAI provider)
 
