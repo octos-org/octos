@@ -1265,16 +1265,30 @@ fn merge_env_memory_policy(config: &mut Config) {
         .is_none()
     {
         if let Ok(v) = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED") {
-            let on = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-            config
-                .memory
-                .get_or_insert_with(Default::default)
-                .refresh
-                .get_or_insert_with(Default::default)
-                .enabled = Some(on);
+            // Recognized values only — an empty or misspelled variable
+            // (easy in shell/Docker) must not silently opt out of the
+            // default-on behavior.
+            let parsed = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                other => {
+                    if !other.is_empty() {
+                        tracing::warn!(
+                            value = %v,
+                            "ignoring unrecognized OCTOS_MEMORY_REFRESH_ENABLED"
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(on) = parsed {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .refresh
+                    .get_or_insert_with(Default::default)
+                    .enabled = Some(on);
+            }
         }
     }
 }
@@ -2930,6 +2944,17 @@ mod tests {
         });
         merge_env_memory_policy(&mut explicit);
         assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
+
+        // Malformed/empty values leave the default-on untouched.
+        for bad in ["", "banana"] {
+            unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", bad) };
+            let mut silent = Config::default();
+            merge_env_memory_policy(&mut silent);
+            assert!(
+                MemoryConfig::refresh_enabled(silent.memory.as_ref()),
+                "unrecognized env value {bad:?} must not opt out"
+            );
+        }
 
         match prev {
             Some(v) => unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", v) },

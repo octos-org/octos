@@ -9782,11 +9782,17 @@ async fn ensure_session_profile_runtime(
     }
 
     let profile_data_dir = store.resolve_data_dir(&profile);
-    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+    // Lazily-created profiles must honour host-level policy too — without
+    // host_memory, a host opt-out of (default-on) memory refresh would not
+    // bind profiles created after startup.
+    let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
         &profile,
         &profile_data_dir,
         Some(store.octos_home_dir()),
         crate::runtime::BootstrapRole::Serve,
+        None,
+        None,
+        state.host_memory.as_ref(),
     )
     .await
     .map_err(|error| {
