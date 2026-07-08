@@ -582,6 +582,9 @@ impl ProfileActorFactoryBuilder {
             if mem.max_inject_tokens.is_none() {
                 mem.max_inject_tokens = host.max_inject_tokens;
             }
+            if mem.refresh.is_none() {
+                mem.refresh = host.refresh.clone();
+            }
         }
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
@@ -597,6 +600,8 @@ impl ProfileActorFactoryBuilder {
         let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
             profile_config.memory.as_ref(),
         );
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(profile_config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
@@ -605,6 +610,7 @@ impl ProfileActorFactoryBuilder {
             &skills_loader,
             &self.tool_config,
             max_inject_tokens,
+            memory_refresh_enabled,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
@@ -738,6 +744,9 @@ impl ProfileActorFactoryBuilder {
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
+            if memory_refresh_enabled {
+                tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
+            }
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);
             }

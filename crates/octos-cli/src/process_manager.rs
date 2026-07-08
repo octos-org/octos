@@ -57,6 +57,9 @@ pub struct ProcessManager {
     /// via `OCTOS_MEMORY_MAX_INJECT_TOKENS` (field-level: a profile's own
     /// explicit value wins; the env only fills the gap).
     host_max_inject_tokens: Option<usize>,
+    /// Host-level `memory.refresh.enabled` forwarded via
+    /// `OCTOS_MEMORY_REFRESH_ENABLED` under the same field-level rule.
+    host_memory_refresh_enabled: bool,
 }
 
 struct GatewayProcess {
@@ -140,6 +143,7 @@ impl ProcessManager {
             self_ref: std::sync::Mutex::new(None),
             host_plugins_require_signed: false,
             host_max_inject_tokens: None,
+            host_memory_refresh_enabled: false,
         }
     }
 
@@ -157,6 +161,13 @@ impl ProcessManager {
     /// the memory block inherit the host injection budget.
     pub fn with_host_max_inject_tokens(mut self, max_inject_tokens: Option<usize>) -> Self {
         self.host_max_inject_tokens = max_inject_tokens;
+        self
+    }
+
+    /// Mirror the host's `memory.refresh.enabled` onto spawned gateways via
+    /// `OCTOS_MEMORY_REFRESH_ENABLED` (field-level: profile value wins).
+    pub fn with_host_memory_refresh_enabled(mut self, enabled: bool) -> Self {
+        self.host_memory_refresh_enabled = enabled;
         self
     }
 
@@ -334,15 +345,17 @@ impl ProcessManager {
                                 );
                                 continue;
                             }
-                            // The host memory budget env is equally
+                            // The host memory envs are equally
                             // host-reserved: a parent profile must not
-                            // impersonate it toward sub-accounts.
-                            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+                            // impersonate them toward sub-accounts.
+                            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS")
+                                || key.eq_ignore_ascii_case("OCTOS_MEMORY_REFRESH_ENABLED")
+                            {
                                 tracing::warn!(
                                     profile = %profile.id,
                                     parent = %parent_id,
                                     var = %key,
-                                    "skipping parent env var that would override host memory budget"
+                                    "skipping parent env var that would override host memory settings"
                                 );
                                 continue;
                             }
@@ -413,14 +426,16 @@ impl ProcessManager {
                 );
                 continue;
             }
-            // Same reservation for the host memory budget: profiles override
-            // it via their own `memory` config block, not by spoofing the
-            // host-controlled env var.
-            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+            // Same reservation for the host memory settings: profiles
+            // override them via their own `memory` config block, not by
+            // spoofing the host-controlled env vars.
+            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS")
+                || key.eq_ignore_ascii_case("OCTOS_MEMORY_REFRESH_ENABLED")
+            {
                 tracing::warn!(
                     profile = %profile.id,
                     var = %key,
-                    "skipping profile env var that would override host memory budget"
+                    "skipping profile env var that would override host memory settings"
                 );
                 continue;
             }
@@ -435,8 +450,23 @@ impl ProcessManager {
         if self.host_plugins_require_signed {
             cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
         }
-        if let Some(n) = self.host_max_inject_tokens {
-            cmd.env("OCTOS_MEMORY_MAX_INJECT_TOKENS", n.to_string());
+        // Set-or-CLEAR: `Command` inherits the parent environment, so when
+        // the host does not forward a memory setting we must remove any
+        // inherited value — otherwise a stale env var from the serve
+        // process's own environment would re-enable a feature the host
+        // config explicitly turned off.
+        match self.host_max_inject_tokens {
+            Some(n) => {
+                cmd.env("OCTOS_MEMORY_MAX_INJECT_TOKENS", n.to_string());
+            }
+            None => {
+                cmd.env_remove("OCTOS_MEMORY_MAX_INJECT_TOKENS");
+            }
+        }
+        if self.host_memory_refresh_enabled {
+            cmd.env("OCTOS_MEMORY_REFRESH_ENABLED", "1");
+        } else {
+            cmd.env_remove("OCTOS_MEMORY_REFRESH_ENABLED");
         }
 
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");

@@ -530,7 +530,10 @@ impl ServeCommand {
                 .with_host_plugins_require_signed(config.plugins.require_signed)
                 .with_host_max_inject_tokens(
                     config.memory.as_ref().and_then(|m| m.max_inject_tokens),
-                ),
+                )
+                .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
+                    config.memory.as_ref(),
+                )),
         );
         process_manager.set_self_ref();
 

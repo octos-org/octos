@@ -1096,6 +1096,9 @@ impl GatewayRuntime {
             // Memory bank tools
             tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+            if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+                tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+            }
 
             // Runtime model switching tool
             tools.register(crate::tools::SwitchModelTool::new(
@@ -1125,6 +1128,8 @@ impl GatewayRuntime {
         // Build system prompt (always the full prompt with persona, memory, skills)
         let max_inject_tokens =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
             &data_dir,
@@ -1133,6 +1138,7 @@ impl GatewayRuntime {
             &skills_loader,
             &tool_config,
             max_inject_tokens,
+            memory_refresh_enabled,
         )
         .await;
 
@@ -1621,6 +1627,7 @@ impl GatewayRuntime {
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
             let max_inject_p = max_inject_tokens;
+            let memory_refresh_p = memory_refresh_enabled;
             persona_service.start(
                 move |_persona_text| {
                     // Rebuild the full system prompt with the new persona and hot-update
@@ -1640,6 +1647,7 @@ impl GatewayRuntime {
                             &sl,
                             &tc,
                             max_inject_p,
+                            memory_refresh_p,
                         )
                         .await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;

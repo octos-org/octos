@@ -537,6 +537,21 @@ pub struct MemoryConfig {
     /// notes) and omissions are disclosed to the model with a marker.
     #[serde(default)]
     pub max_inject_tokens: Option<usize>,
+
+    /// Automatic memory refreshing (capture + consolidation pipeline).
+    #[serde(default)]
+    pub refresh: Option<MemoryRefreshConfig>,
+}
+
+/// Automatic memory-refresh settings. Default OFF: when disabled there is
+/// no `memory_note` tool, no capture policy in the prompt, and no
+/// per-turn memory re-read — behavior is identical to before the feature
+/// existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryRefreshConfig {
+    /// Master switch for the capture layer + read-side refresh.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl MemoryConfig {
@@ -545,6 +560,13 @@ impl MemoryConfig {
         config
             .and_then(|m| m.max_inject_tokens)
             .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
+    }
+
+    /// Whether automatic memory refreshing (capture + read refresh) is on.
+    pub fn refresh_enabled(config: Option<&MemoryConfig>) -> bool {
+        config
+            .and_then(|m| m.refresh.as_ref())
+            .is_some_and(|r| r.enabled)
     }
 }
 
@@ -1098,16 +1120,34 @@ fn merge_env_memory_policy(config: &mut Config) {
         .memory
         .as_ref()
         .and_then(|m| m.max_inject_tokens)
-        .is_some()
+        .is_none()
     {
-        return;
+        if let Ok(v) = std::env::var("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .max_inject_tokens = Some(n);
+            }
+        }
     }
-    if let Ok(v) = std::env::var("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
-        if let Ok(n) = v.trim().parse::<usize>() {
-            config
-                .memory
-                .get_or_insert_with(Default::default)
-                .max_inject_tokens = Some(n);
+    // Same field-level rule for the refresh switch: the env only fills the
+    // gap when the loaded config says nothing about `memory.refresh`.
+    if config
+        .memory
+        .as_ref()
+        .and_then(|m| m.refresh.as_ref())
+        .is_none()
+    {
+        if let Ok(v) = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED") {
+            let on = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+            if on {
+                config.memory.get_or_insert_with(Default::default).refresh =
+                    Some(MemoryRefreshConfig { enabled: true });
+            }
         }
     }
 }
@@ -2667,5 +2707,29 @@ mod tests {
             }));
         assert_eq!(overridden.tts_provider, "cloud");
         assert_eq!(overridden.cloud.unwrap().appid.as_deref(), Some("42"));
+    }
+
+    // --- memory refresh flag ---
+
+    #[test]
+    fn should_default_refresh_off_when_memory_absent_or_empty() {
+        assert!(!MemoryConfig::refresh_enabled(None));
+        let empty: MemoryConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!MemoryConfig::refresh_enabled(Some(&empty)));
+        let refresh_empty: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {}})).unwrap();
+        assert!(!MemoryConfig::refresh_enabled(Some(&refresh_empty)));
+    }
+
+    #[test]
+    fn should_enable_refresh_when_config_sets_it() {
+        let cfg: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": true}})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&cfg)));
+        // max_inject_tokens keeps its default independently.
+        assert_eq!(
+            MemoryConfig::effective_max_inject_tokens(Some(&cfg)),
+            octos_memory::DEFAULT_MAX_INJECT_TOKENS
+        );
     }
 }

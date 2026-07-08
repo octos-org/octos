@@ -748,6 +748,12 @@ impl Agent {
                 self.tools.reset_spawn_only_invoked();
                 self.reset_loop_detected_recently();
 
+                // Refresh provider-backed prompt segments (e.g. the memory
+                // block when MEMORY.md changed on disk) before composing.
+                // No-op unless providers are registered; providers keep the
+                // unchanged path to a single stat.
+                self.refresh_prompt_segments().await;
+
                 // Build the system prompt via the shared helper in
                 // execution.rs so conversation + task loops compose the same
                 // prompt. This is where realtime sensor summary gets appended

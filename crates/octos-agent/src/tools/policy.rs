@@ -205,7 +205,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:memory",
         description: "Long-term memory: save and recall knowledge across sessions",
-        tools: &["recall_memory", "save_memory"],
+        tools: &["recall_memory", "save_memory", "memory_note"],
     },
     ToolGroupInfo {
         name: "group:research",
@@ -252,6 +252,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
             "send_message",
             "message",
             "save_memory",
+            "memory_note",
             "execute_code",
         ],
     },
