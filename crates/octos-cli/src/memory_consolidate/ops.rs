@@ -577,6 +577,53 @@ pub fn validate(output: &ModelOutput, ctx: &ValidationCtx) -> Result<ValidatedOp
         ));
     }
 
+    // Add-back guard: a bad or prompt-injected reply must not survive a
+    // hard delete by copying the deleted entry's text into an add/update/
+    // supersede under a new id. Any folded line of new text matching a
+    // hard-deleted target's folded lines rejects the whole merge.
+    // Compare CONTENT with bookkeeping stripped: the deleted line carries
+    // its `(updated:)` stamp and `^m` id while a re-added copy would not.
+    let strip_fold = |id: &str, text: &str| -> Vec<String> {
+        let entry = super::entry::Entry {
+            id: id.to_string(),
+            text: text.to_string(),
+        };
+        super::pending::strippable_entry_text(&entry)
+            .lines()
+            .map(super::entry::fold_whitespace)
+            .filter(|l| !l.is_empty())
+            .collect()
+    };
+    let mut deleted_lines: HashSet<String> = HashSet::new();
+    for op in &checked {
+        if let CheckedOp::HardDelete { id, .. } = op {
+            if let Some(entry) = ctx.entry(id) {
+                deleted_lines.extend(strip_fold(&entry.id, &entry.text));
+            } else if let Some(text) = ctx.interim.get(id) {
+                deleted_lines.extend(strip_fold(id, text));
+            }
+        }
+    }
+    if !deleted_lines.is_empty() {
+        for (i, op) in checked.iter().enumerate() {
+            let new_text: Option<&str> = match op {
+                CheckedOp::Add { text, .. } => Some(text),
+                CheckedOp::Update { new_text, .. } => Some(new_text),
+                CheckedOp::Supersede { replacement, .. } => replacement.as_deref(),
+                _ => None,
+            };
+            let Some(new_text) = new_text else { continue };
+            for folded in strip_fold("", new_text) {
+                if deleted_lines.contains(&folded) {
+                    return Err(format!(
+                        "ops[{i}]: new text repeats a line of a hard-deleted entry — \
+                         deleted content may not be re-added in the same merge"
+                    ));
+                }
+            }
+        }
+    }
+
     validate_consumption(output, ctx)?;
 
     Ok(ValidatedOps {

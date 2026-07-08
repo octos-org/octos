@@ -535,6 +535,20 @@ pub(crate) async fn run_consolidation_pass(
     params.pending_confirm_days = knobs.pending_confirm_days;
     params.allow_merge = allow_merge;
 
+    // Pre-capture the staging payload size: a successful merge deletes
+    // consumed files, so a post-hoc scan would under-charge zero-usage
+    // providers for the prompt's staging content.
+    let mut staging_bytes_before: u64 = 0;
+    for dir in ["notes", "extract"] {
+        if let Ok(entries) = std::fs::read_dir(data_dir.join("memory/staging").join(dir)) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    staging_bytes_before += meta.len();
+                }
+            }
+        }
+    }
+
     let outcome = crate::memory_consolidate::run_consolidation(provider, &params).await?;
 
     if outcome.skipped_clean {
@@ -554,16 +568,8 @@ pub(crate) async fn run_consolidation_pass(
         // reply) plus the staging payload.
         let memory_md =
             std::fs::read_to_string(data_dir.join("memory").join("MEMORY.md")).unwrap_or_default();
-        let mut estimate = 2 * octos_memory::estimate_tokens(&memory_md) as u64;
-        for dir in ["notes", "extract"] {
-            if let Ok(entries) = std::fs::read_dir(data_dir.join("memory/staging").join(dir)) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        estimate += meta.len() / 4;
-                    }
-                }
-            }
-        }
+        let estimate =
+            2 * octos_memory::estimate_tokens(&memory_md) as u64 + staging_bytes_before / 4;
         spent = estimate.max(1);
     }
     // Failed/rejected merges spent provider calls too — charging them is
@@ -1328,6 +1334,52 @@ mod tests {
         assert!(
             state.consolidations_today >= 1 && state.tokens_today > 0,
             "failed zero-usage merges must be charged: {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_charge_staging_payload_when_zero_usage_merge_consumes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A large-ish note the merge will consume (deleting the file).
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Model,
+                kind: octos_memory::NoteKind::Fact,
+                content: format!("prefers dark mode. {}", "detail ".repeat(600)),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+        let notes_dir = dir.path().join("memory/staging/notes");
+        let note_name = std::fs::read_dir(&notes_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let ops = Arc::new(OpsProvider {
+            response: format!(
+                r#"{{"ops":[{{"op":"add","section":null,"text":"Prefers dark mode.","sources":["{note_name}"]}}],"consumed_ids":["{note_name}"],"dropped":[]}}"#
+            ),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        run_consolidation_pass(dir.path(), ops, &knobs_for_test())
+            .await
+            .unwrap();
+
+        let state = RefreshState::load(&dir.path().join("memory").join("refresh_state.json"));
+        assert!(
+            state.tokens_today >= 1_000,
+            "the consumed staging payload must be charged (pre-capture): {}",
+            state.tokens_today
         );
     }
 

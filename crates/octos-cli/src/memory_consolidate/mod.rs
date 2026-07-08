@@ -374,7 +374,7 @@ pub async fn run_consolidation(
             if named.is_empty() {
                 continue;
             }
-            let targets: Vec<usize> = named
+            let mut targets: Vec<usize> = named
                 .iter()
                 .filter_map(|id| {
                     if frozen_ids.contains(id) {
@@ -383,18 +383,30 @@ pub async fn run_consolidation(
                     working.iter().position(|e| &e.id == id)
                 })
                 .collect();
+            // Descending + dedup: note order is arbitrary; removing a lower
+            // index first would shift later positions and panic.
+            targets.sort_unstable_by(|a, b| b.cmp(a));
+            targets.dedup();
             if targets.is_empty() {
                 continue;
             }
             let all_named_covered = named
                 .iter()
                 .all(|id| working.iter().any(|e| &e.id == id) && !frozen_ids.contains(id));
-            for pos in targets.into_iter().rev() {
+            // A partially honored note (some ids frozen/deferred) must
+            // SURVIVE as the confirmation for the remaining ids — only a
+            // fully honored note is consumed by the apply.
+            let authorizing = if all_named_covered {
+                note.path.clone()
+            } else {
+                PathBuf::new()
+            };
+            for pos in targets {
                 let entry = working.remove(pos);
                 plan.hard_deletes.push(ScrubTarget {
                     entry_id: entry.id.clone(),
                     folded_lines: entry.folded_lines(),
-                    authorizing_note: note.path.clone(),
+                    authorizing_note: authorizing.clone(),
                     originating_pending: Vec::new(),
                 });
                 outcome.hard_deleted.push(entry.id.clone());
@@ -2911,5 +2923,123 @@ mod tests {
         );
         let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
         assert!(memory.contains("^msurviv"), "survivor stays live");
+    }
+
+    #[tokio::test]
+    async fn should_reject_merge_when_add_repeats_hard_deleted_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "The vault code is 9137. (updated: 2026-06-01) ^msecret";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+
+        // The reply deletes the entry AND re-adds its text under a new id.
+        let reply = r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"},{"op":"add","section":null,"text":"The vault code is 9137.","sources":[]}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#;
+        let provider = ScriptedProvider::new(&[reply, reply]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(
+            !outcome.merge_applied,
+            "add-back of deleted content must reject the merge"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("^msecret"),
+            "nothing applies on a rejected merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_delete_multiple_ids_without_panic_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &[
+                "First target. (updated: 2026-06-01) ^maaaaaa",
+                "Middle keeper. (updated: 2026-06-02) ^mcccccc",
+                "Second target. (updated: 2026-06-03) ^mbbbbbb",
+            ],
+        );
+        // Named in reverse entry order to exercise the index-shift hazard.
+        let note = write_note(
+            memory_dir,
+            "01fg-multi",
+            "host",
+            "forget",
+            "delete id:^mbbbbbb and id:^maaaaaa",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let mut p = params(memory_dir);
+        p.allow_merge = false;
+        let outcome = run_consolidation(provider, &p).await.unwrap();
+
+        assert!(outcome.hard_deleted.contains(&"^maaaaaa".to_string()));
+        assert!(outcome.hard_deleted.contains(&"^mbbbbbb".to_string()));
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(memory.contains("^mcccccc"), "keeper survives: {memory}");
+        assert!(!memory.contains("^maaaaaa") && !memory.contains("^mbbbbbb"));
+        assert!(!note.exists(), "fully honored note consumed");
+    }
+
+    #[tokio::test]
+    async fn should_keep_partially_honored_note_when_some_ids_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let frozen_entry = "Frozen candidate. (updated: 2026-06-01) ^mfrozen";
+        write_memory(
+            memory_dir,
+            &["Live target. (updated: 2026-06-01) ^mlivsec", frozen_entry],
+        );
+        // ^mfrozen is a candidate of a waiting pending note → frozen.
+        write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget the frozen thing",
+            false,
+            &format!(
+                r#"[{{"entry_id":"^mfrozen","content_hash":"{}","interim_archived":false}}]"#,
+                sha256_hex(frozen_entry)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        let note = write_note(
+            memory_dir,
+            "02fg-mixed",
+            "host",
+            "forget",
+            "delete id:^mlivsec and id:^mfrozen",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let mut p = params(memory_dir);
+        p.allow_merge = false;
+        let outcome = run_consolidation(provider, &p).await.unwrap();
+
+        assert!(outcome.hard_deleted.contains(&"^mlivsec".to_string()));
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(!memory.contains("^mlivsec"));
+        assert!(
+            memory.contains("^mfrozen"),
+            "frozen id deferred, not deleted"
+        );
+        assert!(
+            note.exists(),
+            "a partially honored note must survive as the confirmation for the frozen id"
+        );
     }
 }

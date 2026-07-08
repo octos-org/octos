@@ -26,7 +26,7 @@ fn normalize(s: &str) -> String {
 /// Entry text with engine-added markers stripped (trailing id token,
 /// `(updated: …)` stamps, `(unverified)`), so note content never binds to an
 /// entry through bookkeeping tokens like the word "updated" or a date.
-fn strippable_entry_text(entry: &Entry) -> String {
+pub(super) fn strippable_entry_text(entry: &Entry) -> String {
     let mut text = entry.text.clone();
     if let Some(pos) = text.rfind(&entry.id) {
         text.replace_range(pos..pos + entry.id.len(), "");
