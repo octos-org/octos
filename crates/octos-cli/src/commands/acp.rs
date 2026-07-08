@@ -175,6 +175,40 @@ struct ConfigAgentFactory {
     max_iterations: u32,
 }
 
+/// Core tools pinned as LRU "base" tools so the agent never auto-evicts them
+/// mid-session. The registry keeps only `max_active` (15) tools visible and
+/// evicts the least-recently-used non-base tools after they sit idle for
+/// `idle_threshold` iterations. Without pinning, the command-execution tools
+/// (`shell`/`exec_command`/`bash`) get evicted once the model spends a stretch
+/// on file/search tools — and the agent then silently loses the ability to run
+/// a script (observed live driving octos from Zed: the model fell back to
+/// `web_search`/`request_user_input` instead of executing a command). Mirrors
+/// the base set the gateway/profile runtimes pin.
+const ACP_BASE_TOOLS: &[&str] = &[
+    "shell",
+    "exec_command",
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "list_dir",
+    "glob",
+    "grep",
+];
+
+/// Build the tool registry shared by every ACP session: built-ins rooted at
+/// `cwd` under `sandbox_config`, with the core coding tools pinned as base
+/// tools (see [`ACP_BASE_TOOLS`]) so they survive LRU eviction.
+fn build_acp_tool_registry(
+    cwd: &std::path::Path,
+    sandbox_config: &octos_agent::SandboxConfig,
+) -> ToolRegistry {
+    let mut tools = ToolRegistry::with_builtins_and_sandbox(cwd, create_sandbox(sandbox_config));
+    tools.set_base_tools(ACP_BASE_TOOLS.iter().copied());
+    tools
+}
+
 #[async_trait::async_trait]
 impl SessionAgentFactory for ConfigAgentFactory {
     fn default_cwd(&self) -> &std::path::Path {
@@ -197,8 +231,7 @@ impl SessionAgentFactory for ConfigAgentFactory {
                 .wrap_err("failed to open episode store")?,
         );
 
-        let sandbox = create_sandbox(&self.config.sandbox);
-        let tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+        let tools = build_acp_tool_registry(&cwd, &self.config.sandbox);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let agent = Agent::new(AgentId::new("acp"), llm, tools, memory)
@@ -321,10 +354,7 @@ impl SessionAgentFactory for TestAgentFactory {
 
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
         let memory = Arc::new(EpisodeStore::open(&self.memory_dir).await?);
-        let tools = ToolRegistry::with_builtins_and_sandbox(
-            &cwd,
-            create_sandbox(&octos_agent::SandboxConfig::default()),
-        );
+        let tools = build_acp_tool_registry(&cwd, &octos_agent::SandboxConfig::default());
         let shutdown = Arc::new(AtomicBool::new(false));
         let agent = Agent::new(AgentId::new("acp-test"), self.llm.clone(), tools, memory)
             .with_shutdown(shutdown.clone());
@@ -871,6 +901,49 @@ pub(crate) fn project_progress_event_deduped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a long ACP session that keeps using file/search tools while
+    /// never touching the exec tools must not lose `shell`/`exec_command`/
+    /// `bash` to LRU eviction (`max_active` = 15). Before they were pinned as
+    /// base tools they got evicted after `idle_threshold` idle iterations and
+    /// the agent silently lost the ability to run scripts — observed live
+    /// driving octos from Zed (the model flailed on `web_search` /
+    /// `request_user_input` instead of running a command).
+    #[test]
+    fn should_keep_exec_tools_visible_when_long_session_only_uses_file_tools() {
+        let reg = build_acp_tool_registry(
+            std::path::Path::new("."),
+            &octos_agent::SandboxConfig::default(),
+        );
+        for t in ["shell", "exec_command", "bash"] {
+            assert!(
+                reg.is_tool_visible(t),
+                "{t} should be present at construction"
+            );
+        }
+        // Drive many turns that only ever use non-exec tools, applying LRU
+        // eviction each turn exactly as the agent loop does.
+        for _ in 0..12 {
+            reg.tick();
+            for used in [
+                "read_file",
+                "edit_file",
+                "grep",
+                "list_dir",
+                "glob",
+                "write_file",
+            ] {
+                reg.record_usage(used);
+            }
+            reg.auto_evict();
+        }
+        for t in ["shell", "exec_command", "bash"] {
+            assert!(
+                reg.is_tool_visible(t),
+                "{t} must survive LRU eviction across a long ACP session"
+            );
+        }
+    }
     use agent_client_protocol::schema::ProtocolVersion;
     use octos_agent::SilentReporter;
     use std::time::Duration;
