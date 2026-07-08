@@ -482,10 +482,14 @@ pub(crate) async fn run_extraction_pass(
         )
         .await;
         match outcome {
-            Ok(wrote) => {
+            Ok(outcome) => {
                 state.failures.remove(&key.0);
-                state.extractions_today += 1;
-                if wrote {
+                // The extraction-call budget counts PROVIDER calls; empty
+                // deltas (filtered-only changes) are free.
+                if outcome.called_provider {
+                    state.extractions_today += 1;
+                }
+                if outcome.wrote {
                     report.extracted += 1;
                 }
                 // Advance the watermark ONLY if the files did not change
@@ -682,6 +686,15 @@ fn snapshots_current(snaps: &[FileSnap]) -> bool {
 }
 
 /// Extract one session; returns Ok(true) when a staging artifact was written.
+/// What one session's extraction attempt did — the CALLER charges the
+/// daily extraction budget only when a provider call actually happened
+/// (empty deltas and unreadable sessions are free).
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtractOutcome {
+    called_provider: bool,
+    wrote: bool,
+}
+
 /// Stable fingerprint of the first `n` transcript messages — the delta
 /// cursor's validity check. Any change below the cursor resets it.
 fn transcript_prefix_fingerprint(transcript: &[(usize, Message)], n: usize) -> String {
@@ -722,10 +735,10 @@ async fn extract_one_session(
     key: &octos_core::SessionKey,
     newest: SystemTime,
     state: &mut RefreshState,
-) -> Result<bool> {
+) -> Result<ExtractOutcome> {
     let Some(transcript) = manager.export_transcript(key).await else {
         // Unreadable/empty: nothing to extract; not an error.
-        return Ok(false);
+        return Ok(ExtractOutcome::default());
     };
     // Delta extraction: skip messages consumed by earlier sweeps. The
     // cursor is valid only when the consumed PREFIX is byte-identical —
@@ -756,7 +769,7 @@ async fn extract_one_session(
                 transcript_prefix_fingerprint(&transcript, transcript.len()),
             ),
         );
-        return Ok(false);
+        return Ok(ExtractOutcome::default());
     }
     let rendered = render_transcript(
         &lines,
@@ -835,7 +848,10 @@ async fn extract_one_session(
                 transcript_prefix_fingerprint(&transcript, transcript.len()),
             ),
         );
-        return Ok(false);
+        return Ok(ExtractOutcome {
+            called_provider: true,
+            wrote: false,
+        });
     }
     memory_store
         .write_staging_extraction(Some(&key.0), provider.model_id(), &items)
@@ -850,7 +866,10 @@ async fn extract_one_session(
             transcript_prefix_fingerprint(&transcript, transcript.len()),
         ),
     );
-    Ok(true)
+    Ok(ExtractOutcome {
+        called_provider: true,
+        wrote: true,
+    })
 }
 
 #[cfg(test)]
@@ -1776,6 +1795,60 @@ mod tests {
             state.extracted_counts.contains_key("api:505"),
             "the no-provider backfill must run on capped passes: {:?}",
             state.extracted_counts
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_charge_extraction_budget_for_empty_delta() {
+        // A session whose only change is filtered content (e.g. a bare
+        // system row) produces an empty delta — no provider call, no
+        // budget charge.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:506", "a real user fact").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let before = RefreshState::load(&state_path).extractions_today;
+
+        // Append a SYSTEM message: build_input_lines drops it, so the
+        // delta is empty.
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("api:506".to_string());
+        let msg = octos_core::Message {
+            role: MessageRole::System,
+            content: "internal marker".to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        mgr.add_message(&key, msg).await.unwrap();
+        drop(mgr);
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert_eq!(
+            state.extractions_today, before,
+            "empty deltas must not burn the extraction-call budget"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "no second provider call"
         );
     }
 
