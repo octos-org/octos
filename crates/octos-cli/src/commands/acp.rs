@@ -609,7 +609,32 @@ async fn run_prompt_turn(
             // and the agent would forget context after the second prompt.
             {
                 let mut h = session.history.lock().await;
+                let assistant_reply = resp.content.clone();
                 h.extend(resp.messages);
+                // For a plain-text turn, `resp.messages` carries the user row but
+                // NOT the final assistant text (that is streamed live via
+                // `content`). Persist it explicitly so later prompts can refer
+                // back to what the agent SAID — mirroring the chat REPL, which
+                // also pushes `response.content` as an assistant message. Guard
+                // against double-append for turns where messages already ends
+                // with that assistant reply.
+                let already_persisted = matches!(
+                    h.last(),
+                    Some(last) if last.role == octos_core::MessageRole::Assistant && last.content == assistant_reply
+                );
+                if !assistant_reply.is_empty() && !already_persisted {
+                    h.push(octos_core::Message {
+                        role: octos_core::MessageRole::Assistant,
+                        content: assistant_reply,
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
             }
             // Distinguish a client-driven cancel from a natural end-of-turn.
             let stop_reason = if cancelled {

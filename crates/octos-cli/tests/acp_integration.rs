@@ -323,8 +323,24 @@ async fn should_accumulate_conversation_history_across_multiple_prompts() {
     );
     assert!(t3.contains("USER_THREE"), "turn 3 sees its own user msg");
 
-    // The accumulated history the LLM receives grows every turn (one extra
-    // user message per turn): [sys, u1] -> [sys, u1, u2] -> [sys, u1, u2, u3].
+    // codex round-2 regression: the ASSISTANT reply must also persist. A
+    // text-only turn carries the final reply in `resp.content`, NOT in
+    // `resp.messages`, so without explicitly persisting it the agent remembers
+    // what the USER said but not what IT answered. Turns 2 and 3 must see turn
+    // 1's assistant reply ("ASSISTANT_ONE").
+    assert!(
+        blob(1).contains("ASSISTANT_ONE"),
+        "turn 2 must see turn 1's ASSISTANT reply; assistant text not persisted. turn-2 messages: {:?}",
+        snapshots[1]
+    );
+    assert!(
+        t3.contains("ASSISTANT_ONE") && t3.contains("ASSISTANT_TWO"),
+        "turn 3 must see the assistant replies from turns 1 and 2. turn-3 messages: {:?}",
+        snapshots[2]
+    );
+
+    // The accumulated history the LLM receives grows every turn (user + assistant
+    // per turn): [sys, u1] -> [sys, u1, a1, u2] -> [sys, u1, a1, u2, a2, u3].
     assert!(
         snapshots[0].len() < snapshots[1].len() && snapshots[1].len() < snapshots[2].len(),
         "incoming message count must grow across turns: {} < {} < {}",
