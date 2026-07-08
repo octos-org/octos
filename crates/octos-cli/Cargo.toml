@@ -71,6 +71,12 @@ base64 = { workspace = true }
 # `octos_agent::workspace_policy::WorkspacePolicy` as the canonical schema
 # and only needs the `toml` deserializer entry point here.
 toml = { workspace = true }
+# `octos acp` speaks the Agent Client Protocol (Zed editor <-> agent standard)
+# over stdio. The official Rust SDK provides the JSON-RPC framing, the schema
+# types (initialize/session-new/prompt/cancel + session/update notifications),
+# and the connection runtime; `acp.rs` implements the agent side on top of the
+# existing octos agent loop. Pinned to the published 1.2.0 line.
+agent-client-protocol = "1.2.0"
 keyring = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }

@@ -1,6 +1,7 @@
 //! CLI commands for octos.
 
 mod account;
+mod acp;
 mod admin;
 mod auth;
 mod channels;
@@ -27,6 +28,13 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
+pub use acp::AcpCommand;
+// Test-support seam for the `octos acp` bridge: the end-to-end integration test
+// in `crates/octos-cli/tests/acp_integration.rs` drives the real ACP handler
+// wiring with a `MockLlm`-backed agent over an in-process transport. Hidden
+// from docs; not part of the stable surface.
+#[doc(hidden)]
+pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
@@ -83,6 +91,8 @@ fn version_string() -> &'static str {
 pub enum Command {
     /// Manage sub-accounts under profiles.
     Account(AccountCommand),
+    /// Run as an Agent Client Protocol (ACP) agent over stdio (Zed, etc.).
+    Acp(AcpCommand),
     /// Admin commands for tenant and tunnel management.
     Admin(AdminCommand),
     /// Manage authentication for LLM providers.
@@ -303,6 +313,7 @@ impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
             Self::Account(cmd) => cmd.execute(),
+            Self::Acp(cmd) => cmd.execute(),
             Self::Admin(cmd) => cmd.execute(),
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
