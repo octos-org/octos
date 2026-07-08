@@ -6,6 +6,72 @@ use tokio::process::Command;
 
 use super::{BLOCKED_ENV_VARS, DEFAULT_READ_ALLOW_PATHS, Sandbox};
 
+/// Pick a scratch temp dir for a READ-ONLY workspace that is provably OUTSIDE
+/// the (already-canonicalized) `real_cwd`.
+///
+/// `candidate` is the natural choice derived from `std::env::temp_dir()` (which
+/// honours `$TMPDIR`). A hostile parent can set `$TMPDIR` to a path UNDER the
+/// workspace; if we used it we would (a) mutate the read-only workspace when
+/// creating the dir and (b) grant SBPL write inside it — both defeat read-only
+/// (codex P2, round 3). So we canonicalize the candidate's location and, if it
+/// falls inside `real_cwd`, fall back to a base rooted at `/private/tmp` (the
+/// real path of `/tmp` on macOS, independent of `$TMPDIR`) which is guaranteed
+/// outside any normal workspace. This function performs NO filesystem
+/// mutation — the caller creates the dir only after the path is validated safe.
+fn read_only_scratch_dir(candidate: &Path, real_cwd: &Path) -> std::path::PathBuf {
+    // Resolve the candidate to a real path. It usually does not exist yet, so
+    // canonicalize the nearest existing ancestor and re-attach the tail.
+    let candidate_real = canonicalize_lexical(candidate);
+
+    if !candidate_real.starts_with(real_cwd) {
+        return candidate.to_path_buf();
+    }
+
+    // Candidate is inside the read-only workspace: fall back to a location that
+    // does not depend on $TMPDIR. `/private/tmp` is the canonical macOS temp
+    // root; guard against the pathological case where the workspace itself is
+    // under it by only using it when it is outside cwd.
+    let unique = format!("octos-sandbox-ro.{}", std::process::id());
+    for base in ["/private/tmp", "/private/var/tmp"] {
+        let fallback = Path::new(base).join(&unique);
+        if !canonicalize_lexical(&fallback).starts_with(real_cwd) {
+            return fallback;
+        }
+    }
+    // Extremely unlikely: even the system temp roots are inside cwd. Return the
+    // first fallback anyway — the SBPL grant is scoped to it, and the caller's
+    // "outside cwd" invariant is enforced by the write-rule guard below.
+    Path::new("/private/tmp").join(unique)
+}
+
+/// Canonicalize `path` as far as it exists, re-attaching any non-existent tail.
+/// Used to decide containment for a scratch dir that has not been created yet
+/// (`canonicalize` fails on non-existent paths, so we resolve the longest
+/// existing ancestor and re-append the remaining components).
+fn canonicalize_lexical(path: &Path) -> std::path::PathBuf {
+    let mut ancestor = path;
+    // Names peeled off while walking up, in leaf-to-root order.
+    let mut peeled: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(ancestor) {
+            for name in peeled.iter().rev() {
+                real.push(name);
+            }
+            return real;
+        }
+        match ancestor.parent() {
+            Some(parent) if parent != ancestor => {
+                if let Some(name) = ancestor.file_name() {
+                    peeled.push(name);
+                }
+                ancestor = parent;
+            }
+            // Reached the root without finding an existing ancestor.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// macOS sandbox using sandbox-exec.
 pub struct MacosSandbox {
     pub(crate) allow_network: bool,
@@ -127,7 +193,14 @@ impl Sandbox for MacosSandbox {
         let user_tmp = if self.workspace_write {
             cwd.join("tmp")
         } else {
-            std::env::temp_dir().join(format!("octos-sandbox-ro.{}", std::process::id()))
+            // `std::env::temp_dir()` honours `$TMPDIR`, which a hostile parent
+            // could point UNDER the workspace. Route the candidate through
+            // `read_only_scratch_dir`, which guarantees a path OUTSIDE the
+            // (canonicalized) workspace so we never mutate it (codex P2).
+            let candidate =
+                std::env::temp_dir().join(format!("octos-sandbox-ro.{}", std::process::id()));
+            let real_cwd_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            read_only_scratch_dir(&candidate, &real_cwd_path)
         };
         // Create the scratch dir. For the writable case this lives inside the
         // (writable) workspace; for the read-only case it is outside it.
@@ -141,10 +214,20 @@ impl Sandbox for MacosSandbox {
         let external_tmp_write_rule = if self.workspace_write {
             String::new()
         } else {
-            let real_tmp = std::fs::canonicalize(&user_tmp)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| user_tmp.to_string_lossy().to_string());
-            if real_tmp
+            let real_tmp_path =
+                std::fs::canonicalize(&user_tmp).unwrap_or_else(|_| user_tmp.clone());
+            let real_tmp = real_tmp_path.to_string_lossy().to_string();
+            // Defence in depth: NEVER grant write to a temp path that resolved
+            // inside the workspace — that would re-open the read-only hole even
+            // though `read_only_scratch_dir` already steers outside cwd
+            // (codex P2, fail-closed).
+            let real_cwd_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            if real_tmp_path.starts_with(&real_cwd_path) {
+                tracing::error!(
+                    "external temp dir resolved inside the read-only workspace, omitting write grant"
+                );
+                String::new()
+            } else if real_tmp
                 .bytes()
                 .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
             {
@@ -715,6 +798,102 @@ mod tests {
             profile.contains(&format!(r#"(allow file-write* (subpath "{real_tmp}"))"#)),
             "external temp dir must be granted file-write* in SBPL, profile:\n{profile}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_reject_scratch_candidate_inside_workspace_when_read_only() {
+        // P2 (codex, round 3): `std::env::temp_dir()` honours `$TMPDIR`, which a
+        // parent could point UNDER the read-only workspace. `read_only_scratch_dir`
+        // must detect a candidate inside the (canonicalized) cwd and fall back to
+        // a location provably OUTSIDE the workspace — WITHOUT creating anything
+        // under cwd.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        // Adversarial candidate: a subdir of the workspace cwd (what $TMPDIR
+        // pointing under cwd would yield).
+        let evil_candidate = cwd.join("evil-tmp");
+        let scratch = read_only_scratch_dir(&evil_candidate, &real_cwd);
+
+        // The chosen scratch dir must be OUTSIDE the workspace...
+        let scratch_real = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        assert!(
+            !scratch_real.starts_with(&real_cwd),
+            "read-only scratch must be OUTSIDE the workspace, got {} (cwd {})",
+            scratch_real.display(),
+            real_cwd.display()
+        );
+        // ...and choosing it must NOT have created anything inside cwd.
+        assert!(
+            !evil_candidate.exists(),
+            "must NOT create the in-workspace candidate dir"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_keep_scratch_candidate_outside_workspace_when_read_only() {
+        // When $TMPDIR is already OUTSIDE the workspace, the candidate is kept.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let outside = tempfile::tempdir().expect("create outside temp dir");
+        let good_candidate = outside.path().join("octos-sandbox-ro.123");
+        let scratch = read_only_scratch_dir(&good_candidate, &real_cwd);
+        assert_eq!(
+            scratch, good_candidate,
+            "an outside candidate must be used as-is"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_not_use_tmpdir_inside_workspace_end_to_end_when_read_only() {
+        // End-to-end through wrap_command: even though we can't safely mutate
+        // $TMPDIR in a #[deny(unsafe_code)] test, assert the wired TMPDIR points
+        // OUTSIDE the workspace and no scratch dir was created under cwd.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+
+        assert!(
+            !cwd.join("tmp").exists(),
+            "read-only wrapper must NOT create <cwd>/tmp"
+        );
+
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            let val = envs
+                .get(key)
+                .and_then(|v| v.clone())
+                .unwrap_or_else(|| panic!("{key} must be set"));
+            let real_val =
+                std::fs::canonicalize(&val).unwrap_or_else(|_| std::path::PathBuf::from(&val));
+            assert!(
+                !real_val.starts_with(&real_cwd),
+                "{key} must point OUTSIDE the read-only workspace, got {val} (real {})",
+                real_val.display()
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
