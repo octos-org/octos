@@ -93,6 +93,13 @@ pub(crate) struct RefreshState {
     /// Per session key: the file snapshots actually READ last time.
     #[serde(default)]
     pub watermarks: std::collections::BTreeMap<String, Vec<FileSnap>>,
+    /// Per session key: transcript messages already CONSUMED by extraction.
+    /// Later sweeps feed only the delta — re-reading history would
+    /// re-learn facts the user has since hard-deleted (they are gone from
+    /// CURRENT MEMORY, so the "do not re-extract" instruction cannot see
+    /// them) and would re-spend tokens on every old turn.
+    #[serde(default)]
+    pub extracted_counts: std::collections::BTreeMap<String, usize>,
     /// Per session key: consecutive extraction failures (skip at cap).
     #[serde(default)]
     pub failures: std::collections::BTreeMap<String, u32>,
@@ -646,8 +653,22 @@ async fn extract_one_session(
         // Unreadable/empty: nothing to extract; not an error.
         return Ok(false);
     };
-    let lines = build_input_lines(&transcript);
+    // Delta extraction: skip messages consumed by earlier sweeps. A
+    // SHORTER transcript means the session file was rewritten (fork,
+    // truncation) — start over from the top.
+    let prior = state
+        .extracted_counts
+        .get(&key.0)
+        .copied()
+        .filter(|&n| n <= transcript.len())
+        .unwrap_or(0);
+    let fresh = &transcript[prior..];
+    let lines = build_input_lines(fresh);
     if lines.is_empty() {
+        // Nothing extractable in the delta; remember we consumed it.
+        state
+            .extracted_counts
+            .insert(key.0.clone(), transcript.len());
         return Ok(false);
     }
     let rendered = render_transcript(
@@ -716,6 +737,12 @@ async fn extract_one_session(
     let parsed = parse_extraction_response(&raw)
         .map_err(|e| eyre::eyre!("extraction output was not valid JSON: {e}"))?;
     let items = validate_items(parsed, &lines, &session_date.format("%Y-%m-%d").to_string());
+    // The delta is consumed whichever way this run ends now — advancing on
+    // the no-op path too is what stops old turns from being re-fed (and
+    // re-charged) on every later sweep.
+    state
+        .extracted_counts
+        .insert(key.0.clone(), transcript.len());
     if items.is_empty() {
         // The no-op gate firing is the expected common case.
         return Ok(false);
@@ -735,17 +762,22 @@ mod tests {
     struct ScriptedProvider {
         response: String,
         calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
     impl LlmProvider for ScriptedProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[ToolSpec],
             _config: &ChatConfig,
         ) -> eyre::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.prompts
+                .lock()
+                .unwrap()
+                .extend(messages.iter().map(|m| m.content.clone()));
             Ok(ChatResponse {
                 content: Some(self.response.clone()),
                 reasoning_content: None,
@@ -817,6 +849,7 @@ mod tests {
                 r#"{"items":[{"kind":"fact","content":"lives in Vancouver","evidence":[0]}]}"#
                     .to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let knobs = knobs_for_test();
         let report = run_extraction_pass(dir.path(), &store, &provider, &knobs)
@@ -844,6 +877,7 @@ mod tests {
         let provider = ScriptedProvider {
             response: r#"{"items":[]}"#.to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let report = run_extraction_pass(dir.path(), &store, &provider, &knobs_for_test())
             .await
@@ -874,6 +908,7 @@ mod tests {
         let provider = ScriptedProvider {
             response: r#"{"items":[]}"#.to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let report = run_extraction_pass(dir.path(), &store, &provider, &knobs_for_test())
             .await
@@ -899,6 +934,7 @@ mod tests {
         let provider = ScriptedProvider {
             response: "NOT JSON AT ALL".to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let knobs = knobs_for_test();
         for _ in 0..MAX_SESSION_FAILURES {
@@ -985,6 +1021,7 @@ mod tests {
                 r#"{"items":[{"kind":"fact","content":"lives in Vancouver","evidence":[0]}]}"#
                     .to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let knobs = knobs_for_test();
         let report = run_extraction_pass(dir.path(), &store, &extract, &knobs)
@@ -1271,6 +1308,7 @@ mod tests {
         let extract = ScriptedProvider {
             response: "NOT JSON".to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let notes_dir = dir.path().join("memory/staging/notes");
         let note_name = std::fs::read_dir(&notes_dir)
@@ -1380,6 +1418,57 @@ mod tests {
             state.tokens_today >= 1_000,
             "the consumed staging payload must be charged (pre-capture): {}",
             state.tokens_today
+        );
+    }
+
+    #[tokio::test]
+    async fn should_extract_only_delta_when_session_grows() {
+        // A fact stated BEFORE the first sweep must not be re-fed to the
+        // extractor after later turns move the watermark — re-reading
+        // history re-learns facts the user may have hard-deleted since.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:500", "my favorite tea is oolong").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider.prompts.lock().unwrap().concat().contains("oolong"),
+            "first sweep reads the full transcript"
+        );
+
+        // The session grows by one new exchange.
+        seed_session(dir.path(), "api:500", "my staging server is maple").await;
+        provider.prompts.lock().unwrap().clear();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let second = provider.prompts.lock().unwrap().concat();
+        assert!(
+            second.contains("maple"),
+            "the new turn is extracted: {second}"
+        );
+        // The old statement may appear in CURRENT MEMORY context but must
+        // not appear in the TRANSCRIPT slice. Assert on the transcript
+        // portion only.
+        let transcript_part = second
+            .split("TRANSCRIPT of session")
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !transcript_part.contains("oolong"),
+            "already-consumed turns must not be re-fed: {transcript_part}"
         );
     }
 
