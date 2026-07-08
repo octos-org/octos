@@ -9,7 +9,9 @@
 //! under the profile's memory directory. Wiring into schedulers/CLI lands in
 //! a later integration PR.
 
+pub mod apply;
 pub mod entry;
 pub mod ops;
 pub mod pending;
+pub mod prompt;
 pub mod staging;

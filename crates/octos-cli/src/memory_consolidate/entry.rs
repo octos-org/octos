@@ -65,7 +65,7 @@ fn trailing_id(block: &str) -> Option<&str> {
 
 /// Split file content into blocks of consecutive non-blank lines.
 /// Lines containing only whitespace act as separators.
-fn split_blocks(content: &str) -> Vec<String> {
+pub(super) fn split_blocks(content: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current: Vec<&str> = Vec::new();
     for line in content.lines() {

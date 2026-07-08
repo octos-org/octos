@@ -107,7 +107,7 @@ pub fn compute_candidates(note_content: &str, entries: &[Entry]) -> Vec<(String,
         .iter()
         .filter_map(|e| binding_score(note_content, e).map(|score| (e.id.clone(), score)))
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
     scored
 }
 
