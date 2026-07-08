@@ -1150,6 +1150,27 @@ fn execute_id_bound_forgets(
         }
     }
     if !plan.hard_deletes.is_empty() || !satisfied_no_op.is_empty() {
+        // Resolve consumed notes to IDENTITY (path) BEFORE any batch
+        // mutation — retain() below shifts positions and stored numeric
+        // indices would remove/delete the wrong note.
+        let mut consumed: Vec<(PathBuf, String, bool)> = executed_notes
+            .iter()
+            .map(|&i| {
+                (
+                    batch.notes[i].path.clone(),
+                    batch.notes[i].id.clone(),
+                    false,
+                )
+            })
+            .chain(
+                satisfied_no_op
+                    .iter()
+                    .map(|&i| (batch.notes[i].path.clone(), batch.notes[i].id.clone(), true)),
+            )
+            .collect();
+        consumed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        consumed.dedup_by(|a, b| a.0 == b.0);
+
         if !plan.hard_deletes.is_empty() {
             plan.final_entries = working.clone();
             let report = apply::apply_plan(memory_dir, params.today, &plan)?;
@@ -1166,25 +1187,31 @@ fn execute_id_bound_forgets(
                     .parse_failures
                     .retain(|(p, _, _)| !scrubbed.contains(p));
             }
+            // apply_plan may itself have scrubbed exact deleted lines out
+            // of SURVIVING entries before publishing MEMORY.md — returning
+            // the pre-scrub `working` would leak them into the next merge
+            // prompt and write them back on the final apply. Re-read the
+            // published state; it is the single source of truth.
+            let published = std::fs::read_to_string(memory_dir.join("MEMORY.md"))
+                .wrap_err("failed to re-read MEMORY.md after Rust-side apply")?;
+            match entry::parse_memory_md(&published).map_err(|e| eyre::eyre!(e))? {
+                entry::ParsedMemory::Entries(parsed) => working = parsed,
+                // Unreachable in practice: this run just published id'd
+                // entries. Keep the pre-scrub set rather than guessing.
+                entry::ParsedMemory::Legacy(_) => {}
+            }
         }
         // Fully-honored notes were consumed by the apply (authorizing note
         // deletion); drop them from the batch — together with siblings
         // whose named ids were already deleted this run (their files must
         // go too, or the ask would reappear next run).
-        let mut consumed: Vec<(usize, bool)> = executed_notes
-            .into_iter()
-            .map(|i| (i, false))
-            .chain(satisfied_no_op.into_iter().map(|i| (i, true)))
-            .collect();
-        consumed.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        consumed.dedup_by_key(|(i, _)| *i);
-        for (i, delete_file) in consumed {
-            let note = batch.notes.remove(i);
+        for (path, note_id, delete_file) in consumed {
+            batch.notes.retain(|n| n.path != path);
             if delete_file {
-                apply::remove_file_if_exists(&note.path)?;
+                apply::remove_file_if_exists(&path)?;
             }
             outcome.dropped.push((
-                note.id.clone(),
+                note_id,
                 "executed Rust-side (id-bound host authority)".to_string(),
             ));
         }
@@ -3786,5 +3813,109 @@ mod tests {
         );
         let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
         assert!(!memory.contains("^mlivsec"));
+    }
+
+    #[tokio::test]
+    async fn should_return_scrubbed_entries_after_rust_side_delete() {
+        // A surviving entry shares an exact line with the deleted one. The
+        // Rust-side apply scrubs it from MEMORY.md — the entries used for
+        // the SAME run's merge prompt must reflect that, or the line leaks
+        // to the provider and gets written back by the final apply.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret_line = "The vault code is 9137.";
+        write_memory(
+            memory_dir,
+            &[
+                &format!("{secret_line}\nKept in the notebook. (updated: 2026-06-01) ^msecret"),
+                &format!("{secret_line}\nAlso likes tea. (updated: 2026-06-02) ^msharer"),
+            ],
+        );
+        write_note(
+            memory_dir,
+            "01fg-exact",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+        write_note(memory_dir, "02clean", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["02clean"]}],"consumed_ids":["02clean"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+
+        let prompt_text: String = provider
+            .call_messages(0)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("9137"),
+            "the scrubbed shared line must not ride the merge prompt"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("9137"),
+            "the final apply must not write the scrubbed line back: {memory}"
+        );
+        assert!(memory.contains("Also likes tea."));
+    }
+
+    #[tokio::test]
+    async fn should_not_misremove_notes_when_scrub_prunes_earlier_paths() {
+        // A model note that sorts BEFORE the authorizing forget quotes the
+        // secret exact-line: the scrub prune shifts batch positions, and
+        // consumption must still remove the RIGHT notes (by identity).
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret_line = "The vault code is 9137.";
+        write_memory(
+            memory_dir,
+            &[
+                &format!("{secret_line} (updated: 2026-06-01) ^msecret"),
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        // "00quoter" sorts before "01fg-exact".
+        write_note(
+            memory_dir,
+            "00quoter",
+            "model",
+            "fact",
+            &format!("Overheard:\n{secret_line}"),
+            false,
+        );
+        write_note(
+            memory_dir,
+            "01fg-exact",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+        let keeper = write_note(memory_dir, "02keeper", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["02keeper"]}],"consumed_ids":["02keeper"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+        assert!(
+            !keeper.exists(),
+            "the keeper was consumed by the merge, not misremoved earlier"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("Likes tea."),
+            "keeper's fact landed: {memory}"
+        );
     }
 }
