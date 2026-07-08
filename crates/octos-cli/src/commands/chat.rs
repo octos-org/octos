@@ -13,8 +13,9 @@ use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
     HookExecutor, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolRegistry,
-    read_workspace_policy,
+    UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester, read_workspace_policy,
 };
+use octos_core::ui_protocol::UserQuestionAnswer;
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
@@ -124,6 +125,144 @@ fn prompt_for_cli_approval(request: ToolApprovalRequest) -> ToolApprovalDecision
     }
 }
 
+struct CliUserQuestionRequester;
+
+#[async_trait::async_trait]
+impl UserQuestionRequester for CliUserQuestionRequester {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
+        // Share the approval prompt lock: an approval and a question in the
+        // same turn must not interleave their stdin reads.
+        static PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = PROMPT_LOCK.lock().await;
+        tokio::task::spawn_blocking(move || prompt_for_cli_user_question(request))
+            .await
+            .unwrap_or(UserQuestionOutcome::Cancelled)
+    }
+}
+
+fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOutcome {
+    // No terminal to prompt on → let the tool degrade to its structured
+    // fallback (the model re-asks in plain text) rather than block forever.
+    if !io::stdin().is_terminal() {
+        return UserQuestionOutcome::Unsupported;
+    }
+
+    eprintln!();
+    eprintln!("{}", "Agent needs your input".cyan().bold());
+    if !request.title.is_empty() {
+        eprintln!("{}", request.title.bold());
+    }
+    if !request.body.is_empty() {
+        eprintln!("{}", request.body);
+    }
+
+    let total = request.questions.len();
+    let mut answers: Vec<UserQuestionAnswer> = Vec::with_capacity(total);
+
+    for (qi, question) in request.questions.iter().enumerate() {
+        eprintln!();
+        if total > 1 {
+            eprintln!("{}", format!("Question {} of {}", qi + 1, total).dimmed());
+        }
+        eprintln!("{}", question.question.bold());
+
+        // Numbered options, then an "Other" row when free text is offered.
+        for (oi, opt) in question.options.iter().enumerate() {
+            if opt.description.is_empty() {
+                eprintln!("  {}. {}", oi + 1, opt.label);
+            } else {
+                eprintln!("  {}. {} — {}", oi + 1, opt.label, opt.description.dimmed());
+            }
+        }
+        let other_index = question.options.len() + 1;
+        if question.allow_free_text {
+            eprintln!("  {other_index}. {}", "Other (type your own)".dimmed());
+        }
+
+        if question.multi_select {
+            eprint!("Choose one or more, comma-separated [1]: ");
+        } else {
+            eprint!("Choose [1]: ");
+        }
+        let _ = io::stderr().flush();
+
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            // EOF (Ctrl-D) — abandon the whole question.
+            return UserQuestionOutcome::Cancelled;
+        }
+        let (selected_labels, other_picked) = parse_question_selection(question, &line);
+
+        // Read the free-text answer only when "Other" was chosen.
+        let mut free_text: Option<String> = None;
+        if other_picked {
+            eprint!("Your answer: ");
+            let _ = io::stderr().flush();
+            let mut ft = String::new();
+            if io::stdin().read_line(&mut ft).unwrap_or(0) == 0 {
+                return UserQuestionOutcome::Cancelled;
+            }
+            let ft = ft.trim().to_string();
+            if !ft.is_empty() {
+                free_text = Some(ft);
+            }
+        }
+
+        answers.push(UserQuestionAnswer {
+            selected_labels,
+            free_text,
+        });
+    }
+
+    UserQuestionOutcome::Answered(answers)
+}
+
+/// Parse the numbered-selection `line` for one question into (option labels,
+/// was-"Other"-picked). Empty input defaults to option 1. Out-of-range and
+/// non-numeric tokens are dropped; a single-select question keeps only the
+/// first valid pick. The "Other" row is index `options.len() + 1` and is only
+/// honoured when the question allows free text. Pure so it can be unit-tested
+/// without stdin.
+fn parse_question_selection(
+    question: &octos_core::ui_protocol::UserQuestion,
+    line: &str,
+) -> (Vec<String>, bool) {
+    let other_index = question.options.len() + 1;
+    // The "Other" row is only selectable when the question allows free text.
+    let max_index = if question.allow_free_text {
+        other_index
+    } else {
+        question.options.len()
+    };
+    let trimmed = line.trim();
+    let mut picks: Vec<usize> = trimmed
+        .split(',')
+        .filter_map(|tok| tok.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1 && *n <= max_index)
+        .collect();
+    // Empty or all-invalid input falls back to the first option (the "[1]"
+    // default shown in the prompt) so a stray keystroke still yields an answer.
+    if picks.is_empty() {
+        picks.push(1);
+    }
+    if !question.multi_select {
+        picks.truncate(1);
+    }
+
+    let mut selected_labels = Vec::new();
+    let mut other_picked = false;
+    for n in picks {
+        // `n == other_index` is only reachable when free text is allowed
+        // (`max_index` excludes it otherwise), so it always means "Other".
+        if n == other_index {
+            other_picked = true;
+        } else if let Some(opt) = question.options.get(n - 1) {
+            selected_labels.push(opt.label.clone());
+        }
+    }
+    (selected_labels, other_picked)
+}
+
 async fn with_chat_approval<F, T>(
     approval_requester: Arc<dyn ToolApprovalRequester>,
     future: F,
@@ -131,8 +270,15 @@ async fn with_chat_approval<F, T>(
 where
     F: Future<Output = T>,
 {
-    octos_agent::tools::TOOL_APPROVAL_CTX
-        .scope(approval_requester, future)
+    // Scope BOTH the approval and the user-question requesters for the turn,
+    // so `ask_user_question` renders the interactive numbered prompt instead
+    // of degrading to Unsupported (the model re-asking in plain text).
+    let uq_requester: Arc<dyn UserQuestionRequester> = Arc::new(CliUserQuestionRequester);
+    octos_agent::tools::USER_QUESTION_CTX
+        .scope(
+            uq_requester,
+            octos_agent::tools::TOOL_APPROVAL_CTX.scope(approval_requester, future),
+        )
         .await
 }
 
@@ -952,6 +1098,74 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    fn q(multi: bool, allow_free_text: bool) -> octos_core::ui_protocol::UserQuestion {
+        use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
+        UserQuestion {
+            header: "H".into(),
+            question: "Which?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: String::new(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: String::new(),
+                },
+                UserQuestionOption {
+                    label: "warp".into(),
+                    description: String::new(),
+                },
+            ],
+            multi_select: multi,
+            allow_free_text,
+        }
+    }
+
+    #[test]
+    fn parse_selection_single_picks_the_numbered_option() {
+        let (labels, other) = parse_question_selection(&q(false, true), "2");
+        assert_eq!(labels, vec!["actix"]);
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_empty_defaults_to_first_option() {
+        let (labels, other) = parse_question_selection(&q(false, true), "  \n");
+        assert_eq!(labels, vec!["axum"]);
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_single_ignores_extra_picks() {
+        // Single-select keeps only the first valid pick.
+        let (labels, _) = parse_question_selection(&q(false, true), "3,1");
+        assert_eq!(labels, vec!["warp"]);
+    }
+
+    #[test]
+    fn parse_selection_multi_keeps_all_valid_and_drops_garbage() {
+        let (labels, other) = parse_question_selection(&q(true, true), "1, 3, 9, x");
+        assert_eq!(labels, vec!["axum", "warp"]); // 9 out-of-range, x non-numeric
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_other_index_sets_free_text_flag() {
+        // Other is options.len()+1 = 4 here.
+        let (labels, other) = parse_question_selection(&q(false, true), "4");
+        assert!(labels.is_empty());
+        assert!(other);
+    }
+
+    #[test]
+    fn parse_selection_other_ignored_when_free_text_disallowed() {
+        // With free text off, index 4 is out of range → filtered → default(1).
+        let (labels, other) = parse_question_selection(&q(false, false), "4");
+        assert!(!other);
+        assert_eq!(labels, vec!["axum"]); // empty picks after filter → default
+    }
 
     #[test]
     fn test_resolve_provider_policy_model_id_match() {
