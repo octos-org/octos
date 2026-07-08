@@ -93,6 +93,16 @@ pub(crate) struct RefreshState {
     /// Per session key: the file snapshots actually READ last time.
     #[serde(default)]
     pub watermarks: std::collections::BTreeMap<String, Vec<FileSnap>>,
+    /// Per session key: (transcript messages CONSUMED, fingerprint of that
+    /// consumed prefix). Later sweeps feed only the delta — re-reading
+    /// history would re-learn facts the user has since hard-deleted (they
+    /// are gone from CURRENT MEMORY, so the "do not re-extract"
+    /// instruction cannot see them) and would re-spend tokens on every
+    /// old turn. The FINGERPRINT (not file bytes) detects rewrites:
+    /// rollback-and-continue can grow the file while replacing folded
+    /// messages below the cursor — any prefix change resets it.
+    #[serde(default)]
+    pub extracted_counts: std::collections::BTreeMap<String, (usize, String)>,
     /// Per session key: consecutive extraction failures (skip at cap).
     #[serde(default)]
     pub failures: std::collections::BTreeMap<String, u32>,
@@ -364,6 +374,47 @@ pub(crate) async fn run_extraction_pass(
     let mut state = RefreshState::load(&state_path);
     state.roll_date(&chrono::Local::now().format("%Y-%m-%d").to_string());
 
+    let manager = SessionManager::open(data_dir).wrap_err("failed to open session manager")?;
+    let now = SystemTime::now();
+
+    // Pre-upgrade cursor backfill — INDEPENDENT of extraction eligibility
+    // (idle windows, age caps, budgets): a watermarked session without a
+    // cursor was fully consumed by a pre-cursor sweep; stamp it before
+    // anything can make the session a candidate, or its next append would
+    // fall back to prior=0 and re-feed the whole history. Sessions whose
+    // files already changed since the old watermark accept a one-time
+    // full re-read (we cannot know the consumed prefix).
+    for session in manager.list_for_analysis() {
+        if session.internal || session.files.is_empty() {
+            continue;
+        }
+        if state.extracted_counts.contains_key(&session.key.0) {
+            continue;
+        }
+        let snaps: Vec<FileSnap> = session
+            .files
+            .iter()
+            .map(|f| FileSnap::of(&f.path, f.modified, f.len))
+            .collect();
+        if state.watermarks.get(&session.key.0) != Some(&snaps) {
+            continue;
+        }
+        if let Some(transcript) = manager.export_transcript(&session.key).await {
+            // Pre-read snapshot rule: a turn appended DURING this read
+            // would be stamped consumed without extraction.
+            if snapshots_current(&snaps) {
+                let fp = transcript_prefix_fingerprint(&transcript, transcript.len());
+                state
+                    .extracted_counts
+                    .insert(session.key.0.clone(), (transcript.len(), fp));
+                state.save(&state_path)?;
+            }
+        }
+    }
+
+    // The budget gates PROVIDER work only — the no-provider backfill above
+    // must run even on capped passes, or an append before the budget reset
+    // would re-feed the whole pre-upgrade history.
     if state.extractions_today >= knobs.max_extractions_per_day
         || state.tokens_today >= knobs.max_daily_tokens
     {
@@ -372,11 +423,9 @@ pub(crate) async fn run_extraction_pass(
         return Ok(report);
     }
 
-    let manager = SessionManager::open(data_dir).wrap_err("failed to open session manager")?;
-    let now = SystemTime::now();
-
     // Eligible = user-facing, idle long enough, young enough, and changed
     // since the snapshots we last read.
+
     let mut candidates: Vec<(octos_bus::AnalysisSession, Vec<FileSnap>, SystemTime)> = Vec::new();
     for session in manager.list_for_analysis() {
         if session.internal || session.files.is_empty() {
@@ -433,10 +482,14 @@ pub(crate) async fn run_extraction_pass(
         )
         .await;
         match outcome {
-            Ok(wrote) => {
+            Ok(outcome) => {
                 state.failures.remove(&key.0);
-                state.extractions_today += 1;
-                if wrote {
+                // The extraction-call budget counts PROVIDER calls; empty
+                // deltas (filtered-only changes) are free.
+                if outcome.called_provider {
+                    state.extractions_today += 1;
+                }
+                if outcome.wrote {
                     report.extracted += 1;
                 }
                 // Advance the watermark ONLY if the files did not change
@@ -633,6 +686,47 @@ fn snapshots_current(snaps: &[FileSnap]) -> bool {
 }
 
 /// Extract one session; returns Ok(true) when a staging artifact was written.
+/// What one session's extraction attempt did — the CALLER charges the
+/// daily extraction budget only when a provider call actually happened
+/// (empty deltas and unreadable sessions are free).
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtractOutcome {
+    called_provider: bool,
+    wrote: bool,
+}
+
+/// Stable fingerprint of the first `n` transcript messages — the delta
+/// cursor's validity check. Any change below the cursor resets it.
+fn transcript_prefix_fingerprint(transcript: &[(usize, Message)], n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (_, msg) in &transcript[..n.min(transcript.len())] {
+        // Every field build_input_lines consumes: rewrites that change
+        // only tool linkage (rollback/migration) must invalidate the
+        // cursor too, or a changed sanitized prefix would be skipped.
+        hasher.update(msg.role.as_str().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(msg.content.as_bytes());
+        hasher.update([0u8]);
+        if let Some(id) = &msg.tool_call_id {
+            hasher.update(id.as_bytes());
+        }
+        hasher.update([0u8]);
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                hasher.update(call.id.as_bytes());
+                hasher.update([1u8]);
+                hasher.update(call.name.as_bytes());
+                hasher.update([1u8]);
+                hasher.update(call.arguments.to_string().as_bytes());
+                hasher.update([1u8]);
+            }
+        }
+        hasher.update([0x1e]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 async fn extract_one_session(
     manager: &SessionManager,
     memory_store: &Arc<MemoryStore>,
@@ -641,14 +735,41 @@ async fn extract_one_session(
     key: &octos_core::SessionKey,
     newest: SystemTime,
     state: &mut RefreshState,
-) -> Result<bool> {
+) -> Result<ExtractOutcome> {
     let Some(transcript) = manager.export_transcript(key).await else {
         // Unreadable/empty: nothing to extract; not an error.
-        return Ok(false);
+        return Ok(ExtractOutcome::default());
     };
-    let lines = build_input_lines(&transcript);
+    // Delta extraction: skip messages consumed by earlier sweeps. The
+    // cursor is valid only when the consumed PREFIX is byte-identical —
+    // fork/truncation/rollback-and-continue all change it and reset the
+    // cursor to a full re-read.
+    let prior = state
+        .extracted_counts
+        .get(&key.0)
+        .filter(|(n, fp)| {
+            *n <= transcript.len() && *fp == transcript_prefix_fingerprint(&transcript, *n)
+        })
+        .map(|(n, _)| *n)
+        .unwrap_or(0);
+    // Build lines over the FULL transcript (tool-call names for result
+    // filtering can live in already-consumed messages), then keep only
+    // the fresh indices. Labels keep original indices, so evidence
+    // validation is unaffected.
+    let lines: Vec<_> = build_input_lines(&transcript)
+        .into_iter()
+        .filter(|l| l.idx >= prior)
+        .collect();
     if lines.is_empty() {
-        return Ok(false);
+        // Nothing extractable in the delta; remember we consumed it.
+        state.extracted_counts.insert(
+            key.0.clone(),
+            (
+                transcript.len(),
+                transcript_prefix_fingerprint(&transcript, transcript.len()),
+            ),
+        );
+        return Ok(ExtractOutcome::default());
     }
     let rendered = render_transcript(
         &lines,
@@ -717,13 +838,38 @@ async fn extract_one_session(
         .map_err(|e| eyre::eyre!("extraction output was not valid JSON: {e}"))?;
     let items = validate_items(parsed, &lines, &session_date.format("%Y-%m-%d").to_string());
     if items.is_empty() {
-        // The no-op gate firing is the expected common case.
-        return Ok(false);
+        // The no-op gate firing is the expected common case — the delta
+        // was consumed (nothing worth staging), so advance the cursor or
+        // these turns would be re-fed and re-charged every later sweep.
+        state.extracted_counts.insert(
+            key.0.clone(),
+            (
+                transcript.len(),
+                transcript_prefix_fingerprint(&transcript, transcript.len()),
+            ),
+        );
+        return Ok(ExtractOutcome {
+            called_provider: true,
+            wrote: false,
+        });
     }
     memory_store
         .write_staging_extraction(Some(&key.0), provider.model_id(), &items)
         .await?;
-    Ok(true)
+    // Only now is the extraction durable — advancing earlier would let a
+    // failed write mark these turns consumed and the retry would skip
+    // them forever.
+    state.extracted_counts.insert(
+        key.0.clone(),
+        (
+            transcript.len(),
+            transcript_prefix_fingerprint(&transcript, transcript.len()),
+        ),
+    );
+    Ok(ExtractOutcome {
+        called_provider: true,
+        wrote: true,
+    })
 }
 
 #[cfg(test)]
@@ -735,17 +881,22 @@ mod tests {
     struct ScriptedProvider {
         response: String,
         calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
     impl LlmProvider for ScriptedProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[ToolSpec],
             _config: &ChatConfig,
         ) -> eyre::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.prompts
+                .lock()
+                .unwrap()
+                .extend(messages.iter().map(|m| m.content.clone()));
             Ok(ChatResponse {
                 content: Some(self.response.clone()),
                 reasoning_content: None,
@@ -817,6 +968,7 @@ mod tests {
                 r#"{"items":[{"kind":"fact","content":"lives in Vancouver","evidence":[0]}]}"#
                     .to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let knobs = knobs_for_test();
         let report = run_extraction_pass(dir.path(), &store, &provider, &knobs)
@@ -844,6 +996,7 @@ mod tests {
         let provider = ScriptedProvider {
             response: r#"{"items":[]}"#.to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let report = run_extraction_pass(dir.path(), &store, &provider, &knobs_for_test())
             .await
@@ -874,6 +1027,7 @@ mod tests {
         let provider = ScriptedProvider {
             response: r#"{"items":[]}"#.to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let report = run_extraction_pass(dir.path(), &store, &provider, &knobs_for_test())
             .await
@@ -899,6 +1053,7 @@ mod tests {
         let provider = ScriptedProvider {
             response: "NOT JSON AT ALL".to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let knobs = knobs_for_test();
         for _ in 0..MAX_SESSION_FAILURES {
@@ -985,6 +1140,7 @@ mod tests {
                 r#"{"items":[{"kind":"fact","content":"lives in Vancouver","evidence":[0]}]}"#
                     .to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let knobs = knobs_for_test();
         let report = run_extraction_pass(dir.path(), &store, &extract, &knobs)
@@ -1271,6 +1427,7 @@ mod tests {
         let extract = ScriptedProvider {
             response: "NOT JSON".to_string(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         };
         let notes_dir = dir.path().join("memory/staging/notes");
         let note_name = std::fs::read_dir(&notes_dir)
@@ -1380,6 +1537,318 @@ mod tests {
             state.tokens_today >= 1_000,
             "the consumed staging payload must be charged (pre-capture): {}",
             state.tokens_today
+        );
+    }
+
+    #[tokio::test]
+    async fn should_extract_only_delta_when_session_grows() {
+        // A fact stated BEFORE the first sweep must not be re-fed to the
+        // extractor after later turns move the watermark — re-reading
+        // history re-learns facts the user may have hard-deleted since.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:500", "my favorite tea is oolong").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider.prompts.lock().unwrap().concat().contains("oolong"),
+            "first sweep reads the full transcript"
+        );
+
+        // The session grows by one new exchange.
+        seed_session(dir.path(), "api:500", "my staging server is maple").await;
+        provider.prompts.lock().unwrap().clear();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let second = provider.prompts.lock().unwrap().concat();
+        assert!(
+            second.contains("maple"),
+            "the new turn is extracted: {second}"
+        );
+        // The old statement may appear in CURRENT MEMORY context but must
+        // not appear in the TRANSCRIPT slice. Assert on the transcript
+        // portion only.
+        let transcript_part = second
+            .split("TRANSCRIPT of session")
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !transcript_part.contains("oolong"),
+            "already-consumed turns must not be re-fed: {transcript_part}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reset_cursor_when_session_rewritten() {
+        // A cleared/recreated session whose byte total SHRANK must reset
+        // the cursor — a stale count would silently skip the new content.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(
+            dir.path(),
+            "api:501",
+            "a very long opening statement that pads the first transcript with bytes",
+        )
+        .await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+
+        // Replace the session with SHORTER different content.
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("api:501".to_string());
+        mgr.clear(&key).await.unwrap();
+        drop(mgr);
+        seed_session(dir.path(), "api:501", "my cat is Miso").await;
+        provider.prompts.lock().unwrap().clear();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let prompts = provider.prompts.lock().unwrap().concat();
+        assert!(
+            prompts.contains("Miso"),
+            "rewritten session must re-extract from the top: {prompts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reset_cursor_when_prefix_rewritten_but_longer() {
+        // Rollback-and-continue: the transcript ends up AT LEAST as long
+        // with different content below the cursor. Byte/length checks
+        // can't see it — the prefix fingerprint must.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:502", "original statement one").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+
+        // Replace with DIFFERENT content of the same+greater length.
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("api:502".to_string());
+        mgr.clear(&key).await.unwrap();
+        drop(mgr);
+        seed_session(dir.path(), "api:502", "replacement statement alpha").await;
+        seed_session(dir.path(), "api:502", "replacement statement beta").await;
+        provider.prompts.lock().unwrap().clear();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let prompts = provider.prompts.lock().unwrap().concat();
+        assert!(
+            prompts.contains("replacement statement alpha"),
+            "rewritten prefix must reset the cursor: {prompts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_backfill_cursor_for_pre_upgrade_watermarks() {
+        // A session fully consumed by a pre-cursor sweep (watermark set,
+        // no cursor) must get a cursor stamped WITHOUT re-extraction, so
+        // the next append feeds only the delta.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:503", "ancient fact: tea is oolong").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+
+        // Simulate the pre-upgrade state: watermark kept, cursor dropped.
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let mut state = RefreshState::load(&state_path);
+        state.extracted_counts.clear();
+        state.save(&state_path).unwrap();
+
+        // Clean pass (watermark matches): backfills without extraction.
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert!(
+            state.extracted_counts.contains_key("api:503"),
+            "cursor backfilled on the clean pass: {:?}",
+            state.extracted_counts
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "no extra extraction"
+        );
+
+        // The next append feeds only the delta.
+        seed_session(dir.path(), "api:503", "new fact: shell is fish").await;
+        provider.prompts.lock().unwrap().clear();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let prompts = provider.prompts.lock().unwrap().concat();
+        let transcript_part = prompts.split("TRANSCRIPT of session").nth(1).unwrap_or("");
+        assert!(
+            transcript_part.contains("fish") && !transcript_part.contains("oolong"),
+            "post-backfill append is delta-only: {transcript_part}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_backfill_cursor_even_when_session_not_extraction_eligible() {
+        // The backfill must not depend on idle windows: a pre-upgrade
+        // session that is TOO FRESH for extraction still gets its cursor
+        // stamped, so an append right after upgrade feeds only the delta.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:504", "pre-upgrade fact: tea is oolong").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        // First pass with normal knobs consumes the session + watermark.
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        // Simulate pre-upgrade state: cursor dropped, watermark kept.
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let mut state = RefreshState::load(&state_path);
+        state.extracted_counts.clear();
+        state.save(&state_path).unwrap();
+
+        // Pass with a LONG idle requirement: the session is not
+        // extraction-eligible, but the backfill must still stamp it.
+        let mut strict = knobs_for_test();
+        strict.min_idle = std::time::Duration::from_secs(3600);
+        run_extraction_pass(dir.path(), &store, &provider, &strict)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert!(
+            state.extracted_counts.contains_key("api:504"),
+            "backfill is independent of extraction eligibility: {:?}",
+            state.extracted_counts
+        );
+    }
+
+    #[tokio::test]
+    async fn should_backfill_cursor_even_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:505", "pre-upgrade fact").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        // Pre-upgrade state + exhausted budget.
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let mut state = RefreshState::load(&state_path);
+        state.extracted_counts.clear();
+        state.extractions_today = knobs.max_extractions_per_day;
+        state.save(&state_path).unwrap();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert!(
+            state.extracted_counts.contains_key("api:505"),
+            "the no-provider backfill must run on capped passes: {:?}",
+            state.extracted_counts
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_charge_extraction_budget_for_empty_delta() {
+        // A session whose only change is filtered content (e.g. a bare
+        // system row) produces an empty delta — no provider call, no
+        // budget charge.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:506", "a real user fact").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let before = RefreshState::load(&state_path).extractions_today;
+
+        // Append a SYSTEM message: build_input_lines drops it, so the
+        // delta is empty.
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("api:506".to_string());
+        let msg = octos_core::Message {
+            role: MessageRole::System,
+            content: "internal marker".to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        mgr.add_message(&key, msg).await.unwrap();
+        drop(mgr);
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert_eq!(
+            state.extractions_today, before,
+            "empty deltas must not burn the extraction-call budget"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "no second provider call"
         );
     }
 
