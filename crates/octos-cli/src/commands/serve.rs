@@ -714,6 +714,7 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            host_memory: config.memory.clone(),
             solo_login_enabled: self.solo
                 || std::env::var("OCTOS_SOLO_LOGIN")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

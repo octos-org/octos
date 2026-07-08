@@ -577,15 +577,10 @@ impl ProfileActorFactoryBuilder {
         }
         // Host memory settings apply field-by-field when the child profile
         // doesn't override them (same pattern as bootstrap_with_host_plugins).
-        if let Some(host) = self.host_memory.as_ref() {
-            let mem = profile_config.memory.get_or_insert_with(Default::default);
-            if mem.max_inject_tokens.is_none() {
-                mem.max_inject_tokens = host.max_inject_tokens;
-            }
-            if mem.refresh.is_none() {
-                mem.refresh = host.refresh.clone();
-            }
-        }
+        crate::config::merge_host_memory_into_profile(
+            &mut profile_config.memory,
+            self.host_memory.as_ref(),
+        );
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();

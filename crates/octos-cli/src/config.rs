@@ -550,9 +550,11 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemoryRefreshConfig {
     /// Master switch for the capture layer + read-side refresh + the
-    /// background extraction sweep.
+    /// background extraction sweep. DEFAULT-ON: `None` means enabled —
+    /// automatic memory is the product behavior; set `false` (or
+    /// `OCTOS_MEMORY_REFRESH_ENABLED=0`) to opt out.
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
 
     /// Model key for the extraction pass (unset → the profile's provider).
     #[serde(default)]
@@ -649,10 +651,41 @@ impl MemoryConfig {
     }
 
     /// Whether automatic memory refreshing (capture + read refresh) is on.
+    /// DEFAULT-ON: an absent memory/refresh block (or an unset `enabled`)
+    /// means enabled; only an explicit `false` opts out.
     pub fn refresh_enabled(config: Option<&MemoryConfig>) -> bool {
         config
             .and_then(|m| m.refresh.as_ref())
-            .is_some_and(|r| r.enabled)
+            .and_then(|r| r.enabled)
+            .unwrap_or(true)
+    }
+}
+
+/// Field-level host→profile memory inheritance (in-process runtimes: the
+/// profile bootstrap and the actor factory). A profile that says nothing
+/// inherits the host block wholesale; a profile block present only for
+/// knobs (tri-state `enabled` unset) still inherits the host's
+/// enabled/disabled decision — under DEFAULT-ON semantics dropping it
+/// would bypass a host-level opt-out.
+pub fn merge_host_memory_into_profile(
+    config: &mut Option<MemoryConfig>,
+    host_memory: Option<&MemoryConfig>,
+) {
+    let Some(host) = host_memory else {
+        return;
+    };
+    let mem = config.get_or_insert_with(Default::default);
+    if mem.max_inject_tokens.is_none() {
+        mem.max_inject_tokens = host.max_inject_tokens;
+    }
+    if mem.refresh.is_none() {
+        mem.refresh = host.refresh.clone();
+    } else if let (Some(profile_refresh), Some(host_refresh)) =
+        (mem.refresh.as_mut(), host.refresh.as_ref())
+    {
+        if profile_refresh.enabled.is_none() {
+            profile_refresh.enabled = host_refresh.enabled;
+        }
     }
 }
 
@@ -1218,24 +1251,43 @@ fn merge_env_memory_policy(config: &mut Config) {
         }
     }
     // Same field-level rule for the refresh switch: the env only fills the
-    // gap when the loaded config says nothing about `memory.refresh`.
+    // gap when the loaded config says nothing about `memory.refresh.enabled`
+    // (block absent OR the tri-state left unset). With the DEFAULT-ON
+    // semantics the OFF direction matters most: a host that disabled
+    // memory mirrors `OCTOS_MEMORY_REFRESH_ENABLED=0` to spawned
+    // subprocesses, and that must beat the child's default-on. An explicit
+    // `enabled` in the config file still wins over the env.
     if config
         .memory
         .as_ref()
         .and_then(|m| m.refresh.as_ref())
+        .and_then(|r| r.enabled)
         .is_none()
     {
         if let Ok(v) = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED") {
-            let on = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-            if on {
-                config.memory.get_or_insert_with(Default::default).refresh =
-                    Some(MemoryRefreshConfig {
-                        enabled: true,
-                        ..Default::default()
-                    });
+            // Recognized values only — an empty or misspelled variable
+            // (easy in shell/Docker) must not silently opt out of the
+            // default-on behavior.
+            let parsed = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                other => {
+                    if !other.is_empty() {
+                        tracing::warn!(
+                            value = %v,
+                            "ignoring unrecognized OCTOS_MEMORY_REFRESH_ENABLED"
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(on) = parsed {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .refresh
+                    .get_or_insert_with(Default::default)
+                    .enabled = Some(on);
             }
         }
     }
@@ -2801,24 +2853,112 @@ mod tests {
     // --- memory refresh flag ---
 
     #[test]
-    fn should_default_refresh_off_when_memory_absent_or_empty() {
-        assert!(!MemoryConfig::refresh_enabled(None));
+    fn should_default_refresh_on_when_memory_absent_or_empty() {
+        // DEFAULT-ON: automatic memory is the product behavior; absence of
+        // config means enabled.
+        assert!(MemoryConfig::refresh_enabled(None));
         let empty: MemoryConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(!MemoryConfig::refresh_enabled(Some(&empty)));
+        assert!(MemoryConfig::refresh_enabled(Some(&empty)));
         let refresh_empty: MemoryConfig =
             serde_json::from_value(serde_json::json!({"refresh": {}})).unwrap();
-        assert!(!MemoryConfig::refresh_enabled(Some(&refresh_empty)));
+        assert!(MemoryConfig::refresh_enabled(Some(&refresh_empty)));
     }
 
     #[test]
-    fn should_enable_refresh_when_config_sets_it() {
-        let cfg: MemoryConfig =
+    fn should_disable_refresh_only_when_explicitly_false() {
+        let off: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": false}})).unwrap();
+        assert!(!MemoryConfig::refresh_enabled(Some(&off)));
+        let on: MemoryConfig =
             serde_json::from_value(serde_json::json!({"refresh": {"enabled": true}})).unwrap();
-        assert!(MemoryConfig::refresh_enabled(Some(&cfg)));
+        assert!(MemoryConfig::refresh_enabled(Some(&on)));
         // max_inject_tokens keeps its default independently.
         assert_eq!(
-            MemoryConfig::effective_max_inject_tokens(Some(&cfg)),
+            MemoryConfig::effective_max_inject_tokens(Some(&on)),
             octos_memory::DEFAULT_MAX_INJECT_TOKENS
         );
+    }
+
+    #[test]
+    fn should_inherit_host_opt_out_when_profile_refresh_is_knobs_only() {
+        // Host explicitly disabled; profile block exists only for knobs.
+        let host = MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut profile = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                min_idle_minutes: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut profile, Some(&host));
+        assert!(
+            !MemoryConfig::refresh_enabled(profile.as_ref()),
+            "knobs-only profile blocks must inherit the host opt-out"
+        );
+        // The profile's own knob survives the merge.
+        assert_eq!(profile.unwrap().refresh.unwrap().min_idle_minutes, Some(5));
+
+        // An explicit profile decision beats the host.
+        let mut explicit = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut explicit, Some(&host));
+        assert!(MemoryConfig::refresh_enabled(explicit.as_ref()));
+
+        // Absent profile memory inherits the host block wholesale.
+        let mut absent: Option<MemoryConfig> = None;
+        merge_host_memory_into_profile(&mut absent, Some(&host));
+        assert!(!MemoryConfig::refresh_enabled(absent.as_ref()));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_let_env_disable_refresh_when_config_silent() {
+        // Host mirroring: OCTOS_MEMORY_REFRESH_ENABLED=0 must beat the
+        // child's default-on when the config file says nothing.
+        let prev = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED").ok();
+        unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", "0") };
+
+        let mut config = Config::default();
+        merge_env_memory_policy(&mut config);
+        assert!(!MemoryConfig::refresh_enabled(config.memory.as_ref()));
+
+        // An explicit config value wins over the env.
+        let mut explicit = Config::default();
+        explicit.memory = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_env_memory_policy(&mut explicit);
+        assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
+
+        // Malformed/empty values leave the default-on untouched.
+        for bad in ["", "banana"] {
+            unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", bad) };
+            let mut silent = Config::default();
+            merge_env_memory_policy(&mut silent);
+            assert!(
+                MemoryConfig::refresh_enabled(silent.memory.as_ref()),
+                "unrecognized env value {bad:?} must not opt out"
+            );
+        }
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", v) },
+            None => unsafe { std::env::remove_var("OCTOS_MEMORY_REFRESH_ENABLED") },
+        }
     }
 }

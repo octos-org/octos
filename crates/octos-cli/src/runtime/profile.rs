@@ -449,15 +449,7 @@ impl ProfileRuntime {
         // override them (same host-default pattern as plugins/voice). A
         // profile serialized with an empty `memory: {}` block must still
         // inherit the host budget.
-        if let Some(host) = host_memory {
-            let mem = config.memory.get_or_insert_with(Default::default);
-            if mem.max_inject_tokens.is_none() {
-                mem.max_inject_tokens = host.max_inject_tokens;
-            }
-            if mem.refresh.is_none() {
-                mem.refresh = host.refresh.clone();
-            }
-        }
+        crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
