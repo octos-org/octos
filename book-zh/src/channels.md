@@ -335,6 +335,140 @@ octos gateway
 
 ---
 
+## DingTalk（钉钉）
+
+钉钉支持通过自定义机器人向外发送消息，以及接收 outgoing-robot 回调。
+
+```bash
+export DINGTALK_BOT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
+export DINGTALK_BOT_SECRET="SEC..."
+```
+
+```json
+{
+  "type": "dingtalk",
+  "allowed_senders": ["staff-id-1"],
+  "settings": {
+    "webhook_url_env": "DINGTALK_BOT_WEBHOOK",
+    "secret_env": "DINGTALK_BOT_SECRET",
+    "webhook_port": 8650
+  }
+}
+```
+
+入站事件请将钉钉 outgoing 机器人的回调 URL 配置为：
+
+```text
+https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
+```
+
+使用 `dingtalk` 特性标志编译：
+
+```bash
+cargo build --release -p octos-cli --features dingtalk
+```
+
+---
+
+## Matrix
+
+Matrix 是一等公民频道，也是本章多处提到的「人工审批」与「管理机器人」功能背后的传输层。由 `matrix` 特性门控。通过 `mode` 设置支持两种模式：
+
+- **`user`**（默认）——以普通 Matrix 账户身份通过 Client-Server API 与 `/sync` 登录。可用于任意 homeserver 上的任意账户，无需服务端注册。
+- **`appservice`**——以应用服务（application service）身份注册到你自控的 homeserver（Conduit/conduwuit/Synapse），可为每个用户提供 bot 分身。
+
+### user 模式
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "user",
+    "homeserver": "https://matrix.org",
+    "user_id": "@mybot:matrix.org",
+    "access_token": "syt_...",
+    "device_name": "octos",
+    "rooms": ["!roomid:matrix.org"],
+    "group_policy": "allowlist",
+    "auto_join_allowlist": ["@owner:matrix.org"]
+  }
+}
+```
+
+登录时提供 `access_token`（推荐）或 `password` 之一。`group_policy`（`allowlist` / `all`）控制 bot 在哪些房间生效；`auto_join_allowlist` 列出其邀请会被自动接受的发送者。`OCTOS_MATRIX_BOT_USER_ID` 与 `MATRIX_APPROVER` 也可通过环境变量提供。
+
+### appservice 模式
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "appservice",
+    "homeserver": "http://localhost:6167",
+    "server_name": "localhost",
+    "as_token": "...",
+    "hs_token": "...",
+    "sender_localpart": "bot",
+    "user_prefix": "bot_"
+  }
+}
+```
+
+使用 `matrix` 特性标志编译。Matrix 房间会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并支持 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。
+
+---
+
+## LINE
+
+入站 webhook + 出站 Messaging API。由 `line` 特性门控。
+
+```bash
+export LINE_CHANNEL_SECRET="..."
+export LINE_CHANNEL_ACCESS_TOKEN="..."
+```
+
+```json
+{
+  "type": "line",
+  "settings": {
+    "channel_secret_env": "LINE_CHANNEL_SECRET",
+    "channel_access_token_env": "LINE_CHANNEL_ACCESS_TOKEN",
+    "webhook_port": 9323,
+    "bot_user_id": "U...",
+    "require_mention": false
+  }
+}
+```
+
+LINE 将事件推送到 `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`；入站签名用 channel secret 校验（HMAC-SHA256）。使用 `line` 特性标志编译。
+
+---
+
+## Twilio（短信）
+
+通过 Twilio Programmable Messaging webhook 实现双向短信。由 `twilio` 特性门控。
+
+```bash
+export TWILIO_ACCOUNT_SID="AC..."
+export TWILIO_AUTH_TOKEN="..."
+```
+
+```json
+{
+  "type": "twilio",
+  "settings": {
+    "account_sid_env": "TWILIO_ACCOUNT_SID",
+    "auth_token_env": "TWILIO_AUTH_TOKEN",
+    "from_number": "+15551234567",
+    "webhook_port": 9324
+  }
+}
+```
+
+将你的 Twilio 号码的入站 webhook 指向 `https://YOUR_OCTOS_HOST/webhook/twilio/<profile_id>`。使用 `twilio` 特性标志编译。
+
+---
+
 ## 会话控制命令
 
 在任何网关频道中，以下命令用于管理对话会话：

@@ -370,6 +370,105 @@ The `wecom-bot` channel uses an outbound WebSocket connection -- no public URL o
 
 ---
 
+## Matrix
+
+Matrix is a first-class channel and the transport behind the human-approval and management-bot features referenced throughout this chapter. Feature-gated behind `matrix`. Two modes are supported via the `mode` setting:
+
+- **`user`** (default) — logs in as an ordinary Matrix account via the Client-Server API and `/sync`. Works with any account on any homeserver; no server-side registration needed.
+- **`appservice`** — registers as an application service against a homeserver you control (Conduit/conduwuit/Synapse), enabling per-user bot puppets.
+
+### User mode
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "user",
+    "homeserver": "https://matrix.org",
+    "user_id": "@mybot:matrix.org",
+    "access_token": "syt_...",
+    "device_name": "octos",
+    "rooms": ["!roomid:matrix.org"],
+    "group_policy": "allowlist",
+    "auto_join_allowlist": ["@owner:matrix.org"]
+  }
+}
+```
+
+Provide either an `access_token` (preferred) or a `password` to log in. `group_policy` (`allowlist` / `all`) controls which rooms the bot acts in; `auto_join_allowlist` lists senders whose invites are auto-accepted. `OCTOS_MATRIX_BOT_USER_ID` and `MATRIX_APPROVER` may be supplied via the environment.
+
+### Appservice mode
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "appservice",
+    "homeserver": "http://localhost:6167",
+    "server_name": "localhost",
+    "as_token": "...",
+    "hs_token": "...",
+    "sender_localpart": "bot",
+    "user_prefix": "bot_"
+  }
+}
+```
+
+Build with the `matrix` feature flag. Matrix rooms render native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and support the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below).
+
+---
+
+## LINE
+
+Inbound webhook + outbound Messaging API. Feature-gated behind `line`.
+
+```bash
+export LINE_CHANNEL_SECRET="..."
+export LINE_CHANNEL_ACCESS_TOKEN="..."
+```
+
+```json
+{
+  "type": "line",
+  "settings": {
+    "channel_secret_env": "LINE_CHANNEL_SECRET",
+    "channel_access_token_env": "LINE_CHANNEL_ACCESS_TOKEN",
+    "webhook_port": 9323,
+    "bot_user_id": "U...",
+    "require_mention": false
+  }
+}
+```
+
+LINE pushes events to `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`; inbound signatures are verified with the channel secret (HMAC-SHA256). Build with the `line` feature flag.
+
+---
+
+## Twilio (SMS)
+
+Two-way SMS via Twilio's Programmable Messaging webhook. Feature-gated behind `twilio`.
+
+```bash
+export TWILIO_ACCOUNT_SID="AC..."
+export TWILIO_AUTH_TOKEN="..."
+```
+
+```json
+{
+  "type": "twilio",
+  "settings": {
+    "account_sid_env": "TWILIO_ACCOUNT_SID",
+    "auth_token_env": "TWILIO_AUTH_TOKEN",
+    "from_number": "+15551234567",
+    "webhook_port": 9324
+  }
+}
+```
+
+Point your Twilio number's inbound webhook at `https://YOUR_OCTOS_HOST/webhook/twilio/<profile_id>`. Build with the `twilio` feature flag.
+
+---
+
 ## Session Control Commands
 
 In any gateway channel, the following commands manage conversation sessions:
