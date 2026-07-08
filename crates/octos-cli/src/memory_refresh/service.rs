@@ -423,11 +423,18 @@ pub(crate) async fn run_extraction_pass(
             // extracted by the old code.
             if !state.extracted_counts.contains_key(&session.key.0) {
                 if let Some(transcript) = manager.export_transcript(&session.key).await {
-                    let fp = transcript_prefix_fingerprint(&transcript, transcript.len());
-                    state
-                        .extracted_counts
-                        .insert(session.key.0.clone(), (transcript.len(), fp));
-                    state.save(&state_path)?;
+                    // Pre-read snapshot rule (same as the watermark
+                    // advance): a turn appended DURING this read would be
+                    // stamped consumed without extraction and skipped
+                    // forever. Leave the cursor unset; the changed file
+                    // makes the session a candidate next pass.
+                    if snapshots_current(&snaps) {
+                        let fp = transcript_prefix_fingerprint(&transcript, transcript.len());
+                        state
+                            .extracted_counts
+                            .insert(session.key.0.clone(), (transcript.len(), fp));
+                        state.save(&state_path)?;
+                    }
                 }
             }
             continue;
