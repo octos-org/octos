@@ -133,12 +133,18 @@ async fn write_host_note(
         sensitive,
         replaces_id: None,
     };
+    let sensitive = note.sensitive;
     let path = memory_store.write_staging_note(&note).await?;
-    println!(
-        "{} recorded at {}",
-        "host note".green().bold(),
-        path.display()
-    );
+    if sensitive {
+        // No content-derived path echo for sensitive requests.
+        println!("{} recorded", "host note".green().bold());
+    } else {
+        println!(
+            "{} recorded at {}",
+            "host note".green().bold(),
+            path.display()
+        );
+    }
     println!("It applies on the next consolidation pass (or run `octos memory refresh` now).");
     Ok(())
 }

@@ -287,14 +287,22 @@ pub async fn run_consolidation(
         let mut any_alive = false;
         let mut archived_only: Vec<String> = Vec::new();
         for id in &named {
-            let live = entries.iter().any(|e| &e.id == id)
-                || waiting.iter().any(|w| {
-                    w.candidates
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|c| &c.entry_id == id)
-                });
+            // Candidate METADATA is not liveness: after a crash between
+            // MEMORY.md publication and staging cleanup, a stale pending
+            // note still lists the id. Only a live entry or a restorable
+            // (hash-findable) interim archive copy keeps the ask alive.
+            let mut restorable_interim = false;
+            for w in &waiting {
+                for c in w.candidates.as_deref().unwrap_or_default() {
+                    if &c.entry_id == id
+                        && c.interim_archived
+                        && find_archive_block_by_hash(memory_dir, &c.content_hash)?.is_some()
+                    {
+                        restorable_interim = true;
+                    }
+                }
+            }
+            let live = entries.iter().any(|e| &e.id == id) || restorable_interim;
             if live {
                 any_alive = true;
             } else if apply::archive_names_id(memory_dir, id)? {
@@ -2266,6 +2274,94 @@ mod tests {
         assert!(
             !memory.contains("embarrassing"),
             "forgotten content must not return"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_honor_both_notes_when_two_forgets_name_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &[
+                "Secret thing. (updated: 2026-06-01) ^msecret",
+                "Keeps bonsai. (updated: 2026-06-01) ^mcccccc",
+            ],
+        );
+        write_note(
+            memory_dir,
+            "01fg-a",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            false,
+        );
+        write_note(
+            memory_dir,
+            "02fg-b",
+            "host",
+            "forget",
+            "please delete id:^msecret",
+            false,
+        );
+
+        // ONE hard_delete satisfies both notes; both are consumed.
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-a"}],"consumed_ids":["01fg-a","02fg-b"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(
+            outcome.merge_applied,
+            "double forget must be satisfiable: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.hard_deleted, vec!["^msecret"]);
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(!memory.contains("^msecret"));
+    }
+
+    #[tokio::test]
+    async fn should_consume_confirm_when_only_stale_pending_metadata_remains() {
+        // Crash between MEMORY.md publication and staging cleanup: the entry
+        // is gone, but the stale pending note (non-interim candidates) and
+        // the id-bound confirm note both survive. The confirm must be
+        // consumed as satisfied — candidate metadata is not liveness.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_pending_note(
+            memory_dir,
+            "01fg-stale",
+            "forget the secret",
+            false,
+            &format!(
+                r#"[{{"entry_id":"^msecret","content_hash":"{}","interim_archived":false}}]"#,
+                sha256_hex("Secret thing. (updated: 2026-06-01) ^msecret")
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        let confirm = write_note(
+            memory_dir,
+            "02fg-confirm",
+            "host",
+            "forget",
+            "yes: id:^msecret",
+            false,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert_eq!(provider.call_count(), 0);
+        assert!(
+            !confirm.exists(),
+            "confirm note must be consumed as satisfied despite stale pending metadata"
         );
     }
 }

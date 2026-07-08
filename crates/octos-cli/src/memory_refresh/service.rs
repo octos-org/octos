@@ -196,15 +196,23 @@ impl MemoryRefreshService {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                let priority = !full_pass && has_priority_note(&data_dir);
                 if let Some(until) = backoff_until {
                     if tokio::time::Instant::now() < until {
-                        continue;
+                        // Backoff throttles the failing EXTRACTION path; a
+                        // host remember/forget written meanwhile still gets
+                        // its consolidation-only fast lane.
+                        if !priority {
+                            continue;
+                        }
+                    } else {
+                        backoff_until = None;
                     }
-                    backoff_until = None;
                 }
-                if !full_pass && !has_priority_note(&data_dir) {
+                if !full_pass && !priority {
                     continue;
                 }
+                let full_pass = full_pass && backoff_until.is_none();
                 let pass = async {
                     // Consolidation must run even when extraction fails —
                     // staged remember/forget notes may not wait behind an

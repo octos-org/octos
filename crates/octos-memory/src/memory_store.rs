@@ -532,7 +532,13 @@ impl MemoryStore {
             .await
             .wrap_err("failed to create staging notes directory")?;
 
-        let slug_source: String = note.content.chars().take(48).collect();
+        // Sensitive notes must not leak their content into the FILENAME —
+        // paths outlive scrubs (shell history, logs, directory listings).
+        let slug_source: String = if note.sensitive {
+            "sensitive".to_string()
+        } else {
+            note.content.chars().take(48).collect()
+        };
         let file_name = format!(
             "{}-{}.md",
             uuid::Uuid::now_v7().simple(),
@@ -1404,6 +1410,27 @@ mod tests {
         assert_eq!(parsed["items"][0]["evidence_kind"], "user_said");
         assert_eq!(parsed["items"][0]["evidence_idx"][1], 7);
         assert_eq!(store.count_staging_extractions().await, 1);
+    }
+
+    #[tokio::test]
+    async fn should_use_opaque_filename_when_note_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let note = StagingNote {
+            origin: NoteOrigin::Host,
+            kind: NoteKind::Forget,
+            content: "forget my embarrassing secret hobby".to_string(),
+            session_key: None,
+            sensitive: true,
+            replaces_id: None,
+        };
+        let path = store.write_staging_note(&note).await.unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert!(
+            !name.contains("embarrassing") && !name.contains("hobby"),
+            "sensitive content must not leak into the filename: {name}"
+        );
+        assert!(name.contains("sensitive"));
     }
 
     #[tokio::test]

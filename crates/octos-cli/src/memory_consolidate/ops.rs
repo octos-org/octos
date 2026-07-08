@@ -641,11 +641,20 @@ fn validate_consumption(output: &ModelOutput, ctx: &ValidationCtx) -> Result<(),
 
         // Id-bound host forget notes must be honored by matching hard_delete
         // ops — consuming the note without acting on it drops the ask.
+        // Two notes can name the SAME id (the user asked twice): one
+        // hard_delete honors both — requiring each note to be the cited
+        // authorizer would make the pair unsatisfiable (duplicate-target
+        // ops are rejected) and wedge consolidation.
         if note.origin == NoteOrigin::Host && note.kind == NoteKind::Forget {
             for named in note.named_entry_ids() {
                 let honored = output.ops.iter().any(|op| {
-                    matches!(op, Op::HardDelete { id: target, authorized_by }
-                        if *target == named && authorized_by == note.id.as_str())
+                    matches!(op, Op::HardDelete { id: target, authorized_by: auth }
+                    if *target == named
+                        && ctx.notes.get(auth.as_str()).is_some_and(|a| {
+                            a.origin == NoteOrigin::Host
+                                && a.kind == NoteKind::Forget
+                                && a.named_entry_ids().iter().any(|n| *n == named)
+                        }))
                 });
                 if !honored {
                     return Err(format!(
