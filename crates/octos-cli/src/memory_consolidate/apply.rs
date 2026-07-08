@@ -305,10 +305,28 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
         };
         let mut blocks = split_blocks(&existing);
         for block in &plan.archive_appends {
+            // A merge can contain BOTH a hard_delete and archive/supersede
+            // ops; appended blocks must honor the scrub set or step 2 would
+            // write hard-deleted content right back into the archive.
+            if plan
+                .hard_deletes
+                .iter()
+                .any(|t| block.contains(&t.entry_id))
+            {
+                continue;
+            }
+            let cleaned: Vec<&str> = block
+                .lines()
+                .filter(|line| !plan.hard_deletes.iter().any(|t| t.line_matches(line)))
+                .collect();
+            if cleaned.is_empty() {
+                continue;
+            }
+            let cleaned = cleaned.join("\n");
             // Duplicate guard: a crash between append and the MEMORY.md
             // write re-plans the same append on the next run.
-            if !blocks.contains(block) {
-                blocks.push(block.clone());
+            if !blocks.contains(&cleaned) {
+                blocks.push(cleaned);
             }
         }
         let mut out = blocks.join("\n\n");

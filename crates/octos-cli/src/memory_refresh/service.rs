@@ -484,16 +484,18 @@ pub(crate) async fn run_consolidation_pass(
     let state_path = data_dir.join("memory").join("refresh_state.json");
     let mut state = RefreshState::load(&state_path);
     state.roll_date(&chrono::Local::now().format("%Y-%m-%d").to_string());
-    if state.consolidations_today >= knobs.max_consolidations_per_day
-        || state.tokens_today >= knobs.max_daily_tokens
-    {
-        return Ok(());
-    }
+    // An exhausted budget disables the MERGE, not the whole engine: the
+    // no-provider phases (pending expiry, satisfied-forget consumption,
+    // crash-recovery re-hide) must keep running or pending_confirm_days
+    // would not be honored on busy profiles.
+    let allow_merge = state.consolidations_today < knobs.max_consolidations_per_day
+        && state.tokens_today < knobs.max_daily_tokens;
 
     let mut params = crate::memory_consolidate::ConsolidateParams::new(data_dir.join("memory"));
     params.max_memory_file_tokens = knobs.max_memory_file_tokens;
     params.unused_days = knobs.unused_days;
     params.pending_confirm_days = knobs.pending_confirm_days;
+    params.allow_merge = allow_merge;
 
     let outcome = crate::memory_consolidate::run_consolidation(provider, &params).await?;
 
@@ -1088,6 +1090,66 @@ mod tests {
         assert!(
             !has_priority_note(dir.path()),
             "parked notes wait on a human, not the fast lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_honor_pending_expiry_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        std::fs::create_dir_all(memory_dir.join("staging/notes")).unwrap();
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        // An interim-archived candidate whose pending note expired long ago.
+        let secret = "Sensitive detail. (updated: 2026-01-01) ^msenstv";
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "Keeps bonsai. (updated: 2026-01-02) ^mcccccc\n",
+        )
+        .unwrap();
+        std::fs::write(memory_dir.join("archive/2026-01.md"), format!("{secret}\n")).unwrap();
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(secret.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        std::fs::write(
+            memory_dir.join("staging/notes/01fg-expired.md"),
+            format!(
+                "---\norigin: host\nkind: forget\ncreated_at: 2026-01-01T00:00:00+00:00\nsensitive: true\ncandidates: [{{\"entry_id\":\"^msenstv\",\"content_hash\":\"{hash}\",\"interim_archived\":true}}]\nexpires_at: 2026-01-08T00:00:00+00:00\n---\n\nforget the sensitive detail\n"
+            ),
+        )
+        .unwrap();
+        // Budget exhausted.
+        RefreshState {
+            date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            consolidations_today: 12,
+            ..Default::default()
+        }
+        .save(&dir.path().join("memory").join("refresh_state.json"))
+        .unwrap();
+
+        let ops = Arc::new(OpsProvider {
+            response: "{}".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        run_consolidation_pass(dir.path(), ops.clone(), &knobs_for_test())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ops.calls.load(Ordering::SeqCst),
+            0,
+            "no provider spend over budget"
+        );
+        assert!(
+            !memory_dir.join("staging/notes/01fg-expired.md").exists(),
+            "expired pending note must be processed despite the budget"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("^msenstv"),
+            "expiry must restore the interim-archived candidate: {memory}"
         );
     }
 

@@ -59,6 +59,12 @@ pub struct ConsolidateParams {
     pub unused_days: u32,
     /// Lifetime of a pending-confirm note before it cancels.
     pub pending_confirm_days: u32,
+    /// When false, run only the no-provider phases (INIT persist, expiry,
+    /// satisfied-forget consumption, crash-recovery re-hide) and stop
+    /// before the merge call — the service sets this when the daily budget
+    /// is exhausted so `pending_confirm_days` stays honored on busy
+    /// profiles.
+    pub allow_merge: bool,
     /// Injected "today" — keeps prompts and stamps deterministic for tests;
     /// [`ConsolidateParams::new`] uses the current UTC date.
     pub today: NaiveDate,
@@ -71,6 +77,7 @@ impl ConsolidateParams {
             max_memory_file_tokens: 8000,
             unused_days: 30,
             pending_confirm_days: 7,
+            allow_merge: true,
             today: Utc::now().date_naive(),
         }
     }
@@ -324,7 +331,11 @@ pub async fn run_consolidation(
     }
 
     // --- 3. skip early when nothing is consumable ------------------------
-    let has_batch = !batch.notes.is_empty() || !batch.extractions.is_empty();
+    // (Also the stop line when the caller disallowed the merge: every
+    // no-provider phase — INIT persist, expiry, satisfied consumption,
+    // recovery re-hide — has already run by this point.)
+    let has_batch =
+        params.allow_merge && (!batch.notes.is_empty() || !batch.extractions.is_empty());
     if !has_batch {
         for note in &waiting {
             outcome
@@ -1022,6 +1033,7 @@ mod tests {
             max_memory_file_tokens: 8000,
             unused_days: 30,
             pending_confirm_days: 7,
+            allow_merge: true,
             today: NaiveDate::parse_from_str(TODAY, "%Y-%m-%d").unwrap(),
         }
     }
@@ -2165,6 +2177,60 @@ mod tests {
         assert!(
             memory.contains("Unrelated entry."),
             "entry must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_rearchive_scrubbed_content_when_merge_mixes_delete_and_supersede() {
+        // One merge hard-deletes ^msecret and supersedes ^mquoter, whose OLD
+        // text quotes the secret line. The superseded text is archived —
+        // but the quoted secret line must not ride back into the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        // The secret entry is multi-line; the quoter's OLD text repeats one
+        // of its EXACT lines (the line-exact scrub contract — embedded
+        // substrings are the documented paraphrase residual).
+        let secret =
+            "The vault code is 9137.\nKept in the red notebook. (updated: 2026-06-01) ^msecret";
+        let quoter = "The vault code is 9137.\nAlso likes tea. (updated: 2026-06-02) ^mquoter";
+        write_memory(memory_dir, &[secret, quoter]);
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^msecret",
+            true,
+        );
+        write_note(
+            memory_dir,
+            "02req",
+            "host",
+            "user_request",
+            "tea note is outdated",
+            false,
+        );
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"hard_delete","id":"^msecret","authorized_by":"01fg-confirm"},{"op":"supersede","id":"^mquoter","replacement":"Likes tea.","reason":"cleanup","sources":["02req"]}],"consumed_ids":["01fg-confirm","02req"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied);
+        assert_eq!(outcome.hard_deleted, vec!["^msecret"]);
+
+        let mut archived = String::new();
+        for entry in std::fs::read_dir(memory_dir.join("archive")).unwrap() {
+            archived.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+        }
+        assert!(
+            !archived.contains("9137"),
+            "hard-deleted content must not be re-archived by the supersede: {archived}"
+        );
+        assert!(
+            archived.contains("Also likes tea."),
+            "the non-secret remainder of the superseded text is archived"
         );
     }
 }
