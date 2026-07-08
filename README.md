@@ -38,6 +38,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 |---|---|
 | The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
 | The agent doesn't reply | No provider credential yet — run `octos auth login --provider <name>` (or export the provider's API key env var, or add the key in the dashboard settings). An `invalid model` error means the provider rejected the configured model name — re-run `octos init` and pick a real one (e.g. `deepseek-v4-flash`). |
+| The dashboard (`/admin/`) asks for a login | Use the **"Login with admin token"** tab with the `Auth token:` the installer printed (also stored in the service file — see *First login to the dashboard* under Option 2). |
 | Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
 
 ### The pieces
@@ -128,6 +129,26 @@ irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | ie
 ```
 
 This installs the binary, sets up `octos serve` as a service, and starts the local dashboard at `http://localhost:8080/admin/`. The end-user web app is served same-origin at `http://localhost:8080/app/` (embedded in the binary — no separate web server needed).
+
+**First login to the dashboard.** The install summary prints your credential once:
+
+```text
+Auth token: 3f2a…64-hex…c9d1
+```
+
+Open `http://localhost:8080/admin/`, switch the login screen to the
+**"Login with admin token"** tab, and paste that token — you're in as the
+admin user. (The email-code tab needs the server's SMTP configured, so the
+token tab is the way in on a fresh local install.)
+
+Lost the token? It's kept in the service definition the installer wrote:
+
+```bash
+# macOS
+grep -A1 OCTOS_AUTH_TOKEN /Library/LaunchDaemons/io.octos.serve.plist
+# Linux
+grep OCTOS_AUTH_TOKEN /etc/systemd/system/octos-serve.service
+```
 
 Alternatively, install just the binaries (the `octos` server plus its bundled skills) via a package manager:
 
@@ -260,7 +281,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
     --auth-token <dashboard-token>
 ```
 
-The installer writes the tenant tunnel configuration, installs `frpc`, and starts the public tunnel alongside `octos serve`.
+The installer writes the tenant tunnel configuration, installs `frpc`, and starts the public tunnel alongside `octos serve`. The `--auth-token` in your personalized command doubles as your dashboard login: open `https://<your-name>.<domain>/admin/` and paste it into the **"Login with admin token"** tab (the same command also arrives by email, so the token is recoverable there).
 
 ### Can I start local and upgrade later?
 
