@@ -920,6 +920,9 @@ impl ProfileRuntime {
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
         let skills_loader = build_account_skills_loader(data_dir);
+        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
+            profile.config.memory.as_ref(),
+        );
         let mut system_prompt = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
@@ -927,6 +930,7 @@ impl ProfileRuntime {
             &memory_store,
             &skills_loader,
             &tool_config,
+            max_inject_tokens,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {

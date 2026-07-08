@@ -89,6 +89,10 @@ pub struct Config {
     #[serde(default)]
     pub embedding: Option<EmbeddingConfig>,
 
+    /// Memory subsystem configuration.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
+
     /// Fallback models for provider failover chain.
     /// When the primary provider fails with a retriable error, the next model is tried.
     #[serde(default)]
@@ -521,6 +525,27 @@ pub struct EmbeddingConfig {
 
 fn default_embedding_provider() -> String {
     "openai".to_string()
+}
+
+/// Memory subsystem configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    /// Token budget for the memory block injected into the system prompt
+    /// (long-term memory + daily notes + bank summary combined). Defaults to
+    /// [`octos_memory::DEFAULT_MAX_INJECT_TOKENS`]. The budget is spent in
+    /// priority order (MEMORY.md, today's notes, bank abstracts, older daily
+    /// notes) and omissions are disclosed to the model with a marker.
+    #[serde(default)]
+    pub max_inject_tokens: Option<usize>,
+}
+
+impl MemoryConfig {
+    /// Effective injection budget, applying the default when unset.
+    pub fn effective_max_inject_tokens(config: Option<&MemoryConfig>) -> usize {
+        config
+            .and_then(|m| m.max_inject_tokens)
+            .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
+    }
 }
 
 /// Email sending configuration for the `send_email` tool.

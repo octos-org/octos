@@ -580,6 +580,9 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
+        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
+            effective_profile.config.memory.as_ref(),
+        );
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
@@ -587,6 +590,7 @@ impl ProfileActorFactoryBuilder {
             &self.memory_store,
             &skills_loader,
             &self.tool_config,
+            max_inject_tokens,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {

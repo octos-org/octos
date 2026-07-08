@@ -9,6 +9,10 @@ use crate::persona_service::PersonaService;
 
 /// Build the system prompt with bootstrap files, memory context, and skills.
 ///
+/// `max_inject_tokens` caps the injected memory block (long-term memory +
+/// daily notes + bank summary combined); use
+/// [`crate::config::MemoryConfig::effective_max_inject_tokens`] to resolve it
+/// from config.
 pub async fn build_system_prompt(
     base: Option<&str>,
     data_dir: &Path,
@@ -16,6 +20,7 @@ pub async fn build_system_prompt(
     memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
     tool_config: &octos_agent::ToolConfigStore,
+    max_inject_tokens: usize,
 ) -> String {
     let compiled = include_str!("../../prompts/gateway_default.txt");
     let runtime = super::super::load_prompt("gateway", compiled);
@@ -58,18 +63,12 @@ pub async fn build_system_prompt(
         prompt.push_str(&user_soul);
     }
 
-    // Append memory context
-    let memory_ctx = memory_store.get_memory_context().await;
+    // Append the token-capped memory block (long-term memory + daily notes
+    // + bank summary; omissions are disclosed to the model).
+    let memory_ctx = memory_store.get_injectable_context(max_inject_tokens).await;
     if !memory_ctx.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&memory_ctx);
-    }
-
-    // Append memory bank summary (entity abstracts)
-    let bank_summary = memory_store.get_bank_summary().await;
-    if !bank_summary.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&bank_summary);
     }
 
     // Append always-on skills

@@ -11,9 +11,112 @@ use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr};
 
+/// Default token budget for memory injected into the system prompt.
+///
+/// Mirrors codex's `memory_summary.md` injection limit. Overridable via
+/// `memory.max_inject_tokens` in config; see
+/// [`MemoryStore::get_injectable_context`].
+pub const DEFAULT_MAX_INJECT_TOKENS: usize = 2500;
+
 /// Persistent memory store backed by markdown files.
 pub struct MemoryStore {
     memory_dir: PathBuf,
+}
+
+/// Raw markdown sections loaded from disk, before prompt formatting.
+struct MemorySections {
+    long_term: String,
+    recent: Vec<(String, String)>,
+    today: String,
+}
+
+/// Rough token estimate that stays honest for CJK-heavy content:
+/// ~4 ASCII chars per token, ~1 token per non-ASCII char.
+fn estimate_tokens(text: &str) -> usize {
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ascii / 4 + non_ascii
+}
+
+/// Keep whole paragraphs (`\n\n`-separated) while they fit `max_tokens`.
+/// Never cuts mid-entry; returns empty when not even the first paragraph fits.
+fn truncate_at_paragraph(text: &str, max_tokens: usize) -> String {
+    let mut kept = String::new();
+    for para in text.split("\n\n") {
+        let candidate_cost = estimate_tokens(para) + estimate_tokens("\n\n");
+        if estimate_tokens(&kept) + candidate_cost > max_tokens {
+            break;
+        }
+        if !kept.is_empty() {
+            kept.push_str("\n\n");
+        }
+        kept.push_str(para);
+    }
+    kept
+}
+
+/// Atomically replace `path` with `content`: same-dir temp file, fsync,
+/// rename over the target, then fsync the directory (Unix). When `backup`
+/// is given and the target exists, the previous content is first copied to
+/// the backup path so one prior version stays recoverable after a bad
+/// rewrite (crash mid-write leaves the original untouched).
+async fn write_atomic_with_backup(
+    path: PathBuf,
+    content: String,
+    backup: Option<PathBuf>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| eyre::eyre!("path has no parent: {}", path.display()))?
+            .to_path_buf();
+
+        if let Some(backup_path) = backup {
+            match std::fs::copy(&path, &backup_path) {
+                Ok(_) => {}
+                // First write: nothing to back up.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(eyre::Report::new(e).wrap_err("failed to write memory backup"));
+                }
+            }
+        }
+
+        let tmp_path = parent.join(format!(
+            ".{}.tmp.{}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("memory"),
+            uuid::Uuid::now_v7().simple()
+        ));
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &path)?;
+            #[cfg(unix)]
+            if let Ok(dir) = std::fs::File::open(&parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })();
+        if write_result.is_err() {
+            // If create/write/rename failed the tmp file may exist and must not leak.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_result
+    })
+    .await
+    .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
 }
 
 impl MemoryStore {
@@ -38,11 +141,14 @@ impl MemoryStore {
 
     /// Write long-term memory (`MEMORY.md`), replacing previous content.
     ///
-    /// Infrastructure for future `write_daily_note` tool wiring -- currently
-    /// has no direct callers but retained as public API for planned tool integration.
+    /// Atomic (temp + fsync + rename) and keeps the previous version in
+    /// `MEMORY.md.bak` so a bad rewrite is recoverable. Output slot for the
+    /// memory-refresh consolidator (design PR-4); currently has no runtime
+    /// callers but retained as public API for that integration.
     pub async fn write_long_term(&self, content: &str) -> Result<()> {
         let path = self.memory_dir.join("MEMORY.md");
-        tokio::fs::write(&path, content)
+        let backup = self.memory_dir.join("MEMORY.md.bak");
+        write_atomic_with_backup(path, content.to_string(), Some(backup))
             .await
             .wrap_err("failed to write MEMORY.md")
     }
@@ -99,8 +205,8 @@ impl MemoryStore {
         Ok(entries)
     }
 
-    /// Build a formatted context string for injection into the system prompt.
-    pub async fn get_memory_context(&self) -> String {
+    /// Load the raw markdown sections, downgrading read errors to warnings.
+    async fn load_sections(&self) -> MemorySections {
         let long_term = match self.read_long_term().await {
             Ok(v) => v,
             Err(e) => {
@@ -122,26 +228,136 @@ impl MemoryStore {
                 String::new()
             }
         };
+        MemorySections {
+            long_term,
+            recent,
+            today,
+        }
+    }
 
+    /// Render sections in the canonical prompt order.
+    fn render_context(sections: &MemorySections) -> String {
         let mut ctx = String::new();
 
-        if !long_term.is_empty() {
+        if !sections.long_term.is_empty() {
             ctx.push_str("## Long-term Memory\n\n");
-            ctx.push_str(&long_term);
+            ctx.push_str(&sections.long_term);
             ctx.push_str("\n\n");
         }
 
-        if !recent.is_empty() {
+        if !sections.recent.is_empty() {
             ctx.push_str("## Recent Activity\n\n");
-            for (date, content) in &recent {
+            for (date, content) in &sections.recent {
                 ctx.push_str(&format!("### {date}\n{content}\n\n"));
             }
         }
 
-        if !today.is_empty() {
+        if !sections.today.is_empty() {
             ctx.push_str("## Today's Notes\n\n");
-            ctx.push_str(&today);
+            ctx.push_str(&sections.today);
             ctx.push('\n');
+        }
+
+        ctx
+    }
+
+    /// Build a formatted context string for injection into the system prompt.
+    ///
+    /// Unbounded — prefer [`Self::get_injectable_context`], which also
+    /// includes the bank summary and enforces a token budget.
+    pub async fn get_memory_context(&self) -> String {
+        Self::render_context(&self.load_sections().await)
+    }
+
+    /// Build the complete, token-capped memory block for system prompt
+    /// injection: long-term memory + recent/today notes + bank summary.
+    ///
+    /// The budget is spent in priority order — `MEMORY.md` first (truncated
+    /// at a paragraph boundary if it alone exceeds the budget), then today's
+    /// notes, then the bank summary, then older daily notes newest-first —
+    /// but the output keeps the canonical section order. Anything dropped is
+    /// disclosed in a trailing marker so the model knows memory is partial.
+    pub async fn get_injectable_context(&self, max_tokens: usize) -> String {
+        let mut sections = self.load_sections().await;
+        let mut bank = self.get_bank_summary().await;
+
+        let mut budget = max_tokens;
+        let mut omitted: Vec<String> = Vec::new();
+
+        // Priority 1: long-term memory (paragraph-truncated when needed).
+        if !sections.long_term.is_empty() {
+            let cost = estimate_tokens(&sections.long_term);
+            if cost <= budget {
+                budget -= cost;
+            } else {
+                let kept = truncate_at_paragraph(&sections.long_term, budget);
+                budget = 0;
+                if kept.is_empty() {
+                    sections.long_term = String::new();
+                    omitted.push("long-term memory".to_string());
+                } else {
+                    sections.long_term = format!(
+                        "{kept}\n\n_[long-term memory truncated to fit the context budget — full MEMORY.md on disk]_"
+                    );
+                }
+            }
+        }
+
+        // Priority 2: today's notes (all-or-nothing).
+        if !sections.today.is_empty() {
+            let cost = estimate_tokens(&sections.today);
+            if cost <= budget {
+                budget -= cost;
+            } else {
+                sections.today = String::new();
+                omitted.push("today's notes".to_string());
+            }
+        }
+
+        // Priority 3: bank summary (all-or-nothing).
+        if !bank.is_empty() {
+            let cost = estimate_tokens(&bank);
+            if cost <= budget {
+                budget -= cost;
+            } else {
+                bank = String::new();
+                omitted.push("memory bank summary".to_string());
+            }
+        }
+
+        // Priority 4: older daily notes, newest first (read_recent returns
+        // yesterday-first already).
+        let mut kept_recent = Vec::new();
+        let mut dropped_days = 0usize;
+        for (date, content) in sections.recent.drain(..) {
+            let cost = estimate_tokens(&content);
+            if dropped_days == 0 && cost <= budget {
+                budget -= cost;
+                kept_recent.push((date, content));
+            } else {
+                dropped_days += 1;
+            }
+        }
+        if dropped_days > 0 {
+            omitted.push(format!("{dropped_days} older daily note(s)"));
+        }
+        sections.recent = kept_recent;
+
+        let mut ctx = Self::render_context(&sections);
+        if !bank.is_empty() {
+            if !ctx.is_empty() && !ctx.ends_with('\n') {
+                ctx.push('\n');
+            }
+            if !ctx.is_empty() {
+                ctx.push('\n');
+            }
+            ctx.push_str(&bank);
+        }
+        if !omitted.is_empty() {
+            ctx.push_str(&format!(
+                "\n_[memory budget: omitted {}; full files under the memory directory]_\n",
+                omitted.join(", ")
+            ));
         }
 
         ctx
@@ -206,11 +422,17 @@ impl MemoryStore {
     }
 
     /// Write (create or update) an entity page. Creates bank directory if needed.
+    ///
+    /// Atomic (temp + fsync + rename) and keeps the previous version in
+    /// `<slug>.md.prev`, so a careless `save_memory` full-overwrite is
+    /// recoverable (`save_memory`'s "merge, don't discard" is prompt-level
+    /// guidance only — this is the mechanical safety net).
     pub async fn write_entity(&self, name: &str, content: &str) -> Result<()> {
         self.ensure_bank_dir().await?;
         let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
         let path = self.bank_dir().join(format!("{safe_name}.md"));
-        tokio::fs::write(&path, content)
+        let backup = self.bank_dir().join(format!("{safe_name}.md.prev"));
+        write_atomic_with_backup(path, content.to_string(), Some(backup))
             .await
             .wrap_err_with(|| format!("failed to write entity: {name}"))
     }
@@ -230,10 +452,12 @@ impl MemoryStore {
 
         let mut summary = String::from(
             "## Memory Bank\n\
-             These are facts you know about the user and their world. Treat them as ground \
-             truth — use them directly when relevant (e.g. if you know the user's city, use it \
-             for weather/time questions without asking). Use `recall_memory` to load full details \
-             when abstracts don't have enough information.\n",
+             Curated notes about the user and their world from past sessions. Use them \
+             directly when relevant (e.g. if you know the user's city, use it for weather/time \
+             questions without asking), but they may be stale — when the current conversation \
+             contradicts a note, trust the conversation, and verify time-sensitive facts before \
+             acting on them. Use `recall_memory` to load full details when abstracts don't have \
+             enough information.\n",
         );
         for (name, abstract_line) in &entities {
             summary.push_str(&format!("- **{name}**: {abstract_line}\n"));
@@ -554,5 +778,234 @@ mod tests {
         assert!(ctx.contains("## Long-term Memory"));
         assert!(ctx.contains("## Recent Activity"));
         assert!(ctx.contains("yesterday notes"));
+    }
+
+    // --- PR-1 foundations: atomic writes + backups ---
+
+    #[tokio::test]
+    async fn should_create_backup_when_rewriting_long_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term("version one").await.unwrap();
+        store.write_long_term("version two").await.unwrap();
+
+        assert_eq!(store.read_long_term().await.unwrap(), "version two");
+        let bak = tokio::fs::read_to_string(dir.path().join("memory").join("MEMORY.md.bak"))
+            .await
+            .unwrap();
+        assert_eq!(bak, "version one");
+    }
+
+    #[tokio::test]
+    async fn should_not_create_backup_when_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term("first").await.unwrap();
+
+        let bak_exists = tokio::fs::try_exists(dir.path().join("memory").join("MEMORY.md.bak"))
+            .await
+            .unwrap();
+        assert!(!bak_exists);
+    }
+
+    #[tokio::test]
+    async fn should_leave_no_temp_files_when_writes_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term("a").await.unwrap();
+        store.write_long_term("b").await.unwrap();
+        store
+            .write_entity("thing", "# Thing\n\ncontent\n")
+            .await
+            .unwrap();
+        store
+            .write_entity("thing", "# Thing\n\nupdated\n")
+            .await
+            .unwrap();
+
+        for sub in [
+            dir.path().join("memory"),
+            dir.path().join("memory/bank/entities"),
+        ] {
+            let mut entries = tokio::fs::read_dir(&sub).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(!name.contains(".tmp."), "leaked temp file: {name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_keep_prev_revision_when_overwriting_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_entity("proj", "old details").await.unwrap();
+        store.write_entity("proj", "new details").await.unwrap();
+
+        assert_eq!(
+            store.read_entity("proj").await.unwrap(),
+            Some("new details".to_string())
+        );
+        let prev = tokio::fs::read_to_string(dir.path().join("memory/bank/entities/proj.md.prev"))
+            .await
+            .unwrap();
+        assert_eq!(prev, "old details");
+
+        // The .prev revision must not surface as a bank entity.
+        let entities = store.list_entities().await.unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].0, "proj");
+    }
+
+    // --- PR-1 foundations: budgeted injectable context ---
+
+    #[tokio::test]
+    async fn should_include_all_sections_in_canonical_order_when_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term("long term facts").await.unwrap();
+        store.append_today("today note").await.unwrap();
+        store
+            .write_entity("octos", "# octos\n\nagent framework\n")
+            .await
+            .unwrap();
+        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        tokio::fs::write(
+            dir.path().join("memory").join(format!("{yesterday}.md")),
+            "yesterday note",
+        )
+        .await
+        .unwrap();
+
+        let ctx = store.get_injectable_context(10_000).await;
+        let lt = ctx.find("## Long-term Memory").expect("long-term present");
+        let recent = ctx.find("## Recent Activity").expect("recent present");
+        let today = ctx.find("## Today's Notes").expect("today present");
+        let bank = ctx.find("## Memory Bank").expect("bank present");
+        assert!(lt < recent && recent < today && today < bank);
+        assert!(!ctx.contains("memory budget: omitted"));
+    }
+
+    #[tokio::test]
+    async fn should_drop_oldest_daily_notes_first_when_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term("tiny").await.unwrap();
+        let today = chrono::Local::now().date_naive();
+        for (days_ago, tag) in [(1, "NEWEST"), (2, "OLDEST")] {
+            let date = (today - chrono::Duration::days(days_ago)).format("%Y-%m-%d");
+            tokio::fs::write(
+                dir.path().join("memory").join(format!("{date}.md")),
+                format!("{tag} {}", "x".repeat(4000)),
+            )
+            .await
+            .unwrap();
+        }
+
+        // ~1000 tokens per day-note; budget fits exactly one.
+        let ctx = store.get_injectable_context(1_200).await;
+        assert!(ctx.contains("NEWEST"));
+        assert!(!ctx.contains("OLDEST"));
+        assert!(ctx.contains("1 older daily note(s)"));
+    }
+
+    #[tokio::test]
+    async fn should_truncate_long_term_at_paragraph_when_alone_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let big_para = "y".repeat(2000);
+        store
+            .write_long_term(&format!("first entry\n\n{big_para}"))
+            .await
+            .unwrap();
+
+        let ctx = store.get_injectable_context(30).await;
+        assert!(ctx.contains("first entry"));
+        assert!(!ctx.contains(&big_para));
+        assert!(ctx.contains("long-term memory truncated"));
+    }
+
+    #[tokio::test]
+    async fn should_prefer_today_and_bank_over_recent_when_budget_tight() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store.write_long_term(&"l".repeat(400)).await.unwrap();
+        store.append_today("small today note").await.unwrap();
+        store
+            .write_entity("octos", "# octos\n\nagent framework\n")
+            .await
+            .unwrap();
+        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        tokio::fs::write(
+            dir.path().join("memory").join(format!("{yesterday}.md")),
+            "z".repeat(4000),
+        )
+        .await
+        .unwrap();
+
+        let ctx = store.get_injectable_context(500).await;
+        assert!(ctx.contains("## Today's Notes"));
+        assert!(ctx.contains("## Memory Bank"));
+        assert!(!ctx.contains("## Recent Activity"));
+        assert!(ctx.contains("1 older daily note(s)"));
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_when_no_memory_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        assert_eq!(store.get_injectable_context(2500).await, "");
+    }
+
+    #[tokio::test]
+    async fn should_not_claim_ground_truth_when_bank_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        store
+            .write_entity("octos", "# octos\n\nframework\n")
+            .await
+            .unwrap();
+
+        let summary = store.get_bank_summary().await;
+        assert!(!summary.contains("ground truth"));
+        assert!(summary.contains("may be stale"));
+    }
+
+    // --- PR-1 foundations: token estimation ---
+
+    #[test]
+    fn should_estimate_ascii_at_quarter_char_rate() {
+        assert_eq!(estimate_tokens(&"a".repeat(400)), 100);
+    }
+
+    #[test]
+    fn should_estimate_cjk_at_one_token_per_char() {
+        let text = "记".repeat(100);
+        assert_eq!(estimate_tokens(&text), 100);
+    }
+
+    #[test]
+    fn should_keep_whole_paragraphs_when_truncating() {
+        let text = "aaaa\n\nbbbb\n\ncccc";
+        // Each paragraph ≈1 token; a budget of 2 keeps exactly two.
+        let kept = truncate_at_paragraph(text, 2);
+        assert_eq!(kept, "aaaa\n\nbbbb");
+    }
+
+    #[test]
+    fn should_return_empty_when_first_paragraph_exceeds_budget() {
+        assert_eq!(truncate_at_paragraph(&"x".repeat(4000), 10), "");
     }
 }
