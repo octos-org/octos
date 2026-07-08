@@ -2,9 +2,11 @@
 //!
 //! Registered on conversation agents when `memory.refresh.enabled` is on.
 //! [`crate::Agent::refresh_prompt_segments`] calls [`MemorySegmentProvider::refresh`]
-//! at every turn start; the provider re-renders the block only when
-//! `MEMORY.md` changed on disk (mtime+len) or the local date rolled over
-//! (daily-note windows shift) — the unchanged path is a single `stat`.
+//! at every turn start; the provider re-renders the block only when one of
+//! the injected sources changed: `MEMORY.md` (mtime+len), today's daily
+//! note (mtime+len), the bank entities directory (mtime — entity writes
+//! rename into it), or the local date rolled over (daily-note windows
+//! shift). The unchanged path is three stats, no reads.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -35,11 +37,17 @@ better for knowing it.\n\
 Never edit files under the memory directory with file tools; `memory_note` is \
 the only memory write path.";
 
-/// Change fingerprint for the memory block inputs.
+/// Change fingerprint over every source that feeds the injected block.
 #[derive(PartialEq, Eq, Clone)]
 struct Fingerprint {
     /// (mtime, len) of MEMORY.md; `None` when the file doesn't exist.
     memory_md: Option<(SystemTime, u64)>,
+    /// (mtime, len) of today's daily note (append_today writes land here).
+    today_note: Option<(SystemTime, u64)>,
+    /// mtime of `bank/entities/` — save_memory's atomic rename and `.prev`
+    /// copy both bump the directory mtime, so entity edits are caught
+    /// without stat-ing every entity file.
+    bank_dir: Option<SystemTime>,
     /// Local date — daily-note windows shift at midnight.
     date: String,
 }
@@ -67,12 +75,20 @@ impl MemorySegmentProvider {
     }
 
     async fn fingerprint(&self) -> Fingerprint {
-        let memory_md = tokio::fs::metadata(self.store.memory_md_path())
+        async fn stat_file(path: std::path::PathBuf) -> Option<(SystemTime, u64)> {
+            let meta = tokio::fs::metadata(path).await.ok()?;
+            meta.modified().ok().map(|t| (t, meta.len()))
+        }
+        let memory_md = stat_file(self.store.memory_md_path()).await;
+        let today_note = stat_file(self.store.today_note_path()).await;
+        let bank_dir = tokio::fs::metadata(self.store.bank_entities_dir())
             .await
             .ok()
-            .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+            .and_then(|m| m.modified().ok());
         Fingerprint {
             memory_md,
+            today_note,
+            bank_dir,
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
         }
     }
@@ -167,6 +183,43 @@ mod tests {
         // Empty memory + capture off → empty segment.
         let provider_off = MemorySegmentProvider::new(store, 2500, false);
         assert_eq!(provider_off.refresh().await, Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn should_re_render_when_bank_entity_or_today_note_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        store.write_long_term("stable long-term").await.unwrap();
+
+        let provider = MemorySegmentProvider::new(store.clone(), 2500, false);
+        assert!(provider.refresh().await.is_some());
+        assert!(provider.refresh().await.is_none());
+
+        // save_memory-style bank write must invalidate the fingerprint.
+        store
+            .write_entity(
+                "city",
+                "# city
+
+user lives in Vancouver
+",
+            )
+            .await
+            .unwrap();
+        let after_bank = provider.refresh().await;
+        assert!(
+            after_bank.is_some_and(|c| c.contains("Vancouver")),
+            "bank entity write must refresh the injected block"
+        );
+        assert!(provider.refresh().await.is_none());
+
+        // append_today must invalidate it too.
+        store.append_today("learned something today").await.unwrap();
+        let after_today = provider.refresh().await;
+        assert!(
+            after_today.is_some_and(|c| c.contains("learned something today")),
+            "today-note append must refresh the injected block"
+        );
     }
 
     #[test]

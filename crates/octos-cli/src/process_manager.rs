@@ -450,11 +450,23 @@ impl ProcessManager {
         if self.host_plugins_require_signed {
             cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
         }
-        if let Some(n) = self.host_max_inject_tokens {
-            cmd.env("OCTOS_MEMORY_MAX_INJECT_TOKENS", n.to_string());
+        // Set-or-CLEAR: `Command` inherits the parent environment, so when
+        // the host does not forward a memory setting we must remove any
+        // inherited value — otherwise a stale env var from the serve
+        // process's own environment would re-enable a feature the host
+        // config explicitly turned off.
+        match self.host_max_inject_tokens {
+            Some(n) => {
+                cmd.env("OCTOS_MEMORY_MAX_INJECT_TOKENS", n.to_string());
+            }
+            None => {
+                cmd.env_remove("OCTOS_MEMORY_MAX_INJECT_TOKENS");
+            }
         }
         if self.host_memory_refresh_enabled {
             cmd.env("OCTOS_MEMORY_REFRESH_ENABLED", "1");
+        } else {
+            cmd.env_remove("OCTOS_MEMORY_REFRESH_ENABLED");
         }
 
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");

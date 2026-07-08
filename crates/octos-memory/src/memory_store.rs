@@ -154,6 +154,17 @@ impl MemoryStore {
         self.memory_dir.join("MEMORY.md")
     }
 
+    /// Path to today's daily-note file (for cheap change detection).
+    pub fn today_note_path(&self) -> PathBuf {
+        self.today_path()
+    }
+
+    /// Path to the bank entities directory (for cheap change detection:
+    /// entity writes rename/copy into this directory, bumping its mtime).
+    pub fn bank_entities_dir(&self) -> PathBuf {
+        self.bank_dir()
+    }
+
     /// Read long-term memory (`MEMORY.md`). Returns empty string if missing.
     pub async fn read_long_term(&self) -> Result<String> {
         let path = self.memory_dir.join("MEMORY.md");
