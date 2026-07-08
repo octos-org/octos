@@ -300,7 +300,12 @@ impl<'a> ValidationCtx<'a> {
     /// pending-confirm and carries no authority until the user confirms.
     fn source_qualifies(&self, source: &str) -> bool {
         if let Some(note) = self.notes.get(source) {
-            return note.origin == NoteOrigin::Host && !note.is_free_text_forget();
+            // Forget notes carry hard-delete-only authority over their
+            // NAMED ids (checked at the hard_delete gate); they must never
+            // qualify as edit authority for update/supersede/archive — a
+            // bad reply could otherwise cite a delete confirmation to
+            // rewrite unrelated entries.
+            return note.origin == NoteOrigin::Host && note.kind != NoteKind::Forget;
         }
         if let Some(item) = self.items.get(source) {
             return matches!(

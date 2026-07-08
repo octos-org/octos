@@ -229,6 +229,38 @@ pub async fn run_consolidation(
         }
     }
 
+    // --- 2.4 recovery re-hide (runs BEFORE any fallible/early exit) -------
+    // A crash after a sensitive parking persisted its binding (apply step
+    // 2.5) and archive copy (step 2) but before MEMORY.md was rewritten
+    // (step 3) leaves interim-archived candidates live — and injectable.
+    // Re-hide and PERSIST immediately: the parked invariant must not wait
+    // for a successful merge (the pending note may be the only staging, or
+    // the model may fail validation for the rest of the day).
+    {
+        let mut re_hidden = false;
+        for note in &waiting {
+            for cand in note.candidates.as_deref().unwrap_or_default() {
+                if !cand.interim_archived {
+                    continue;
+                }
+                if let Some(pos) = entries
+                    .iter()
+                    .position(|e| e.id == cand.entry_id && e.content_hash() == cand.content_hash)
+                {
+                    tracing::info!(
+                        id = %cand.entry_id,
+                        "re-hiding interim-archived candidate left live by a crashed run"
+                    );
+                    entries.remove(pos);
+                    re_hidden = true;
+                }
+            }
+        }
+        if re_hidden {
+            apply::write_memory_md(memory_dir, &entries, true)?;
+        }
+    }
+
     // --- 2.5 consume already-satisfied id-bound forgets -------------------
     // Crash recovery: the apply order deletes the authorizing note only
     // AFTER the new MEMORY.md is published. A crash in between leaves an
@@ -494,29 +526,6 @@ pub async fn run_consolidation(
     let mut interim_texts: HashMap<String, String> = HashMap::new();
     // Restores: entry id → (block text, exact archive block to remove).
     let mut restores: HashMap<String, String> = HashMap::new();
-
-    // Recovery re-hide: a crash after the binding persisted (step 2.5)
-    // but before MEMORY.md was rewritten leaves interim-archived
-    // candidates still live. Their archive copies exist (appends precede
-    // the binding), so hiding them again is safe and restores the parked
-    // invariant.
-    for note in &waiting {
-        for cand in note.candidates.as_deref().unwrap_or_default() {
-            if !cand.interim_archived {
-                continue;
-            }
-            if let Some(pos) = entries
-                .iter()
-                .position(|e| e.id == cand.entry_id && e.content_hash() == cand.content_hash)
-            {
-                tracing::info!(
-                    id = %cand.entry_id,
-                    "re-hiding interim-archived candidate left live by a crashed run"
-                );
-                entries.remove(pos);
-            }
-        }
-    }
 
     for note in &waiting {
         let cands = note.candidates.as_deref().unwrap_or_default();
@@ -2074,6 +2083,88 @@ mod tests {
             archived.matches("^msenstv").count(),
             1,
             "no duplicate archive copies"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_re_hide_before_early_exit_when_parked_note_is_only_staging() {
+        // The crash-recovery privacy hole: the parked note is the ONLY
+        // staging state, so the run exits early with no merge — the
+        // sensitive entry must be re-hidden and PERSISTED anyway.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "Sensitive location detail. (updated: 2026-06-01) ^msenstv";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(memory_dir.join("archive/2026-07.md"), format!("{secret}\n")).unwrap();
+        write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget the location",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^msenstv","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex(secret)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert_eq!(provider.call_count(), 0, "no merge needed");
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("^msenstv"),
+            "re-hide must persist even on the early-exit path: {memory}"
+        );
+        assert!(memory.contains("^mcccccc"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_update_when_only_source_is_id_bound_forget_note() {
+        // A delete confirmation must not double as edit authority.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &[
+                "Target entry text. (updated: 2026-06-01) ^maaaaaa",
+                "Unrelated entry. (updated: 2026-06-02) ^mbbbbbb",
+            ],
+        );
+        write_note(
+            memory_dir,
+            "01fg-confirm",
+            "host",
+            "forget",
+            "delete id:^maaaaaa",
+            false,
+        );
+
+        // The reply uses the forget note as the sole source for editing the
+        // UNRELATED entry (and never performs the authorized delete).
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"update","id":"^mbbbbbb","new_text":"Rewritten by a delete confirmation.","sources":["01fg-confirm"]}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#,
+            r#"{"ops":[{"op":"update","id":"^mbbbbbb","new_text":"Rewritten by a delete confirmation.","sources":["01fg-confirm"]}],"consumed_ids":["01fg-confirm"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.merge_applied,
+            "forget-sourced edit must be rejected"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("Unrelated entry."),
+            "entry must be untouched"
         );
     }
 }
