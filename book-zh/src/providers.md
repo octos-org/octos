@@ -1,6 +1,6 @@
 # LLM 服务商与路由
 
-Octos 开箱即用地支持 14 家 LLM 服务商。每个服务商需要一个存储在环境变量中的 API 密钥（本地服务商如 Ollama 除外）。
+Octos 开箱即用地支持 16 家 LLM 服务商。每个服务商需要一个存储在环境变量中的 API 密钥（本地服务商如 Ollama、以及使用服务账号 JSON 的 Vertex AI 除外）。
 
 ## 支持的服务商
 
@@ -8,7 +8,8 @@ Octos 开箱即用地支持 14 家 LLM 服务商。每个服务商需要一个�
 |----------|-------------|---------------|------------|---------|
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native Anthropic | -- |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | -- |
-| `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | Native Gemini | -- |
+| `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | `google` |
+| `vertex` | `VERTEX_SA_JSON` | gemini-2.5-flash | Vertex AI（Gemini） | -- |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | -- |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI 兼容 | -- |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI 兼容 | -- |
@@ -16,10 +17,15 @@ Octos 开箱即用地支持 14 家 LLM 服务商。每个服务商需要一个�
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI 兼容 | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI 兼容 | -- |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI 兼容 | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5 | Anthropic 兼容 | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic 兼容 | `z.ai` |
+| `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | 自动（Anthropic/OpenAI） | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | -- |
 | `vllm` | `VLLM_API_KEY` | *（须指定）* | OpenAI 兼容 | -- |
+
+**`vertex`** 使用 Google 服务账号 JSON 认证（通过 `VERTEX_SA_JSON` 解析——钥匙串标记、配置值或环境变量），而非 API 密钥；GCP 项目从 JSON 中读取，区域固定为 `global`。必须显式选择（`provider: "vertex"`）——裸的 `gemini-*` 模型名仍会解析到 AI Studio 的 `gemini` 服务商。**`r9s`** 是多协议代理：`claude-*` 模型自动走 Anthropic Messages API，其余走 OpenAI Chat Completions。
+
+其他任何 OpenAI 或 Anthropic 兼容端点（如 `wisemodel`、Together、Fireworks、Azure）可通过在服务商上设置 `base_url` 接入——见[自定义端点](#自定义端点)。
 
 ## 配置方式
 
