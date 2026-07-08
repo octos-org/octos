@@ -546,6 +546,24 @@ impl MemoryConfig {
             .and_then(|m| m.max_inject_tokens)
             .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
     }
+
+    /// Effective injection budget for configs derived in-process from a
+    /// profile (which never pass through `Config::from_file`'s env merge):
+    /// profile value → host `OCTOS_MEMORY_MAX_INJECT_TOKENS` env (set by
+    /// `ProcessManager` from the host config.json) → default.
+    pub fn effective_max_inject_tokens_with_host_env(config: Option<&MemoryConfig>) -> usize {
+        config
+            .and_then(|m| m.max_inject_tokens)
+            .or_else(host_env_max_inject_tokens)
+            .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
+    }
+}
+
+/// Parse the host-forwarded memory budget env var, if present and valid.
+fn host_env_max_inject_tokens() -> Option<usize> {
+    std::env::var("OCTOS_MEMORY_MAX_INJECT_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
 }
 
 /// Email sending configuration for the `send_email` tool.

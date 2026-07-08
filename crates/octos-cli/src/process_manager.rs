@@ -334,6 +334,18 @@ impl ProcessManager {
                                 );
                                 continue;
                             }
+                            // The host memory budget env is equally
+                            // host-reserved: a parent profile must not
+                            // impersonate it toward sub-accounts.
+                            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+                                tracing::warn!(
+                                    profile = %profile.id,
+                                    parent = %parent_id,
+                                    var = %key,
+                                    "skipping parent env var that would override host memory budget"
+                                );
+                                continue;
+                            }
                             cmd.env(key, value);
                         }
                     }

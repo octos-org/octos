@@ -580,9 +580,13 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
-        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
-            effective_profile.config.memory.as_ref(),
-        );
+        // Routed child-bot actors are built in-process from the profile
+        // JSON, so the host budget arrives via the ProcessManager-set env
+        // var rather than Config::from_file's merge.
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens_with_host_env(
+                effective_profile.config.memory.as_ref(),
+            );
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
