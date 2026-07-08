@@ -214,6 +214,30 @@ fn rewrite_block_file(
     Ok(())
 }
 
+/// True when the file's FRONTMATTER declares `origin: host`. Only the
+/// fenced header counts — untrusted note bodies could contain the literal
+/// and must not gain scrub immunity.
+pub(super) fn frontmatter_declares_host(content: &str) -> bool {
+    let Some(after) = content.strip_prefix("---") else {
+        return false;
+    };
+    let Some(rest) = after
+        .strip_prefix("\r\n")
+        .or_else(|| after.strip_prefix('\n'))
+    else {
+        return false;
+    };
+    for line in rest.lines() {
+        if line.trim_end() == "---" {
+            return false;
+        }
+        if line.trim() == "origin: host" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Does this staging file contain an exact (whitespace-folded) line of any
 /// hard-deleted entry? Whole-file-delete if so — staging bodies are
 /// untrusted and cannot be safely partially edited.
@@ -286,8 +310,9 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
                 // (consumption / pending-confirm / expiry) — whole-file
                 // scrub-deleting one that merely quotes a deleted line
                 // would orphan its parked candidates (binding written in
-                // step 2.5) or silently drop the ask.
-                if dir == "notes" && content.contains("origin: host") {
+                // step 2.5) or silently drop the ask. FRONTMATTER decides:
+                // an untrusted body containing the literal gains nothing.
+                if dir == "notes" && frontmatter_declares_host(&content) {
                     continue;
                 }
                 if staging_file_matches(&content, &plan.hard_deletes) {
@@ -442,6 +467,13 @@ pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> R
         for path in list_md_files(&memory_dir.join("staging").join(dir))? {
             let content = std::fs::read_to_string(&path)
                 .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+            // Same host-ask immunity as the main scrub: a mixed forget note
+            // naming this archived id AND a live id must survive until the
+            // merge honors the live part — deleting it here would lose the
+            // request if that merge fails.
+            if dir == "notes" && frontmatter_declares_host(&content) {
+                continue;
+            }
             if staging_file_matches(&content, &targets) {
                 remove_file_if_exists(&path)?;
             }
