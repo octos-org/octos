@@ -76,7 +76,8 @@ pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{
     DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS, DEFAULT_EMBEDDING_TIMEOUT_SECS,
-    DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS, LlmProvider, build_http_client,
+    DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS, LlmProvider, allow_insecure,
+    build_http_client, set_allow_insecure,
 };
 pub use responsiveness::ResponsivenessObserver;
 pub use retry::{RetryConfig, RetryProvider};
