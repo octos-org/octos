@@ -372,89 +372,39 @@ pub async fn run_consolidation(
         tracing::info!(note = %note.path.display(), "satisfied forget note consumed");
     }
 
-    // --- 2.7 budget-exhausted parking (no provider) -----------------------
-    // The daily cap disables the MERGE, not user asks: a sensitive forget
-    // must hide its candidates NOW, not when the budget resets — otherwise
-    // the raw priority note also keeps spinning the fast lane.
-    if !params.allow_merge {
-        entries =
-            park_free_text_forgets(memory_dir, params, &batch, &entries, &mut outcome, false)?;
-        // Id-bound forgets carry complete host authority — execute them
-        // Rust-side on live, unfrozen entries so `forget --id --sensitive`
-        // is honored NOW instead of when the budget resets. Ids that are
-        // pending-note candidates keep the full hash-verified confirmation
-        // flow of a merged run (their entries are already hidden when
-        // sensitive, so nothing stays exposed).
-        let frozen_ids: HashSet<String> = waiting
-            .iter()
-            .flat_map(|w| w.candidates.as_deref().unwrap_or_default())
-            .map(|c| c.entry_id.clone())
-            .collect();
-        let mut plan = ApplyPlan::default();
-        let mut working = entries.clone();
-        let mut executed_notes: Vec<usize> = Vec::new();
-        for (i, note) in batch.notes.iter().enumerate() {
-            if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
-                continue;
+    // --- 2.7 sensitive-first isolation (before ANY provider call) ---------
+    // Content the user marked sensitive must never ride a merge prompt:
+    // free-text sensitive forgets park (their bodies leave the batch) and
+    // id-bound sensitive forgets execute Rust-side — BEFORE section 5
+    // builds the prompt from entries + notes. Under an exhausted budget
+    // the same treatment extends to non-sensitive host forgets, since no
+    // merge will run to honor them.
+    for sensitive_only in [true, false] {
+        if sensitive_only || !params.allow_merge {
+            let mut parked: Vec<NoteFile> = Vec::new();
+            entries = park_free_text_forgets(
+                memory_dir,
+                params,
+                &batch,
+                &entries,
+                &mut outcome,
+                sensitive_only,
+                &mut parked,
+            )?;
+            if !parked.is_empty() {
+                let parked_ids: HashSet<String> = parked.iter().map(|n| n.id.clone()).collect();
+                batch.notes.retain(|n| !parked_ids.contains(&n.id));
+                waiting.extend(parked);
             }
-            let named = note.named_entry_ids();
-            if named.is_empty() {
-                continue;
-            }
-            let mut targets: Vec<usize> = named
-                .iter()
-                .filter_map(|id| {
-                    if frozen_ids.contains(id) {
-                        return None;
-                    }
-                    working.iter().position(|e| &e.id == id)
-                })
-                .collect();
-            // Descending + dedup: note order is arbitrary; removing a lower
-            // index first would shift later positions and panic.
-            targets.sort_unstable_by(|a, b| b.cmp(a));
-            targets.dedup();
-            if targets.is_empty() {
-                continue;
-            }
-            let all_named_covered = named
-                .iter()
-                .all(|id| working.iter().any(|e| &e.id == id) && !frozen_ids.contains(id));
-            // A partially honored note (some ids frozen/deferred) must
-            // SURVIVE as the confirmation for the remaining ids — only a
-            // fully honored note is consumed by the apply.
-            let authorizing = if all_named_covered {
-                note.path.clone()
-            } else {
-                PathBuf::new()
-            };
-            for pos in targets {
-                let entry = working.remove(pos);
-                plan.hard_deletes.push(ScrubTarget {
-                    entry_id: entry.id.clone(),
-                    folded_lines: entry.folded_lines(),
-                    authorizing_note: authorizing.clone(),
-                    originating_pending: Vec::new(),
-                });
-                outcome.hard_deleted.push(entry.id.clone());
-            }
-            if all_named_covered {
-                executed_notes.push(i);
-            }
-        }
-        if !plan.hard_deletes.is_empty() {
-            plan.final_entries = working.clone();
-            apply::apply_plan(memory_dir, params.today, &plan)?;
-            entries = working;
-            // Fully-honored notes were consumed by the apply (authorizing
-            // note deletion); drop them from the batch.
-            for i in executed_notes.into_iter().rev() {
-                let note = batch.notes.remove(i);
-                outcome.dropped.push((
-                    note.id.clone(),
-                    "executed under budget exhaustion (id-bound host authority)".to_string(),
-                ));
-            }
+            entries = execute_id_bound_forgets(
+                memory_dir,
+                params,
+                &mut batch,
+                &entries,
+                &waiting,
+                &mut outcome,
+                sensitive_only,
+            )?;
         }
     }
 
@@ -555,7 +505,15 @@ pub async fn run_consolidation(
         Err(e) => {
             // A sensitive ask must hide its data even when the merge never
             // happens — park before surfacing the transport error.
-            park_free_text_forgets(memory_dir, params, &batch, &entries, &mut outcome, true)?;
+            park_free_text_forgets(
+                memory_dir,
+                params,
+                &batch,
+                &entries,
+                &mut outcome,
+                true,
+                &mut Vec::new(),
+            )?;
             return Err(e);
         }
     };
@@ -579,6 +537,7 @@ pub async fn run_consolidation(
                         &entries,
                         &mut outcome,
                         true,
+                        &mut Vec::new(),
                     )?;
                     return Err(e);
                 }
@@ -1050,6 +1009,108 @@ fn protected_paths(batch: &StagingBatch) -> HashSet<PathBuf> {
 /// Used by the budget-exhausted path and by merge-FAILURE paths so a
 /// sensitive ask hides its data even when the merge never succeeds.
 /// Returns the entries list after any interim hiding.
+/// Rust-side execution of id-bound host forgets on live, unfrozen entries
+/// (full scrub pipeline, no provider). `sensitive_only` gates the
+/// sensitive-first isolation pass; the budget-exhausted pass runs it for
+/// every id-bound host forget. Fully honored notes are consumed; partially
+/// honored ones survive as the confirmation for their frozen ids.
+fn execute_id_bound_forgets(
+    memory_dir: &Path,
+    params: &ConsolidateParams,
+    batch: &mut StagingBatch,
+    entries: &[Entry],
+    waiting: &[NoteFile],
+    outcome: &mut ConsolidateOutcome,
+    sensitive_only: bool,
+) -> Result<Vec<Entry>> {
+    let frozen_ids: HashSet<String> = waiting
+        .iter()
+        .flat_map(|w| w.candidates.as_deref().unwrap_or_default())
+        .map(|c| c.entry_id.clone())
+        .collect();
+    let mut plan = ApplyPlan::default();
+    let mut working = entries.to_vec();
+    let mut executed_notes: Vec<usize> = Vec::new();
+    for (i, note) in batch.notes.iter().enumerate() {
+        if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
+            continue;
+        }
+        if sensitive_only && !note.sensitive {
+            continue;
+        }
+        let named = note.named_entry_ids();
+        if named.is_empty() {
+            continue;
+        }
+        let mut targets: Vec<usize> = named
+            .iter()
+            .filter_map(|id| {
+                if frozen_ids.contains(id) {
+                    return None;
+                }
+                working.iter().position(|e| &e.id == id)
+            })
+            .collect();
+        // Descending + dedup: note order is arbitrary; removing a lower
+        // index first would shift later positions and panic.
+        targets.sort_unstable_by(|a, b| b.cmp(a));
+        targets.dedup();
+        if targets.is_empty() {
+            continue;
+        }
+        // Covered = frozen nowhere AND either being executed now (live) or
+        // already gone everywhere (e.g. an archived-only id scrubbed by the
+        // satisfied pre-pass) — such a note is fully honored.
+        let mut all_named_covered = true;
+        for id in &named {
+            if frozen_ids.contains(id) {
+                all_named_covered = false;
+                break;
+            }
+            let live = working.iter().any(|e| &e.id == id);
+            if !live && apply::archive_names_id(memory_dir, id)? {
+                all_named_covered = false;
+                break;
+            }
+        }
+        // A partially honored note (some ids frozen/deferred) must SURVIVE
+        // as the confirmation for the remaining ids — only a fully honored
+        // note is consumed by the apply.
+        let authorizing = if all_named_covered {
+            note.path.clone()
+        } else {
+            PathBuf::new()
+        };
+        for pos in targets {
+            let entry = working.remove(pos);
+            plan.hard_deletes.push(ScrubTarget {
+                entry_id: entry.id.clone(),
+                folded_lines: entry.folded_lines(),
+                authorizing_note: authorizing.clone(),
+                originating_pending: Vec::new(),
+            });
+            outcome.hard_deleted.push(entry.id.clone());
+        }
+        if all_named_covered {
+            executed_notes.push(i);
+        }
+    }
+    if !plan.hard_deletes.is_empty() {
+        plan.final_entries = working.clone();
+        apply::apply_plan(memory_dir, params.today, &plan)?;
+        // Fully-honored notes were consumed by the apply (authorizing note
+        // deletion); drop them from the batch.
+        for i in executed_notes.into_iter().rev() {
+            let note = batch.notes.remove(i);
+            outcome.dropped.push((
+                note.id.clone(),
+                "executed Rust-side (id-bound host authority)".to_string(),
+            ));
+        }
+    }
+    Ok(working)
+}
+
 fn park_free_text_forgets(
     memory_dir: &Path,
     params: &ConsolidateParams,
@@ -1057,6 +1118,7 @@ fn park_free_text_forgets(
     entries: &[Entry],
     outcome: &mut ConsolidateOutcome,
     sensitive_only: bool,
+    parked_out: &mut Vec<NoteFile>,
 ) -> Result<Vec<Entry>> {
     let mut plan = ApplyPlan::default();
     let mut working = entries.to_vec();
@@ -1111,6 +1173,10 @@ fn park_free_text_forgets(
             sensitive: note.sensitive,
             expires_at: Some(expires_at),
         });
+        let mut parked = note.clone();
+        parked.candidates = Some(candidates);
+        parked.expires_at = Some(expires_at);
+        parked_out.push(parked);
         parked_any = true;
     }
     if parked_any {
@@ -1134,7 +1200,15 @@ fn finish_failed(
     // A sensitive ask must hide its data even when the merge failed — park
     // it now (Rust-only) instead of leaving the candidates live until some
     // later successful run.
-    park_free_text_forgets(memory_dir, params, batch, entries, outcome, true)?;
+    park_free_text_forgets(
+        memory_dir,
+        params,
+        batch,
+        entries,
+        outcome,
+        true,
+        &mut Vec::new(),
+    )?;
     for note in waiting {
         outcome
             .pending_notes
@@ -1619,10 +1693,18 @@ mod tests {
             true,
         );
 
-        let provider = ScriptedProvider::new(&[r#"{"ops":[],"consumed_ids":[],"dropped":[]}"#]);
+        // Sensitive-first isolation: parking happens Rust-side BEFORE any
+        // provider call — the sensitive body and entry never ride a merge
+        // prompt, and with nothing else staged no merge runs at all.
+        let provider = ScriptedProvider::new(&[]);
         let outcome = run(&provider, &params(dir.path())).await;
 
-        assert!(outcome.merge_applied, "errors: {:?}", outcome.errors);
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "sensitive content must not reach the provider"
+        );
+        assert!(!outcome.merge_applied);
         // Candidate hidden from MEMORY.md, parked in the archive.
         let memory = read_memory(dir.path());
         assert!(!memory.contains("bees"));
@@ -2454,7 +2536,7 @@ mod tests {
             "host",
             "forget",
             "delete id:^msecret",
-            true,
+            false,
         );
         write_note(
             memory_dir,
@@ -2637,18 +2719,15 @@ mod tests {
             true,
         );
 
-        let provider = ScriptedProvider::new(&[
-            r#"{"ops":[{"op":"hard_delete","id":"^mlivsec","authorized_by":"01fg-mixed"}],"consumed_ids":["01fg-mixed"],"dropped":[]}"#,
-        ]);
-        let outcome = run_consolidation(provider, &params(memory_dir))
+        // Sensitive-first isolation handles BOTH ids Rust-side — the
+        // archived-only scrub (2.5) plus the id-bound executor (2.7) —
+        // with zero provider involvement.
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
             .await
             .unwrap();
 
-        assert!(
-            outcome.merge_applied,
-            "mixed note must be satisfiable: {:?}",
-            outcome.errors
-        );
+        assert_eq!(provider.call_count(), 0);
         assert!(outcome.hard_deleted.contains(&"^marcsec".to_string()));
         assert!(outcome.hard_deleted.contains(&"^mlivsec".to_string()));
         let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
@@ -2676,7 +2755,7 @@ mod tests {
             "host",
             "forget",
             "delete id:^msecret",
-            true,
+            false,
         );
         // A separate free-text host forget QUOTING the deleted line.
         let quoting = write_note(
@@ -2762,10 +2841,12 @@ mod tests {
             "host",
             "forget",
             "delete id:^mlivsec and id:^marcsec",
-            true,
+            false,
         );
 
-        // The merge fails (garbage twice) — the on-disk request for the LIVE
+        // Non-sensitive mixed note (sensitive ones are executed Rust-side
+        // before any merge). The merge fails (garbage twice) — the on-disk
+        // request for the LIVE
         // deletion must survive even though the archived id was scrubbed.
         let provider = ScriptedProvider::new(&["GARBAGE", "GARBAGE"]);
         let outcome = run_consolidation(provider, &params(memory_dir))
@@ -2799,7 +2880,7 @@ mod tests {
             "host",
             "forget",
             "delete id:^msecret",
-            true,
+            false,
         );
         // A MODEL note whose untrusted body quotes the deleted line AND the
         // literal "origin: host" — spoofing must not grant scrub immunity.
@@ -2977,7 +3058,7 @@ mod tests {
             "host",
             "forget",
             "delete id:^msecret",
-            true,
+            false,
         );
 
         // The reply deletes the entry AND re-adds its text under a new id.
@@ -3183,7 +3264,7 @@ mod tests {
             "host",
             "forget",
             "delete id:^msecret",
-            true,
+            false,
         );
 
         let provider = ScriptedProvider::new(&[
@@ -3262,7 +3343,7 @@ mod tests {
             "host",
             "forget",
             "delete id:^msecret",
-            true,
+            false,
         );
 
         let provider = ScriptedProvider::new(&[
@@ -3285,5 +3366,58 @@ mod tests {
             "daily notes are injectable and must be scrubbed"
         );
         assert!(note.contains("harmless other line"));
+    }
+
+    #[tokio::test]
+    async fn should_keep_sensitive_content_out_of_merge_prompts() {
+        // The core round-16 property: when other staging forces a merge,
+        // the prompt must not contain the sensitive entry text or the
+        // sensitive note body — they were parked/executed Rust-side first.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "Sensitive location detail. (updated: 2026-06-01) ^msenstv";
+        write_memory(
+            memory_dir,
+            &[secret, "Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_note(
+            memory_dir,
+            "01fg-sens",
+            "host",
+            "forget",
+            "forget the sensitive location detail",
+            true,
+        );
+        // A model fact keeps the batch dirty so a merge DOES run.
+        write_note(memory_dir, "02fact", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["02fact"]}],"consumed_ids":["02fact"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+
+        assert_eq!(provider.call_count(), 1);
+        let prompt_text: String = provider
+            .call_messages(0)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("Sensitive location detail"),
+            "the sensitive entry text must not ride the merge prompt"
+        );
+        assert!(
+            !prompt_text.contains("forget the sensitive location detail"),
+            "the sensitive note body must not ride the merge prompt"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("^msenstv"),
+            "candidates hidden before the merge"
+        );
     }
 }

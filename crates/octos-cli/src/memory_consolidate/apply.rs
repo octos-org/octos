@@ -452,7 +452,7 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
                 if kept.is_empty() {
                     return None;
                 }
-                let text = kept.join("\n");
+                let mut text = kept.join("\n");
                 // An entry reduced to bookkeeping only carries no content.
                 if super::pending::strippable_entry_text(&super::entry::Entry {
                     id: entry.id.clone(),
@@ -462,6 +462,16 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
                 .is_empty()
                 {
                     return None;
+                }
+                // The scrub may have removed the id-bearing line; an id-less
+                // block would parse as mixed/legacy next run and brick the
+                // engine. Re-stamp the survivor.
+                if !text.contains(&entry.id) {
+                    text.push_str(&format!(
+                        "\n(updated: {}) {}",
+                        today.format("%Y-%m-%d"),
+                        entry.id
+                    ));
                 }
                 Some(super::entry::Entry {
                     id: entry.id.clone(),
@@ -531,7 +541,9 @@ pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> R
         for block in split_blocks(&content) {
             if block.contains(entry_id) {
                 found = true;
-                folded_lines.extend(block.lines().map(fold_whitespace).filter(|l| !l.is_empty()));
+                // Content-stripped shape (same as live-entry scrub sets):
+                // copies in daily notes / bank pages differ by bookkeeping.
+                folded_lines.extend(super::entry::content_folded_lines(&block));
             }
         }
     }
