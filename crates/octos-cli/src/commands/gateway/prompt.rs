@@ -13,6 +13,11 @@ use crate::persona_service::PersonaService;
 /// daily notes + bank summary combined); use
 /// [`crate::config::MemoryConfig::effective_max_inject_tokens`] to resolve it
 /// from config.
+// These are the cohesive set of bootstrap inputs a system prompt is composed
+// from (persona base, data/project dirs, memory + skills sources, and the two
+// resolved memory knobs); they don't group into a smaller, meaningful sub-type,
+// so the arg count is expected here.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_system_prompt(
     base: Option<&str>,
     data_dir: &Path,
