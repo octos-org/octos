@@ -250,7 +250,10 @@ pub async fn run_consolidation(
             continue;
         }
         let expires_at = note.expires_at.expect("pending notes carry expires_at");
-        if now > expires_at {
+        // Day-granularity: the run's clock is params.today (deterministic),
+        // so a note expires on the DAY its expiry falls — comparing full
+        // instants against midnight kept notes alive a day too long.
+        if now > expires_at || expires_at.date_naive() <= params.today {
             let result = apply::apply_expiry(memory_dir, note, &mut entries)?;
             outcome.errors.extend(result.errors);
             taken_ids.extend(result.restored.iter().cloned());
@@ -3418,6 +3421,61 @@ mod tests {
         assert!(
             !memory.contains("^msenstv"),
             "candidates hidden before the merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_expire_pending_note_on_its_expiry_day() {
+        // expires_at 10:00 on TODAY: day-granularity must expire it during
+        // today's passes, not tomorrow's.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        let parked = write_pending_note(
+            memory_dir,
+            "01fg-today",
+            "forget something vague",
+            false,
+            "[]",
+            &format!("{}T10:00:00+00:00", TODAY),
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(!parked.exists(), "note must expire on its expiry day");
+        assert!(
+            outcome
+                .pending_notes
+                .iter()
+                .any(|p| p.note_id == "01fg-today" && p.state == PendingState::Expired),
+            "{:?}",
+            outcome.pending_notes
+        );
+    }
+
+    #[test]
+    fn should_skip_symlinked_dirs_when_deleting_backups() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("precious.bak"), "outside data").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inside.bak"), "inside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        super::apply::delete_backups_for_test(dir.path()).unwrap();
+
+        assert!(
+            !dir.path().join("inside.bak").exists(),
+            "in-tree backups deleted"
+        );
+        assert!(
+            outside.path().join("precious.bak").exists(),
+            "the scrub must not follow symlinks out of the memory tree"
         );
     }
 }

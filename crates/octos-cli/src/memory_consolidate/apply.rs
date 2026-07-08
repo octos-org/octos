@@ -115,6 +115,11 @@ pub(super) fn remove_file_if_exists(path: &Path) -> Result<bool> {
 
 /// Recursively delete `*.bak` / `*.prev` files under `dir`. Backups are
 /// deleted outright on hard-delete merges — never scrub-edited.
+#[cfg(test)]
+pub(super) fn delete_backups_for_test(dir: &Path) -> Result<()> {
+    delete_backups(dir)
+}
+
 fn delete_backups(dir: &Path) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -122,8 +127,18 @@ fn delete_backups(dir: &Path) -> Result<()> {
         Err(e) => return Err(e).wrap_err_with(|| format!("failed to list {}", dir.display())),
     };
     for entry in entries {
-        let path = entry?.path();
-        if path.is_dir() {
+        let entry = entry?;
+        let path = entry.path();
+        // symlink_metadata: the scrub must stay scoped to the profile's
+        // memory tree — following a symlinked directory would delete
+        // backups elsewhere on the filesystem.
+        let file_type = std::fs::symlink_metadata(&path)
+            .wrap_err_with(|| format!("failed to stat {}", path.display()))?
+            .file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             delete_backups(&path)?;
         } else if path.extension().is_some_and(|e| e == "bak" || e == "prev") {
             remove_file_if_exists(&path)?;
