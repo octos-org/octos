@@ -34,6 +34,14 @@ fn redact_line(line: &str) -> String {
     // "="/":" token promotes it to value_pending.
     let mut sep_pending = false;
     while let Some(token) = tokens.next() {
+        // Runs of spaces produce empty tokens; they carry no content and
+        // must NOT reset the pending-assignment state ("PASSWORD  =  x").
+        if token.is_empty() {
+            if tokens.peek().is_some() {
+                result.push(' ');
+            }
+            continue;
+        }
         let mut replaced: Option<String> = None;
         let bare = token.trim_end_matches(['\n', '\r', ',', ';', '"', '\'', ')']);
         let inner = unquote(bare);
@@ -193,6 +201,17 @@ mod tests {
         assert!(
             !out2.contains("abcd1234efgh5678"),
             "glued value leaked: {out2}"
+        );
+        // Runs of spaces around the separator must not defeat the guard.
+        let out3 = redact_secrets("PASSWORD  =  abcd1234efgh5678");
+        assert!(
+            !out3.contains("abcd1234efgh5678"),
+            "double-spaced leaked: {out3}"
+        );
+        let out4 = redact_secrets("API_KEY =  abcd1234efgh5678");
+        assert!(
+            !out4.contains("abcd1234efgh5678"),
+            "mixed-spaced leaked: {out4}"
         );
     }
 

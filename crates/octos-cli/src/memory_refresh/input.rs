@@ -114,9 +114,21 @@ pub(crate) fn render_transcript(
         if within || start + 1 >= rendered.len() {
             if !within {
                 // A single message can exceed the whole budget (pasted
-                // logs); the hard cap must hold regardless. Keep the TAIL
-                // — the durable outcome lives at the end.
-                candidate = truncate_front_to_budget(&candidate, max_tokens, max_bytes);
+                // logs); the hard cap must hold regardless. Keep the
+                // `[idx:role]` label — the extractor must cite it — and
+                // truncate the BODY from the front (the durable outcome
+                // lives at the end).
+                let (label, body) = match candidate.split_once("] ") {
+                    Some((l, b)) => (format!("{l}] "), b.to_string()),
+                    None => (String::new(), candidate),
+                };
+                let budget_tokens =
+                    max_tokens.saturating_sub(octos_memory::estimate_tokens(&label));
+                let budget_bytes = max_bytes.saturating_sub(label.len());
+                candidate = format!(
+                    "{label}{}",
+                    truncate_front_to_budget(&body, budget_tokens, budget_bytes)
+                );
             }
             let mut out = candidate;
             if start > 0 {
@@ -273,6 +285,11 @@ mod tests {
         assert!(octos_memory::estimate_tokens(&text) <= 1_000);
         assert!(text.contains("truncated by input budget"));
         assert!(text.ends_with('z'), "tail must be kept");
+        assert!(
+            text.starts_with("[0:user] "),
+            "the citable [idx:role] label must survive truncation: {}",
+            &text[..40.min(text.len())]
+        );
     }
 
     #[test]
