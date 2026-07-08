@@ -10,7 +10,7 @@ The fastest way to a working assistant, on the supported platforms (macOS Apple 
 
 ```bash
 # 1. Install
-npm install -g @octos-org/octos
+brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
 
 # 2. Choose your AI provider and a model (interactive — pick a real
 #    model name; some providers reject the "auto" default)
@@ -24,11 +24,6 @@ octos serve --solo
 ```
 
 Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
-
-> Homebrew users: `brew install octos-org/tap/octos` works too, but the
-> current formula builds without the embedded web app (`/app/` returns
-> `web_bundle_missing`) — use npm or the installer script below if you want
-> the browser app.
 
 Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [Option 2](#option-2-self-hosted-local-only) below:
 
@@ -67,7 +62,7 @@ You can think of it as the **backend operating system for AI agents**. Instead o
 
 Beyond the quick local setup above, Octos can be deployed three ways:
 
-1. **Octos Cloud signup** — a hosted multi-tenant account; the signup experience belongs to the web client (see the [octos-web README](https://github.com/octos-org/octos-web#octos-cloud)).
+1. **Octos Cloud signup** — a hosted multi-tenant account at [octos.cloud](https://octos.cloud); the signup experience belongs to the web client (see the [octos-web README](https://github.com/octos-org/octos-web#octos-cloud)).
 2. **Self-hosted local** — run Octos only on your own machine or local network.
 3. **Self-hosted cloud + tenant pair** — run your own public VPS plus your own tenant device for internet-accessible remote use.
 
@@ -108,9 +103,9 @@ Visual overview:
 
 ### Option 1: Sign up on Octos Cloud
 
-Octos Cloud is the hosted, multi-tenant way in: register with your email on an
-operator's portal, pick a node name, and run one generated setup command on
-your device. The signup and account experience is part of the **web client** —
+Octos Cloud is the hosted, multi-tenant way in: register with your email at
+[octos.cloud](https://octos.cloud) (or a self-hosted operator's portal), pick a
+node name, and run one generated setup command on your device. The signup and account experience is part of the **web client** —
 the walkthrough lives in the
 [octos-web README (Octos Cloud)](https://github.com/octos-org/octos-web#octos-cloud).
 
@@ -144,7 +139,7 @@ brew install octos-org/tap/octos
 npm install -g @octos-org/octos
 ```
 
-The npm package installs the full release bundle — the `octos` server (with the web app and dashboard embedded) and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. The Homebrew formula currently builds from source without the embedded web app / dashboard SPAs. Unlike `install.sh`, neither sets up a background service; run `octos serve` yourself.
+Both install the full release bundle — the `octos` server (with the web app and dashboard embedded) and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
 
 Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
 
