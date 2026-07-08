@@ -425,20 +425,36 @@ pub async fn run_consolidation(
                 sensitive_only,
             )?;
             // Confirmations of parked pending forgets are deterministic
-            // (hash-bound host authority) — the merge budget must not
-            // defer them.
-            if !params.allow_merge {
-                entries = confirm_pending_forgets_rust_side(
-                    memory_dir,
-                    params,
-                    &mut batch,
-                    &mut waiting,
-                    &entries,
-                    &mut outcome,
-                )?;
-            }
+            // (hash-bound host authority): SENSITIVE ones always execute
+            // Rust-side (their notes may never ride a merge prompt), and
+            // under an exhausted budget the rest do too (no merge will
+            // run to honor them).
+            entries = confirm_pending_forgets_rust_side(
+                memory_dir,
+                params,
+                &mut batch,
+                &mut waiting,
+                &entries,
+                &mut outcome,
+                sensitive_only,
+            )?;
         }
     }
+    // Isolation backstop: any sensitive id-bound forget still in the batch
+    // was deferred (frozen candidate with a stale binding hash). It stays
+    // on disk fail-closed for a later pass/expiry, but its body may not be
+    // rendered into a merge prompt — drop it from THIS run's batch.
+    batch.notes.retain(|n| {
+        let deferred_sensitive =
+            n.sensitive && n.origin == NoteOrigin::Host && n.kind == NoteKind::Forget;
+        if deferred_sensitive {
+            tracing::info!(
+                note = %n.path.display(),
+                "sensitive forget deferred (stale binding); excluded from this run's prompt"
+            );
+        }
+        !deferred_sensitive
+    });
 
     // --- 3. skip early when nothing is consumable ------------------------
     // (Also the stop line when the caller disallowed the merge: every
@@ -1248,6 +1264,7 @@ fn confirm_pending_forgets_rust_side(
     waiting: &mut Vec<NoteFile>,
     entries: &[Entry],
     outcome: &mut ConsolidateOutcome,
+    sensitive_only: bool,
 ) -> Result<Vec<Entry>> {
     let mut working = entries.to_vec();
     let mut plan = ApplyPlan::default();
@@ -1256,6 +1273,9 @@ fn confirm_pending_forgets_rust_side(
 
     for note in &batch.notes {
         if note.origin != NoteOrigin::Host || note.kind != NoteKind::Forget {
+            continue;
+        }
+        if sensitive_only && !note.sensitive {
             continue;
         }
         let named = note.named_entry_ids();
@@ -2055,7 +2075,7 @@ mod tests {
             "host",
             "forget",
             "confirmed, forget id:^maaaaaa",
-            true,
+            false,
         );
 
         let provider = ScriptedProvider::new(&[
@@ -3307,7 +3327,7 @@ mod tests {
             "host",
             "forget",
             "yes: id:^mtarget",
-            true,
+            false,
         );
 
         let provider = ScriptedProvider::new(&[
@@ -4175,6 +4195,128 @@ mod tests {
                 .any(|pn| pn.note_id == "01fg-parked" && pn.state == PendingState::Confirmed),
             "{:?}",
             outcome.pending_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn should_confirm_sensitive_pending_rust_side_with_budget_available() {
+        // Budget available + dirty batch: the merge RUNS, but the sensitive
+        // confirmation of a frozen interim candidate executes Rust-side
+        // first — the prompt carries neither the note body nor the id.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let hidden = "Hidden sensitive fact. (updated: 2026-06-01) ^mtarget";
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-03) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(memory_dir.join("archive/2026-07.md"), format!("{hidden}\n")).unwrap();
+        let parked = write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget the hidden fact",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^mtarget","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex(hidden)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        let confirm = write_note(
+            memory_dir,
+            "02fg-confirm",
+            "host",
+            "forget",
+            "yes: id:^mtarget",
+            true,
+        );
+        write_note(memory_dir, "03clean", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["03clean"]}],"consumed_ids":["03clean"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+        assert!(outcome.hard_deleted.contains(&"^mtarget".to_string()));
+        assert!(
+            !parked.exists() && !confirm.exists(),
+            "both notes consumed Rust-side"
+        );
+
+        assert_eq!(provider.call_count(), 1);
+        let prompt_text: String = provider
+            .call_messages(0)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("^mtarget") && !prompt_text.contains("yes: id:"),
+            "the sensitive confirmation must not ride the merge prompt"
+        );
+        let archived =
+            std::fs::read_to_string(memory_dir.join("archive/2026-07.md")).unwrap_or_default();
+        assert!(!archived.contains("^mtarget"), "confirmed target scrubbed");
+    }
+
+    #[tokio::test]
+    async fn should_keep_stale_sensitive_confirm_out_of_prompt() {
+        // A sensitive confirmation whose binding hash is stale defers
+        // fail-closed — but its body still may not ride the merge prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let frozen_entry = "Frozen candidate. (updated: 2026-06-01) ^mfrozen";
+        write_memory(
+            memory_dir,
+            &[frozen_entry, "Keeps bonsai. (updated: 2026-06-03) ^mcccccc"],
+        );
+        write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget the frozen thing",
+            false,
+            &format!(
+                r#"[{{"entry_id":"^mfrozen","content_hash":"{}","interim_archived":false}}]"#,
+                sha256_hex("An older frozen version. ^mfrozen")
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        let confirm = write_note(
+            memory_dir,
+            "02fg-confirm",
+            "host",
+            "forget",
+            "yes: id:^mfrozen",
+            true,
+        );
+        write_note(memory_dir, "03clean", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["03clean"]}],"consumed_ids":["03clean"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied, "{:?}", outcome.errors);
+
+        assert!(confirm.exists(), "stale confirmation defers fail-closed");
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            memory.contains("^mfrozen"),
+            "no destructive action on stale hash"
+        );
+        let prompt_text: String = provider
+            .call_messages(0)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("yes: id:^mfrozen"),
+            "deferred sensitive confirmation must not ride the merge prompt"
         );
     }
 }
