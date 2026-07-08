@@ -411,7 +411,8 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None).await
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None, None)
+            .await
     }
 
     /// Section B (codex review round-3): bootstrap a profile runtime while
@@ -428,6 +429,7 @@ impl ProfileRuntime {
         role: BootstrapRole,
         host_plugins: Option<&crate::config::PluginsConfig>,
         host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
@@ -437,6 +439,11 @@ impl ProfileRuntime {
             if host.require_signed {
                 config.plugins.require_signed = true;
             }
+        }
+        // Host memory settings apply when the profile doesn't override them
+        // (same host-default pattern as plugins/voice).
+        if config.memory.is_none() {
+            config.memory = host_memory.cloned();
         }
 
         // Step 2: resolve the provider name. `config_from_profile`
@@ -920,9 +927,8 @@ impl ProfileRuntime {
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
         let skills_loader = build_account_skills_loader(data_dir);
-        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
-            profile.config.memory.as_ref(),
-        );
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
@@ -1770,6 +1776,7 @@ mod tests {
             Some(&octos_home),
             BootstrapRole::Serve,
             Some(&host_plugins),
+            None,
             None,
         )
         .await

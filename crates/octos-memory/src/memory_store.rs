@@ -62,6 +62,22 @@ fn truncate_at_paragraph(text: &str, max_tokens: usize) -> String {
     kept
 }
 
+/// Filesystem NAME_MAX on the platforms we support.
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Sibling backup filename for `file_name` + `suffix`, bounded to fit
+/// NAME_MAX: the natural `<file_name><suffix>` when it fits, else a clamped,
+/// hash-disambiguated stem via `octos_core::safe_filename`. Backups are
+/// internal — nothing looks them up by name — so the rename is safe.
+fn bounded_backup_name(file_name: &str, suffix: &str) -> String {
+    let natural = format!("{file_name}{suffix}");
+    if natural.len() <= MAX_FILENAME_BYTES {
+        natural
+    } else {
+        format!("{}{suffix}", octos_core::safe_filename(file_name))
+    }
+}
+
 /// Atomically replace `path` with `content`: same-dir temp file, fsync,
 /// rename over the target, then fsync the directory (Unix). When `backup`
 /// is given and the target exists, the previous content is first copied to
@@ -91,17 +107,21 @@ async fn write_atomic_with_backup(
             }
         }
 
-        let tmp_path = parent.join(format!(
-            ".{}.tmp.{}",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("memory"),
-            uuid::Uuid::now_v7().simple()
-        ));
+        // Short fixed-prefix temp name: the target basename must NOT be
+        // embedded, or near-NAME_MAX entity slugs would push the temp name
+        // over the filesystem limit and fail writes that used to succeed.
+        let tmp_path = parent.join(format!(".mem.{}.tmp", uuid::Uuid::now_v7().simple()));
         let write_result = (|| -> Result<()> {
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
+            // Preserve a tightened mode on the file being replaced: rename
+            // swaps the inode, so without this a 0600 memory file would
+            // silently revert to the default 0666 & umask.
+            #[cfg(unix)]
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let _ = std::fs::set_permissions(&tmp_path, meta.permissions());
+            }
             std::fs::rename(&tmp_path, &path)?;
             #[cfg(unix)]
             if let Ok(dir) = std::fs::File::open(&parent) {
@@ -430,8 +450,11 @@ impl MemoryStore {
     pub async fn write_entity(&self, name: &str, content: &str) -> Result<()> {
         self.ensure_bank_dir().await?;
         let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
-        let path = self.bank_dir().join(format!("{safe_name}.md"));
-        let backup = self.bank_dir().join(format!("{safe_name}.md.prev"));
+        let file_name = format!("{safe_name}.md");
+        let path = self.bank_dir().join(&file_name);
+        let backup = self
+            .bank_dir()
+            .join(bounded_backup_name(&file_name, ".prev"));
         write_atomic_with_backup(path, content.to_string(), Some(backup))
             .await
             .wrap_err_with(|| format!("failed to write entity: {name}"))
@@ -859,6 +882,61 @@ mod tests {
         let entities = store.list_entities().await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].0, "proj");
+    }
+
+    #[tokio::test]
+    async fn should_write_and_backup_entity_when_name_is_near_filename_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        // 250-char slug + ".md" = 253 bytes: a valid target filename, but one
+        // where embedding it in temp/backup names would exceed NAME_MAX.
+        let name = "a".repeat(250);
+        store.write_entity(&name, "v1").await.unwrap();
+        store.write_entity(&name, "v2").await.unwrap();
+
+        assert_eq!(
+            store.read_entity(&name).await.unwrap(),
+            Some("v2".to_string())
+        );
+
+        let mut entries = tokio::fs::read_dir(dir.path().join("memory/bank/entities"))
+            .await
+            .unwrap();
+        let mut prev_contents = None;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            assert!(file_name.len() <= 255, "over-limit filename: {file_name}");
+            if file_name.ends_with(".prev") {
+                prev_contents = Some(tokio::fs::read_to_string(entry.path()).await.unwrap());
+            }
+        }
+        assert_eq!(prev_contents.as_deref(), Some("v1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_preserve_tightened_mode_when_rewriting_long_term() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let path = dir.path().join("memory/MEMORY.md");
+
+        store.write_long_term("private v1").await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        store.write_long_term("private v2").await.unwrap();
+
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "rename must not loosen a tightened mode");
     }
 
     // --- PR-1 foundations: budgeted injectable context ---
