@@ -10,4 +10,6 @@
 //! a later integration PR.
 
 pub mod entry;
+pub mod ops;
+pub mod pending;
 pub mod staging;
