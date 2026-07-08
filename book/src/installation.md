@@ -32,7 +32,7 @@ cd octos
 # channel adapter. Build this first if you don't know which features
 # you need — it's what release artifacts ship.
 cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # Minimal: CLI + chat + gateway with CLI channel only.
 # This produces a binary that does NOT have `octos serve` (the api
@@ -42,9 +42,9 @@ cargo install --path crates/octos-cli
 
 # Trim the feature list to your needs. Available channel features:
 #   telegram, discord, dingtalk, slack, whatsapp, feishu, email, wecom, wecom-bot,
-#   matrix, qq-bot, twilio, wechat
+#   matrix, line, qq-bot, twilio, wechat
 # Required for `octos serve`: api
-# Other features: git (gitoxide), ast (tree-sitter)
+# Other features: git (gitoxide), ast (tree-sitter), audio_mp3 (mp3 TTS output)
 # Note: the browser tool (headless Chrome via CDP) is always compiled
 # in — there is no `browser` feature.
 cargo install --path crates/octos-cli --features "api,telegram,slack"
@@ -192,7 +192,7 @@ rustup-init.exe
 git clone https://github.com/octos-org/octos.git
 cd octos
 cargo install --path crates/octos-cli `
-    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # 3. Set API key and run
 $env:ANTHROPIC_API_KEY = "sk-ant-..."

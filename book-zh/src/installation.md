@@ -27,14 +27,24 @@
 git clone https://github.com/octos-org/octos
 cd octos
 
-# 基本功能（CLI、chat、run、gateway + CLI 渠道）
+# 推荐：规范特性集（与 scripts/milestone-ci.sh 一致）。
+# 包含 REST API + 仪表板（`octos serve`）以及所有消息渠道适配器。
+# 若不确定需要哪些特性，先编译这一套——它就是发布产物所用的组合。
+cargo install --path crates/octos-cli \
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+
+# 最小：仅 CLI + chat + gateway（仅 CLI 渠道）。
+# 该二进制不含 `octos serve`（是 api 特性注册了该子命令），
+# 也不编译任何消息渠道适配器。
 cargo install --path crates/octos-cli
 
-# 启用消息渠道
-cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
-
-# 启用 Web 界面和 REST API
-cargo install --path crates/octos-cli --features api
+# 按需裁剪特性列表。可用的渠道特性：
+#   telegram、discord、dingtalk、slack、whatsapp、feishu、email、wecom、wecom-bot、
+#   matrix、line、qq-bot、twilio、wechat
+# `octos serve` 必需：api
+# 其他特性：git（gitoxide）、ast（tree-sitter）、audio_mp3（mp3 TTS 输出）
+# 注意：浏览器工具（通过 CDP 的无头 Chrome）始终编译在内——没有 `browser` 特性。
+cargo install --path crates/octos-cli --features "api,telegram,slack"
 
 # 验证安装
 octos --version
@@ -173,10 +183,12 @@ Octos 支持在 Windows 上原生编译和运行。Shell 命令通过 `cmd /C` �
 # 1. 安装 Rust（从 https://rustup.rs 下载 rustup-init.exe）
 rustup-init.exe
 
-# 2. 克隆并编译
+# 2. 克隆并使用规范特性集编译
+#    （若只想要 `octos chat` 可省略特性；`octos serve` 需要 api 特性）
 git clone https://github.com/octos-org/octos.git
 cd octos
-cargo install --path crates/octos-cli
+cargo install --path crates/octos-cli `
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # 3. 设置 API 密钥并运行
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
