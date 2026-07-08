@@ -5,7 +5,15 @@
   "memory": {
     "max_inject_tokens": 2500,
     "refresh": {
-      "enabled": false
+      "enabled": false,
+      "extract_model": null,
+      "min_idle_minutes": 30,
+      "max_session_age_days": 10,
+      "max_sessions_per_pass": 2,
+      "max_extractions_per_day": 20,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30,
+      "max_extract_input_tokens": 24000
     }
   },
 

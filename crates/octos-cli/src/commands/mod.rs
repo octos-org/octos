@@ -13,6 +13,7 @@ mod doctor;
 pub mod gateway;
 mod init;
 pub mod mcp_serve;
+mod memory;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
@@ -38,6 +39,7 @@ pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
 pub use mcp_serve::McpServeCommand;
+pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
@@ -97,6 +99,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Inspect and drive the memory-refresh pipeline.
+    Memory(MemoryCommand),
     /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
     McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
@@ -315,6 +319,7 @@ impl Executable for Command {
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
+            Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
         }

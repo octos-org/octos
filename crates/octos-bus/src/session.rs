@@ -877,6 +877,29 @@ fn last_prompt_preview(content: &str) -> Option<String> {
 /// Uses `lru::LruCache` for O(1) get/put with automatic eviction of the
 /// least-recently-used session when capacity is exceeded. Evicted sessions
 /// remain on disk and are lazy-loaded on next access.
+/// One physical session file discovered by [`SessionManager::list_for_analysis`].
+#[derive(Debug, Clone)]
+pub struct AnalysisFile {
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    pub len: u64,
+}
+
+/// One session (canonical key) as seen by a background analysis sweep,
+/// with every physical layout copy and lineage hints.
+#[derive(Debug, Clone)]
+pub struct AnalysisSession {
+    pub key: SessionKey,
+    /// Every JSONL copy (legacy flat and/or canonical per-user), sorted by
+    /// path for stable watermarking.
+    pub files: Vec<AnalysisFile>,
+    /// Lineage from the freshest meta line, when present.
+    pub parent_key: Option<String>,
+    /// True for spawned/child/task-ledger sessions a memory sweep must
+    /// skip (also true whenever `parent_key` is set).
+    pub internal: bool,
+}
+
 pub struct SessionManager {
     sessions_dir: PathBuf,
     cache: LruCache<String, Session>,
@@ -1368,6 +1391,163 @@ impl SessionManager {
             .parent()
             .unwrap_or(&self.sessions_dir)
             .to_path_buf()
+    }
+
+    /// Enumerate sessions for a background analysis sweep (memory refresh).
+    ///
+    /// Unlike the `list_*` family, this returns EVERY physical JSONL copy
+    /// of a session — legacy flat AND canonical per-user — per canonical
+    /// key, with each file's `(modified, len)` snapshot, so a sweep can
+    /// watermark on the exact bytes it read and notice a stale legacy copy.
+    /// Read-only: no cache insertion, no migration, no directory creation.
+    ///
+    /// Limitation: legacy flat filenames that were truncated + FNV-suffixed
+    /// (keys over ~183 encoded chars) can't be decoded back to their true
+    /// key and are skipped (warn-logged).
+    pub fn list_for_analysis(&self) -> Vec<AnalysisSession> {
+        let mut by_key: std::collections::BTreeMap<String, AnalysisSession> =
+            std::collections::BTreeMap::new();
+
+        let mut record = |key_str: String, path: PathBuf| {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                return;
+            };
+            let Ok(modified) = meta.modified() else {
+                return;
+            };
+            // Cheap meta-line read for lineage: buffered, bounded to the
+            // first 64KB — a sweep over many/large session files must not
+            // slurp whole transcripts just to peek at line one.
+            let parent_key = std::fs::File::open(&path)
+                .ok()
+                .and_then(|file| {
+                    use std::io::{BufRead, BufReader, Read};
+                    let mut first = String::new();
+                    BufReader::new(file.take(64 * 1024))
+                        .read_line(&mut first)
+                        .ok()?;
+                    serde_json::from_str::<SessionMeta>(first.trim_end()).ok()
+                })
+                .and_then(|m| m.parent_key);
+
+            let entry = by_key
+                .entry(key_str.clone())
+                .or_insert_with(|| AnalysisSession {
+                    key: SessionKey(key_str),
+                    files: Vec::new(),
+                    parent_key: None,
+                    internal: false,
+                });
+            entry.files.push(AnalysisFile {
+                path,
+                modified,
+                len: meta.len(),
+            });
+            if entry.parent_key.is_none() {
+                entry.parent_key = parent_key;
+            }
+        };
+
+        // Legacy flat layout: sessions/{encoded_full_key}.jsonl
+        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let decoded = Self::decode_filename(stem);
+                // Truncated names carry a `_{16 hex}` suffix and cannot be
+                // decoded back to the real key.
+                if Self::flat_stem_is_truncated(stem) {
+                    tracing::warn!(
+                        file = %path.display(),
+                        "skipping truncated legacy session filename in analysis sweep"
+                    );
+                    continue;
+                }
+                record(decoded, path);
+            }
+        }
+
+        // Canonical per-user layout: users/{base}/sessions/{topic}.jsonl
+        let users_root = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        if let Ok(users) = std::fs::read_dir(&users_root) {
+            for user in users.flatten() {
+                let Some(encoded_base) = user.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let base = Self::decode_filename(&encoded_base);
+                let sessions = user.path().join("sessions");
+                let Ok(files) = std::fs::read_dir(&sessions) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().is_none_or(|e| e != "jsonl") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let topic = Self::decode_filename(stem);
+                    let key_str = if topic == "default" {
+                        base.clone()
+                    } else {
+                        format!("{base}#{topic}")
+                    };
+                    record(key_str, path);
+                }
+            }
+        }
+
+        let mut out: Vec<AnalysisSession> = by_key.into_values().collect();
+        for session in &mut out {
+            session.internal =
+                session.parent_key.is_some() || Self::analysis_key_is_internal(&session.key.0);
+            // Deterministic file order (path) for stable watermarks.
+            session.files.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        out
+    }
+
+    /// True when a flat filename stem carries the truncation hash suffix
+    /// (`…_{16 uppercase hex}`) appended by `session_path_static`.
+    fn flat_stem_is_truncated(stem: &str) -> bool {
+        stem.len() > 17
+            && stem.as_bytes()[stem.len() - 17] == b'_'
+            && stem[stem.len() - 16..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+    }
+
+    /// Internal-session classifier for the analysis sweep: the standard
+    /// internal topics PLUS `spawn-*` worker sessions (which the legacy
+    /// filter does not cover) — background lineage a memory sweep must not
+    /// mine as user-facing conversation.
+    fn analysis_key_is_internal(decoded_key: &str) -> bool {
+        decoded_key.split_once('#').is_some_and(|(_, topic)| {
+            Self::is_internal_session_topic(topic) || topic.starts_with("spawn-")
+        })
+    }
+
+    /// Load a session's messages READ-ONLY for analysis, with stable
+    /// indices into the folded transcript.
+    ///
+    /// Same semantics as [`Self::load`] (both layouts merged, rollback
+    /// control records folded — rolled-back turns are absent — schema
+    /// handling, 10MB cap) and none of `SessionHandle::open`'s migration
+    /// side effects (no legacy deletion, no marker writes, no dir
+    /// creation).
+    pub async fn export_transcript(&self, key: &SessionKey) -> Option<Vec<(usize, Message)>> {
+        let session = self.load(key).await?;
+        Some(session.messages.into_iter().enumerate().collect())
     }
 
     /// Static version of `session_path` — used by `SessionHandle` too.
@@ -6090,6 +6270,127 @@ mod tests {
             mgr.session_known(&key),
             "session_known must find session via canonical per-user layout \
              when only that layout has the file (regression for UPCR-2026-009/010/011 handlers)"
+        );
+    }
+
+    // --- list_for_analysis / export_transcript (memory-refresh sweep) ---
+
+    #[tokio::test]
+    async fn should_list_both_layout_files_when_session_exists_in_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("tg:42#research".to_string());
+
+        write_jsonl_with_one_user_message(&legacy_session_path(dir.path(), &key), &key, "old row");
+        write_jsonl_with_one_user_message(
+            &per_user_session_path(dir.path(), &key),
+            &key,
+            "new row",
+        );
+
+        let sessions = mgr.list_for_analysis();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.key.0, "tg:42#research");
+        assert_eq!(s.files.len(), 2, "both physical copies must be reported");
+        assert!(s.files.iter().all(|f| f.len > 0));
+        assert!(!s.internal);
+    }
+
+    #[tokio::test]
+    async fn should_reconstruct_base_key_when_per_user_default_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("discord:99".to_string());
+        write_jsonl_with_one_user_message(&per_user_session_path(dir.path(), &key), &key, "hi");
+
+        let sessions = mgr.list_for_analysis();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].key.0, "discord:99");
+    }
+
+    #[tokio::test]
+    async fn should_mark_internal_when_spawn_child_or_parented() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::open(dir.path()).unwrap();
+
+        for key_str in ["tg:1#spawn-worker1", "tg:1#child-abc", "tg:1#roadmap.tasks"] {
+            let key = SessionKey(key_str.to_string());
+            write_jsonl_with_one_user_message(&per_user_session_path(dir.path(), &key), &key, "x");
+        }
+        // Parented session: meta carries parent_key.
+        let parented = SessionKey("tg:1#forked".to_string());
+        let path = per_user_session_path(dir.path(), &parented);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": parented.0,
+            "parent_key": "tg:1",
+            "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(),
+        });
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+
+        let sessions = mgr.list_for_analysis();
+        assert_eq!(sessions.len(), 4);
+        assert!(
+            sessions.iter().all(|s| s.internal),
+            "spawn/child/tasks/parented sessions must all be internal: {:?}",
+            sessions
+                .iter()
+                .map(|s| (&s.key.0, s.internal))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fold_rollback_and_stay_read_only_when_exporting_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("tg:7".to_string());
+
+        mgr.add_message(&key, make_message(MessageRole::User, "keep me"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::Assistant, "kept reply"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "roll me back"))
+            .await
+            .unwrap();
+        mgr.rollback_last_n_user_turns(&key, 1).await.unwrap();
+
+        let transcript = mgr.export_transcript(&key).await.expect("session loads");
+        let texts: Vec<&str> = transcript.iter().map(|(_, m)| m.content.as_str()).collect();
+        assert!(texts.contains(&"keep me"));
+        assert!(
+            !texts.contains(&"roll me back"),
+            "rolled-back turn must be folded out: {texts:?}"
+        );
+        // Indices are dense positions into the folded transcript.
+        for (expected, (idx, _)) in transcript.iter().enumerate() {
+            assert_eq!(expected, *idx);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_not_migrate_legacy_file_when_exporting_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey("tg:legacy#old".to_string());
+        let legacy = legacy_session_path(dir.path(), &key);
+        write_jsonl_with_one_user_message(&legacy, &key, "legacy row");
+
+        let transcript = mgr.export_transcript(&key).await.expect("loads");
+        assert_eq!(transcript.len(), 1);
+
+        assert!(
+            legacy.exists(),
+            "export must not delete/migrate the legacy file"
+        );
+        assert!(
+            !dir.path().join("users").exists(),
+            "export must not create the per-user tree"
         );
     }
 }

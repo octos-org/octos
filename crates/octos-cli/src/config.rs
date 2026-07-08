@@ -544,14 +544,91 @@ pub struct MemoryConfig {
 }
 
 /// Automatic memory-refresh settings. Default OFF: when disabled there is
-/// no `memory_note` tool, no capture policy in the prompt, and no
-/// per-turn memory re-read — behavior is identical to before the feature
-/// existed.
+/// no `memory_note` tool, no capture policy in the prompt, no per-turn
+/// memory re-read, and no background sweep — behavior is identical to
+/// before the feature existed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemoryRefreshConfig {
-    /// Master switch for the capture layer + read-side refresh.
+    /// Master switch for the capture layer + read-side refresh + the
+    /// background extraction sweep.
     #[serde(default)]
     pub enabled: bool,
+
+    /// Model key for the extraction pass (unset → the profile's provider).
+    #[serde(default)]
+    pub extract_model: Option<String>,
+    /// Model key for the consolidation pass (unset → profile's provider).
+    #[serde(default)]
+    pub consolidate_model: Option<String>,
+    /// A session must be idle at least this long before it is swept.
+    #[serde(default)]
+    pub min_idle_minutes: Option<u64>,
+    /// Sessions idle longer than this are too old to sweep.
+    #[serde(default)]
+    pub max_session_age_days: Option<u64>,
+    /// Sessions extracted per pass.
+    #[serde(default)]
+    pub max_sessions_per_pass: Option<usize>,
+    /// Daily extraction-call budget per profile.
+    #[serde(default)]
+    pub max_extractions_per_day: Option<u32>,
+    /// Daily consolidation-run budget per profile (used by the
+    /// consolidator; reserved here so the config surface is complete).
+    #[serde(default)]
+    pub max_consolidations_per_day: Option<u32>,
+    /// Daily token budget per profile, shared by extraction+consolidation.
+    #[serde(default)]
+    pub max_daily_tokens: Option<u64>,
+    /// Background tick interval (extraction pass; consolidation piggybacks).
+    #[serde(default)]
+    pub consolidate_interval_minutes: Option<u64>,
+    /// Fast-lane debounce after a user note (consolidator; reserved).
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+    /// Entries unused/unrefreshed this long become archive candidates
+    /// (consolidator; reserved).
+    #[serde(default)]
+    pub unused_days: Option<u32>,
+    /// Durable MEMORY.md size cap enforced at consolidation (reserved).
+    #[serde(default)]
+    pub max_memory_file_tokens: Option<usize>,
+    /// Pending-confirm forget requests expire after this many days
+    /// (consolidator; reserved).
+    #[serde(default)]
+    pub pending_confirm_days: Option<u32>,
+    /// Hard input budget for one extraction call, tokens (CJK-aware
+    /// estimate). Provider metadata does not expose context windows, so
+    /// this is explicit.
+    #[serde(default)]
+    pub max_extract_input_tokens: Option<usize>,
+}
+
+impl MemoryRefreshConfig {
+    /// Resolve the sweep knobs, applying design defaults for unset fields.
+    pub fn knobs(config: Option<&MemoryConfig>) -> crate::memory_refresh::RefreshKnobs {
+        let refresh = config.and_then(|m| m.refresh.as_ref());
+        let get = |f: fn(&MemoryRefreshConfig) -> Option<u64>, default: u64| {
+            refresh.and_then(f).unwrap_or(default)
+        };
+        crate::memory_refresh::RefreshKnobs {
+            min_idle: std::time::Duration::from_secs(60 * get(|r| r.min_idle_minutes, 30)),
+            max_session_age: std::time::Duration::from_secs(
+                60 * 60 * 24 * get(|r| r.max_session_age_days, 10),
+            ),
+            max_sessions_per_pass: refresh.and_then(|r| r.max_sessions_per_pass).unwrap_or(2),
+            max_extractions_per_day: refresh
+                .and_then(|r| r.max_extractions_per_day)
+                .unwrap_or(20),
+            max_daily_tokens: get(|r| r.max_daily_tokens, 200_000),
+            interval: std::time::Duration::from_secs(
+                60 * get(|r| r.consolidate_interval_minutes, 30),
+            ),
+            max_extract_input_tokens: refresh
+                .and_then(|r| r.max_extract_input_tokens)
+                .unwrap_or(24_000),
+            max_inject_tokens: MemoryConfig::effective_max_inject_tokens(config),
+        }
+    }
 }
 
 impl MemoryConfig {
@@ -1146,7 +1223,10 @@ fn merge_env_memory_policy(config: &mut Config) {
             );
             if on {
                 config.memory.get_or_insert_with(Default::default).refresh =
-                    Some(MemoryRefreshConfig { enabled: true });
+                    Some(MemoryRefreshConfig {
+                        enabled: true,
+                        ..Default::default()
+                    });
             }
         }
     }

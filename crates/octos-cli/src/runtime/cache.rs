@@ -605,6 +605,7 @@ mod tests {
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,

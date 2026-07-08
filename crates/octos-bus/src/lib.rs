@@ -63,9 +63,9 @@ pub use resume_policy::{
     reconstruct_content_replacement_state,
 };
 pub use session::{
-    ActiveSessionStore, MessageCommitObserver, Session, SessionHandle, SessionListEntry,
-    SessionManager, persist_message_through_canonical_path, set_message_commit_observer,
-    validate_topic_name,
+    ActiveSessionStore, AnalysisFile, AnalysisSession, MessageCommitObserver, Session,
+    SessionHandle, SessionListEntry, SessionManager, persist_message_through_canonical_path,
+    set_message_commit_observer, validate_topic_name,
 };
 
 #[cfg(feature = "api")]

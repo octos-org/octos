@@ -251,6 +251,11 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+    /// Background memory-refresh sweep (extraction over idle sessions).
+    /// `Some` only when `memory.refresh.enabled` and this process won the
+    /// profile's refresh lock; dropping the runtime stops the sweep and
+    /// releases the lock.
+    pub memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
 
     /// Shared [`ToolConfigStore`] for the profile (per-tool
     /// runtime overrides, e.g. `deep_crawl.page_settle_ms`).
@@ -1008,6 +1013,28 @@ impl ProfileRuntime {
                 .wrap_err("invalid profile approval_policy")?;
         }
 
+        // Start the background memory-refresh sweep when enabled. The
+        // flock decides ownership when serve and gateway share a profile
+        // dir; the loser just logs and skips.
+        let memory_refresh = if memory_refresh_enabled {
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.to_path_buf(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    config
+                        .memory
+                        .as_ref()
+                        .and_then(|m| m.refresh.as_ref())
+                        .and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -1036,6 +1063,7 @@ impl ProfileRuntime {
             system_prompt,
             memory,
             memory_store,
+            memory_refresh,
             tool_config,
             cron_service: Some(cron_service),
             pipeline_factory,

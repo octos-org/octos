@@ -217,6 +217,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         voice: octos_cli::config::VoiceConfig::default(),
         memory,
         memory_store,
+        memory_refresh: None,
         tool_config,
         cron_service: None,
         pipeline_factory: None,
