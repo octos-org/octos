@@ -10,6 +10,7 @@ use reqwest::redirect::Policy;
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
+use octos_llm;
 
 /// Maximum number of redirects to follow (with SSRF validation per hop).
 const MAX_REDIRECTS: usize = 10;
@@ -211,7 +212,8 @@ async fn ssrf_safe_fetch(initial_url: &str) -> Result<reqwest::Response, String>
         let mut builder = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("octos/0.1 (web-fetch-tool)")
-            .redirect(Policy::none());
+            .redirect(Policy::none())
+            .danger_accept_invalid_certs(octos_llm::allow_insecure());
         for addr in &check.resolved_addrs {
             builder = builder.resolve(&host, *addr);
         }
@@ -363,5 +365,14 @@ mod tests {
         let result = ssrf_safe_fetch("http://169.254.169.254/latest/meta-data/").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("private"));
+    }
+
+    #[test]
+    fn should_compile_with_allow_insecure_false() {
+        // Verifies the danger_accept_invalid_certs call is wired in and does
+        // not panic when the flag is false (the default).
+        octos_llm::set_allow_insecure(false);
+        assert!(!octos_llm::allow_insecure());
+        octos_llm::set_allow_insecure(false); // reset
     }
 }

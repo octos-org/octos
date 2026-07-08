@@ -774,6 +774,7 @@ fn extract_subtopics(text: &str) -> Vec<String> {
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
