@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use octos_agent::SkillsLoader;
-use octos_memory::MemoryStore;
 
 use crate::persona_service::PersonaService;
 
@@ -22,11 +21,8 @@ pub async fn build_system_prompt(
     base: Option<&str>,
     data_dir: &Path,
     project_dir: &Path,
-    memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
     tool_config: &octos_agent::ToolConfigStore,
-    max_inject_tokens: usize,
-    memory_capture_policy: bool,
 ) -> String {
     let compiled = include_str!("../../prompts/gateway_default.txt");
     let runtime = super::super::load_prompt("gateway", compiled);
@@ -69,15 +65,13 @@ pub async fn build_system_prompt(
         prompt.push_str(&user_soul);
     }
 
-    // Append the token-capped memory block (long-term memory + daily notes
-    // + bank summary; omissions are disclosed to the model), plus the
-    // capture-policy teaching block when memory refresh is enabled.
-    let memory_ctx = memory_store.get_injectable_context(max_inject_tokens).await;
-    let memory_segment = octos_agent::compose_memory_segment(&memory_ctx, memory_capture_policy);
-    if !memory_segment.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&memory_segment);
-    }
+    // Memory is NOT inlined here anymore: every model call flows through a
+    // per-session `octos_agent::Agent`, which owns the memory as a named
+    // prompt segment refreshed at each turn start (chat.rs pattern —
+    // fingerprint stat per turn). Inlining it in this base String froze it
+    // at build time: serve profiles bootstrapped before any consolidation
+    // carried an empty block forever, and gateway staleness was bounded
+    // only by the 6-hour persona tick.
 
     // Append always-on skills
     if let Ok(always_names) = skills_loader.get_always_skills().await {

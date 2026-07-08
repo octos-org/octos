@@ -601,11 +601,8 @@ impl ProfileActorFactoryBuilder {
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
             &self.project_dir,
-            &self.memory_store,
             &skills_loader,
             &self.tool_config,
-            max_inject_tokens,
-            memory_refresh_enabled,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
@@ -961,6 +958,8 @@ impl ProfileActorFactoryBuilder {
             llm: llm.clone(),
             llm_for_compaction,
             memory: self.memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: Arc::new(std::sync::RwLock::new(system_prompt)),
             hooks,
             hook_context_template: Some(HookContext {

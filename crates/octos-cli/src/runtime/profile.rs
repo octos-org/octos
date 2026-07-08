@@ -251,6 +251,11 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    pub memory_inject_tokens: usize,
+    /// Resolved `memory.refresh.enabled` — gates the capture-policy text in
+    /// the memory segment and the per-turn refresh provider.
+    pub memory_refresh_enabled: bool,
     /// Background memory-refresh sweep (extraction over idle sessions).
     /// `Some` only when `memory.refresh.enabled` and this process won the
     /// profile's refresh lock; dropping the runtime stops the sweep and
@@ -943,11 +948,8 @@ impl ProfileRuntime {
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
             data_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
-            max_inject_tokens,
-            memory_refresh_enabled,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {
@@ -1055,6 +1057,8 @@ impl ProfileRuntime {
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
             system_prompt,
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             memory,
             memory_store,
             memory_refresh,

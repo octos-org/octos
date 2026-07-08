@@ -509,6 +509,30 @@ impl SessionRuntime {
             agent = agent.with_session_scope(scope);
         }
 
+        // Memory rides the per-session agent as a NAMED prompt segment
+        // (chat.rs pattern) instead of being frozen into the profile's
+        // bootstrap prompt String: serve profiles bootstrapped before any
+        // consolidation carried an empty block forever (the model then
+        // fabricates a "memory bank" when asked). The provider re-renders
+        // the segment at each turn start when MEMORY.md / daily notes /
+        // bank change on disk (one fingerprint stat per turn otherwise).
+        let memory_ctx = profile
+            .memory_store
+            .get_injectable_context(profile.memory_inject_tokens)
+            .await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
+        );
+        // Refresh is unconditional — reading CURRENT memory each turn is
+        // correct even when the capture layer is opted out; the flag only
+        // controls the capture-policy teaching text inside the segment.
+        agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+            profile.memory_store.clone(),
+            profile.memory_inject_tokens,
+            profile.memory_refresh_enabled,
+        )));
+
         // M11-F regression fix REG-3: propagate the profile-scope
         // [`octos_agent::HookExecutor`] onto the per-session agent.
         // `ProfileRuntime::bootstrap` assembled it once from
@@ -820,6 +844,8 @@ mod tests {
             system_prompt,
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             memory_refresh: None,
             tool_config,
             cron_service: None,
@@ -836,6 +862,49 @@ mod tests {
     ) -> Arc<ProfileRuntime> {
         make_profile_with_prompt_and_sandbox(data_dir, "test-system-prompt".to_string(), sandbox)
             .await
+    }
+
+    #[tokio::test]
+    async fn session_agent_renders_fresh_memory_segment() {
+        // Serve sessions read MEMORY.md via the per-session agent's NAMED
+        // segment + turn-start refresh — NOT a value frozen into the
+        // profile bootstrap prompt (which fabricated-memory bugs came
+        // from). Consolidations landing AFTER the session was created
+        // must be visible on the next refresh.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Monday. (updated: 2026-07-08) ^mvzercg\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "mem"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Deploy day is Monday"),
+            "session agent must inject MEMORY.md: {prompt}"
+        );
+
+        // A consolidation AFTER session creation becomes visible on the
+        // next turn-start refresh (fingerprint change).
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Friday again. (updated: 2026-07-09) ^mvzercg\n",
+        )
+        .unwrap();
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Friday again"),
+            "read-refresh must pick up post-bootstrap consolidations: {prompt}"
+        );
     }
 
     #[tokio::test]
@@ -1402,6 +1471,8 @@ mod tests {
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             memory_refresh: None,
             tool_config,
             cron_service: None,
@@ -1458,6 +1529,8 @@ mod tests {
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             memory_refresh: None,
             tool_config,
             cron_service: None,
@@ -1542,6 +1615,8 @@ mod tests {
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             memory_refresh: None,
             tool_config,
             cron_service: None,

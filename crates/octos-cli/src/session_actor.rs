@@ -2790,6 +2790,11 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    /// Paired with `memory_store`; `memory_refresh_enabled` gates the
+    /// capture-policy text and the per-turn refresh provider.
+    pub memory_inject_tokens: usize,
+    pub memory_refresh_enabled: bool,
     /// Profile id (= tenant id in [`SessionScope::multi_tenant`]). Used
     /// to construct a per-session [`SessionScope`] when spawning gateway
     /// session actors. `None` for the top-level admin factory (the
@@ -3735,6 +3740,25 @@ impl ActorFactory {
             agent = agent.with_session_scope(scope);
         }
 
+        // Memory as a NAMED per-agent prompt segment (chat.rs pattern):
+        // the factory's base prompt String no longer inlines it, so both
+        // gateway channel actors and serve WS/stdio actors read a fresh
+        // block each turn instead of whatever was on disk at
+        // build_system_prompt time (gateway persona tick = 6h; serve
+        // profile bootstrap = forever). This builder is synchronous, so
+        // the segment is not pre-seeded: the provider composes it during
+        // the turn-start refresh, which runs BEFORE the first model call.
+        // Registered unconditionally — with refresh disabled the segment
+        // still renders (without the capture-policy text); it only
+        // re-renders when the fingerprint changes.
+        if let Some(ref memory_store) = self.memory_store {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                memory_store.clone(),
+                self.memory_inject_tokens,
+                self.memory_refresh_enabled,
+            )));
+        }
+
         if let Some(ref embedder) = self.embedder {
             agent = agent.with_embedder(embedder.clone());
         }
@@ -3821,6 +3845,8 @@ impl ActorFactory {
             adaptive_router: self.adaptive_router.clone(),
             lane_routing: self.lane_routing.clone(),
             memory_store: self.memory_store.clone(),
+            memory_inject_tokens: self.memory_inject_tokens,
+            memory_refresh_enabled: self.memory_refresh_enabled,
             usage_profile_id: self
                 .profile_id
                 .clone()
@@ -4327,6 +4353,9 @@ struct SessionActor {
     lane_routing: Option<octos_llm::LaneRoutingConfig>,
     /// Memory store for saving long research reports out-of-band.
     memory_store: Option<Arc<MemoryStore>>,
+    /// Resolved memory-segment knobs (from the factory's profile config).
+    memory_inject_tokens: usize,
+    memory_refresh_enabled: bool,
     /// Active overflow task counter for concurrency limiting.
     active_overflow_tasks: Arc<std::sync::atomic::AtomicU32>,
     /// Cancellation flag for in-flight overflow tasks.
@@ -11719,6 +11748,8 @@ mod tests {
             adaptive_router,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -11800,6 +11831,8 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -12066,6 +12099,8 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -12200,6 +12235,8 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -12330,6 +12367,8 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -12432,6 +12471,8 @@ mod tests {
             adaptive_router: Some(router),
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -12533,6 +12574,8 @@ mod tests {
             adaptive_router: Some(router),
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -15051,6 +15094,8 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             profile_id: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
@@ -17958,6 +18003,8 @@ mod tests {
             adaptive_router: None,
             lane_routing: None,
             memory_store: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
