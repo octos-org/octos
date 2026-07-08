@@ -222,6 +222,33 @@ pub async fn run_consolidation(
         .fixed_offset();
     let mut waiting: Vec<NoteFile> = Vec::new();
     for note in &batch.pending {
+        // Self-heal: a pending note whose EVERY candidate is dead — no live
+        // entry and no restorable archive block — describes an ask that was
+        // already completed (e.g. a crash between the interim-copy scrub
+        // and the note deletion). It can never be hash-verified or expired;
+        // without this it would wedge forever.
+        let cands = note.candidates.as_deref().unwrap_or_default();
+        let mut all_dead = !cands.is_empty();
+        for cand in cands {
+            let live = entries.iter().any(|e| e.id == cand.entry_id);
+            let archived = cand.interim_archived
+                && find_archive_block_by_hash(memory_dir, &cand.content_hash)?.is_some();
+            if live || archived {
+                all_dead = false;
+                break;
+            }
+        }
+        if all_dead {
+            apply::remove_file_if_exists(&note.path)?;
+            outcome
+                .pending_notes
+                .push(pending_status(note, PendingState::Confirmed));
+            tracing::info!(
+                note = %note.path.display(),
+                "pending forget completed by a prior run; note self-healed"
+            );
+            continue;
+        }
         let expires_at = note.expires_at.expect("pending notes carry expires_at");
         if now > expires_at {
             let result = apply::apply_expiry(memory_dir, note, &mut entries)?;
@@ -615,12 +642,22 @@ pub async fn run_consolidation(
         .flat_map(|e| e.items.iter())
         .map(|i| (i.id.clone(), i))
         .collect();
-    let interim: HashMap<String, String> = waiting
-        .iter()
-        .flat_map(|n| n.candidates.as_deref().unwrap_or_default())
-        .filter(|c| c.interim_archived)
-        .map(|c| (c.entry_id.clone(), c.content_hash.clone()))
-        .collect();
+    // id → archived block TEXT (resolved by hash). The text powers the
+    // add-back guard for interim targets; an unresolvable block keeps the
+    // key (the hard_delete existence gate) with empty text — its
+    // confirmation will hash-mismatch before anything applies anyway.
+    let mut interim: HashMap<String, String> = HashMap::new();
+    for note in &waiting {
+        for cand in note.candidates.as_deref().unwrap_or_default() {
+            if !cand.interim_archived {
+                continue;
+            }
+            let text = find_archive_block_by_hash(memory_dir, &cand.content_hash)?
+                .map(|(_, block)| block)
+                .unwrap_or_default();
+            interim.insert(cand.entry_id.clone(), text);
+        }
+    }
 
     let ctx = ValidationCtx {
         entries: &entries,
@@ -3040,6 +3077,91 @@ mod tests {
         assert!(
             note.exists(),
             "a partially honored note must survive as the confirmation for the frozen id"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_add_back_of_interim_archived_content() {
+        // The hidden (interim-archived) entry's TEXT must power the
+        // add-back guard — a merge may not confirm the delete and re-add
+        // the same sensitive content in one reply.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "Hidden sensitive fact. (updated: 2026-06-01) ^msenstv";
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(memory_dir.join("archive/2026-07.md"), format!("{secret}\n")).unwrap();
+        write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget the hidden fact",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^msenstv","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex(secret)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        write_note(
+            memory_dir,
+            "02fg-confirm",
+            "host",
+            "forget",
+            "yes: id:^msenstv",
+            true,
+        );
+
+        let reply = r#"{"ops":[{"op":"hard_delete","id":"^msenstv","authorized_by":"02fg-confirm"},{"op":"add","section":null,"text":"Hidden sensitive fact.","sources":[]}],"consumed_ids":["02fg-confirm"],"dropped":[]}"#;
+        let provider = ScriptedProvider::new(&[reply, reply]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(
+            !outcome.merge_applied,
+            "interim add-back must be rejected: {:?}",
+            outcome.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn should_self_heal_pending_note_when_all_candidates_dead() {
+        // Crash window: the interim copy was scrubbed and the entry deleted,
+        // but the originating pending note survived. It can never verify or
+        // expire — it must self-heal instead of wedging.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        let parked = write_pending_note(
+            memory_dir,
+            "01fg-orphan",
+            "forget the thing",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^mgone00","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex("Long gone entry. (updated: 2026-05-01) ^mgone00")
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+        assert_eq!(provider.call_count(), 0);
+        assert!(!parked.exists(), "orphaned pending note must self-heal");
+        assert!(
+            outcome
+                .pending_notes
+                .iter()
+                .any(|p| p.note_id == "01fg-orphan" && p.state == PendingState::Confirmed),
+            "self-heal must be surfaced: {:?}",
+            outcome.pending_notes
         );
     }
 }
