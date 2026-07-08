@@ -648,7 +648,7 @@ fn parse_catalog_content(content: &str) -> BTreeMap<String, Vec<String>> {
                     if parts.len() == 2 {
                         result
                             .entry(parts[0].to_string())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(parts[1].to_string());
                     }
                 }
