@@ -57,6 +57,8 @@ pub struct MemorySegmentProvider {
     store: Arc<MemoryStore>,
     max_inject_tokens: usize,
     include_capture_policy: bool,
+    /// See [`Self::static_snapshot`]: first render only, no re-reads.
+    static_after_first: bool,
     last: tokio::sync::Mutex<Option<Fingerprint>>,
 }
 
@@ -70,8 +72,19 @@ impl MemorySegmentProvider {
             store,
             max_inject_tokens,
             include_capture_policy,
+            static_after_first: false,
             last: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Snapshot mode: render ONCE (the first turn-start refresh) and never
+    /// re-render. Used when `memory.refresh.enabled = false` — the config
+    /// contract there is "no per-turn memory re-read", but agents built by
+    /// synchronous factories (session actors) still need their initial
+    /// memory block seeded through the provider path.
+    pub fn static_snapshot(mut self) -> Self {
+        self.static_after_first = true;
+        self
     }
 
     async fn fingerprint(&self) -> Fingerprint {
@@ -122,6 +135,17 @@ impl PromptSegmentProvider for MemorySegmentProvider {
     }
 
     async fn refresh(&self) -> Option<String> {
+        if self.static_after_first {
+            let mut last = self.last.lock().await;
+            if last.is_some() {
+                return None;
+            }
+            // Any non-None marker: the fingerprint is irrelevant in
+            // snapshot mode — one render, then silence.
+            *last = Some(self.fingerprint().await);
+            drop(last);
+            return Some(self.render().await);
+        }
         let current = self.fingerprint().await;
         {
             let mut last = self.last.lock().await;
