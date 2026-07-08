@@ -1459,7 +1459,7 @@ Dashboard (octos serve)
 
 ## 测试
 
-全部 crate 共 1300+ 测试。完整清单和 CI 指南见 [TESTING.md](./TESTING.md)。
+整个工作区共 5,000+ 测试。完整清单和 CI 指南见 [TESTING.md](./TESTING.md)。
 
 - **单元测试**：类型 serde 往返、工具参数解析、配置验证、提供商检测、工具策略、压缩、合并、BM25 评分、L2 归一化、SSE 解析
 - **自适应路由**：Off/Hedge/Lane 模式、熔断器、故障转移、评分、指标、提供商竞速（19 个测试）

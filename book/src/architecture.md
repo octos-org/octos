@@ -1453,7 +1453,7 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 
 ## Testing
 
-1300+ tests across all crates. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
+5,000+ tests across the workspace. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
 
 - **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction, coalescing, BM25 scoring, L2 normalization, SSE parsing
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing (19 tests)
