@@ -17,26 +17,52 @@ pub(crate) fn redact_secrets(text: &str) -> String {
     out
 }
 
+/// Strip surrounding quote characters so `KEY="value"` and `'value'`
+/// expose the inner token for both the tokenish check and the replace.
+fn unquote(value: &str) -> &str {
+    value.trim_matches(['"', '\''])
+}
+
 fn redact_line(line: &str) -> String {
     let mut result = String::with_capacity(line.len());
     let mut tokens = line.split(' ').peekable();
-    // Set when the NEXT token is a value to mask: after "Bearer", or after
-    // a sensitive key with the value in the following token ("password: x").
+    // Set when the NEXT token is a value to mask: after "Bearer", after a
+    // sensitive "password:" with the value in the following token, or
+    // after a spaced separator ("PASSWORD = hunter2").
     let mut value_pending = false;
+    // Set right after a bare sensitive key ("PASSWORD"); a following
+    // "="/":" token promotes it to value_pending.
+    let mut sep_pending = false;
     while let Some(token) = tokens.next() {
         let mut replaced: Option<String> = None;
         let bare = token.trim_end_matches(['\n', '\r', ',', ';', '"', '\'', ')']);
+        let inner = unquote(bare);
 
-        if value_pending && looks_tokenish(bare) {
-            replaced = Some(token.replace(bare, "[redacted]"));
+        if value_pending && looks_tokenish(inner) {
+            replaced = Some(token.replace(inner, "[redacted]"));
         }
         value_pending = token.eq_ignore_ascii_case("bearer");
 
+        if sep_pending {
+            sep_pending = false;
+            if bare == "=" || bare == ":" {
+                // Spaced assignment: the NEXT token is the value.
+                value_pending = true;
+            } else if let Some(rest) = bare.strip_prefix(['=', ':']) {
+                // "PASSWORD =hunter2" — value glued to the separator.
+                let rest = unquote(rest);
+                if replaced.is_none() && looks_tokenish(rest) {
+                    replaced = Some(token.replace(rest, "[redacted]"));
+                }
+            }
+        }
+
         if replaced.is_none() {
-            if has_secret_prefix(bare) {
-                replaced = Some(token.replace(bare, "[redacted]"));
+            if has_secret_prefix(inner) {
+                replaced = Some(token.replace(inner, "[redacted]"));
             } else if let Some((key, value)) = split_assignment(bare) {
                 if key_is_sensitive(key) {
+                    let value = unquote(value);
                     if looks_tokenish(value) {
                         replaced = Some(token.replace(value, "[redacted]"));
                     } else if value.is_empty() {
@@ -45,8 +71,11 @@ fn redact_line(line: &str) -> String {
                         value_pending = true;
                     }
                 }
-            } else if is_long_token_run(bare) {
-                replaced = Some(token.replace(bare, "[redacted]"));
+            } else if key_is_sensitive(bare) && !bare.is_empty() {
+                // Bare sensitive key: watch for a spaced "=" / ":" next.
+                sep_pending = true;
+            } else if is_long_token_run(inner) {
+                replaced = Some(token.replace(inner, "[redacted]"));
             }
         }
 
@@ -137,6 +166,34 @@ mod tests {
         assert!(!out.contains("abcd1234efgh5678"));
         let out2 = redact_secrets("password: hunter2hunter2");
         assert!(!out2.contains("hunter2hunter2"));
+    }
+
+    #[test]
+    fn should_redact_quoted_assignment_values() {
+        let out = redact_secrets(r#"export OPENAI_API_KEY="abcd1234efgh5678""#);
+        assert!(
+            !out.contains("abcd1234efgh5678"),
+            "quoted value leaked: {out}"
+        );
+        let out2 = redact_secrets("token: 'zyxw9876vuts5432'");
+        assert!(
+            !out2.contains("zyxw9876vuts5432"),
+            "single-quoted leaked: {out2}"
+        );
+    }
+
+    #[test]
+    fn should_redact_spaced_assignments() {
+        let out = redact_secrets("PASSWORD = hunter2hunter2");
+        assert!(
+            !out.contains("hunter2hunter2"),
+            "spaced value leaked: {out}"
+        );
+        let out2 = redact_secrets("API_KEY =abcd1234efgh5678");
+        assert!(
+            !out2.contains("abcd1234efgh5678"),
+            "glued value leaked: {out2}"
+        );
     }
 
     #[test]

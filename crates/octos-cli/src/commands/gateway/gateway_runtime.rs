@@ -168,6 +168,10 @@ pub(super) struct GatewayRuntime {
     actor_registry: ActorRegistry,
     session_dispatcher: crate::gateway_dispatcher::GatewayDispatcher,
     profile_factory_builder: Option<ProfileActorFactoryBuilder>,
+    /// Background memory-refresh sweep; must live on the runtime so the
+    /// flock + loop survive past construction (drop stops the sweep).
+    #[allow(dead_code)]
+    memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
     profile_store: Option<Arc<crate::profiles::ProfileStore>>,
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
 
@@ -1100,29 +1104,6 @@ impl GatewayRuntime {
                 tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
             }
 
-            // Background memory-refresh sweep: the flock arbitrates when a
-            // serve daemon also owns this profile dir; the binding lives
-            // for the gateway's lifetime so drop stops the sweep.
-            let _memory_refresh =
-                if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
-                    crate::memory_refresh::MemoryRefreshService::try_start(
-                        data_dir.clone(),
-                        memory_store.clone(),
-                        crate::memory_refresh::resolve_refresh_provider(
-                            &config,
-                            llm.clone(),
-                            config
-                                .memory
-                                .as_ref()
-                                .and_then(|m| m.refresh.as_ref())
-                                .and_then(|r| r.extract_model.as_deref()),
-                        ),
-                        crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
-                    )
-                } else {
-                    None
-                };
-
             // Runtime model switching tool
             tools.register(crate::tools::SwitchModelTool::new(
                 swappable.clone(),
@@ -1153,6 +1134,30 @@ impl GatewayRuntime {
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let memory_refresh_enabled =
             crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+
+        // Background memory-refresh sweep: the flock arbitrates when a
+        // serve daemon also owns this profile dir. Stored on the runtime
+        // struct — a local binding would drop (and kill the sweep) the
+        // moment construction returns.
+        let memory_refresh = if memory_refresh_enabled {
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.clone(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    config
+                        .memory
+                        .as_ref()
+                        .and_then(|m| m.refresh.as_ref())
+                        .and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
             &data_dir,
@@ -1724,6 +1729,7 @@ impl GatewayRuntime {
             actor_registry,
             session_dispatcher,
             profile_factory_builder,
+            memory_refresh,
             profile_store,
             active_sessions,
             system_prompt,

@@ -1415,12 +1415,19 @@ impl SessionManager {
             let Ok(modified) = meta.modified() else {
                 return;
             };
-            // Cheap meta-line read for lineage (first JSONL line only).
-            let parent_key = std::fs::read_to_string(&path)
+            // Cheap meta-line read for lineage: buffered, bounded to the
+            // first 64KB — a sweep over many/large session files must not
+            // slurp whole transcripts just to peek at line one.
+            let parent_key = std::fs::File::open(&path)
                 .ok()
-                .as_deref()
-                .and_then(|c| c.lines().next())
-                .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
+                .and_then(|file| {
+                    use std::io::{BufRead, BufReader, Read};
+                    let mut first = String::new();
+                    BufReader::new(file.take(64 * 1024))
+                        .read_line(&mut first)
+                        .ok()?;
+                    serde_json::from_str::<SessionMeta>(first.trim_end()).ok()
+                })
                 .and_then(|m| m.parent_key);
 
             let entry = by_key

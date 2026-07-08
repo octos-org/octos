@@ -108,10 +108,16 @@ pub(crate) fn render_transcript(
 
     let mut start = 0usize;
     loop {
-        let candidate = rendered[start..].join("\n");
+        let mut candidate = rendered[start..].join("\n");
         let within =
             octos_memory::estimate_tokens(&candidate) <= max_tokens && candidate.len() <= max_bytes;
         if within || start + 1 >= rendered.len() {
+            if !within {
+                // A single message can exceed the whole budget (pasted
+                // logs); the hard cap must hold regardless. Keep the TAIL
+                // — the durable outcome lives at the end.
+                candidate = truncate_front_to_budget(&candidate, max_tokens, max_bytes);
+            }
             let mut out = candidate;
             if start > 0 {
                 out = format!("[…{start} earlier messages omitted by input budget]\n{out}");
@@ -119,6 +125,30 @@ pub(crate) fn render_transcript(
             return out;
         }
         start += 1;
+    }
+}
+
+/// Cut from the FRONT at a char boundary until both budgets hold.
+fn truncate_front_to_budget(text: &str, max_tokens: usize, max_bytes: usize) -> String {
+    const MARKER: &str = "[…message truncated by input budget] ";
+    let mut cut = 0usize;
+    let bytes = text.len();
+    loop {
+        let tail = &text[cut..];
+        if octos_memory::estimate_tokens(tail) <= max_tokens.saturating_sub(16)
+            && tail.len() <= max_bytes.saturating_sub(MARKER.len())
+        {
+            return format!("{MARKER}{tail}");
+        }
+        // Halve the remaining text each round, snapping to a boundary.
+        let step = ((bytes - cut) / 2).max(1);
+        cut = (cut + step).min(bytes);
+        while cut < bytes && !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        if cut >= bytes {
+            return MARKER.to_string();
+        }
     }
 }
 
@@ -231,6 +261,18 @@ mod tests {
         assert!(text.contains("omitted by input budget"));
         assert!(text.contains("message number 19"));
         assert!(!text.contains("message number 0 "));
+    }
+
+    #[test]
+    fn should_hard_cap_when_single_message_exceeds_budget() {
+        let huge = "z".repeat(400_000);
+        let transcript = vec![(0, msg(MessageRole::User, &huge))];
+        let lines = build_input_lines(&transcript);
+        let text = render_transcript(&lines, 1_000, 8_000);
+        assert!(text.len() <= 8_000, "byte cap violated: {}", text.len());
+        assert!(octos_memory::estimate_tokens(&text) <= 1_000);
+        assert!(text.contains("truncated by input budget"));
+        assert!(text.ends_with('z'), "tail must be kept");
     }
 
     #[test]
