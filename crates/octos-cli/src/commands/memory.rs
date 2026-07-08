@@ -33,6 +33,32 @@ enum MemoryAction {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Record a host-authored remember request (full consolidation
+    /// authority — no model in the loop).
+    Remember {
+        /// What to remember, verbatim.
+        text: Vec<String>,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Record a host-authored forget request. Free text starts a
+    /// confirm flow; `--id ^m…` deletes that exact entry on the next
+    /// consolidation.
+    Forget {
+        /// What to forget (free text), unless --id is given.
+        text: Vec<String>,
+        /// Exact MEMORY.md entry id (e.g. ^m4k2abq) to hard-delete.
+        #[arg(long)]
+        id: Option<String>,
+        /// Sensitive data: candidates are interim-archived immediately and
+        /// scrubbed everywhere on confirmation.
+        #[arg(long)]
+        sensitive: bool,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 impl Executable for MemoryCommand {
@@ -50,8 +76,71 @@ impl MemoryCommand {
         match self.action {
             MemoryAction::Refresh { data_dir } => run_refresh(data_dir).await,
             MemoryAction::Status { data_dir } => run_status(data_dir).await,
+            MemoryAction::Remember { text, data_dir } => {
+                write_host_note(data_dir, octos_memory::NoteKind::UserRequest, text, false).await
+            }
+            MemoryAction::Forget {
+                text,
+                id,
+                sensitive,
+                data_dir,
+            } => {
+                let content = match id {
+                    Some(id) => {
+                        let id = id.trim();
+                        let id = if id.starts_with("^m") {
+                            id.to_string()
+                        } else {
+                            format!("^m{}", id.trim_start_matches("m"))
+                        };
+                        format!("id:{id}")
+                    }
+                    None => text.join(" "),
+                };
+                write_host_note(
+                    data_dir,
+                    octos_memory::NoteKind::Forget,
+                    vec![content],
+                    sensitive,
+                )
+                .await
+            }
         }
     }
+}
+
+async fn write_host_note(
+    data_dir: Option<PathBuf>,
+    kind: octos_memory::NoteKind,
+    text: Vec<String>,
+    sensitive: bool,
+) -> Result<()> {
+    let content = text.join(" ").trim().to_string();
+    if content.is_empty() {
+        eyre::bail!("empty request — provide the text to remember/forget");
+    }
+    let (data_dir, _config) = resolve(data_dir).await?;
+    let memory_store = Arc::new(
+        octos_memory::MemoryStore::open(&data_dir)
+            .await
+            .wrap_err("failed to open memory store")?,
+    );
+    let note = octos_memory::StagingNote {
+        origin: octos_memory::NoteOrigin::Host,
+        kind,
+        content,
+        session_key: None,
+        sensitive,
+        replaces_id: None,
+    };
+    let path = memory_store.write_staging_note(&note).await?;
+    println!(
+        "{} recorded at {}",
+        "host note".green().bold(),
+        path.display()
+    );
+    println!("It applies on the next consolidation pass (or run `octos memory refresh` now).");
+    Ok(())
 }
 
 async fn resolve(data_dir: Option<PathBuf>) -> Result<(PathBuf, Config)> {
@@ -73,14 +162,16 @@ async fn run_refresh(data_dir: Option<PathBuf>) -> Result<()> {
     // path); the background service still requires `enabled`.
     let (llm, provider_name, _router, _strong) =
         crate::commands::gateway::profile_factory::build_llm_stack(&config, false)?;
+    let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
     let provider = crate::memory_refresh::resolve_refresh_provider(
         &config,
+        llm.clone(),
+        refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+    );
+    let consolidate_provider = crate::memory_refresh::resolve_refresh_provider(
+        &config,
         llm,
-        config
-            .memory
-            .as_ref()
-            .and_then(|m| m.refresh.as_ref())
-            .and_then(|r| r.extract_model.as_deref()),
+        refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
     );
     let knobs = crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref());
 
@@ -89,9 +180,14 @@ async fn run_refresh(data_dir: Option<PathBuf>) -> Result<()> {
         "octos memory refresh".cyan().bold(),
         provider.model_id()
     );
-    let report =
-        crate::memory_refresh::run_once(&data_dir, &memory_store, provider.as_ref(), &knobs)
-            .await?;
+    let report = crate::memory_refresh::run_once(
+        &data_dir,
+        &memory_store,
+        provider.as_ref(),
+        consolidate_provider,
+        &knobs,
+    )
+    .await?;
     println!(
         "candidates: {}  extracted: {}  budget-limited: {}",
         report.candidates, report.extracted, report.skipped_budget

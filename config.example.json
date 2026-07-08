@@ -13,7 +13,13 @@
       "max_extractions_per_day": 20,
       "max_daily_tokens": 200000,
       "consolidate_interval_minutes": 30,
-      "max_extract_input_tokens": 24000
+      "max_extract_input_tokens": 24000,
+      "consolidate_model": null,
+      "max_consolidations_per_day": 12,
+      "debounce_seconds": 90,
+      "unused_days": 30,
+      "max_memory_file_tokens": 8000,
+      "pending_confirm_days": 7
     }
   },
 

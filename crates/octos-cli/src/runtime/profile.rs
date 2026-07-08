@@ -1017,17 +1017,19 @@ impl ProfileRuntime {
         // flock decides ownership when serve and gateway share a profile
         // dir; the loser just logs and skips.
         let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
             crate::memory_refresh::MemoryRefreshService::try_start(
                 data_dir.to_path_buf(),
                 memory_store.clone(),
                 crate::memory_refresh::resolve_refresh_provider(
                     &config,
                     llm.clone(),
-                    config
-                        .memory
-                        .as_ref()
-                        .and_then(|m| m.refresh.as_ref())
-                        .and_then(|r| r.extract_model.as_deref()),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
                 ),
                 crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
             )
