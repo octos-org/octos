@@ -374,19 +374,9 @@ pub(crate) async fn run_extraction_pass(
     let mut state = RefreshState::load(&state_path);
     state.roll_date(&chrono::Local::now().format("%Y-%m-%d").to_string());
 
-    if state.extractions_today >= knobs.max_extractions_per_day
-        || state.tokens_today >= knobs.max_daily_tokens
-    {
-        report.skipped_budget = true;
-        state.save(&state_path)?;
-        return Ok(report);
-    }
-
     let manager = SessionManager::open(data_dir).wrap_err("failed to open session manager")?;
     let now = SystemTime::now();
 
-    // Eligible = user-facing, idle long enough, young enough, and changed
-    // since the snapshots we last read.
     // Pre-upgrade cursor backfill — INDEPENDENT of extraction eligibility
     // (idle windows, age caps, budgets): a watermarked session without a
     // cursor was fully consumed by a pre-cursor sweep; stamp it before
@@ -421,6 +411,20 @@ pub(crate) async fn run_extraction_pass(
             }
         }
     }
+
+    // The budget gates PROVIDER work only — the no-provider backfill above
+    // must run even on capped passes, or an append before the budget reset
+    // would re-feed the whole pre-upgrade history.
+    if state.extractions_today >= knobs.max_extractions_per_day
+        || state.tokens_today >= knobs.max_daily_tokens
+    {
+        report.skipped_budget = true;
+        state.save(&state_path)?;
+        return Ok(report);
+    }
+
+    // Eligible = user-facing, idle long enough, young enough, and changed
+    // since the snapshots we last read.
 
     let mut candidates: Vec<(octos_bus::AnalysisSession, Vec<FileSnap>, SystemTime)> = Vec::new();
     for session in manager.list_for_analysis() {
@@ -1738,6 +1742,39 @@ mod tests {
         assert!(
             state.extracted_counts.contains_key("api:504"),
             "backfill is independent of extraction eligibility: {:?}",
+            state.extracted_counts
+        );
+    }
+
+    #[tokio::test]
+    async fn should_backfill_cursor_even_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "api:505", "pre-upgrade fact").await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let knobs = knobs_for_test();
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        // Pre-upgrade state + exhausted budget.
+        let state_path = dir.path().join("memory").join("refresh_state.json");
+        let mut state = RefreshState::load(&state_path);
+        state.extracted_counts.clear();
+        state.extractions_today = knobs.max_extractions_per_day;
+        state.save(&state_path).unwrap();
+
+        run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        let state = RefreshState::load(&state_path);
+        assert!(
+            state.extracted_counts.contains_key("api:505"),
+            "the no-provider backfill must run on capped passes: {:?}",
             state.extracted_counts
         );
     }
