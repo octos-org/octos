@@ -295,10 +295,12 @@ impl<'a> ValidationCtx<'a> {
 
     /// A source qualifies as validated authority when it is a host note or
     /// an extraction item whose host-computed evidence is `user_said` /
-    /// `tool_showed`. Model notes and `assistant_claimed` items never do.
+    /// `tool_showed`. Model notes and `assistant_claimed` items never do —
+    /// and neither does a free-text host forget note: it is parked as
+    /// pending-confirm and carries no authority until the user confirms.
     fn source_qualifies(&self, source: &str) -> bool {
         if let Some(note) = self.notes.get(source) {
-            return note.origin == NoteOrigin::Host;
+            return note.origin == NoteOrigin::Host && !note.is_free_text_forget();
         }
         if let Some(item) = self.items.get(source) {
             return matches!(
@@ -506,7 +508,9 @@ pub fn validate(output: &ModelOutput, ctx: &ValidationCtx) -> Result<ValidatedOp
                 if !in_memory && !ctx.interim.contains_key(id) {
                     return Err(format!("ops[{i}]: unknown entry id '{id}'"));
                 }
-                if in_memory && !targeted.insert(id.as_str()) {
+                // Interim-archived targets are tracked too: two ops on one
+                // id are a conflict wherever the entry lives.
+                if !targeted.insert(id.as_str()) {
                     return Err(format!("ops[{i}]: duplicate op targeting '{id}'"));
                 }
                 // Machine-enforced hard-delete gate: the authorizing note
@@ -854,6 +858,25 @@ mod tests {
     }
 
     #[test]
+    fn should_reject_update_when_only_source_is_free_text_forget_note() {
+        let mut fx = Fixture::default();
+        // Host forget note WITHOUT an id token: pending-confirm material,
+        // not edit authority.
+        fx.notes
+            .push(note("h1", "host", "forget", "forget the portland stuff"));
+        let out = output(
+            vec![Op::Update {
+                id: "^mbbbbbb".into(),
+                new_text: "Prefers spaces.".into(),
+                sources: vec!["h1".into()],
+            }],
+            &[],
+        );
+        let err = fx.validate(&out).unwrap_err();
+        assert!(err.contains("lacks validated authority"), "got: {err}");
+    }
+
+    #[test]
     fn should_mark_unverified_when_add_sources_are_model_notes_only() {
         let mut fx = Fixture::default();
         fx.notes.push(note("m1", "model", "fact", "likes rust"));
@@ -954,6 +977,30 @@ mod tests {
     }
 
     #[test]
+    fn should_reject_duplicate_hard_deletes_when_target_interim_archived() {
+        let mut fx = Fixture::default();
+        fx.interim
+            .insert("^mzzzzzz".to_string(), "somehash".to_string());
+        fx.notes
+            .push(note("h1", "host", "forget", "forget id:^mzzzzzz"));
+        let dup = output(
+            vec![
+                Op::HardDelete {
+                    id: "^mzzzzzz".into(),
+                    authorized_by: "h1".into(),
+                },
+                Op::HardDelete {
+                    id: "^mzzzzzz".into(),
+                    authorized_by: "h1".into(),
+                },
+            ],
+            &["h1"],
+        );
+        let err = fx.validate(&dup).unwrap_err();
+        assert!(err.contains("duplicate op targeting"), "got: {err}");
+    }
+
+    #[test]
     fn should_allow_archive_when_age_qualified_without_sources() {
         let fx = Fixture::default();
         // ^mbbbbbb updated 2026-01-01, today 2026-07-07, unused_days 30.
@@ -1035,8 +1082,10 @@ mod tests {
 
     #[test]
     fn should_reject_non_add_ops_when_init_mode() {
-        let mut fx = Fixture::default();
-        fx.init_mode = true;
+        let mut fx = Fixture {
+            init_mode: true,
+            ..Fixture::default()
+        };
         fx.notes.push(note("h1", "host", "fact", "x"));
         let out = output(
             vec![Op::Update {
@@ -1052,16 +1101,18 @@ mod tests {
 
     #[test]
     fn should_reject_merge_when_over_half_entries_removed() {
-        let mut fx = Fixture::default();
-        fx.entries = (0..8)
-            .map(|i| {
-                let id = format!("^maaaaa{}", char::from(b'a' + i));
-                Entry {
-                    text: format!("Fact {i}. (updated: 2026-01-01) {id}"),
-                    id,
-                }
-            })
-            .collect();
+        let fx = Fixture {
+            entries: (0..8)
+                .map(|i| {
+                    let id = format!("^maaaaa{}", char::from(b'a' + i));
+                    Entry {
+                        text: format!("Fact {i}. (updated: 2026-01-01) {id}"),
+                        id,
+                    }
+                })
+                .collect(),
+            ..Fixture::default()
+        };
         let ops: Vec<Op> = fx.entries[..5]
             .iter()
             .map(|e| Op::Archive {

@@ -41,7 +41,7 @@ impl ScrubTarget {
             return true;
         }
         let folded = fold_whitespace(line);
-        !folded.is_empty() && self.folded_lines.iter().any(|l| *l == folded)
+        !folded.is_empty() && self.folded_lines.contains(&folded)
     }
 }
 
@@ -309,7 +309,9 @@ pub struct ExpiryResult {
 
 /// Expiry = cancel: restore every interim-archived candidate byte-identically
 /// (hash-verified), then delete the pending note. `entries` is the live
-/// MEMORY.md entry list; the caller persists it via the returned flag.
+/// MEMORY.md entry list — restored entries are appended to it and MEMORY.md
+/// is written HERE, before the archive copies are removed, so a crash can
+/// never leave a restored entry existing nowhere.
 ///
 /// Idempotent across crashes: a candidate already present in MEMORY.md with
 /// a matching hash counts as restored (its archive copy, if any, is still
@@ -360,10 +362,14 @@ pub fn apply_expiry(
         return Ok(result);
     }
 
-    // 1. MEMORY.md gains the restored entries (caller writes it).
-    for entry in to_restore {
-        result.restored.push(entry.id.clone());
-        entries.push(entry);
+    // 1. MEMORY.md gains the restored entries and is persisted BEFORE the
+    //    archive copies disappear (no hard deletes here → .bak kept).
+    if !to_restore.is_empty() {
+        for entry in to_restore {
+            result.restored.push(entry.id.clone());
+            entries.push(entry);
+        }
+        write_memory_md(memory_dir, entries, true)?;
     }
     // 2. Remove restored blocks from their archive files.
     for (path, block) in archive_removals {
@@ -547,6 +553,10 @@ mod tests {
         assert!(result.errors.is_empty());
         assert!(!note_path.exists());
         assert_eq!(entries[1].text, block, "byte-identical restore");
+        // MEMORY.md was persisted by the expiry itself (before the archive
+        // copy was removed).
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(memory.contains(block));
         let archived = std::fs::read_to_string(archive_dir.join("2026-06.md")).unwrap();
         assert!(!archived.contains("Sensitive thing."));
         assert!(archived.contains("Other archived."));
