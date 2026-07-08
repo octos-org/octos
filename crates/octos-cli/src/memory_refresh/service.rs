@@ -206,24 +206,30 @@ impl MemoryRefreshService {
                     continue;
                 }
                 let pass = async {
-                    if full_pass {
-                        let report = run_extraction_pass(
-                            &data_dir,
-                            &memory_store,
-                            provider.as_ref(),
-                            &knobs,
-                        )
-                        .await?;
-                        if report.extracted > 0 || report.skipped_budget {
-                            tracing::info!(
-                                extracted = report.extracted,
-                                candidates = report.candidates,
-                                skipped_budget = report.skipped_budget,
-                                "memory extraction pass complete"
-                            );
-                        }
-                    }
-                    run_consolidation_pass(&data_dir, consolidate_provider.clone(), &knobs).await
+                    // Consolidation must run even when extraction fails —
+                    // staged remember/forget notes may not wait behind an
+                    // unrelated broken session. First error wins the report.
+                    let extract_result = if full_pass {
+                        run_extraction_pass(&data_dir, &memory_store, provider.as_ref(), &knobs)
+                            .await
+                            .map(|report| {
+                                if report.extracted > 0 || report.skipped_budget {
+                                    tracing::info!(
+                                        extracted = report.extracted,
+                                        candidates = report.candidates,
+                                        skipped_budget = report.skipped_budget,
+                                        "memory extraction pass complete"
+                                    );
+                                }
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    let consolidate_result =
+                        run_consolidation_pass(&data_dir, consolidate_provider.clone(), &knobs)
+                            .await;
+                    extract_result?;
+                    consolidate_result
                 };
                 match pass.await {
                     Ok(()) => consecutive_failures = 0,
@@ -300,8 +306,12 @@ pub async fn run_once(
             holder.trim()
         );
     };
-    let report = run_extraction_pass(data_dir, memory_store, provider, knobs).await?;
-    run_consolidation_pass(data_dir, consolidate_provider, knobs).await?;
+    // Consolidation runs even when extraction fails — staged host notes
+    // must apply regardless; the extraction error is surfaced after.
+    let extract_result = run_extraction_pass(data_dir, memory_store, provider, knobs).await;
+    let consolidate_result = run_consolidation_pass(data_dir, consolidate_provider, knobs).await;
+    let report = extract_result?;
+    consolidate_result?;
     Ok(report)
 }
 
@@ -457,13 +467,16 @@ pub(crate) fn has_priority_note(data_dir: &Path) -> bool {
         };
         use std::io::Read;
         let mut head = String::new();
-        if file.take(512).read_to_string(&mut head).is_err() {
+        // 16KB covers the whole frontmatter even when a parked note's
+        // `candidates:` JSON is long (it precedes `expires_at:` in the
+        // render order — a short prefix would misread parked notes as
+        // fast-lane triggers and spin every debounce).
+        if file.take(16 * 1024).read_to_string(&mut head).is_err() {
             continue;
         }
-        // Already-parked pending-confirm notes (the engine stamps
-        // `expires_at:` when it parks them) wait on a HUMAN, not on the
+        // Already-parked pending-confirm notes wait on a HUMAN, not on the
         // fast lane — re-running every debounce would only spin.
-        if head.contains("expires_at:") {
+        if head.contains("expires_at:") || head.contains("candidates:") {
             continue;
         }
         if head.contains("origin: host") || head.contains("kind: user_request") {
@@ -1150,6 +1163,90 @@ mod tests {
         assert!(
             memory.contains("^msenstv"),
             "expiry must restore the interim-archived candidate: {memory}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_fast_lane_when_expires_at_beyond_short_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes_dir = dir.path().join("memory/staging/notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        // Long candidates JSON pushes expires_at past a 512-byte prefix.
+        let candidates: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    r#"{{"entry_id":"^mcand{i:02}","content_hash":"{}","interim_archived":false}}"#,
+                    "a".repeat(64)
+                )
+            })
+            .collect();
+        std::fs::write(
+            notes_dir.join("0abc-parked-long.md"),
+            format!(
+                "---\norigin: host\nkind: forget\ncreated_at: 2026-07-08T00:00:00Z\ncandidates: [{}]\nexpires_at: 2026-07-15T00:00:00Z\n---\n\nforget a lot of things\n",
+                candidates.join(",")
+            ),
+        )
+        .unwrap();
+        assert!(
+            !has_priority_note(dir.path()),
+            "a parked note with long candidate metadata must not spin the fast lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_consolidate_staged_notes_when_extraction_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // A poisoned session makes extraction fail…
+        seed_session(dir.path(), "tg:500", "broken").await;
+        // …while a host remember note waits in staging.
+        store
+            .write_staging_note(&octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Host,
+                kind: octos_memory::NoteKind::UserRequest,
+                content: "remember: the deploy password rotates monthly".to_string(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            })
+            .await
+            .unwrap();
+
+        let extract = ScriptedProvider {
+            response: "NOT JSON".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let notes_dir = dir.path().join("memory/staging/notes");
+        let note_name = std::fs::read_dir(&notes_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ops = Arc::new(OpsProvider {
+            response: format!(
+                r#"{{"ops":[{{"op":"add","section":null,"text":"Deploy password rotates monthly.","sources":["{note_name}"]}}],"consumed_ids":["{note_name}"],"dropped":[]}}"#
+            ),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let knobs = knobs_for_test();
+        let err = run_once(dir.path(), &store, &extract, ops.clone(), &knobs).await;
+        assert!(err.is_err(), "extraction failure must still surface");
+        assert!(
+            ops.calls.load(Ordering::SeqCst) >= 1,
+            "consolidation must run despite the extraction failure"
+        );
+        let memory =
+            std::fs::read_to_string(dir.path().join("memory/MEMORY.md")).unwrap_or_default();
+        assert!(
+            memory.contains("Deploy password rotates monthly"),
+            "the staged host note must be applied: {memory}"
         );
     }
 

@@ -408,9 +408,24 @@ pub fn validate(output: &ModelOutput, ctx: &ValidationCtx) -> Result<ValidatedOp
         match op {
             Op::Add { text, sources, .. } => {
                 let text = sanitize_text("add", text)?;
-                // Adds are always allowed, but weak sourcing (model notes /
-                // assistant_claimed only, or no sources at all) must be
-                // visible in the rendered entry.
+                // A forget note may NEVER feed an add: a bad reply could
+                // otherwise write the very content the user asked to forget
+                // back into MEMORY.md while the request stays pending.
+                for src in sources {
+                    if ctx
+                        .notes
+                        .get(src)
+                        .is_some_and(|n| n.kind == NoteKind::Forget)
+                    {
+                        return Err(format!(
+                            "ops[{i}]: add cites forget note '{src}' — forget requests \
+                             cannot source new memory"
+                        ));
+                    }
+                }
+                // Adds are otherwise always allowed, but weak sourcing
+                // (model notes / assistant_claimed only, or no sources at
+                // all) must be visible in the rendered entry.
                 let unverified = !sources.iter().any(|s| ctx.source_qualifies(s));
                 checked.push(CheckedOp::Add { text, unverified });
             }

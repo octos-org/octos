@@ -2233,4 +2233,39 @@ mod tests {
             "the non-secret remainder of the superseded text is archived"
         );
     }
+
+    #[tokio::test]
+    async fn should_reject_add_when_sourced_from_forget_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        write_note(
+            memory_dir,
+            "01fg-freetext",
+            "host",
+            "forget",
+            "forget my embarrassing hobby",
+            false,
+        );
+
+        // The reply re-adds the forgotten content citing the forget note.
+        let reply = r#"{"ops":[{"op":"add","section":null,"text":"Has an embarrassing hobby.","sources":["01fg-freetext"]}],"consumed_ids":[],"dropped":[]}"#;
+        let provider = ScriptedProvider::new(&[reply, reply]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.merge_applied,
+            "forget-sourced add must be rejected"
+        );
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("embarrassing"),
+            "forgotten content must not return"
+        );
+    }
 }
