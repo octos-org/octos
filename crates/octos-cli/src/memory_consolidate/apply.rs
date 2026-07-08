@@ -226,13 +226,16 @@ fn staging_file_matches(content: &str, scrubs: &[ScrubTarget]) -> bool {
 /// Execute the apply order.
 ///
 /// Crash-safety invariants the ordering guarantees:
-/// - The hash-bound pending metadata (step 0) is durable BEFORE any entry
-///   is hidden from MEMORY.md — a crash can never orphan interim-archived
-///   candidates without their binding record.
-/// - Archived/interim content is appended (step 2) BEFORE the entries
-///   leave MEMORY.md (step 3) — content is never in neither place; a
-///   crash between the two leaves a duplicate, which re-runs tolerate
-///   (appends are skipped when the identical block already exists).
+/// - Archived/interim content is appended (step 2) BEFORE the pending
+///   binding claims `interim_archived` (step 2.5) and BEFORE the entries
+///   leave MEMORY.md (step 3) — the confirmation path resolves interim
+///   candidates by hash in the archive, so the copy must exist first;
+///   content is never in neither place, and re-runs skip identical
+///   blocks instead of duplicating.
+/// - The hash-bound pending metadata (step 2.5) is durable BEFORE any
+///   entry is hidden from MEMORY.md — a crash can never orphan
+///   interim-archived candidates without their binding record; the
+///   orchestrator re-hides still-live interim candidates on recovery.
 /// - The authorizing forget note (step 4) outlives the MEMORY.md write —
 ///   a crash before publication leaves the durable request in staging and
 ///   the next run re-plans the delete; a re-run whose target id is
@@ -246,11 +249,6 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
         // Restores can only originate from confirmations (which imply hard
         // deletes) — reaching here is a plan-construction bug.
         eyre::bail!("archive block removals without hard deletes");
-    }
-
-    // --- step 0: persist pending bindings -------------------------------
-    for (path, content) in &plan.pending_rewrites {
-        atomic_write(path, content)?;
     }
 
     // --- step 1: hard-delete content scrub -------------------------------
@@ -318,6 +316,20 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
         atomic_write(&path, &out)?;
     }
 
+    // --- step 2.5: persist pending bindings -------------------------------
+    // AFTER the archive copies exist (the confirmation path resolves
+    // interim candidates by hash in the archive) and BEFORE MEMORY.md
+    // hides the entries (a binding must never be orphaned).
+    let scrubbed_so_far: HashSet<&PathBuf> = report.scrub_deleted_staging.iter().collect();
+    for (path, content) in &plan.pending_rewrites {
+        // A pending note that quoted a hard-deleted entry line was already
+        // whole-file-deleted in step 1 — do not resurrect it.
+        if scrubbed_so_far.contains(path) {
+            continue;
+        }
+        atomic_write(path, content)?;
+    }
+
     // --- step 3: MEMORY.md -------------------------------------------------
     write_memory_md(memory_dir, &plan.final_entries, !has_hard_deletes)?;
 
@@ -348,6 +360,68 @@ pub fn apply_plan(memory_dir: &Path, today: NaiveDate, plan: &ApplyPlan) -> Resu
     }
 
     Ok(report)
+}
+
+/// Does any archive block name this entry id?
+pub(super) fn archive_names_id(memory_dir: &Path, entry_id: &str) -> Result<bool> {
+    for path in archive_files(memory_dir)? {
+        let content = std::fs::read_to_string(&path)
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        if content.contains(entry_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Scrub a hard-delete target that exists ONLY in the archive (the live
+/// entry was archived/superseded earlier). Id-bound host authority is
+/// complete without a merge: remove every archive block naming the id,
+/// line-scrub bank copies, delete backups, and whole-file-delete staging
+/// copies. Returns false when no archive block names the id.
+pub(super) fn scrub_archived_only_target(memory_dir: &Path, entry_id: &str) -> Result<bool> {
+    // Collect the folded lines of every archived version first — they form
+    // the scrub set for bank/staging copies.
+    let mut folded_lines: Vec<String> = Vec::new();
+    let mut found = false;
+    for path in archive_files(memory_dir)? {
+        let content = std::fs::read_to_string(&path)
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        for block in split_blocks(&content) {
+            if block.contains(entry_id) {
+                found = true;
+                folded_lines.extend(block.lines().map(fold_whitespace).filter(|l| !l.is_empty()));
+            }
+        }
+    }
+    if !found {
+        return Ok(false);
+    }
+    let target = ScrubTarget {
+        entry_id: entry_id.to_string(),
+        folded_lines,
+        authorizing_note: PathBuf::new(),
+        originating_pending: Vec::new(),
+    };
+    let targets = [target];
+
+    delete_backups(memory_dir)?;
+    for path in archive_files(memory_dir)? {
+        rewrite_block_file(&path, &[], &targets, true)?;
+    }
+    for path in list_md_files(&memory_dir.join("bank").join("entities"))? {
+        rewrite_block_file(&path, &[], &targets, false)?;
+    }
+    for dir in ["notes", "extract"] {
+        for path in list_md_files(&memory_dir.join("staging").join(dir))? {
+            let content = std::fs::read_to_string(&path)
+                .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+            if staging_file_matches(&content, &targets) {
+                remove_file_if_exists(&path)?;
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Outcome of processing one expired pending note.

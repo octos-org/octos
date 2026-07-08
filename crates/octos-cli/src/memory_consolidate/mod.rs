@@ -245,16 +245,38 @@ pub async fn run_consolidation(
         if named.is_empty() {
             continue;
         }
-        let any_alive = named.iter().any(|id| {
-            entries.iter().any(|e| &e.id == id)
+        let mut any_alive = false;
+        let mut archived_only: Vec<String> = Vec::new();
+        for id in &named {
+            let live = entries.iter().any(|e| &e.id == id)
                 || waiting.iter().any(|w| {
                     w.candidates
                         .as_deref()
                         .unwrap_or_default()
                         .iter()
                         .any(|c| &c.entry_id == id)
-                })
-        });
+                });
+            if live {
+                any_alive = true;
+            } else if apply::archive_names_id(memory_dir, id)? {
+                // The target survives ONLY as archived version(s): the user
+                // asked to forget it, so it must be scrubbed there too —
+                // treating it as satisfied would silently retain the data.
+                archived_only.push(id.clone());
+            }
+        }
+        if !archived_only.is_empty() && !any_alive {
+            // Id-bound host authority is complete without a merge: execute
+            // the scrub deterministically Rust-side.
+            for id in &archived_only {
+                if apply::scrub_archived_only_target(memory_dir, id)? {
+                    outcome.hard_deleted.push(id.clone());
+                    tracing::info!(id, "archived-only forget target scrubbed");
+                }
+            }
+            satisfied.push(i);
+            continue;
+        }
         if !any_alive {
             satisfied.push(i);
         }
@@ -472,6 +494,29 @@ pub async fn run_consolidation(
     let mut interim_texts: HashMap<String, String> = HashMap::new();
     // Restores: entry id → (block text, exact archive block to remove).
     let mut restores: HashMap<String, String> = HashMap::new();
+
+    // Recovery re-hide: a crash after the binding persisted (step 2.5)
+    // but before MEMORY.md was rewritten leaves interim-archived
+    // candidates still live. Their archive copies exist (appends precede
+    // the binding), so hiding them again is safe and restores the parked
+    // invariant.
+    for note in &waiting {
+        for cand in note.candidates.as_deref().unwrap_or_default() {
+            if !cand.interim_archived {
+                continue;
+            }
+            if let Some(pos) = entries
+                .iter()
+                .position(|e| e.id == cand.entry_id && e.content_hash() == cand.content_hash)
+            {
+                tracing::info!(
+                    id = %cand.entry_id,
+                    "re-hiding interim-archived candidate left live by a crashed run"
+                );
+                entries.remove(pos);
+            }
+        }
+    }
 
     for note in &waiting {
         let cands = note.candidates.as_deref().unwrap_or_default();
@@ -1937,6 +1982,98 @@ mod tests {
         assert!(
             archived.contains("^mother1"),
             "unrelated archived block must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_scrub_archived_only_target_when_forget_names_it() {
+        // The entry was archived/superseded earlier; only archive blocks
+        // carry its id. A forget naming it must scrub the archive — not be
+        // treated as satisfied — and needs no merge call when it is the
+        // only staging item.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        write_memory(
+            memory_dir,
+            &["Keeps bonsai. (updated: 2026-06-01) ^mcccccc"],
+        );
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(
+            memory_dir.join("archive/2026-05.md"),
+            "Old wifi password was letmein99. (updated: 2026-05-01) ^msecret\n\nUnrelated fact. (updated: 2026-04-01) ^mother1\n",
+        )
+        .unwrap();
+        let note_path = write_note(
+            memory_dir,
+            "01fg-archived",
+            "host",
+            "forget",
+            "please forget id:^msecret",
+            true,
+        );
+
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run_consolidation(provider.clone(), &params(memory_dir))
+            .await
+            .unwrap();
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(!note_path.exists(), "note consumed after the scrub");
+        assert_eq!(outcome.hard_deleted, vec!["^msecret"]);
+        let archived = std::fs::read_to_string(memory_dir.join("archive/2026-05.md")).unwrap();
+        assert!(
+            !archived.contains("letmein99"),
+            "archived secret must be gone"
+        );
+        assert!(archived.contains("^mother1"), "unrelated block survives");
+    }
+
+    #[tokio::test]
+    async fn should_re_hide_live_interim_candidates_when_recovering_from_crash() {
+        // Crash window: binding persisted (interim_archived=true) and the
+        // archive copy exists, but MEMORY.md was never rewritten — the
+        // sensitive entry is still live. Recovery must hide it again and a
+        // later confirmation must still resolve by archive hash.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let secret = "Sensitive location detail. (updated: 2026-06-01) ^msenstv";
+        let keep = "Keeps bonsai. (updated: 2026-06-01) ^mcccccc";
+        write_memory(memory_dir, &[secret, keep]);
+        std::fs::create_dir_all(memory_dir.join("archive")).unwrap();
+        std::fs::write(memory_dir.join("archive/2026-07.md"), format!("{secret}\n")).unwrap();
+        write_pending_note(
+            memory_dir,
+            "01fg-parked",
+            "forget the location",
+            true,
+            &format!(
+                r#"[{{"entry_id":"^msenstv","content_hash":"{}","interim_archived":true}}]"#,
+                sha256_hex(secret)
+            ),
+            "2026-07-20T10:00:00+00:00",
+        );
+        // A model fact note so the batch is non-empty and the merge runs.
+        write_note(memory_dir, "02fact", "model", "fact", "likes tea", false);
+
+        let provider = ScriptedProvider::new(&[
+            r#"{"ops":[{"op":"add","section":null,"text":"Likes tea.","sources":["02fact"]}],"consumed_ids":["02fact"],"dropped":[]}"#,
+        ]);
+        let outcome = run_consolidation(provider, &params(memory_dir))
+            .await
+            .unwrap();
+        assert!(outcome.merge_applied);
+
+        let memory = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            !memory.contains("^msenstv"),
+            "recovery must re-hide the still-live interim candidate: {memory}"
+        );
+        assert!(memory.contains("^mcccccc"), "unrelated entry survives");
+        let archived = std::fs::read_to_string(memory_dir.join("archive/2026-07.md")).unwrap();
+        assert_eq!(
+            archived.matches("^msenstv").count(),
+            1,
+            "no duplicate archive copies"
         );
     }
 }
