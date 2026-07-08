@@ -32,15 +32,21 @@ impl Sandbox for BwrapSandbox {
             }
         }
 
-        // Mount the /tmp scratch tmpfs BEFORE binding the workspace. bwrap
-        // applies mounts in order, so this must precede the workspace bind: if
-        // the workspace lives under /tmp (e.g. cwd = /tmp/ws) a later `--tmpfs
-        // /tmp` would SHADOW the workspace bind with a fresh writable tmpfs —
-        // hiding the real contents AND, under `--sandbox read-only`,
-        // re-permitting `touch /tmp/ws/newfile` (round-4 sibling of the
+        // Mount the /tmp AND /var/tmp scratch tmpfs BEFORE binding the workspace.
+        // bwrap applies mounts in order, so these must precede the workspace bind:
+        // if the workspace lives under /tmp or /var/tmp (e.g. cwd = /tmp/ws) a
+        // later `--tmpfs` on that root would SHADOW the workspace bind with a
+        // fresh writable tmpfs — hiding the real contents AND, under `--sandbox
+        // read-only`, re-permitting `touch $cwd/newfile` (round-4 sibling of the
         // Landlock /tmp-overlap edge). Mounting the tmpfs first means the
         // subsequent workspace bind lands on top and wins.
+        //
+        // Both /tmp and /var/tmp are covered so bwrap is symmetric with the
+        // Landlock helper (which treats both as system temp roots): a read-only
+        // cwd under EITHER root is protected, and tools that default to either
+        // still get writable scratch (round-5 audit).
         cmd.arg("--tmpfs").arg("/tmp");
+        cmd.arg("--tmpfs").arg("/var/tmp");
 
         // Bind the working directory. Read-write by default; read-only when
         // the permission profile denies workspace writes (`--sandbox
@@ -237,6 +243,88 @@ mod tests {
         assert!(
             tmpfs_idx < ws_bind_idx,
             "--tmpfs /tmp must precede the workspace bind so it is not shadowed, args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn should_tmpfs_var_tmp_before_workspace_ro_bind_when_cwd_under_var_tmp() {
+        // Round-5 audit (bwrap sibling of the Landlock /var/tmp handling): the
+        // Landlock backend treats BOTH /tmp and /var/tmp as system temp roots and
+        // provides a scratch for a read-only cwd under either. bwrap must be
+        // symmetric: a /var/tmp scratch tmpfs must exist AND be mounted BEFORE the
+        // workspace ro-bind, so (a) a read-only cwd under /var/tmp is not shadowed
+        // (and cannot be re-permitted for writes) and (b) tools that default to
+        // /var/tmp still have writable scratch.
+        let sb = BwrapSandbox {
+            allow_network: false,
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("touch newfile", Path::new("/var/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // A `--tmpfs /var/tmp` mount must be present.
+        let var_tmp_tmpfs_idx = args
+            .iter()
+            .enumerate()
+            .find(|(i, a)| {
+                *a == "--tmpfs" && args.get(i + 1).map(String::as_str) == Some("/var/tmp")
+            })
+            .map(|(i, _)| i)
+            .expect("bwrap must mount a /var/tmp tmpfs");
+
+        // The workspace ro-bind must come AFTER the tmpfs so it wins.
+        let ws_bind_idx = args
+            .iter()
+            .position(|a| a == "/var/tmp/ws")
+            .expect("workspace path must be bound");
+        assert_eq!(args[ws_bind_idx - 1], "--ro-bind");
+        assert!(
+            var_tmp_tmpfs_idx < ws_bind_idx,
+            "--tmpfs /var/tmp must be mounted BEFORE the workspace ro-bind so the \
+             tmpfs cannot shadow (and re-permit writes to) the read-only \
+             workspace, args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn should_tmpfs_both_temp_roots_before_workspace_bind() {
+        // Both temp-root tmpfs mounts must precede the workspace bind regardless
+        // of where cwd lives, so ordering is never workspace-dependent.
+        let sb = BwrapSandbox {
+            allow_network: false,
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/home/u/proj"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let tmp_idx = args
+            .iter()
+            .enumerate()
+            .find(|(i, a)| *a == "--tmpfs" && args.get(i + 1).map(String::as_str) == Some("/tmp"))
+            .map(|(i, _)| i)
+            .expect("must mount /tmp tmpfs");
+        let var_tmp_idx = args
+            .iter()
+            .enumerate()
+            .find(|(i, a)| {
+                *a == "--tmpfs" && args.get(i + 1).map(String::as_str) == Some("/var/tmp")
+            })
+            .map(|(i, _)| i)
+            .expect("must mount /var/tmp tmpfs");
+        let ws_bind_idx = args
+            .iter()
+            .position(|a| a == "/home/u/proj")
+            .expect("workspace path must be bound");
+        assert!(
+            tmp_idx < ws_bind_idx && var_tmp_idx < ws_bind_idx,
+            "both temp-root tmpfs mounts must precede the workspace bind, args: {args:?}"
         );
     }
 

@@ -11,20 +11,41 @@ use super::{BLOCKED_ENV_VARS, DEFAULT_READ_ALLOW_PATHS, Sandbox};
 ///
 /// `candidate` is the natural choice derived from `std::env::temp_dir()` (which
 /// honours `$TMPDIR`). A hostile parent can set `$TMPDIR` to a path UNDER the
-/// workspace; if we used it we would (a) mutate the read-only workspace when
-/// creating the dir and (b) grant SBPL write inside it — both defeat read-only
-/// (codex P2, round 3). So we canonicalize the candidate's location and, if it
-/// falls inside `real_cwd`, fall back to a base rooted at `/private/tmp` (the
-/// real path of `/tmp` on macOS, independent of `$TMPDIR`) which is guaranteed
-/// outside any normal workspace. This function performs NO filesystem
-/// mutation — the caller creates the dir only after the path is validated safe.
+/// workspace — either an ABSOLUTE path inside it, or a RELATIVE path like "tmp"
+/// that the sandboxed process resolves against its cwd to `<cwd>/tmp`. If we
+/// used it we would (a) mutate the read-only workspace when creating the dir and
+/// (b) grant SBPL write inside it — both defeat read-only (codex P2, rounds
+/// 3+5). So we first ABSOLUTIZE the candidate against `real_cwd` (a relative
+/// candidate is joined onto cwd, an absolute one is left as-is), then
+/// canonicalize its location; if it falls inside `real_cwd` we fall back to a
+/// base rooted at `/private/tmp` (the real path of `/tmp` on macOS, independent
+/// of `$TMPDIR`) which is guaranteed outside any normal workspace. The returned
+/// path is always ABSOLUTE. This function performs NO filesystem mutation — the
+/// caller creates the dir only after the path is validated safe.
 fn read_only_scratch_dir(candidate: &Path, real_cwd: &Path) -> std::path::PathBuf {
+    // Absolutize the candidate FIRST. A hostile `$TMPDIR` can be RELATIVE (e.g.
+    // "tmp" or "./sub/tmp"); the sandboxed process resolves it relative to its
+    // cwd — i.e. it lands at `<cwd>/tmp`, inside the read-only workspace. If we
+    // canonicalized it while still relative, the absolute `real_cwd`-contains
+    // check below would MISS it (absolute vs relative never match) and we would
+    // accept it, then `create_dir_all` would mutate the read-only workspace
+    // (codex P2, round 5). Joining a relative candidate onto `real_cwd` models
+    // where it truly resolves so the containment check rejects it. An absolute
+    // candidate is unchanged by the join.
+    let candidate_abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        real_cwd.join(candidate)
+    };
+
     // Resolve the candidate to a real path. It usually does not exist yet, so
     // canonicalize the nearest existing ancestor and re-attach the tail.
-    let candidate_real = canonicalize_lexical(candidate);
+    let candidate_real = canonicalize_lexical(&candidate_abs);
 
     if !candidate_real.starts_with(real_cwd) {
-        return candidate.to_path_buf();
+        // Return the ABSOLUTIZED candidate (never the raw relative one) so the
+        // caller creates the dir at the location we actually validated.
+        return candidate_abs;
     }
 
     // Candidate is inside the read-only workspace: fall back to a location that
@@ -846,6 +867,80 @@ mod tests {
         assert_eq!(
             scratch, good_candidate,
             "an outside candidate must be used as-is"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_reject_relative_scratch_candidate_when_read_only() {
+        // P2 (codex, round 5): a NON-EXISTENT RELATIVE `$TMPDIR` like "tmp" is
+        // resolved by the sandboxed process relative to its cwd — i.e. it lands
+        // at `<cwd>/tmp`, inside the read-only workspace. A prior lexical
+        // canonicalization left it relative, so the absolute `real_cwd`-contains
+        // check missed it and it was accepted → `create_dir_all` would mutate the
+        // read-only workspace. The relative candidate must be absolutized against
+        // cwd BEFORE the containment check and thereby rejected; the chosen
+        // scratch must be ABSOLUTE and OUTSIDE cwd.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let relative_candidate = Path::new("tmp");
+        let scratch = read_only_scratch_dir(relative_candidate, &real_cwd);
+
+        assert!(
+            scratch.is_absolute(),
+            "chosen scratch must be absolute, got {}",
+            scratch.display()
+        );
+        // Absolutize a still-relative result against cwd the way the process
+        // would, then confirm it is NOT inside the workspace.
+        let scratch_abs = if scratch.is_absolute() {
+            scratch.clone()
+        } else {
+            real_cwd.join(&scratch)
+        };
+        let scratch_real =
+            std::fs::canonicalize(&scratch_abs).unwrap_or_else(|_| scratch_abs.clone());
+        assert!(
+            !scratch_real.starts_with(&real_cwd),
+            "a relative $TMPDIR candidate must not resolve inside cwd; got {} (cwd {})",
+            scratch_real.display(),
+            real_cwd.display()
+        );
+        // Purity: selecting the scratch must NOT create `<cwd>/tmp`.
+        assert!(
+            !cwd.join("tmp").exists(),
+            "must NOT create <cwd>/tmp when rejecting a relative candidate"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_reject_nested_relative_scratch_candidate_when_read_only() {
+        // Same hazard with a deeper relative path "./sub/tmp".
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let relative_candidate = Path::new("./sub/tmp");
+        let scratch = read_only_scratch_dir(relative_candidate, &real_cwd);
+
+        assert!(
+            scratch.is_absolute(),
+            "chosen scratch must be absolute, got {}",
+            scratch.display()
+        );
+        let scratch_real = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        assert!(
+            !scratch_real.starts_with(&real_cwd),
+            "nested relative candidate must not resolve inside cwd; got {} (cwd {})",
+            scratch_real.display(),
+            real_cwd.display()
+        );
+        assert!(
+            !cwd.join("sub").exists(),
+            "must NOT create <cwd>/sub when rejecting a nested relative candidate"
         );
     }
 
