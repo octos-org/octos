@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate};
 use eyre::{Result, WrapErr};
 use octos_core::Message;
 use octos_llm::{ChatConfig, LlmProvider, TokenUsage};
@@ -78,7 +78,10 @@ impl ConsolidateParams {
             unused_days: 30,
             pending_confirm_days: 7,
             allow_merge: true,
-            today: Utc::now().date_naive(),
+            // Local date — budgets, daily notes, and extraction dates all
+            // use the profile machine's local calendar; UTC would stamp
+            // evening runs with tomorrow's date on western timezones.
+            today: chrono::Local::now().date_naive(),
         }
     }
 }

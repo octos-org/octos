@@ -653,7 +653,7 @@ fn validate_consumption(output: &ModelOutput, ctx: &ValidationCtx) -> Result<(),
                         && ctx.notes.get(auth.as_str()).is_some_and(|a| {
                             a.origin == NoteOrigin::Host
                                 && a.kind == NoteKind::Forget
-                                && a.named_entry_ids().iter().any(|n| *n == named)
+                                && a.named_entry_ids().contains(&named)
                         }))
                 });
                 if !honored {

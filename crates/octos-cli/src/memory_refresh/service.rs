@@ -528,8 +528,27 @@ pub(crate) async fn run_consolidation_pass(
     // `skipped_clean == false` purely to stay surfaced; charging those
     // no-op checks would drain the daily cap and block the eventual
     // confirmation.
-    let spent =
+    let mut spent =
         (outcome.token_usage.input_tokens as u64) + (outcome.token_usage.output_tokens as u64);
+    if outcome.merge_applied && spent == 0 {
+        // Estimator fallback (parity with extraction): some providers
+        // report zero usage; a merge call still spent real tokens —
+        // roughly the memory file (in the prompt AND regenerated in the
+        // reply) plus the staging payload.
+        let memory_md =
+            std::fs::read_to_string(data_dir.join("memory").join("MEMORY.md")).unwrap_or_default();
+        let mut estimate = 2 * octos_memory::estimate_tokens(&memory_md) as u64;
+        for dir in ["notes", "extract"] {
+            if let Ok(entries) = std::fs::read_dir(data_dir.join("memory/staging").join(dir)) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        estimate += meta.len() / 4;
+                    }
+                }
+            }
+        }
+        spent = estimate.max(1);
+    }
     let did_work = outcome.merge_applied || outcome.init_performed || spent > 0;
     if did_work {
         state.consolidations_today += 1;
