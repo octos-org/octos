@@ -89,6 +89,10 @@ pub struct Config {
     #[serde(default)]
     pub embedding: Option<EmbeddingConfig>,
 
+    /// Memory subsystem configuration.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
+
     /// Fallback models for provider failover chain.
     /// When the primary provider fails with a retriable error, the next model is tried.
     #[serde(default)]
@@ -521,6 +525,27 @@ pub struct EmbeddingConfig {
 
 fn default_embedding_provider() -> String {
     "openai".to_string()
+}
+
+/// Memory subsystem configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    /// Token budget for the memory block injected into the system prompt
+    /// (long-term memory + daily notes + bank summary combined). Defaults to
+    /// [`octos_memory::DEFAULT_MAX_INJECT_TOKENS`]. The budget is spent in
+    /// priority order (MEMORY.md, today's notes, bank abstracts, older daily
+    /// notes) and omissions are disclosed to the model with a marker.
+    #[serde(default)]
+    pub max_inject_tokens: Option<usize>,
+}
+
+impl MemoryConfig {
+    /// Effective injection budget, applying the default when unset.
+    pub fn effective_max_inject_tokens(config: Option<&MemoryConfig>) -> usize {
+        config
+            .and_then(|m| m.max_inject_tokens)
+            .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
+    }
 }
 
 /// Email sending configuration for the `send_email` tool.
@@ -1058,7 +1083,33 @@ impl Config {
 /// processes pick up the policy via env, even when the profile JSON they
 /// load omits the new `plugins` block.
 pub(crate) fn merge_env_plugin_policy_pub(config: &mut Config) {
-    merge_env_plugin_policy(config)
+    merge_env_plugin_policy(config);
+    merge_env_memory_policy(config);
+}
+
+/// Fill `memory.max_inject_tokens` from `OCTOS_MEMORY_MAX_INJECT_TOKENS`
+/// (set by `ProcessManager` from the host config.json) when the loaded
+/// config leaves it unset. Field-level merge: an explicit value in the
+/// loaded config always wins; the env var only fills the gap, so spawned
+/// gateways inherit the host budget even when their profile JSON omits it
+/// (or serializes an empty `memory: {}` block).
+fn merge_env_memory_policy(config: &mut Config) {
+    if config
+        .memory
+        .as_ref()
+        .and_then(|m| m.max_inject_tokens)
+        .is_some()
+    {
+        return;
+    }
+    if let Ok(v) = std::env::var("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            config
+                .memory
+                .get_or_insert_with(Default::default)
+                .max_inject_tokens = Some(n);
+        }
+    }
 }
 
 fn merge_env_plugin_policy(config: &mut Config) {
@@ -1349,6 +1400,7 @@ impl Config {
         tracing::info!("no config.json found, using defaults");
         let mut config = Self::default();
         merge_env_plugin_policy(&mut config);
+        merge_env_memory_policy(&mut config);
         Ok((config, None))
     }
 
@@ -1375,8 +1427,11 @@ impl Config {
         // processes too. `ProcessManager` sets `OCTOS_PLUGINS_REQUIRE_SIGNED=1`
         // when the parent serve was launched with strict signing; we
         // OR-merge that into every Config so a profile JSON that omits
-        // the new block still inherits the strict policy.
+        // the new block still inherits the strict policy. The host memory
+        // budget rides the same mechanism via
+        // `OCTOS_MEMORY_MAX_INJECT_TOKENS`.
         merge_env_plugin_policy(&mut config);
+        merge_env_memory_policy(&mut config);
 
         // Log if migration changed something (don't silently rewrite user's config)
         if migrated {

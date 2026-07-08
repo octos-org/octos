@@ -38,4 +38,7 @@ pub use types::{
     MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId,
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
-pub use utils::{tool_output_limit, truncate_head_tail, truncate_utf8, truncated_utf8};
+pub use utils::{
+    SAFE_FILENAME_MAX_BYTES, safe_filename, tool_output_limit, truncate_head_tail, truncate_utf8,
+    truncated_utf8,
+};

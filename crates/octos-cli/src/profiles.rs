@@ -76,6 +76,10 @@ pub struct ProfileConfig {
     /// without changing code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
+    /// Per-profile memory subsystem settings (e.g. the token budget for the
+    /// memory block injected into the system prompt). `None` → defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::config::MemoryConfig>,
     /// Search provider contract for product-level search behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
@@ -1845,6 +1849,7 @@ pub(crate) fn config_from_profile(
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,
+        memory: profile.config.memory.clone(),
         hooks: profile.config.hooks.clone(),
         approval_policy: profile.config.approval_policy.clone(),
         context_filter: vec![],

@@ -236,6 +236,16 @@ impl HybridIndex {
         }
 
         // Insert embedding into HNSW if provided, dimension matches, and not at capacity
+        if let Some(e) = embedding {
+            if e.len() != self.dimension {
+                tracing::warn!(
+                    "embedding dimension mismatch for {episode_id}: got {}, index expects {} — \
+                     vector dropped, episode indexed BM25-only (check embedding model vs index dimension)",
+                    e.len(),
+                    self.dimension
+                );
+            }
+        }
         let valid_emb = embedding.filter(|e| e.len() == self.dimension);
         let normalized = valid_emb.and_then(l2_normalize);
         let can_insert_hnsw = normalized.is_some() && !at_capacity;
@@ -270,6 +280,12 @@ impl HybridIndex {
     /// Returns false if the episode_id is not found or dimension mismatches.
     pub fn add_embedding(&mut self, episode_id: &str, embedding: &[f32]) -> bool {
         if embedding.len() != self.dimension {
+            tracing::warn!(
+                "embedding dimension mismatch for {episode_id}: got {}, index expects {} — \
+                 vector dropped (check embedding model vs index dimension)",
+                embedding.len(),
+                self.dimension
+            );
             return false;
         }
 
@@ -1124,5 +1140,23 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn should_drop_vector_and_keep_bm25_when_insert_dimension_mismatches() {
+        let mut index = HybridIndex::new(4);
+        // 3-dim vector into a 4-dim index: vector dropped, text still indexed.
+        index.insert("ep1", "searchable summary text", Some(&[1.0, 0.0, 0.0]));
+        let results = index.search("searchable summary", None, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "ep1");
+    }
+
+    #[test]
+    fn should_return_false_when_add_embedding_dimension_mismatches() {
+        let mut index = HybridIndex::new(4);
+        index.insert("ep1", "some text", None);
+        assert!(!index.add_embedding("ep1", &[1.0, 0.0, 0.0]));
+        assert!(index.add_embedding("ep1", &[1.0, 0.0, 0.0, 0.0]));
     }
 }

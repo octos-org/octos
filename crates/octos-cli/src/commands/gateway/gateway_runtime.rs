@@ -374,6 +374,7 @@ impl GatewayRuntime {
                 crate::runtime::BootstrapRole::Gateway,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -1122,6 +1123,8 @@ impl GatewayRuntime {
         }
 
         // Build system prompt (always the full prompt with persona, memory, skills)
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
             &data_dir,
@@ -1129,6 +1132,7 @@ impl GatewayRuntime {
             &memory_store,
             &skills_loader,
             &tool_config,
+            max_inject_tokens,
         )
         .await;
 
@@ -1402,6 +1406,10 @@ impl GatewayRuntime {
                     // plugin policy so child profiles inherit the
                     // strict-signing gate even when their JSON omits it.
                     host_plugins: config.plugins.clone(),
+                    // The gateway's own config already encodes the correct
+                    // host precedence (explicit config beats the
+                    // ProcessManager env var via merge_env_memory_policy).
+                    host_memory: config.memory.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1612,6 +1620,7 @@ impl GatewayRuntime {
             let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
+            let max_inject_p = max_inject_tokens;
             persona_service.start(
                 move |_persona_text| {
                     // Rebuild the full system prompt with the new persona and hot-update
@@ -1623,8 +1632,16 @@ impl GatewayRuntime {
                     let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
                         let sl = crate::skills_scope::build_account_skills_loader(&dd);
-                        let new_prompt =
-                            build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
+                        let new_prompt = build_system_prompt(
+                            base.as_deref(),
+                            &dd,
+                            &pd,
+                            &ms,
+                            &sl,
+                            &tc,
+                            max_inject_p,
+                        )
+                        .await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;
                         info!("system prompt updated with new persona");
                     });

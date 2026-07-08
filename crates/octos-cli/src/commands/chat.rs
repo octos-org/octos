@@ -605,16 +605,13 @@ impl ChatCommand {
             agent.append_system_prompt(&bootstrap);
         }
 
-        // Inject memory context (long-term + daily notes)
-        let memory_ctx = memory_store.get_memory_context().await;
+        // Inject the token-capped memory block (long-term memory + daily
+        // notes + bank summary; omissions are disclosed to the model).
+        let max_inject =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_ctx = memory_store.get_injectable_context(max_inject).await;
         if !memory_ctx.is_empty() {
             agent.append_system_prompt(&memory_ctx);
-        }
-
-        // Inject memory bank summary (entity abstracts)
-        let bank_summary = memory_store.get_bank_summary().await;
-        if !bank_summary.is_empty() {
-            agent.append_system_prompt(&bank_summary);
         }
 
         // Inject skill prompt fragments

@@ -411,7 +411,8 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None).await
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None, None)
+            .await
     }
 
     /// Section B (codex review round-3): bootstrap a profile runtime while
@@ -428,6 +429,7 @@ impl ProfileRuntime {
         role: BootstrapRole,
         host_plugins: Option<&crate::config::PluginsConfig>,
         host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
@@ -436,6 +438,16 @@ impl ProfileRuntime {
         if let Some(host) = host_plugins {
             if host.require_signed {
                 config.plugins.require_signed = true;
+            }
+        }
+        // Host memory settings apply field-by-field when the profile doesn't
+        // override them (same host-default pattern as plugins/voice). A
+        // profile serialized with an empty `memory: {}` block must still
+        // inherit the host budget.
+        if let Some(host) = host_memory {
+            let mem = config.memory.get_or_insert_with(Default::default);
+            if mem.max_inject_tokens.is_none() {
+                mem.max_inject_tokens = host.max_inject_tokens;
             }
         }
 
@@ -920,6 +932,8 @@ impl ProfileRuntime {
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
         let skills_loader = build_account_skills_loader(data_dir);
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
@@ -927,6 +941,7 @@ impl ProfileRuntime {
             &memory_store,
             &skills_loader,
             &tool_config,
+            max_inject_tokens,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {
@@ -1766,6 +1781,7 @@ mod tests {
             Some(&octos_home),
             BootstrapRole::Serve,
             Some(&host_plugins),
+            None,
             None,
         )
         .await

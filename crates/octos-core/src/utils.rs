@@ -104,6 +104,62 @@ pub fn tool_output_limit(tool_name: &str) -> usize {
     }
 }
 
+/// Maximum byte length of a [`safe_filename`] result.
+pub const SAFE_FILENAME_MAX_BYTES: usize = 80;
+/// Byte budget for the encoded stem before the hash suffix kicks in.
+const SAFE_FILENAME_STEM_BYTES: usize = 64;
+
+/// Turn an arbitrary string into a filesystem-safe filename stem.
+///
+/// - ASCII alphanumerics, `-` and `_` pass through; every other byte is
+///   percent-encoded (`%XX` of its UTF-8 bytes), which makes the mapping
+///   injective for un-clamped names — distinct inputs can never collide.
+/// - Results longer than [`SAFE_FILENAME_STEM_BYTES`] are clamped (never
+///   splitting a `%XX` triplet) and suffixed with `-<8 hex>` of the
+///   original name's SHA-256, so clamped names stay collision-resistant.
+/// - The result never exceeds [`SAFE_FILENAME_MAX_BYTES`] bytes, contains
+///   no path separators or dots, and is never empty.
+///
+/// Shared naming helper for memory artifacts (staging notes/extractions,
+/// backups); callers append their own extension.
+pub fn safe_filename(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for b in name.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => encoded.push(b as char),
+            _ => encoded.push_str(&format!("%{b:02X}")),
+        }
+    }
+
+    if encoded.is_empty() {
+        encoded.push('_');
+    }
+    if encoded.len() <= SAFE_FILENAME_STEM_BYTES {
+        return encoded;
+    }
+
+    // Clamp without splitting a %XX triplet: back up while the cut point
+    // lands inside one (a '%' at cut-1 or cut-2 started a triplet that
+    // extends past the cut).
+    let mut cut = SAFE_FILENAME_STEM_BYTES;
+    let bytes = encoded.as_bytes();
+    while cut > 0 && ((cut >= 1 && bytes[cut - 1] == b'%') || (cut >= 2 && bytes[cut - 2] == b'%'))
+    {
+        cut -= 1;
+    }
+    encoded.truncate(cut);
+
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(name.as_bytes());
+    let mut suffix = String::with_capacity(9);
+    suffix.push('-');
+    for byte in digest.iter().take(4) {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    encoded.push_str(&suffix);
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +277,76 @@ mod tests {
              middle-elision triggering retry behaviour; current value is {}",
             tool_output_limit("deep_search")
         );
+    }
+
+    #[test]
+    fn should_pass_through_plain_ascii_when_safe_filename() {
+        assert_eq!(safe_filename("hello-world_1"), "hello-world_1");
+    }
+
+    #[test]
+    fn should_percent_encode_specials_and_cjk_when_safe_filename() {
+        assert_eq!(safe_filename("a b"), "a%20b");
+        assert_eq!(safe_filename("a.b/c"), "a%2Eb%2Fc");
+        // "密" = E5 AF 86 in UTF-8
+        assert_eq!(safe_filename("密"), "%E5%AF%86");
+    }
+
+    #[test]
+    fn should_stay_injective_when_names_differ_only_by_special_chars() {
+        // The legacy char-replace slugging collapsed these; percent-encoding must not.
+        assert_ne!(safe_filename("a/b"), safe_filename("a_b"));
+        assert_ne!(safe_filename("a b"), safe_filename("a-b"));
+    }
+
+    #[test]
+    fn should_contain_no_path_or_dot_bytes_when_input_is_hostile() {
+        let out = safe_filename("../../etc/passwd\0~");
+        assert!(!out.contains('/'));
+        assert!(!out.contains('\\'));
+        assert!(!out.contains('.'));
+        assert!(!out.contains('\0'));
+        assert!(!out.contains('~'));
+    }
+
+    #[test]
+    fn should_clamp_with_distinct_hash_suffix_when_names_share_long_prefix() {
+        let prefix = "x".repeat(100);
+        let a = safe_filename(&format!("{prefix}-alpha"));
+        let b = safe_filename(&format!("{prefix}-beta"));
+        assert!(a.len() <= SAFE_FILENAME_MAX_BYTES);
+        assert!(b.len() <= SAFE_FILENAME_MAX_BYTES);
+        assert_ne!(a, b, "hash suffix must disambiguate clamped names");
+    }
+
+    #[test]
+    fn should_not_split_percent_triplet_when_clamping() {
+        // All-CJK input: every char encodes to three %XX triplets (9 bytes),
+        // so a naive 64-byte cut would land mid-triplet.
+        let name = "记".repeat(40);
+        let out = safe_filename(&name);
+        assert!(out.len() <= SAFE_FILENAME_MAX_BYTES);
+        // Every '%' must be followed by two hex digits within the stem.
+        let stem = &out[..out.rfind('-').unwrap()];
+        let bytes = stem.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                assert!(
+                    i + 2 < bytes.len()
+                        && bytes[i + 1].is_ascii_hexdigit()
+                        && bytes[i + 2].is_ascii_hexdigit(),
+                    "dangling percent triplet in {out}"
+                );
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn should_return_placeholder_when_input_empty() {
+        assert_eq!(safe_filename(""), "_");
     }
 }
