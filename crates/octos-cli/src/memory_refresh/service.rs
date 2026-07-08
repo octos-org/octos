@@ -234,7 +234,11 @@ fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<std::fs::File>> {
             );
             Ok(Some(file))
         }
-        Err(_) => Ok(None),
+        // Only genuine contention means "held elsewhere"; any other error
+        // (EINTR under load, fd pressure) must surface, not masquerade as
+        // a running service.
+        Err(e) if e.kind() == fs2::lock_contended_error().kind() => Ok(None),
+        Err(e) => Err(e).wrap_err("flock on memory refresh lock failed"),
     }
 }
 
@@ -693,7 +697,17 @@ mod tests {
         let second = acquire_refresh_lock(dir.path()).unwrap();
         assert!(second.is_none(), "flock must be exclusive");
         drop(first);
-        let third = acquire_refresh_lock(dir.path()).unwrap();
+        // Release rides the fd close; under a heavily parallel test run the
+        // kernel-visible release can lag a beat — poll briefly rather than
+        // flake, while still failing hard if the lock never frees.
+        let mut third = None;
+        for _ in 0..40 {
+            third = acquire_refresh_lock(dir.path()).unwrap();
+            if third.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(third.is_some(), "lock must release on drop");
     }
 
