@@ -2934,14 +2934,16 @@ mod tests {
         assert!(!MemoryConfig::refresh_enabled(config.memory.as_ref()));
 
         // An explicit config value wins over the env.
-        let mut explicit = Config::default();
-        explicit.memory = Some(MemoryConfig {
-            refresh: Some(MemoryRefreshConfig {
-                enabled: Some(true),
+        let mut explicit = Config {
+            memory: Some(MemoryConfig {
+                refresh: Some(MemoryRefreshConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
-        });
+        };
         merge_env_memory_policy(&mut explicit);
         assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
 
