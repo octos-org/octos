@@ -83,17 +83,21 @@ pub struct ChatCommand {
 /// Exit commands.
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 
+/// Serializes ALL interactive stdin prompts (approvals AND user questions):
+/// if two prompt-raising tools run in the same turn, their stdin prints/reads
+/// must not interleave — otherwise a single `y` or a picked number could land
+/// on whichever request won the stdin race rather than the one the user
+/// meant. One module-level lock shared by both requesters — a function-local
+/// `static` would be a *distinct* mutex per function and not serialize an
+/// approval against a question (codex review).
+static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct CliApprovalRequester;
 
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
-        // Serialize prompts: if two approval-gated tools run in the same turn,
-        // their stdin prompts/reads must not interleave — otherwise a single
-        // `y` could approve whichever request won the stdin race rather than
-        // the one the user meant. One prompt at a time, process-wide.
-        static PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = PROMPT_LOCK.lock().await;
+        let _guard = CHAT_PROMPT_LOCK.lock().await;
         tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
             .await
             .unwrap_or(ToolApprovalDecision::Deny)
@@ -130,10 +134,9 @@ struct CliUserQuestionRequester;
 #[async_trait::async_trait]
 impl UserQuestionRequester for CliUserQuestionRequester {
     async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
-        // Share the approval prompt lock: an approval and a question in the
-        // same turn must not interleave their stdin reads.
-        static PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = PROMPT_LOCK.lock().await;
+        // Shared CHAT_PROMPT_LOCK: an approval and a question in the same
+        // turn must not interleave their stdin reads.
+        let _guard = CHAT_PROMPT_LOCK.lock().await;
         tokio::task::spawn_blocking(move || prompt_for_cli_user_question(request))
             .await
             .unwrap_or(UserQuestionOutcome::Cancelled)
