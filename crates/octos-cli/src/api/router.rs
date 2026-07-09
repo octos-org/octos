@@ -209,6 +209,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        .route("/api/my/profile/qr", get(auth_handlers::my_profile_qr))
         // Reply-voice selection: list synthesizable voices + set this user's
         // sticky default. Both need the caller's identity, so they live in the
         // authenticated `my_api` group.

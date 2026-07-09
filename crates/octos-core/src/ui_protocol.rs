@@ -2713,6 +2713,20 @@ pub struct SessionHydrateResult {
     /// edge cases codex flagged on PR landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
+    /// Additive reload-recovery lane for tool-call UI state. These are
+    /// canonical M9-gamma projection envelopes filtered to tool_* payloads
+    /// from the hydrate replay window. They let clients that still render via
+    /// the legacy ThreadStore rebuild the same tool cards that live
+    /// `tool/started`, `tool/progress`, and `tool/completed` notifications
+    /// produced before the page refresh.
+    ///
+    /// This intentionally does not make `messages_page` equivalent to
+    /// `session/hydrate`: message rows remain the durable transcript, while
+    /// hydrate carries replayable UI projection facts. Omitted unless the
+    /// client requested `messages` and negotiated the same refresh-recovery
+    /// capability used by `replayed_envelopes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_tool_envelopes: Option<Vec<Envelope>>,
 }
 
 /// Params for `session/rollback` — conversation-only rewind. Drops the last
@@ -9845,6 +9859,7 @@ mod tests {
             pending_approvals: Some(vec![]),
             pending_questions: Some(vec![sample_user_question_requested_event()]),
             replayed_envelopes: Some(vec![]),
+            replayed_tool_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
         let parsed: SessionHydrateResult =
@@ -9863,6 +9878,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
         let object = value.as_object().expect("hydrate result is object");
@@ -9875,6 +9891,7 @@ mod tests {
         assert!(!object.contains_key("pending_questions"));
         // Bug C: a non-negotiated client never sees the new field.
         assert!(!object.contains_key("replayed_envelopes"));
+        assert!(!object.contains_key("replayed_tool_envelopes"));
     }
 
     #[test]
@@ -9918,6 +9935,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             },
         };
         let wire = UiRpcResult::SessionRollback(result.clone());

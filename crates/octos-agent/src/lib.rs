@@ -52,6 +52,7 @@ pub mod subagent_summary;
 mod subprocess_env;
 pub use subprocess_env::register_secret_env_names;
 pub mod summarizer;
+pub mod swarm;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -165,6 +166,10 @@ pub use subagent_summary::{
     DEFAULT_SUBAGENT_SUMMARY_WINDOW, SubAgentSummaryRegistry, SubAgentSummaryWatcher,
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
+pub use swarm::{
+    FileMailbox, InProcessMailbox, MAILBOX_SCHEMA_VERSION, MailboxBackend, MailboxEnvelope,
+    MailboxMessage, MailboxRecovery,
+};
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
     TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,

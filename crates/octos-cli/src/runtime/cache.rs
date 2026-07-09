@@ -609,6 +609,7 @@ mod tests {
             },
             memory,
             memory_store,
+            embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: false,
             memory_refresh: None,
