@@ -308,6 +308,14 @@ Current M9 sandbox-parity decision:
   It lets clients render and invoke skill-owned UI actions without gaining a
   generic AppUI tool-call primitive. Skill manifests own the action id, input
   schema, UI hints, bound backend tool, and any file-materialization mode.
+- The additive skill action background-job surface
+  (`skill/action/job/list`, `skill/action/job/read`, the
+  `skill/action/job/updated` notification, and the `skill.action_jobs.v1`
+  capability feature) is governed by accepted
+  [UPCR-2026-027](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_027_SKILL_ACTION_JOBS.md).
+  It lets clients observe manifest-declared background actions through generic
+  persisted job snapshots. It does not introduce notebook-specific routes or a
+  generic client-selected tool-call primitive.
 
 ## 5. Identity Model
 
@@ -440,6 +448,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   management)
 - `skill/action/list`, `skill/action/invoke` (gate `skill.actions.v1`,
   accepted `UPCR-2026-026`; manifest-declared skill actions only)
+- `skill/action/job/list`, `skill/action/job/read` (gate
+  `skill.action_jobs.v1`, accepted `UPCR-2026-027`; persisted background skill
+  action jobs only)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
@@ -1280,6 +1291,33 @@ Clients must use that method list to enable or disable slash commands.
   `materialized_paths`
 - each `results[]` entry mirrors an Octos `ToolResult` as `success`, `output`,
   `file_modified`, `files_to_send`, and `structured_metadata`
+- when the manifest action declares `execution: "background"`, response shape
+  is `{ action_id, ok, batch_id, jobs }`; the server appends persisted job
+  snapshots and emits `skill/action/job/updated` for subsequent state changes
+
+`skill/action/job/list`:
+
+- requires `session_id`; accepts optional `profile_id`, `batch_id`, and
+  `action_id`
+- returns `{ profile_id, session_id, count, jobs }`
+- each job is the latest persisted snapshot for that `job_id`
+- job status is one of `queued`, `running`, `succeeded`, `failed`, or
+  `abandoned`
+- queued/running jobs from a previous server process are surfaced as
+  `abandoned` after startup recovery; clients must not assume automatic resume
+
+`skill/action/job/read`:
+
+- requires `session_id` and `job_id`; accepts optional `profile_id`
+- returns `{ job }` with the latest persisted snapshot
+- missing jobs return a typed AppUI error rather than an empty success payload
+
+`skill/action/job/updated`:
+
+- server notification emitted after every persisted background job snapshot
+- payload is `{ profile_id, session_id, job }`
+- the `job` object uses the same wire shape returned by
+  `skill/action/job/list` and `skill/action/job/read`
 
 `mcp/status/list` and `tool/status/list`:
 

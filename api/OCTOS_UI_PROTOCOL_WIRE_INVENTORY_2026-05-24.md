@@ -94,6 +94,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/skills/remove` | shipped AppUI extra when profile store is configured |
 | `skill/action/list` | shipped AppUI extra, UPCR-2026-026 |
 | `skill/action/invoke` | shipped AppUI extra, UPCR-2026-026 |
+| `skill/action/job/list` | shipped AppUI extra, UPCR-2026-027 |
+| `skill/action/job/read` | shipped AppUI extra, UPCR-2026-027 |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
 
 ## Notifications
@@ -127,6 +129,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `agent/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
 | `agent/output/delta` | shipped, UPCR-2026-019 / UPCR-2026-021 |
 | `agent/artifact/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
+| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
 | `session/goal/updated` | shipped, UPCR-2026-021 |
 | `session/goal/cleared` | shipped, UPCR-2026-021 |
 | `loop/updated` | shipped, UPCR-2026-021 |

@@ -1063,6 +1063,10 @@ function routeProbeParams(method) {
       return { session_id: sessionId, profile_id: profileId };
     case 'skill/action/invoke':
       return { session_id: sessionId, profile_id: profileId, action_id: 'm18-missing-action' };
+    case 'skill/action/job/list':
+      return { session_id: sessionId, profile_id: profileId };
+    case 'skill/action/job/read':
+      return { session_id: sessionId, profile_id: profileId, job_id: 'm18-missing-job' };
     case 'onboarding/workspace_probe':
       return { path: workspace };
     default:

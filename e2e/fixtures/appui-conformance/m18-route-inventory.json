@@ -77,6 +77,8 @@
     { "method": "profile/skills/remove", "classification": "shared_extra" },
     { "method": "skill/action/list", "classification": "shared_extra" },
     { "method": "skill/action/invoke", "classification": "shared_extra" },
+    { "method": "skill/action/job/list", "classification": "shared_extra" },
+    { "method": "skill/action/job/read", "classification": "shared_extra" },
     { "method": "onboarding/workspace_probe", "classification": "local_solo_extra" },
     { "method": "client_hello", "classification": "shared_extra" }
   ]
