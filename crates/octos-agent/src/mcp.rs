@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{Tool, ToolRegistry, ToolResult};
 
 /// A live rmcp client session (any transport). Kept alive behind an `Arc`; when
@@ -121,6 +121,46 @@ fn octos_client_info() -> ClientInfo {
     let mut info = ClientInfo::default();
     info.client_info = Implementation::new("octos", env!("CARGO_PKG_VERSION"));
     info
+}
+
+/// Build a reqwest client (rmcp's 0.13 major) for talking to a remote MCP
+/// server: SSRF-validated, DNS-pinned to the vetted resolved addresses, with
+/// redirects refused (a 3xx must not smuggle us to a private/metadata host),
+/// carrying the configured headers verbatim. Shared by the static-HTTP and
+/// OAuth transports.
+pub(crate) async fn build_pinned_http_client(
+    url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<reqwest_rmcp::Client> {
+    let check = crate::tools::ssrf::check_ssrf_with_addrs(url)
+        .await
+        .map_err(|e| eyre::eyre!("SSRF check failed for MCP url '{url}': {e}"))?;
+    let host = reqwest_rmcp::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .ok_or_else(|| eyre::eyre!("MCP url '{url}' has no host"))?;
+
+    let mut builder =
+        reqwest_rmcp::Client::builder().redirect(reqwest_rmcp::redirect::Policy::none());
+    // Pin the vetted addresses so a rebind can't swap in a private target
+    // between the check and the connection (empty for literal public IPs).
+    if !check.resolved_addrs.is_empty() {
+        builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
+    }
+    if !headers.is_empty() {
+        let mut hmap = reqwest_rmcp::header::HeaderMap::new();
+        for (k, v) in headers {
+            let name = reqwest_rmcp::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| eyre::eyre!("invalid MCP header name '{k}': {e}"))?;
+            let value = reqwest_rmcp::header::HeaderValue::from_str(v)
+                .map_err(|e| eyre::eyre!("invalid MCP header value for '{k}': {e}"))?;
+            hmap.insert(name, value);
+        }
+        builder = builder.default_headers(hmap);
+    }
+    builder
+        .build()
+        .map_err(|e| eyre::eyre!("build MCP http client: {e}"))
 }
 
 /// Validate an MCP-provided input schema for reasonable complexity.
@@ -271,11 +311,18 @@ impl McpClient {
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(&config.args).kill_on_drop(true);
 
-        // Strip injection-vector env vars and forward only the names the
-        // operator explicitly listed under `env`.
+        // Strip injection-vector env vars from the inherited environment and
+        // forward only the names the operator explicitly listed under `env`.
         let allowlist = EnvAllowlist::from_names(config.env.keys().map(|k| k.as_str()));
         sanitize_command_env(&mut cmd, &allowlist);
         for (k, v) in &config.env {
+            // Re-apply the same denylist to the *explicit* env: a config that
+            // lists e.g. LD_PRELOAD/DYLD_INSERT_LIBRARIES/NODE_OPTIONS must not
+            // reopen a process-hijack vector that sanitize_command_env stripped.
+            if !should_forward_env_name(k, &allowlist) {
+                warn!(command = command, var = %k, "MCP env var blocked (injection vector), not forwarded");
+                continue;
+            }
             cmd.env(k, v);
         }
 
@@ -291,8 +338,8 @@ impl McpClient {
         Ok(Arc::new(service))
     }
 
-    /// Connect to a streamable-HTTP MCP server. Static bearer via an
-    /// `Authorization` header; OAuth 2.1 via keyring-stored tokens.
+    /// Connect to a streamable-HTTP MCP server. Static headers (incl. a bearer
+    /// `Authorization`) are sent verbatim; OAuth 2.1 via keyring-stored tokens.
     async fn connect_http(config: &McpServerConfig) -> Result<McpService> {
         let url = config
             .url
@@ -303,11 +350,13 @@ impl McpClient {
             return crate::mcp_auth::connect_oauth(config, url, octos_client_info()).await;
         }
 
-        let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.to_string());
-        if let Some(auth) = config.headers.get("Authorization") {
-            cfg = cfg.auth_header(auth.clone());
-        }
-        let transport = StreamableHttpClientTransport::from_config(cfg);
+        // SSRF-validated + DNS-pinned + no-redirect client carrying the
+        // configured headers verbatim (no double `Bearer`, custom headers kept).
+        let client = build_pinned_http_client(url, &config.headers).await?;
+        let transport = StreamableHttpClientTransport::with_client(
+            client,
+            StreamableHttpClientTransportConfig::with_uri(url.to_string()),
+        );
 
         let service = timeout(HANDSHAKE_TIMEOUT, serve_client(octos_client_info(), transport))
             .await

@@ -13,13 +13,13 @@
 //!   for the redirect. The resulting tokens are written to the keyring.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eyre::Result;
 use rmcp::model::ClientInfo;
 use rmcp::service::serve_client;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::auth::{AuthClient, OAuthState, OAuthTokenResponse};
+use rmcp::transport::auth::{AuthClient, AuthorizationManager, OAuthState, OAuthTokenResponse};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -108,6 +108,9 @@ pub async fn connect_oauth(
     let token: OAuthTokenResponse = serde_json::from_value(stored.token_response.clone())
         .map_err(|e| eyre::eyre!("parse stored oauth token: {e}"))?;
 
+    // SSRF-validated + DNS-pinned + no-redirect client for the MCP transport.
+    let client = crate::mcp::build_pinned_http_client(url, &_config.headers).await?;
+
     let mut oauth_state = OAuthState::new(url.to_string(), None)
         .await
         .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
@@ -121,7 +124,19 @@ pub async fn connect_oauth(
         _ => eyre::bail!("unexpected OAuth state after loading credentials"),
     };
 
-    let auth_client = AuthClient::new(reqwest_rmcp::Client::new(), manager);
+    // `set_credentials` resets rmcp's token receipt time to now, so it would
+    // treat a token that expired while octos was stopped as fresh and send it.
+    // If our persisted wall-clock expiry says it's stale, force a refresh and
+    // persist the new token before the handshake.
+    if token_expired(stored.expires_at_ms) {
+        manager
+            .refresh_token()
+            .await
+            .map_err(|e| eyre::eyre!("refresh expired oauth token for '{url}': {e}"))?;
+        persist_manager_credentials(url, &manager).await;
+    }
+
+    let auth_client = AuthClient::new(client, manager);
     let transport = StreamableHttpClientTransport::with_client(
         auth_client,
         StreamableHttpClientTransportConfig::with_uri(url.to_string()),
@@ -167,14 +182,14 @@ pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
     println!("If it does not open, visit this URL:\n  {auth_url}\n");
     let _ = webbrowser::open(&auth_url);
 
-    // Await the redirect on a blocking worker, bounded by LOGIN_TIMEOUT.
-    let (code, state) = timeout(
-        LOGIN_TIMEOUT,
-        tokio::task::spawn_blocking(move || wait_for_callback(&server)),
-    )
-    .await
-    .map_err(|_| eyre::eyre!("timed out waiting for authorization (>{LOGIN_TIMEOUT:?})"))?
-    .map_err(|e| eyre::eyre!("callback task failed: {e}"))??;
+    // Await the redirect on a blocking worker. The deadline lives *inside*
+    // `wait_for_callback` (via `recv_timeout`) so the blocking task always
+    // terminates — a plain outer `timeout` would leave `recv()` wedged and the
+    // runtime would hang on drop.
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    let (code, state) = tokio::task::spawn_blocking(move || wait_for_callback(&server, deadline))
+        .await
+        .map_err(|e| eyre::eyre!("callback task failed: {e}"))??;
 
     oauth_state
         .handle_callback(&code, &state)
@@ -209,12 +224,49 @@ fn expires_at_ms(creds: &OAuthTokenResponse) -> Option<u64> {
     Some((now + dur).as_millis() as u64)
 }
 
-/// Block until the OAuth redirect hits the loopback server; return `(code, state)`.
-fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String)> {
+/// Whether a stored token is at/near its persisted wall-clock expiry (30s skew).
+/// `None` (server sent no `expires_in`) → treat as non-expiring; rmcp handles it.
+fn token_expired(expires_at_ms: Option<u64>) -> bool {
+    let Some(exp) = expires_at_ms else { return false };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_add(30_000) >= exp
+}
+
+/// Re-read the (possibly just-refreshed) credentials from the manager and
+/// persist them to the keyring. Best-effort — a persist failure is logged, not
+/// fatal (the in-memory token still works for this session).
+async fn persist_manager_credentials(url: &str, manager: &AuthorizationManager) {
+    if let Ok((client_id, Some(creds))) = manager.get_credentials().await
+        && let Ok(value) = serde_json::to_value(&creds)
+    {
+        let stored = StoredTokens {
+            url: url.to_string(),
+            client_id,
+            token_response: value,
+            expires_at_ms: expires_at_ms(&creds),
+        };
+        if let Err(e) = save_tokens(url, &stored) {
+            tracing::warn!(server = url, error = %e, "failed to persist refreshed MCP oauth token");
+        }
+    }
+}
+
+/// Block until the OAuth redirect hits the loopback server (or `deadline`);
+/// return `(code, state)`. Uses `recv_timeout` so the caller can bound the wait
+/// without leaving a wedged blocking task.
+fn wait_for_callback(server: &tiny_http::Server, deadline: Instant) -> Result<(String, String)> {
     loop {
-        let req = server
-            .recv()
-            .map_err(|e| eyre::eyre!("receive callback request: {e}"))?;
+        if Instant::now() >= deadline {
+            eyre::bail!("timed out waiting for authorization (>{LOGIN_TIMEOUT:?})");
+        }
+        let req = match server.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue, // tick — re-check the deadline
+            Err(e) => eyre::bail!("receive callback request: {e}"),
+        };
         // `req.url()` is just the path+query; wrap it so `url` can parse it.
         let full = format!("http://localhost{}", req.url());
         let parsed =
