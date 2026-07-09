@@ -76,8 +76,8 @@ use octos_agent::{
     Agent, AgentConfig, ProgressEvent, ProgressReporter, ToolRegistry, create_sandbox,
 };
 use octos_core::AgentId;
-use octos_llm::{LlmProvider, RetryProvider};
-use octos_memory::EpisodeStore;
+use octos_llm::{EmbeddingProvider, LlmProvider};
+use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::Mutex;
 
 use super::Executable;
@@ -162,19 +162,6 @@ trait SessionAgentFactory: Send + Sync {
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)>;
 }
 
-/// Production agent factory: resolves the LLM provider + tools + memory the same
-/// way `octos chat` does, minus the profile/plugin/pipeline bootstrap so the ACP
-/// entrypoint stays self-contained.
-struct ConfigAgentFactory {
-    config: Config,
-    provider_name: String,
-    model: Option<String>,
-    base_url: Option<String>,
-    data_dir: PathBuf,
-    default_cwd: PathBuf,
-    max_iterations: u32,
-}
-
 /// Core tools pinned as LRU "base" tools so the agent never auto-evicts them
 /// mid-session. The registry keeps only `max_active` (15) tools visible and
 /// evicts the least-recently-used non-base tools after they sit idle for
@@ -209,6 +196,360 @@ fn build_acp_tool_registry(
     tools
 }
 
+/// Register the long-term memory-bank tools (recall/save, plus the refresh
+/// capture tool when memory-refresh is enabled). Shared by the production
+/// assembler and the unit test so both exercise the same wiring.
+fn register_memory_bank(
+    tools: &mut ToolRegistry,
+    memory_store: &Arc<MemoryStore>,
+    refresh_enabled: bool,
+) {
+    tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+    tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+    if refresh_enabled {
+        tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+    }
+}
+
+/// Apply every registry-narrowing filter LAST, in the same order as `octos chat`:
+/// config tool policy -> context tag filter -> provider policy -> resolved
+/// profile envelope. Shared by the production assembler and the unit test.
+fn finalize_tool_registry(
+    tools: &mut ToolRegistry,
+    config: &Config,
+    provider_name: &str,
+    model_id: &str,
+    profile: &octos_agent::profile::ProfileDefinition,
+) {
+    if let Some(policy) = &config.tool_policy {
+        tools.apply_policy(policy);
+    }
+    if !config.context_filter.is_empty() {
+        tools.set_context_filter(config.context_filter.clone());
+    }
+    if let Some(policy) = super::chat::resolve_provider_policy(config, provider_name, model_id) {
+        tools.set_provider_policy(policy);
+    }
+    // M8.3: profile narrowing runs AFTER every other filter (spawn_only preserved).
+    profile.apply_to_registry(tools);
+}
+
+/// Process-wide state assembled ONCE at `octos acp` startup and shared behind an
+/// `Arc` across every ACP `session/new`. Mirrors what `octos chat` builds for its
+/// single embedded agent — failover provider chain, episodic + long-term memory,
+/// the full tool registry (builtins + plugins + MCP + memory-bank + pipeline +
+/// policy + profile), embedder, system prompt, hooks, and compaction — so ACP is
+/// as capable as `octos chat` / a serve session. The expensive work (provider
+/// chain, plugin scan, MCP spawn, memory stores, redb episode store opened
+/// exactly once) happens here; per-session work in [`ConfigAgentFactory::build`]
+/// is only the cheap cwd rebind + agent construction.
+struct AcpBootstrap {
+    llm: Arc<dyn LlmProvider>,
+    memory: Arc<EpisodeStore>,
+    memory_store: Arc<MemoryStore>,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Base registry template — NOT bound to a session cwd. Each session clones +
+    /// rebinds it via `rebind_cwd_with_permissions`.
+    tool_specs: Arc<ToolRegistry>,
+    sandbox: octos_agent::SandboxConfig,
+    /// System-prompt override from the profile template (None = keep the agent's
+    /// built-in default). Bootstrap files + memory segment are attached per session.
+    profile_system_prompt: Option<String>,
+    plugin_prompt_fragments: Vec<String>,
+    hook_executor: Option<Arc<octos_agent::HookExecutor>>,
+    agent_definitions: Arc<octos_agent::agents::AgentDefinitions>,
+    profile: Arc<octos_agent::profile::ProfileDefinition>,
+    agent_config: AgentConfig,
+    compaction: Option<(
+        Arc<octos_agent::compaction::CompactionRunner>,
+        octos_agent::WorkspacePolicy,
+    )>,
+    memory_refresh_enabled: bool,
+    max_inject_tokens: usize,
+    data_dir: PathBuf,
+}
+
+impl AcpBootstrap {
+    /// Assemble the full shared agent stack. Mirrors `octos chat`'s `run_async`
+    /// (crates/octos-cli/src/commands/chat.rs) step-for-step, minus the console
+    /// reporter / Ctrl-C / single-message REPL bits. All diagnostics go to stderr
+    /// (never stdout — ACP speaks JSON-RPC there).
+    #[allow(clippy::too_many_arguments)]
+    async fn build(
+        config: Config,
+        provider_name: String,
+        model: Option<String>,
+        base_url: Option<String>,
+        data_dir: PathBuf,
+        cwd: PathBuf,
+        max_iterations: u32,
+        profile_arg: &Option<String>,
+    ) -> Result<Self> {
+        // --- LLM provider (failover chain, same canonical helper serve/gateway use) ---
+        let base_provider: Arc<dyn LlmProvider> =
+            super::chat::create_provider(&provider_name, &config, model, base_url)?;
+        let model_id = base_provider.model_id().to_string();
+        let bundle = crate::qos_catalog::build_adaptive_provider_chain(
+            base_provider,
+            &config,
+            &data_dir,
+            /* no_retry */ false,
+            crate::qos_catalog::ExporterMode::Spawn,
+        );
+        let llm = bundle.llm.clone();
+
+        // --- memory (episodic + long-term) ---
+        let memory = Arc::new(
+            EpisodeStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open episode store")?,
+        );
+        let memory_store = Arc::new(
+            MemoryStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open memory store")?,
+        );
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+
+        // --- profile (resolved now; applied to the registry LAST via finalize) ---
+        let (profile, profile_source_label) = super::chat::resolve_profile(profile_arg)?;
+        tracing::info!(
+            "profile resolved: name={} source={}",
+            profile.name,
+            profile_source_label
+        );
+
+        // --- tool registry ---
+        let sandbox = config.sandbox.clone();
+        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, create_sandbox(&sandbox));
+        tools.set_base_tools(ACP_BASE_TOOLS.iter().copied());
+
+        let tool_config = Arc::new(
+            octos_agent::ToolConfigStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open tool config store")?,
+        );
+        tools.inject_tool_config(tool_config.clone());
+        if let Some(gw) = &config.gateway {
+            if let Some(secs) = gw.browser_timeout_secs {
+                tools.register(
+                    octos_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
+                        .with_config(tool_config.clone()),
+                );
+            }
+        }
+
+        // spawn (sync sub-agents; background delivery is a dummy channel) + research synth
+        let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(1);
+        let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
+        tools.register(
+            octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
+                .with_worker_prompt(worker_prompt),
+        );
+        tools.register(octos_agent::SynthesizeResearchTool::new(
+            llm.clone(),
+            data_dir.clone(),
+        ));
+
+        // long-term memory bank tools
+        register_memory_bank(&mut tools, &memory_store, memory_refresh_enabled);
+
+        // MCP tools declared in config
+        if !config.mcp_servers.is_empty() {
+            match octos_agent::McpClient::start(&config.mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => eprintln!("Warning: MCP initialization failed: {e}"),
+            }
+        }
+
+        // Bootstrap bundled app-skills / platform-skills / pipelines BEFORE plugin load.
+        let project_dir = cwd.join(".octos");
+        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
+        if n > 0 {
+            eprintln!("Bootstrapped {n} app-skills");
+        }
+        let n = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        if n > 0 {
+            eprintln!("Bootstrapped {n} platform skills");
+        }
+        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
+        if n > 0 {
+            eprintln!("Bootstrapped {n} bundled pipelines");
+        }
+
+        // Load plugins/skills (binary-protocol + HTTP tool discovery).
+        let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".octos"));
+        let mut plugin_result = octos_agent::PluginLoadResult::default();
+        if !plugin_dirs.is_empty() {
+            match octos_agent::PluginLoader::load_into_with_options(
+                &mut tools,
+                &plugin_dirs,
+                &[],
+                octos_agent::PluginLoadOptions {
+                    work_dir: None,
+                    synthesis_config: None,
+                    require_signed: config.plugins.require_signed,
+                    verified_cache_dir: None,
+                },
+            ) {
+                Ok(result) => plugin_result = result,
+                Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
+            }
+            octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                .await
+                .wrap_err("HTTP tool discovery failed at agent boot")?;
+        }
+        if !plugin_result.mcp_servers.is_empty() {
+            match octos_agent::McpClient::start(&plugin_result.mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => eprintln!("Warning: skill MCP initialization failed: {e}"),
+            }
+        }
+
+        // Pipeline tool (DOT workflows), embedder-aware, marked spawn_only.
+        let pipeline_tool = super::chat::build_run_pipeline_tool(
+            llm.clone(),
+            memory.clone(),
+            cwd.clone(),
+            data_dir.clone(),
+            tools.provider_policy().cloned(),
+            plugin_dirs.clone(),
+            config.plugins.require_signed,
+            super::chat::create_embedder(&config),
+        );
+        tools.register(pipeline_tool);
+        tools.mark_spawn_only(
+            "run_pipeline",
+            Some(
+                "Pipeline started in background. The final result and any artifacts will be sent here when complete."
+                    .to_string(),
+            ),
+        );
+
+        // Policy + context filter + provider policy + profile narrowing (LAST).
+        finalize_tool_registry(&mut tools, &config, &provider_name, &model_id, &profile);
+
+        // Sub-agent manifests from `<cwd>/agents/` layered on the built-ins.
+        let agents_dir = cwd.join("agents");
+        let agent_definitions = match octos_agent::agents::AgentDefinitions::load_dir(&agents_dir) {
+            Ok(defs) => Arc::new(defs),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to load agent manifests from {}: {err}",
+                    agents_dir.display()
+                );
+                Arc::new(octos_agent::agents::AgentDefinitions::with_builtins())
+            }
+        };
+        profile
+            .validate_against_registry(&agent_definitions)
+            .wrap_err("profile references missing agent_definition ids")?;
+
+        let embedder = super::chat::create_embedder(&config);
+
+        // System-prompt override from the profile template (bootstrap files +
+        // memory segment are attached per session in `build`, since they are
+        // cwd-specific / live-refreshing).
+        let profile_system_prompt = profile
+            .system_prompt_template
+            .as_ref()
+            .and_then(|tpl| super::load_profile_prompt_template(&profile.name, tpl));
+
+        // Hooks (config + skill-declared).
+        let mut all_hooks = config.hooks.clone();
+        all_hooks.extend(plugin_result.hooks.clone());
+        let hook_executor = if all_hooks.is_empty() {
+            None
+        } else {
+            Some(Arc::new(octos_agent::HookExecutor::new(all_hooks)))
+        };
+
+        // Declarative compaction runner from the cwd's workspace policy.
+        let compaction = match octos_agent::read_workspace_policy(&cwd) {
+            Ok(Some(ws)) => {
+                if let Some(cp) = ws.compaction.clone() {
+                    let runner = match cp.summarizer {
+                        octos_agent::CompactionSummarizerKind::LlmIterative => {
+                            octos_agent::compaction::CompactionRunner::with_provider(
+                                cp,
+                                llm.clone(),
+                            )
+                        }
+                        octos_agent::CompactionSummarizerKind::Extractive => {
+                            octos_agent::compaction::CompactionRunner::new(cp)
+                        }
+                    }
+                    .with_workspace_policy(&ws);
+                    Some((Arc::new(runner), ws))
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("Warning: failed to read workspace policy for compaction: {error}");
+                None
+            }
+        };
+
+        let agent_config = AgentConfig {
+            max_iterations,
+            save_episodes: true,
+            chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
+            ..Default::default()
+        };
+
+        // NOTE(acp): the background `MemoryRefreshService` (auto-sweep of MEMORY.md)
+        // is intentionally NOT started here. The memory-bank tools + MEMORY.md
+        // injection above already give recall/save/capture (chat parity). The
+        // long-running sweep is a serve-only concern (flock-arbitrated); enable it
+        // later behind `memory.refresh.enabled` if wanted.
+
+        let profile = Arc::new(profile);
+
+        Ok(Self {
+            llm,
+            memory,
+            memory_store,
+            embedder,
+            tool_specs: Arc::new(tools),
+            sandbox,
+            profile_system_prompt,
+            plugin_prompt_fragments: plugin_result.prompt_fragments,
+            hook_executor,
+            agent_definitions,
+            profile,
+            agent_config,
+            compaction,
+            memory_refresh_enabled,
+            max_inject_tokens,
+            data_dir,
+        })
+    }
+}
+
+/// Production agent factory: holds the raw config inputs plus a lazily-built
+/// shared [`AcpBootstrap`]. The heavy assembly runs ONCE on the first
+/// `session/new` (using the client's real project cwd); every session then only
+/// does a cheap cwd rebind. Building lazily keeps `initialize` cheap and turns a
+/// misconfiguration (e.g. missing provider key) into a `session/new` error
+/// response rather than a startup crash before the ACP handshake.
+struct ConfigAgentFactory {
+    config: Config,
+    provider_name: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    data_dir: PathBuf,
+    default_cwd: PathBuf,
+    max_iterations: u32,
+    profile: Option<String>,
+    bootstrap: tokio::sync::OnceCell<Arc<AcpBootstrap>>,
+}
+
 #[async_trait::async_trait]
 impl SessionAgentFactory for ConfigAgentFactory {
     fn default_cwd(&self) -> &std::path::Path {
@@ -216,30 +557,96 @@ impl SessionAgentFactory for ConfigAgentFactory {
     }
 
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
-        // Provider resolution mirrors `chat.rs`: base provider -> RetryProvider.
-        let base_provider: Arc<dyn LlmProvider> = super::chat::create_provider(
-            &self.provider_name,
-            &self.config,
-            self.model.clone(),
-            self.base_url.clone(),
-        )?;
-        let llm: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(base_provider));
-
-        let memory = Arc::new(
-            EpisodeStore::open(&self.data_dir)
+        // Assemble the shared stack once, lazily, on the first session (using the
+        // client's real project cwd for plugins/skills/policy/system-prompt).
+        let b = self
+            .bootstrap
+            .get_or_try_init(|| async {
+                AcpBootstrap::build(
+                    self.config.clone(),
+                    self.provider_name.clone(),
+                    self.model.clone(),
+                    self.base_url.clone(),
+                    self.data_dir.clone(),
+                    cwd.clone(),
+                    self.max_iterations,
+                    &self.profile,
+                )
                 .await
-                .wrap_err("failed to open episode store")?,
+                .map(Arc::new)
+            })
+            .await?
+            .clone();
+
+        // Per-session: rebind the shared base registry to the client's cwd so the
+        // cwd-bound tools (shell/read_file/…) run against the client's repo, and
+        // give this session its own Arc-able registry.
+        let tools = b.tool_specs.rebind_cwd_with_permissions(
+            &cwd,
+            create_sandbox(&b.sandbox),
+            octos_agent::EffectivePermissions::workspace_write(),
         );
 
-        let tools = build_acp_tool_registry(&cwd, &self.config.sandbox);
+        // Per-session sub-agent output routing + file-state cache (cheap).
+        let subagent_output_router = Arc::new(octos_agent::SubAgentOutputRouter::new(
+            b.data_dir.join("subagent-outputs"),
+        ));
+        let supervisor_for_summary = (*tools.supervisor()).clone();
+        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
+            b.llm.clone(),
+            subagent_output_router.clone(),
+            supervisor_for_summary,
+        ));
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let agent = Agent::new(AgentId::new("acp"), llm, tools, memory)
-            .with_config(AgentConfig {
-                max_iterations: self.max_iterations,
-                ..AgentConfig::default()
-            })
+        let mut agent = Agent::new(AgentId::new("acp"), b.llm.clone(), tools, b.memory.clone())
+            .with_config(b.agent_config.clone())
+            .with_agent_definitions(b.agent_definitions.clone())
+            .with_profile(b.profile.clone())
+            .with_file_state_cache(Arc::new(octos_agent::FileStateCache::new()))
+            .with_subagent_output_router(subagent_output_router)
+            .with_subagent_summary_generator(subagent_summary_generator)
             .with_shutdown(shutdown.clone());
+        if let Some(embedder) = &b.embedder {
+            agent = agent.with_embedder(embedder.clone());
+        }
+        if let Some(hooks) = &b.hook_executor {
+            agent = agent.with_hooks(hooks.clone());
+        }
+        if let Some((runner, ws)) = &b.compaction {
+            agent = agent
+                .with_compaction_runner(runner.clone())
+                .with_compaction_workspace(ws.clone());
+        }
+
+        // System prompt: profile template (opt) + bootstrap files (per-cwd) +
+        // token-capped MEMORY.md segment (+ live provider when refresh on) + skill
+        // fragments — mirrors `octos chat`.
+        if let Some(sp) = &b.profile_system_prompt {
+            agent.set_system_prompt(sp.clone());
+        }
+        let bootstrap_files = super::load_bootstrap_files(&cwd.join(".octos"));
+        if !bootstrap_files.is_empty() {
+            agent.append_system_prompt(&bootstrap_files);
+        }
+        let memory_ctx = b
+            .memory_store
+            .get_injectable_context(b.max_inject_tokens)
+            .await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, b.memory_refresh_enabled),
+        );
+        if b.memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                b.memory_store.clone(),
+                b.max_inject_tokens,
+                true,
+            )));
+        }
+        for fragment in &b.plugin_prompt_fragments {
+            agent.append_system_prompt(fragment);
+        }
 
         Ok((Arc::new(agent), shutdown))
     }
@@ -435,6 +842,9 @@ impl AcpCommand {
                 )
             })?;
 
+        // The full shared agent stack (provider chain, memory, plugins, MCP,
+        // hooks, system prompt, compaction) is assembled lazily on the first
+        // `session/new` — see `ConfigAgentFactory`.
         let factory: Arc<dyn SessionAgentFactory> = Arc::new(ConfigAgentFactory {
             config,
             provider_name,
@@ -443,6 +853,8 @@ impl AcpCommand {
             data_dir,
             default_cwd: cwd,
             max_iterations: self.max_iterations,
+            profile: self.profile.clone(),
+            bootstrap: tokio::sync::OnceCell::new(),
         });
 
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
@@ -901,6 +1313,35 @@ pub(crate) fn project_progress_event_deduped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ACP assembler wires the long-term memory bank (chat parity), so the
+    /// agent is no longer a bare-builtins skeleton. Exercises the real
+    /// `register_memory_bank` helper the production `AcpBootstrap` uses. Offline:
+    /// `MemoryStore::open` is local (no network / no provider key).
+    #[tokio::test]
+    async fn should_register_memory_bank_tools_in_acp_assembly() {
+        let dir = std::env::temp_dir().join(format!("octos-acp-membank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MemoryStore::open(&dir).await.expect("open memory store"));
+
+        let mut tools = ToolRegistry::with_builtins_and_sandbox(
+            &dir,
+            create_sandbox(&octos_agent::SandboxConfig::default()),
+        );
+        assert!(
+            !tools.is_tool_visible("recall_memory"),
+            "baseline builtins should not carry the long-term memory bank"
+        );
+        register_memory_bank(&mut tools, &store, /* refresh_enabled */ true);
+        for t in ["recall_memory", "save_memory", "memory_note"] {
+            assert!(
+                tools.is_tool_visible(t),
+                "{t} must be registered by the ACP memory-bank wiring"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Regression: a long ACP session that keeps using file/search tools while
     /// never touching the exec tools must not lose `shell`/`exec_command`/
