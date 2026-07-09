@@ -23,8 +23,8 @@ interface LiveRow {
 }
 
 /**
- * Live-view panel. Subscribes to `/api/chat/stream` SSE — the existing
- * harness event stream — and re-groups incoming events by dispatch_id.
+ * Live-view panel. Subscribes to `/api/events/harness` SSE and re-groups
+ * incoming events by dispatch_id.
  * Newly-observed dispatches trigger a detail fetch so per-subtask state
  * lands inline. Falls back to polling `/api/swarm/dispatches` every 10s.
  */
@@ -74,8 +74,7 @@ export default function LiveView() {
     [upsert],
   )
 
-  // SSE subscription — invariant 3: uses the existing /api/events style
-  // stream (exposed at /api/chat/stream in the octos-cli backend).
+  // SSE subscription — invariant 3: uses the existing harness event stream.
   useEffect(() => {
     let es: EventSource | null = null
     try {
@@ -154,7 +153,7 @@ export default function LiveView() {
               connected ? 'bg-green-400' : 'bg-gray-500'
             }`}
           />
-          <span>{connected ? 'Connected to /api/chat/stream' : 'Awaiting SSE…'}</span>
+          <span>{connected ? 'Connected to /api/events/harness' : 'Awaiting SSE…'}</span>
         </div>
         <div className="text-[11px] text-gray-500">
           {orderedRows.length} dispatch{orderedRows.length === 1 ? '' : 'es'}

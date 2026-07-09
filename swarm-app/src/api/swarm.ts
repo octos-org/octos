@@ -8,7 +8,7 @@
  *   - POST   /api/swarm/dispatches/{id}/review
  *   - GET    /api/cost/attributions/{dispatch_id}
  *
- * And subscribes to the existing `/api/events` SSE stream for live
+ * And subscribes to the existing `/api/events/harness` SSE stream for live
  * progress updates (no new channel, per invariant 3).
  */
 
@@ -419,9 +419,8 @@ export const swarmApi = {
 // ── SSE subscription helper for the Live tab ──
 
 /**
- * Subscribe to the existing `/api/chat/stream` SSE broadcaster. New
- * event types (swarm_dispatch, swarm_review_decision) flow through the
- * same stream by design (invariant 3 — no new channel).
+ * Subscribe to the harness SSE broadcaster. Swarm live events flow through
+ * the same stream by design (invariant 3 — no new channel).
  *
  * Returns the EventSource so the caller can close() on teardown.
  */
@@ -429,16 +428,21 @@ export function subscribeToEvents(
   onEvent: (data: unknown) => void,
   onError?: (e: Event) => void,
 ): EventSource {
-  // The legacy broadcaster is at /api/chat/stream; auth flows through
-  // the ?token=... query param so SSE works without Authorization
-  // headers (which EventSource cannot attach).
+  const eventKinds = [
+    'swarm_dispatch',
+    'swarm_review_decision',
+    'cost_attribution',
+    'sub_agent_dispatch',
+  ].join(',')
   const token =
     localStorage.getItem('octos_session_token') ||
     localStorage.getItem('octos_auth_token') ||
     ''
-  const url = token
-    ? `/api/chat/stream?token=${encodeURIComponent(token)}`
-    : '/api/chat/stream'
+  const params = new URLSearchParams({ kinds: eventKinds })
+  if (token) {
+    params.set('token', token)
+  }
+  const url = `/api/events/harness?${params.toString()}`
   const es = new EventSource(url)
   es.onmessage = (msg: MessageEvent) => {
     try {
