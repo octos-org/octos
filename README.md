@@ -445,12 +445,12 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 
 ```bash
 npm install -g @octos-org/octos      # or Homebrew / build from source — see Start here
-octos init                           # pick a provider + model — this guide uses DeepSeek
+octos init                           # pick a provider + model, then paste that provider's API key
 ```
 
-**2. Provide your DeepSeek API key.** Run `octos auth login --provider deepseek` and **paste your key when prompted** (get one from the DeepSeek platform). It's stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by env var, put it in the `env` block below instead.
+`octos init` walks you through choosing a provider + model (this guide uses **DeepSeek**) and then prompts you to **paste that provider's API key** — stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). Pressed Enter to skip it? Add the key later with `octos auth login --provider deepseek`. A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by an env var, put it in the `env` block below instead.
 
-**3. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
+**2. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
 
 ```jsonc
 {
@@ -466,7 +466,7 @@ octos init                           # pick a provider + model — this guide us
 
 > The `--provider`/`--model` in `args` must match the provider you set up in steps 1–2 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
 
-**4. Play with it in Zed.**
+**3. Play with it in Zed.**
 - **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
 - Open the **Agent Panel** (right dock), click the **＋ New Thread** dropdown (or press `⌥⌘⇧N`), and choose **Octos**.
 - Type a prompt. octos runs the agent loop and streams tools, thinking, and results back into Zed — and it remembers across turns via your `MEMORY.md`.

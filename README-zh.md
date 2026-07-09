@@ -47,12 +47,12 @@ octos chat
 
 ```bash
 npm install -g @octos-org/octos      # 或用 Homebrew / 从源码构建（见快速开始）
-octos init                           # 选择提供者与模型——本指南以 DeepSeek 为例
+octos init                           # 选择提供者与模型，并粘贴该提供者的 API key
 ```
 
-**2. 配置 DeepSeek API key。** 运行 `octos auth login --provider deepseek`，**在提示时粘贴你的 key**（从 DeepSeek 平台获取）。它会安全存入 `auth.json`，且不依赖环境变量（`octos acp` 与 `octos chat` 一样解析 LLM）。Dock 启动的 Zed 不会继承你 shell 的环境变量，若想用环境变量传 key，请写进下面的 `env` 块。
+`octos init` 会引导你选择提供者与模型（本指南以 **DeepSeek** 为例），并提示你**粘贴该提供者的 API key**——安全存入 `auth.json`，且不依赖环境变量（`octos acp` 与 `octos chat` 一样解析 LLM）。按 Enter 跳过了？之后可用 `octos auth login --provider deepseek` 补上。Dock 启动的 Zed 不会继承你 shell 的环境变量，若想用环境变量传 key，请写进下面的 `env` 块。
 
-**3. 在 Zed 设置中注册 octos**（`~/.config/zed/settings.json`，或运行 *zed: open settings*）。若 `octos` 在 `PATH` 中可用则用 `"command": "octos"`，否则填 `which octos` 的绝对路径（Dock 启动的 Zed 的 `PATH` 很精简，可能找不到裸 `octos`）：
+**2. 在 Zed 设置中注册 octos**（`~/.config/zed/settings.json`，或运行 *zed: open settings*）。若 `octos` 在 `PATH` 中可用则用 `"command": "octos"`，否则填 `which octos` 的绝对路径（Dock 启动的 Zed 的 `PATH` 很精简，可能找不到裸 `octos`）：
 
 ```jsonc
 {
@@ -68,7 +68,7 @@ octos init                           # 选择提供者与模型——本指南�
 
 > `args` 中的 `--provider`/`--model` 必须与第 1–2 步配置的提供者一致（本指南以 DeepSeek 为例）。`octos acp` 会从你的 `octos init` 配置继承其余字段——`base_url`、`api_type`、`api_key_env`——因此用 `deepseek` 参数指向另一个已配置的提供者会把错误的 key/端点发出去，导致会话失败。
 
-**4. 在 Zed 中使用。** 先**打开一个文件夹**（外部 Agent 需要工作区，否则 Agent 面板只显示 *"Open Project"*），打开 **Agent 面板**（右侧停靠栏），点击 **＋ New Thread** 下拉（或按 `⌥⌘⇧N`），选择 **Octos**，然后输入提示词。octos 会运行完整 Agent 循环，并把工具、思考与结果流式返回 Zed，还会通过你的 `MEMORY.md` 跨轮次记忆。
+**3. 在 Zed 中使用。** 先**打开一个文件夹**（外部 Agent 需要工作区，否则 Agent 面板只显示 *"Open Project"*），打开 **Agent 面板**（右侧停靠栏），点击 **＋ New Thread** 下拉（或按 `⌥⌘⇧N`），选择 **Octos**，然后输入提示词。octos 会运行完整 Agent 循环，并把工具、思考与结果流式返回 Zed，还会通过你的 `MEMORY.md` 跨轮次记忆。
 
 > **找不到 Octos？** 它在 **＋ New Thread** 菜单（外部 Agent）里，**不在** `⋯` → *MCP / Context Servers* 列表中（那是另一个功能）。修改 `agent_servers` 后请用 `Cmd-Q` 彻底退出并重开 Zed 以重新加载配置。
 
