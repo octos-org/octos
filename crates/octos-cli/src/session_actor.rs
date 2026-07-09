@@ -3663,6 +3663,15 @@ impl ActorFactory {
                 (parts.pre_memory, parts.post_memory)
             }
         };
+        // Per-chat soul override (set via /soul in this chat) — appended to
+        // the pre-memory half so it lands in the base prompt's soul slot,
+        // after any profile-wide soul and before the memory segment.
+        if let Some(user_soul) =
+            crate::soul_service::read_soul_for_session(&self.data_dir, &session_key)
+        {
+            system_prompt.push_str("\n\n## Soul\n\n");
+            system_prompt.push_str(&user_soul);
+        }
         if is_slides && !slides_generation_available {
             post_memory_tail.push_str(
                 "\n\n## Slides Generation Availability\n\n\
