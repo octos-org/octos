@@ -341,7 +341,7 @@ In `config.json` or per-profile JSON:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `event` | yes | -- | One of the 4 event types |
+| `event` | yes | -- | One of the 10 event types (see Events above) |
 | `command` | yes | -- | Argv array (no shell interpretation) |
 | `timeout_ms` | no | 5000 | Kill hook process after this timeout |
 | `tool_filter` | no | all | Only trigger for these tool names (tool events only) |

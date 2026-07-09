@@ -326,7 +326,7 @@ octos memory forget  "<text>" [--sensitive]      # 自由文本遗忘（进入�
 octos memory forget  --id ^m4k2abq               # 硬删除某条精确的 MEMORY.md 条目
 ```
 
-即使配置中禁用了后台扫描，`refresh` 仍可运行；但当运行中的服务持有 profile 锁时会拒绝执行。`remember`/`forget` 拥有完整的整合权限——不调用任何 LLM。`--sensitive` 会立即临时归档候选内容，并在确认后在各处彻底清除。
+即使配置中禁用了后台扫描，`refresh` 仍可运行；但当运行中的服务持有 profile 锁时会拒绝执行。`remember`/`forget` 只写入**本地暂存笔记**（写入时不调用 LLM）；该笔记会在下一次整合（后台扫描或 `octos memory refresh`）时应用，而那一步*会*把它发送给整合模型。`--sensitive` 会立即临时归档候选内容，并在确认后在各处彻底清除。
 
 ---
 

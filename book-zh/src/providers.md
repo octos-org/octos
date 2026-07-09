@@ -9,7 +9,7 @@ Octos 开箱即用地支持 16 家 LLM 服务商。每个服务商需要一个�
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native Anthropic | -- |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | -- |
 | `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | `google` |
-| `vertex` | `VERTEX_SA_JSON` | gemini-2.5-flash | Vertex AI（Gemini） | -- |
+| `vertex` | `VERTEX_SA_JSON` | gemini-2.5-flash | Vertex AI（Gemini） | `vertex-ai`、`vertexai` |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | -- |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI 兼容 | -- |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI 兼容 | -- |

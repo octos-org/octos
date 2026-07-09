@@ -337,7 +337,7 @@ octos memory forget  "<text>" [--sensitive]     # Free-text forget (starts a con
 octos memory forget  --id ^m4k2abq              # Hard-delete an exact MEMORY.md entry
 ```
 
-`refresh` works even when the background sweep is disabled in config, but refuses when a running service holds the profile lock. `remember`/`forget` carry full consolidation authority — no LLM is invoked. `--sensitive` interim-archives candidates immediately and scrubs them everywhere on confirmation.
+`refresh` works even when the background sweep is disabled in config, but refuses when a running service holds the profile lock. `remember`/`forget` only write a **local staging note** (no LLM at write time); the note is applied on the next consolidation pass — the background sweep or `octos memory refresh` — which *does* send it to the consolidation model. `--sensitive` interim-archives candidates immediately and scrubs them everywhere on confirmation.
 
 ---
 
