@@ -1059,6 +1059,15 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
     let mut e = OpenAIEmbedder::new(key);
     if let Some(ref url) = cfg.base_url {
         e = e.with_base_url(url);
+    } else if !cfg.provider.eq_ignore_ascii_case("openai") {
+        // A non-openai provider without an explicit base_url falls back to
+        // the registry's default endpoint — otherwise the request goes to
+        // api.openai.com with the other provider's key/model (codex R8).
+        if let Some(url) =
+            octos_llm::registry::lookup(&cfg.provider).and_then(|e| e.default_base_url)
+        {
+            e = e.with_base_url(url);
+        }
     }
     if let Some(ref model) = cfg.model {
         e = e.with_model(model);
