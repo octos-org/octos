@@ -133,7 +133,7 @@ The entity bank is a structured knowledge store at `.octos/memory/bank/entities/
 - **`save_memory`** — Create or update an entity page. The agent is instructed to first `recall_memory` for existing content, then merge new information before saving (no data loss).
 - **`recall_memory`** — Load the full content of a named entity. If the entity doesn't exist, returns a list of all available entities.
 
-> **Auto-deferral:** When the total tool count exceeds 15, memory tools are moved to the `group:memory` deferred group. The agent must use `activate_tools` to enable them before saving or recalling.
+> **Availability:** memory tools (`save_memory`, `recall_memory`) are part of the full tool set sent to the model every turn — no activation step is needed. (Earlier versions deferred them behind an `activate_tools` meta-tool; that scheme was removed in RFC-0.)
 
 ## File Layout
 

@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use colored::Colorize;
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
@@ -78,6 +78,142 @@ pub struct ChatCommand {
     /// byte-for-byte.
     #[arg(long)]
     pub profile: Option<String>,
+
+    /// FULL AUTONOMY ("yolo"): bypass all approvals AND the sandbox — the
+    /// agent can edit any file and run any command with network access,
+    /// without asking. Equivalent to `--sandbox danger-full-access`. Only
+    /// safe on a local single-user box you trust; risks data loss.
+    ///
+    /// `octos chat` is inherently local single-user, so this resolves through
+    /// the solo runtime mode. The `--yolo` alias is hidden for brevity.
+    #[arg(
+        long = "dangerously-bypass-approvals-and-sandbox",
+        visible_alias = "yolo",
+        default_value_t = false
+    )]
+    pub dangerously_bypass_approvals_and_sandbox: bool,
+
+    /// Sandbox / filesystem reach (codex parity). One of `read-only`,
+    /// `workspace-write` (default), or `danger-full-access`. Mutually
+    /// exclusive with a non-danger combination of `--yolo`.
+    #[arg(long, value_enum)]
+    pub sandbox: Option<ChatSandboxMode>,
+
+    /// When to ask for command approval (codex parity). `ask` (default)
+    /// prompts for risky commands; `never` fails them closed at the tool
+    /// boundary instead of prompting.
+    #[arg(long, value_enum)]
+    pub ask_for_approval: Option<ChatApprovalMode>,
+}
+
+/// `--sandbox` choices, mirroring codex's sandbox modes and octos's
+/// [`PermissionProfile`](octos_agent::PermissionProfile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChatSandboxMode {
+    /// Read-only workspace access; write/edit tools fail.
+    ReadOnly,
+    /// Read/write inside the workspace (default).
+    WorkspaceWrite,
+    /// No sandbox, host filesystem, network on, approvals never ("yolo").
+    DangerFullAccess,
+}
+
+/// `--ask-for-approval` choices, mirroring codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChatApprovalMode {
+    /// Prompt for approval on risky commands (default).
+    Ask,
+    /// Never prompt; risky commands fail closed at the tool boundary.
+    Never,
+}
+
+/// Resolve the chat session's [`EffectivePermissions`] from the CLI flags.
+///
+/// yolo GAP #3 — codex parity. Precedence and conflict rules:
+///   * `--yolo` (a.k.a. `--dangerously-bypass-approvals-and-sandbox`) and
+///     `--sandbox danger-full-access` both select the dangerous profile.
+///   * `--yolo` combined with an explicit NON-danger `--sandbox` is
+///     contradictory and errors (fail closed).
+///   * `--ask-for-approval` overrides the approval policy, EXCEPT it may not
+///     contradict the dangerous profile (which is always `never`).
+///
+/// `octos chat` is inherently local single-user, so the dangerous profile is
+/// resolved through [`RuntimeMode::Solo`](octos_agent::RuntimeMode) — a
+/// legitimate use of solo here, unlike the multi-tenant `serve` path.
+pub fn resolve_chat_permissions(
+    yolo: bool,
+    sandbox: Option<ChatSandboxMode>,
+    approval: Option<ChatApprovalMode>,
+) -> Result<octos_agent::EffectivePermissions> {
+    use octos_agent::{ApprovalPolicy, EffectivePermissions, PermissionProfile, RuntimeMode};
+
+    // Determine the requested profile, folding `--yolo` and `--sandbox`
+    // together and rejecting contradictions.
+    let profile = match (yolo, sandbox) {
+        // `--yolo` alone, or `--yolo`/`--sandbox danger-full-access` agreeing.
+        (true, None) | (true, Some(ChatSandboxMode::DangerFullAccess)) => {
+            PermissionProfile::DangerFullAccess
+        }
+        // `--yolo` with a non-danger sandbox is contradictory.
+        (true, Some(other)) => {
+            return Err(eyre!(
+                "--dangerously-bypass-approvals-and-sandbox (--yolo) conflicts with \
+                 --sandbox {:?}: yolo implies danger-full-access",
+                other
+            ));
+        }
+        (false, Some(ChatSandboxMode::ReadOnly)) => PermissionProfile::ReadOnly,
+        (false, Some(ChatSandboxMode::WorkspaceWrite)) | (false, None) => {
+            PermissionProfile::WorkspaceWrite
+        }
+        (false, Some(ChatSandboxMode::DangerFullAccess)) => PermissionProfile::DangerFullAccess,
+    };
+
+    // `octos chat` is local single-user; the dangerous profile is legitimately
+    // resolved via Solo. `for_runtime` still centralizes the danger gate.
+    let mut permissions = EffectivePermissions::for_runtime(profile, RuntimeMode::Solo)
+        .map_err(|err| eyre!("{err}"))?;
+
+    // Apply an explicit `--ask-for-approval` override, guarding against a
+    // contradiction with the always-`never` dangerous profile.
+    if let Some(approval) = approval {
+        let requested = match approval {
+            ChatApprovalMode::Ask => ApprovalPolicy::Ask,
+            ChatApprovalMode::Never => ApprovalPolicy::Never,
+        };
+        if permissions.is_dangerous() && requested != ApprovalPolicy::Never {
+            return Err(eyre!(
+                "--ask-for-approval ask conflicts with danger-full-access, \
+                 which never asks for approval"
+            ));
+        }
+        permissions = permissions.with_approval_policy(requested);
+    }
+
+    Ok(permissions)
+}
+
+/// Bind every loaded [`octos_agent::plugins::PluginTool`] in `tools` to the
+/// resolved chat working directory.
+///
+/// yolo GAP #4: unlike `octos serve` (whose `SessionRuntime::bootstrap`
+/// calls `rebind_plugin_work_dirs`), `octos chat` loads plugins with
+/// `work_dir: None` and never rebinds them. `PluginTool::execute` derives
+/// its `current_dir`/`OCTOS_WORK_DIR` from `ctx.session_scope` ONLY when its
+/// own `work_dir` is unset — and under a Host-scope (`--yolo`) session the
+/// scope is deliberately omitted (so host-reaching file tools keep host
+/// access). With BOTH `work_dir: None` and `session_scope: None`, plugins run
+/// in the process LAUNCH directory instead of the requested `--cwd`, breaking
+/// relative plugin inputs/outputs.
+///
+/// Binding the work_dir at registration (via the registry's existing
+/// [`ToolRegistry::rebind_plugin_work_dirs`] path) fixes the Host case while
+/// staying a no-op for the Workspace case — there `work_dir` == `cwd` ==
+/// `scope.workspace()`, and `execute` prefers `work_dir` first, so the
+/// resolved directory is unchanged. Only plugin working directory is
+/// affected; the Host-scope decision for FILE tools is untouched.
+fn bind_chat_plugin_work_dirs(tools: &mut ToolRegistry, cwd: &std::path::Path) {
+    tools.rebind_plugin_work_dirs(cwd);
 }
 
 /// Exit commands.
@@ -485,9 +621,40 @@ impl ChatCommand {
             profile_source_label
         );
 
-        // Create tool registry (with sandbox if configured)
-        let sandbox = octos_agent::create_sandbox(&config.sandbox);
-        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+        // yolo GAP #3: resolve the effective permissions from the CLI flags
+        // (codex parity: --yolo / --sandbox / --ask-for-approval). `octos
+        // chat` is inherently local single-user, so a dangerous profile
+        // legitimately resolves through RuntimeMode::Solo.
+        //
+        // Guardrails PRESERVED in yolo (codex parity): hooks
+        // `before_tool_call` deny still runs (wired further below); `ToolPolicy`
+        // deny lists still apply (resolved per-provider below); SSRF +
+        // `BLOCKED_ENV_VARS` are untouched (enforced inside the tools/sandbox
+        // regardless of profile). yolo only relaxes the approval prompt, the
+        // shell command policy (SafePolicy→AllowAll), the filesystem scope
+        // (workspace→host), and the sandbox (off) — nothing else.
+        let permissions = resolve_chat_permissions(
+            self.dangerously_bypass_approvals_and_sandbox,
+            self.sandbox,
+            self.ask_for_approval,
+        )?;
+        if permissions.is_dangerous() {
+            // Codex-style one-line RED warning on stderr.
+            eprintln!(
+                "{}",
+                "⚠ full access — can edit any file and run commands with network, \
+                 without approval; risk of data loss"
+                    .red()
+                    .bold()
+            );
+        }
+
+        // Create tool registry under the resolved permissions. The sandbox is
+        // derived from the config default with the permission profile applied
+        // (a dangerous profile disables the sandbox and forces network on).
+        let effective_sandbox_config = permissions.apply_to_sandbox(&config.sandbox);
+        let sandbox = octos_agent::create_sandbox(&effective_sandbox_config);
+        let mut tools = ToolRegistry::with_builtins_and_permissions(&cwd, sandbox, permissions);
 
         // Open tool config store for user-customizable tool defaults
         let tool_config = std::sync::Arc::new(
@@ -507,14 +674,25 @@ impl ChatCommand {
             }
         }
 
+        // Resolve the embedding provider ONCE and share the handle across
+        // every consumer (spawn workers, pipeline workers, the chat agent)
+        // so they agree on the exact same embed-on-save + hybrid-recall
+        // behaviour — and the "pinning …" log fires once, not per site.
+        let embedder = create_embedder(&config);
+
         // Register spawn tool for sync sub-agent support in chat mode.
         // Background mode won't deliver results (dummy channel), but sync mode works fine.
         let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(1);
         let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
-        tools.register(
+        let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
-                .with_worker_prompt(worker_prompt),
-        );
+                .with_worker_prompt(worker_prompt);
+        if let Some(ref embedder) = embedder {
+            // Workers save episodes by default; without the embedder those
+            // episodes are stored vectorless and worker recall skips.
+            spawn_tool = spawn_tool.with_embedder(embedder.clone());
+        }
+        tools.register(spawn_tool);
 
         // Register research synthesis tool (map-reduce over deep_search source files)
         tools.register(octos_agent::SynthesizeResearchTool::new(
@@ -608,6 +786,14 @@ impl ChatCommand {
             }
         }
 
+        // yolo GAP #2/#3: plugin tools are registered directly on `tools`
+        // above (chat does not go through `rebind_cwd_with_permissions`), so
+        // thread the session approval context into them here. Under `never` a
+        // high-risk plugin fails closed; under danger-full-access it
+        // auto-allows — matching the shell/coding tools built with the same
+        // permissions.
+        tools.apply_permissions_to_plugin_tools(permissions);
+
         // Pipeline tool (DOT-based multi-step workflows, with plugin access).
         // Section B (codex review follow-up): propagate
         // `plugins.require_signed` so pipeline workers enforce the same
@@ -632,7 +818,7 @@ impl ChatCommand {
             tools.provider_policy().cloned(),
             plugin_dirs.clone(),
             config.plugins.require_signed,
-            create_embedder(&config),
+            embedder.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
@@ -772,6 +958,20 @@ impl ChatCommand {
                 .wrap_err("failed to absolutize --cwd: current_dir() unavailable")?
                 .join(&cwd)
         };
+
+        // yolo GAP #4: bind every loaded `PluginTool` to the resolved chat
+        // cwd. Chat loads plugins with `work_dir: None` and does NOT go
+        // through `SessionRuntime::rebind_plugin_work_dirs`, so under a
+        // Host-scope (`--yolo`) session — where `session_scope` is left
+        // `None` so file tools keep host reach — `PluginTool::execute`
+        // would derive its `current_dir`/`OCTOS_WORK_DIR` from neither the
+        // scope nor a work_dir and fall back to the process LAUNCH dir,
+        // breaking relative plugin inputs/outputs under `--cwd`. Binding the
+        // work_dir here fixes the Host case and is a no-op behavioural change
+        // for Workspace scope (where `work_dir` == `scope.workspace()` ==
+        // `absolute_cwd` already). See `bind_chat_plugin_work_dirs`.
+        bind_chat_plugin_work_dirs(&mut tools, &absolute_cwd);
+
         // PR-A: thread the per-profile plugin install directories
         // through to the scope so `read_file` can reach the SKILL.md
         // content the agent's system prompt auto-injects.
@@ -784,7 +984,19 @@ impl ChatCommand {
         // `octos-core` drops the entry and logs a warning per skip.
         let canonical_skill_dirs: Vec<PathBuf> =
             octos_core::canonicalize_skill_read_zones(&plugin_dirs);
-        let session_scope = {
+        // yolo GAP #3: mirror the serve path (session.rs) — a
+        // danger-full-access session resolves to `FilesystemScope::Host` and
+        // the file tools deliberately keep their absolute-host reach. They
+        // PREFER an attached `ctx.session_scope` over their `filesystem_scope`,
+        // so attaching a solo scope here would silently re-fence a session the
+        // operator explicitly opened up. Leave the scope unset under Host.
+        let session_scope = if permissions.filesystem_scope.is_host() {
+            tracing::debug!(
+                "skipping SessionScope: --yolo/danger-full-access grants Host \
+                 filesystem access — file tools must keep their host reach"
+            );
+            None
+        } else {
             let base = SessionScope::solo(absolute_cwd.clone(), Vec::new()).expect(
                 "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
             );
@@ -798,7 +1010,7 @@ impl ChatCommand {
                     SessionScope::solo(absolute_cwd.clone(), Vec::new())
                         .expect("absolutized cwd still valid")
                 });
-            Arc::new(scope)
+            Some(Arc::new(scope))
         };
 
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
@@ -809,8 +1021,10 @@ impl ChatCommand {
             .with_profile(profile_arc.clone())
             .with_file_state_cache(file_state_cache)
             .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator)
-            .with_session_scope(session_scope);
+            .with_subagent_summary_generator(subagent_summary_generator);
+        if let Some(session_scope) = session_scope {
+            agent = agent.with_session_scope(session_scope);
+        }
 
         // M8.3: if the profile declares a system_prompt_template, try to
         // read it relative to `~/.octos/profiles/<name>/`. The path is a
@@ -864,8 +1078,8 @@ impl ChatCommand {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
         }
 
-        if let Some(embedder) = create_embedder(&config) {
-            agent = agent.with_embedder(embedder);
+        if let Some(ref embedder) = embedder {
+            agent = agent.with_embedder(embedder.clone());
         }
 
         // Harness M6.3/M6.4: wire the declarative compaction runner when the
@@ -1235,6 +1449,134 @@ pub(crate) fn build_run_pipeline_tool(
 mod tests {
     use super::*;
 
+    // ---- yolo GAP #3: chat permission flags → EffectivePermissions ----
+
+    use octos_agent::{ApprovalPolicy, PermissionProfile};
+
+    #[test]
+    fn should_yield_danger_full_access_when_yolo_flag_set() {
+        // `--yolo` / `--dangerously-bypass-approvals-and-sandbox` maps onto
+        // the codex "danger full access" profile: no approvals, no sandbox,
+        // host filesystem, network on.
+        let perms = resolve_chat_permissions(true, None, None)
+            .expect("--yolo must resolve to danger_full_access");
+        assert_eq!(
+            perms.permission_profile,
+            PermissionProfile::DangerFullAccess
+        );
+        assert_eq!(perms.approval_policy, ApprovalPolicy::Never);
+        assert!(perms.is_dangerous());
+    }
+
+    #[test]
+    fn should_yield_workspace_write_never_when_sandbox_and_approval_flags_set() {
+        // Codex parity: `--sandbox workspace-write --ask-for-approval never`
+        // yields exactly that pair (workspace-write profile, approvals never)
+        // WITHOUT escalating to host/danger.
+        let perms = resolve_chat_permissions(
+            false,
+            Some(ChatSandboxMode::WorkspaceWrite),
+            Some(ChatApprovalMode::Never),
+        )
+        .expect("explicit sandbox + approval flags must resolve");
+        assert_eq!(perms.permission_profile, PermissionProfile::WorkspaceWrite);
+        assert_eq!(perms.approval_policy, ApprovalPolicy::Never);
+        assert!(!perms.is_dangerous());
+    }
+
+    #[test]
+    fn should_default_to_workspace_write_ask_when_no_flags() {
+        let perms =
+            resolve_chat_permissions(false, None, None).expect("no flags is the plain default");
+        assert_eq!(perms.permission_profile, PermissionProfile::WorkspaceWrite);
+        assert_eq!(perms.approval_policy, ApprovalPolicy::Ask);
+    }
+
+    #[test]
+    fn should_map_sandbox_read_only_and_danger_variants() {
+        let ro = resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+        assert_eq!(ro.permission_profile, PermissionProfile::ReadOnly);
+
+        // `--sandbox danger-full-access` is the long-form of `--yolo`.
+        let danger =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::DangerFullAccess), None).unwrap();
+        assert_eq!(
+            danger.permission_profile,
+            PermissionProfile::DangerFullAccess
+        );
+        assert!(danger.is_dangerous());
+    }
+
+    #[test]
+    fn should_reject_conflicting_yolo_and_non_danger_sandbox() {
+        // `--yolo` plus an explicit non-danger `--sandbox` is contradictory;
+        // fail closed rather than silently pick one.
+        let err = resolve_chat_permissions(true, Some(ChatSandboxMode::ReadOnly), None)
+            .expect_err("conflicting flags must error");
+        assert!(
+            err.to_string().contains("sandbox"),
+            "error should explain the sandbox conflict; got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_approval_override_on_danger_sandbox() {
+        // DangerFullAccess implies approvals=never; an explicit
+        // `--ask-for-approval ask` alongside it is contradictory.
+        let err = resolve_chat_permissions(
+            false,
+            Some(ChatSandboxMode::DangerFullAccess),
+            Some(ChatApprovalMode::Ask),
+        )
+        .expect_err("ask-for-approval=ask cannot combine with danger-full-access");
+        assert!(err.to_string().contains("approval"));
+    }
+
+    #[test]
+    fn should_parse_yolo_alias_and_sandbox_flags_via_clap() {
+        // Prove the clap wiring: the hidden `--yolo` alias, the long form,
+        // and both value-enum flags parse into the expected fields.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let yolo = Wrap::parse_from(["prog", "--yolo"]).chat;
+        assert!(yolo.dangerously_bypass_approvals_and_sandbox);
+        let perms = resolve_chat_permissions(
+            yolo.dangerously_bypass_approvals_and_sandbox,
+            yolo.sandbox,
+            yolo.ask_for_approval,
+        )
+        .unwrap();
+        assert!(perms.is_dangerous());
+
+        let long = Wrap::parse_from(["prog", "--dangerously-bypass-approvals-and-sandbox"]).chat;
+        assert!(long.dangerously_bypass_approvals_and_sandbox);
+
+        let explicit = Wrap::parse_from([
+            "prog",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+        ])
+        .chat;
+        assert_eq!(explicit.sandbox, Some(ChatSandboxMode::WorkspaceWrite));
+        assert_eq!(explicit.ask_for_approval, Some(ChatApprovalMode::Never));
+
+        // Default: neither flag present.
+        let bare = Wrap::parse_from(["prog"]).chat;
+        assert!(!bare.dangerously_bypass_approvals_and_sandbox);
+        assert_eq!(bare.sandbox, None);
+        assert_eq!(bare.ask_for_approval, None);
+    }
+
+    // ---- #1570: [y/s/N] approval prompt + numbered user-question prompt ----
+
     fn q(multi: bool, allow_free_text: bool) -> octos_core::ui_protocol::UserQuestion {
         use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
         UserQuestion {
@@ -1569,6 +1911,90 @@ mod tests {
             "build_run_pipeline_tool with `embedder = None` must not \
              attach one — otherwise legacy callers that never configured \
              an embedder would observe a behaviour change."
+        );
+    }
+
+    /// yolo GAP #4 (codex P2): a `PluginTool` loaded for a chat session with
+    /// an explicit cwd must be BOUND to that cwd, so `PluginTool::execute`
+    /// runs the plugin in `--cwd` even when the session scope is omitted
+    /// (Host/yolo). Before the fix, chat loaded plugins with `work_dir: None`
+    /// and never rebound them, so a Host-scope session (scope `None`) left the
+    /// plugin's `work_dir` `None` → the plugin ran in the process launch dir.
+    ///
+    /// This test replicates chat's plugin-load path (loader `work_dir: None`,
+    /// mirroring `run_async`), then applies the chat cwd-binding helper the
+    /// yolo path uses, and asserts the loaded plugin's `work_dir` == the
+    /// resolved cwd. Removing the `bind_chat_plugin_work_dirs` call makes this
+    /// fail (RED), pinning the fix.
+    #[cfg(unix)]
+    #[test]
+    fn should_bind_plugin_work_dir_to_cwd_for_host_scope_chat_session() {
+        use octos_agent::plugins::PluginTool;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Plugin fixture: manifest + executable (mirrors loader.rs tests).
+        let root = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = root.path().join("demo-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        let manifest = r#"{
+            "name": "demo-plugin",
+            "version": "1.0",
+            "tools": [{"name": "demo_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
+        }"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("demo-plugin");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho ok").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The resolved chat cwd (the `--cwd` the operator passed).
+        let cwd = root.path().join("work-here");
+        std::fs::create_dir(&cwd).unwrap();
+
+        // Load exactly as chat's `run_async` does: `work_dir: None`.
+        let mut tools = ToolRegistry::new();
+        let result = octos_agent::PluginLoader::load_into_with_options(
+            &mut tools,
+            &[root.path().to_path_buf()],
+            &[],
+            octos_agent::PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: None,
+            },
+        )
+        .expect("plugin load");
+        assert_eq!(result.tool_count, 1, "fixture must register one tool");
+
+        // Sanity: straight off the loader (chat's pre-fix state) the tool is
+        // UNBOUND — this is the gap that breaks Host-scope plugin cwd.
+        let unbound = tools
+            .get("demo_tool")
+            .and_then(|t| {
+                t.as_any()
+                    .downcast_ref::<PluginTool>()
+                    .map(|p| p.work_dir().is_none())
+            })
+            .expect("demo_tool is a PluginTool");
+        assert!(unbound, "precondition: loader leaves plugin work_dir unset");
+
+        // Apply the chat cwd-binding (the fix run_async performs before it
+        // constructs the agent). This is the ONLY step under test.
+        bind_chat_plugin_work_dirs(&mut tools, &cwd);
+
+        let bound = tools
+            .get("demo_tool")
+            .and_then(|t| {
+                t.as_any()
+                    .downcast_ref::<PluginTool>()
+                    .map(|p| p.work_dir().map(|d| d.to_path_buf()))
+            })
+            .expect("demo_tool is a PluginTool");
+        assert_eq!(
+            bound.as_deref(),
+            Some(cwd.as_path()),
+            "chat must bind the plugin work_dir to --cwd so Host-scope (yolo) \
+             sessions run plugins in --cwd, not the process launch dir"
         );
     }
 

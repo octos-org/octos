@@ -269,7 +269,7 @@ jobs:
       fail-fast: false
       matrix:
         # `lib` runs `--lib` only. `integration` runs `--tests` (every
-        # integration test binary, including activate_tools_regression).
+        # integration test binary).
         # Splitting these onto separate runners means each gets a fresh
         # 16GB allocation and neither inherits residual RAM from the
         # other's compile phase.
@@ -307,12 +307,6 @@ jobs:
         # comfortably within the runner's 6h budget.
         run: cargo test -p octos-agent --tests -- --test-threads=1
 
-      # Co-located in the integration job so it reuses the warm octos-agent
-      # integration test build cache (activate_tools_regression is itself an
-      # integration test binary). Skipped in the lib job.
-      - name: activate_tools regression tests
-        if: matrix.test-mode == 'integration'
-        run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
   test-octos-cli:
     runs-on: ubuntu-latest

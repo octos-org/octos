@@ -16,6 +16,7 @@ mod init;
 pub mod mcp_serve;
 mod memory;
 mod office;
+mod profile;
 #[cfg(feature = "api")]
 mod serve;
 pub mod skills;
@@ -49,6 +50,7 @@ pub use init::InitCommand;
 pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
+pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
@@ -111,6 +113,8 @@ pub enum Command {
     Init(InitCommand),
     /// Inspect and drive the memory-refresh pipeline.
     Memory(MemoryCommand),
+    /// Portable profile export (QR) and payload inspection.
+    Profile(ProfileCommand),
     /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
     McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
@@ -322,6 +326,7 @@ impl Executable for Command {
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Profile(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
             #[cfg(feature = "api")]
             Self::Serve(cmd) => cmd.execute(),
