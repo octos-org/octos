@@ -4167,6 +4167,30 @@ async fn ui_protocol_connection(
         if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
             continue;
         }
+        // SECURITY (#1594): `handle_raw_appui_rpc` dispatches raw methods BEFORE
+        // `route_rpc_command`, so they never reach the typed
+        // `validate_session_ingress_command_scope` gate below. The raw handlers
+        // resolve their profile/session targets from request params
+        // independently of the credential (`raw_profile_id` prefers
+        // `params.profile_id`; autonomy targeting broadens to the base session
+        // key), so a per-session work-secret could drive autonomy on a sibling
+        // session or mutate an arbitrary profile. A caller-supplied `session_id`
+        // check alone cannot close that gap. Since legitimate ingress clients
+        // (the work-secret bridge) use only the typed surface, deny the entire
+        // raw surface for session-ingress connections — typed methods still flow
+        // to `validate_session_ingress_command_scope` untouched.
+        if session_ingress_scope.is_some()
+            && raw_method_is_dispatched(&request.method, features.stdio_transport)
+        {
+            let _ = send_rpc_error(
+                &ws,
+                Some(id),
+                RpcError::invalid_request(
+                    "session ingress credentials may not call raw (non-session-routed) methods",
+                ),
+            );
+            continue;
+        }
         if handle_raw_appui_rpc(
             &ws,
             &state,
@@ -7945,6 +7969,15 @@ async fn handle_raw_appui_rpc(
     id: String,
     request: &RpcRequest<Value>,
 ) -> bool {
+    // SINGLE SOURCE OF TRUTH: `raw_method_is_dispatched` decides the raw surface.
+    // Anything it rejects is NOT dispatched here (it flows to the typed surface),
+    // which lets the match default below be `unreachable!` and guarantees the
+    // session-ingress deny gate (which consults the same function) can never
+    // drift from what this handler actually serves.
+    if !raw_method_is_dispatched(request.method.as_str(), features.stdio_transport) {
+        return false;
+    }
+
     if request.method == APPUI_METHOD_REVIEW_START {
         handle_review_start(
             ws,
@@ -8174,7 +8207,12 @@ async fn handle_raw_appui_rpc(
             };
             onboarding_workspace_probe_result(state, &params.path)
         }
-        _ => return false,
+        // Unreachable: the `raw_method_is_dispatched` guard at the top of this
+        // function admits exactly the methods handled above. A method reaching
+        // here means the guard and this match have drifted — a bug, and (for
+        // session-ingress creds) a scope-bypass, so fail loudly rather than
+        // silently routing it to the typed surface.
+        other => unreachable!("raw_method_is_dispatched admitted an unhandled method: {other}"),
     };
 
     match result {
@@ -8395,6 +8433,58 @@ fn route_rpc_command(
 
 fn string_session_with_optional_topic(session_id: &str, topic: Option<&str>) -> SessionKey {
     session_key_with_optional_topic(&SessionKey(session_id.to_owned()), topic)
+}
+
+/// SINGLE SOURCE OF TRUTH for which methods `handle_raw_appui_rpc` dispatches —
+/// the raw path that runs BEFORE `route_rpc_command`, so it never reaches the
+/// typed `validate_session_ingress_command_scope` gate.
+///
+/// `handle_raw_appui_rpc` early-returns `false` for any method this rejects and
+/// treats its own match default as `unreachable!`, so the dispatcher and the
+/// session-ingress deny gate CANNOT drift: a new raw arm that isn't also added
+/// here is dead (its feature won't dispatch) and trips the coverage test, while
+/// adding it here without a matching arm panics the `unreachable!`. Both point
+/// back to this one function.
+fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
+    if method == APPUI_METHOD_REVIEW_START || is_autonomy_method(method) {
+        return true;
+    }
+    if matches!(
+        method,
+        APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+            | APPUI_METHOD_SESSION_STATUS_READ
+            | APPUI_METHOD_PROFILE_LLM_CATALOG
+            | APPUI_METHOD_PROFILE_LLM_LIST
+            | APPUI_METHOD_PROFILE_LLM_UPSERT
+            | APPUI_METHOD_PROFILE_LLM_TEST
+            | APPUI_METHOD_PROFILE_LLM_SELECT
+            | APPUI_METHOD_PROFILE_LLM_DELETE
+            | APPUI_METHOD_PROFILE_LLM_FETCH_MODELS
+            | APPUI_METHOD_PROFILE_SKILLS_LIST
+            | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
+            | APPUI_METHOD_PROFILE_SKILLS_INSTALL
+            | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_AUTH_STATUS
+            | APPUI_METHOD_AUTH_ME
+            | APPUI_METHOD_AUTH_SEND_CODE
+            | APPUI_METHOD_AUTH_VERIFY
+            | APPUI_METHOD_AUTH_LOGOUT
+            | APPUI_METHOD_MCP_STATUS_LIST
+            | APPUI_METHOD_TOOL_STATUS_LIST
+            | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+    ) {
+        return true;
+    }
+    // Content methods are dispatched by the raw handler ONLY on the stdio
+    // transport (where they return an auth-unavailable error); on every other
+    // transport they fall through to the typed surface. A session-ingress
+    // socket is never stdio, so these never reach the ingress deny gate.
+    stdio_transport
+        && matches!(
+            method,
+            octos_core::ui_protocol::methods::CONTENT_LIST
+                | octos_core::ui_protocol::methods::CONTENT_DELETE
+        )
 }
 
 fn validate_session_ingress_command_scope(
@@ -32845,6 +32935,106 @@ ignore = []
             after: None,
         });
         assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
+    }
+
+    #[test]
+    fn raw_method_is_dispatched_distinguishes_raw_from_typed() {
+        // Raw-dispatched (bypass route_rpc_command + the typed ingress gate):
+        for method in [
+            APPUI_METHOD_REVIEW_START,
+            APPUI_METHOD_SESSION_STATUS_READ,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            octos_core::ui_protocol::methods::SESSION_GOAL_SET,
+            octos_core::ui_protocol::methods::LOOP_CREATE,
+        ] {
+            assert!(
+                raw_method_is_dispatched(method, false),
+                "{method} is raw-dispatched"
+            );
+        }
+        // Typed (routed through route_rpc_command + `validate_session_ingress_command_scope`):
+        for method in [
+            octos_core::ui_protocol::methods::TURN_START,
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SESSION_HYDRATE,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SESSION_STATUS_GET,
+            APPUI_METHOD_CLIENT_HELLO,
+        ] {
+            assert!(
+                !raw_method_is_dispatched(method, true),
+                "{method} is a typed method, not raw-dispatched"
+            );
+        }
+        // Content methods are raw ONLY on stdio; never on a (non-stdio) ingress socket.
+        assert!(raw_method_is_dispatched(
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            true
+        ));
+        assert!(!raw_method_is_dispatched(
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            false
+        ));
+    }
+
+    /// Drift guard for the session-ingress raw-surface deny gate. The gate at
+    /// the WS read loop rejects a raw method for ingress connections iff
+    /// `raw_method_is_dispatched` returns true — the SAME function
+    /// `handle_raw_appui_rpc` uses to guard its own dispatch (its match default
+    /// is `unreachable!`). This enumerates the full raw surface and pins every
+    /// entry to `true`. (Content methods are excluded: they are only
+    /// raw-dispatched on the stdio transport, never a session-ingress socket.)
+    #[test]
+    fn raw_method_is_dispatched_covers_full_raw_surface() {
+        let raw_methods = [
+            APPUI_METHOD_REVIEW_START,
+            APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+            APPUI_METHOD_SESSION_STATUS_READ,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+            APPUI_METHOD_PROFILE_LLM_LIST,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            APPUI_METHOD_PROFILE_LLM_TEST,
+            APPUI_METHOD_PROFILE_LLM_SELECT,
+            APPUI_METHOD_PROFILE_LLM_DELETE,
+            APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
+            APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_AUTH_ME,
+            APPUI_METHOD_AUTH_SEND_CODE,
+            APPUI_METHOD_AUTH_VERIFY,
+            APPUI_METHOD_AUTH_LOGOUT,
+            APPUI_METHOD_MCP_STATUS_LIST,
+            APPUI_METHOD_TOOL_STATUS_LIST,
+            APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+            // Autonomy (session/goal/*, loop/*, agent/*, task/artifact/*):
+            octos_core::ui_protocol::methods::SESSION_GOAL_GET,
+            octos_core::ui_protocol::methods::SESSION_GOAL_SET,
+            octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR,
+            octos_core::ui_protocol::methods::LOOP_CREATE,
+            octos_core::ui_protocol::methods::LOOP_LIST,
+            octos_core::ui_protocol::methods::LOOP_PAUSE,
+            octos_core::ui_protocol::methods::LOOP_RESUME,
+            octos_core::ui_protocol::methods::LOOP_DELETE,
+            octos_core::ui_protocol::methods::LOOP_FIRE_NOW,
+            octos_core::ui_protocol::methods::AGENT_LIST,
+            octos_core::ui_protocol::methods::AGENT_STATUS_READ,
+            octos_core::ui_protocol::methods::AGENT_OUTPUT_READ,
+            octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST,
+            octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ,
+            octos_core::ui_protocol::methods::AGENT_INTERRUPT,
+            octos_core::ui_protocol::methods::AGENT_CLOSE,
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST,
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_READ,
+        ];
+        for method in raw_methods {
+            assert!(
+                raw_method_is_dispatched(method, false),
+                "{method} is raw-dispatched and MUST be denied for session-ingress creds"
+            );
+        }
     }
 
     /// Codex review 2026-05-12 (BLOCK 1, companion): the legacy
