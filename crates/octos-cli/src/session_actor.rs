@@ -6717,7 +6717,12 @@ impl SessionActor {
             let slug = slug.trim_matches('-').to_string();
 
             let mut banked = false;
-            if let Some(ref ms) = self.memory_store {
+            // A punctuation/emoji-only task label slugs to "" and would
+            // persist as bank/entities/.md — unlisted and unrecallable
+            // while the reply claims it was saved (codex round-3 P3).
+            if !slug.is_empty()
+                && let Some(ref ms) = self.memory_store
+            {
                 let report_md = format!(
                     "# {task_label}\n\n_Generated: {}_\n\n{content}",
                     chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
