@@ -297,10 +297,12 @@ mod tests {
     use super::*;
 
     fn config_with_provider() -> Config {
-        let mut config = Config::default();
-        config.provider = Some("deepseek".into());
-        config.model = Some("deepseek-v4-pro".into());
-        config.api_key_env = Some("DEEPSEEK_API_KEY".into());
+        let mut config = Config {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-v4-pro".into()),
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            ..Default::default()
+        };
         config
             .env_vars
             .insert("DEEPSEEK_API_KEY".into(), "sk-test-key".into());
