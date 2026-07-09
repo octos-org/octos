@@ -2429,6 +2429,42 @@ fn replace_voice_user_message_content(messages: &mut [Message], transcript: Opti
     }
 }
 
+/// Whether a turn should short-circuit as "no speech detected" (#1555 review).
+///
+/// `run_standalone_turn`'s `asr_media` list holds ALL materialized media paths
+/// (images and files as well as audio), so the short-circuit must NOT key off
+/// "any media + no transcript" — that silently completes e.g. a text+image
+/// turn without ever running the agent. Only swallow the turn when there is
+/// literally nothing left to act on: the turn carried audio, ASR produced no
+/// transcript, and there is no typed prompt and no non-audio media (an image
+/// or file alongside silent audio still gives the agent real input).
+///
+/// Pure (no I/O, no task-locals) so it is unit-testable in isolation.
+fn should_short_circuit_no_speech(
+    had_audio_media: bool,
+    had_non_audio_media: bool,
+    had_audio_input: bool,
+    prompt_is_empty: bool,
+) -> bool {
+    had_audio_media && !had_non_audio_media && !had_audio_input && prompt_is_empty
+}
+
+/// User-visible content of a voice turn: the typed prompt (if any) combined
+/// with the ASR transcript, exactly as the LLM prompt is assembled — but
+/// WITHOUT the `[语音模式:…]` scaffolding that gets appended to the prompt
+/// afterwards. This is both the base the prompt builds on and the value
+/// persisted into history via [`replace_voice_user_message_content`], so a
+/// mixed typed-text + audio turn keeps the typed text in the persisted user
+/// message (#1555 review). Pure-voice turns (empty typed prompt) persist the
+/// bare transcript, unchanged from before.
+fn combine_typed_prompt_with_transcript(typed_prompt: &str, transcript: &str) -> String {
+    if typed_prompt.trim().is_empty() {
+        transcript.to_owned()
+    } else {
+        format!("{typed_prompt}\n{transcript}")
+    }
+}
+
 /// Process-global event ledger.
 ///
 /// First call decides the durability path:
@@ -18843,7 +18879,19 @@ async fn run_standalone_turn(
         had_audio_input,
         "voice_turn: STT result"
     );
-    if !asr_media.is_empty() && !had_audio_input {
+    // #1555 review finding 1: `asr_media` is ALL materialized media (images,
+    // files, audio) — gating the no-speech return on `!asr_media.is_empty()`
+    // silently completed any non-audio-media turn (e.g. text+image) without
+    // running the agent. Short-circuit only genuinely empty voice turns:
+    // audio present, no transcript, no typed prompt, no other media.
+    let had_audio_media = asr_media.iter().any(|p| octos_bus::media::is_audio(p));
+    let had_non_audio_media = asr_media.iter().any(|p| !octos_bus::media::is_audio(p));
+    if should_short_circuit_no_speech(
+        had_audio_media,
+        had_non_audio_media,
+        had_audio_input,
+        prompt.trim().is_empty(),
+    ) {
         let mut no_speech_metadata = UiProgressMetadata::new("voice_no_speech");
         no_speech_metadata.message = Some("no speech detected".to_owned());
         no_speech_metadata.extra.insert(
@@ -18873,6 +18921,13 @@ async fn run_standalone_turn(
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
+    // #1555 review finding 2: content persisted as the voice turn's user
+    // message. Captured below as the COMBINED user-visible content (typed
+    // prompt + transcript, exactly as merged into the LLM prompt) BEFORE the
+    // `[语音模式:…]` scaffolding is appended, so a mixed typed+voice turn
+    // keeps its typed text in history. `None` for non-voice turns leaves the
+    // persisted message untouched.
+    let mut voice_user_content_for_persist: Option<String> = None;
     if had_audio_input {
         let joined = voice_transcripts.join("\n");
         let mut transcript_metadata = UiProgressMetadata::new("voice_transcript");
@@ -18893,11 +18948,8 @@ async fn run_standalone_turn(
                 transcript_metadata,
             )),
         );
-        prompt = if prompt.trim().is_empty() {
-            joined
-        } else {
-            format!("{}\n{}", prompt, joined)
-        };
+        prompt = combine_typed_prompt_with_transcript(&prompt, &joined);
+        voice_user_content_for_persist = Some(prompt.clone());
         // Voice-turn only (had_audio_input): replies are spoken aloud by TTS, so
         // ask for short, speakable answers. Text chat (had_audio_input == false)
         // keeps its normal detailed/formatted persona — this branch never runs there.
@@ -18925,7 +18977,6 @@ async fn run_standalone_turn(
         // the agent into calling `voice_transcribe` / exploring the workspace.
         turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
     }
-    let voice_user_content_for_persist = had_audio_input.then(|| voice_transcripts.join("\n"));
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
@@ -37700,6 +37751,56 @@ ignore = []
 
         assert_eq!(messages[0].content, "帮我记住我喜欢乌龙茶");
         assert_eq!(messages[1].content, "记住了。");
+    }
+
+    #[test]
+    fn voice_user_message_persist_keeps_typed_text_for_mixed_turn() {
+        // #1555 review finding 2: a mixed typed-text + audio turn persists the
+        // COMBINED user-visible content (typed + transcript), not the
+        // transcript alone — the typed text must survive in history.
+        let persisted = combine_typed_prompt_with_transcript("请看看这份周报", "帮我念一下重点");
+        assert_eq!(persisted, "请看看这份周报\n帮我念一下重点");
+
+        let mut messages = vec![
+            Message::user(
+                "请看看这份周报\n帮我念一下重点\n\n[语音模式:用口语化中文、一两句话简短回答]",
+            ),
+            Message::assistant("好的。"),
+        ];
+
+        replace_voice_user_message_content(&mut messages, Some(&persisted));
+
+        assert_eq!(messages[0].content, "请看看这份周报\n帮我念一下重点");
+        assert_eq!(messages[1].content, "好的。");
+    }
+
+    #[test]
+    fn voice_combine_falls_back_to_transcript_for_pure_voice_turn() {
+        // Pure-voice turn (no typed prompt): persisted content stays the bare
+        // transcript — unchanged behavior.
+        assert_eq!(combine_typed_prompt_with_transcript("", "你好"), "你好");
+        assert_eq!(combine_typed_prompt_with_transcript("  \n", "你好"), "你好");
+    }
+
+    #[test]
+    fn voice_no_speech_short_circuit_ignores_non_audio_media() {
+        // #1555 review finding 1: `asr_media` holds ALL media paths, so a
+        // text+image turn (no audio at all) must NOT take the no-speech early
+        // return — it previously completed the turn without running the agent.
+        // (had_audio_media, had_non_audio_media, had_audio_input, prompt_is_empty)
+        assert!(!should_short_circuit_no_speech(false, true, false, false));
+        assert!(!should_short_circuit_no_speech(false, true, false, true));
+        // No media at all → nothing voice-related to short-circuit on.
+        assert!(!should_short_circuit_no_speech(false, false, false, true));
+        // Silent audio + typed prompt → proceed as a plain text turn.
+        assert!(!should_short_circuit_no_speech(true, false, false, false));
+        // Silent audio + image/file → proceed; the agent still has real input.
+        assert!(!should_short_circuit_no_speech(true, true, false, true));
+        // Audio that produced a transcript → never short-circuit.
+        assert!(!should_short_circuit_no_speech(true, false, true, true));
+        // Only a genuinely empty voice turn (silent audio, nothing else)
+        // takes the friendly "no speech detected" path.
+        assert!(should_short_circuit_no_speech(true, false, false, true));
     }
 
     // ========================================================================
