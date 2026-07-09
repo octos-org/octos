@@ -52,6 +52,7 @@ use octos_core::MAIN_PROFILE_ID;
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
+const CLI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 // `large_enum_variant`: the `Inbound` variant carries an
 // `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
@@ -1561,6 +1562,7 @@ impl GatewayRuntime {
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
+                shutdown_notify: &shutdown_notify,
                 on_session_deleted: Some(Arc::new(move |id: &str| {
                     let _ = delete_tx.send(id.to_string());
                 })),
@@ -1634,7 +1636,7 @@ impl GatewayRuntime {
         eprintln!("[gateway] ready");
         println!(
             "{}",
-            "Gateway ready. Type a message or /quit to exit.".dimmed()
+            "Gateway ready. Type a message, quit, exit, /quit, or /exit.".dimmed()
         );
         println!();
 
@@ -2180,12 +2182,14 @@ impl GatewayRuntime {
         // Timeout prevents hung actors from blocking the entire sequence.
         // CLI shutdown should return control to the terminal promptly.
         // Hung actors will be abandoned and then torn down by runtime shutdown.
-        let shutdown_timeout = Duration::from_secs(1);
-        if tokio::time::timeout(shutdown_timeout, self.actor_registry.shutdown_all())
+        if tokio::time::timeout(CLI_SHUTDOWN_TIMEOUT, self.actor_registry.shutdown_all())
             .await
             .is_err()
         {
-            warn!("actor shutdown timed out after {shutdown_timeout:?}, forcing exit");
+            warn!(
+                "actor shutdown timed out after {:?}, forcing exit",
+                CLI_SHUTDOWN_TIMEOUT
+            );
         }
 
         // Stop background services concurrently
@@ -2206,6 +2210,11 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn cli_shutdown_timeout_stays_prompt() {
+        assert!(CLI_SHUTDOWN_TIMEOUT <= Duration::from_secs(1));
+    }
 
     fn make_inbound(content: &str) -> octos_core::InboundMessage {
         octos_core::InboundMessage {
