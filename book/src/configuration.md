@@ -154,12 +154,12 @@ The complete configuration structure with all available fields:
 
   // Memory injection + automatic refresh (see Memory & Skills)
   "memory": {
-    "max_inject_tokens": 2000,
+    "max_inject_tokens": 2500,
     "refresh": {
       "enabled": true,          // tri-state: absent = ON (default)
       "extract_model": null,    // null = profile provider
       "consolidate_model": null,
-      "max_extractions_per_day": 50,
+      "max_extractions_per_day": 20,
       "max_daily_tokens": 200000,
       "consolidate_interval_minutes": 30
     }

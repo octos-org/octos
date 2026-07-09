@@ -154,12 +154,12 @@
 
   // 记忆注入 + 自动刷新（见「记忆与技能」）
   "memory": {
-    "max_inject_tokens": 2000,
+    "max_inject_tokens": 2500,
     "refresh": {
       "enabled": true,          // 三态：缺省 = 开启（默认）
       "extract_model": null,    // null = 使用 profile 服务商
       "consolidate_model": null,
-      "max_extractions_per_day": 50,
+      "max_extractions_per_day": 20,
       "max_daily_tokens": 200000,
       "consolidate_interval_minutes": 30
     }

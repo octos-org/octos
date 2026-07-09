@@ -96,19 +96,19 @@ octos memory forget --id ^m4k2abq   # Hard-delete an exact MEMORY.md entry
 ```json
 {
   "memory": {
-    "max_inject_tokens": 2000,
+    "max_inject_tokens": 2500,
     "refresh": {
       "enabled": true,
-      "extract_model": "deepseek-chat",
+      "extract_model": null,
       "consolidate_model": null,
-      "min_idle_minutes": 10,
-      "max_session_age_days": 7,
-      "max_sessions_per_pass": 3,
-      "max_extractions_per_day": 50,
-      "max_consolidations_per_day": 20,
+      "min_idle_minutes": 30,
+      "max_session_age_days": 10,
+      "max_sessions_per_pass": 2,
+      "max_extractions_per_day": 20,
+      "max_consolidations_per_day": 12,
       "max_daily_tokens": 200000,
       "consolidate_interval_minutes": 30,
-      "max_memory_file_tokens": 4000
+      "max_memory_file_tokens": 8000
     }
   }
 }
