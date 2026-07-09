@@ -215,6 +215,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // authenticated `my_api` group.
         .route("/api/voices", get(auth_handlers::list_voices))
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
+        // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
+        .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
@@ -495,6 +497,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // System metrics
         .route("/api/admin/system/metrics", get(admin::system_metrics))
+        .route("/api/admin/serve/logs", get(admin::serve_logs))
         .route("/api/admin/operator/summary", get(admin::operator_summary))
         .route("/api/admin/operator/tasks", get(admin::operator_tasks))
         // Monitor control

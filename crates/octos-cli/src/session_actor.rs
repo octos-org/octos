@@ -3311,13 +3311,9 @@ impl ActorFactory {
             Some(self.subagent_output_router.clone()),
             user_workspace.clone(),
         ));
-        // Codex round 3 P2: pin `read_task_output` against the
-        // `ToolLifecycle` LRU evictor. Without this, in long-running
-        // gateway sessions the reader can be auto-deferred after the
-        // idle threshold and disappear from `specs()`, making the
-        // `task_handle` envelope point at a tool the LLM is no longer
-        // offered. The base-tool list is the LRU pin point.
-        tools.add_base_tools(["read_task_output"]);
+        // RFC-0 (#1289): LRU tool deferral was removed — `read_task_output`
+        // (like every enabled tool) is emitted every turn, so no base-tool
+        // pin is needed.
         tools.register(message_tool);
         tools.register(send_file_tool);
         tools.register(octos_agent::SendAppCardTool::with_context(
@@ -3554,20 +3550,16 @@ impl ActorFactory {
             tools.apply_policy(policy);
         }
 
-        // Defer rarely-used per-session tools to keep active tool count low
-        // for providers that choke on many tools (e.g. Dashscope).
-        // Keep cron active so reminder flows don't require activate_tools.
-        tools.defer(["spawn".to_string()]);
+        // RFC-0 (#1289): LRU tool deferral was removed — every enabled tool
+        // is emitted every turn (full schema).
 
-        // For slides sessions, auto-activate media tools and use primary model
-        // (bypasses adaptive router which may pick a weak model).
+        // For slides sessions use the primary model (bypasses adaptive
+        // router which may pick a weak model).
         let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
         let is_site = session_key
             .topic()
             .is_some_and(|t| t == "site" || t.starts_with("site "));
         if is_slides {
-            tools.activate("group:media");
-
             // Structural guardrail (fix/slides-session-tool-allowlist):
             // hide every `mofa_*` plugin tool except `mofa_slides` so a
             // weaker fallback model (e.g. kimi-k2.6 on mini1 dspfac,
@@ -3654,11 +3646,10 @@ impl ActorFactory {
             self.llm.clone()
         };
         let agent_id = AgentId::new(format!("session-{}", session_key));
-        let has_deferred = tools.has_deferred();
         // Pre/post-memory split: the memory segment must keep its
         // pre-refactor slot (after bootstrap/soul, BEFORE skills/tool
         // guidance) — see GatewayPromptParts. Per-session tails (slides
-        // availability, deferred-tools teaching) belong to the post half.
+        // availability) belong to the post half.
         let (mut system_prompt, mut post_memory_tail) = match system_prompt_override {
             // An override replaces the whole base prompt; memory still
             // takes the slot right after it.
@@ -3689,20 +3680,8 @@ impl ActorFactory {
                  Do NOT retry generation via shell, run_pipeline, or alternative binaries.",
             );
         }
-        if has_deferred {
-            let groups = tools.deferred_groups();
-            let mut tool_names = Vec::new();
-            for (name, _desc, _count) in &groups {
-                if let Some(info) = octos_agent::tools::policy::TOOL_GROUPS
-                    .iter()
-                    .find(|g| g.name == name)
-                {
-                    tool_names.extend(info.tools.iter().copied());
-                }
-            }
-            let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
-            post_memory_tail.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
-        }
+        // RFC-0 (#1289): tool deferral + the `activate_tools` meta-tool were
+        // removed, so there is no deferred-tools teaching block to append.
         let _ = &mut system_prompt;
 
         // M8 fix-first item 8 (gap 2): build a per-actor
@@ -3855,10 +3834,8 @@ impl ActorFactory {
             );
         }
 
-        // Wire the activate_tools back-reference now that tools are in Arc
-        agent.wire_activate_tools();
         // RFC-1 (issue #1290): wire the mofa_make dispatcher's
-        // back-reference at the same site.
+        // back-reference now that tools are in Arc.
         agent.wire_mofa_make_dispatcher();
 
         // Load per-user status configuration
