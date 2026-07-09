@@ -17,5 +17,8 @@ pub use install::{
     SkillActivateResult, activate_skill, register_http_skills_on_startup, run_shutdown_phase,
 };
 pub use loader::{PluginLoadOptions, PluginLoadResult, PluginLoader};
-pub use manifest::{PluginManifest, PluginToolDef};
+pub use manifest::{
+    PluginManifest, PluginToolDef, SkillActionBinding, SkillActionDef,
+    SkillActionFileMaterialization, SkillActionInputMode,
+};
 pub use tool::{PluginTool, SynthesisConfig};

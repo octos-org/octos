@@ -489,11 +489,44 @@ pub fn materialize_turn_uploads(
     tenant_id: Option<&str>,
     media: &[String],
 ) -> Vec<String> {
+    materialize_uploads(
+        workspace_root,
+        tenant_id,
+        media,
+        ImageMaterializeMode::VisionPath,
+    )
+}
+
+/// Materialize upload references into `<workspace>/uploads/`.
+///
+/// Unlike turn media, this mode is for consumers that explicitly require
+/// workspace-relative file paths. That means images must be copied too: the
+/// vision encoder's absolute tmpdir path is useful for chat media, but tools
+/// that validate workspace paths reject absolute upload-tmpdir paths.
+pub fn materialize_uploads_as_workspace_relative(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    media: &[String],
+) -> Vec<String> {
+    materialize_uploads(
+        workspace_root,
+        tenant_id,
+        media,
+        ImageMaterializeMode::WorkspaceFile,
+    )
+}
+
+fn materialize_uploads(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    media: &[String],
+    image_mode: ImageMaterializeMode,
+) -> Vec<String> {
     let uploads_dir = workspace_root.join("uploads");
     media
         .iter()
         .filter_map(
-            |entry| match materialize_one(&uploads_dir, tenant_id, entry) {
+            |entry| match materialize_one(&uploads_dir, tenant_id, entry, image_mode) {
                 MaterializeOutcome::Rewritten(path) => Some(path),
                 MaterializeOutcome::Passthrough => Some(entry.clone()),
                 // Foreign / cross-tenant: DROP the entry entirely. Passing the
@@ -504,6 +537,14 @@ pub fn materialize_turn_uploads(
             },
         )
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum ImageMaterializeMode {
+    /// Keep images on an absolute upload-tmpdir path for the vision encoder.
+    VisionPath,
+    /// Copy images into `<workspace>/uploads/` like every other action input.
+    WorkspaceFile,
 }
 
 enum MaterializeOutcome {
@@ -562,7 +603,12 @@ pub fn upload_owned_by_tenant(resolved: &Path, tenant_id: Option<&str>) -> bool 
     first_is_tenant && comps.next().is_some()
 }
 
-fn materialize_one(uploads_dir: &Path, tenant_id: Option<&str>, entry: &str) -> MaterializeOutcome {
+fn materialize_one(
+    uploads_dir: &Path,
+    tenant_id: Option<&str>,
+    entry: &str,
+    image_mode: ImageMaterializeMode,
+) -> MaterializeOutcome {
     let Some(src) = resolve_upload_reference(entry) else {
         return MaterializeOutcome::Passthrough; // not a staged upload (workspace path / external / unknown)
     };
@@ -582,7 +628,7 @@ fn materialize_one(uploads_dir: &Path, tenant_id: Option<&str>, entry: &str) -> 
     // ABSOLUTE path so the encoder can read it (a bare `up/` handle isn't a real
     // file path). A non-tmpdir image (workspace/external) already returned
     // Passthrough above via `resolve_upload_reference` == None.
-    if crate::media::is_image(entry) {
+    if matches!(image_mode, ImageMaterializeMode::VisionPath) && crate::media::is_image(entry) {
         return match src.to_str() {
             Some(abs) => MaterializeOutcome::Rewritten(abs.to_string()),
             None => MaterializeOutcome::Passthrough,
@@ -805,6 +851,25 @@ mod tests {
         assert!(
             !ws.path().join("uploads").exists(),
             "no uploads/ dir created for an image-only turn"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn materialize_uploads_as_workspace_relative_copies_images_into_workspace_uploads() {
+        let ws = tempfile::tempdir().unwrap();
+        let (src, handle) = stage_upload("photo.png", b"\x89PNG\r\n");
+
+        let out = materialize_uploads_as_workspace_relative(
+            ws.path(),
+            None,
+            std::slice::from_ref(&handle),
+        );
+
+        assert_eq!(out[0], "uploads/photo.png");
+        assert_eq!(
+            std::fs::read(ws.path().join("uploads/photo.png")).unwrap(),
+            b"\x89PNG\r\n"
         );
         let _ = std::fs::remove_file(&src);
     }

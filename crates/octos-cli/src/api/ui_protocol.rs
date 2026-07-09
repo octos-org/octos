@@ -193,6 +193,8 @@ const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+const APPUI_METHOD_SKILL_ACTION_LIST: &str = "skill/action/list";
+const APPUI_METHOD_SKILL_ACTION_INVOKE: &str = "skill/action/invoke";
 /// #1057: M22 TUI Solo Onboarding backend support contract.
 ///
 /// Backend-owned workspace validation/status for onboarding. Resolves the
@@ -209,6 +211,7 @@ const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
+const APPUI_FEATURE_SKILL_ACTIONS_V1: &str = "skill.actions.v1";
 /// #1057: backend onboarding support contract — TUI Solo Onboarding (M22).
 /// Advertises `onboarding/workspace_probe`, which canonicalizes a workspace
 /// candidate path, reports existence/writability, surfaces
@@ -240,6 +243,8 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+    APPUI_METHOD_SKILL_ACTION_LIST,
+    APPUI_METHOD_SKILL_ACTION_INVOKE,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
@@ -1419,6 +1424,12 @@ impl ConnectionUiFeatures {
                 APPUI_FEATURE_CONTEXT_LIFECYCLE_V1,
             );
         }
+        if state.profile_store.is_some() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_SKILL_ACTIONS_V1,
+            );
+        }
         // #965 / UPCR-2026-019 — advertise the M13-A canonical capability
         // names alongside the consolidated `coding.agent_control.v1` so
         // clients that look for the spec strings find them. The methods
@@ -1477,6 +1488,8 @@ fn is_profile_skill_appui_method(method: &str) -> bool {
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_SKILL_ACTION_LIST
+            | APPUI_METHOD_SKILL_ACTION_INVOKE
     )
 }
 
@@ -5431,6 +5444,28 @@ struct RawProfileSkillsListParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawSkillActionListParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSkillActionInvokeParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    session_id: SessionKey,
+    action_id: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawProfileSkillsRegistrySearchParams {
     #[serde(default)]
     profile_id: Option<String>,
@@ -7010,6 +7045,394 @@ fn raw_profile_skills_list(
     }))
 }
 
+#[derive(Debug, Clone)]
+struct SkillActionRecord {
+    skill_id: String,
+    skill_dir: PathBuf,
+    action: octos_agent::plugins::SkillActionDef,
+    available: bool,
+    unavailable_reason: Option<String>,
+}
+
+fn candidate_skill_manifest_paths(plugin_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in plugin_dirs {
+        let direct_manifest = root.join("manifest.json");
+        if direct_manifest.is_file() {
+            paths.push(direct_manifest);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut child_paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.join("manifest.json").is_file())
+            .map(|path| path.join("manifest.json"))
+            .collect();
+        child_paths.sort();
+        paths.extend(child_paths);
+    }
+    paths
+}
+
+fn action_matches_filters(
+    action: &octos_agent::plugins::SkillActionDef,
+    surface: Option<&str>,
+    required_tags: &[String],
+) -> bool {
+    if let Some(surface) = surface.map(str::trim).filter(|surface| !surface.is_empty()) {
+        if !action.surfaces.is_empty()
+            && !action.surfaces.iter().any(|candidate| candidate == surface)
+        {
+            return false;
+        }
+    }
+    required_tags
+        .iter()
+        .all(|tag| action.tags.iter().any(|candidate| candidate == tag))
+}
+
+fn discover_skill_action_records(
+    plugin_dirs: &[PathBuf],
+    registry: &octos_agent::ToolRegistry,
+    surface: Option<&str>,
+    required_tags: &[String],
+) -> Result<Vec<SkillActionRecord>, RpcError> {
+    let mut records = Vec::new();
+    for manifest_path in candidate_skill_manifest_paths(plugin_dirs) {
+        let raw = match std::fs::read_to_string(&manifest_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                warn!(
+                    path = %manifest_path.display(),
+                    %error,
+                    "failed to read skill manifest while discovering actions"
+                );
+                continue;
+            }
+        };
+        let manifest: octos_agent::plugins::PluginManifest = match serde_json::from_str(&raw) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warn!(
+                    path = %manifest_path.display(),
+                    %error,
+                    "failed to parse skill manifest while discovering actions"
+                );
+                continue;
+            }
+        };
+        for action in manifest.actions {
+            if !action_matches_filters(&action, surface, required_tags) {
+                continue;
+            }
+            let tool_name = action.binding.tool_name().unwrap_or_default();
+            let available = !tool_name.is_empty() && registry.get(tool_name).is_some();
+            if !available {
+                continue;
+            }
+            records.push(SkillActionRecord {
+                skill_id: manifest.name.clone(),
+                skill_dir: manifest_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(PathBuf::new),
+                action,
+                available,
+                unavailable_reason: None,
+            });
+        }
+    }
+    Ok(records)
+}
+
+fn skill_action_record_to_value(record: SkillActionRecord) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("id".into(), Value::String(record.action.id));
+    object.insert("skill_id".into(), Value::String(record.skill_id));
+    object.insert(
+        "skill_dir".into(),
+        Value::String(record.skill_dir.to_string_lossy().into_owned()),
+    );
+    object.insert("label".into(), Value::String(record.action.label));
+    if let Some(description) = record.action.description {
+        object.insert("description".into(), Value::String(description));
+    }
+    object.insert("tags".into(), json!(record.action.tags));
+    object.insert("surfaces".into(), json!(record.action.surfaces));
+    object.insert("input_schema".into(), record.action.input_schema);
+    if !record.action.ui_schema.is_null() {
+        object.insert("ui_schema".into(), record.action.ui_schema);
+    }
+    object.insert("available".into(), Value::Bool(record.available));
+    if let Some(reason) = record.unavailable_reason {
+        object.insert("unavailable_reason".into(), Value::String(reason));
+    }
+    Value::Object(object)
+}
+
+fn action_arguments_object(arguments: Value) -> Result<serde_json::Map<String, Value>, RpcError> {
+    match arguments {
+        Value::Null => Ok(serde_json::Map::new()),
+        Value::Object(map) => Ok(map),
+        _ => Err(RpcError::invalid_params(
+            "skill action arguments must be a JSON object",
+        )),
+    }
+}
+
+fn string_array_argument(value: Value, field: &str) -> Result<Vec<String>, RpcError> {
+    let array = value.as_array().ok_or_else(|| {
+        RpcError::invalid_params(format!("skill action field `{field}` must be an array"))
+    })?;
+    let mut strings = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(path) = item.as_str().map(str::trim).filter(|path| !path.is_empty()) else {
+            return Err(RpcError::invalid_params(format!(
+                "skill action field `{field}` must contain only non-empty strings"
+            )));
+        };
+        strings.push(path.to_owned());
+    }
+    if strings.is_empty() {
+        return Err(RpcError::invalid_params(format!(
+            "skill action field `{field}` must not be empty"
+        )));
+    }
+    Ok(strings)
+}
+
+fn tool_result_to_action_value(result: octos_agent::ToolResult) -> Value {
+    json!({
+        "success": result.success,
+        "output": result.output,
+        "file_modified": result.file_modified.map(|path| path.to_string_lossy().into_owned()),
+        "files_to_send": result.files_to_send
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "structured_metadata": result.structured_metadata,
+    })
+}
+
+async fn invoke_skill_action_tool_binding(
+    action: &octos_agent::plugins::SkillActionDef,
+    registry: &octos_agent::ToolRegistry,
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    arguments: Value,
+) -> Result<Value, RpcError> {
+    let (tool, input_mode, file_argument, file_materialization) = match &action.binding {
+        octos_agent::plugins::SkillActionBinding::Tool {
+            tool,
+            input_mode,
+            file_argument,
+            file_materialization,
+        } => (
+            tool.as_str(),
+            *input_mode,
+            file_argument.as_deref(),
+            *file_materialization,
+        ),
+    };
+    if registry.get(tool).is_none() {
+        return Err(RpcError::invalid_params(format!(
+            "skill action '{}' is bound to unavailable tool '{}'",
+            action.id, tool
+        )));
+    }
+
+    std::fs::create_dir_all(workspace_root).map_err(|error| {
+        RpcError::internal_error(format!(
+            "failed to create action workspace {}: {error}",
+            workspace_root.display()
+        ))
+    })?;
+
+    let mut args = action_arguments_object(arguments)?;
+    match input_mode {
+        octos_agent::plugins::SkillActionInputMode::Single => {
+            let result = registry
+                .execute(tool, &Value::Object(args))
+                .await
+                .map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "skill action '{}' failed to invoke tool '{}': {error}",
+                        action.id, tool
+                    ))
+                })?;
+            let ok = result.success;
+            Ok(json!({
+                "action_id": action.id,
+                "ok": ok,
+                "results": [tool_result_to_action_value(result)],
+            }))
+        }
+        octos_agent::plugins::SkillActionInputMode::FileEach => {
+            let paths = args.remove("paths").ok_or_else(|| {
+                RpcError::invalid_params("file_each skill action requires arguments.paths")
+            })?;
+            let raw_paths = string_array_argument(paths, "paths")?;
+            let materialized = match file_materialization {
+                octos_agent::plugins::SkillActionFileMaterialization::Raw => raw_paths,
+                octos_agent::plugins::SkillActionFileMaterialization::WorkspaceRelative => {
+                    octos_bus::file_handle::materialize_uploads_as_workspace_relative(
+                        workspace_root,
+                        tenant_id,
+                        &raw_paths,
+                    )
+                }
+                octos_agent::plugins::SkillActionFileMaterialization::TurnMedia => {
+                    octos_bus::file_handle::materialize_turn_uploads(
+                        workspace_root,
+                        tenant_id,
+                        &raw_paths,
+                    )
+                }
+            };
+            if materialized.is_empty() {
+                return Err(RpcError::invalid_params(
+                    "no action input files could be materialized for this session",
+                ));
+            }
+            let file_argument = file_argument.unwrap_or("path");
+            let mut ok = true;
+            let mut results = Vec::with_capacity(materialized.len());
+            for path in &materialized {
+                let mut call_args = args.clone();
+                call_args.insert(file_argument.to_string(), Value::String(path.clone()));
+                let result = registry
+                    .execute(tool, &Value::Object(call_args))
+                    .await
+                    .map_err(|error| {
+                        RpcError::internal_error(format!(
+                            "skill action '{}' failed to invoke tool '{}': {error}",
+                            action.id, tool
+                        ))
+                    })?;
+                ok &= result.success;
+                results.push(tool_result_to_action_value(result));
+                if !ok {
+                    break;
+                }
+            }
+            Ok(json!({
+                "action_id": action.id,
+                "ok": ok,
+                "materialized_paths": materialized,
+                "results": results,
+            }))
+        }
+    }
+}
+
+async fn skill_action_session_runtime(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<Arc<crate::runtime::SessionRuntime>, RpcError> {
+    let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
+    let Some(profile_runtime) = profile_runtime else {
+        return Err(runtime_unavailable_error(
+            "profile runtime is required for skill actions",
+        ));
+    };
+    let permissions = effective_permissions_for_session(state, session_id)?;
+    let workspace_hint = session_workspaces().get(session_id);
+    state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            workspace_hint,
+            permissions,
+        )
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!(
+                "failed to bootstrap session runtime for skill action: {error}"
+            ))
+        })
+}
+
+async fn raw_skill_action_list(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionListParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let active_profile_id = validate_session_scope(
+        &session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let session_runtime =
+        skill_action_session_runtime(state, &session_id, active_profile_id.as_deref()).await?;
+    let records = discover_skill_action_records(
+        &session_runtime.profile.plugin_dirs,
+        &session_runtime.tools,
+        params.surface.as_deref(),
+        &params.tags,
+    )?;
+    let actions = records
+        .into_iter()
+        .map(skill_action_record_to_value)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "profile_id": active_profile_id.unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+        "session_id": session_id,
+        "count": actions.len(),
+        "actions": actions,
+    }))
+}
+
+async fn raw_skill_action_invoke(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionInvokeParams = parse_raw_params(request)?;
+    let active_profile_id = validate_session_scope(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let session_runtime =
+        skill_action_session_runtime(state, &params.session_id, active_profile_id.as_deref())
+            .await?;
+    let records = discover_skill_action_records(
+        &session_runtime.profile.plugin_dirs,
+        &session_runtime.tools,
+        None,
+        &[],
+    )?;
+    let record = records
+        .into_iter()
+        .find(|record| {
+            record.action.id == params.action_id
+                || format!("{}/{}", record.skill_id, record.action.id) == params.action_id
+        })
+        .ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "skill action '{}' is not available in this session",
+                params.action_id
+            ))
+        })?;
+    invoke_skill_action_tool_binding(
+        &record.action,
+        &session_runtime.tools,
+        &session_runtime.workspace_root,
+        Some(session_runtime.profile.profile_id.as_str()),
+        params.arguments,
+    )
+    .await
+}
+
 async fn raw_profile_skills_registry_search(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
@@ -7964,6 +8387,12 @@ async fn handle_raw_appui_rpc(
         }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
+        }
+        APPUI_METHOD_SKILL_ACTION_LIST => {
+            raw_skill_action_list(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_SKILL_ACTION_INVOKE => {
+            raw_skill_action_invoke(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
             raw_profile_skills_registry_search(state, request, connection_profile_id).await
@@ -25601,6 +26030,7 @@ ignore = []
                 .iter()
                 .any(|method| is_profile_skill_appui_method(method))
         );
+        assert!(!no_profile_capabilities.supports_feature(APPUI_FEATURE_SKILL_ACTIONS_V1));
 
         let tenant = AppState {
             deployment_mode: crate::config::DeploymentMode::Tenant,
@@ -26380,6 +26810,232 @@ ignore = []
             error.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("auth_scope_violation"))
         );
+    }
+
+    struct CaptureActionTool {
+        calls: Arc<StdMutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_agent::Tool for CaptureActionTool {
+        fn name(&self) -> &str {
+            "source_import"
+        }
+
+        fn description(&self) -> &str {
+            "capture action calls"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, args: &Value) -> eyre::Result<octos_agent::ToolResult> {
+            self.calls.lock().unwrap().push(args.clone());
+            Ok(octos_agent::ToolResult {
+                success: true,
+                output: "captured".to_string(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn skill_action_discovery_loads_manifest_actions_for_registered_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let source_skill = skills_dir.join("mofa-notebook-source");
+        let missing_skill = skills_dir.join("missing-tool-skill");
+        std::fs::create_dir_all(&source_skill).unwrap();
+        std::fs::create_dir_all(&missing_skill).unwrap();
+        std::fs::write(
+            source_skill.join("manifest.json"),
+            r#"{
+                "name": "mofa-notebook-source",
+                "version": "0.1.0",
+                "tools": [{"name": "source_import", "description": "Import source"}],
+                "actions": [{
+                    "id": "source.import",
+                    "label": "Add source",
+                    "surfaces": ["studio.sources"],
+                    "binding": {
+                        "type": "tool",
+                        "tool": "source_import",
+                        "input_mode": "file_each",
+                        "file_argument": "path"
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            missing_skill.join("manifest.json"),
+            r#"{
+                "name": "missing-tool-skill",
+                "version": "0.1.0",
+                "actions": [{
+                    "id": "missing.run",
+                    "label": "Missing",
+                    "surfaces": ["studio.sources"],
+                    "binding": { "type": "tool", "tool": "missing_tool" }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let records =
+            discover_skill_action_records(&[skills_dir], &registry, Some("studio.sources"), &[])
+                .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].skill_id, "mofa-notebook-source");
+        assert_eq!(records[0].action.id, "source.import");
+        assert!(records[0].available);
+    }
+
+    #[tokio::test]
+    async fn skill_action_file_each_materializes_uploads_and_invokes_declared_tool() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upload_dir = octos_bus::file_handle::temp_upload_root().join("tenant-a");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        let uploaded = upload_dir.join(format!("{}-report.md", uuid::Uuid::new_v4()));
+        std::fs::write(&uploaded, "# Report\n\nNotebook source body\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("report.md")).unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path",
+                "file_materialization": "workspace_relative"
+            }
+        }))
+        .unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: calls.clone(),
+        });
+
+        let response = invoke_skill_action_tool_binding(
+            &action,
+            &registry,
+            workspace.path(),
+            Some("tenant-a"),
+            json!({
+                "paths": [handle],
+                "title": "Report"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["materialized_paths"], json!(["uploads/report.md"]));
+        assert!(workspace.path().join("uploads/report.md").is_file());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["path"], "uploads/report.md");
+        assert_eq!(calls[0]["title"], "Report");
+        assert!(
+            calls[0].get("paths").is_none(),
+            "file_each action must not forward the raw upload handles to the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_action_file_each_materializes_image_uploads_as_workspace_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upload_dir = octos_bus::file_handle::temp_upload_root().join("tenant-a");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        let uploaded = upload_dir.join(format!("{}-photo.jpg", uuid::Uuid::new_v4()));
+        std::fs::write(&uploaded, b"\xff\xd8\xff\xe0image").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("photo.jpg")).unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path",
+                "file_materialization": "workspace_relative"
+            }
+        }))
+        .unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: calls.clone(),
+        });
+
+        let response = invoke_skill_action_tool_binding(
+            &action,
+            &registry,
+            workspace.path(),
+            Some("tenant-a"),
+            json!({ "paths": [handle] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["materialized_paths"], json!(["uploads/photo.jpg"]));
+        assert!(workspace.path().join("uploads/photo.jpg").is_file());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0]["path"], "uploads/photo.jpg");
+    }
+
+    #[tokio::test]
+    async fn skill_action_file_each_defaults_to_raw_file_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upload_dir = octos_bus::file_handle::temp_upload_root().join("tenant-a");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        let uploaded = upload_dir.join(format!("{}-photo.jpg", uuid::Uuid::new_v4()));
+        std::fs::write(&uploaded, b"\xff\xd8\xff\xe0image").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("photo.jpg")).unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "vision.inspect",
+            "label": "Inspect image",
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path"
+            }
+        }))
+        .unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: calls.clone(),
+        });
+
+        let response = invoke_skill_action_tool_binding(
+            &action,
+            &registry,
+            workspace.path(),
+            Some("tenant-a"),
+            json!({ "paths": [handle.clone()] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["materialized_paths"], json!([handle]));
+        assert!(
+            !workspace.path().join("uploads/photo.jpg").exists(),
+            "raw file_each actions must not imply workspace-relative materialization"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0]["path"], response["materialized_paths"][0]);
     }
 
     #[tokio::test]

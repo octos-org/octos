@@ -376,6 +376,7 @@ mod tests {
             content_type_description: None,
             make_target_tool: None,
             tools: vec![],
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,
@@ -410,6 +411,7 @@ mod tests {
             content_type_description: None,
             make_target_tool: None,
             tools: vec![],
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,
@@ -466,6 +468,7 @@ mod tests {
                     concurrency_class: None,
                 })
                 .collect(),
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,

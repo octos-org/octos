@@ -1059,6 +1059,10 @@ function routeProbeParams(method) {
       return { profile_id: profileId, name: 'm18-missing-skill' };
     case 'profile/skills/remove':
       return { profile_id: profileId, name: 'm18-missing-skill' };
+    case 'skill/action/list':
+      return { session_id: sessionId, profile_id: profileId };
+    case 'skill/action/invoke':
+      return { session_id: sessionId, profile_id: profileId, action_id: 'm18-missing-action' };
     case 'onboarding/workspace_probe':
       return { path: workspace };
     default:

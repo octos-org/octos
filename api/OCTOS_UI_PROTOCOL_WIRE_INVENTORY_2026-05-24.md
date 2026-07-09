@@ -92,6 +92,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |
 | `profile/skills/install` | shipped AppUI extra when profile store is configured |
 | `profile/skills/remove` | shipped AppUI extra when profile store is configured |
+| `skill/action/list` | shipped AppUI extra, UPCR-2026-026 |
+| `skill/action/invoke` | shipped AppUI extra, UPCR-2026-026 |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
 
 ## Notifications

@@ -54,6 +54,9 @@ pub struct PluginManifest {
     /// Tools provided by this plugin.
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
+    /// User-facing actions this skill allows UI clients to invoke directly.
+    #[serde(default)]
+    pub actions: Vec<SkillActionDef>,
     /// SHA-256 hash of the plugin executable for integrity verification.
     ///
     /// Empty-string values (`""`) are rejected at parse time: a manifest that
@@ -217,6 +220,101 @@ pub struct SkillDiscovery {
     /// `"(no summary)"` in the rendered card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+/// A UI-callable action declared by a skill manifest.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct SkillActionDef {
+    /// Stable action id within the skill, for example `source.import`.
+    pub id: String,
+    /// Human-readable label for menus and buttons.
+    pub label: String,
+    /// Optional short description for tooltips or secondary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Semantic tags clients can filter on without coupling to a specific app.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// UI surfaces where this action is relevant, for example `studio.sources`.
+    #[serde(default)]
+    pub surfaces: Vec<String>,
+    /// JSON Schema for the action-level input.
+    #[serde(default = "default_schema")]
+    pub input_schema: serde_json::Value,
+    /// Optional UI hints. The host treats this as opaque metadata.
+    #[serde(default)]
+    pub ui_schema: serde_json::Value,
+    /// Backend binding. UI clients cannot override this at invocation time.
+    pub binding: SkillActionBinding,
+}
+
+/// Backend binding for a UI-callable skill action.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SkillActionBinding {
+    /// Invoke an existing registered tool.
+    Tool {
+        tool: String,
+        #[serde(default)]
+        input_mode: SkillActionInputMode,
+        #[serde(default)]
+        file_argument: Option<String>,
+        #[serde(default)]
+        file_materialization: SkillActionFileMaterialization,
+    },
+}
+
+impl SkillActionBinding {
+    pub fn tool_name(&self) -> Option<&str> {
+        match self {
+            Self::Tool { tool, .. } => Some(tool.as_str()),
+        }
+    }
+
+    pub fn input_mode(&self) -> SkillActionInputMode {
+        match self {
+            Self::Tool { input_mode, .. } => *input_mode,
+        }
+    }
+
+    pub fn file_argument(&self) -> Option<&str> {
+        match self {
+            Self::Tool { file_argument, .. } => file_argument.as_deref(),
+        }
+    }
+
+    pub fn file_materialization(&self) -> SkillActionFileMaterialization {
+        match self {
+            Self::Tool {
+                file_materialization,
+                ..
+            } => *file_materialization,
+        }
+    }
+}
+
+/// How action input is mapped to the bound tool call.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionInputMode {
+    /// Forward the action arguments once.
+    #[default]
+    Single,
+    /// Materialize `arguments.paths[]` and call the tool once per file.
+    FileEach,
+}
+
+/// How `file_each` action paths are prepared before invoking the bound tool.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionFileMaterialization {
+    /// Forward each string from `arguments.paths[]` unchanged.
+    #[default]
+    Raw,
+    /// Copy upload references into `<workspace>/uploads/` and pass workspace-relative paths.
+    WorkspaceRelative,
+    /// Use the same upload handling as chat turn media.
+    TurnMedia,
 }
 
 /// An MCP server declared by a skill manifest.
@@ -989,6 +1087,7 @@ mod tests {
             content_type_description: None,
             make_target_tool: None,
             tools,
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,
@@ -1340,6 +1439,63 @@ mod tests {
         }"#;
         let manifest: PluginManifest = serde_json::from_str(json).unwrap();
         assert!(!manifest.has_extras());
+    }
+
+    #[test]
+    fn manifest_parses_ui_actions_bound_to_tools() {
+        let json = r#"{
+            "name": "mofa-notebook-source",
+            "version": "0.1.0",
+            "tools": [{"name": "source_import", "description": "Import source"}],
+            "actions": [{
+                "id": "source.import",
+                "label": "Add source",
+                "description": "Import uploaded files as reusable sources.",
+                "tags": ["source", "document"],
+                "surfaces": ["studio.sources"],
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["paths"]
+                },
+                "ui_schema": {
+                    "accept": [".md", ".txt", ".csv", ".json", ".html"]
+                },
+                "binding": {
+                    "type": "tool",
+                    "tool": "source_import",
+                    "input_mode": "file_each",
+                    "file_argument": "path",
+                    "file_materialization": "workspace_relative"
+                }
+            }]
+        }"#;
+
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(manifest.actions.len(), 1);
+        let action = &manifest.actions[0];
+        assert_eq!(action.id, "source.import");
+        assert_eq!(action.label, "Add source");
+        assert_eq!(action.tags, vec!["source", "document"]);
+        assert_eq!(action.surfaces, vec!["studio.sources"]);
+        assert_eq!(
+            action.input_schema["required"],
+            serde_json::json!(["paths"])
+        );
+        assert_eq!(action.ui_schema["accept"][0], ".md");
+        assert_eq!(action.binding.tool_name(), Some("source_import"));
+        assert_eq!(action.binding.input_mode(), SkillActionInputMode::FileEach);
+        assert_eq!(action.binding.file_argument(), Some("path"));
+        assert_eq!(
+            action.binding.file_materialization(),
+            SkillActionFileMaterialization::WorkspaceRelative
+        );
     }
 
     // ------------------------------------------------------------------
