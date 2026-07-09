@@ -16,6 +16,8 @@ vi.mock('../api', () => ({
   api: {
     monitorStatus: () => mockMonitorStatus(),
     listProfiles: () => mockListProfiles(),
+    // The page loads all pages; in tests one mocked page is the whole set.
+    listAllProfiles: () => mockListProfiles(),
     toggleWatchdog: (enabled: boolean) => mockToggleWatchdog(enabled),
     toggleAlerts: (enabled: boolean) => mockToggleAlerts(enabled),
     updateProfileMonitor: (

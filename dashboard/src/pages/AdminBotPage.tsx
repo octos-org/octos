@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
+import StatusBadge from '../components/StatusBadge'
 import { useToast } from '../components/Toast'
 import type { MonitorProfileStatus, MonitorStatus, ProfileResponse } from '../types'
 
@@ -23,7 +24,9 @@ export default function AdminBotPage() {
     try {
       const [monitor, profileList] = await Promise.all([
         api.monitorStatus().catch(() => EMPTY_MONITOR_STATUS),
-        api.listProfiles(),
+        // All pages — admin profiles past the first page (limit=100)
+        // must not silently vanish from this list.
+        api.listAllProfiles(),
       ])
       setMonitorStatus({ ...EMPTY_MONITOR_STATUS, ...monitor, profiles: monitor.profiles ?? [] })
       setProfiles(profileList)
@@ -199,15 +202,12 @@ export default function AdminBotPage() {
                   </Link>
                   <p className="text-xs text-gray-500 font-mono mt-1 truncate">{profile.id}</p>
                 </div>
-                <span
-                  className={`shrink-0 inline-flex px-2 py-0.5 text-[10px] font-medium rounded-full ${
-                    profile.status.running
-                      ? 'bg-green-500/15 text-green-400'
-                      : 'bg-gray-500/15 text-gray-400'
-                  }`}
-                >
-                  {profile.status.running ? 'Running' : 'Stopped'}
-                </span>
+                <StatusBadge
+                  className="shrink-0"
+                  running={profile.status.running}
+                  status={profile.status.status}
+                  error={profile.status.error ?? null}
+                />
               </div>
             ))}
           </div>
