@@ -180,6 +180,52 @@ The focused fixture test is:
 npm --prefix e2e run test -- --workers=1 tests/m12-solo-soak-artifacts.spec.ts
 ```
 
+### M19 UX Gate Reporting
+
+Use this gate to classify the UX scenario pack and publish release-facing
+summary artifacts without requiring provider keys. The report keeps skipped,
+blocked, quarantined, failed, runnable-not-run, and passed scenarios in separate
+counts so blocked or skipped lanes cannot be counted as passing release
+evidence.
+
+```bash
+# Validate manifest parsing and runnability classification.
+npm --prefix e2e run ux:scenario:list:test
+npm --prefix e2e run ux:scenario:list -- --tier local
+
+# Write e2e/test-results-ux/summaries/<run>/ux-summary.{json,md}.
+npm --prefix e2e run ux:gate:local
+
+# Validate one artifact directory produced by ux:tmux:run.
+npm --prefix e2e run ux:tmux:validate -- \
+  e2e/test-results-ux/<run-id>/<scenario-id>
+
+# Summarize one or more real tmux artifact directories.
+npm --prefix e2e run ux:gate:report -- \
+  --tier release \
+  --artifact-root e2e/test-results-ux/<run-id>
+```
+
+`ux-summary.json` records each scenario's id, selected command, duration when
+available, status, validators, artifact directory, and first actionable
+validator failure. `ux-summary.md` renders the same information as a CI-friendly
+table. Use `--strict` only for release jobs that should fail on any non-passed
+lane; PR-local reporting jobs should normally omit it so developers still
+receive the summary artifact.
+
+Recommended lanes:
+
+- PR-local: run `ux:scenario:list:test`, `ux:gate:report:test`, and
+  `ux:gate:local` without `--strict`; upload `ux-summary.*` for inspection.
+- Nightly: run `ux:gate:release` against the latest available UX artifact root
+  and publish the summary even when scenarios are skipped or blocked.
+- Soak: run selected `ux:tmux:run` scenarios into one
+  `e2e/test-results-ux/<run-id>/` tree, run `ux:tmux:validate` against each
+  scenario artifact directory, then run `ux:gate:report --tier release
+  --artifact-root e2e/test-results-ux/<run-id>`.
+- Release: run the same release report with `--strict` only when every required
+  lane is expected to pass; the command exits nonzero on any non-passed row.
+
 ### M22 TUI Solo Onboarding Gate
 
 Use this gate for first-run TUI onboarding product-surface evidence. The full
