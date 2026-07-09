@@ -244,8 +244,22 @@ pub struct SkillActionDef {
     /// Optional UI hints. The host treats this as opaque metadata.
     #[serde(default)]
     pub ui_schema: serde_json::Value,
+    /// Whether the action runs inline or as a persisted background job.
+    #[serde(default)]
+    pub execution: SkillActionExecution,
     /// Backend binding. UI clients cannot override this at invocation time.
     pub binding: SkillActionBinding,
+}
+
+/// How a UI-callable skill action is executed by the host.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionExecution {
+    /// Invoke the bound backend operation before returning the AppUI response.
+    #[default]
+    Sync,
+    /// Enqueue persisted job snapshots and execute out of band.
+    Background,
 }
 
 /// Backend binding for a UI-callable skill action.
@@ -1495,6 +1509,35 @@ mod tests {
         assert_eq!(
             action.binding.file_materialization(),
             SkillActionFileMaterialization::WorkspaceRelative
+        );
+        assert_eq!(action.execution, SkillActionExecution::Sync);
+    }
+
+    #[test]
+    fn manifest_parses_background_skill_action_execution() {
+        let json = r#"{
+            "name": "mofa-notebook-source",
+            "version": "0.1.0",
+            "tools": [{"name": "source_import", "description": "Import source"}],
+            "actions": [{
+                "id": "source.import",
+                "label": "Add source",
+                "execution": "background",
+                "binding": {
+                    "type": "tool",
+                    "tool": "source_import",
+                    "input_mode": "file_each",
+                    "file_argument": "path",
+                    "file_materialization": "workspace_relative"
+                }
+            }]
+        }"#;
+
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            manifest.actions[0].execution,
+            SkillActionExecution::Background
         );
     }
 

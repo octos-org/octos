@@ -18,7 +18,7 @@ pub use install::{
 };
 pub use loader::{PluginLoadOptions, PluginLoadResult, PluginLoader};
 pub use manifest::{
-    PluginManifest, PluginToolDef, SkillActionBinding, SkillActionDef,
+    PluginManifest, PluginToolDef, SkillActionBinding, SkillActionDef, SkillActionExecution,
     SkillActionFileMaterialization, SkillActionInputMode,
 };
 pub use tool::{PluginTool, SynthesisConfig};
