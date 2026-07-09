@@ -46,6 +46,9 @@ rmcp = { version = "1.8", default-features = false, features = [
     "transport-streamable-http-client-reqwest",
     "transport-streamable-http-server",
 ] }
+# `CancellationToken` for the streamable-HTTP service: rmcp does not re-export
+# it, and the CLI needs it to tear down live SSE sessions on graceful shutdown.
+tokio-util = "0.7"
 oauth2 = "5"
 # rmcp's `AuthClient` wraps a reqwest 0.13 client (rmcp's own reqwest major).
 # Aliased so it coexists with octos's reqwest 0.12; cargo unifies both 0.13

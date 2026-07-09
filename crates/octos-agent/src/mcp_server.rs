@@ -48,6 +48,7 @@ use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler, serve_server};
+use tokio_util::sync::CancellationToken;
 
 use crate::harness_events::HarnessEvent;
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
@@ -61,7 +62,6 @@ pub const RUN_OCTOS_SESSION_TOOL: &str = "run_octos_session";
 
 /// Environment variable name that the HTTP transport reads for its bearer token.
 pub const OCTOS_MCP_SERVER_TOKEN_ENV: &str = "OCTOS_MCP_SERVER_TOKEN";
-
 
 /// Typed error kinds surfaced by the session-level dispatch flow.
 #[derive(Debug, Clone)]
@@ -212,18 +212,42 @@ impl McpServer {
     /// The caller (the CLI, which owns axum) mounts this into a router behind a
     /// bearer-token layer and binds it — bearer authentication and TLS are the
     /// caller's responsibility, not this service's.
+    ///
+    /// Returns the service together with a [`CancellationToken`]: cancelling it
+    /// terminates all live sessions so an `axum` graceful shutdown can drain the
+    /// long-lived SSE connections instead of hanging until they idle out. The
+    /// caller must cancel it in its shutdown path.
+    ///
+    /// The session manager's idle keep-alive is disabled: `run_octos_session` is
+    /// a single long-running synchronous tool call that emits no intermediate
+    /// MCP traffic, so rmcp's default 300s idle timer would reap the session
+    /// mid-call and drop the result before the client received it. Sessions are
+    /// instead torn down by the returned token on shutdown (and a client
+    /// disconnect cancels its own in-flight request).
     pub fn streamable_http_service(
         self,
         allow_non_loopback: bool,
-    ) -> StreamableHttpService<OctosMcpHandler, LocalSessionManager> {
+    ) -> (
+        StreamableHttpService<OctosMcpHandler, LocalSessionManager>,
+        CancellationToken,
+    ) {
         let dispatch = self.dispatch;
         let supervisor = self.supervisor;
         let event_sink = self.event_sink;
-        let mut config = StreamableHttpServerConfig::default();
+
+        let cancel = CancellationToken::new();
+        let mut config =
+            StreamableHttpServerConfig::default().with_cancellation_token(cancel.clone());
         if allow_non_loopback {
             config = config.disable_allowed_hosts();
         }
-        StreamableHttpService::new(
+
+        // Disable idle reaping (see the doc comment): a long tool call is not a
+        // dead session.
+        let mut session_manager = LocalSessionManager::default();
+        session_manager.session_config.keep_alive = None;
+
+        let service = StreamableHttpService::new(
             move || {
                 Ok(OctosMcpHandler {
                     dispatch: dispatch.clone(),
@@ -232,9 +256,10 @@ impl McpServer {
                     transport_label: "http",
                 })
             },
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(session_manager),
             config,
-        )
+        );
+        (service, cancel)
     }
 
     /// Serve the single `run_octos_session` tool over the rmcp SDK on an
@@ -944,5 +969,4 @@ mod tests {
         assert!(contract.is_none());
         assert!(error.is_none());
     }
-
 }

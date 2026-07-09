@@ -7,8 +7,8 @@
 //! # Transports
 //!
 //! - `stdio` (default): JSON-RPC over stdin/stdout. Parent-trust auth.
-//! - `http`: minimal HTTP/1.1 JSON-RPC endpoint. Requires a bearer token
-//!   supplied via the `OCTOS_MCP_SERVER_TOKEN` environment variable.
+//! - `http`: MCP Streamable HTTP served by the rmcp SDK. Requires a bearer
+//!   token supplied via the `OCTOS_MCP_SERVER_TOKEN` environment variable.
 //!
 //! # Session dispatch (M7.2a)
 //!
@@ -167,16 +167,25 @@ impl McpServeCommand {
     }
 }
 
-/// Serve the MCP Streamable HTTP transport on `bind`, gating every request
-/// behind the bearer token. The rmcp tower service (built in octos-agent) is
-/// mounted in axum here; bearer auth is an axum middleware in front of it.
-/// Requires the `api` feature (axum); the canonical install includes it.
-/// Build the axum router that serves the MCP Streamable HTTP transport: the
+/// Maximum accepted HTTP request body for the MCP transport (1 MiB), restoring
+/// the explicit cap the hand-rolled endpoint enforced. The rmcp tower service
+/// otherwise buffers the whole body, so without this a bearer-holding client
+/// could exhaust memory with an arbitrarily large or chunked POST.
+#[cfg(feature = "api")]
+const MAX_HTTP_BODY_BYTES: usize = 1_048_576;
+
 /// rmcp tower service (from octos-agent) behind a bearer-token gate. Extracted
 /// from [`serve_http`] so the gate can be exercised by an integration test
 /// without binding a well-known port.
+///
+/// Returns the [`CancellationToken`](tokio_util::sync::CancellationToken) that
+/// tears down live SSE sessions; [`serve_http`] cancels it on shutdown.
 #[cfg(feature = "api")]
-fn mcp_http_router(server: McpServer, token: String, allow_non_loopback: bool) -> axum::Router {
+fn mcp_http_router(
+    server: McpServer,
+    token: String,
+    allow_non_loopback: bool,
+) -> (axum::Router, tokio_util::sync::CancellationToken) {
     use std::sync::Arc;
 
     use axum::Router;
@@ -184,6 +193,7 @@ fn mcp_http_router(server: McpServer, token: String, allow_non_loopback: bool) -
     use axum::http::{StatusCode, header::AUTHORIZATION};
     use axum::middleware::{self, Next};
     use axum::response::{IntoResponse, Response};
+    use tower_http::limit::RequestBodyLimit;
 
     /// Reject any request whose bearer token is missing or wrong before it
     /// reaches the MCP service, using the same parser + constant-time compare
@@ -198,21 +208,28 @@ fn mcp_http_router(server: McpServer, token: String, allow_non_loopback: bool) -
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
         match octos_agent::mcp_server::parse_bearer_token(provided) {
-            Some(candidate)
-                if octos_agent::mcp_server::constant_time_eq(&candidate, &token) =>
-            {
+            Some(candidate) if octos_agent::mcp_server::constant_time_eq(&candidate, &token) => {
                 next.run(request).await
             }
             _ => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
         }
     }
 
-    let service = server.streamable_http_service(allow_non_loopback);
-    Router::new()
-        .fallback_service(service)
-        .layer(middleware::from_fn_with_state(Arc::new(token), bearer_gate))
+    let (service, cancel) = server.streamable_http_service(allow_non_loopback);
+    // Bound the request body on the fallback service (inner) so rmcp never
+    // buffers an unbounded POST, and keep the bearer gate as the sole router
+    // layer (outermost) so unauthenticated requests are still rejected first.
+    let limited = RequestBodyLimit::new(service, MAX_HTTP_BODY_BYTES);
+    let router = Router::new()
+        .fallback_service(limited)
+        .layer(middleware::from_fn_with_state(Arc::new(token), bearer_gate));
+    (router, cancel)
 }
 
+/// Serve the MCP Streamable HTTP transport on `bind`, gating every request
+/// behind the bearer token. The rmcp tower service (built in octos-agent) is
+/// mounted in axum here; bearer auth is an axum middleware in front of it.
+/// Requires the `api` feature (axum); the canonical install includes it.
 #[cfg(feature = "api")]
 async fn serve_http(server: McpServer, bind: SocketAddr, token: String) -> Result<()> {
     // A loopback bind keeps rmcp's DNS-rebinding Host guard. An explicit
@@ -227,17 +244,20 @@ async fn serve_http(server: McpServer, bind: SocketAddr, token: String) -> Resul
         );
     }
 
-    let app = mcp_http_router(server, token, allow_non_loopback);
+    let (app, cancel) = mcp_http_router(server, token, allow_non_loopback);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .wrap_err_with(|| format!("failed to bind MCP server on {bind}"))?;
     let addr = listener.local_addr().unwrap_or(bind);
     tracing::info!(%addr, "octos mcp-serve http bound (streamable HTTP, bearer required)");
 
-    // Serve until Ctrl+C / SIGTERM.
+    // Serve until Ctrl+C / SIGTERM. On shutdown, cancel the rmcp service so live
+    // SSE sessions terminate immediately — otherwise axum's graceful drain would
+    // block on those long-lived streams.
     axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            cancel.cancel();
         })
         .await
         .wrap_err("mcp-serve http server error")?;
@@ -857,7 +877,7 @@ mod http_transport_tests {
     /// runtime is dropped.
     async fn spawn_http_server(token: &str) -> std::net::SocketAddr {
         let server = McpServer::new(Arc::new(ReadyDispatch), Arc::new(TaskSupervisor::new()));
-        let app = mcp_http_router(server, token.to_string(), false);
+        let (app, _cancel) = mcp_http_router(server, token.to_string(), false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

@@ -372,4 +372,3 @@ async fn should_directly_dispatch_session_via_helper() {
     assert_eq!(body["final_state"], "ready");
     assert_eq!(body["schema_version"], TASK_RESULT_SCHEMA_VERSION);
 }
-

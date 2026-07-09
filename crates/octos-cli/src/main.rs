@@ -51,9 +51,7 @@ fn main() -> Result<()> {
     // (`qr --payload-only`, `decode`), so it reserves stdout the same way.
     let reserve_stdout = matches!(
         args.command,
-        commands::Command::Acp(_)
-            | commands::Command::Profile(_)
-            | commands::Command::McpServe(_)
+        commands::Command::Acp(_) | commands::Command::Profile(_) | commands::Command::McpServe(_)
     );
     let _log_guard = init_tracing(log_dir.as_deref(), reserve_stdout)?;
 

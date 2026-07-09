@@ -23,9 +23,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use octos_agent::SandboxConfig;
 use octos_agent::mcp_server::{McpSessionDispatch, SessionLifecycleObserver};
 use octos_agent::task_supervisor::TaskLifecycleState;
-use octos_agent::SandboxConfig;
 use octos_cli::commands::mcp_serve::{AgentLlmFactory, RealSessionDispatch, SessionDispatchConfig};
 use octos_core::{Message, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
@@ -524,7 +524,8 @@ async fn should_populate_validator_results_when_workspace_policy_declares_valida
 async fn should_block_shell_write_outside_workspace_via_sandbox() {
     // Probe the resolved backend: NoSandbox wraps with `sh`/`cmd`, an
     // enforcing backend wraps with `sandbox-exec`/`bwrap`/`docker`.
-    let program = octos_agent::create_sandbox(&SandboxConfig::default())
+    let sandbox = octos_agent::create_sandbox(&SandboxConfig::default());
+    let program = sandbox
         .wrap_command("true", std::path::Path::new("."))
         .as_std()
         .get_program()
@@ -534,6 +535,35 @@ async fn should_block_shell_write_outside_workspace_via_sandbox() {
         eprintln!(
             "skipping should_block_shell_write_outside_workspace_via_sandbox: \
              no enforcing sandbox backend on this host (wrap program = {program:?})"
+        );
+        return;
+    }
+    // Docker wraps the command into a container whose filesystem does not map
+    // the host `cwd`/sibling temp dirs the assertions below rely on, so the
+    // write-path checks don't apply.
+    if program.ends_with("docker") {
+        eprintln!(
+            "skipping should_block_shell_write_outside_workspace_via_sandbox: \
+             docker backend needs container-relative paths"
+        );
+        return;
+    }
+    // The backend binary exists, but on some hosts it is present yet unusable
+    // (`sandbox-exec` denied, `bwrap` without user namespaces, Docker with no
+    // daemon). Trusting the wrapper name alone would let the test proceed and
+    // then fail its own positive control. Actually run a harmless command
+    // through the wrapper; if it can't execute, OS confinement can't be
+    // exercised here, so skip rather than fail.
+    let probe_ok = sandbox
+        .wrap_command("true", std::path::Path::new("."))
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !probe_ok {
+        eprintln!(
+            "skipping should_block_shell_write_outside_workspace_via_sandbox: \
+             sandbox backend {program:?} is present but not runnable on this host"
         );
         return;
     }
@@ -570,11 +600,7 @@ async fn should_block_shell_write_outside_workspace_via_sandbox() {
     // regression is about the filesystem effect, not the returned state.
     let _ = harness
         .dispatch
-        .run_session(
-            "coding",
-            &json!({ "prompt": "run the command" }),
-            &observer,
-        )
+        .run_session("coding", &json!({ "prompt": "run the command" }), &observer)
         .await;
 
     assert!(
