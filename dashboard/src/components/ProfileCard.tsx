@@ -36,7 +36,11 @@ export default function ProfileCard({ profile, subAccounts = [], onStart, onStop
         >
           {profile.name}
         </Link>
-        <StatusBadge running={profile.status.running} />
+        <StatusBadge
+          running={profile.status.running}
+          status={profile.status.status}
+          error={profile.status.error}
+        />
       </div>
 
       <div className="space-y-2 mb-4">
@@ -56,6 +60,9 @@ export default function ProfileCard({ profile, subAccounts = [], onStart, onStop
               <span className="text-gray-600 ml-1">({formatUptime(profile.status.uptime_secs)})</span>
             ) : null}
           </div>
+        )}
+        {profile.status.status === 'configuration_error' && profile.status.error && (
+          <div className="text-xs text-amber-300">{profile.status.error}</div>
         )}
       </div>
 
@@ -155,7 +162,12 @@ function SubAccountRow({
 
   return (
     <div className="flex items-center gap-2 py-1.5 px-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
-      <StatusBadge running={sub.status.running} className="shrink-0" />
+      <StatusBadge
+        running={sub.status.running}
+        status={sub.status.status}
+        error={sub.status.error}
+        className="shrink-0"
+      />
 
       <Link
         to={`/profile/${sub.id}`}

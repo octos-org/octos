@@ -815,12 +815,7 @@ pub async fn me(
                 let status = if let Some(ref pm) = state.process_manager {
                     pm.status(&p.id).await
                 } else {
-                    crate::process_manager::ProcessStatus {
-                        running: false,
-                        pid: None,
-                        started_at: None,
-                        uptime_secs: None,
-                    }
+                    crate::process_manager::ProcessStatus::stopped()
                 };
                 Some(ProfileResponse {
                     email: None,
@@ -896,12 +891,7 @@ pub async fn me(
             let status = if let Some(ref pm) = state.process_manager {
                 pm.status(&p.id).await
             } else {
-                crate::process_manager::ProcessStatus {
-                    running: false,
-                    pid: None,
-                    started_at: None,
-                    uptime_secs: None,
-                }
+                crate::process_manager::ProcessStatus::stopped()
             };
             Some(ProfileResponse {
                 email: None,
@@ -942,12 +932,7 @@ pub async fn my_profile(
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
     } else {
-        crate::process_manager::ProcessStatus {
-            running: false,
-            pid: None,
-            started_at: None,
-            uptime_secs: None,
-        }
+        crate::process_manager::ProcessStatus::stopped()
     };
 
     Ok(Json(ProfileResponse {
@@ -1334,12 +1319,7 @@ pub async fn update_my_profile(
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
     } else {
-        crate::process_manager::ProcessStatus {
-            running: false,
-            pid: None,
-            started_at: None,
-            uptime_secs: None,
-        }
+        crate::process_manager::ProcessStatus::stopped()
     };
 
     Ok(Json(ProfileResponse {

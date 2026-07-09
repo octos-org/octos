@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::process_manager::ProcessManager;
+use crate::process_manager::{ProcessManager, ProcessState};
 use crate::profiles::ProfileStore;
 
 /// Alert types sent by ProcessManager or health checker.
@@ -199,6 +199,14 @@ impl Monitor {
                 // Watchdog: auto-restart on GatewayExited
                 if let AdminAlert::GatewayExited { ref profile_id, .. } = alert {
                     if profile_watchdog_enabled(&ps1, profile_id, wd1.load(Ordering::Relaxed)) {
+                        if pm1.status(profile_id).await.status == ProcessState::ConfigurationError {
+                            tracing::warn!(
+                                profile = %profile_id,
+                                "watchdog skipping restart: profile has configuration error"
+                            );
+                            continue;
+                        }
+
                         let mut counts = rc1.lock().await;
                         let (count, _) =
                             counts.entry(profile_id.clone()).or_insert((0, Utc::now()));
@@ -227,6 +235,14 @@ impl Monitor {
                             // Backoff: 2^attempt seconds, capped at 30s
                             let backoff = Duration::from_secs((2u64.pow(attempt)).min(30));
                             tokio::time::sleep(backoff).await;
+
+                            if pm1.has_configuration_error(profile_id).await {
+                                tracing::warn!(
+                                    profile = %profile_id,
+                                    "watchdog skipping restart: profile has configuration error"
+                                );
+                                continue;
+                            }
 
                             if let Ok(Some(profile)) = ps1.get(profile_id) {
                                 if let Err(e) = pm1.start(&profile).await {
@@ -284,6 +300,10 @@ impl Monitor {
 
                 for p in &profiles {
                     if p.enabled && !statuses.contains_key(&p.id) {
+                        if pm.status(&p.id).await.status == ProcessState::ConfigurationError {
+                            continue;
+                        }
+
                         // Check if watchdog already knows about this
                         let counts = rc2.lock().await;
                         let already_tracked = counts.get(&p.id).is_some_and(|(c, _)| *c > 0);

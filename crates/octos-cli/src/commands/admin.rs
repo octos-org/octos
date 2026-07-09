@@ -444,6 +444,10 @@ fn render_collection_section(output: &mut String, summary: &serde_json::Value) {
     writeln!(output, "{}", "─".repeat(60).dimmed()).unwrap();
     for (label, key) in [
         ("running-gateways", "running_gateways"),
+        (
+            "configuration-error-gateways",
+            "configuration_error_gateways",
+        ),
         ("gateways-with-api-port", "gateways_with_api_port"),
         ("gateways-missing-api-port", "gateways_missing_api_port"),
         ("scrape-failures", "scrape_failures"),

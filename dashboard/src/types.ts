@@ -1,8 +1,11 @@
 export interface ProcessStatus {
+  status?: 'running' | 'stopped' | 'configuration_error'
   running: boolean
   pid: number | null
   started_at: string | null
   uptime_secs: number | null
+  error?: string | null
+  error_since?: string | null
 }
 
 export interface GatewaySettings {

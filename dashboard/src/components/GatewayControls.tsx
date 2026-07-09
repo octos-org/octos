@@ -24,8 +24,12 @@ export default function GatewayControls({ status, loading, onStart, onStop, onRe
     <div className="bg-surface rounded-xl border border-gray-700/50 p-5">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-sm font-semibold text-white">Gateway Process</h3>
-        <StatusBadge running={status.running} />
+        <StatusBadge running={status.running} status={status.status} error={status.error} />
       </div>
+
+      {status.status === 'configuration_error' && status.error && (
+        <p className="mb-4 text-xs text-amber-300">{status.error}</p>
+      )}
 
       {status.running && (
         <div className="grid grid-cols-2 gap-3 mb-4 text-xs">

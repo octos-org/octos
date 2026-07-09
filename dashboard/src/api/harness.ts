@@ -65,7 +65,7 @@ export interface HarnessTaskView {
 
 export interface HarnessTaskSource {
   profile_id: string
-  status: 'ok' | 'failed' | 'missing_api_port' | string
+  status: 'ok' | 'failed' | 'missing_api_port' | 'configuration_error' | string
   error?: string | null
   api_port?: number | null
   session_count: number
@@ -86,6 +86,8 @@ export interface HarnessTasksResponse {
 
 export interface OperatorSummaryCollection {
   running_gateways: number
+  /** Profiles in a configuration-error state — not counted as running. */
+  configuration_error_gateways?: number
   gateways_with_api_port: number
   gateways_missing_api_port: number
   scrape_failures: number
