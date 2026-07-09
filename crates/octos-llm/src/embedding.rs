@@ -26,6 +26,7 @@ pub struct OpenAIEmbedder {
     api_key: SecretString,
     model: String,
     base_url: String,
+    dimensions: Option<u32>,
 }
 
 impl OpenAIEmbedder {
@@ -40,7 +41,18 @@ impl OpenAIEmbedder {
             api_key: SecretString::from(api_key.into()),
             model: "text-embedding-3-small".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
+            dimensions: None,
         }
+    }
+
+    /// Request a specific output dimension (OpenAI-standard `dimensions`
+    /// field). The episodic HNSW index is built at a fixed dimension
+    /// (1536 by default) — set this when the model's native size differs
+    /// (e.g. DashScope text-embedding-v4 defaults to 1024) or mismatched
+    /// vectors are dropped to BM25-only.
+    pub fn with_dimensions(mut self, dimensions: u32) -> Self {
+        self.dimensions = Some(dimensions);
+        self
     }
 
     /// Set a custom base URL.
@@ -60,6 +72,11 @@ impl OpenAIEmbedder {
 struct EmbeddingRequest<'a> {
     model: &'a str,
     input: &'a [&'a str],
+    /// OpenAI-standard optional output dimension (supported by
+    /// text-embedding-3-* and OpenAI-compatible providers like DashScope
+    /// text-embedding-v4). Skipped when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +96,7 @@ impl EmbeddingProvider for OpenAIEmbedder {
         let body = EmbeddingRequest {
             model: &self.model,
             input: texts,
+            dimensions: self.dimensions,
         };
 
         let resp = self
@@ -126,9 +144,43 @@ mod tests {
         let req = EmbeddingRequest {
             model: "text-embedding-3-small",
             input: &texts,
+            dimensions: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "text-embedding-3-small");
         assert_eq!(json["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn request_serializes_dimensions_only_when_set() {
+        let without = EmbeddingRequest {
+            model: "text-embedding-3-small",
+            input: &["x"],
+            dimensions: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(
+            !json.contains("dimensions"),
+            "unset must be skipped: {json}"
+        );
+
+        let with = EmbeddingRequest {
+            model: "text-embedding-v4",
+            input: &["x"],
+            dimensions: Some(1536),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("\"dimensions\":1536"), "{json}");
+    }
+
+    #[test]
+    fn builder_overrides_model_and_dimensions() {
+        let e = OpenAIEmbedder::new("k")
+            .with_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1")
+            .with_model("text-embedding-v4")
+            .with_dimensions(1536);
+        assert_eq!(e.model, "text-embedding-v4");
+        assert_eq!(e.dimensions, Some(1536));
+        assert!(e.base_url.contains("compatible-mode"));
     }
 }

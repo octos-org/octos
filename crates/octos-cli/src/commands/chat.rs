@@ -1048,10 +1048,22 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
-    let key = config.get_api_key(&cfg.provider).ok()?;
+    // `api_key_env` was declared on EmbeddingConfig but never honored —
+    // it wins over the provider-default key lookup so an OpenAI-compatible
+    // endpoint (DashScope etc.) can use its own key variable.
+    let key = match cfg.api_key_env.as_deref() {
+        Some(var) => std::env::var(var).ok()?,
+        None => config.get_api_key(&cfg.provider).ok()?,
+    };
     let mut e = OpenAIEmbedder::new(key);
     if let Some(ref url) = cfg.base_url {
         e = e.with_base_url(url);
+    }
+    if let Some(ref model) = cfg.model {
+        e = e.with_model(model);
+    }
+    if let Some(dimensions) = cfg.dimensions {
+        e = e.with_dimensions(dimensions);
     }
     Some(Arc::new(e))
 }

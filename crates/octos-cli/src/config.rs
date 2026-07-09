@@ -521,6 +521,18 @@ pub struct EmbeddingConfig {
     /// Custom base URL for the embedding API.
     #[serde(default)]
     pub base_url: Option<String>,
+
+    /// Embedding model id (default: text-embedding-3-small). Set for
+    /// OpenAI-compatible providers with their own catalogs (e.g.
+    /// DashScope `text-embedding-v4`).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// OpenAI-standard `dimensions` request field. The episodic HNSW
+    /// index is fixed at 1536 dims — set this when the model's native
+    /// output differs or its vectors are dropped to BM25-only.
+    #[serde(default)]
+    pub dimensions: Option<u32>,
 }
 
 fn default_embedding_provider() -> String {
