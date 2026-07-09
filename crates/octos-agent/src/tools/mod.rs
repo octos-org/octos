@@ -29,7 +29,7 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -638,85 +638,6 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// LRU-based tool lifecycle manager.
-///
-/// Tracks per-tool usage and auto-evicts idle tools when the active count
-/// exceeds a threshold. Base tools are pinned and never evicted.
-pub struct ToolLifecycle {
-    /// Per-tool last-used iteration counter.
-    pub(crate) last_used: HashMap<String, u32>,
-    /// Current iteration counter.
-    pub(crate) iteration: u32,
-    /// Tools that are never auto-evicted.
-    pub(crate) base_tools: HashSet<String>,
-    /// Maximum active tools before eviction kicks in.
-    pub(crate) max_active: usize,
-    /// Tools idle for this many iterations become eviction candidates.
-    pub(crate) idle_threshold: u32,
-}
-
-impl Default for ToolLifecycle {
-    fn default() -> Self {
-        Self {
-            last_used: HashMap::new(),
-            iteration: 0,
-            base_tools: HashSet::new(),
-            max_active: 15,
-            idle_threshold: 5,
-        }
-    }
-}
-
-impl ToolLifecycle {
-    /// Set base tools that are never auto-evicted.
-    pub fn set_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.base_tools = names.into_iter().map(|n| n.into()).collect();
-    }
-
-    /// Add more tools to the base set (extends, does not replace).
-    pub fn add_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.base_tools.extend(names.into_iter().map(|n| n.into()));
-    }
-
-    /// Record that a tool was used at the current iteration.
-    pub fn record_usage(&mut self, name: &str) {
-        self.last_used.insert(name.to_string(), self.iteration);
-    }
-
-    /// Advance the iteration counter.
-    pub fn tick(&mut self) {
-        self.iteration += 1;
-    }
-
-    /// Find idle non-base tools to evict from `active_tools`, sorted by
-    /// staleness (oldest first). Callers should have already excluded
-    /// deferred tools from `active_tools`.
-    pub fn find_evictable(&self, active_tools: &[&str]) -> Vec<String> {
-        let active_count = active_tools.len();
-        if active_count <= self.max_active {
-            return Vec::new();
-        }
-
-        let mut candidates: Vec<(&str, u32)> = active_tools
-            .iter()
-            .filter(|name| !self.base_tools.contains(**name))
-            .map(|name| {
-                let last = self.last_used.get(*name).copied().unwrap_or(0);
-                (*name, last)
-            })
-            .filter(|(_, last)| self.iteration.saturating_sub(*last) >= self.idle_threshold)
-            .collect();
-
-        candidates.sort_by_key(|(_, last)| *last);
-        let to_evict = active_count.saturating_sub(self.max_active);
-        candidates
-            .into_iter()
-            .take(to_evict)
-            .map(|(name, _)| name.to_string())
-            .collect()
-    }
-}
-
 // Tool registry (extracted to its own module)
 mod registry;
 pub use registry::ToolRegistry;
@@ -772,7 +693,6 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
-pub mod activate_tools;
 pub mod admin;
 pub mod browser;
 pub mod check_background_tasks;
@@ -828,7 +748,6 @@ pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
-pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
