@@ -35,6 +35,7 @@ pub mod otp;
 pub mod persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;
+pub mod profile_qr;
 pub mod profiles;
 pub mod project_templates;
 mod qos_catalog;

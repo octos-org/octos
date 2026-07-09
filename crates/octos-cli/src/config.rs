@@ -1725,7 +1725,7 @@ impl Config {
     }
 
     /// The env-var name the provider chain would use by default.
-    fn provider_default_env_var(provider: &str) -> Option<String> {
+    pub(crate) fn provider_default_env_var(provider: &str) -> Option<String> {
         Some(
             octos_llm::registry::lookup(provider)
                 .and_then(|e| e.api_key_env)
