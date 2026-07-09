@@ -1097,24 +1097,46 @@ impl PluginTool {
             }
         }
 
-        // Host workspace metadata is opt-in. It is injected after path rewriting
-        // so it is treated as metadata, not as a file argument to normalize.
+        // Host workspace metadata is opt-in and HOST-OWNED. It is injected
+        // after path rewriting so it is treated as metadata, not as a file
+        // argument to normalize. The host-computed value ALWAYS wins: a
+        // caller-supplied `workspace_root` is overwritten (or stripped when
+        // the host cannot compute one) so a spoofed tool call can't point the
+        // plugin at a workspace outside the session root.
         if self.tool_def.accepts_host_config_key("workspace_root") {
             if let Some(obj) = effective_args.as_object_mut() {
-                if !obj.contains_key("workspace_root") {
-                    if let Some(root) =
-                        self.workspace_root_for_host_injection(effective_scope.as_deref())
-                    {
-                        obj.insert(
-                            "workspace_root".into(),
-                            serde_json::Value::String(root.to_string_lossy().into_owned()),
-                        );
+                let caller_supplied = obj.get("workspace_root").cloned();
+                match self.workspace_root_for_host_injection(effective_scope.as_deref()) {
+                    Some(root) => {
+                        let host_value =
+                            serde_json::Value::String(root.to_string_lossy().into_owned());
+                        if let Some(prev) = caller_supplied.filter(|prev| *prev != host_value) {
+                            tracing::warn!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                caller_workspace_root = %prev,
+                                host_workspace_root = %root.display(),
+                                "overriding caller-supplied workspace_root with host-computed value (host-owned metadata)"
+                            );
+                        }
+                        obj.insert("workspace_root".into(), host_value);
                         tracing::info!(
                             plugin = %self.plugin_name,
                             tool = %self.tool_def.name,
                             workspace_root = %root.display(),
                             "injected workspace_root into plugin args"
                         );
+                    }
+                    None => {
+                        if let Some(prev) = caller_supplied {
+                            obj.remove("workspace_root");
+                            tracing::warn!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                caller_workspace_root = %prev,
+                                "stripping caller-supplied workspace_root; host has no computed value (host-owned metadata)"
+                            );
+                        }
                     }
                 }
             }
@@ -4329,8 +4351,11 @@ mod tests {
         assert!(prepared.get("workspace_root").is_none());
     }
 
+    /// `workspace_root` is host-owned metadata: when the manifest opts in,
+    /// the host-computed value ALWAYS wins over a caller-supplied one, so a
+    /// spoofed tool call can't point the plugin outside the session root.
     #[test]
-    fn prepare_effective_args_does_not_overwrite_explicit_workspace_root() {
+    fn prepare_effective_args_overwrites_caller_supplied_workspace_root_with_host_value() {
         let workspace = tempfile::tempdir().unwrap();
         let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
         let ctx = ToolContext {
@@ -4353,7 +4378,40 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(prepared["workspace_root"], "/caller/workspace");
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref(),
+            "host-computed workspace_root must override the caller-supplied value"
+        );
+        assert_ne!(prepared["workspace_root"], "/caller/workspace");
+    }
+
+    /// When the manifest opts in but the host cannot compute a workspace
+    /// root (no scope, no work dir), a caller-supplied value is STRIPPED
+    /// rather than preserved — host-owned metadata never passes through
+    /// from the caller.
+    #[test]
+    fn prepare_effective_args_strips_caller_supplied_workspace_root_without_host_value() {
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool
+            .prepare_effective_args(
+                &json!({
+                    "path": "docs/report.md",
+                    "workspace_root": "/caller/workspace"
+                }),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prepared.get("workspace_root").is_none(),
+            "caller-supplied workspace_root must be stripped when the host has no computed value"
+        );
     }
 
     #[test]
