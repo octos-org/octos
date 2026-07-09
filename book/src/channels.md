@@ -374,8 +374,10 @@ The `wecom-bot` channel uses an outbound WebSocket connection -- no public URL o
 
 Matrix is a first-class channel and the transport behind the human-approval and management-bot features referenced throughout this chapter. Feature-gated behind `matrix`. Two modes are supported via the `mode` setting:
 
-- **`user`** (default) — logs in as an ordinary Matrix account via the Client-Server API and `/sync`. Works with any account on any homeserver; no server-side registration needed.
+- **`user`** — logs in as an ordinary Matrix account via the Client-Server API and `/sync`. Works with any account on any homeserver; no server-side registration needed.
 - **`appservice`** — registers as an application service against a homeserver you control (Conduit/conduwuit/Synapse), enabling per-user bot puppets.
+
+When `mode` is omitted the gateway falls back to **`appservice`** (which then requires `as_token`/`hs_token`), so set `"mode": "user"` explicitly for ordinary account login.
 
 ### User mode
 
@@ -389,13 +391,13 @@ Matrix is a first-class channel and the transport behind the human-approval and 
     "access_token": "syt_...",
     "device_name": "octos",
     "rooms": ["!roomid:matrix.org"],
-    "group_policy": "allowlist",
-    "auto_join_allowlist": ["@owner:matrix.org"]
+    "auto_join": "allowlist",
+    "auto_join_allowlist": ["!roomid:matrix.org", "#alias:matrix.org"]
   }
 }
 ```
 
-Provide either an `access_token` (preferred) or a `password` to log in. `group_policy` (`allowlist` / `all`) controls which rooms the bot acts in; `auto_join_allowlist` lists senders whose invites are auto-accepted. `OCTOS_MATRIX_BOT_USER_ID` and `MATRIX_APPROVER` may be supplied via the environment.
+Provide either an `access_token` (preferred) or a `password` to log in. `auto_join` (`off` / `allowlist` / `always`) controls invite auto-accept; under `allowlist`, `auto_join_allowlist` lists the **room IDs / aliases** (or `*`) whose invites are accepted — matched against rooms, not inviter user IDs — and falls back to `rooms` when empty. `OCTOS_MATRIX_BOT_USER_ID` and `MATRIX_APPROVER` may be supplied via the environment.
 
 ### Appservice mode
 

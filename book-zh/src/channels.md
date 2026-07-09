@@ -374,8 +374,10 @@ cargo build --release -p octos-cli --features dingtalk
 
 Matrix 是一等公民频道，也是本章多处提到的「人工审批」与「管理机器人」功能背后的传输层。由 `matrix` 特性门控。通过 `mode` 设置支持两种模式：
 
-- **`user`**（默认）——以普通 Matrix 账户身份通过 Client-Server API 与 `/sync` 登录。可用于任意 homeserver 上的任意账户，无需服务端注册。
+- **`user`**——以普通 Matrix 账户身份通过 Client-Server API 与 `/sync` 登录。可用于任意 homeserver 上的任意账户，无需服务端注册。
 - **`appservice`**——以应用服务（application service）身份注册到你自控的 homeserver（Conduit/conduwuit/Synapse），可为每个用户提供 bot 分身。
+
+当省略 `mode` 时，网关会回退到 **`appservice`**（此时需要 `as_token`/`hs_token`），因此进行普通账户登录时请显式设置 `"mode": "user"`。
 
 ### user 模式
 
@@ -389,13 +391,13 @@ Matrix 是一等公民频道，也是本章多处提到的「人工审批」与�
     "access_token": "syt_...",
     "device_name": "octos",
     "rooms": ["!roomid:matrix.org"],
-    "group_policy": "allowlist",
-    "auto_join_allowlist": ["@owner:matrix.org"]
+    "auto_join": "allowlist",
+    "auto_join_allowlist": ["!roomid:matrix.org", "#alias:matrix.org"]
   }
 }
 ```
 
-登录时提供 `access_token`（推荐）或 `password` 之一。`group_policy`（`allowlist` / `all`）控制 bot 在哪些房间生效；`auto_join_allowlist` 列出其邀请会被自动接受的发送者。`OCTOS_MATRIX_BOT_USER_ID` 与 `MATRIX_APPROVER` 也可通过环境变量提供。
+登录时提供 `access_token`（推荐）或 `password` 之一。`auto_join`（`off` / `allowlist` / `always`）控制邀请的自动接受；在 `allowlist` 下，`auto_join_allowlist` 列出被接受邀请的**房间 ID / 别名**（或 `*`）——按房间匹配，而非邀请者用户 ID——为空时回退到 `rooms`。`OCTOS_MATRIX_BOT_USER_ID` 与 `MATRIX_APPROVER` 也可通过环境变量提供。
 
 ### appservice 模式
 

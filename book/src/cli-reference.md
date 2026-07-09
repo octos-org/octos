@@ -232,24 +232,24 @@ Office file manipulation (DOCX/PPTX/XLSX). Native Rust implementation with no ex
 
 ```bash
 # Core (pure Rust)
-octos office extract <file>               # Extract text as Markdown
-octos office unpack <file> <output-dir>   # Unpack into pretty-printed XML
-octos office pack <input-dir> <output>    # Pack directory into Office file
-octos office clean <dir>                  # Remove orphaned files from unpacked PPTX
-octos office validate <file>              # Validate an Office file's structure
-octos office make-slide [OPTIONS]         # Generate a .pptx deck from Markdown/JSON
-octos office add-slide <file> [OPTIONS]   # Append a slide to an existing deck
-octos office overlay-text <file> [OPTIONS]# Overlay text onto slides
-octos office comment <file> [OPTIONS]     # Read/add document comments
-octos office accept-changes <file>        # Accept tracked changes (DOCX)
-octos office recalc <file>                # Recalculate formulas (XLSX)
+octos office extract <file>                     # Extract text as Markdown
+octos office unpack <file> <output-dir>         # Unpack into pretty-printed XML
+octos office pack <input-dir> <output>          # Pack directory into Office file
+octos office clean <dir>                        # Remove orphaned files from unpacked PPTX
+octos office validate <file>                    # Validate an Office file's structure
+octos office make-slide <image> -o <pptx>       # Compose a slide (bg image + --texts JSON overlays) into a .pptx
+octos office add-slide <unpacked-dir> <source>  # Add a slide to an unpacked PPTX (dup slideN.xml or apply slideLayoutN.xml)
+octos office overlay-text <file> [OPTIONS]      # Overlay text onto slides
+octos office comment <unpacked-dir> <id> <text> # Add a comment to an unpacked DOCX
+octos office accept-changes <input> <output>    # Accept tracked changes (DOCX) → clean copy
 
 # LibreOffice-backed (require `soffice` on PATH)
-octos office thumbnail <file> [OPTIONS]   # Render slide/page thumbnails
-octos office soffice <args...>            # Passthrough to a sandboxed soffice
+octos office recalc <file>                      # Recalculate XLSX formulas
+octos office thumbnail <file> [OPTIONS]         # Render slide/page thumbnails
+octos office soffice <args...>                  # Passthrough to a sandboxed soffice
 ```
 
-`make-slide` is the primary deck-authoring entry point used by the slides skill and the web Slides Studio. Office is **CLI-only** — it is not exposed as an agent tool.
+`make-slide` composes a rendered background image plus JSON text overlays into a `.pptx` slide (used by the slides pipeline). Office is **CLI-only** — it is not exposed as an agent tool. Run `octos office <subcommand> --help` for the exact arguments.
 
 ---
 
@@ -321,7 +321,7 @@ Generate reference documentation for the built-in tools and providers.
 octos docs [--output <DIR>]
 ```
 
-With no `--output` the Markdown is written to stdout; otherwise one file per topic is written into `<DIR>`. Useful for keeping downstream docs in sync with the compiled tool/provider set.
+With no `--output` the Markdown is written to stdout; otherwise it creates `<DIR>` and writes `<DIR>/TOOLS.md`. Useful for keeping downstream docs in sync with the compiled tool/provider set.
 
 ---
 
@@ -382,7 +382,7 @@ octos admin delete-tenant <id>                    # Remove a tenant
 octos admin show-tenant-config <id>               # Print the frpc config for a tenant
 octos admin reset-token                           # Reset the admin token (restores bootstrap auth)
 octos admin set-smtp-password                     # Write smtp_secret.json (0600) for OTP email
-octos admin operator-summary [--base-url <URL>] [--token <TOK>]  # Condensed runtime observability view
+octos admin operator-summary [--base-url <URL>] [--auth-token <TOK>]  # Condensed runtime observability view
 ```
 
 `create-tenant` defaults the base domain to `octos-cloud.org` and the local serve port to `50080` (matching `octos serve`). `reset-token` and `set-smtp-password` operate on the local `--data-dir`; `operator-summary` queries a running API.

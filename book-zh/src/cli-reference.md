@@ -221,24 +221,24 @@ Office 文件操作（DOCX/PPTX/XLSX）。核心操作使用原生 Rust 实现�
 
 ```bash
 # 核心（纯 Rust）
-octos office extract <file>               # 提取文本为 Markdown
-octos office unpack <file> <output-dir>   # 解包为格式化的 XML
-octos office pack <input-dir> <output>    # 将目录打包为 Office 文件
-octos office clean <dir>                  # 清理解包后 PPTX 中的孤立文件
-octos office validate <file>              # 校验 Office 文件的结构
-octos office make-slide [OPTIONS]         # 从 Markdown/JSON 生成 .pptx 演示文稿
-octos office add-slide <file> [OPTIONS]   # 向现有演示文稿追加幻灯片
-octos office overlay-text <file> [OPTIONS]# 在幻灯片上叠加文本
-octos office comment <file> [OPTIONS]     # 读取/添加文档批注
-octos office accept-changes <file>        # 接受修订（DOCX）
-octos office recalc <file>                # 重新计算公式（XLSX）
+octos office extract <file>                     # 提取文本为 Markdown
+octos office unpack <file> <output-dir>         # 解包为格式化的 XML
+octos office pack <input-dir> <output>          # 将目录打包为 Office 文件
+octos office clean <dir>                        # 清理解包后 PPTX 中的孤立文件
+octos office validate <file>                    # 校验 Office 文件的结构
+octos office make-slide <image> -o <pptx>       # 将背景图 + --texts JSON 叠加文本合成为一张 .pptx 幻灯片
+octos office add-slide <unpacked-dir> <source>  # 向解包后的 PPTX 添加幻灯片（复制 slideN.xml 或套用 slideLayoutN.xml）
+octos office overlay-text <file> [OPTIONS]      # 在幻灯片上叠加文本
+octos office comment <unpacked-dir> <id> <text> # 向解包后的 DOCX 添加批注
+octos office accept-changes <input> <output>    # 接受修订（DOCX）→ 干净副本
 
 # 依赖 LibreOffice（需 PATH 中有 `soffice`）
-octos office thumbnail <file> [OPTIONS]   # 渲染幻灯片/页面缩略图
-octos office soffice <args...>            # 透传到沙箱化的 soffice
+octos office recalc <file>                      # 重新计算 XLSX 公式
+octos office thumbnail <file> [OPTIONS]         # 渲染幻灯片/页面缩略图
+octos office soffice <args...>                  # 透传到沙箱化的 soffice
 ```
 
-`make-slide` 是主要的演示文稿创作入口，被 slides 技能和 Web 版 Slides Studio 使用。Office 是**仅 CLI** 功能——不作为 agent 工具暴露。
+`make-slide` 将渲染好的背景图与 JSON 叠加文本合成为一张 `.pptx` 幻灯片（供 slides 流水线使用）。Office 是**仅 CLI** 功能——不作为 agent 工具暴露。运行 `octos office <子命令> --help` 查看确切参数。
 
 ---
 
@@ -310,7 +310,7 @@ octos doctor [OPTIONS]
 octos docs [--output <DIR>]
 ```
 
-未指定 `--output` 时将 Markdown 写到标准输出；否则按主题逐个写入 `<DIR>`。可用于让下游文档与已编译的工具/供应商集合保持同步。
+未指定 `--output` 时将 Markdown 写到标准输出；否则创建 `<DIR>` 并写入 `<DIR>/TOOLS.md`。可用于让下游文档与已编译的工具/供应商集合保持同步。
 
 ---
 
@@ -371,7 +371,7 @@ octos admin delete-tenant <id>                    # 删除租户
 octos admin show-tenant-config <id>               # 打印某租户的 frpc 配置
 octos admin reset-token                           # 重置管理员令牌（恢复引导令牌认证）
 octos admin set-smtp-password                     # 写入 smtp_secret.json（0600）用于 OTP 邮件
-octos admin operator-summary [--base-url <URL>] [--token <TOK>]  # 精简的运行时可观测性视图
+octos admin operator-summary [--base-url <URL>] [--auth-token <TOK>]  # 精简的运行时可观测性视图
 ```
 
 `create-tenant` 默认基础域名为 `octos-cloud.org`、本地 serve 端口为 `50080`（与 `octos serve` 一致）。`reset-token` 与 `set-smtp-password` 作用于本地 `--data-dir`；`operator-summary` 查询运行中的 API。
