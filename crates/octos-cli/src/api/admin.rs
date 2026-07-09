@@ -1692,6 +1692,7 @@ pub async fn operator_summary(
         sources.push(super::metrics::OperatorSummarySourceInput {
             scope: "serve".to_string(),
             profile_id: None,
+            running: true,
             scrape_status: "local".to_string(),
             scrape_error: None,
             api_port: None,
@@ -1705,6 +1706,29 @@ pub async fn operator_summary(
     let mut statuses = pm.all_statuses().await.into_iter().collect::<Vec<_>>();
     statuses.sort_by(|left, right| left.0.cmp(&right.0));
     for (profile_id, status) in statuses {
+        // `all_statuses()` also surfaces non-running profiles (configuration
+        // errors). They have no gateway to scrape — report them as their own
+        // state instead of a running gateway with a missing API port.
+        if !status.running {
+            let scrape_status = match status.status {
+                crate::process_manager::ProcessState::ConfigurationError => "configuration_error",
+                _ => "not_running",
+            };
+            sources.push(super::metrics::OperatorSummarySourceInput {
+                scope: "gateway".to_string(),
+                profile_id: Some(profile_id),
+                running: false,
+                scrape_status: scrape_status.to_string(),
+                scrape_error: status.error,
+                api_port: None,
+                pid: None,
+                started_at: None,
+                uptime_secs: None,
+                metrics_text: None,
+            });
+            continue;
+        }
+
         let api_port = pm.api_port(&profile_id).await;
         let (scrape_status, scrape_error, metrics_text) = match api_port {
             Some(port) => match scrape_gateway_metrics(&state.http_client, port).await {
@@ -1724,6 +1748,7 @@ pub async fn operator_summary(
         sources.push(super::metrics::OperatorSummarySourceInput {
             scope: "gateway".to_string(),
             profile_id: Some(profile_id),
+            running: true,
             scrape_status,
             scrape_error,
             api_port,
@@ -1779,7 +1804,26 @@ pub async fn operator_tasks(
     let mut inputs: Vec<super::metrics::OperatorTaskInput> = Vec::new();
     let mut sources: Vec<super::metrics::OperatorTaskSource> = Vec::new();
 
-    for (profile_id, _status) in statuses {
+    for (profile_id, status) in statuses {
+        // Non-running profiles (configuration errors) have no gateway to
+        // scrape tasks from — surface them as their own state instead of a
+        // running gateway with a missing API port.
+        if !status.running {
+            let source_status = match status.status {
+                crate::process_manager::ProcessState::ConfigurationError => "configuration_error",
+                _ => "not_running",
+            };
+            sources.push(super::metrics::OperatorTaskSource {
+                profile_id: profile_id.clone(),
+                status: source_status.into(),
+                error: status.error,
+                api_port: None,
+                session_count: 0,
+                task_count: 0,
+            });
+            continue;
+        }
+
         let api_port = pm.api_port(&profile_id).await;
         let Some(port) = api_port else {
             sources.push(super::metrics::OperatorTaskSource {
