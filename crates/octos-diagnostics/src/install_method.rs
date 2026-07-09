@@ -343,7 +343,7 @@ mod tests {
 
     fn octos_spec() -> ProductSpec {
         ProductSpec::new("octos", "octos", "1.0.0", "octos-org/octos", "octos-bundle")
-            .with_brew_formula("octos-org/tap/octos")
+            .with_brew_formula("octos-org/octos/octos")
             .with_npm_package("@octos-org/octos")
             .with_cargo_install("octos-cli")
             .with_cargo_dist_app("octos")
@@ -436,7 +436,7 @@ mod tests {
         );
         assert_eq!(
             InstallMethod::Homebrew.upgrade_hint(&spec).unwrap(),
-            "brew update && brew upgrade octos-org/tap/octos"
+            "brew update && brew upgrade octos-org/octos/octos"
         );
         assert_eq!(
             InstallMethod::Npm.upgrade_hint(&spec).unwrap(),

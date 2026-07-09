@@ -193,7 +193,7 @@ mod tests {
 
     fn octos_spec() -> ProductSpec {
         ProductSpec::new("octos", "octos", "1.0.0", "octos-org/octos", "octos-bundle")
-            .with_brew_formula("octos-org/tap/octos")
+            .with_brew_formula("octos-org/octos/octos")
             .with_cargo_dist_app("octos")
     }
 

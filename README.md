@@ -10,7 +10,8 @@ The fastest way to a working assistant, on the supported platforms (macOS Apple 
 
 ```bash
 # 1. Install
-brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
+brew tap octos-org/octos https://github.com/octos-org/octos
+brew install octos-org/octos/octos      # or: npm install -g @octos-org/octos
 
 # 2. Choose your AI provider and a model (interactive — pick a real
 #    model name; some providers reject the "auto" default)
@@ -153,8 +154,9 @@ grep OCTOS_AUTH_TOKEN /etc/systemd/system/octos-serve.service
 Alternatively, install just the binaries (the `octos` server plus its bundled skills) via a package manager:
 
 ```bash
-# Homebrew (macOS Apple Silicon, Linux x86_64/ARM64)
-brew install octos-org/tap/octos
+# Homebrew (macOS Apple Silicon, Linux x86_64/ARM64) — this repo is its own tap
+brew tap octos-org/octos https://github.com/octos-org/octos
+brew install octos-org/octos/octos
 
 # npm (macOS Apple Silicon, Linux x86_64/ARM64, Windows x64)
 npm install -g @octos-org/octos
