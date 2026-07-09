@@ -1807,6 +1807,13 @@ impl ToolRegistry {
         registry.register(ToolSearchTool::new(catalog_cell.clone()));
         registry.register(ToolSuggestTool::new(catalog_cell));
         registry.refresh_live_catalog();
+        // yolo GAP #2: plugin tools are carried across the snapshot unchanged,
+        // so thread the session approval context into them here — the same
+        // permissions the built-in shell/coding tools were just re-registered
+        // with above. Under a `never`/DangerFullAccess session this makes the
+        // manifest risk gate honor `ApprovalPolicy` instead of always
+        // prompting.
+        registry.apply_permissions_to_plugin_tools(permissions);
         registry
     }
 
@@ -1824,6 +1831,43 @@ impl ToolRegistry {
                 tool.as_any()
                     .downcast_ref::<PluginTool>()
                     .map(|pt| (name.clone(), pt.clone_with_work_dir(work_dir.to_path_buf())))
+            })
+            .collect();
+        for (name, new_tool) in replacements {
+            self.tools.insert(name, Arc::new(new_tool));
+        }
+    }
+
+    /// yolo GAP #2: thread the session's approval context into every
+    /// `PluginTool` so the manifest risk gate honors `ApprovalPolicy` the
+    /// same way the shell/coding tools do.
+    ///
+    /// `rebind_cwd_with_permissions` re-registers built-in tools with the
+    /// session `EffectivePermissions`, but plugin tools are carried across
+    /// the snapshot unchanged — so a `high`/`critical`-risk plugin would
+    /// otherwise still prompt in a `never`/DangerFullAccess session. This
+    /// pass replaces each plugin tool with a copy that carries:
+    ///   * `approval_policy` — under `Never`, the risk gate denies without
+    ///     prompting (parity with shell.rs);
+    ///   * `auto_approve_high_risk` — set from `permissions.is_dangerous()`,
+    ///     so a DangerFullAccess ("yolo") context auto-allows the gate
+    ///     (parity with the shell tools swapping in `AllowAllPolicy`).
+    ///
+    /// Called automatically at the end of `rebind_cwd_with_permissions`.
+    pub fn apply_permissions_to_plugin_tools(&mut self, permissions: EffectivePermissions) {
+        use crate::plugins::PluginTool;
+        let approval_policy = permissions.approval_policy;
+        let auto_approve = permissions.is_dangerous();
+        let replacements: Vec<_> = self
+            .tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                tool.as_any().downcast_ref::<PluginTool>().map(|pt| {
+                    (
+                        name.clone(),
+                        pt.clone_with_permissions(approval_policy, auto_approve),
+                    )
+                })
             })
             .collect();
         for (name, new_tool) in replacements {

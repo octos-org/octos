@@ -58,6 +58,40 @@ fn request_host(headers: &HeaderMap) -> Option<String> {
     Some(strip_port_from_host(&raw).to_string())
 }
 
+/// The endpoint URL a scanning client should dial: original authority
+/// (host AND port — `request_host` strips the port, which would send
+/// scanners to :80/:443, codex P2) plus `X-Forwarded-Proto` when a
+/// reverse proxy supplies it, else https with a loopback http fallback.
+fn request_endpoint(headers: &HeaderMap) -> Option<String> {
+    let authority = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|p| p == "http" || p == "https");
+    let scheme = forwarded_proto.unwrap_or_else(|| {
+        let host_only = strip_port_from_host(&authority);
+        if host_only == "localhost" || host_only.starts_with("127.") || host_only == "::1" {
+            "http".to_string()
+        } else {
+            "https".to_string()
+        }
+    });
+    Some(format!("{scheme}://{authority}"))
+}
+
 fn strip_port_from_host(host: &str) -> &str {
     if let Some(stripped) = host.strip_prefix('[') {
         return stripped.split(']').next().unwrap_or(host);
@@ -922,6 +956,163 @@ pub async fn my_profile(
         status,
     }))
 }
+
+#[derive(Deserialize, Default)]
+pub struct MyProfileQrQuery {
+    #[serde(default)]
+    pub include_secrets: bool,
+    /// Endpoint URL to embed; defaults to the request host.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// Whether an env-var value may be resolved into a QR export for
+/// `profile_id`: plain values always; `keychain:` markers ONLY when they
+/// point at the profile's own scoped account (`VAR::profile_id`). Bare
+/// (`keychain:VAR`) and foreign-scoped markers are refused — both can
+/// address keychain items the profile does not own.
+pub(crate) fn marker_allowed_for_export(raw: &str, var: &str, profile_id: &str) -> bool {
+    if !crate::auth::keychain::is_marker(raw) {
+        return true;
+    }
+    raw == crate::auth::keychain::marker_for(&crate::auth::keychain::scoped_account(
+        var, profile_id,
+    ))
+}
+
+/// Build the QR wire payload from a stored [`crate::profiles::UserProfile`].
+///
+/// Secrets are the profile's OWN `env_vars` entries referenced by its
+/// LLM routes (`api_key_env` on primary + fallbacks) — never the host
+/// process env or auth store, so a tenant export can only ever carry
+/// tenant-scoped credentials. Sub-account inheritance is NOT resolved
+/// here: the payload mirrors the profile as stored.
+pub(crate) fn payload_from_user_profile(
+    profile: &crate::profiles::UserProfile,
+    include_secrets: bool,
+) -> eyre::Result<crate::profile_qr::ProfileQrPayload> {
+    use eyre::WrapErr;
+
+    let mut payload = crate::profile_qr::ProfileQrPayload::new(&profile.id);
+    payload.name = Some(profile.name.clone());
+    if let Some(ref llm) = profile.config.llm {
+        payload.llm = Some(serde_json::to_value(llm).wrap_err("serialize llm config")?);
+    }
+    if let Some(ref memory) = profile.config.memory {
+        payload.memory = Some(serde_json::to_value(memory).wrap_err("serialize memory config")?);
+    }
+    payload.voice_default = profile.config.voice_default.clone();
+
+    if include_secrets {
+        if let Some(ref llm) = profile.config.llm {
+            let routes = llm
+                .primary
+                .iter()
+                .chain(llm.fallbacks.iter())
+                .filter_map(|selection| selection.route.as_ref());
+            for route in routes {
+                let Some(ref var) = route.api_key_env else {
+                    continue;
+                };
+                let Some(raw) = profile.config.env_vars.get(var) else {
+                    continue;
+                };
+                if !marker_allowed_for_export(raw, var, &profile.id) {
+                    // A profile may persist an ARBITRARY keychain marker
+                    // suffix ("keychain:VERTEX_SA_JSON::admin"); resolving
+                    // it here would exfiltrate another tenant's (or the
+                    // host's) keychain item through the QR (codex P1).
+                    continue;
+                }
+                let Some(value) = crate::auth::keychain::resolve_value(var, raw)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                payload.secrets.entry(var.clone()).or_insert(value);
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+/// GET /api/my/profile/qr
+///
+/// Export the caller's profile as an `OCTOS1:`/`OCTOS1E:` payload for
+/// client-side QR rendering. With `include_secrets=true` the payload is
+/// ALWAYS PIN-wrapped (`OCTOS1E`) — there is no plain-secrets override
+/// over the API — and the one-time PIN is returned beside the payload,
+/// so a screenshotted or logged QR image alone reveals nothing.
+pub async fn my_profile_qr(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Query(query): Query<MyProfileQrQuery>,
+) -> Result<
+    (
+        axum::response::AppendHeaders<[(axum::http::HeaderName, &'static str); 2]>,
+        Json<serde_json::Value>,
+    ),
+    (StatusCode, String),
+> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "profile store not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+
+    let mut payload = payload_from_user_profile(&profile, query.include_secrets)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    payload.endpoint = query.endpoint.or_else(|| request_endpoint(&headers));
+
+    let (encoded, pin) = if payload.has_secrets() {
+        // The Argon2id profile is deliberately heavy (64 MiB, t=3) — run
+        // it OFF the async workers, and bound concurrent secret exports
+        // so parallel requests can't pin N×64 MiB + all Tokio workers
+        // (codex round-2 P2).
+        let _permit = SECRET_EXPORT_LIMIT.try_acquire().map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent secret exports; retry shortly".to_string(),
+            )
+        })?;
+        let pin = crate::profile_qr::generate_pin();
+        let sealed_payload = payload.clone();
+        let sealed_pin = pin.clone();
+        let encoded = tokio::task::spawn_blocking(move || {
+            crate::profile_qr::encode_encrypted(&sealed_payload, &sealed_pin)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, Some(pin))
+    } else {
+        let encoded = crate::profile_qr::encode_plain(&payload, false)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, None)
+    };
+
+    // The response body carries everything needed to decrypt the exported
+    // keys (payload + transfer secret) — it must never land in a shared
+    // cache or be persisted by an intermediary (codex round-2 P2).
+    Ok((
+        axum::response::AppendHeaders([
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ]),
+        Json(serde_json::json!({
+            "payload": encoded,
+            "pin": pin,
+            "profile_id": profile.id,
+        })),
+    ))
+}
+
+/// Bounded concurrency for PIN-wrapped profile exports: each runs a
+/// 64 MiB Argon2id derivation on the blocking pool.
+static SECRET_EXPORT_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// GET /api/my/profile/skills
 pub async fn my_profile_skills(
@@ -3452,6 +3643,152 @@ mod tests {
     use crate::user_store::UserStore;
     use axum::http::HeaderMap;
     use axum::http::Request;
+
+    // --- payload_from_user_profile (profile QR export) ---
+
+    fn qr_profile_fixture() -> crate::profiles::UserProfile {
+        let mut profile = crate::profiles::UserProfile {
+            id: "ada".into(),
+            name: "Ada".into(),
+            public_subdomain: None,
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-pro".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    route_id: None,
+                    label: None,
+                    base_url: None,
+                    api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                    api_type: None,
+                }),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: vec![],
+        });
+        profile
+            .config
+            .env_vars
+            .insert("DEEPSEEK_API_KEY".into(), "sk-profile-key".into());
+        profile.config.env_vars.insert(
+            "TELEGRAM_BOT_TOKEN".into(),
+            "bot-token-must-not-leak".into(),
+        );
+        profile
+    }
+
+    #[test]
+    fn qr_payload_without_secrets_masks_nothing_because_nothing_is_included() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, false).unwrap();
+        assert_eq!(payload.id, "ada");
+        assert_eq!(payload.name.as_deref(), Some("Ada"));
+        assert!(payload.llm.is_some());
+        assert!(payload.secrets.is_empty());
+        assert!(!payload.has_secrets());
+    }
+
+    #[test]
+    fn qr_payload_with_secrets_includes_only_llm_route_referenced_vars() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        assert_eq!(payload.secrets["DEEPSEEK_API_KEY"], "sk-profile-key");
+        assert!(
+            !payload.secrets.contains_key("TELEGRAM_BOT_TOKEN"),
+            "env vars not referenced by an LLM route must not ride along"
+        );
+    }
+
+    #[test]
+    fn qr_export_refuses_foreign_and_bare_keychain_markers() {
+        // plain values export
+        assert!(marker_allowed_for_export(
+            "sk-plain",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // own scoped marker exports
+        assert!(marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // ANOTHER tenant's scoped account: refuse (exfiltration vector)
+        assert!(!marker_allowed_for_export(
+            "keychain:VERTEX_SA_JSON::admin",
+            "VERTEX_SA_JSON",
+            "ada"
+        ));
+        // bare marker addresses a host-level item: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // marker under a DIFFERENT var name than referenced: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:OTHER_VAR::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+    }
+
+    #[test]
+    fn qr_endpoint_keeps_port_and_honors_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://localhost:50080"),
+            "authority (incl. port) must survive; loopback defaults to http"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "ada.crew.example.com".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("https://ada.crew.example.com")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::1]:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://[::1]:50080"),
+            "bracketed IPv6 loopback is local, not https"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            "ada.crew.example.com:8443".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://ada.crew.example.com:8443"),
+            "reverse-proxy proto must win over the https default"
+        );
+    }
+
+    #[test]
+    fn qr_payload_secrets_round_trip_pin_wrapped() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        let encoded = crate::profile_qr::encode_encrypted(&payload, "246810").unwrap();
+        let decoded = crate::profile_qr::decode(&encoded, Some("246810")).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(crate::profile_qr::decode(&encoded, Some("000000")).is_err());
+    }
 
     // --- relocate_secret_to_keychain ---
 

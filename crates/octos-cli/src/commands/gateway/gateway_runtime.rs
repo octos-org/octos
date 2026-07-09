@@ -648,7 +648,12 @@ impl GatewayRuntime {
         // are NOT registered in the base registry — they are created per-session
         // by the ActorFactory to eliminate the set_context() race condition.
 
-        // Store config needed for per-session tool creation
+        // Store config needed for per-session tool creation.
+        // Resolve the gateway's embedding provider ONCE; the pipeline
+        // factory and the ActorFactory share this handle (codex P3:
+        // duplicate resolves doubled keychain lookups and logs).
+        let gateway_embedder =
+            create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
         let provider_policy_for_factory: Option<octos_agent::ToolPolicy>;
         let worker_prompt_for_factory: Option<String>;
         let provider_router_for_factory: Option<Arc<ProviderRouter>>;
@@ -1089,8 +1094,7 @@ impl GatewayRuntime {
                 // recall the gateway's own session agent gets via
                 // `ActorFactory::embedder` -> `with_embedder` (see
                 // session_actor.rs).
-                let embedder_c =
-                    create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+                let embedder_c = gateway_embedder.clone();
 
                 pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
                     llm: llm_c,
@@ -1374,7 +1378,7 @@ impl GatewayRuntime {
             tool_policy: config.tool_policy.clone(),
             worker_prompt: worker_prompt_for_factory,
             provider_router: provider_router_for_factory,
-            embedder: create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: gateway_embedder.clone(),
             active_sessions: active_sessions.clone(),
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
@@ -1707,6 +1711,7 @@ impl GatewayRuntime {
             pending_messages.clone(),
             out_tx.clone(),
         )
+        .with_session_delete_tx(session_delete_tx.clone())
         .with_data_dir(data_dir.clone());
 
         // Drop the original out_tx — factory and registry hold their own clones.

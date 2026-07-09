@@ -45,7 +45,12 @@ fn main() -> Result<()> {
     // `octos acp` speaks ACP JSON-RPC on STDOUT, so its logs MUST NOT touch
     // stdout — one stray log line corrupts the protocol stream and strict
     // clients (Zed) reject it all with a -32700 parse error. Route to stderr.
-    let reserve_stdout = matches!(args.command, commands::Command::Acp(_));
+    // `octos profile` emits payloads meant for `$(...)` capture and piping
+    // (`qr --payload-only`, `decode`), so it reserves stdout the same way.
+    let reserve_stdout = matches!(
+        args.command,
+        commands::Command::Acp(_) | commands::Command::Profile(_)
+    );
     let _log_guard = init_tracing(log_dir.as_deref(), reserve_stdout)?;
 
     args.command.execute()

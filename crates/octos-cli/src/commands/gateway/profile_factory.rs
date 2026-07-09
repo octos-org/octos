@@ -624,6 +624,13 @@ impl ProfileActorFactoryBuilder {
         let mut actor_plugin_dirs: Vec<PathBuf> = Vec::new();
         let mut actor_plugin_env: Vec<(String, String)> = Vec::new();
 
+        // Resolve the profile's embedding provider ONCE; the child
+        // pipeline factory and the ActorFactory below share this handle
+        // (codex P3: duplicate resolves broke the single-handle
+        // invariant and doubled keychain lookups).
+        let profile_embedder =
+            create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
         // build their own fresh registry (full tools, no admin API).
@@ -911,11 +918,10 @@ impl ProfileActorFactoryBuilder {
             }
 
             // NEW-06 fix: the parent ActorFactory's session agent gets
-            // its embedder from `create_embedder(profile_config)`; mirror
-            // that here so child-profile pipeline workers run on the
-            // same contamination-safe hybrid memory path.
-            let child_pipeline_embedder = create_embedder(&profile_config)
-                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            // its embedder from the shared single resolve below; hand the
+            // same handle here so child-profile pipeline workers run on
+            // the same contamination-safe hybrid memory path.
+            let child_pipeline_embedder = profile_embedder.clone();
 
             pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
                 llm: llm.clone(),
@@ -997,8 +1003,7 @@ impl ProfileActorFactoryBuilder {
             tool_policy: profile_config.tool_policy.clone(),
             worker_prompt,
             provider_router,
-            embedder: create_embedder(&profile_config)
-                .map(|embedder| embedder as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: profile_embedder,
             active_sessions: self.active_sessions.clone(),
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
