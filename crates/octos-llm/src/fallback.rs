@@ -84,6 +84,9 @@ impl LlmProvider for FallbackProvider {
         match self.primary.chat(messages, tools, config).await {
             Ok(resp) => Ok(resp),
             Err(primary_err) => {
+                if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
+                    return Err(primary_err);
+                }
                 if !RetryProvider::should_failover(&primary_err) {
                     return Err(primary_err);
                 }
@@ -129,6 +132,9 @@ impl LlmProvider for FallbackProvider {
         match self.primary.chat_stream(messages, tools, config).await {
             Ok(stream) => Ok(stream),
             Err(primary_err) => {
+                if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
+                    return Err(primary_err);
+                }
                 if !RetryProvider::should_failover(&primary_err) {
                     return Err(primary_err);
                 }
@@ -171,5 +177,176 @@ impl LlmProvider for FallbackProvider {
     fn report_stream_metrics(&self, output_tokens: u32, stream_duration_us: u64) {
         self.primary
             .report_stream_metrics(output_tokens, stream_duration_us);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use eyre::Result;
+    use octos_core::Message;
+
+    use super::FallbackProvider;
+    use crate::config::ChatConfig;
+    use crate::error::{LlmError, LlmErrorKind};
+    use crate::provider::LlmProvider;
+    use crate::types::{ChatResponse, ChatStream, StopReason, TokenUsage, ToolSpec};
+
+    /// A provider with a shared call counter that either always errors or
+    /// always succeeds, depending on how it was constructed.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+        mode: CountingMode,
+    }
+
+    enum CountingMode {
+        AlwaysErr500,
+        AlwaysOk,
+    }
+
+    impl CountingProvider {
+        fn always_err_500() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                mode: CountingMode::AlwaysErr500,
+            }
+        }
+
+        fn ok() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                mode: CountingMode::AlwaysOk,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                CountingMode::AlwaysErr500 => Err(LlmError::new(
+                    LlmErrorKind::ServerError { status: 500 },
+                    "internal server error",
+                )
+                .into()),
+                CountingMode::AlwaysOk => Ok(ChatResponse {
+                    content: Some("ok".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                }),
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                CountingMode::AlwaysErr500 => Err(LlmError::new(
+                    LlmErrorKind::ServerError { status: 500 },
+                    "internal server error",
+                )
+                .into()),
+                CountingMode::AlwaysOk => {
+                    let stream = futures::stream::empty();
+                    Ok(Box::pin(stream))
+                }
+            }
+        }
+
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_not_failover_when_failfast() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+
+        let primary = CountingProvider::always_err_500();
+        let fallback = CountingProvider::ok();
+        let fb_calls = fallback.calls.clone();
+        let chain = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            chain.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "FailFast returns primary error, no failover"
+        );
+        assert_eq!(
+            fb_calls.load(Ordering::SeqCst),
+            0,
+            "fallback must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_failover_stream_when_failfast() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+
+        let primary = CountingProvider::always_err_500();
+        let fallback = CountingProvider::ok();
+        let fb_calls = fallback.calls.clone();
+        let chain = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            chain.chat_stream(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "FailFast returns primary error, no failover"
+        );
+        assert_eq!(
+            fb_calls.load(Ordering::SeqCst),
+            0,
+            "fallback must not be called on stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_failover_when_normal_policy() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+
+        let primary = CountingProvider::always_err_500();
+        let fallback = CountingProvider::ok();
+        let fb_calls = fallback.calls.clone();
+        let chain = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_ok(), "Normal policy should failover and succeed");
+        assert_eq!(
+            fb_calls.load(Ordering::SeqCst),
+            1,
+            "fallback must be called once"
+        );
     }
 }

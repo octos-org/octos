@@ -29,6 +29,7 @@ pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod mcp_server;
 pub mod memory_segment;
 pub mod permissions;
@@ -86,6 +87,7 @@ pub use agent::{
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
     rich_output,
+    turn_failure::{TurnFailure, is_voice_empty_response},
     verifier::{
         AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
         VerifierVerdict,
@@ -176,9 +178,9 @@ pub use task_supervisor::{
     TaskSupervisor, TerminalEvent, TerminalOutcome, parse_alternatives,
 };
 pub use tools::{
-    ActivateToolsTool, AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload,
-    BrowserTool, CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass,
-    ConfigureToolTool, DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+    AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
+    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass, ConfigureToolTool,
+    DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,
     DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool,
     DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,

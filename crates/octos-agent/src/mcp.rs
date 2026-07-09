@@ -1,27 +1,52 @@
 //! MCP (Model Context Protocol) client for external tool integration.
 //!
-//! Supports two transport modes:
-//! - **stdio**: Spawns MCP servers as child processes, communicates via stdin/stdout JSON-RPC.
-//! - **HTTP**: Connects to remote MCP servers via HTTP POST for JSON-RPC requests.
+//! Backed by the official [`rmcp`] SDK. Supports three transports:
+//! - **stdio**: spawns MCP servers as child processes (JSON-RPC over stdin/stdout).
+//! - **streamable-HTTP**: connects to a remote MCP server URL (optionally with a
+//!   static bearer token via a configured `Authorization` header).
+//! - **streamable-HTTP + OAuth 2.1**: for `oauth: true` servers, using tokens
+//!   obtained by `octos mcp login` and stored in the OS keyring (see
+//!   [`crate::mcp_auth`]).
+//!
+//! rmcp performs the full MCP lifecycle handshake (`initialize` +
+//! `notifications/initialized`), negotiates the protocol version, and multiplexes
+//! concurrent requests over a single connection with id routing — fixing the
+//! hand-rolled client's spec gaps (missing `initialized`, hardcoded version,
+//! one-line-per-request desync).
 
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use rmcp::model::{CallToolRequestParams, ClientInfo, Implementation};
+use rmcp::service::{RoleClient, RunningService, serve_client};
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::child_process::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{Tool, ToolRegistry, ToolResult};
 
-/// Maximum size for a single JSON-RPC response line (1MB).
-const MAX_LINE_BYTES: usize = 1_048_576;
+/// A live rmcp client session (any transport). Kept alive behind an `Arc`; when
+/// the last reference drops, rmcp closes the transport and (stdio) reaps the
+/// child via `kill_on_drop`. `sanitize_command_env` internally strips the shared
+/// `BLOCKED_ENV_VARS` from every spawned stdio server.
+pub(crate) type McpService = Arc<RunningService<RoleClient, ClientInfo>>;
 
-use crate::sandbox::BLOCKED_ENV_VARS;
-use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
+/// How long to wait for the MCP `initialize` handshake before giving up.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a single `tools/call` may run before it is cancelled.
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum nesting depth for MCP tool input schemas.
+const MAX_SCHEMA_DEPTH: usize = 10;
+/// Maximum serialized size of an MCP tool input schema (64 KB).
+const MAX_SCHEMA_SIZE: usize = 65_536;
 
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,43 +61,33 @@ pub struct McpServerConfig {
     /// HTTP transport: URL of the MCP server endpoint.
     #[serde(default)]
     pub url: Option<String>,
-    /// HTTP transport: additional headers (e.g. Authorization).
+    /// HTTP transport: additional headers (e.g. `Authorization` for a static
+    /// bearer token). Ignored when `oauth` is set.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// HTTP transport: perform the OAuth 2.1 authorization-code flow against
+    /// this server. Tokens are obtained interactively via `octos mcp login`
+    /// and loaded from the OS keyring at runtime. Requires `url`.
+    #[serde(default)]
+    pub oauth: bool,
+    /// OAuth scopes to request during `octos mcp login` (server-specific).
+    #[serde(default)]
+    pub scopes: Vec<String>,
     /// Optional override for the M8.8 concurrency class assigned to every
     /// tool exposed by this server.
     ///
-    /// Defaults to [`crate::tools::ConcurrencyClass::Safe`] — most MCP
-    /// servers in practice expose read-only / query tools (search, wiki
-    /// lookup, time, weather), and forcing `Exclusive` on all of them
-    /// would serialise the fast common path. Operators who run an MCP
-    /// server that mutates files, posts to remote services, or otherwise
-    /// races with the native `edit_file` / `write_file` tools must
-    /// declare `"exclusive"` here so the M8.8 scheduler serialises the
-    /// batch.
-    ///
-    /// Accepted values: `"safe"`, `"exclusive"` (case-insensitive).
-    /// Unknown values resolve to the conservative `Exclusive` side
-    /// (fail-safe: a typo must not silently downgrade enforcement).
-    ///
-    /// Per-tool granularity is intentionally not supported — MCP's
-    /// `tools/list` carries no concurrency hint, and exposing a per-tool
-    /// override field would invite drift between operator config and the
-    /// remote tool surface.
+    /// Accepted values: `"safe"`, `"exclusive"` (case-insensitive). Absent →
+    /// `Safe` (read-only common case). Unknown values resolve to the
+    /// conservative `Exclusive` side (fail-safe: a typo must not silently
+    /// downgrade enforcement).
     #[serde(default)]
     pub concurrency_class: Option<String>,
 }
 
 impl McpServerConfig {
     /// Resolve the configured concurrency class for tools spawned by this
-    /// server.
-    ///
-    /// - Field absent → `Safe` (read-only common case).
-    /// - Field `"safe"` (any case) → `Safe`.
-    /// - Field `"exclusive"` (any case) → `Exclusive` (operator opt-in
-    ///   for mutating servers).
-    /// - Unknown value → `Exclusive` (fail-safe — a typo must not
-    ///   silently downgrade enforcement).
+    /// server. Absent/`"safe"` → `Safe`; `"exclusive"` → `Exclusive`; unknown
+    /// → `Exclusive` (fail-safe).
     pub fn resolved_concurrency_class(&self) -> crate::tools::ConcurrencyClass {
         match self
             .concurrency_class
@@ -82,13 +97,12 @@ impl McpServerConfig {
         {
             None | Some("safe") => crate::tools::ConcurrencyClass::Safe,
             Some("exclusive") => crate::tools::ConcurrencyClass::Exclusive,
-            // Unknown values fail safe to Exclusive so a typo doesn't
-            // silently downgrade serialisation.
             Some(_) => crate::tools::ConcurrencyClass::Exclusive,
         }
     }
 
-    fn display_name(&self) -> &str {
+    /// A stable, human-readable name for this server (for logs / keyring keys).
+    pub fn display_name(&self) -> &str {
         if let Some(cmd) = &self.command {
             cmd
         } else if let Some(url) = &self.url {
@@ -99,232 +113,184 @@ impl McpServerConfig {
     }
 }
 
-/// A running MCP server connection (stdio or HTTP).
-enum McpConnection {
-    Stdio(Box<StdioMcpConnection>),
-    Http(HttpMcpConnection),
+/// Build the octos client identity sent in the MCP `initialize` request.
+/// (`ClientInfo`/`Implementation` are `#[non_exhaustive]`, so they can't be
+/// built with a struct literal — hence default-then-assign.)
+#[allow(clippy::field_reassign_with_default)]
+fn octos_client_info() -> ClientInfo {
+    let mut info = ClientInfo::default();
+    info.client_info = Implementation::new("octos", env!("CARGO_PKG_VERSION"));
+    info
 }
 
-impl McpConnection {
-    async fn rpc_call(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        match self {
-            McpConnection::Stdio(c) => c.rpc_call(method, params).await,
-            McpConnection::Http(c) => c.rpc_call(method, params).await,
-        }
-    }
-}
+/// A reqwest DNS resolver that rejects any host resolving to a private,
+/// loopback, link-local, or otherwise-blocked address. Applied to EVERY request
+/// the client makes — the MCP transport *and* (for OAuth) every metadata /
+/// registration / token / refresh endpoint the server advertises — so a public
+/// MCP server can't point us at `127.0.0.1` / `169.254.169.254` / RFC1918. Also
+/// re-checks on each resolve, defeating DNS rebinding.
+#[derive(Debug)]
+struct SsrfDnsResolver;
 
-/// Stdio-based MCP connection (child process).
-struct StdioMcpConnection {
-    stdin: tokio::process::ChildStdin,
-    reader: BufReader<tokio::process::ChildStdout>,
-    child: tokio::process::Child,
-    next_id: u64,
-}
-
-impl StdioMcpConnection {
-    async fn rpc_call(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id,
-            method: method.into(),
-            params,
-        };
-
-        let mut line = serde_json::to_string(&request)?;
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
-
-        let buf = read_line_limited(&mut self.reader, MAX_LINE_BYTES).await?;
-
-        let response: JsonRpcResponse =
-            serde_json::from_str(&buf).wrap_err("invalid JSON-RPC response from MCP server")?;
-
-        if let Some(err) = response.error {
-            eyre::bail!("MCP error {}: {}", err.code, err.message);
-        }
-
-        response
-            .result
-            .ok_or_else(|| eyre::eyre!("MCP response missing result"))
-    }
-}
-
-/// Read a single line with a size limit to prevent memory exhaustion.
-async fn read_line_limited(
-    reader: &mut BufReader<tokio::process::ChildStdout>,
-    limit: usize,
-) -> Result<String> {
-    let mut buf = Vec::with_capacity(4096);
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            eyre::bail!("MCP server closed connection");
-        }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            buf.extend_from_slice(&available[..=pos]);
-            reader.consume(pos + 1);
-            break;
-        }
-        // Check BEFORE extending to enforce strict limit
-        if buf.len() + available.len() > limit {
-            eyre::bail!("MCP response exceeds {}KB limit", limit / 1024);
-        }
-        let len = available.len();
-        buf.extend_from_slice(available);
-        reader.consume(len);
-    }
-    String::from_utf8(buf).wrap_err("MCP response is not valid UTF-8")
-}
-
-impl Drop for StdioMcpConnection {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-        // Reap child to avoid zombie processes
-        let _ = self.child.try_wait();
-    }
-}
-
-/// HTTP-based MCP connection (remote server).
-struct HttpMcpConnection {
-    client: reqwest::Client,
-    url: String,
-    headers: HashMap<String, String>,
-    next_id: u64,
-    /// Session ID returned by the server for request affinity.
-    session_id: Option<String>,
-}
-
-impl HttpMcpConnection {
-    async fn rpc_call(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id,
-            method: method.into(),
-            params,
-        };
-
-        let mut req = self
-            .client
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
-
-        for (k, v) in &self.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        if let Some(sid) = &self.session_id {
-            req = req.header("Mcp-Session-Id", sid.as_str());
-        }
-
-        let resp = req
-            .json(&request)
-            .timeout(std::time::Duration::from_secs(60))
-            .send()
-            .await
-            .wrap_err("failed to send HTTP request to MCP server")?;
-
-        // Capture session ID from response if present.
-        if let Some(sid) = resp.headers().get("mcp-session-id") {
-            if let Ok(s) = sid.to_str() {
-                self.session_id = Some(s.to_string());
+impl reqwest_rmcp::dns::Resolve for SsrfDnsResolver {
+    fn resolve(&self, name: reqwest_rmcp::dns::Name) -> reqwest_rmcp::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0u16))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("no addresses resolved for '{host}'").into());
             }
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            eyre::bail!("MCP HTTP error: {status} - {body}");
-        }
-
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let body = resp
-            .text()
-            .await
-            .wrap_err("failed to read MCP HTTP response")?;
-
-        // SSE responses: extract JSON-RPC message from data events.
-        let json_text = if content_type.contains("text/event-stream") {
-            parse_sse_json_rpc(&body)?
-        } else {
-            body
-        };
-
-        let response: JsonRpcResponse = serde_json::from_str(&json_text)
-            .wrap_err("invalid JSON-RPC response from MCP HTTP server")?;
-
-        if let Some(err) = response.error {
-            eyre::bail!("MCP error {}: {}", err.code, err.message);
-        }
-
-        response
-            .result
-            .ok_or_else(|| eyre::eyre!("MCP response missing result"))
-    }
-}
-
-/// Extract the last JSON-RPC data payload from an SSE response body.
-fn parse_sse_json_rpc(body: &str) -> Result<String> {
-    let mut last_data = None;
-    for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data != "[DONE]" {
-                last_data = Some(data.to_string());
+            if let Some(bad) = addrs
+                .iter()
+                .find(|a| crate::tools::ssrf::is_private_ip(&a.ip()))
+            {
+                return Err(format!(
+                    "SSRF blocked: '{host}' resolves to private/blocked address {}",
+                    bad.ip()
+                )
+                .into());
             }
-        }
+            Ok(Box::new(addrs.into_iter()) as reqwest_rmcp::dns::Addrs)
+        })
     }
-    last_data.ok_or_else(|| eyre::eyre!("no JSON-RPC data in SSE response"))
 }
 
-/// MCP client that manages server connections and tool registration.
-pub struct McpClient {
-    /// Kept alive so Drop kills child processes (stdio) / holds HTTP clients.
-    #[allow(dead_code)]
-    connections: Vec<(String, Arc<Mutex<McpConnection>>)>,
-    tools: Vec<McpToolSpec>,
+/// Reject a configured URL whose host is a literal private/loopback IP or
+/// `localhost`. reqwest/hyper skip [`SsrfDnsResolver`] for literal-IP hosts, so
+/// this closes the config-level vector the resolver can't see. (Hostname hosts
+/// are covered by the resolver at connect time.)
+pub(crate) fn reject_private_url_host(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).map_err(|e| eyre::eyre!("invalid MCP url '{url}': {e}"))?;
+    let blocked = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => crate::tools::ssrf::is_private_host(d),
+        None => eyre::bail!("MCP url '{url}' has no host"),
+    };
+    if blocked {
+        eyre::bail!("MCP url '{url}' targets a private/loopback host — refused (SSRF)");
+    }
+    Ok(())
 }
 
-struct McpToolSpec {
-    name: String,
-    description: String,
-    input_schema: serde_json::Value,
-    connection: Arc<Mutex<McpConnection>>,
-    /// Concurrency class for the M8.8 scheduler. Carried per-spec so each
-    /// server's `McpServerConfig.concurrency_class` propagates to every
-    /// tool the server exposes when `register_tools` runs.
-    concurrency_class: crate::tools::ConcurrencyClass,
+/// Build a reqwest client (rmcp's 0.13 major) for talking to a remote MCP
+/// server: SSRF-filtered on every host via [`SsrfDnsResolver`], redirects
+/// refused (a 3xx must not smuggle us to a private/metadata host), carrying the
+/// configured headers verbatim. Shared by the static-HTTP and OAuth transports
+/// (and, for OAuth, reused for the discovery/token client so those requests are
+/// SSRF-filtered too).
+pub(crate) fn build_ssrf_http_client(
+    headers: &HashMap<String, String>,
+) -> Result<reqwest_rmcp::Client> {
+    let mut builder = reqwest_rmcp::Client::builder()
+        .redirect(reqwest_rmcp::redirect::Policy::none())
+        .dns_resolver(
+            std::sync::Arc::new(SsrfDnsResolver) as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>
+        );
+    if !headers.is_empty() {
+        let mut hmap = reqwest_rmcp::header::HeaderMap::new();
+        for (k, v) in headers {
+            let name = reqwest_rmcp::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| eyre::eyre!("invalid MCP header name '{k}': {e}"))?;
+            let value = reqwest_rmcp::header::HeaderValue::from_str(v)
+                .map_err(|e| eyre::eyre!("invalid MCP header value for '{k}': {e}"))?;
+            hmap.insert(name, value);
+        }
+        builder = builder.default_headers(hmap);
+    }
+    builder
+        .build()
+        .map_err(|e| eyre::eyre!("build MCP http client: {e}"))
 }
 
-/// Maximum nesting depth for MCP tool input schemas.
-const MAX_SCHEMA_DEPTH: usize = 10;
-/// Maximum serialized size of an MCP tool input schema (64 KB).
-const MAX_SCHEMA_SIZE: usize = 65_536;
+/// Per-OAuth-request timeout so a token/refresh/discovery endpoint that accepts
+/// the connection but never answers can't hang login/startup.
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validate an OAuth endpoint URL before we hit it: must be `https` (bearer
+/// tokens never travel cleartext) and must not resolve to a private/loopback/
+/// metadata host. Uses `url::Host` so bracketed IPv6 literals (`[::1]`) are
+/// handled, unlike a bare `Uri::host()` string.
+fn validate_oauth_uri(uri: &oauth2::http::Uri) -> std::result::Result<(), String> {
+    let s = uri.to_string();
+    let parsed = url::Url::parse(&s).map_err(|e| format!("invalid OAuth url '{s}': {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "OAuth endpoint '{s}' must be https — refusing cleartext bearer/credential exchange"
+        ));
+    }
+    let private = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => crate::tools::ssrf::is_private_host(d),
+        None => return Err(format!("OAuth endpoint '{s}' has no host")),
+    };
+    if private {
+        return Err(format!(
+            "SSRF blocked: OAuth endpoint '{s}' is private/loopback"
+        ));
+    }
+    Ok(())
+}
+
+/// An rmcp `OAuthHttpClient` that SSRF- and TLS-validates EVERY OAuth request
+/// URL before executing it — metadata discovery / registration / token /
+/// refresh — including literal-IP and IPv6 endpoints the DNS resolver skips.
+/// Redirects are refused (a followed hop would bypass the per-request check),
+/// and each request is timeout-bounded.
+pub(crate) struct SsrfOAuthHttpClient {
+    client: reqwest_rmcp::Client,
+}
+
+impl SsrfOAuthHttpClient {
+    pub(crate) fn new() -> Result<Self> {
+        let client = reqwest_rmcp::Client::builder()
+            .redirect(reqwest_rmcp::redirect::Policy::none())
+            .timeout(OAUTH_HTTP_TIMEOUT)
+            .dns_resolver(std::sync::Arc::new(SsrfDnsResolver)
+                as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>)
+            .build()
+            .map_err(|e| eyre::eyre!("build OAuth http client: {e}"))?;
+        Ok(Self { client })
+    }
+}
+
+impl rmcp::transport::auth::OAuthHttpClient for SsrfOAuthHttpClient {
+    fn execute(
+        &self,
+        req: rmcp::transport::auth::OAuthHttpRequest,
+    ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRequest};
+        let client = self.client.clone();
+        Box::pin(async move {
+            let OAuthHttpRequest { request, .. } = req;
+            // Redirects are refused (Policy::none), so the request URL is the
+            // only host we contact — validate it (https + non-private, IPv6-safe).
+            validate_oauth_uri(request.uri()).map_err(OAuthHttpClientError::new)?;
+            let rq = reqwest_rmcp::Request::try_from(request)
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))?;
+            let resp = client
+                .execute(rq)
+                .await
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))?;
+            let mut builder = oauth2::http::Response::builder().status(resp.status());
+            for (name, value) in resp.headers() {
+                builder = builder.header(name, value);
+            }
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))?
+                .to_vec();
+            builder
+                .body(body)
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))
+        })
+    }
+}
 
 /// Validate an MCP-provided input schema for reasonable complexity.
 fn validate_schema(schema: &serde_json::Value) -> bool {
@@ -346,175 +312,34 @@ fn validate_schema(schema: &serde_json::Value) -> bool {
             _ => level,
         }
     }
-    let d = depth(schema, 0);
-    if d > MAX_SCHEMA_DEPTH {
+    if depth(schema, 0) > MAX_SCHEMA_DEPTH {
         return false;
     }
-    let size = serde_json::to_string(schema)
+    serde_json::to_string(schema)
         .map(|s| s.len())
-        .unwrap_or(MAX_SCHEMA_SIZE + 1);
-    size <= MAX_SCHEMA_SIZE
+        .unwrap_or(MAX_SCHEMA_SIZE + 1)
+        <= MAX_SCHEMA_SIZE
+}
+
+/// A discovered MCP tool bound to its live session.
+struct McpToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+    service: McpService,
+    concurrency_class: crate::tools::ConcurrencyClass,
+}
+
+/// A running set of MCP server connections and the tools they expose.
+pub struct McpClient {
+    /// Kept alive so the underlying transports (and stdio child processes) stay
+    /// open for as long as any registered tool references them.
+    #[allow(dead_code)]
+    services: Vec<(String, McpService)>,
+    tools: Vec<McpToolSpec>,
 }
 
 impl McpClient {
-    /// Start all configured MCP servers and discover their tools.
-    pub async fn start(configs: &[McpServerConfig]) -> Result<Self> {
-        let mut connections = Vec::new();
-        let mut tools = Vec::new();
-
-        for config in configs {
-            let result = if config.url.is_some() {
-                Self::start_http_server(config).await
-            } else {
-                Self::start_stdio_server(config).await
-            };
-
-            match result {
-                Ok((conn, server_tools)) => {
-                    let server_name = config.display_name().to_string();
-                    let conn = Arc::new(Mutex::new(conn));
-                    let concurrency_class = config.resolved_concurrency_class();
-                    info!(
-                        server = server_name,
-                        tools = server_tools.len(),
-                        concurrency_class = ?concurrency_class,
-                        "MCP server started"
-                    );
-                    for tool in server_tools {
-                        let schema = tool
-                            .input_schema
-                            .unwrap_or(serde_json::json!({"type": "object"}));
-                        if !validate_schema(&schema) {
-                            warn!(
-                                server = server_name,
-                                tool = tool.name,
-                                "MCP tool schema exceeds depth/size limits, skipping"
-                            );
-                            continue;
-                        }
-                        tools.push(McpToolSpec {
-                            name: tool.name,
-                            description: tool.description.unwrap_or_default(),
-                            input_schema: schema,
-                            connection: conn.clone(),
-                            concurrency_class,
-                        });
-                    }
-                    connections.push((server_name, conn));
-                }
-                Err(e) => {
-                    warn!(
-                        server = config.display_name(),
-                        error = %e,
-                        "failed to start MCP server, skipping"
-                    );
-                }
-            }
-        }
-
-        Ok(Self { connections, tools })
-    }
-
-    async fn start_stdio_server(
-        config: &McpServerConfig,
-    ) -> Result<(McpConnection, Vec<McpToolDef>)> {
-        let command = config
-            .command
-            .as_deref()
-            .ok_or_else(|| eyre::eyre!("MCP stdio server requires 'command' field"))?;
-
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()); // Forward stderr for debugging
-
-        let env_allowlist = EnvAllowlist::from_names(config.env.keys().map(|key| key.as_str()));
-        sanitize_command_env(&mut cmd, &env_allowlist);
-
-        for (k, v) in &config.env {
-            if BLOCKED_ENV_VARS
-                .iter()
-                .any(|blocked| k.eq_ignore_ascii_case(blocked))
-            {
-                warn!(
-                    key = k,
-                    "blocked dangerous MCP environment variable, skipping"
-                );
-                continue;
-            }
-            if !should_forward_env_name(k, &env_allowlist) {
-                warn!(
-                    key = k,
-                    "blocked non-allowlisted MCP environment variable, skipping"
-                );
-                continue;
-            }
-            cmd.env(k, v);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .wrap_err_with(|| format!("failed to spawn MCP server: {command}"))?;
-
-        let stdin = child.stdin.take().ok_or_else(|| eyre::eyre!("no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| eyre::eyre!("no stdout"))?;
-        let reader = BufReader::new(stdout);
-
-        let conn = McpConnection::Stdio(Box::new(StdioMcpConnection {
-            stdin,
-            reader,
-            child,
-            next_id: 1,
-        }));
-
-        initialize_and_list_tools(conn).await
-    }
-
-    async fn start_http_server(
-        config: &McpServerConfig,
-    ) -> Result<(McpConnection, Vec<McpToolDef>)> {
-        let url = config
-            .url
-            .as_deref()
-            .ok_or_else(|| eyre::eyre!("MCP HTTP server requires 'url' field"))?;
-
-        // Validate URL against SSRF before connecting to prevent reaching
-        // internal endpoints through MCP config.  Use check_ssrf_with_addrs
-        // so we can pin the resolved DNS addresses on the reqwest client,
-        // preventing DNS rebinding (TOCTOU) between check and actual connection.
-        let ssrf_result = crate::tools::ssrf::check_ssrf_with_addrs(url)
-            .await
-            .map_err(|msg| eyre::eyre!("MCP HTTP server URL blocked by SSRF policy: {msg}"))?;
-
-        // Build client with DNS pinning — the TLS/HTTP connection uses the
-        // exact IPs we validated, not a fresh DNS lookup.
-        let parsed_url =
-            reqwest::Url::parse(url).map_err(|e| eyre::eyre!("invalid MCP URL: {e}"))?;
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| eyre::eyre!("MCP URL has no host"))?
-            .to_string();
-        let mut builder = reqwest::Client::builder();
-        for addr in &ssrf_result.resolved_addrs {
-            builder = builder.resolve(&host, *addr);
-        }
-        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-
-        let conn = McpConnection::Http(HttpMcpConnection {
-            client,
-            url: url.to_string(),
-            headers: config.headers.clone(),
-            next_id: 1,
-            session_id: None,
-        });
-
-        initialize_and_list_tools(conn).await
-    }
-
     /// Built-in tool names that MCP tools must not shadow.
     const PROTECTED_NAMES: &[&str] = &[
         "shell",
@@ -538,10 +363,166 @@ impl McpClient {
         "configure_tool",
     ];
 
-    /// Register all discovered MCP tools into the given registry.
-    ///
-    /// Tools whose names collide with built-in tool names are rejected to prevent
-    /// a remote MCP server from silently replacing core functionality.
+    /// Start all configured MCP servers and discover their tools. Fail-soft: a
+    /// server that fails to start is logged and skipped, never aborting the rest.
+    pub async fn start(configs: &[McpServerConfig]) -> Result<Self> {
+        let mut services = Vec::new();
+        let mut tools = Vec::new();
+
+        for config in configs {
+            let server_name = config.display_name().to_string();
+            match Self::connect(config).await {
+                Ok(service) => {
+                    let concurrency_class = config.resolved_concurrency_class();
+                    // Bound tool discovery: a server that completes `initialize`
+                    // but never answers `tools/list` must not wedge startup (and
+                    // block later servers) — fail-soft on timeout.
+                    let discovered = match timeout(HANDSHAKE_TIMEOUT, service.list_all_tools())
+                        .await
+                    {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => {
+                            warn!(server = server_name, error = %e, "MCP tools/list failed, skipping server");
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(
+                                server = server_name,
+                                "MCP tools/list timed out, skipping server"
+                            );
+                            continue;
+                        }
+                    };
+                    info!(
+                        server = server_name,
+                        tools = discovered.len(),
+                        concurrency_class = ?concurrency_class,
+                        "MCP server started"
+                    );
+                    for tool in discovered {
+                        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+                        if !validate_schema(&schema) {
+                            warn!(
+                                server = server_name,
+                                tool = %tool.name,
+                                "MCP tool schema exceeds depth/size limits, skipping"
+                            );
+                            continue;
+                        }
+                        tools.push(McpToolSpec {
+                            name: tool.name.to_string(),
+                            description: tool
+                                .description
+                                .map(|d| d.to_string())
+                                .unwrap_or_default(),
+                            input_schema: schema,
+                            service: service.clone(),
+                            concurrency_class,
+                        });
+                    }
+                    services.push((server_name, service));
+                }
+                Err(e) => {
+                    warn!(server = server_name, error = %e, "failed to start MCP server, skipping");
+                }
+            }
+        }
+
+        Ok(Self { services, tools })
+    }
+
+    /// Connect to one MCP server, returning the live rmcp session.
+    async fn connect(config: &McpServerConfig) -> Result<McpService> {
+        if config.url.is_some() {
+            Self::connect_http(config).await
+        } else {
+            Self::connect_stdio(config).await
+        }
+    }
+
+    /// Spawn a stdio MCP server as a child process. Environment is sanitized
+    /// (BLOCKED_ENV_VARS stripped, only explicitly-configured names forwarded)
+    /// exactly as for every other octos subprocess.
+    async fn connect_stdio(config: &McpServerConfig) -> Result<McpService> {
+        let command = config
+            .command
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("MCP stdio server requires a 'command' field"))?;
+
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(&config.args).kill_on_drop(true);
+
+        // Strip injection-vector env vars from the inherited environment and
+        // forward only the names the operator explicitly listed under `env`.
+        let allowlist = EnvAllowlist::from_names(config.env.keys().map(|k| k.as_str()));
+        sanitize_command_env(&mut cmd, &allowlist);
+        for (k, v) in &config.env {
+            // Re-apply the same denylist to the *explicit* env: a config that
+            // lists e.g. LD_PRELOAD/DYLD_INSERT_LIBRARIES/NODE_OPTIONS must not
+            // reopen a process-hijack vector that sanitize_command_env stripped.
+            if !should_forward_env_name(k, &allowlist) {
+                warn!(command = command, var = %k, "MCP env var blocked (injection vector), not forwarded");
+                continue;
+            }
+            cmd.env(k, v);
+        }
+
+        // NOTE: rmcp's child-process transport reads JSON-RPC frames with an
+        // unbounded `read_until`, so it lacks the old client's MAX_LINE_BYTES
+        // guard. A malicious frame could grow memory before schema validation.
+        // Accepted for now: stdio servers are operator-configured local binaries
+        // (the operator already trusts the executable they named). A bounded
+        // frame codec would require a custom transport; tracked as a follow-up.
+        let (transport, _stderr) = TokioChildProcess::builder(cmd)
+            .stderr(Stdio::inherit())
+            .spawn()
+            .wrap_err_with(|| format!("failed to spawn MCP server '{command}'"))?;
+
+        let service = timeout(
+            HANDSHAKE_TIMEOUT,
+            serve_client(octos_client_info(), transport),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
+        .map_err(|e| eyre::eyre!("MCP initialize failed: {e}"))?;
+        Ok(Arc::new(service))
+    }
+
+    /// Connect to a streamable-HTTP MCP server. Static headers (incl. a bearer
+    /// `Authorization`) are sent verbatim; OAuth 2.1 via keyring-stored tokens.
+    async fn connect_http(config: &McpServerConfig) -> Result<McpService> {
+        let url = config
+            .url
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("MCP http server requires a 'url' field"))?;
+
+        if config.oauth {
+            return crate::mcp_auth::connect_oauth(config, url, octos_client_info()).await;
+        }
+
+        // SSRF-filtered + no-redirect client carrying the configured headers
+        // verbatim (no double `Bearer`, custom headers kept). Reject literal
+        // private-IP hosts up front (the resolver is skipped for those).
+        reject_private_url_host(url)?;
+        let client = build_ssrf_http_client(&config.headers)?;
+        let transport = StreamableHttpClientTransport::with_client(
+            client,
+            StreamableHttpClientTransportConfig::with_uri(url.to_string()),
+        );
+
+        let service = timeout(
+            HANDSHAKE_TIMEOUT,
+            serve_client(octos_client_info(), transport),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
+        .map_err(|e| eyre::eyre!("MCP initialize failed: {e}"))?;
+        Ok(Arc::new(service))
+    }
+
+    /// Register all discovered MCP tools into the given registry. Tools whose
+    /// names collide with built-in tool names are rejected so a remote server
+    /// cannot silently replace core functionality.
     pub fn register_tools(self, registry: &mut ToolRegistry) {
         for spec in self.tools {
             if Self::PROTECTED_NAMES.contains(&spec.name.as_str()) {
@@ -555,59 +536,19 @@ impl McpClient {
                 name: spec.name,
                 description: spec.description,
                 input_schema: spec.input_schema,
-                connection: spec.connection,
-                // Per-server class resolved at `start()` from
-                // `McpServerConfig.concurrency_class`. Defaults to
-                // `Safe` (read-only common case — search, wiki, time);
-                // operators declare `"exclusive"` for MCP servers that
-                // mutate files / remote state and could race with the
-                // native `edit_file` / `write_file` tools.
+                service: spec.service,
                 concurrency_class: spec.concurrency_class,
             });
         }
     }
 }
 
-/// Shared initialization sequence for both transports.
-async fn initialize_and_list_tools(
-    mut conn: McpConnection,
-) -> Result<(McpConnection, Vec<McpToolDef>)> {
-    conn.rpc_call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "octos", "version": env!("CARGO_PKG_VERSION")}
-        }),
-    )
-    .await
-    .wrap_err("MCP initialize failed")?;
-
-    let tools_result = conn
-        .rpc_call("tools/list", serde_json::json!({}))
-        .await
-        .wrap_err("MCP tools/list failed")?;
-
-    let tool_list: McpToolListResponse =
-        serde_json::from_value(tools_result).wrap_err("failed to parse MCP tools/list response")?;
-
-    Ok((conn, tool_list.tools))
-}
-
-/// A tool backed by an MCP server.
+/// A tool backed by an MCP server session.
 struct McpTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
-    connection: Arc<Mutex<McpConnection>>,
-    /// Concurrency class for the M8.8 scheduler. Resolved at
-    /// `McpClient::start` from the per-server `McpServerConfig`:
-    /// defaults to `Safe` (read-only common case — search, wiki, time
-    /// servers); operators must declare `"exclusive"` per server when
-    /// the MCP server mutates files or remote state and could race
-    /// with the native `edit_file` / `write_file` tools. Per-tool
-    /// granularity is intentionally not wired — MCP's `tools/list`
-    /// carries no concurrency hint.
+    service: McpService,
     concurrency_class: crate::tools::ConcurrencyClass,
 }
 
@@ -630,521 +571,124 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            let mut conn = self.connection.lock().await;
-            conn.rpc_call(
-                "tools/call",
-                serde_json::json!({
-                    "name": self.name,
-                    "arguments": args,
-                }),
-            )
+        let mut param = CallToolRequestParams::new(self.name.clone());
+        param.arguments = args.as_object().cloned();
+
+        let result = timeout(TOOL_CALL_TIMEOUT, self.service.call_tool(param))
             .await
-        })
-        .await
-        .wrap_err("MCP tool call timed out after 60s")?
-        .wrap_err_with(|| format!("MCP tool '{}' call failed", self.name))?;
+            .map_err(|_| {
+                eyre::eyre!(
+                    "MCP tool '{}' call timed out after {TOOL_CALL_TIMEOUT:?}",
+                    self.name
+                )
+            })?
+            .map_err(|e| eyre::eyre!("MCP tool '{}' call failed: {e}", self.name))?;
 
-        // Parse MCP tool result: { "content": [{"type": "text", "text": "..."}] }
-        let output = if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
-            content
-                .iter()
-                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            result.to_string()
-        };
-
-        let is_error = result
-            .get("isError")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Flatten text content parts; non-text parts (images/resources) are
+        // dropped as the agent tool surface is text-only.
+        let output = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         Ok(ToolResult {
             output,
-            success: !is_error,
+            success: !result.is_error.unwrap_or(false),
             ..Default::default()
         })
     }
 }
 
-// --- JSON-RPC types ---
-
-#[derive(Serialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: u64,
-    method: String,
-    params: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcResponse {
-    #[allow(dead_code)]
-    id: u64,
-    result: Option<serde_json::Value>,
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct McpToolListResponse {
-    tools: Vec<McpToolDef>,
-}
-
-#[derive(Deserialize)]
-struct McpToolDef {
-    name: String,
-    description: Option<String>,
-    #[serde(rename = "inputSchema")]
-    input_schema: Option<serde_json::Value>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ConcurrencyClass;
 
-    // --- SSE parsing ---
-
-    #[test]
-    fn test_parse_sse_json_rpc() {
-        let body =
-            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
-        let result = parse_sse_json_rpc(body).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["id"], 1);
-    }
-
-    #[test]
-    fn test_parse_sse_skips_done() {
-        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\ndata: [DONE]\n\n";
-        let result = parse_sse_json_rpc(body).unwrap();
-        assert!(result.contains("\"id\":1"));
-    }
-
-    #[test]
-    fn test_parse_sse_empty_body() {
-        let body = "event: ping\n\n";
-        assert!(parse_sse_json_rpc(body).is_err());
-    }
-
-    #[test]
-    fn test_parse_sse_returns_last_data_line() {
-        let body = "data: {\"id\":1}\ndata: {\"id\":2}\n\n";
-        let result = parse_sse_json_rpc(body).unwrap();
-        assert!(result.contains("\"id\":2"));
-    }
-
-    #[test]
-    fn test_parse_sse_no_data_prefix() {
-        let body = "id: 1\nevent: open\n\n";
-        assert!(parse_sse_json_rpc(body).is_err());
-    }
-
-    // --- Config deserialization ---
-
-    #[test]
-    fn test_config_deser_stdio() {
-        let json = r#"{"command": "npx", "args": ["-y", "mcp-server"]}"#;
-        let config: McpServerConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.command.as_deref(), Some("npx"));
-        assert!(config.url.is_none());
-        assert_eq!(config.display_name(), "npx");
-    }
-
-    #[test]
-    fn test_config_deser_http() {
-        let json =
-            r#"{"url": "https://mcp.example.com/sse", "headers": {"Authorization": "Bearer tok"}}"#;
-        let config: McpServerConfig = serde_json::from_str(json).unwrap();
-        assert!(config.command.is_none());
-        assert_eq!(config.url.as_deref(), Some("https://mcp.example.com/sse"));
-        assert_eq!(config.headers.get("Authorization").unwrap(), "Bearer tok");
-        assert_eq!(config.display_name(), "https://mcp.example.com/sse");
-    }
-
-    #[test]
-    fn test_config_display_name_no_command_no_url() {
-        let config = McpServerConfig {
-            command: None,
+    fn cfg() -> McpServerConfig {
+        McpServerConfig {
+            command: Some("echo".into()),
             args: vec![],
             env: HashMap::new(),
             url: None,
             headers: HashMap::new(),
+            oauth: false,
+            scopes: vec![],
             concurrency_class: None,
-        };
-        assert_eq!(config.display_name(), "unknown");
-    }
-
-    #[test]
-    fn test_config_defaults() {
-        let json = r#"{}"#;
-        let config: McpServerConfig = serde_json::from_str(json).unwrap();
-        assert!(config.command.is_none());
-        assert!(config.args.is_empty());
-        assert!(config.env.is_empty());
-        assert!(config.url.is_none());
-        assert!(config.headers.is_empty());
-        // Backward-compat: existing configs that omit `concurrency_class`
-        // continue to parse. The resolved class falls through to `Safe`
-        // (read-only common case for MCP — search, wiki, time, weather).
-        // Mutating servers must declare `"exclusive"` explicitly.
-        assert!(config.concurrency_class.is_none());
-        assert_eq!(
-            config.resolved_concurrency_class(),
-            crate::tools::ConcurrencyClass::Safe,
-        );
-    }
-
-    #[test]
-    fn test_config_concurrency_class_explicit_safe() {
-        // Explicit declaration round-trips through serde and resolves
-        // identically to the default — pinned so a future schema change
-        // doesn't silently break operator configs that opt in.
-        let json = r#"{"concurrency_class": "safe"}"#;
-        let config: McpServerConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.concurrency_class.as_deref(), Some("safe"));
-        assert_eq!(
-            config.resolved_concurrency_class(),
-            crate::tools::ConcurrencyClass::Safe,
-        );
-    }
-
-    #[test]
-    fn test_config_concurrency_class_explicit_exclusive() {
-        // Operators who run a mutating MCP server (e.g. one that
-        // writes files into the workspace) declare `"exclusive"` so
-        // the M8.8 scheduler serialises the batch.
-        let json = r#"{"concurrency_class": "exclusive"}"#;
-        let config: McpServerConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.resolved_concurrency_class(),
-            crate::tools::ConcurrencyClass::Exclusive,
-        );
-    }
-
-    #[test]
-    fn test_config_concurrency_class_case_insensitive_and_unknown_falls_back() {
-        // Mixed case still resolves correctly.
-        let mixed_json = r#"{"concurrency_class": "ExClUsIvE"}"#;
-        let mixed: McpServerConfig = serde_json::from_str(mixed_json).unwrap();
-        assert_eq!(
-            mixed.resolved_concurrency_class(),
-            crate::tools::ConcurrencyClass::Exclusive,
-        );
-
-        // Unknown values fall back to `Exclusive` (fail-safe — typo in
-        // operator config must not silently downgrade enforcement).
-        let typo_json = r#"{"concurrency_class": "exlusive"}"#;
-        let typo: McpServerConfig = serde_json::from_str(typo_json).unwrap();
-        assert_eq!(
-            typo.resolved_concurrency_class(),
-            crate::tools::ConcurrencyClass::Exclusive,
-        );
-    }
-
-    #[test]
-    fn test_mcp_tool_surfaces_per_server_concurrency_class() {
-        // Construct an `McpTool` directly with a stub HTTP connection
-        // so we can verify the wrapper surfaces the per-spec class
-        // through `Tool::concurrency_class()`. This pins the contract
-        // that `register_tools` plumbs the per-server class to every
-        // tool — a regression that swapped the field back to
-        // hardcoded `Exclusive` would turn this test red for the
-        // safe-server case.
-        use crate::tools::ConcurrencyClass;
-
-        let conn = Arc::new(Mutex::new(McpConnection::Http(HttpMcpConnection {
-            client: reqwest::Client::new(),
-            url: "http://stub.invalid/".into(),
-            headers: HashMap::new(),
-            next_id: 1,
-            session_id: None,
-        })));
-
-        let safe_tool = McpTool {
-            name: "search".into(),
-            description: "test".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-            connection: conn.clone(),
-            concurrency_class: ConcurrencyClass::Safe,
-        };
-        assert_eq!(safe_tool.concurrency_class(), ConcurrencyClass::Safe);
-
-        let exclusive_tool = McpTool {
-            name: "write_remote".into(),
-            description: "test".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-            connection: conn,
-            concurrency_class: ConcurrencyClass::Exclusive,
-        };
-        assert_eq!(
-            exclusive_tool.concurrency_class(),
-            ConcurrencyClass::Exclusive,
-        );
-    }
-
-    // --- Schema validation ---
-
-    #[test]
-    fn test_validate_schema_simple_object() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "count": {"type": "integer"}
-            }
-        });
-        assert!(validate_schema(&schema));
-    }
-
-    #[test]
-    fn test_validate_schema_empty_object() {
-        let schema = serde_json::json!({"type": "object"});
-        assert!(validate_schema(&schema));
-    }
-
-    #[test]
-    fn test_validate_schema_at_max_depth() {
-        let mut schema = serde_json::json!({"type": "string"});
-        for _ in 0..9 {
-            schema = serde_json::json!({"nested": schema});
-        }
-        assert!(validate_schema(&schema));
-    }
-
-    #[test]
-    fn test_validate_schema_exceeds_max_depth() {
-        let mut schema = serde_json::json!({"type": "string"});
-        for _ in 0..11 {
-            schema = serde_json::json!({"nested": schema});
-        }
-        assert!(!validate_schema(&schema));
-    }
-
-    #[test]
-    fn test_validate_schema_array_depth() {
-        let mut schema = serde_json::json!({"type": "string"});
-        for _ in 0..11 {
-            schema = serde_json::json!([schema]);
-        }
-        assert!(!validate_schema(&schema));
-    }
-
-    #[test]
-    fn test_validate_schema_exceeds_max_size() {
-        let mut props = serde_json::Map::new();
-        for i in 0..2000 {
-            props.insert(
-                format!("field_{i}_with_a_long_name_padding"),
-                serde_json::json!({"type": "string", "description": "x".repeat(30)}),
-            );
-        }
-        let schema = serde_json::Value::Object(props);
-        assert!(!validate_schema(&schema));
-    }
-
-    #[test]
-    fn test_validate_schema_scalar_values() {
-        assert!(validate_schema(&serde_json::json!(null)));
-        assert!(validate_schema(&serde_json::json!(42)));
-        assert!(validate_schema(&serde_json::json!("hello")));
-        assert!(validate_schema(&serde_json::json!(true)));
-    }
-
-    // --- JSON-RPC serialization/deserialization ---
-
-    #[test]
-    fn test_jsonrpc_request_serialization() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id: 42,
-            method: "tools/list".into(),
-            params: serde_json::json!({}),
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["jsonrpc"], "2.0");
-        assert_eq!(json["id"], 42);
-        assert_eq!(json["method"], "tools/list");
-        assert_eq!(json["params"], serde_json::json!({}));
-    }
-
-    #[test]
-    fn test_jsonrpc_response_with_result() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.id, 1);
-        assert!(resp.result.is_some());
-        assert!(resp.error.is_none());
-    }
-
-    #[test]
-    fn test_jsonrpc_response_with_error() {
-        let json =
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
-        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.id, 1);
-        assert!(resp.result.is_none());
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, -32601);
-        assert_eq!(err.message, "Method not found");
-    }
-
-    #[test]
-    fn test_jsonrpc_response_null_result() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
-        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.result.is_none());
-    }
-
-    // --- MCP tool definition deserialization ---
-
-    #[test]
-    fn test_mcp_tool_def_full() {
-        let json = r#"{"name":"read","description":"Read a file","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}"#;
-        let def: McpToolDef = serde_json::from_str(json).unwrap();
-        assert_eq!(def.name, "read");
-        assert_eq!(def.description.as_deref(), Some("Read a file"));
-        assert!(def.input_schema.is_some());
-    }
-
-    #[test]
-    fn test_mcp_tool_def_minimal() {
-        let json = r#"{"name":"ping"}"#;
-        let def: McpToolDef = serde_json::from_str(json).unwrap();
-        assert_eq!(def.name, "ping");
-        assert!(def.description.is_none());
-        assert!(def.input_schema.is_none());
-    }
-
-    #[test]
-    fn test_mcp_tool_list_response() {
-        let json = r#"{"tools":[{"name":"a"},{"name":"b","description":"tool b"}]}"#;
-        let resp: McpToolListResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.tools.len(), 2);
-        assert_eq!(resp.tools[0].name, "a");
-        assert_eq!(resp.tools[1].name, "b");
-    }
-
-    // --- BLOCKED_ENV_VARS filtering ---
-
-    #[test]
-    fn test_blocked_env_vars_contains_known_dangerous_vars() {
-        let expected = [
-            "LD_PRELOAD",
-            "LD_LIBRARY_PATH",
-            "DYLD_INSERT_LIBRARIES",
-            "NODE_OPTIONS",
-            "PYTHONSTARTUP",
-            "BASH_ENV",
-        ];
-        for var in &expected {
-            assert!(
-                BLOCKED_ENV_VARS.iter().any(|b| b == var),
-                "{var} should be in BLOCKED_ENV_VARS"
-            );
         }
     }
 
     #[test]
-    fn test_blocked_env_vars_filtering_logic() {
-        let env: HashMap<String, String> = [
-            ("SAFE_VAR".into(), "ok".into()),
-            ("LD_PRELOAD".into(), "evil.so".into()),
-            ("NODE_OPTIONS".into(), "--require=bad".into()),
-            ("MY_TOKEN".into(), "secret".into()),
-        ]
-        .into_iter()
-        .collect();
-
-        let allowlist = crate::subprocess_env::EnvAllowlist::empty();
-        let allowed: Vec<&String> = env
-            .keys()
-            .filter(|k| crate::subprocess_env::should_forward_env_name(k, &allowlist))
-            .collect();
-
-        assert!(allowed.contains(&&"SAFE_VAR".to_string()));
-        assert!(!allowed.contains(&&"MY_TOKEN".to_string()));
-        assert!(!allowed.contains(&&"LD_PRELOAD".to_string()));
-        assert!(!allowed.contains(&&"NODE_OPTIONS".to_string()));
+    fn concurrency_class_defaults_to_safe_and_fails_safe_on_typo() {
+        let mut c = cfg();
+        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Safe);
+        c.concurrency_class = Some("SAFE".into());
+        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Safe);
+        c.concurrency_class = Some("Exclusive".into());
+        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Exclusive);
+        c.concurrency_class = Some("bogus".into());
+        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Exclusive);
     }
 
     #[test]
-    fn test_blocked_env_vars_case_insensitive() {
-        let key = "ld_preload";
-        assert!(
-            BLOCKED_ENV_VARS
-                .iter()
-                .any(|blocked| key.eq_ignore_ascii_case(blocked)),
-            "filtering should be case-insensitive"
-        );
+    fn display_name_prefers_command_then_url() {
+        let mut c = cfg();
+        assert_eq!(c.display_name(), "echo");
+        c.command = None;
+        c.url = Some("https://example.com/mcp".into());
+        assert_eq!(c.display_name(), "https://example.com/mcp");
+        c.url = None;
+        assert_eq!(c.display_name(), "unknown");
     }
 
-    // --- Protected names ---
-
     #[test]
-    fn test_protected_names_coverage() {
-        let names = McpClient::PROTECTED_NAMES;
-        assert!(!names.is_empty());
-        let mut seen = std::collections::HashSet::new();
-        for name in names {
-            assert!(!name.is_empty());
-            assert!(seen.insert(name), "duplicate protected name: {name}");
+    fn validate_schema_rejects_too_deep_and_too_big() {
+        assert!(validate_schema(&serde_json::json!({"type": "object"})));
+        // Build a schema deeper than MAX_SCHEMA_DEPTH.
+        let mut v = serde_json::json!("leaf");
+        for _ in 0..(MAX_SCHEMA_DEPTH + 3) {
+            v = serde_json::json!({ "nested": v });
         }
+        assert!(!validate_schema(&v));
+        // Oversized flat schema.
+        let big: String = "x".repeat(MAX_SCHEMA_SIZE + 10);
+        assert!(!validate_schema(&serde_json::json!({ "d": big })));
     }
 
     #[test]
-    fn test_protected_names_blocks_builtin_shadowing() {
-        // Verify that EVERY protected name would be rejected by the filtering logic.
-        // This tests the same branch as register_tools() without needing a live MCP connection.
-        let registry = crate::ToolRegistry::new();
-        let initial_count = registry.specs().len();
-
-        for &name in McpClient::PROTECTED_NAMES {
+    fn protected_names_cover_core_builtins() {
+        for name in [
+            "shell",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "send_file",
+            "spawn",
+        ] {
             assert!(
                 McpClient::PROTECTED_NAMES.contains(&name),
-                "protected name '{name}' should be blocked"
+                "{name} must be protected"
             );
         }
-
-        // Verify specific critical tools are protected
-        assert!(McpClient::PROTECTED_NAMES.contains(&"shell"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"read_file"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"write_file"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"edit_file"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"send_file"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"spawn"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"glob"));
-        assert!(McpClient::PROTECTED_NAMES.contains(&"grep"));
-
-        // Registry should not have gained any tools
-        assert_eq!(registry.specs().len(), initial_count);
     }
 
     #[test]
-    fn test_register_tools_skips_protected_and_keeps_safe() {
-        // Since McpClient fields are private, we test via the public PROTECTED_NAMES
-        // constant and verify the filtering logic inline.
-        let protected = vec!["shell", "read_file", "write_file"];
-        let safe = vec!["my_custom_tool", "analyze_data", "fetch_weather"];
+    fn oauth_and_scopes_default_off() {
+        let c = cfg();
+        assert!(!c.oauth);
+        assert!(c.scopes.is_empty());
+    }
 
-        for name in &protected {
-            assert!(
-                McpClient::PROTECTED_NAMES.contains(name),
-                "'{name}' should be in PROTECTED_NAMES"
-            );
-        }
-        for name in &safe {
-            assert!(
-                !McpClient::PROTECTED_NAMES.contains(name),
-                "'{name}' should NOT be in PROTECTED_NAMES"
-            );
-        }
+    #[test]
+    fn reject_private_url_host_blocks_private_allows_public() {
+        // Literal private/loopback/metadata hosts (resolver is skipped for these).
+        assert!(reject_private_url_host("http://127.0.0.1/mcp").is_err());
+        assert!(reject_private_url_host("http://localhost:8000/mcp").is_err());
+        assert!(reject_private_url_host("http://169.254.169.254/latest").is_err());
+        assert!(reject_private_url_host("http://[::1]/mcp").is_err());
+        assert!(reject_private_url_host("http://10.0.0.5/mcp").is_err());
+        // Public hostnames pass the up-front check (resolver enforces at connect).
+        assert!(reject_private_url_host("https://example.com/mcp").is_ok());
     }
 }

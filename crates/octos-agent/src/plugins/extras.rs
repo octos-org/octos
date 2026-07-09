@@ -201,6 +201,10 @@ fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig
         env,
         url: srv.url.clone(),
         headers: srv.headers.clone(),
+        // Skill-bundled MCP servers use stdio/static-HTTP only; OAuth servers
+        // are operator-configured (they require an interactive `octos mcp login`).
+        oauth: false,
+        scopes: Vec::new(),
         // Skill-bundled MCP servers fall through to the wrapper's
         // server default (`Safe` — read-only common case). A skill
         // that bundles a mutating MCP server should plumb a per-server

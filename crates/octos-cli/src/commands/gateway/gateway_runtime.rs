@@ -52,6 +52,7 @@ use octos_core::MAIN_PROFILE_ID;
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
+const CLI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 // `large_enum_variant`: the `Inbound` variant carries an
 // `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
@@ -584,10 +585,8 @@ impl GatewayRuntime {
         // Gateway-specific composition stacks ON TOP — gateway
         // architecture, not redundant assembly: `SwappableProvider`,
         // `provider_router`, `SwitchModelTool`, gateway top-level MCP,
-        // admin tools, auto-defer, `pipeline_factory`,
-        // `ManageSkillsTool`, `SynthesizeResearchTool`,
-        // `ActivateToolsTool`, base-tool pin extension for gateway-
-        // only tools.
+        // admin tools, `pipeline_factory`, `ManageSkillsTool`,
+        // `SynthesizeResearchTool` for gateway-only tools.
         //
         // Non-profile paths (config.json-only / CLI overrides) keep
         // the existing inline assembly because `ProfileRuntime::bootstrap`
@@ -1242,63 +1241,17 @@ impl GatewayRuntime {
             None
         };
 
-        // Mark base tools that should never be auto-evicted by LRU.
-        tools.set_base_tools([
-            "run_pipeline",
-            "search",
-            "deep_crawl",
-            "web_search",
-            "web_fetch",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "shell",
-            "list_dir",
-            "glob",
-            "grep",
-            "message",
-            "send_file",
-            "spawn",
-            "activate_tools",
-        ]);
-        // Pin all plugin/skill tools as base so they are never auto-evicted.
-        if !plugin_result.tool_names.is_empty() {
-            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
-        }
-
-        // Auto-defer non-core tool groups when tool count is high to prevent
-        // overwhelming weaker LLMs (e.g. GLM) that return empty responses
-        // when too many tool definitions are present.
-        let visible = tools.specs().len();
-        if visible > 15 {
-            // Keep research (deep_search, deep_crawl) active — users
-            // often call these directly. Defer rarely-used groups only.
-            for group in &[
-                "group:admin",
-                "group:sessions",
-                "group:web",
-                "group:runtime",
-                "group:media", // mofa_comic, mofa_slides, mofa_infographic, mofa_cards, fm_tts
-            ] {
-                tools.defer_group(group);
-            }
-            let after = tools.specs().len();
-            info!(
-                before = visible,
-                after, "auto-deferred tool groups to reduce tool count"
-            );
-        }
-        // Register activate_tools (wired per-session in session_actor)
-        if tools.has_deferred() {
-            tools.register(octos_agent::ActivateToolsTool::new());
-        }
+        // RFC-0 (#1289): LRU tool deferral + the `activate_tools` meta-tool
+        // were removed. Every enabled tool is now emitted every turn (full
+        // schema), so the base-tool pin list and the auto-defer-non-core
+        // -groups pass are gone.
 
         // PR #688 follow-up — codex finding (post-MEDIUM #4):
         // re-apply tool_policy AFTER all base-registry tools have been
         // registered. The first pass at line ~684 above ran before
         // `ManageSkillsTool`, `SynthesizeResearchTool`,
-        // `RecallMemoryTool`, `SaveMemoryTool`, `SwitchModelTool`, and
-        // `ActivateToolsTool` were registered, so a `tool_policy.deny`
+        // `RecallMemoryTool`, `SaveMemoryTool`, and `SwitchModelTool`
+        // were registered, so a `tool_policy.deny`
         // entry targeting any of those names was silently bypassed at
         // the base level. The per-session re-apply in
         // `ActorFactory::spawn` is still required for `run_pipeline`
@@ -1561,6 +1514,7 @@ impl GatewayRuntime {
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
+                shutdown_notify: &shutdown_notify,
                 on_session_deleted: Some(Arc::new(move |id: &str| {
                     let _ = delete_tx.send(id.to_string());
                 })),
@@ -1634,7 +1588,7 @@ impl GatewayRuntime {
         eprintln!("[gateway] ready");
         println!(
             "{}",
-            "Gateway ready. Type a message or /quit to exit.".dimmed()
+            "Gateway ready. Type a message, quit, exit, /quit, or /exit.".dimmed()
         );
         println!();
 
@@ -2180,12 +2134,14 @@ impl GatewayRuntime {
         // Timeout prevents hung actors from blocking the entire sequence.
         // CLI shutdown should return control to the terminal promptly.
         // Hung actors will be abandoned and then torn down by runtime shutdown.
-        let shutdown_timeout = Duration::from_secs(1);
-        if tokio::time::timeout(shutdown_timeout, self.actor_registry.shutdown_all())
+        if tokio::time::timeout(CLI_SHUTDOWN_TIMEOUT, self.actor_registry.shutdown_all())
             .await
             .is_err()
         {
-            warn!("actor shutdown timed out after {shutdown_timeout:?}, forcing exit");
+            warn!(
+                "actor shutdown timed out after {:?}, forcing exit",
+                CLI_SHUTDOWN_TIMEOUT
+            );
         }
 
         // Stop background services concurrently
@@ -2206,6 +2162,11 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn cli_shutdown_timeout_stays_prompt() {
+        assert!(CLI_SHUTDOWN_TIMEOUT <= Duration::from_secs(1));
+    }
 
     fn make_inbound(content: &str) -> octos_core::InboundMessage {
         octos_core::InboundMessage {

@@ -91,9 +91,9 @@ Skills are self-contained binaries with `manifest.json` declarations. Binary pro
 
 DOT-graph based multi-step agent workflows. Per-node model selection via `ModelStylesheet`. Parallel fan-out spawns N concurrent workers at runtime. Includes artifact store, checkpoints, condition evaluation, human gates. `PipelineResult` tracks output, token usage, per-node summaries, modified files.
 
-### LRU Tool Deferral
+### Tool Visibility (RFC-0, #1289)
 
-15 active tools for fast LLM reasoning, 34+ available on demand. Idle tools auto-evict. `spawn_only` tools cannot be evicted.
+All enabled tools are sent to the LLM every turn (full schema) — there is no LRU-by-recency deferral, no `activate_tools` meta-tool, and no config-driven group deferral. `spawn_only` tools still auto-redirect to background execution but remain visible in `specs()`. `internal_hidden` tools (mofa_make dispatcher targets) remain hidden from `specs()` but callable internally via `get()`. `provider_policy` and `context_filter` are the only remaining `specs()` filters.
 
 ### Memory (`octos-memory/src/`)
 
