@@ -211,4 +211,23 @@ mod tests {
         segs.append("only content");
         assert_eq!(segs.render(), "\n\nonly content");
     }
+
+    #[test]
+    fn reserved_empty_named_slot_keeps_position_when_filled_later() {
+        // The session-actor pattern: base → reserve empty named slot →
+        // append tail → (turn-start refresh) fill the slot. The filled
+        // content must land BETWEEN base and tail, and the empty slot
+        // must render as nothing meanwhile.
+        let mut segs = PromptSegments::from_base("BASE".to_string());
+        segs.set_named("memory", String::new());
+        segs.append("TAIL");
+        assert_eq!(segs.render(), "BASE\n\nTAIL");
+
+        segs.set_named("memory", "MEMORY".to_string());
+        let rendered = segs.render();
+        let b = rendered.find("BASE").unwrap();
+        let m = rendered.find("MEMORY").unwrap();
+        let t = rendered.find("TAIL").unwrap();
+        assert!(b < m && m < t, "order must be base→memory→tail: {rendered}");
+    }
 }

@@ -2929,6 +2929,9 @@ mod tests {
     fn should_let_env_disable_refresh_when_config_silent() {
         // Host mirroring: OCTOS_MEMORY_REFRESH_ENABLED=0 must beat the
         // child's default-on when the config file says nothing.
+        // Serialized: process-env mutation races every parallel test that
+        // loads a Config (same rule as the HOME-mutating tests).
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED").ok();
         unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", "0") };
 
