@@ -12,7 +12,6 @@ use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::acp_websocket::acp_websocket_handler;
-use super::acp;
 use super::admin;
 use super::admin_audit;
 use super::admin_setup;
@@ -693,6 +692,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         metrics_route
     };
 
+    // ACP WebSocket route — protected when auth is configured, public otherwise
+    let acp_route = Router::new().route("/acp", get(acp_websocket_handler));
+    let acp_route = if has_auth {
+        acp_route.layer(middleware::from_fn_with_state(
+            state.clone(),
+            user_auth_middleware,
+        ))
+    } else {
+        acp_route
+    };
+
     // Public version/health endpoints (no auth required)
     let version_routes = Router::new()
         .route("/api/version", get(handlers::version))
@@ -741,7 +751,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/session_ingress/ws/{session_id}",
             get(session_ingress::ws_handler),
         )
-        .route("/acp", get(acp::acp_websocket_handler))
+        .merge(acp_route)
         .merge(webhook_routes)
         .merge(version_routes)
         .merge(internal_routes);

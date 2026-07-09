@@ -23,35 +23,35 @@ use super::AppState;
 
 /// JSON-RPC 2.0 Request
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcRequest {
-    pub jsonrpc: String,
-    pub id: String,
-    pub method: String,
-    pub params: serde_json::Value,
+pub(crate) struct JsonRpcRequest {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: String,
+    pub(crate) method: String,
+    pub(crate) params: serde_json::Value,
 }
 
 /// JSON-RPC 2.0 Response
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcResponse {
-    pub jsonrpc: String,
-    pub id: String,
+pub(crate) struct JsonRpcResponse {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
+    pub(crate) result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<AcpError>,
+    pub(crate) error: Option<AcpError>,
 }
 
 /// JSON-RPC 2.0 Notification
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcNotification {
-    pub jsonrpc: String,
-    pub method: String,
-    pub params: serde_json::Value,
+pub(crate) struct JsonRpcNotification {
+    pub(crate) jsonrpc: String,
+    pub(crate) method: String,
+    pub(crate) params: serde_json::Value,
 }
 
 /// ACP message types (for internal use)
 #[derive(Debug, Clone)]
-pub enum AcpMessage {
+pub(crate) enum AcpMessage {
     Request(JsonRpcRequest),
     Response(JsonRpcResponse),
     Notification(JsonRpcNotification),
@@ -69,11 +69,11 @@ impl AcpMessage {
 
 /// ACP error structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AcpError {
-    pub code: i32,
-    pub message: String,
+pub(crate) struct AcpError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
+    pub(crate) data: Option<serde_json::Value>,
 }
 
 /// Progress reporter that sends ACP session/update notifications via WebSocket
@@ -92,7 +92,6 @@ impl ProgressReporter for WebSocketStreamReporter {
     fn report(&self, event: ProgressEvent) {
         match event {
             ProgressEvent::StreamChunk { text, .. } => {
-                // Send session/update notification with agent_message_chunk
                 let notification = AcpMessage::Notification(JsonRpcNotification {
                     jsonrpc: "2.0".to_string(),
                     method: "session/update".to_string(),
@@ -109,9 +108,7 @@ impl ProgressReporter for WebSocketStreamReporter {
                 });
                 let _ = self.sender.send(notification);
             }
-            _ => {
-                // Ignore other events for now
-            }
+            _ => {}
         }
     }
 }
@@ -131,7 +128,10 @@ async fn handle_acp_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Create channel for outgoing messages (for streaming)
+    // Unique session key for this connection so conversation history is isolated.
+    let session_key = SessionKey::new("acp", &Uuid::new_v4().to_string());
+
+    // Unbounded sender keeps report() synchronous (ProgressReporter::report is not async).
     let (tx, mut rx): (mpsc::UnboundedSender<AcpMessage>, mpsc::UnboundedReceiver<AcpMessage>) =
         mpsc::unbounded_channel();
 
@@ -166,9 +166,12 @@ async fn handle_acp_socket(socket: WebSocket, state: Arc<AppState>) {
             match msg {
                 Ok(Message::Text(text)) => {
                     debug!("Received ACP message: {}", text);
-                    if let Err(e) = handle_acp_message(&text, tx.clone(), &state).await {
-                        error!("Error handling ACP message: {}", e);
-                        // Error responses are handled inside handle_acp_message
+                    if let Err(e) =
+                        handle_acp_message(&text, tx.clone(), &state, &session_key).await
+                    {
+                        // A channel send error means the send_task has exited; close cleanly.
+                        error!("ACP connection lost: {}", e);
+                        break;
                     }
                 }
                 Ok(Message::Binary(data)) => {
@@ -207,43 +210,47 @@ async fn handle_acp_message(
     message: &str,
     sender: mpsc::UnboundedSender<AcpMessage>,
     state: &AppState,
+    session_key: &SessionKey,
 ) -> eyre::Result<()> {
     // Try to parse as JSON-RPC request
-    if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(message) {
-        info!("Handling ACP request: {} ({})", request.method, request.id);
+    match serde_json::from_str::<JsonRpcRequest>(message) {
+        Ok(request) => {
+            info!("Handling ACP request: {} ({})", request.method, request.id);
 
-        // Route the request to appropriate handler
-        let response = match request.method.as_str() {
-            "chat" | "user_input" => {
-                handle_chat_request(request.id.clone(), request.params, state, sender.clone()).await
-            }
-            "ping" => Ok(AcpMessage::Response(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id.clone(),
-                result: Some(serde_json::json!({ "pong": true })),
-                error: None,
-            })),
-            "status" => handle_status_request(request.id.clone(), state).await,
-            "list_sessions" => handle_list_sessions_request(request.id.clone(), state).await,
-            _ => Ok(AcpMessage::Response(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id.clone(),
-                result: None,
-                error: Some(AcpError {
-                    code: -32601,
-                    message: format!("Method not found: {}", request.method),
-                    data: None,
-                }),
-            })),
-        };
+            let response = match request.method.as_str() {
+                "chat" | "user_input" => {
+                    handle_chat_request(
+                        request.id.clone(),
+                        request.params,
+                        state,
+                        sender.clone(),
+                        session_key.clone(),
+                    )
+                    .await
+                }
+                "ping" => Ok(AcpMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: Some(serde_json::json!({ "pong": true })),
+                    error: None,
+                })),
+                "status" => handle_status_request(request.id.clone(), state).await,
+                "list_sessions" => handle_list_sessions_request(request.id.clone(), state).await,
+                _ => Ok(AcpMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: None,
+                    error: Some(AcpError {
+                        code: -32601,
+                        message: format!("Method not found: {}", request.method),
+                        data: None,
+                    }),
+                })),
+            };
 
-        // Send response
-        match response {
-            Ok(resp) => {
-                sender.send(resp)?;
-            }
-            Err(e) => {
-                let error_resp = AcpMessage::Response(JsonRpcResponse {
+            let resp = match response {
+                Ok(r) => r,
+                Err(e) => AcpMessage::Response(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: request.id,
                     result: None,
@@ -252,13 +259,25 @@ async fn handle_acp_message(
                         message: format!("Internal error: {}", e),
                         data: None,
                     }),
-                });
-                sender.send(error_resp)?;
-            }
+                }),
+            };
+            sender.send(resp)?;
         }
-    } else {
-        // Not a valid request, log and ignore
-        warn!("Received invalid JSON-RPC message: {}", message);
+        Err(_) => {
+            // JSON-RPC 2.0 §5 — respond with parse error; use null id (unknown).
+            warn!("Received invalid JSON-RPC message");
+            let error_resp = AcpMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: "null".to_string(),
+                result: None,
+                error: Some(AcpError {
+                    code: -32700,
+                    message: "Parse error".to_string(),
+                    data: None,
+                }),
+            });
+            sender.send(error_resp)?;
+        }
     }
 
     Ok(())
@@ -270,6 +289,7 @@ async fn handle_chat_request(
     params: serde_json::Value,
     state: &AppState,
     sender: mpsc::UnboundedSender<AcpMessage>,
+    session_key: SessionKey,
 ) -> eyre::Result<AcpMessage> {
     let input = params
         .get("input")
@@ -281,8 +301,6 @@ async fn handle_chat_request(
         .values()
         .next()
         .ok_or_else(|| eyre::eyre!("No profiles configured"))?;
-
-    let session_key = SessionKey::new("acp", "default");
 
     let session_rt = state
         .session_cache

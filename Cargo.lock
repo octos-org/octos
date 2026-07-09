@@ -3892,7 +3892,6 @@ dependencies = [
  "eyre",
  "flate2",
  "futures",
- "futures-util",
  "getrandom 0.2.17",
  "iana-time-zone",
  "image",

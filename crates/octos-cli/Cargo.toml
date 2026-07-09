@@ -60,8 +60,6 @@ constant_time_eq = "0.3"
 percent-encoding = "2"
 open = { workspace = true }
 url = { workspace = true }
-tokio-tungstenite = { workspace = true }
-futures-util = "0.3"
 zip = { workspace = true }
 quick-xml = { workspace = true }
 image = { workspace = true }
