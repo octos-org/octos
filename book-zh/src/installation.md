@@ -43,7 +43,8 @@ cargo install --path crates/octos-cli
 #   telegram、discord、dingtalk、slack、whatsapp、feishu、email、wecom、wecom-bot、
 #   matrix、line、qq-bot、twilio、wechat
 # `octos serve` 必需：api
-# 其他特性：git（gitoxide）、ast（tree-sitter）、audio_mp3（mp3 TTS 输出）
+# 其他特性：git（gitoxide）、ast（tree-sitter）、
+#   audio_mp3（用于音频工作区契约校验的 MP3 解码）
 # 注意：浏览器工具（通过 CDP 的无头 Chrome）始终编译在内——没有 `browser` 特性。
 cargo install --path crates/octos-cli --features "api,telegram,slack"
 

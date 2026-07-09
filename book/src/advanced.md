@@ -462,15 +462,15 @@ Configure in `config.json`:
 
 ## Session Management
 
-### Session Forking
+### New & Named Sessions
 
-Send `/new` to create a branched conversation:
+Send bare `/new` (equivalent to `/clear`) to wipe the current session's history and start fresh:
 
 ```
 /new
 ```
 
-This creates a new session that copies the last 10 messages from the current conversation. The child session has a `parent_key` reference to the original. Each fork gets a unique key namespaced by sender and timestamp.
+Use `/new <name>` to switch to — or create — a **named** session (e.g. `/new research`), and `/new slides <name>` / `/new site <preset>` to scaffold a project session. Sessions are keyed by sender/channel; the session store additionally carries a `parent_key` field used for internally-forked child sessions (e.g. background spawns).
 
 ### Session Persistence
 
@@ -478,7 +478,7 @@ Each channel:chat_id pair maintains its own session (conversation history).
 
 - **Storage**: JSONL files in `.octos/sessions/`
 - **Max history**: Configurable via `gateway.max_history` (default: 50 messages)
-- **Session forking**: `/new` creates a branched conversation with parent_key tracking
+- **Sessions**: bare `/new` clears the current session; named sessions are keyed by sender/channel, with a `parent_key` field for internally-forked child sessions
 
 ### Config Hot-Reload
 
@@ -520,7 +520,7 @@ When the conversation exceeds the LLM's context window, older messages are autom
 
 | Command | Description |
 |---------|-------------|
-| `/new [name]` | Start (or switch to) a session; `/new <name>` names it, `/new slides <name>` / `/new site <preset>` scaffold a project |
+| `/new [name]` | Bare `/new` clears the current session; `/new <name>` switches to (or creates) a named session; `/new slides <name>` / `/new site <preset>` scaffold a project |
 | `/clear` | Wipe the current session's history |
 | `/s`, `/switch <name>` | Switch to a named session |
 | `/sessions` | List sessions for this chat |
