@@ -47,8 +47,42 @@ fn make_tls_connector() -> Option<tokio_tungstenite::Connector> {
     Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
 }
 
-fn ws_endpoint() -> String {
-    std::env::var("VOLC_TTS_WS_ENDPOINT").unwrap_or_else(|_| WS_ENDPOINT.to_string())
+/// True only for a `wss://` URL whose host is in the shared Volcano allowlist
+/// ([`crate::api::voice_turn::VOLCANO_ALLOWED_HOSTS`]). This is the same SSRF /
+/// token-exfiltration boundary the HTTP path enforces before sending the
+/// token: the `Authorization: Bearer;{token}` header and the body token ride
+/// this URL, so an off-allowlist (or plaintext `ws://`) override must never
+/// see credentials.
+fn is_allowed_ws_endpoint(endpoint: &str) -> bool {
+    match reqwest::Url::parse(endpoint) {
+        Ok(u) => {
+            u.scheme() == "wss"
+                && u.host_str()
+                    .is_some_and(|h| crate::api::voice_turn::VOLCANO_ALLOWED_HOSTS.contains(&h))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve the ws endpoint. An unset/empty `VOLC_TTS_WS_ENDPOINT` yields the
+/// default; a set override must pass [`is_allowed_ws_endpoint`] or it is
+/// REFUSED (`None` — the token is never attached), and the caller degrades to
+/// the allowlist-validated HTTP path in [`crate::api::voice_turn`].
+fn ws_endpoint() -> Option<String> {
+    match std::env::var("VOLC_TTS_WS_ENDPOINT") {
+        Ok(ep) if !ep.is_empty() => {
+            if is_allowed_ws_endpoint(&ep) {
+                Some(ep)
+            } else {
+                tracing::warn!(
+                    endpoint = %ep,
+                    "voice_turn: refusing volcano ws TTS — endpoint not in the wss Volcano allowlist; token NOT sent"
+                );
+                None
+            }
+        }
+        _ => Some(WS_ENDPOINT.to_string()),
+    }
 }
 
 /// File extension for the requested audio encoding.
@@ -80,7 +114,7 @@ pub(crate) async fn synthesize_ws_stream(
     let payload = build_submit_payload(appid, token, cluster, voice, encoding, text, &reqid);
     let frame = encode_request_frame(&payload, false);
 
-    let mut request = ws_endpoint()
+    let mut request = ws_endpoint()?
         .into_client_request()
         .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano ws bad endpoint"))
         .ok()?;
@@ -276,6 +310,42 @@ fn parse_server_frame(bytes: &[u8]) -> Result<ServerFrame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_accept_default_ws_endpoint_when_checking_allowlist() {
+        assert!(is_allowed_ws_endpoint(WS_ENDPOINT));
+    }
+
+    #[test]
+    fn should_reject_off_host_ws_endpoint_to_prevent_token_exfiltration() {
+        // An env-overridden endpoint pointing off the Volcano allowlist must
+        // never see the Authorization header / body token.
+        assert!(!is_allowed_ws_endpoint(
+            "wss://evil.example.com/api/v1/tts/ws_binary"
+        ));
+        // Allowlisted host as a suffix of an attacker domain must not pass.
+        assert!(!is_allowed_ws_endpoint(
+            "wss://openspeech.bytedance.com.evil.example/api/v1/tts/ws_binary"
+        ));
+    }
+
+    #[test]
+    fn should_reject_non_wss_scheme_ws_endpoint() {
+        // Plaintext ws:// would leak the token on the wire; https:// is not a
+        // WebSocket endpoint at all.
+        assert!(!is_allowed_ws_endpoint(
+            "ws://openspeech.bytedance.com/api/v1/tts/ws_binary"
+        ));
+        assert!(!is_allowed_ws_endpoint(
+            "https://openspeech.bytedance.com/api/v1/tts/ws_binary"
+        ));
+    }
+
+    #[test]
+    fn should_reject_unparseable_ws_endpoint() {
+        assert!(!is_allowed_ws_endpoint("not a url"));
+        assert!(!is_allowed_ws_endpoint(""));
+    }
 
     #[test]
     fn request_frame_has_4byte_header_then_be_length_then_payload() {

@@ -947,7 +947,9 @@ fn build_volcano(
 
 /// HTTPS Volcano TTS hosts the token may be sent to. Keep this tight — it is the
 /// SSRF / token-exfiltration boundary for the partly tenant-controlled endpoint.
-const VOLCANO_ALLOWED_HOSTS: &[&str] = &["openspeech.bytedance.com"];
+/// Shared with the ws_binary streaming path ([`crate::api::volcano_ws`]) so both
+/// transports enforce the same boundary.
+pub(crate) const VOLCANO_ALLOWED_HOSTS: &[&str] = &["openspeech.bytedance.com"];
 
 /// True only for an `https://` URL whose host is in [`VOLCANO_ALLOWED_HOSTS`].
 fn is_allowed_volcano_endpoint(endpoint: &str) -> bool {
