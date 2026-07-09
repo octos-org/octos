@@ -1073,20 +1073,32 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
             );
         }
         e = e.with_dimensions(dimensions);
-    } else if cfg.model.is_some() {
-        // ANY custom model pins to the index dimension when `dimensions`
-        // is unset: the native-size table only knows OpenAI's models, so
-        // an unknown OpenAI-compatible model (DashScope v4 is natively
-        // 1024-d) would silently drop every vector to BM25-only. Known
-        // 1536-native models tolerate the explicit param; providers that
-        // reject it error visibly at request time instead of degrading
-        // silently. The no-model default keeps the legacy request shape.
-        tracing::info!(
-            model = %e.model(),
-            pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
-            "pinning custom embedding model to the episodic index dimension"
-        );
-        e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
+    } else if let Some(model) = cfg.model.as_deref() {
+        // Auto-pin to the index dimension ONLY for families known to
+        // accept the OpenAI-standard `dimensions` field (OpenAI 3-series;
+        // DashScope text-embedding-v3/v4, natively 1024-d). Models that
+        // reject the field (ada-002) keep the legacy request shape; for
+        // families we can't classify, warn loudly instead of degrading
+        // silently — the native size is unknown and non-1536 vectors are
+        // dropped to BM25-only.
+        let supports_dimensions =
+            model.starts_with("text-embedding-3") || model.starts_with("text-embedding-v");
+        if supports_dimensions {
+            tracing::info!(
+                model = %e.model(),
+                pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "pinning custom embedding model to the episodic index dimension"
+            );
+            e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
+        } else {
+            tracing::warn!(
+                model = %e.model(),
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "custom embedding model without `dimensions`: native size unknown — \
+                 vectors that are not index-sized will be dropped to BM25-only; set \
+                 embedding.dimensions if the provider supports it"
+            );
+        }
     }
     Some(Arc::new(e))
 }
