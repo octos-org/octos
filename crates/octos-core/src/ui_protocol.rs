@@ -9935,6 +9935,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             },
         };
         let wire = UiRpcResult::SessionRollback(result.clone());
