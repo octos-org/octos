@@ -61,9 +61,174 @@ pub(crate) fn response_path_for_profile_file(
 fn resolve_scoped_download_path(
     base_dir: &std::path::Path,
     request_path: &str,
+    auth_profile: Option<&str>,
+    session_workspace: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
-    resolve_scoped_file_handle(base_dir, request_path)
+    if let Some(resolved) = resolve_scoped_file_handle(base_dir, request_path)
         .or_else(|| resolve_legacy_file_request(base_dir, request_path))
+    {
+        // SECURITY (#1377 round-6 P1.2): `up/` handles + raw tmpdir refs resolve
+        // against the PROCESS-GLOBAL upload root regardless of `base_dir`, so a
+        // requester who obtains another tenant's handle could otherwise download
+        // it. Now that uploads are stored under `octos-uploads/<profile>/…`,
+        // refuse an upload-tmpdir result whose owning tenant != the authenticated
+        // requester. Non-upload results (profile files already scoped to
+        // `base_dir`) are unaffected.
+        if let Some(owner) = upload_tmpdir_tenant(&resolved) {
+            if auth_profile != Some(owner.as_str()) {
+                return None;
+            }
+        }
+        return Some(resolved);
+    }
+    // #1377: uploaded files are materialized into the per-session workspace
+    // (`<workspace>/uploads/<name>`) and the user-message `FileRef` carries that
+    // workspace-relative path. Serve it from the resolved session workspace (the
+    // caller passes the SAME root the turn materialized into).
+    resolve_within_workspace(session_workspace?, request_path)
+}
+
+/// If `p` is contained under the process-global upload tmpdir, return its owning
+/// tenant (the first path component, since uploads live at
+/// `octos-uploads/<tenant>/<uuid>_<name>`). `None` for any path NOT under the
+/// upload root (e.g. a profile file already scoped to its tenant `base_dir`).
+fn upload_tmpdir_tenant(p: &std::path::Path) -> Option<String> {
+    let root = std::fs::canonicalize(octos_bus::file_handle::temp_upload_root()).ok()?;
+    let canon = std::fs::canonicalize(p).ok()?;
+    match canon.strip_prefix(&root).ok()?.components().next()? {
+        std::path::Component::Normal(s) => s.to_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Resolve a workspace-relative download path (e.g. `uploads/<name>`) under
+/// `workspace_root`. Canonical containment + traversal guards keep it inside
+/// that workspace.
+fn resolve_within_workspace(
+    workspace_root: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    let rel = std::path::Path::new(request_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let candidate = std::fs::canonicalize(workspace_root.join(rel)).ok()?;
+    let canon_ws = std::fs::canonicalize(workspace_root).ok()?;
+    (candidate.is_file() && candidate.starts_with(&canon_ws)).then_some(candidate)
+}
+
+/// Resolve the workspace root for a download request's owning session, matching
+/// EXACTLY where the turn materialized uploads (#1377). `data_dir` is the
+/// authenticated caller's profile/tenant root, so this only reaches that
+/// tenant's own sessions.
+///
+/// Primary: the in-memory open-session map (`session_workspace_root_for_state`),
+/// which holds the exact `workspace_root` the turn used — correct for every
+/// session shape, including `base_key()`-encoded and cwd-hinted workspaces.
+/// Fallback (evicted session): the canonical multi-tenant layout
+/// `<data>/users/<encode_path_component(base_key)>/workspace` (mirrors the
+/// workspace construction in `ui_protocol.rs`).
+///
+/// SECURITY: the open-session map is process-GLOBAL across tenants, so a map
+/// hit is trusted ONLY when its workspace is contained under the authenticated
+/// `data_dir` (this tenant's root). A foreign session id therefore can't
+/// surface another tenant's workspace; it falls through to the tenant-scoped
+/// reconstruction, which (for a foreign session) won't exist under this
+/// `data_dir` and resolves to a 404 — never a cross-tenant read (codex #1377
+/// round-3/8 P1).
+///
+/// KNOWN LIMITATION: a session opened with an approved `cwd` OUTSIDE the data
+/// dir (desktop/AppUI custom workspaces — NOT the hosted `<data>/users/...`
+/// fleet layout) materialises uploads into that external repo, which this
+/// containment rule won't serve via `/api/files`. Soundly serving those needs a
+/// session→owning-profile binding the workspace map does not carry; a generic
+/// cwd-safety re-check is NOT an ownership proof (it would reopen the
+/// cross-tenant read — codex round-8 P1). Tracked as a follow-up.
+fn resolve_session_workspace_root(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let key = octos_core::SessionKey(session_id.to_string());
+    if let Some(ws) = crate::api::ui_protocol::session_workspace_root_for_state(state, &key) {
+        if map_workspace_belongs_to_tenant(&ws, data_dir) {
+            return Some(ws);
+        }
+        // Outside this tenant's data dir → not provably owned by the requester.
+        // Ignore the global map entry and fall through to the tenant-scoped
+        // reconstruction below.
+    }
+    let base = session_id.split('#').next().unwrap_or(session_id);
+    if base.is_empty() || base.contains('/') || base.contains('\\') || base.contains("..") {
+        return None;
+    }
+    let encoded = octos_bus::session::encode_path_component(base);
+    Some(data_dir.join("users").join(encoded).join("workspace"))
+}
+
+/// True when `ws` (a global-map workspace root) is contained under the
+/// authenticated tenant's `data_dir`. Canonicalizes both sides; fails closed if
+/// either can't be canonicalized.
+fn map_workspace_belongs_to_tenant(ws: &std::path::Path, data_dir: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(ws), std::fs::canonicalize(data_dir)) {
+        (Ok(w), Ok(d)) => w.starts_with(&d),
+        _ => false,
+    }
+}
+
+/// The authenticated requester's owning profile id, derived the SAME way the WS
+/// session derives its tenant (routed header OR authenticated identity), so a
+/// download's tenant check matches the upload's stamp. Admin-without-routing →
+/// `MAIN_PROFILE_ID` (admin runs default sessions as `_main`). `None` when it
+/// can't be resolved — download callers then fail closed. Used by `/api/files`.
+fn request_owner_profile(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Option<String> {
+    let header_profile_id = routed_profile_id_from_headers(state, headers);
+    let identity_profile_id = match identity {
+        Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
+        Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
+        None => None,
+    };
+    let pid = if identity.is_none() && header_profile_id.is_none() {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        decide_resolved_profile_id(
+            state,
+            identity,
+            header_profile_id.as_deref(),
+            identity_profile_id,
+        )
+        .ok()?
+    };
+    Some(owner_profile_for_resolved_request(
+        pid,
+        header_profile_id.as_deref(),
+    ))
+}
+
+fn owner_profile_for_resolved_request(
+    resolved_profile_id: String,
+    header_profile_id: Option<&str>,
+) -> String {
+    // Admin without an explicit tenant route is the legacy bootstrap/admin
+    // surface and runs default sessions under `_main`. If the client explicitly
+    // routes to `admin` (X-Profile-Id or hosted profile route), keep `admin` so
+    // upload ownership matches the WS `session/open` runtime.
+    if resolved_profile_id == ADMIN_PROFILE_ID && header_profile_id.is_none() {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        resolved_profile_id
+    }
 }
 
 fn request_host(headers: &HeaderMap) -> Option<String> {
@@ -396,6 +561,19 @@ pub struct SessionInfo {
     /// the client should fall back to deriving a title from message content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Recency timestamp (RFC3339) — `SessionMeta.updated_at`, or the JSONL
+    /// file mtime as a cheap fallback. Lets the TUI sort the session list by
+    /// most-recently-touched. None when neither source is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Preview of the session's MOST RECENT user prompt, truncated (~100 bytes,
+    /// UTF-8 safe). Sourced by scanning the tail of the session JSONL for the
+    /// last user-role message (see
+    /// `octos_bus::SessionManager::list_top_level_sessions_with_meta`). Lets the
+    /// `/resume` picker show what each session was about. None for sessions with
+    /// no user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -414,6 +592,7 @@ pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
+    connection_profile_id: Option<&str>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -448,7 +627,38 @@ pub async fn list_sessions(
     // ids are already chat-bare. The process-wide walk below remains
     // as an admin / legacy fallback (still strips `<profile>:api:`
     // for legacy entries).
-    if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await {
+    //
+    // Resolve the profile data dir. The solo/stdio connection carries no
+    // HTTP routing header, so the header/identity + gateway resolver
+    // (`resolve_profile_data_dir`) returns `Err` there — pre-fix the
+    // per-profile `sessions/` dir was never scanned and the TUI
+    // `/resume` picker showed "No prior sessions" even with sessions on
+    // disk. When there is NO routing header we instead resolve from the
+    // connection's own frozen profile scope (`connection_profile_id`),
+    // mirroring how `session/hydrate` resolves its store for the same
+    // connection (`resolve_sessions_for_lookup` keys on
+    // `connection_profile_id`), so `session/list` scans the SAME
+    // directory the running session writes turns to.
+    //
+    // SECURITY / multi-tenant: `connection_profile_id` is the
+    // connection's frozen scope (authenticated identity / `session/open`),
+    // never a client-supplied per-request value — so this lists the
+    // connection's OWN sessions, not another tenant's. Whenever a
+    // `Host` / `X-Profile-Id` routing header IS present (hosted
+    // multi-tenant WS / gateway), or the connection is admin/unscoped, we
+    // keep the existing header + identity authorized resolution unchanged
+    // — Layer-2 authorization still applies, and a parent viewing a
+    // sub-account subdomain still lists the routed profile's sessions.
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let profile_data_dir = match connection_profile_id {
+        Some(pid) if routed_profile_id.is_none() => {
+            resolve_profile_data_dir_by_id(&state, pid).ok()
+        }
+        _ => resolve_profile_data_dir(&state, &headers, identity_ref)
+            .await
+            .ok(),
+    };
+    if let Some(profile_data_dir) = profile_data_dir {
         let profile_sessions = list_profile_sessions(&profile_data_dir);
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
@@ -471,9 +681,9 @@ pub async fn list_sessions(
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
-            sess.list_top_level_sessions_with_title()
+            sess.list_top_level_sessions_with_meta()
                 .into_iter()
-                .filter_map(|(id, count, title)| {
+                .filter_map(|(id, count, title, updated_at, last_prompt)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
                         return None;
@@ -485,6 +695,8 @@ pub async fn list_sessions(
                         id: chat_id.to_string(),
                         message_count: count,
                         title,
+                        updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                        last_prompt,
                     })
                 }),
         );
@@ -550,9 +762,9 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
     let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
         return Vec::new();
     };
-    mgr.list_top_level_sessions_with_title()
+    mgr.list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt)| {
             if is_internal_api_session_id(&id) {
                 return None;
             }
@@ -560,6 +772,8 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
                 id,
                 message_count: count,
                 title,
+                updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                last_prompt,
             })
         })
         .collect()
@@ -768,6 +982,7 @@ pub async fn session_messages(
                         role: m.role.to_string(),
                         content: m.content.clone(),
                         timestamp: m.timestamp.to_rfc3339(),
+                        media: m.media.clone(),
                         thread_id: m.thread_id.clone(),
                     })
                     .collect();
@@ -811,6 +1026,11 @@ pub struct MessageInfo {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    /// File attachments stored with this row. Kept additive and omitted when
+    /// empty so legacy clients that only read text continue to see the same
+    /// shape, while reload paths can restore user-uploaded image/video bubbles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
     /// M8.10 PR #1 thread grouping key. Lets the web client render chat
     /// history as `Vec<Thread>` rather than a flat message list. Omitted
     /// from the JSON when `None` so legacy clients that don't read the
@@ -1413,6 +1633,26 @@ pub async fn delete_session(
                 );
             }
         }
+        // `SessionManager::clear` removes only the chat JSONL. The
+        // per-session reasoning/thinking effort lives in a sidecar
+        // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
+        // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
+        // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
+        // that left it behind, or a `session/open` that wrote the sidecar for
+        // an otherwise-fresh key before any message was persisted. Without this
+        // unlink a deleted session's stale effort is resurrected on the next
+        // `session/open` of the same key. The helper reuses
+        // `reasoning_effort_path` so the encoding matches, and is
+        // best-effort/idempotent (missing file = `Ok(())`).
+        let data_dir = sess.data_dir();
+        if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
+        {
+            tracing::warn!(
+                session_key = %key,
+                error = %e,
+                "failed to clear per-session reasoning_effort sidecar on delete"
+            );
+        }
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's
@@ -1435,11 +1675,47 @@ pub async fn delete_session(
 /// Accepts multipart/form-data with one or more `file` fields.
 /// Returns JSON array of server-side upload handles.
 pub async fn upload(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    // Determine upload directory
-    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    // #1377 tenant isolation: stamp the upload with the OWNING profile so the
+    // turn-start materializer can verify ownership (`octos-uploads/<profile>/…`).
+    // The id MUST equal the session's `tenant_id` (both `profile.id`), so it is
+    // resolved IDENTITY-AWARE exactly like the session's profile — NOT from the
+    // routing header alone: an OTP/bearer user on the bare host has no routed
+    // header but their session is scoped to their own profile, so a header-only
+    // `_main` fallback would mis-stamp the upload and make it unreadable (codex
+    // round-5 P1). Cross-tenant `X-Profile-Id` → 403; truly unauthenticated
+    // (no identity, no header) → `MAIN_PROFILE_ID` (the default profile's tenant).
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let header_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let identity_profile_id = match identity_ref {
+        Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
+        Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
+        None => None,
+    };
+    let resolved_profile_id = if identity_ref.is_none() && header_profile_id.is_none() {
+        MAIN_PROFILE_ID.to_string()
+    } else {
+        decide_resolved_profile_id(
+            &state,
+            identity_ref,
+            header_profile_id.as_deref(),
+            identity_profile_id,
+        )
+        .map_err(|_| (StatusCode::FORBIDDEN, "forbidden".to_string()))?
+    };
+    // Keep upload ownership aligned with the WS session runtime. Admin without
+    // an explicit route remains `_main`; explicit `X-Profile-Id: admin` stays
+    // `admin`, otherwise voice turns in the admin Home profile lose their audio
+    // during tenant materialization.
+    let profile_id =
+        owner_profile_for_resolved_request(resolved_profile_id, header_profile_id.as_deref());
+
+    // Determine upload directory (per-tenant subdir).
+    let upload_dir = std::env::temp_dir().join("octos-uploads").join(&profile_id);
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1703,7 +1979,19 @@ pub async fn serve_file_by_query(
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
-    serve_file_impl(&data_dir, filename).await
+    // #1377: the authenticated requester's profile gates upload-tmpdir downloads
+    // (no cross-tenant) and authorizes a session-relative `uploads/<name>` path.
+    let auth_profile = request_owner_profile(&state, &headers, identity);
+    let session_ws = params
+        .get("session")
+        .and_then(|s| resolve_session_workspace_root(&state, &data_dir, s));
+    serve_file_impl(
+        &data_dir,
+        filename,
+        auth_profile.as_deref(),
+        session_ws.as_deref(),
+    )
+    .await
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
@@ -1712,21 +2000,79 @@ pub async fn serve_file(
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(filename): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
     let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
-    serve_file_impl(&data_dir, &filename).await
+    let auth_profile = request_owner_profile(&state, &headers, identity);
+    let session_ws = params
+        .get("session")
+        .and_then(|s| resolve_session_workspace_root(&state, &data_dir, s));
+    serve_file_impl(
+        &data_dir,
+        &filename,
+        auth_profile.as_deref(),
+        session_ws.as_deref(),
+    )
+    .await
 }
 
-async fn serve_file_impl(data_dir: &std::path::Path, filename: &str) -> Response {
-    let Some(path) = resolve_scoped_download_path(data_dir, filename) else {
+/// Read a file's bytes through an `O_NOFOLLOW` open (Unix) so a symlink leaf
+/// swapped in after a path was validated cannot redirect the read. On
+/// non-Unix, re-checks `symlink_metadata` before reading (best-effort, still
+/// racy but matches the platform's capabilities). The blocking I/O runs on a
+/// blocking thread.
+async fn read_file_no_follow(path: std::path::PathBuf) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+async fn serve_file_impl(
+    data_dir: &std::path::Path,
+    filename: &str,
+    auth_profile: Option<&str>,
+    session_workspace: Option<&std::path::Path>,
+) -> Response {
+    let Some(path) =
+        resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace)
+    else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
-    let data = match tokio::fs::read(&path).await {
+    // Read through an O_NOFOLLOW open rather than `tokio::fs::read(&path)`:
+    // `resolve_scoped_download_path` canonicalizes + containment-checks the
+    // path, but the final read still races that check — a leaf swapped to a
+    // symlink after resolution (time-of-check) would be followed by a plain
+    // read (time-of-use), serving an off-tenant / out-of-workspace file
+    // (e.g. a symlink to /etc/passwd). O_NOFOLLOW makes the open fail closed
+    // on a symlink leaf.
+    let data = match read_file_no_follow(path.clone()).await {
         Ok(d) => d,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -1814,6 +2160,7 @@ async fn read_profile_session_messages(
                 role: m.role.to_string(),
                 content: m.content.clone(),
                 timestamp: m.timestamp.to_rfc3339(),
+                media: m.media.clone(),
                 thread_id: m.thread_id.clone(),
             })
             .collect();
@@ -3685,6 +4032,42 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn read_file_no_follow_reads_regular_file_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("doc.pdf");
+        std::fs::write(&file, b"%PDF-1.7 body bytes").unwrap();
+        let bytes = read_file_no_follow(file).await.unwrap();
+        assert_eq!(bytes, b"%PDF-1.7 body bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_no_follow_rejects_a_symlink_leaf() {
+        // P2 (tri-repo #1529): a served path whose leaf is a symlink (e.g.
+        // swapped in after resolve_scoped_download_path canonicalized it)
+        // must NOT be followed — O_NOFOLLOW fails the open closed instead of
+        // serving the off-tenant target.
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, "off-tenant secret").unwrap();
+        let link = dir.path().join("served.pdf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_file_no_follow(link).await.unwrap_err();
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the symlink leaf must be rejected at open, not silently followed"
+        );
+        // The target's content must never be returned.
+        assert!(
+            read_file_no_follow(dir.path().join("served.pdf"))
+                .await
+                .is_err()
+        );
+    }
+
     // Legacy `POST /api/chat` REST tests (chat_request_*, chat_response_*)
     // were retired with the handler in the cleanup follow-up to PR #908.
     // Wire-level chat coverage now lives in
@@ -3698,6 +4081,8 @@ mod tests {
             id: "test-session".into(),
             message_count: 42,
             title: None,
+            updated_at: None,
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -3705,6 +4090,14 @@ mod tests {
         assert!(
             json.get("title").is_none(),
             "None title must be omitted from JSON"
+        );
+        assert!(
+            json.get("updated_at").is_none(),
+            "None updated_at must be omitted from JSON"
+        );
+        assert!(
+            json.get("last_prompt").is_none(),
+            "None last_prompt must be omitted from JSON"
         );
     }
 
@@ -3714,9 +4107,37 @@ mod tests {
             id: "test-session".into(),
             message_count: 7,
             title: Some("My Pinned Chat".into()),
+            updated_at: None,
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
+    }
+
+    #[test]
+    fn session_info_serialize_includes_updated_at() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 3,
+            title: None,
+            updated_at: Some("2026-07-02T12:00:00+00:00".into()),
+            last_prompt: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
+    }
+
+    #[test]
+    fn session_info_serialize_includes_last_prompt() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 5,
+            title: None,
+            updated_at: None,
+            last_prompt: Some("what is the capital of France?".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["last_prompt"], "what is the capital of France?");
     }
 
     #[test]
@@ -3725,6 +4146,7 @@ mod tests {
             role: "user".into(),
             content: "hello".into(),
             timestamp: "2025-01-01T00:00:00Z".into(),
+            media: Vec::new(),
             thread_id: None,
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -3733,6 +4155,8 @@ mod tests {
         assert_eq!(json["timestamp"], "2025-01-01T00:00:00Z");
         // None thread_id must be omitted so legacy clients keep round-tripping.
         assert!(json.get("thread_id").is_none());
+        // Empty media must be omitted for the same legacy wire-shape reason.
+        assert!(json.get("media").is_none());
     }
 
     #[test]
@@ -3744,6 +4168,7 @@ mod tests {
             role: "assistant".into(),
             content: "answer".into(),
             timestamp: "2026-04-26T00:00:00Z".into(),
+            media: Vec::new(),
             thread_id: Some("thread-cmid-1".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -3954,9 +4379,9 @@ mod tests {
             SessionKey("slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string());
         {
             let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
-            mgr.add_message(&bare_key, octos_core::Message::user("hello"))
-                .await
-                .unwrap();
+            let mut user = octos_core::Message::user("hello");
+            user.media = vec!["uploads/photo.png".to_string()];
+            mgr.add_message(&bare_key, user).await.unwrap();
             // PR F (M8.10 thread-binding): assistant persists require a
             // caller-supplied thread_id.
             let mut assistant = octos_core::Message::assistant("hi back");
@@ -3977,6 +4402,8 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
+        let first = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(first["media"], serde_json::json!(["uploads/photo.png"]));
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi back");
     }
@@ -4055,6 +4482,50 @@ mod tests {
         assert!(
             !sessions.iter().any(|s| s.id.starts_with("web-303")),
             "child-* fanouts must be filtered: {ids:?}"
+        );
+    }
+
+    /// The `/resume` picker previews each session by its most recent user
+    /// prompt. `list_profile_sessions` must surface `last_prompt` as the LAST
+    /// user message (not the first) for a session with ≥2 user turns — the
+    /// regression guard for the `session/list` `last_prompt` enrichment.
+    #[tokio::test]
+    async fn list_profile_sessions_surfaces_last_user_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            // First user turn + assistant reply.
+            mgr.add_message(
+                &SessionKey("web-501".to_string()),
+                octos_core::Message::user("first question"),
+            )
+            .await
+            .unwrap();
+            let mut a1 = octos_core::Message::assistant("first answer");
+            a1.thread_id = Some("turn-1".to_string());
+            mgr.add_message(&SessionKey("web-501".to_string()), a1)
+                .await
+                .unwrap();
+            // Second (most recent) user turn — this is the expected preview.
+            mgr.add_message(
+                &SessionKey("web-501".to_string()),
+                octos_core::Message::user("second question"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let sessions = list_profile_sessions(profile_data_dir);
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "web-501")
+            .expect("web-501 present");
+        assert_eq!(
+            session.last_prompt.as_deref(),
+            Some("second question"),
+            "last_prompt must be the MOST RECENT user message, not the first"
         );
     }
 
@@ -4162,6 +4633,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Some(Extension(AuthIdentity::Admin)),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4173,6 +4645,88 @@ mod tests {
         assert!(
             list.iter().any(|s| s.id == "web-legacy-1"),
             "admin legacy path must still surface profiled sessions: {ids:?}"
+        );
+    }
+
+    /// Regression: `session/list` over a solo/stdio connection (no HTTP
+    /// headers, no gateway / `process_manager`) must resolve the profile
+    /// data dir from the connection's own `connection_profile_id` — the
+    /// same scope `session/hydrate` uses — and surface the sessions the
+    /// running session persists under `<profile>/data/sessions/`.
+    ///
+    /// Pre-fix, `list_sessions` only resolved the profile via HTTP
+    /// headers / identity (`resolve_profile_data_dir`), which returns
+    /// `Err` over stdio (no `resolve_api_port`), so the per-profile scan
+    /// was skipped and the TUI `/resume` picker showed "No prior
+    /// sessions" even with sessions on disk. With `state.sessions` also
+    /// `None` (the solo/stdio shape) the handler returned `503` instead
+    /// of the session list.
+    #[tokio::test]
+    async fn list_sessions_solo_connection_profile_surfaces_profile_sessions() {
+        use crate::profiles::{ProfileStore, UserProfile};
+
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(home.path()).unwrap();
+
+        // A profile whose sessions live at an explicit data dir — the
+        // directory the running solo/stdio session persists turns to.
+        let sessions_dir = home.path().join("dev-data");
+        let profile = UserProfile {
+            id: "dev".into(),
+            name: "dev".into(),
+            enabled: true,
+            data_dir: Some(sessions_dir.to_string_lossy().into_owned()),
+            parent_id: None,
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // Seed one chat session the way the WS / stdio turn handler writes
+        // it (bare `web-<id>` key under the per-profile data dir).
+        {
+            let mut mgr = octos_bus::SessionManager::open(&sessions_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-solo-1".to_string()),
+                Message::user("hi from solo"),
+            )
+            .await
+            .unwrap();
+            let mut reply = Message::assistant("hello from solo");
+            reply.thread_id = Some("turn-solo-1".to_string());
+            mgr.add_message(&SessionKey("web-solo-1".to_string()), reply)
+                .await
+                .unwrap();
+        }
+
+        // Exactly the solo/stdio shape: profile_store wired, but no
+        // process_manager (gateway) and no process-wide `sessions` store.
+        let state = std::sync::Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            ..AppState::empty_for_tests()
+        });
+
+        // connection_profile_id = "dev", empty headers, no identity — the
+        // frozen scope a solo stdio connection carries.
+        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        let session = list
+            .iter()
+            .find(|s| s.id == "web-solo-1")
+            .unwrap_or_else(|| panic!("solo profile session must be surfaced; got {ids:?}"));
+        // 1 meta line + 2 message lines = 3, matching the count contract
+        // the process-wide walk emits.
+        assert_eq!(session.message_count, 3);
+        assert!(
+            session.title.is_some(),
+            "resumable session must carry a title for the /resume picker"
         );
     }
 
@@ -4268,8 +4822,104 @@ mod tests {
         std::fs::write(&other_file, b"secret").unwrap();
 
         assert!(
-            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none()
+            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy(), None, None)
+                .is_none()
         );
+    }
+
+    #[test]
+    fn resolve_scoped_download_path_serves_session_workspace_upload() {
+        // #1377: `uploads/<name>` resolves under the resolved session workspace.
+        let data = tempfile::tempdir().unwrap();
+        let ws = data.path().join("users/web-abc/workspace");
+        std::fs::create_dir_all(ws.join("uploads")).unwrap();
+        std::fs::write(ws.join("uploads/report.md"), b"hi").unwrap();
+
+        // With the owning session workspace → resolves to the workspace file.
+        // (auth_profile is irrelevant for a workspace-relative path — only
+        // upload-tmpdir results are tenant-gated.)
+        let ok = resolve_scoped_download_path(
+            data.path(),
+            "uploads/report.md",
+            None,
+            Some(ws.as_path()),
+        );
+        assert_eq!(
+            ok,
+            Some(std::fs::canonicalize(ws.join("uploads/report.md")).unwrap())
+        );
+
+        // Without a session workspace → not resolvable (no session context).
+        assert!(
+            resolve_scoped_download_path(data.path(), "uploads/report.md", None, None).is_none()
+        );
+        // Traversal is refused even with a workspace.
+        assert!(
+            resolve_scoped_download_path(data.path(), "../../etc/passwd", None, Some(ws.as_path()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_download_path_gates_cross_tenant_upload_handle() {
+        // codex round-6 P1.2: a download for an upload-tmpdir file owned by
+        // another tenant is refused; the owner gets it.
+        let data = tempfile::tempdir().unwrap();
+        let upload_root = octos_bus::file_handle::temp_upload_root().join("tenant-b");
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let f = upload_root.join(format!("u-{}-secret.md", std::process::id()));
+        std::fs::write(&f, b"theirs").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&f, Some("secret.md")).unwrap();
+
+        // Requester is tenant-a → refused.
+        assert!(
+            resolve_scoped_download_path(data.path(), &handle, Some("tenant-a"), None).is_none(),
+            "cross-tenant upload download must be refused"
+        );
+        // Owner tenant-b → served.
+        assert!(
+            resolve_scoped_download_path(data.path(), &handle, Some("tenant-b"), None).is_some(),
+            "the owning tenant must be able to download its upload"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn resolve_session_workspace_root_falls_back_to_base_key_layout() {
+        // #1377: an evicted (not-in-map) session resolves to the canonical
+        // `<data>/users/<encode(base_key)>/workspace`, with the topic stripped.
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        // Topic-suffixed key → workspace dir uses base_key (topic stripped).
+        let ws = resolve_session_workspace_root(&state, data.path(), "slides-xyz#deck-1").unwrap();
+        let expected_base = octos_bus::session::encode_path_component("slides-xyz");
+        assert_eq!(
+            ws,
+            data.path()
+                .join("users")
+                .join(expected_base)
+                .join("workspace")
+        );
+        // Empty session id → None.
+        assert!(resolve_session_workspace_root(&state, data.path(), "").is_none());
+    }
+
+    #[test]
+    fn map_workspace_must_be_under_authenticated_tenant() {
+        // codex #1377 round-3 P1: a global-map workspace from ANOTHER tenant must
+        // not be trusted by the session-aware download path.
+        let tenant_a = tempfile::tempdir().unwrap();
+        let tenant_b = tempfile::tempdir().unwrap();
+        let a_ws = tenant_a.path().join("users/web-a/workspace");
+        std::fs::create_dir_all(&a_ws).unwrap();
+        let b_ws = tenant_b.path().join("users/web-b/workspace");
+        std::fs::create_dir_all(&b_ws).unwrap();
+
+        // A's workspace is under A's data dir → trusted.
+        assert!(map_workspace_belongs_to_tenant(&a_ws, tenant_a.path()));
+        // B's workspace is NOT under A's data dir → rejected (no cross-tenant).
+        assert!(!map_workspace_belongs_to_tenant(&b_ws, tenant_a.path()));
     }
 
     #[test]
@@ -4850,7 +5500,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -4908,7 +5558,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4960,6 +5610,125 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let fresh = octos_bus::SessionManager::open(data_dir.path()).unwrap();
         assert!(fresh.load(&topic_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_persisted_reasoning_effort_sidecar() {
+        // Regression: `/thinking` persists a per-session reasoning-effort
+        // sidecar (`<topic>.reasoning_effort.json`) next to the session JSONL.
+        // The delete path previously removed only the JSONL, so a later
+        // `session/open` of the same key resurrected the stale effort for an
+        // otherwise-fresh session. Deleting the session must unlink the sidecar.
+        use crate::api::ui_protocol_reasoning_effort::{
+            read_reasoning_effort, reasoning_effort_path, write_reasoning_effort,
+        };
+        use octos_core::ui_protocol::ReasoningEffortLevel;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let topic_key =
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web-topic", "research");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("topic"))
+                .await
+                .unwrap();
+            assert!(sess.load(&topic_key).await.is_some());
+        }
+
+        // The `data_dir` the reasoning-effort store keys against is the
+        // SessionManager's own `data_dir()` (same root the turn/open paths use).
+        let effort_data_dir = sessions.lock().await.data_dir();
+        write_reasoning_effort(&effort_data_dir, &topic_key, ReasoningEffortLevel::High)
+            .expect("seed reasoning effort sidecar");
+        let sidecar = reasoning_effort_path(&effort_data_dir, &topic_key);
+        assert!(sidecar.exists(), "sidecar should exist before delete");
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = delete_session(
+            State(state),
+            HeaderMap::new(),
+            None,
+            axum::extract::Path("web-topic#research".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            !sidecar.exists(),
+            "delete must unlink the reasoning-effort sidecar at {}",
+            sidecar.display()
+        );
+        // And a subsequent read (what session/open does) must NOT resurrect the
+        // old effort for the now-deleted session.
+        assert_eq!(
+            read_reasoning_effort(&effort_data_dir, &topic_key),
+            None,
+            "stale reasoning effort must not be resurrected after delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_reasoning_effort_sidecar_without_jsonl() {
+        // Codex #1428 P2: a reasoning-effort sidecar can exist WITHOUT a chat
+        // JSONL — an older delete left it behind, or `session/open` wrote it for
+        // an otherwise-fresh key before any message was persisted. The unlink
+        // must run per candidate regardless of whether `sess.load` finds a
+        // JSONL, else the stale effort is resurrected on the next open.
+        use crate::api::ui_protocol_reasoning_effort::{
+            read_reasoning_effort, reasoning_effort_path, write_reasoning_effort,
+        };
+        use octos_core::ui_protocol::ReasoningEffortLevel;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let topic_key =
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web-topic", "research");
+
+        // Deliberately NO `add_message`: there is no chat JSONL for this key, so
+        // `sess.load(&key)` returns None and the old (nested) cleanup was skipped.
+        let effort_data_dir = sessions.lock().await.data_dir();
+        assert!(
+            sessions.lock().await.load(&topic_key).await.is_none(),
+            "precondition: no chat JSONL for this key"
+        );
+        write_reasoning_effort(&effort_data_dir, &topic_key, ReasoningEffortLevel::High)
+            .expect("seed reasoning effort sidecar");
+        let sidecar = reasoning_effort_path(&effort_data_dir, &topic_key);
+        assert!(sidecar.exists(), "sidecar should exist before delete");
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = delete_session(
+            State(state),
+            HeaderMap::new(),
+            None,
+            axum::extract::Path("web-topic#research".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            !sidecar.exists(),
+            "delete must unlink the sidecar even with no chat JSONL, at {}",
+            sidecar.display()
+        );
+        assert_eq!(
+            read_reasoning_effort(&effort_data_dir, &topic_key),
+            None,
+            "stale reasoning effort must not survive a JSONL-less delete"
+        );
     }
 
     #[test]
@@ -5291,6 +6060,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn owner_profile_maps_unrouted_admin_to_main() {
+        let pid = owner_profile_for_resolved_request(ADMIN_PROFILE_ID.to_string(), None);
+        assert_eq!(pid, MAIN_PROFILE_ID);
+    }
+
+    #[test]
+    fn owner_profile_keeps_explicit_admin_route() {
+        let pid = owner_profile_for_resolved_request(
+            ADMIN_PROFILE_ID.to_string(),
+            Some(ADMIN_PROFILE_ID),
+        );
+        assert_eq!(pid, ADMIN_PROFILE_ID);
     }
 
     #[test]

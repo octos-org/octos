@@ -21,7 +21,7 @@ impl octos_llm::LlmProvider for MockProvider {
         _config: &octos_llm::ChatConfig,
     ) -> eyre::Result<octos_llm::ChatResponse> {
         Ok(octos_llm::ChatResponse {
-            content: Some("ok".into()),
+            content: Some("DOT_UI_SMOKE_OK".into()),
             tool_calls: vec![],
             stop_reason: octos_llm::StopReason::EndTurn,
             usage: octos_llm::TokenUsage::default(),
@@ -52,48 +52,13 @@ async fn make_tool() -> (RunPipelineTool, tempfile::TempDir, tempfile::TempDir) 
 }
 
 #[tokio::test]
-async fn pre_flight_rejects_dot_with_ambiguous_start() {
-    // Real-world LLM mistake captured on mini5 2026-05-14: five parallel
-    // search nodes without a common entry. Pre-fix, this only surfaced
-    // inside the spawn_only background task — the LLM's foreground turn
-    // had already returned "Pipeline started in background…" and never
-    // saw the validator's complaint. Now the same shape is rejected
-    // synchronously so the LLM can fix the DOT in the next iteration.
-    let (tool, _working, _data) = make_tool().await;
-    let args = serde_json::json!({
-        "pipeline": "digraph bad {\n\
-            search_a [handler=DynamicParallel, tools=search];\n\
-            search_b [handler=DynamicParallel, tools=search];\n\
-            search_c [handler=DynamicParallel, tools=search];\n\
-            search_d [handler=DynamicParallel, tools=search];\n\
-            search_e [handler=DynamicParallel, tools=search];\n\
-            analyze [handler=Codergen, tools=read_file];\n\
-            synthesize [handler=Codergen, tools=write_file];\n\
-            search_a -> analyze;\n\
-            search_b -> analyze;\n\
-            search_c -> analyze;\n\
-            search_d -> analyze;\n\
-            search_e -> analyze;\n\
-            analyze -> synthesize;\n\
-        }",
-        "input": "anything",
-    });
-    let err = tool
-        .pre_flight_validate(&args)
-        .await
-        .expect_err("structurally invalid DOT must be rejected by pre-flight");
-    assert!(
-        err.contains("pipeline validation failed"),
-        "error must surface the validator's complaint verbatim — got: {err}"
-    );
-    assert!(
-        err.contains("ambiguous start") || err.contains("rule 1"),
-        "error must identify rule 1 (ambiguous start) — got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn pre_flight_accepts_well_formed_dot() {
+async fn pre_flight_rejects_inline_dot_even_when_well_formed() {
+    // Killing the unsafe authoring surface: free-form inline DOT let a model
+    // request arbitrary tools/handlers (incl. `shell`) or an empty tool-list
+    // that silently expanded to all builtins. It is now rejected at the tool
+    // boundary REGARDLESS of whether the DOT is structurally valid — validity
+    // is irrelevant once the surface itself is unsafe. Agents author via the
+    // capability-locked `ir` palette or name a sanctioned pipeline.
     let (tool, _working, _data) = make_tool().await;
     let args = serde_json::json!({
         "pipeline": "digraph ok {\n\
@@ -103,12 +68,144 @@ async fn pre_flight_accepts_well_formed_dot() {
         }",
         "input": "anything",
     });
-    let result = tool.pre_flight_validate(&args).await;
+    let err = tool
+        .pre_flight_validate(&args)
+        .await
+        .expect_err("inline DOT must be rejected even when well-formed");
     assert!(
-        result.is_ok(),
-        "well-formed DOT must pass pre-flight; got Err: {:?}",
-        result.err()
+        err.contains("inline DOT"),
+        "error must name the inline-DOT rejection — got: {err}"
     );
+    assert!(
+        err.contains("`ir`") || err.contains("sanctioned pipeline"),
+        "error must point the LLM at the safe alternatives — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pre_flight_rejects_multi_node_inline_dot_before_structural_validation() {
+    // Real-world LLM mistake captured on mini5 2026-05-14 (five parallel search
+    // nodes without a common entry). It used to reach the structural validator
+    // ("ambiguous start"); now the inline-DOT surface is rejected FIRST, so the
+    // model never gets to author this shape at all. Structural-rule coverage
+    // lives in `validate.rs` unit tests, exercised on named/bundled pipelines.
+    let (tool, _working, _data) = make_tool().await;
+    let args = serde_json::json!({
+        "pipeline": "digraph bad {\n\
+            search_a [handler=DynamicParallel, tools=search];\n\
+            search_b [handler=DynamicParallel, tools=search];\n\
+            analyze [handler=Codergen, tools=read_file];\n\
+            search_a -> analyze;\n\
+            search_b -> analyze;\n\
+        }",
+        "input": "anything",
+    });
+    let err = tool
+        .pre_flight_validate(&args)
+        .await
+        .expect_err("inline DOT must be rejected by pre-flight");
+    assert!(
+        err.contains("inline DOT"),
+        "rejection must fire before structural validation — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_rejects_inline_dot_at_chokepoint() {
+    // The single resolution chokepoint both `execute` and `pre_flight` funnel
+    // through must reject inline DOT, so no path can smuggle it to the parser.
+    let (tool, _working, _data) = make_tool().await;
+    let err = tool
+        .resolve_named_for_test("digraph x { a -> b }")
+        .await
+        .expect_err("inline DOT must not resolve");
+    assert!(
+        err.to_string().contains("inline DOT"),
+        "chokepoint must reject inline DOT — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_still_accepts_named_bundled_pipeline() {
+    // Regression guard: killing inline DOT must NOT break the safe path. The
+    // sanctioned bundled `deep_research` name still resolves to runnable DOT
+    // (discovery miss → embedded bundled bytes).
+    let (tool, _working, _data) = make_tool().await;
+    let dot = tool
+        .resolve_named_for_test("deep_research")
+        .await
+        .expect("bundled deep_research must still resolve");
+    assert!(
+        dot.contains("digraph"),
+        "resolved named pipeline must be DOT — got: {dot:.80}"
+    );
+}
+
+#[tokio::test]
+async fn pre_flight_rejects_dot_file_paths() {
+    // Security: a model-supplied `.dot` FILE PATH (e.g. one it wrote with
+    // handler=shell) must be rejected — not read + executed via discovery's
+    // direct-path resolution. Only bare sanctioned names are accepted.
+    let (tool, _working, _data) = make_tool().await;
+    for path in [
+        "/tmp/pwn.dot",
+        "./pwn.dot",
+        "../x.dot",
+        "subdir/p.dot",
+        "pwn.dot",
+    ] {
+        let args = serde_json::json!({ "pipeline": path, "input": "x" });
+        let err = tool
+            .pre_flight_validate(&args)
+            .await
+            .expect_err("a .dot file path must be rejected");
+        assert!(
+            err.contains("file paths are not accepted"),
+            "`{path}` must be rejected as a path; got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_cannot_run_workspace_authored_pipeline_by_bare_name() {
+    // Security: a model can write to the workspace; a `.dot` it drops in
+    // `<working>/.octos/pipelines` must NOT be resolvable by bare name — the
+    // agent tool searches only operator-trusted dirs + bundled bytes.
+    let (tool, working, _data) = make_tool().await;
+    let pdir = working.path().join(".octos").join("pipelines");
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::write(
+        pdir.join("pwn.dot"),
+        "digraph pwn { x [handler=shell, prompt=\"PWNED\"] }",
+    )
+    .unwrap();
+    let err = tool
+        .resolve_named_for_test("pwn")
+        .await
+        .expect_err("a workspace-authored pipeline must not resolve by bare name");
+    assert!(
+        !err.to_string().contains("PWNED"),
+        "must NOT have read the workspace .dot; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn deep_research_resolves_to_the_bundled_ir() {
+    // The sanctioned `deep_research` now ships as a capability-locked IR program
+    // and runs the audited palette, not the embedded raw DOT.
+    let (tool, _working, _data) = make_tool().await;
+    assert_eq!(
+        tool.resolve_named_kind_for_test("deep_research")
+            .await
+            .unwrap(),
+        "ir",
+        "deep_research must resolve to the bundled IR"
+    );
+    // ...and it pre-flights clean (the bundled IR composes under l2_default).
+    let args = serde_json::json!({ "pipeline": "deep_research", "input": "x" });
+    tool.pre_flight_validate(&args)
+        .await
+        .expect("bundled deep_research IR must pre-flight clean");
 }
 
 #[tokio::test]
@@ -122,5 +219,45 @@ async fn pre_flight_rejects_malformed_json_args() {
     assert!(
         err.contains("invalid run_pipeline input"),
         "error must reference the input shape — got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn text_only_ir_pipeline_synthesizes_report_under_working_dir() {
+    let (tool, working, _data) = make_tool().await;
+    let tool = tool.with_ir_enabled(true);
+    let args = serde_json::json!({
+        "input": "ignored",
+        "ir": r#"{"id":"dot_delivery_smoke","nodes":[{"id":"start","kind":{"type":"transform","prompt":"Return exactly DOT_UI_SMOKE_OK"}}],"edges":[]}"#,
+    });
+
+    let result = tool
+        .execute(&args)
+        .await
+        .expect("text-only IR pipeline should execute");
+
+    assert!(result.success, "pipeline should succeed: {}", result.output);
+    assert!(
+        result.output.contains("DOT_UI_SMOKE_OK"),
+        "pipeline stdout should be in tool output: {}",
+        result.output
+    );
+    assert_eq!(
+        result.files_to_send.len(),
+        1,
+        "text-only pipeline should synthesize one deliverable report"
+    );
+
+    let report = &result.files_to_send[0];
+    let expected_root = working.path().join("skill-output").join("run_pipeline");
+    assert!(
+        report.starts_with(&expected_root),
+        "synthetic report must live under the tool working dir so send_file can deliver it; got {}",
+        report.display()
+    );
+    assert!(
+        report.exists(),
+        "synthetic report path should exist: {}",
+        report.display()
     );
 }

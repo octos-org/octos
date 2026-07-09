@@ -4,6 +4,7 @@ import CategoryTabs from '../../components/CategoryTabs'
 import SaveFooter from '../../components/SaveFooter'
 import TelegramTab from '../../components/tabs/TelegramTab'
 import DiscordTab from '../../components/tabs/DiscordTab'
+import DingTalkTab from '../../components/tabs/DingTalkTab'
 import WhatsAppTab from '../../components/tabs/WhatsAppTab'
 import FeishuTab from '../../components/tabs/FeishuTab'
 import WeComBotTab from '../../components/tabs/WeComBotTab'
@@ -14,6 +15,7 @@ import LineTab from '../../components/tabs/LineTab'
 const TABS = [
   { key: 'telegram', label: 'Telegram' },
   { key: 'discord', label: 'Discord' },
+  { key: 'dingtalk', label: 'DingTalk' },
   { key: 'whatsapp', label: 'WhatsApp' },
   { key: 'feishu', label: 'Feishu' },
   { key: 'line', label: 'LINE' },
@@ -46,6 +48,7 @@ export default function MessagingPage() {
         <div className="p-5">
           {activeTab === 'telegram' && <TelegramTab config={config} onChange={setConfig} />}
           {activeTab === 'discord' && <DiscordTab config={config} onChange={setConfig} />}
+          {activeTab === 'dingtalk' && <DingTalkTab config={config} onChange={setConfig} profileId={profileId} />}
           {activeTab === 'whatsapp' && <WhatsAppTab config={config} onChange={setConfig} isRunning={isRunning} />}
           {activeTab === 'feishu' && <FeishuTab config={config} onChange={setConfig} profileId={profileId} />}
           {activeTab === 'line' && <LineTab config={config} onChange={setConfig} profileId={profileId} />}

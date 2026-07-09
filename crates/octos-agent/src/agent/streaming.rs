@@ -19,17 +19,26 @@ use crate::progress::ProgressEvent;
 /// unwarranted recovery turn (codex P2).
 static SYNTH_TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Default inter-chunk idle timeout for SSE streams.
+/// Per-call streaming timeout budget. Bundles the three guards that bound a
+/// single streaming LLM call so a stalled or pathologically-slow provider
+/// cannot hang the turn forever:
 ///
-/// Codex round (PR #1355) bumped this from 30s → 180s based on production
-/// evidence (mini3 2026-05-28 mofa_slides failure batch): kimi-k2.5/autodl,
-/// claude-opus thinking blocks, and other reasoning-heavy models legitimately
-/// pause for minutes between chunks. The 30s default produced false-positive
-/// stalls under normal load. codex's reference value is 5 minutes; 180s is a
-/// middle-ground that keeps a genuinely-stuck call from blocking forever.
+/// * `first_token_grace_secs` — generous ceiling on time-to-first-token; a
+///   reasoning model can take minutes before the first chunk.
+/// * `inter_chunk_idle_secs` — once streaming starts, the max idle gap between
+///   chunks; trips on a provider that stalls mid-flight.
+/// * `overall_max_secs` — final wall-clock backstop measured from call start;
+///   catches a stream that trickles a token every `<idle>` seconds forever.
 ///
-/// See `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md`.
-pub(super) const STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180;
+/// Production values flow from `AgentConfig` (env-overridable). A value of `0`
+/// for `overall_max_secs` disables the wall-clock backstop (idle/TTFT guards
+/// still apply); the idle/TTFT fields are floored at 1s internally.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StreamTimeouts {
+    pub first_token_grace_secs: u64,
+    pub inter_chunk_idle_secs: u64,
+    pub overall_max_secs: u64,
+}
 
 impl Agent {
     /// Wait until the shutdown flag is set. Used with `tokio::select!`
@@ -60,35 +69,36 @@ impl Agent {
         iteration: u32,
         input_tokens_estimate: u32,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(
-            stream,
-            iteration,
-            input_tokens_estimate,
-            STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS,
-        )
-        .await
+        // Thresholds flow from `AgentConfig` (env-overridable: see
+        // `OCTOS_LLM_FIRST_TOKEN_GRACE_SECS` / `OCTOS_LLM_STREAM_IDLE_SECS` /
+        // `OCTOS_LLM_CALL_MAX_SECS`). The first-token grace caps the
+        // input-scaled TTFT budget so a stream that never yields a single
+        // token can't hang the turn; the inter-chunk idle catches a stream
+        // that stalls mid-flight; `llm_call_max` is the overall wall-clock
+        // backstop.
+        let thresholds = StreamTimeouts {
+            first_token_grace_secs: self.config.llm_first_token_grace.as_secs(),
+            inter_chunk_idle_secs: self.config.llm_stream_idle.as_secs(),
+            overall_max_secs: self.config.llm_call_max.as_secs(),
+        };
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
+            .await
     }
 
-    /// Test-only entry point: lets fixtures dial the inter-chunk idle
-    /// timeout down to milliseconds so virtual-time orchestration
-    /// (`#[tokio::test(start_paused)]`) can race the 30s `wait_for_shutdown`
-    /// safety guard cleanly. Production callers always use the
-    /// 180s constant via `consume_stream_with_input_estimate`.
+    /// Test-only entry point: lets fixtures dial the timeouts down to
+    /// milliseconds so a stalling stream trips the guard within a bounded
+    /// real-time deadline. Production callers always derive thresholds from
+    /// `AgentConfig` via `consume_stream_with_input_estimate`.
     #[cfg(test)]
     pub(super) async fn consume_stream_for_test(
         &self,
         stream: ChatStream,
         iteration: u32,
         input_tokens_estimate: u32,
-        inter_chunk_idle_secs: u64,
+        thresholds: StreamTimeouts,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(
-            stream,
-            iteration,
-            input_tokens_estimate,
-            inter_chunk_idle_secs,
-        )
-        .await
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
+            .await
     }
 
     async fn consume_stream_inner(
@@ -96,13 +106,13 @@ impl Agent {
         mut stream: ChatStream,
         iteration: u32,
         input_tokens_estimate: u32,
-        // Codex round (PR #1355): the inter-chunk idle timeout is passed in
-        // explicitly so test fixtures can dial it down to milliseconds
-        // (the production default is 180s, see
-        // `STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS`). Production callers go
-        // through `consume_stream_with_input_estimate` which always uses
-        // the constant.
-        inter_chunk_idle_secs: u64,
+        // Codex round (PR #1355): the inter-chunk idle timeout used to be the
+        // only configurable knob. It is now bundled with the first-token
+        // grace and an overall wall-clock cap (`StreamTimeouts`) so a stream
+        // that never yields, stalls mid-flight, OR trickles a token every
+        // <idle>s forever all terminate. Production thresholds come from
+        // `AgentConfig` (env-overridable); test fixtures inject tiny values.
+        thresholds: StreamTimeouts,
     ) -> Result<(ChatResponse, bool)> {
         // Clear any pending status line (e.g., "Thinking...")
         self.reporter().report(ProgressEvent::Response {
@@ -121,14 +131,25 @@ impl Agent {
         // Adaptive stream timeout:
         // - TTFT (first token): generous — models need time to process large
         //   inputs before generating. Scales with input: base 30s + 1s per 1K
-        //   input tokens, capped at 180s.
-        // - Inter-chunk: once streaming starts, codex round PR #1355 bumped
-        //   from 30s → STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS (180s) to give
-        //   reasoning models legitimate room to pause. The 30s value was
-        //   producing false-positive stalls on kimi-k2.5/autodl mofa_slides
-        //   calls; production evidence in
+        //   input tokens, capped at the configured first-token grace
+        //   (default 180s, env `OCTOS_LLM_FIRST_TOKEN_GRACE_SECS`). The cap
+        //   guarantees a stream that never yields a single token still aborts.
+        // - Inter-chunk: once streaming starts, the per-poll idle deadline is
+        //   the configured stream-idle (default 90s, env
+        //   `OCTOS_LLM_STREAM_IDLE_SECS`). A reasoning model legitimately
+        //   pausing mid-stream stays under it; a genuinely stalled provider
+        //   trips it. Production evidence:
         //   `docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md`.
-        let ttft_secs = (30 + input_tokens_estimate as u64 / 1000).min(180);
+        // - Overall: a final wall-clock backstop (default 1200s, env
+        //   `OCTOS_LLM_CALL_MAX_SECS`) catches a pathological stream that
+        //   trickles one token every <idle>s indefinitely — the inter-chunk
+        //   guard never trips for it, but the turn must still end.
+        let first_token_grace_secs = thresholds.first_token_grace_secs.max(1);
+        let inter_chunk_idle_secs = thresholds.inter_chunk_idle_secs.max(1);
+        let ttft_secs = (30 + input_tokens_estimate as u64 / 1000).min(first_token_grace_secs);
+        let overall_deadline = (thresholds.overall_max_secs > 0).then(|| {
+            std::time::Instant::now() + std::time::Duration::from_secs(thresholds.overall_max_secs)
+        });
         let mut got_first_chunk = false;
         // Codex round (PR #1355): track whether we observed an explicit
         // `Done` event. Combined with the tool_calls list this lets us
@@ -139,10 +160,40 @@ impl Agent {
         let mut saw_done = false;
 
         loop {
-            let timeout = if got_first_chunk {
+            // Overall wall-clock backstop: if the configured cap has elapsed,
+            // abort now with a retryable idle timeout rather than entering
+            // another poll. A stream that trickles one token every <idle>s
+            // forever never trips the inter-chunk guard, so this is the only
+            // bound that catches it. Computed each iteration so the per-poll
+            // idle sleep can also be clamped to never overshoot the cap.
+            let overall_remaining = match overall_deadline {
+                Some(deadline) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        warn!(
+                            "LLM stream stalled: exceeded overall {overall_max}s wall-clock cap \
+                             (iteration {iteration})",
+                            overall_max = thresholds.overall_max_secs,
+                        );
+                        return Err(eyre::Report::new(StreamError::IdleTimeout {
+                            idle_secs: thresholds.overall_max_secs,
+                        }));
+                    }
+                    Some(deadline - now)
+                }
+                None => None,
+            };
+
+            let idle_timeout = if got_first_chunk {
                 std::time::Duration::from_secs(inter_chunk_idle_secs)
             } else {
                 std::time::Duration::from_secs(ttft_secs)
+            };
+            // Never sleep past the overall deadline: clamp the per-poll idle
+            // budget so the cap is honored even on the first poll.
+            let timeout = match overall_remaining {
+                Some(rem) => idle_timeout.min(rem),
+                None => idle_timeout,
             };
 
             let event = tokio::select! {
@@ -164,18 +215,30 @@ impl Agent {
                     // upstream surfaces this via `is_retryable_stream_error`
                     // (matches "stream idle timeout") and retries. No
                     // partial state ever leaves this function.
+                    //
+                    // The `timeout` may have been clamped to the overall
+                    // wall-clock remainder; the top-of-loop check converts a
+                    // clamp-induced wakeup into the overall-cap error on the
+                    // next iteration, so the idle-secs reported here is always
+                    // the true idle/TTFT budget that elapsed.
                     let idle_secs = if got_first_chunk {
                         inter_chunk_idle_secs
                     } else {
                         ttft_secs
                     };
+                    if timeout < idle_timeout {
+                        // We slept the clamped remainder, not the full idle
+                        // budget — loop so the overall-cap branch fires.
+                        continue;
+                    }
                     if got_first_chunk {
                         warn!(
-                            "stream inter-chunk timeout after {idle_secs}s — provider stalled"
+                            "LLM stream stalled: no tokens for {idle_secs}s (iteration {iteration})"
                         );
                     } else {
                         warn!(
-                            "stream TTFT timeout after {ttft_secs}s (input_estimate={input_tokens_estimate})"
+                            "LLM stream stalled: no first token for {ttft_secs}s \
+                             (iteration {iteration}, input_estimate={input_tokens_estimate})"
                         );
                     }
                     return Err(eyre::Report::new(StreamError::IdleTimeout { idle_secs }));
@@ -195,6 +258,10 @@ impl Agent {
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
                     reasoning.push_str(&delta);
+                    self.reporter().report(ProgressEvent::ReasoningChunk {
+                        text: delta.clone(),
+                        iteration,
+                    });
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
@@ -420,12 +487,25 @@ impl Agent {
         } else {
             Some(metadata.model.clone())
         };
+        // Resolve the context window from the SAME slot that answered. For the
+        // active slot (`provider_index == None`) use the provider's configured
+        // window (honors any context override); for a failover/routed slot
+        // derive it from the model that actually answered, parallel to how
+        // `model` and `pricing` are resolved above — otherwise the gauge could
+        // report the right model with the primary slot's window.
+        let context_window = match response.provider_index {
+            Some(_) if !metadata.model.is_empty() => {
+                octos_llm::context::context_window_tokens(&metadata.model)
+            }
+            _ => self.llm.context_window(),
+        };
         self.reporter().report(ProgressEvent::CostUpdate {
             session_input_tokens: total_usage.input_tokens,
             session_output_tokens: total_usage.output_tokens,
             response_cost,
             session_cost,
             model,
+            context_window: Some(context_window),
         });
     }
 
@@ -481,7 +561,7 @@ mod tests {
     //! These tests run with `tokio::time::pause` so the 180s inter-chunk
     //! timeout fires instantly under virtual time.
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -498,9 +578,27 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::Agent;
+    use crate::progress::{ProgressEvent, ProgressReporter};
     use crate::tools::ToolRegistry;
 
     struct NoopProvider;
+
+    #[derive(Default)]
+    struct CapturingReporter {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+
+    impl CapturingReporter {
+        fn events(&self) -> Vec<ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ProgressReporter for CapturingReporter {
+        fn report(&self, event: ProgressEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     #[async_trait]
     impl LlmProvider for NoopProvider {
@@ -551,6 +649,19 @@ mod tests {
         err.downcast_ref::<StreamError>()
     }
 
+    /// Tiny-threshold `StreamTimeouts` for tests: dial every guard down to
+    /// the given seconds so a stalling stream trips within a bounded
+    /// real-time deadline. The overall cap is set generously high here so
+    /// individual tests can target the idle/TTFT guard; the overall-cap test
+    /// builds its own value.
+    fn test_thresholds(idle_secs: u64) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            first_token_grace_secs: idle_secs,
+            inter_chunk_idle_secs: idle_secs,
+            overall_max_secs: 3600,
+        }
+    }
+
     #[tokio::test]
     async fn stream_idle_timeout_returns_err_not_partial_buffer() {
         // PR #1355: the previous code would silently `break` here and ship
@@ -582,7 +693,9 @@ mod tests {
         // `got_first_chunk = true` immediately and the second iteration
         // uses our 1s `inter_chunk_idle_secs`. Real time + 1s vs 30s ttft
         // is fine — the stream::iter event resolves in micros.
-        let result = agent.consume_stream_for_test(stream, 1, 0, 1).await;
+        let result = agent
+            .consume_stream_for_test(stream, 1, 0, test_thresholds(1))
+            .await;
         let elapsed = start.elapsed();
 
         let err = result.expect_err("idle timeout must surface as Err");
@@ -604,6 +717,146 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "idle timeout took {elapsed:?} — wait_for_shutdown safety guard likely fired \
              before the 1s timeout, which means the test passes by accident"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_first_token_grace_timeout_aborts_when_no_chunk_ever_arrives() {
+        // A stream that NEVER yields a single chunk (provider accepted the
+        // request then went silent) must trip the first-token grace and
+        // abort with a retryable IdleTimeout — not hang the turn forever.
+        let (agent, _dir) = build_test_agent().await;
+
+        // No prelude: pure `pending` stream. The first poll uses the TTFT /
+        // first-token-grace budget (tiny here) and must fire.
+        let stream = stalling_stream(vec![]);
+
+        let start = std::time::Instant::now();
+        let result = agent
+            .consume_stream_for_test(stream, 7, 0, test_thresholds(1))
+            .await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("first-token grace timeout must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(
+            matches!(typed, StreamError::IdleTimeout { .. }),
+            "expected IdleTimeout, got {typed:?}"
+        );
+        assert!(
+            typed.is_retryable(),
+            "first-token-grace timeout must be retryable so the retry ladder drives recovery"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "first-token timeout took {elapsed:?} — should fire within ~1s"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_overall_wall_clock_cap_aborts_trickling_stream() {
+        // A stream that keeps trickling one chunk just under the inter-chunk
+        // idle gap forever never trips the idle guard — only the overall
+        // wall-clock cap can terminate it. Build a stream that emits a chunk
+        // every ~20ms; with a generous idle but a 1s overall cap, the cap
+        // must fire and return a retryable IdleTimeout within a bounded time.
+        use std::time::Duration;
+        let (agent, _dir) = build_test_agent().await;
+
+        // Infinite text-delta stream, one chunk every 20ms. Idle gap (20ms)
+        // stays well under the 10s idle budget, so only the 1s overall cap
+        // can stop it.
+        let trickle = futures::stream::unfold(0u64, |n| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((StreamEvent::TextDelta(format!("tok{n} ")), n + 1))
+        });
+        let stream: ChatStream = Box::pin(trickle);
+
+        let thresholds = super::StreamTimeouts {
+            first_token_grace_secs: 10,
+            inter_chunk_idle_secs: 10,
+            overall_max_secs: 1,
+        };
+
+        let start = std::time::Instant::now();
+        let result = agent
+            .consume_stream_for_test(stream, 9, 0, thresholds)
+            .await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("overall wall-clock cap must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(
+            matches!(typed, StreamError::IdleTimeout { idle_secs } if *idle_secs == 1),
+            "expected overall-cap IdleTimeout{{idle_secs:1}}, got {typed:?}"
+        );
+        assert!(
+            typed.is_retryable(),
+            "overall-cap timeout must be retryable so the turn ends cleanly after retries"
+        );
+        // 1s cap + 20ms slack; must NOT have run for the full 10s idle budget.
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "overall cap took {elapsed:?} — wall-clock backstop did not fire promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_completes_fast_unaffected_by_timeouts() {
+        // Regression: a normal fast stream completes well under the (tiny in
+        // test) thresholds and returns Ok — the timeout machinery never
+        // interferes with a healthy provider.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta("Hello".to_string()),
+            StreamEvent::TextDelta(", fast world!".to_string()),
+            StreamEvent::Usage(LlmTokenUsage::default()),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_for_test(stream, 1, 0, test_thresholds(1))
+            .await
+            .expect("a fast stream must complete unaffected by the idle/cap guards");
+        assert!(streamed);
+        assert_eq!(response.content.as_deref(), Some("Hello, fast world!"));
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn reasoning_delta_reports_reasoning_chunk_and_keeps_buffering() {
+        let (agent, _dir) = build_test_agent().await;
+        let reporter = Arc::new(CapturingReporter::default());
+        agent.set_reporter(reporter.clone());
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ReasoningDelta("plan ".to_string()),
+            StreamEvent::ReasoningDelta("step".to_string()),
+            StreamEvent::TextDelta("Answer".to_string()),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 3, 100)
+            .await
+            .expect("clean reasoning stream must assemble");
+
+        assert!(streamed);
+        assert_eq!(response.content.as_deref(), Some("Answer"));
+        assert_eq!(response.reasoning_content.as_deref(), Some("plan step"));
+
+        let reasoning_chunks: Vec<(String, u32)> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProgressEvent::ReasoningChunk { text, iteration } => Some((text, iteration)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning_chunks,
+            vec![("plan ".to_string(), 3), ("step".to_string(), 3)]
         );
     }
 
@@ -841,24 +1094,33 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_constant_is_180s() {
-        // Pin the constant value so a future tweak that brings it back
-        // down to 30s (the production-broken value) trips this test.
-        assert_eq!(
-            super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS,
-            180,
-            "30s was producing false-positive stalls on reasoning models; \
-             see docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md"
-        );
-        // Sanity: must be larger than legacy 30s value.
-        const { assert!(super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS > 30) };
+    fn stream_timeout_defaults_are_sane() {
+        // Pin the live config defaults so a future tweak that brings the
+        // inter-chunk idle back down to the production-broken 30s (or
+        // collapses the first-token grace below it) trips this test. These
+        // are the values that actually drive production via `AgentConfig`
+        // (env-overridable: OCTOS_LLM_STREAM_IDLE_SECS /
+        // OCTOS_LLM_FIRST_TOKEN_GRACE_SECS / OCTOS_LLM_CALL_MAX_SECS).
+        use super::super::{
+            DEFAULT_LLM_CALL_MAX_SECS, DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS,
+            DEFAULT_LLM_STREAM_IDLE_SECS,
+        };
+        const { assert!(DEFAULT_LLM_STREAM_IDLE_SECS > 30) };
+        const { assert!(DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS >= DEFAULT_LLM_STREAM_IDLE_SECS) };
+        const { assert!(DEFAULT_LLM_CALL_MAX_SECS > DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS) };
+        assert_eq!(DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS, 180);
+        assert_eq!(DEFAULT_LLM_STREAM_IDLE_SECS, 90);
+        assert_eq!(DEFAULT_LLM_CALL_MAX_SECS, 1200);
     }
 
-    // Use Duration in a sanity check to make sure the constant is usable.
+    // Sanity: the defaults build valid Durations and a default AgentConfig
+    // carries them.
     #[test]
-    fn idle_timeout_constant_builds_valid_duration() {
-        let d = Duration::from_secs(super::STREAM_INTER_CHUNK_IDLE_TIMEOUT_SECS);
-        assert_eq!(d.as_secs(), 180);
+    fn default_agent_config_carries_stream_timeouts() {
+        let cfg = crate::AgentConfig::default();
+        assert_eq!(cfg.llm_first_token_grace, Duration::from_secs(180));
+        assert_eq!(cfg.llm_stream_idle, Duration::from_secs(90));
+        assert_eq!(cfg.llm_call_max, Duration::from_secs(1200));
     }
 
     // Silence unused-import warnings in cfg(test) when one helper isn't used.

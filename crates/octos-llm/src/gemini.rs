@@ -9,7 +9,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 
+use crate::vertex_auth::{ServiceAccount, TokenSource, VertexTokenProvider};
 use crate::vision;
 
 use crate::config::ChatConfig;
@@ -17,27 +19,128 @@ use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::{
     ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-global monotonic counter for synthesizing Gemini tool-call ids.
+///
+/// Gemini's API returns `functionCall` parts WITHOUT a call id — it matches
+/// `functionResponse` parts back by function NAME, not by id (see the
+/// `MessageRole::Tool` arm of `to_gemini_contents`, which resolves the name
+/// from a `tool_call_id → name` map). The synthesized id is therefore purely
+/// octos-internal correlation, but it MUST be process-unique: it becomes
+/// `BackgroundTask::tool_call_id`, and several long-lived per-session
+/// structures key on it — `TaskSupervisor`'s synth-ack set (commit 9e972d8a),
+/// the `mark_descendants_failed` pipeline cascade, and the orphan-sweep
+/// liveness gate's tool_call_id-family exemption (fix/orphan-sweep-liveness-
+/// gate). A POSITIONAL `call_{index}` resets every response, so two unrelated
+/// tool calls in different turns both get `call_0`, which (a) could match a
+/// stale synth-ack and fire an unwarranted recovery turn, and (b) lets a live
+/// task's tcid falsely exempt a genuinely-dead task from orphan reaping. A
+/// process-global monotonic counter never repeats within the process.
+///
+/// octos-agent's empty-id fallback (`streaming.rs`) uses the same scheme with
+/// a distinct `call_synth_` prefix; the `call_gemini_` prefix here keeps the
+/// two synthesized id spaces disjoint even if one session ever switched
+/// providers mid-conversation.
+static GEMINI_TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Mint the next process-unique synthesized Gemini tool-call id.
+fn next_gemini_tool_call_id() -> String {
+    format!(
+        "call_gemini_{}",
+        GEMINI_TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Default AI Studio base URL (the `generativelanguage.googleapis.com` host).
+const STUDIO_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// How a [`GeminiProvider`] authenticates.
+///
+/// `ApiKey` is AI Studio (`x-goog-api-key` against
+/// `generativelanguage.googleapis.com`). `Vertex` is Vertex AI: an OAuth2
+/// `Authorization: Bearer` token (minted from a service account) against the
+/// `aiplatform.googleapis.com` `projects/.../locations/global` endpoint.
+enum GeminiAuth {
+    ApiKey(SecretString),
+    Vertex {
+        project: String,
+        token: Arc<dyn TokenSource>,
+    },
+}
 
 /// Google Gemini provider.
 pub struct GeminiProvider {
     client: Client,
-    api_key: SecretString,
+    auth: GeminiAuth,
     model: String,
     base_url: String,
 }
 
 impl GeminiProvider {
-    /// Create a new Gemini provider.
+    /// Create a new Gemini provider authenticating with an AI Studio API key.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
-            api_key: SecretString::from(api_key.into()),
+            auth: GeminiAuth::ApiKey(SecretString::from(api_key.into())),
             model: model.into(),
-            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            base_url: STUDIO_BASE_URL.to_string(),
         }
+    }
+
+    /// Create a Gemini provider that calls **Vertex AI** with an OAuth2 token
+    /// source. `project` is the GCP project id; the region is fixed to `global`.
+    pub fn vertex(
+        project: impl Into<String>,
+        model: impl Into<String>,
+        token: Arc<dyn TokenSource>,
+    ) -> Self {
+        Self {
+            client: crate::provider::build_http_client(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
+            auth: GeminiAuth::Vertex {
+                project: project.into(),
+                token,
+            },
+            model: model.into(),
+            // Unused in Vertex mode (endpoint is computed), kept for metadata.
+            base_url: STUDIO_BASE_URL.to_string(),
+        }
+    }
+
+    /// Create a Vertex-mode provider from a service account. The GCP project is
+    /// taken from the service account's `project_id`.
+    pub fn vertex_from_service_account(sa: ServiceAccount, model: impl Into<String>) -> Self {
+        Self::vertex_from_service_account_with_timeout(sa, model, None)
+    }
+
+    /// Like [`vertex_from_service_account`], but threads the provider's HTTP
+    /// timeout into the OAuth token-exchange client as well. Without this the
+    /// token fetcher uses an unbounded `reqwest::Client`, so a stalled token
+    /// endpoint would block a Vertex chat past the configured LLM timeout before
+    /// `generateContent` is ever reached.
+    pub fn vertex_from_service_account_with_timeout(
+        sa: ServiceAccount,
+        model: impl Into<String>,
+        http_timeout: Option<(u64, u64)>,
+    ) -> Self {
+        let project = sa.project_id.clone();
+        let token: Arc<dyn TokenSource> =
+            if let Some((timeout_secs, connect_timeout_secs)) = http_timeout {
+                Arc::new(VertexTokenProvider::from_service_account_with_timeout(
+                    sa,
+                    timeout_secs,
+                    connect_timeout_secs,
+                ))
+            } else {
+                Arc::new(VertexTokenProvider::from_service_account(sa))
+            };
+        Self::vertex(project, model, token)
     }
 
     /// Create a provider using the GEMINI_API_KEY environment variable.
@@ -48,7 +151,7 @@ impl GeminiProvider {
         Ok(Self::new(api_key, "gemini-2.5-flash"))
     }
 
-    /// Set a custom base URL.
+    /// Set a custom base URL (AI Studio mode only; ignored for Vertex).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -58,6 +161,36 @@ impl GeminiProvider {
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
         self
+    }
+
+    /// Build the generateContent endpoint URL for the active auth mode.
+    fn build_url(&self, streaming: bool) -> String {
+        let action = if streaming {
+            "streamGenerateContent?alt=sse"
+        } else {
+            "generateContent"
+        };
+        match &self.auth {
+            GeminiAuth::ApiKey(_) => {
+                format!("{}/models/{}:{}", self.base_url, self.model, action)
+            }
+            GeminiAuth::Vertex { project, .. } => format!(
+                "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/google/models/{}:{}",
+                self.model, action
+            ),
+        }
+    }
+
+    /// Attach the auth header for the active mode (resolving a fresh Vertex
+    /// token when needed).
+    async fn apply_auth(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        Ok(match &self.auth {
+            GeminiAuth::ApiKey(key) => req.header("x-goog-api-key", key.expose_secret()),
+            GeminiAuth::Vertex { token, .. } => {
+                let t = token.token().await?;
+                req.header("Authorization", format!("Bearer {t}"))
+            }
+        })
     }
 }
 
@@ -94,24 +227,29 @@ impl LlmProvider for GeminiProvider {
         let request = GeminiRequest {
             contents,
             system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
-                parts: vec![GeminiPart::Text { text }],
+                parts: vec![GeminiPart::Text {
+                    text,
+                    thought: None,
+                }],
             }),
             tools: gemini_tools,
             generation_config: Some(build_gemini_generation_config(config)),
             cached_content: None,
         };
 
-        let url = format!("{}/models/{}:generateContent", self.base_url, self.model);
+        let url = self.build_url(false);
 
-        let response = self
+        let req = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("x-goog-api-key", self.api_key.expose_secret())
             .timeout(std::time::Duration::from_secs(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
             ))
-            .json(&request)
+            .json(&request);
+        let response = self
+            .apply_auth(req)
+            .await?
             .send()
             .await
             .wrap_err("failed to send request to Gemini")?;
@@ -135,78 +273,7 @@ impl LlmProvider for GeminiProvider {
         let api_response: GeminiResponse =
             serde_json::from_str(&response_text).wrap_err("failed to parse Gemini response")?;
 
-        // Extract content from response
-        let candidate = api_response
-            .candidates
-            .into_iter()
-            .next()
-            .ok_or_else(|| eyre::eyre!("no candidates in Gemini response"))?;
-
-        let mut content = None;
-        let mut tool_calls = Vec::new();
-
-        for part in candidate.content.parts {
-            match part {
-                GeminiPart::Text { text } => {
-                    content = Some(text);
-                }
-                GeminiPart::FunctionCall {
-                    function_call,
-                    thought_signature,
-                } => {
-                    let metadata = thought_signature
-                        .map(|sig| serde_json::json!({ "thought_signature": sig }));
-                    tool_calls.push(octos_core::ToolCall {
-                        id: format!("call_{}", tool_calls.len()),
-                        name: function_call.name,
-                        arguments: function_call.args,
-                        metadata,
-                    });
-                }
-                GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
-                    // InlineData and FunctionResponse are only used in requests
-                }
-            }
-        }
-
-        let stop_reason = match candidate.finish_reason.as_deref() {
-            Some("STOP") => StopReason::EndTurn,
-            Some("MAX_TOKENS") => StopReason::MaxTokens,
-            Some("SAFETY" | "RECITATION" | "OTHER" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
-                StopReason::ContentFiltered
-            }
-            Some("MALFORMED_FUNCTION_CALL") => {
-                // Gemini sometimes fails to format tool calls properly.
-                // Treat as empty response so the retry logic picks it up.
-                tracing::warn!("Gemini returned MALFORMED_FUNCTION_CALL");
-                StopReason::EndTurn
-            }
-            _ if !tool_calls.is_empty() => StopReason::ToolUse,
-            _ => StopReason::EndTurn,
-        };
-
-        // Gemini doesn't always return usage in the same format
-        let usage = api_response.usage_metadata.unwrap_or(GeminiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-            thoughts_token_count: 0,
-            cached_content_token_count: 0,
-        });
-
-        Ok(ChatResponse {
-            content,
-            reasoning_content: None,
-            tool_calls,
-            stop_reason,
-            usage: TokenUsage {
-                input_tokens: usage.prompt_token_count,
-                output_tokens: usage.candidates_token_count,
-                reasoning_tokens: usage.thoughts_token_count,
-                cache_read_tokens: usage.cached_content_token_count,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        gemini_response_to_chat_response(api_response)
     }
 
     async fn chat_stream(
@@ -239,24 +306,26 @@ impl LlmProvider for GeminiProvider {
         let request = GeminiRequest {
             contents,
             system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
-                parts: vec![GeminiPart::Text { text }],
+                parts: vec![GeminiPart::Text {
+                    text,
+                    thought: None,
+                }],
             }),
             tools: gemini_tools,
             generation_config: Some(build_gemini_generation_config(config)),
             cached_content: None,
         };
 
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse",
-            self.base_url, self.model
-        );
+        let url = self.build_url(true);
 
-        let response = self
+        let req = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("x-goog-api-key", self.api_key.expose_secret())
-            .json(&request)
+            .json(&request);
+        let response = self
+            .apply_auth(req)
+            .await?
             .send()
             .await
             .wrap_err("failed to send streaming request to Gemini")?;
@@ -290,7 +359,13 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn provider_name(&self) -> &str {
-        "gemini"
+        // Vertex AI and AI Studio Gemini must be distinguishable for routing,
+        // adaptive-lane matching and metrics — they're different backends even
+        // though both use `GeminiProvider`.
+        match self.auth {
+            GeminiAuth::Vertex { .. } => "vertex",
+            GeminiAuth::ApiKey(_) => "gemini",
+        }
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
@@ -299,7 +374,9 @@ impl LlmProvider for GeminiProvider {
         } else {
             None
         };
-        ProviderMetadata::new("gemini", self.model.clone(), endpoint)
+        // Derive the metadata name from the auth mode (same as `provider_name`)
+        // so Vertex calls aren't mislabelled as AI Studio gemini in provenance.
+        ProviderMetadata::new(self.provider_name(), self.model.clone(), endpoint)
     }
 }
 
@@ -333,6 +410,8 @@ struct GeminiContent {
 enum GeminiPart {
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought: Option<bool>,
     },
     InlineData {
         #[serde(rename = "inlineData")]
@@ -377,7 +456,8 @@ fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig
         let budget = match effort {
             ReasoningEffort::Low => Some(1024),
             ReasoningEffort::Medium => Some(8192),
-            ReasoningEffort::High => None, // let model decide
+            // High and Max both let the model decide (unbounded thinking budget).
+            ReasoningEffort::High | ReasoningEffort::Max => None,
         };
         GeminiThinkingConfig {
             thinking_budget: budget,
@@ -438,6 +518,7 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                 if !msg.content.is_empty() {
                     parts.push(GeminiPart::Text {
                         text: msg.content.clone(),
+                        thought: None,
                     });
                 }
                 // Include functionCall parts for any tool calls the model made.
@@ -464,6 +545,7 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                 if parts.is_empty() {
                     parts.push(GeminiPart::Text {
                         text: String::new(),
+                        thought: None,
                     });
                 }
                 push_or_merge(&mut contents, "model", parts);
@@ -534,6 +616,7 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     if images.is_empty() {
         return vec![GeminiPart::Text {
             text: msg.content.clone(),
+            thought: None,
         }];
     }
 
@@ -551,6 +634,7 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     if !msg.content.is_empty() {
         parts.push(GeminiPart::Text {
             text: msg.content.clone(),
+            thought: None,
         });
     }
     parts
@@ -675,6 +759,98 @@ struct GeminiUsageMetadata {
     cached_content_token_count: u32,
 }
 
+fn append_nonempty(target: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match target {
+        Some(existing) => existing.push_str(&text),
+        None => *target = Some(text),
+    }
+}
+
+fn gemini_response_to_chat_response(api_response: GeminiResponse) -> Result<ChatResponse> {
+    let GeminiResponse {
+        candidates,
+        usage_metadata,
+    } = api_response;
+
+    let candidate = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre::eyre!("no candidates in Gemini response"))?;
+
+    let mut content = None;
+    let mut reasoning_content = None;
+    let mut tool_calls = Vec::new();
+
+    for part in candidate.content.parts {
+        match part {
+            GeminiPart::Text { text, thought } => {
+                if thought.unwrap_or(false) {
+                    append_nonempty(&mut reasoning_content, text);
+                } else {
+                    append_nonempty(&mut content, text);
+                }
+            }
+            GeminiPart::FunctionCall {
+                function_call,
+                thought_signature,
+            } => {
+                let metadata =
+                    thought_signature.map(|sig| serde_json::json!({ "thought_signature": sig }));
+                tool_calls.push(octos_core::ToolCall {
+                    id: next_gemini_tool_call_id(),
+                    name: function_call.name,
+                    arguments: function_call.args,
+                    metadata,
+                });
+            }
+            GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
+                // InlineData and FunctionResponse are only used in requests.
+            }
+        }
+    }
+
+    let stop_reason = match candidate.finish_reason.as_deref() {
+        Some("STOP") => StopReason::EndTurn,
+        Some("MAX_TOKENS") => StopReason::MaxTokens,
+        Some("SAFETY" | "RECITATION" | "OTHER" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
+            StopReason::ContentFiltered
+        }
+        Some("MALFORMED_FUNCTION_CALL") => {
+            // Gemini sometimes fails to format tool calls properly.
+            // Treat as empty response so the retry logic picks it up.
+            tracing::warn!("Gemini returned MALFORMED_FUNCTION_CALL");
+            StopReason::EndTurn
+        }
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        _ => StopReason::EndTurn,
+    };
+
+    let usage = usage_metadata.unwrap_or(GeminiUsageMetadata {
+        prompt_token_count: 0,
+        candidates_token_count: 0,
+        thoughts_token_count: 0,
+        cached_content_token_count: 0,
+    });
+
+    Ok(ChatResponse {
+        content,
+        reasoning_content,
+        tool_calls,
+        stop_reason,
+        usage: TokenUsage {
+            input_tokens: usage.prompt_token_count,
+            output_tokens: usage.candidates_token_count,
+            reasoning_tokens: usage.thoughts_token_count,
+            cache_read_tokens: usage.cached_content_token_count,
+            ..Default::default()
+        },
+        provider_index: None,
+    })
+}
+
 // --- Streaming SSE helpers ---
 
 #[derive(Default)]
@@ -698,7 +874,11 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                 for part in parts {
                     if let Some(text) = part["text"].as_str() {
                         if !text.is_empty() {
-                            events.push(StreamEvent::TextDelta(text.to_string()));
+                            if part["thought"].as_bool().unwrap_or(false) {
+                                events.push(StreamEvent::ReasoningDelta(text.to_string()));
+                            } else {
+                                events.push(StreamEvent::TextDelta(text.to_string()));
+                            }
                         }
                     }
                     if let Some(fc) = part.get("functionCall") {
@@ -716,7 +896,7 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                             .map(|s| serde_json::json!({ "thought_signature": s }));
                         events.push(StreamEvent::ToolCallDelta {
                             index: state.tool_count,
-                            id: Some(format!("call_{}", state.tool_count)),
+                            id: Some(next_gemini_tool_call_id()),
                             name: Some(name),
                             arguments_delta: args.to_string(),
                         });
@@ -967,7 +1147,10 @@ mod tests {
 
     #[test]
     fn test_parts_compatible_blocks_mixed_types() {
-        let text = vec![GeminiPart::Text { text: "hi".into() }];
+        let text = vec![GeminiPart::Text {
+            text: "hi".into(),
+            thought: None,
+        }];
         let func_resp = vec![GeminiPart::FunctionResponse {
             function_response: GeminiFunctionResponse {
                 name: "test".into(),
@@ -992,6 +1175,20 @@ mod tests {
         let events = map_gemini_sse(&mut state, &event);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "Hello"));
+    }
+
+    #[test]
+    fn test_gemini_sse_thought_text_delta() {
+        let mut state = GeminiStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"candidates": [{"content": {"parts": [{"text": "Check the invariants.", "thought": true}]}}]}"#.into(),
+        };
+        let events = map_gemini_sse(&mut state, &event);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "Check the invariants.")
+        );
     }
 
     #[test]
@@ -1039,6 +1236,55 @@ mod tests {
         );
     }
 
+    fn first_tool_call_id(events: Vec<StreamEvent>) -> String {
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                StreamEvent::ToolCallDelta { id, .. } => id,
+                _ => None,
+            })
+            .expect("a ToolCallDelta carrying an id")
+    }
+
+    /// Regression (codex round-3 / fix/orphan-sweep-liveness-gate): Gemini
+    /// synthesizes tool-call ids (its API supplies none — it matches results
+    /// by function name). Those ids MUST be PROCESS-UNIQUE, not positional. A
+    /// positional `call_{index}` resets every response, so two unrelated tool
+    /// calls in different turns both get `call_0` — colliding in the
+    /// supervisor's per-session synth-ack set and the orphan-sweep
+    /// tool_call_id-family exemption (a live task's tcid would then falsely
+    /// exempt a genuinely-dead task from reaping). Two independent SSE
+    /// responses (each a fresh state with tool_count back at 0) must mint
+    /// disjoint ids.
+    #[test]
+    fn synthesized_gemini_tool_call_ids_are_unique_across_responses() {
+        let fc = r#"{"candidates": [{"content": {"parts": [{"functionCall": {"name": "search", "args": {}}}]}}]}"#;
+
+        let mut resp1 = GeminiStreamState::default();
+        let id1 = first_tool_call_id(map_gemini_sse(
+            &mut resp1,
+            &crate::sse::SseEvent {
+                event: None,
+                data: fc.into(),
+            },
+        ));
+
+        let mut resp2 = GeminiStreamState::default();
+        let id2 = first_tool_call_id(map_gemini_sse(
+            &mut resp2,
+            &crate::sse::SseEvent {
+                event: None,
+                data: fc.into(),
+            },
+        ));
+
+        assert!(id1.starts_with("call_gemini_"), "got {id1}");
+        assert_ne!(
+            id1, id2,
+            "synthesized ids must be process-unique across responses, not positional",
+        );
+    }
+
     #[test]
     fn test_gemini_sse_usage() {
         let mut state = GeminiStreamState::default();
@@ -1063,6 +1309,46 @@ mod tests {
         assert!(map_gemini_sse(&mut state, &event).is_empty());
     }
 
+    #[test]
+    fn test_gemini_response_captures_thought_parts() {
+        let api_response: GeminiResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "Inspect the constraints.",
+                                "thought": true
+                            },
+                            {
+                                "text": "Return the concise answer."
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP"
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 22,
+                "thoughtsTokenCount": 7
+            }
+        }))
+        .unwrap();
+
+        let response = gemini_response_to_chat_response(api_response).unwrap();
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("Inspect the constraints.")
+        );
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Return the concise answer.")
+        );
+        assert_eq!(response.usage.reasoning_tokens, 7);
+    }
+
     // --- Provider metadata tests ---
 
     #[test]
@@ -1077,6 +1363,76 @@ mod tests {
         let provider =
             GeminiProvider::new("key", "model").with_base_url("https://custom.googleapis.com");
         assert_eq!(provider.base_url, "https://custom.googleapis.com");
+    }
+
+    // --- Vertex / Gemini auth-mode tests ---
+
+    struct StaticToken(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::vertex_auth::TokenSource for StaticToken {
+        async fn token(&self) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    #[test]
+    fn should_build_global_vertex_endpoint_when_vertex_mode() {
+        let provider =
+            GeminiProvider::vertex("my-proj", "gemini-2.5-flash", Arc::new(StaticToken("tok")));
+        assert_eq!(
+            provider.build_url(false),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            provider.build_url(true),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn provider_name_distinguishes_vertex_from_studio_gemini() {
+        use crate::provider::LlmProvider;
+        let vertex = GeminiProvider::vertex("p", "m", Arc::new(StaticToken("tok")));
+        let studio = GeminiProvider::new("key", "gemini-2.5-flash");
+        assert_eq!(vertex.provider_name(), "vertex");
+        assert_eq!(studio.provider_name(), "gemini");
+        // provider_metadata must agree with provider_name (provenance label).
+        assert_eq!(vertex.provider_metadata().provider, "vertex");
+        assert_eq!(studio.provider_metadata().provider, "gemini");
+    }
+
+    #[test]
+    fn should_build_studio_endpoint_when_api_key_mode() {
+        let provider = GeminiProvider::new("key", "gemini-2.5-flash");
+        assert_eq!(
+            provider.build_url(false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_send_bearer_header_when_vertex_mode() {
+        let provider = GeminiProvider::vertex("p", "m", Arc::new(StaticToken("abc123")));
+        let req = provider.client.post("https://example.com");
+        let built = provider.apply_auth(req).await.unwrap().build().unwrap();
+        assert_eq!(
+            built.headers().get("Authorization").unwrap(),
+            "Bearer abc123"
+        );
+        assert!(
+            built.headers().get("x-goog-api-key").is_none(),
+            "Vertex mode must not send the AI Studio api-key header"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_send_api_key_header_when_studio_mode() {
+        let provider = GeminiProvider::new("secret-key", "m");
+        let req = provider.client.post("https://example.com");
+        let built = provider.apply_auth(req).await.unwrap().build().unwrap();
+        assert_eq!(built.headers().get("x-goog-api-key").unwrap(), "secret-key");
+        assert!(built.headers().get("Authorization").is_none());
     }
 
     // --- Generation config tests ---

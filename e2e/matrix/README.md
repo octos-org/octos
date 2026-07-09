@@ -4,10 +4,9 @@ Issue: [#1056](https://github.com/octos-org/octos/issues/1056)
 Contract: [UPCR-2026-018 Local Solo Onboarding And Policy Inspection](../../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_018_LOCAL_SOLO_ONBOARDING_AND_POLICY.md)
 
 The matrix is a scenario-driven harness that exercises the AppUI onboarding
-surface against `octos serve --stdio`. The first PR (this directory) lands
-the manifest schema, a stdlib-only runner, and the **tier-fast** scenario
-lane. Validators, **tier-local**, and **tier-release** are deferred to
-follow-up PRs.
+surface against `octos serve --stdio`. The **tier-fast** lane runs
+deterministic JSON-RPC scenarios and enforces the declared fast onboarding
+validators. **tier-local** and **tier-release** remain placeholder lanes.
 
 ## Layout
 
@@ -45,7 +44,7 @@ Other invocations:
 
 ```bash
 npm run matrix -- --pack onboarding --tier local     # placeholder scenarios (skipped)
-npm run matrix -- --pack onboarding --tier release   # placeholder scenarios (skipped)
+npm run matrix -- --pack onboarding --tier release   # fails while required release placeholders remain
 ```
 
 Environment knobs:
@@ -62,7 +61,7 @@ Environment knobs:
 | --------- | --------------------- | --------- | ----------------------- | -------------- |
 | `fast`    | No                    | No        | < 30 s per scenario     | Active         |
 | `local`   | Yes (local provider)  | Optional  | < 5 min per scenario    | Placeholder    |
-| `release` | Yes (release lane)    | Yes       | Bounded by gating CI    | Placeholder    |
+| `release` | Yes (release lane)    | Yes       | Bounded by gating CI    | Required placeholder; fails until wired |
 
 `tier=fast` scenarios MUST be mock-or-deterministic. The runner does not
 expose any provider configuration knobs in this PR — the only entry points
@@ -76,17 +75,23 @@ for the full schema. The runner today understands:
 
 - `[pack]` metadata: `name`, `contract`, `issue`.
 - `[[scenarios]]` with: `name`, `tier`, `transport`, `description`,
-  optional `skip_reason`, `validators`, `artifacts`.
+  optional `required`, `skip_reason`, `validators`, `artifacts`.
 - `[[scenarios.steps]]` with: `id`, `rpc`, `params`, optional `expect`.
 
 `expect` supports three light, shape-only checks that the runner enforces
-itself (full validators land with PR #2):
+before scenario validators run:
 
 | Key           | Meaning                                                            |
 | ------------- | ------------------------------------------------------------------ |
 | `ok`          | `false` means the RPC MUST return an error. Defaults to `true`.    |
 | `error_kind`  | When `ok=false`, expected `data.kind` typed-error discriminator.   |
 | `result_has`  | Array of dotted paths that MUST exist in `result`.                 |
+
+Fast onboarding validators run after the transcript is captured. They fail
+the scenario when declared invariants are violated, including advertised
+onboarding capabilities, local profile id consistency, no OTP auth traffic,
+typed profile collision errors, workspace probe semantics, and safe resume
+after partial setup.
 
 ### Placeholders
 
@@ -108,17 +113,18 @@ Inside `params`, the runner substitutes:
   manifest's needs and rejects everything else with a parse error so a
   scenario authoring mistake surfaces immediately.
 
+## Required Scenario Skips
+
+Required scenarios are allowed to carry `skip_reason` while the manifest is
+being built out, but they fail the run instead of reporting `skipped`. This
+keeps release-facing commands from returning green when every required lane is
+still a placeholder.
+
 ## Follow-ups (not in this PR)
 
-1. **Validators** — promote each scenario's `validators = [...]` entries
-   into Python or Node validators that run after the steps emit
-   `rpc-transcript.jsonl`. Required validators per issue #1056:
-   `no_otp_emitted`, `profile_id_consistency`,
-   `workspace_probe_typed_result`, `runtime_policy_stamp_present`,
-   `secret_redaction`, `unsupported_appui_method_gated`,
-   `resume_partial_setup_safe`.
-2. **tier-local** — live tmux capture, live provider key paths.
-3. **tier-release** — required-cannot-skip gate, OTP-leak detection,
+1. **tier-local** — live tmux capture, live provider key paths, runtime
+   policy stamp checks.
+2. **tier-release** — required-cannot-skip gate, OTP-leak detection,
    secret-leak detection, blank/stuck tmux capture detection.
 
 GitHub follow-up issues are filed alongside this PR.

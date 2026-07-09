@@ -353,12 +353,66 @@ tokio::task_local! {
     pub static TOOL_APPROVAL_CTX: Arc<dyn ToolApprovalRequester>;
 }
 
+/// Request emitted by the `ask_user_question` tool when it asks the user a
+/// structured multiple-choice question mid-turn (UPCR-2026-023).
+///
+/// Mirrors [`ToolApprovalRequest`]: a typed payload the
+/// [`UserQuestionRequester`] surfaces to the attached client, blocking the
+/// tool on a oneshot until the client answers. `questions` is already
+/// validated (1..=4 questions, 2..=4 options each); `title`/`body` are the
+/// mandatory generic fallback text a non-structured client renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionRequest {
+    pub questions: Vec<octos_core::ui_protocol::UserQuestion>,
+    pub title: String,
+    pub body: String,
+}
+
+/// Outcome returned to the blocked `ask_user_question` tool after client
+/// handling (UPCR-2026-023). Mirrors [`ToolApprovalDecision`] but carries the
+/// structured per-question answers and distinguishes a cancelled turn from an
+/// unsupported client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserQuestionOutcome {
+    /// The client answered; one entry per question, in question order.
+    Answered(Vec<octos_core::ui_protocol::UserQuestionAnswer>),
+    /// The turn was interrupted / the pending question drained before an
+    /// answer arrived. The tool returns a cancelled result.
+    Cancelled,
+    /// No capable client was attached for this turn; the tool degrades to the
+    /// structured-metadata fallback (§4.4).
+    Unsupported,
+}
+
+/// Async user-question bridge provided by clients that negotiated
+/// `user_question.v1` (UPCR-2026-023). Mirrors [`ToolApprovalRequester`]:
+/// scoped per-turn via [`USER_QUESTION_CTX`] so the `ask_user_question` tool
+/// can block on a oneshot until `user_question/respond` resolves it.
+#[async_trait]
+pub trait UserQuestionRequester: Send + Sync {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome;
+}
+
+tokio::task_local! {
+    /// Optional task-local user-question bridge scoped around a turn by
+    /// interactive clients that negotiated `user_question.v1`. When unset the
+    /// `ask_user_question` tool degrades gracefully (no hard block).
+    pub static USER_QUESTION_CTX: Arc<dyn UserQuestionRequester>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnAttachmentContext {
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
     pub prompt_summary: Option<String>,
+    /// Explicit live-video signal for this turn, set by the ingress from the
+    /// client (`InboundMessage.metadata.live_video`) — NOT inferred from
+    /// attachment types. True only when the turn is a real-time video call
+    /// whose attached image is the user's current camera frame; drives the
+    /// agent loop's video-call note. Defaults false (no auto-detection): a
+    /// voice note plus an uploaded image is not a camera frame.
+    pub live_video: bool,
 }
 
 tokio::task_local! {
@@ -537,6 +591,51 @@ pub trait Tool: Send + Sync {
     fn concurrency_class(&self) -> ConcurrencyClass {
         ConcurrencyClass::Safe
     }
+
+    /// Per-tool execution timeout (seconds) enforced at the registry dispatch
+    /// boundary (Gap 3.3). `None` (the default) means "use the registry's
+    /// global backstop" (`ToolRegistry::set_tool_timeout_secs`, default
+    /// 1800s). A tool that returns `Some(n)` caps its own foreground
+    /// execution at `n` seconds regardless of the registry default.
+    ///
+    /// This is the LAST line of defence against a hung foreground tool
+    /// wedging the session-actor turn forever: even direct registry callers
+    /// (e.g. the serve/API tool path, workspace-contract auto-send) that do
+    /// not run inside the agent loop's per-batch timeout get bounded here.
+    /// It composes with — and is independent of — the agent loop's
+    /// fast/long batch timeout in `agent::execution`, which fires first on
+    /// that path; this guard catches the unprotected direct-caller paths.
+    ///
+    /// `spawn_only` tools are intercepted and backgrounded BEFORE the
+    /// foreground dispatch path, so they never hit this timeout. Genuinely
+    /// long-running foreground tools (`web_fetch`, `web_search`, `browser`,
+    /// deep research/crawl) inherit the generous 1800s backstop by leaving
+    /// this `None`; the `shell` tool already clamps its own internal timeout
+    /// to [1, 600]s, well under the backstop, so it is not double-killed.
+    ///
+    /// Default: `None` (inherit the registry backstop). Keep any override
+    /// generous — this is a safety net, not a tuning knob for normal work.
+    fn execution_timeout_secs(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether this tool BLOCKS on human input (e.g. `ask_user_question`
+    /// awaits the [`USER_QUESTION_CTX`] requester until the client answers,
+    /// exactly as the approval gate blocks on [`TOOL_APPROVAL_CTX`]). Such a
+    /// tool must be EXEMPT from the dispatch-boundary timeout in
+    /// [`ToolRegistry::execute_with_context`]: a human may legitimately take
+    /// longer than any finite tool timeout, and firing the timeout would drop
+    /// the requester's receiver and leak the pending question/approval store
+    /// entry forever (Gap-3.3 interaction). The waiting future is instead
+    /// cancelled the right way — when the turn is interrupted the pending
+    /// store drains the entry and resolves the waiter as `Cancelled`.
+    ///
+    /// Returning `true` here makes the registry skip wrapping the call in the
+    /// dispatch timeout entirely (it still composes with the agent loop's
+    /// per-turn lifecycle and the turn-interrupt drain). Default: `false`.
+    fn blocks_on_human_input(&self) -> bool {
+        false
+    }
 }
 
 /// LRU-based tool lifecycle manager.
@@ -642,6 +741,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod ask_user_question;
 pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
@@ -654,12 +754,14 @@ pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
+pub mod memory_note;
 pub mod message;
 pub mod read_file;
 pub mod read_task_output;
 pub mod recall_memory;
 pub mod research_utils;
 pub mod save_memory;
+pub mod send_app_card;
 pub mod send_file;
 pub mod shell;
 #[allow(dead_code)]
@@ -675,6 +777,7 @@ pub mod admin;
 pub mod browser;
 pub mod check_background_tasks;
 pub mod check_workspace_contract;
+pub mod mofa_make;
 pub mod tool_config;
 pub mod workspace_history;
 
@@ -684,6 +787,7 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use ask_user_question::AskUserQuestionTool;
 pub use coding_tools::{
     ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
     ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
@@ -709,11 +813,13 @@ pub use mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
+pub use memory_note::MemoryNoteTool;
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
+pub use send_app_card::SendAppCardTool;
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
 pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
@@ -726,6 +832,9 @@ pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
+pub use mofa_make::{
+    MakeTypeEntry, MofaDescribeContentTypeTool, MofaMakeTool, make_dispatcher_with_entries,
+};
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 pub use workspace_history::{WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool};
 
@@ -892,6 +1001,23 @@ fn resolve_for_scope(
     // `SessionScope` does not currently expose; tracked as a follow-up
     // (issue #1367).
     if user_path.starts_with("up/") {
+        // #1377 tenant isolation: in a multi-tenant (scoped) session, uploads
+        // are materialized into `<workspace>/uploads/` at turn start and read
+        // by that workspace path. Refuse global `up/` handle resolution here so
+        // a scoped session cannot reach the process-global upload tmpdir (and
+        // thus another tenant's uploads) by handle. Solo sessions (CLI
+        // `octos chat`) keep resolving handles for back-compat.
+        if scope.tenant_id().is_some()
+            && matches!(
+                octos_bus::file_handle::decode_file_handle(user_path),
+                Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+            )
+        {
+            return Err(
+                "Uploaded file not found; uploaded files are under uploads/ — \
+                 read with read_file(\"uploads/<name>\")",
+            );
+        }
         match octos_bus::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
             Ok(resolved)
                 if resolved.scope == octos_bus::file_handle::ToolPathScope::UploadTmpdir =>
@@ -1089,7 +1215,7 @@ pub fn is_symlink_error(e: &std::io::Error) -> bool {
 pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
@@ -1108,40 +1234,36 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
         }
         let mut file = opts.open(&path)?;
 
-        // Peek the first 5 bytes to detect a PDF (`%PDF-`). The symlink-safe
-        // open above is already done; the bytes we read here can't have
-        // followed a symlink. PDF content is binary so `read_to_string`
-        // would fail with a UTF-8 error — for those we route through
-        // `pdf-extract` to recover plain text. Pinned by the mini5 invoice
-        // upload regression (2026-05-12): the LLM couldn't summarize a PDF
-        // because read_to_string aborted immediately.
+        // Peek the first 5 bytes to detect a PDF (`%PDF-`). PDF content is
+        // binary so `read_to_string` would fail with a UTF-8 error — for
+        // those we route through `pdf-extract` to recover plain text. Pinned
+        // by the mini5 invoice upload regression (2026-05-12).
+        //
+        // Both branches read the REST from the SAME O_NOFOLLOW file
+        // descriptor (seek back to 0), never by re-opening the path. The
+        // previous PDF branch did `std::fs::read(&path)`, which follows
+        // symlinks and does no symlink re-check — a leaf swapped between the
+        // O_NOFOLLOW open (time-of-check) and that read (time-of-use) was
+        // followed, so an attacker could redirect the read to `/etc/passwd`
+        // or any file and feed its contents to the LLM. Reading from the
+        // held fd binds every byte to the inode we already validated.
         let mut magic = [0u8; 5];
-        match file.read(&mut magic) {
-            Ok(n) if n >= 5 && &magic == b"%PDF-" => {
-                // PDF detected — close the partial read, load whole bytes,
-                // hand to pdf-extract. Errors from extraction get wrapped
-                // as io::Error so callers see a single error type.
-                drop(file);
-                let bytes = std::fs::read(&path)?;
-                match pdf_extract::extract_text_from_mem(&bytes) {
-                    Ok(text) => Ok(text),
-                    Err(err) => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("pdf extraction failed: {err}"),
-                    )),
-                }
+        let n = file.read(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if n >= 5 && &magic == b"%PDF-" {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) => Ok(text),
+                Err(err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {err}"),
+                )),
             }
-            Ok(n) => {
-                // Not a PDF. Re-open at the start and read as UTF-8 text.
-                // (Seeking back works on regular files but we re-open for
-                // simplicity — the path is already known-safe.)
-                drop(file);
-                let mut file = opts.open(&path)?;
-                let mut content = String::with_capacity(n);
-                file.read_to_string(&mut content)?;
-                Ok(content)
-            }
-            Err(err) => Err(err),
+        } else {
+            let mut content = String::with_capacity(n);
+            file.read_to_string(&mut content)?;
+            Ok(content)
         }
     })
     .await
@@ -1265,6 +1387,45 @@ mod nofollow_tests {
 
         let err = read_no_follow(&link).await.unwrap_err();
         assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_reads_full_content_from_held_fd() {
+        // P2 (tri-repo #1529): both branches now read the rest of the file
+        // from the ALREADY-OPEN O_NOFOLLOW fd (seek back to 0) instead of
+        // re-opening the path. This guards the seek: after the 5-byte magic
+        // peek, the full content — INCLUDING the first 5 bytes — must be
+        // returned. A missing `seek(0)` would drop the leading 5 bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("plain.txt");
+        let content = "HELLO, this plaintext must round-trip in full.";
+        std::fs::write(&file, content).unwrap();
+
+        let read = read_no_follow(&file).await.unwrap();
+        assert_eq!(read, content, "full content must be read from the held fd");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_pdf_reads_whole_file_from_fd_not_path() {
+        // The PDF branch previously did `std::fs::read(&path)` — a re-open by
+        // path that follows a symlink swapped in after the O_NOFOLLOW open
+        // (TOCTOU). It now reads the whole file (magic + body) from the held
+        // fd. A PDF whose body extends well past the 5-byte magic must reach
+        // the extractor in full: pdf-extract fails on this junk body with
+        // InvalidData (proving the whole buffer, not a 5-byte truncation, was
+        // handed over — an empty/short buffer would surface differently).
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf = dir.path().join("doc.pdf");
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'X', 4096));
+        std::fs::write(&pdf, &bytes).unwrap();
+
+        let err = read_no_follow(&pdf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("pdf extraction failed"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1640,6 +1801,43 @@ mod path_tests {
             resolve_path_for_session_scope_write(&scope, &handle).is_err(),
             "write to a missing upload handle must error"
         );
+    }
+
+    /// #1377 tenant isolation: a multi-tenant (scoped) session must NOT resolve
+    /// a global `up/` upload handle — uploads are materialized into `uploads/`
+    /// and read by that workspace path. (Solo sessions keep resolving handles;
+    /// covered by `scoped_session_resolves_upload_handle_to_tmpdir_not_workspace`.)
+    #[test]
+    fn multi_tenant_session_refuses_global_up_handle_but_reads_uploads_dir() {
+        let data = tempfile::tempdir().expect("profile data dir");
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.path().to_path_buf(),
+            "tenant-a".into(),
+            "web-x".into(),
+        )
+        .unwrap();
+        // Create the workspace so canonicalize is firmlink-consistent on macOS.
+        std::fs::create_dir_all(scope.workspace()).unwrap();
+
+        // A valid up/ handle (which a solo session WOULD resolve under the
+        // global tmpdir) is refused for a multi-tenant session.
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("mt-{}-secret.md", std::process::id()));
+        std::fs::write(&uploaded, b"tenant secret\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("secret.md")).unwrap();
+        let resolved = resolve_path_for_session_scope_read(&scope, &handle);
+        let _ = std::fs::remove_file(&uploaded);
+        assert!(
+            resolved.is_err(),
+            "a multi-tenant session must refuse a global up/ handle, got {resolved:?}"
+        );
+
+        // ...but the materialized workspace path resolves InWorkspace.
+        let ok = resolve_path_for_session_scope_read(&scope, "uploads/secret.md")
+            .expect("uploads/<name> must resolve in the workspace");
+        assert!(ok.starts_with(scope.workspace().join("uploads")));
     }
 
     /// Interim guard (#1378): the upload-handle namespace is detected for

@@ -1622,6 +1622,7 @@ async fn handle_chat(
                 serde_json::Value::Object(metadata)
             },
             message_id: Some(request_thread_id.clone()),
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if let Err(e) = state.inbound_tx.send(inbound).await {
@@ -1712,6 +1713,16 @@ struct SessionInfo {
     /// first user message, or set manually). None for legacy sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    /// RFC3339 last-updated timestamp, for the resume picker's recency
+    /// column. None for legacy files lacking the meta field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    /// The session's most recent user prompt (content-part text unwrapped,
+    /// truncated) — the resume picker's preview. codex P2: the gateway path
+    /// previously emitted only id/count/title, so gateway-only sessions had
+    /// no preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2268,9 +2279,9 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
-        .list_top_level_sessions_with_title()
+        .list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt)| {
             let chat_id = api_chat_id_from_session_key(&id)?.to_string();
             if !seen.insert(chat_id.clone()) {
                 return None;
@@ -2279,6 +2290,8 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
                 id: chat_id,
                 message_count: count,
                 title,
+                updated_at: updated_at.map(|ts| ts.to_rfc3339()),
+                last_prompt,
             })
         })
         .collect();
@@ -2452,6 +2465,36 @@ async fn handle_file_download(
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
+    // #1377 (codex pre-merge P1): the download route resolves `up/` handles
+    // against the PROCESS-GLOBAL upload root, so without an ownership check a
+    // leaked/guessable `up/<other-tenant>/...` handle would let one tenant
+    // download another's upload — the download-side twin of the upload-in gap
+    // this PR closes.
+    //
+    // AUTHZ uses ONLY the server-trusted gateway tenant (`state.profile_id`,
+    // fixed at startup), NEVER a request-supplied value. The gateway HTTP
+    // layer has no per-request tenant authentication, so trusting a
+    // `?target_profile_id` here would let an attacker name the foreign tenant
+    // and pass the check (codex pre-merge P1 round-2). `_main` fallback keeps
+    // a no-profile gateway gated (never None -> never skipped).
+    //
+    // Consequence: a cross-profile-ROUTED upload (stamped with a
+    // `target_profile_id` other than the gateway profile) is NOT downloadable
+    // through this raw `up/` route — the gateway cannot authenticate the
+    // caller as that tenant, so it must refuse. The agent still reaches such a
+    // file via the materialized workspace copy (`uploads/<name>`); only the
+    // un-authenticatable raw-handle download is closed. Workspace/profile
+    // files (not under the upload root) are unaffected.
+    if crate::file_handle::is_under_upload_root(&canonical) {
+        let tenant = state
+            .profile_id
+            .clone()
+            .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_string());
+        if !crate::file_handle::upload_owned_by_tenant(&canonical, Some(&tenant)) {
+            return (StatusCode::FORBIDDEN, "access denied").into_response();
+        }
+    }
+
     match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
             let filename = canonical
@@ -2488,9 +2531,84 @@ async fn handle_file_download(
     }
 }
 
+/// Query params for `POST /upload`. `target_profile_id` lets a cross-profile
+/// routing client stamp the upload with the same tenant it will route the
+/// subsequent `/chat` to (#1377 codex round-5 P2); absent for the common
+/// single-profile case.
+#[derive(Debug, Default, serde::Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    target_profile_id: Option<String>,
+}
+
+/// The effective OWNING tenant an `/upload` is STAMPED with (#1377): a
+/// charset-guarded `?target_profile_id` (cross-profile routing), else the
+/// gateway's own profile, else `_main`. NEVER `None`.
+///
+/// NOTE: this is the UPLOAD-STAMP tenant, used only for where to STORE the
+/// file. It is NOT an authorization signal — `target_profile_id` is
+/// request-supplied. The `/files` download gate authorizes against the
+/// server-trusted `state.profile_id` ONLY (see `handle_file_download`).
+fn effective_upload_tenant(
+    target_profile_id: Option<&str>,
+    gateway_profile_id: Option<&str>,
+) -> String {
+    target_profile_id
+        .filter(|t| {
+            !t.is_empty()
+                && t.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .map(str::to_string)
+        .or_else(|| gateway_profile_id.map(str::to_string))
+        .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_string())
+}
+
 /// POST /upload — upload files for use in chat media field.
-async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
-    let upload_dir = std::env::temp_dir().join("octos-uploads");
+///
+/// #1377: stores uploads under `octos-uploads/<tenant>/<name>` where the
+/// tenant is the gateway's resolved profile (the same layout the `octos serve`
+/// handler uses), so the resolved `up/` handle carries the owning tenant and
+/// the cross-tenant ownership gate (`upload_owned_by_tenant`) can enforce
+/// isolation. A gateway with no profile (single-tenant / main) stores flat,
+/// preserving the previous behaviour.
+async fn handle_upload(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    let upload_root = std::env::temp_dir().join("octos-uploads");
+    // #1377: stamp the upload with the OWNING tenant so the resolved handle
+    // matches what the subsequent `/chat` filters against. When the client
+    // routes cross-profile it passes `?target_profile_id=<p>` (the same value
+    // it sends on `/chat`); otherwise fall back to the gateway's own profile,
+    // then to `_main` (codex round-7 P1: a gateway is a multi-tenant context,
+    // so uploads are ALWAYS tenant-stamped — never flat — otherwise the
+    // main/admin route would accept any tenant's handles). The target is
+    // charset-guarded (lowercase alnum + `-`, the profile-id alphabet) so it
+    // cannot inject a path component or `..`; an invalid/empty value falls
+    // back to the gateway profile / `_main`.
+    let tenant = effective_upload_tenant(
+        query.target_profile_id.as_deref(),
+        state.profile_id.as_deref(),
+    );
+    let upload_dir = upload_root.join(&tenant);
+    // codex round-7 P2: a LEGACY flat upload named exactly like a profile id
+    // (`octos-uploads/<tenant>`) would block `create_dir_all` and 500 every
+    // upload for that tenant. Such a flat file is a pre-migration artifact in
+    // the ephemeral temp dir that the new layout treats as un-owned (dropped
+    // by the filter) anyway, so clear it to make room for the tenant dir.
+    if tokio::fs::metadata(&upload_dir)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        warn!(
+            tenant = %tenant,
+            "removing legacy flat upload colliding with tenant directory"
+        );
+        let _ = tokio::fs::remove_file(&upload_dir).await;
+    }
     if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2692,6 +2810,38 @@ mod tests {
     use axum::http::Request;
     use std::path::Path;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn effective_upload_tenant_is_never_none_and_matches_upload_stamp() {
+        // Cross-profile target (charset-valid) wins.
+        assert_eq!(
+            effective_upload_tenant(Some("dspfac--lbc-bot"), Some("dspfac")),
+            "dspfac--lbc-bot"
+        );
+        // Invalid target (path-injection / uppercase / empty) is ignored,
+        // falls back to the gateway profile.
+        assert_eq!(
+            effective_upload_tenant(Some("../etc"), Some("dspfac")),
+            "dspfac"
+        );
+        assert_eq!(effective_upload_tenant(Some(""), Some("dspfac")), "dspfac");
+        assert_eq!(
+            effective_upload_tenant(Some("Dspfac"), Some("dspfac")),
+            "dspfac"
+        );
+        // No target -> gateway profile.
+        assert_eq!(effective_upload_tenant(None, Some("dspfac")), "dspfac");
+        // No target AND no gateway profile (main/admin gateway) -> `_main`,
+        // NEVER None — so the download gate actually fires (codex pre-merge P1).
+        assert_eq!(
+            effective_upload_tenant(None, None),
+            octos_core::MAIN_PROFILE_ID
+        );
+        assert_eq!(
+            effective_upload_tenant(Some(""), None),
+            octos_core::MAIN_PROFILE_ID
+        );
+    }
 
     const TEST_PROFILE_ID: &str = "dspfac";
 

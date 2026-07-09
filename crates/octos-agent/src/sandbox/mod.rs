@@ -1,16 +1,20 @@
 //! Sandboxing for shell command execution.
 //!
-//! Provides platform-specific isolation: bubblewrap on Linux,
-//! sandbox-exec on macOS, or no sandbox (pass-through).
+//! Provides platform-specific isolation: bubblewrap or Landlock/seccomp on Linux,
+//! sandbox-exec on macOS, AppContainer on Windows, or no sandbox (pass-through).
 
 mod bwrap;
 mod docker;
+#[cfg(target_os = "linux")]
+mod landlock;
 mod macos;
 #[cfg(windows)]
 mod windows;
 
 pub use bwrap::BwrapSandbox;
 pub use docker::DockerSandbox;
+#[cfg(target_os = "linux")]
+pub use landlock::LinuxContainerSandbox;
 pub use macos::MacosSandbox;
 #[cfg(windows)]
 pub use windows::AppContainerSandbox;
@@ -63,6 +67,19 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub allow_network: bool,
 
+    /// Whether shell/exec commands may write to the workspace cwd
+    /// (default: true).
+    ///
+    /// When `false`, the workspace is mounted/bound read-only for the
+    /// shell sandbox: macOS omits the `file-write*` grant for the cwd,
+    /// bwrap `--ro-bind`s it, and Docker mounts it `ro`. This is what a
+    /// read-only permission profile sets so `--sandbox read-only` stops
+    /// shell writes (`touch newfile`), not just the native file tools.
+    /// The `default_enabled` (true) default preserves backward-compatible
+    /// writable behaviour for configs that never set this field.
+    #[serde(default = "default_enabled")]
+    pub workspace_write: bool,
+
     /// Docker-specific settings (used when mode = "docker").
     #[serde(default)]
     pub docker: DockerConfig,
@@ -106,6 +123,7 @@ impl Default for SandboxConfig {
             enabled: true,
             mode: SandboxMode::Auto,
             allow_network: false,
+            workspace_write: true,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,
@@ -186,6 +204,8 @@ pub enum SandboxMode {
     Auto,
     /// Linux bubblewrap.
     Bwrap,
+    /// Linux container sandbox using Landlock filesystem rules plus seccomp.
+    Landlock,
     /// macOS sandbox-exec.
     Macos,
     /// Docker container isolation.
@@ -234,10 +254,30 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::None => Box::new(NoSandbox),
         SandboxMode::Bwrap => Box::new(BwrapSandbox {
             allow_network: config.allow_network,
+            workspace_write: config.workspace_write,
         }),
+        SandboxMode::Landlock => {
+            #[cfg(target_os = "linux")]
+            {
+                Box::new(LinuxContainerSandbox {
+                    allow_network: config.allow_network,
+                    read_allow_paths: config.read_allow_paths.clone(),
+                    profile_name: config.profile_name.clone(),
+                    workspace_write: config.workspace_write,
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::warn!(
+                    "Landlock/seccomp is only available on Linux, falling back to NoSandbox"
+                );
+                Box::new(NoSandbox)
+            }
+        }
         SandboxMode::Macos => Box::new(MacosSandbox {
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
+            workspace_write: config.workspace_write,
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: config.docker.clone(),
@@ -250,6 +290,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
+                    workspace_write: config.workspace_write,
                 })
             }
             #[cfg(not(windows))]
@@ -260,56 +301,139 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 Box::new(NoSandbox)
             }
         }
-        SandboxMode::Auto => {
-            if cfg!(target_os = "linux") && which_exists("bwrap") {
-                Box::new(BwrapSandbox {
-                    allow_network: config.allow_network,
-                })
-            } else if cfg!(target_os = "macos") && which_exists("sandbox-exec") {
-                Box::new(MacosSandbox {
-                    allow_network: config.allow_network,
-                    read_allow_paths: config.read_allow_paths.clone(),
-                })
-            } else if cfg!(target_os = "windows") && has_sandbox_helper() {
-                #[cfg(windows)]
-                {
-                    Box::new(AppContainerSandbox {
-                        allow_network: config.allow_network,
-                        read_allow_paths: config.read_allow_paths.clone(),
-                        profile_name: config.profile_name.clone(),
-                    })
-                }
-                #[cfg(not(windows))]
-                {
-                    Box::new(NoSandbox)
-                }
-            } else if which_exists("docker") {
-                Box::new(DockerSandbox {
-                    config: config.docker.clone(),
-                    allow_network: config.allow_network,
-                })
-            } else {
-                tracing::warn!(
-                    "no sandbox backend found (bwrap, sandbox-exec, docker, or AppContainer). \
-                     Shell commands will run WITHOUT isolation. \
-                     Install a sandbox backend or set sandbox.enabled = false to silence this warning."
-                );
-                Box::new(NoSandbox)
-            }
-        }
+        SandboxMode::Auto => create_auto_sandbox(config),
     }
 }
 
+fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
+    #[cfg(target_os = "macos")]
+    {
+        if which_exists("sandbox-exec") {
+            return Box::new(MacosSandbox {
+                allow_network: config.allow_network,
+                read_allow_paths: config.read_allow_paths.clone(),
+                workspace_write: config.workspace_write,
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if bwrap_works() {
+            return Box::new(BwrapSandbox {
+                allow_network: config.allow_network,
+                workspace_write: config.workspace_write,
+            });
+        }
+        if linux_container_sandbox_available() {
+            return Box::new(LinuxContainerSandbox {
+                allow_network: config.allow_network,
+                read_allow_paths: config.read_allow_paths.clone(),
+                profile_name: config.profile_name.clone(),
+                workspace_write: config.workspace_write,
+            });
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if has_sandbox_helper() {
+            return Box::new(AppContainerSandbox {
+                allow_network: config.allow_network,
+                read_allow_paths: config.read_allow_paths.clone(),
+                profile_name: config.profile_name.clone(),
+                workspace_write: config.workspace_write,
+            });
+        }
+    }
+
+    if which_exists("docker") {
+        Box::new(DockerSandbox {
+            config: config.docker.clone(),
+            allow_network: config.allow_network,
+        })
+    } else {
+        tracing::warn!(
+            "no sandbox backend found (bwrap, Landlock/seccomp, sandbox-exec, docker, or AppContainer). \
+             Shell commands will run WITHOUT isolation. \
+             Install a sandbox backend or set sandbox.enabled = false to silence this warning."
+        );
+        Box::new(NoSandbox)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bwrap_works() -> bool {
+    if !which_exists("bwrap") {
+        return false;
+    }
+
+    let mut cmd = std::process::Command::new("bwrap");
+    for dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
+        if Path::new(dir).exists() {
+            cmd.arg("--ro-bind").arg(dir).arg(dir);
+        }
+    }
+    cmd.arg("--dev")
+        .arg("/dev")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--tmpfs")
+        .arg("/tmp")
+        .arg("--die-with-parent")
+        .arg("--")
+        .arg(if Path::new("/bin/true").exists() {
+            "/bin/true"
+        } else {
+            "/usr/bin/true"
+        })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_container_sandbox_available() -> bool {
+    find_sandbox_helper_path()
+        .and_then(|helper| {
+            std::process::Command::new(helper)
+                .arg("--probe-linux")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+        })
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Check if the octos-sandbox helper binary is available.
+#[cfg(windows)]
 fn has_sandbox_helper() -> bool {
+    find_sandbox_helper_path().is_some()
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn find_sandbox_helper_path() -> Option<String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            if dir.join("octos-sandbox.exe").exists() || dir.join("octos-sandbox").exists() {
-                return true;
+            let helper = if cfg!(windows) {
+                dir.join("octos-sandbox.exe")
+            } else {
+                dir.join("octos-sandbox")
+            };
+            if helper.exists() {
+                return Some(helper.to_string_lossy().into_owned());
             }
         }
     }
-    which_exists("octos-sandbox")
+    if which_exists("octos-sandbox") {
+        Some("octos-sandbox".to_string())
+    } else {
+        None
+    }
 }
 
 /// Check if a binary exists on PATH.
@@ -367,6 +491,7 @@ mod tests {
         let modes = [
             (SandboxMode::Auto, "\"auto\""),
             (SandboxMode::Bwrap, "\"bwrap\""),
+            (SandboxMode::Landlock, "\"landlock\""),
             (SandboxMode::Macos, "\"macos\""),
             (SandboxMode::Docker, "\"docker\""),
             (SandboxMode::AppContainer, "\"appcontainer\""),
@@ -494,6 +619,7 @@ mod tests {
             enabled: true,
             mode: SandboxMode::None,
             allow_network: false,
+            workspace_write: true,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,

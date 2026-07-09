@@ -41,6 +41,12 @@ pub struct ModelHints {
     /// Merge consecutive system messages into one (some providers reject multiples).
     #[serde(default = "default_true")]
     pub merge_system_messages: bool,
+
+    /// How this model accepts a reasoning/thinking control on the chat path.
+    /// Translates `ChatConfig::reasoning_effort` into request fields; `None`
+    /// (default) emits nothing, so it is a no-op for non-thinking models.
+    #[serde(default)]
+    pub reasoning_style: ReasoningStyle,
 }
 
 fn default_true() -> bool {
@@ -54,6 +60,7 @@ impl Default for ModelHints {
             fixed_temperature: false,
             lacks_vision: false,
             merge_system_messages: true,
+            reasoning_style: ReasoningStyle::None,
         }
     }
 }
@@ -74,29 +81,68 @@ impl ModelHints {
         let fixed_temperature =
             is_o_series || m.starts_with("gpt-5") || m.contains("kimi-k2") || m == "gpt-4.1-nano";
 
-        let lacks_vision = m.starts_with("deepseek")
-            || m.starts_with("minimax")
-            || m.contains("codestral")
-            || m.starts_with("mistral")
-            || m.starts_with("yi-")
-            // 2026-05-18: kimi-k2.5 returns
-            //   `400 InvalidParameter: incorrect modal "image" was entered,
-            //    which may not be supported by the model`
-            // when image_url content parts are present. Production users on
-            // mini3 (dspfac profile) hit this when attaching slide PNGs as
-            // user-uploaded media. The text-only fallback (`[user-uploaded
-            // files: ...]`) lets kimi still process the turn and ask the
-            // agent to `read_file` the attachment if needed.
-            || m.contains("kimi")
-            || m.contains("moonshot");
+        // Vision capability is NO LONGER inferred from the model name. The old
+        // allow/deny list wrongly stripped images from vision-capable models —
+        // kimi-k2.5/k2.6 are natively multimodal, moonshot/minimax/deepseek
+        // also ship vision variants (deepseek-v4/VL), and the SAME model name
+        // can front either a vision endpoint (e.g. `moonshot@api/kimi-k2.6`)
+        // or a proxy that rejects `image_url` parts (e.g. `moonshot@autodl`).
+        // A name heuristic cannot tell those apart, so it silently dropped
+        // images users uploaded to vision-capable models.
+        //
+        // Instead we ATTEMPT images for user uploads and rely on the graceful
+        // image-modality fallback in `chat()` / `chat_stream()`: if the
+        // endpoint returns the `400 ... incorrect modal "image"` (or similar)
+        // error, we retry the request once text-only. `lacks_vision` remains a
+        // config-overridable field so an operator CAN pre-strip for a known
+        // text-only endpoint and skip the one doomed attempt — it just is not
+        // auto-asserted from the model name.
+        let lacks_vision = false;
+
+        // Reasoning-control style on the chat/completions path. DeepSeek V4
+        // (incl. `deepseek-reasoner`, a V4-Flash thinking alias) wants
+        // `reasoning_effort` + a `thinking` toggle; OpenAI reasoning models and
+        // grok-4.x take a plain `reasoning_effort`. Everything else emits nothing.
+        // Effort/thinking is only EMITTED when an operator sets `reasoning_effort`
+        // (opt-in), and the style is config-overridable per route — important
+        // because the same `deepseek-v4` name fronts endpoints that differ
+        // (api.deepseek.com accepts it; nvidia/vllm may not), same caveat as
+        // `lacks_vision`. `grok` is narrowed to `grok-4` since older Grok
+        // families can reject `reasoning_effort`.
+        let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
+            ReasoningStyle::EffortAndThinkingToggle
+        } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
+            ReasoningStyle::Effort
+        } else {
+            ReasoningStyle::None
+        };
 
         Self {
             uses_completion_tokens,
             fixed_temperature,
             lacks_vision,
             merge_system_messages: true,
+            reasoning_style,
         }
     }
+}
+
+/// How a model on the OpenAI-compatible chat/completions path accepts a
+/// reasoning/thinking control. Used to translate the provider-agnostic
+/// [`ChatConfig::reasoning_effort`](crate::config::ChatConfig) into the right
+/// request fields. The SAME model name can front endpoints with different
+/// support (cf. `lacks_vision`), so this is config-overridable via `ModelHints`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningStyle {
+    /// No reasoning control emitted on the chat path (default — backward compatible).
+    #[default]
+    None,
+    /// Top-level `reasoning_effort: "low"|"medium"|"high"` — OpenAI chat-completions
+    /// reasoning models (o-series / gpt-5) and xAI Grok.
+    Effort,
+    /// `reasoning_effort` plus `thinking: {"type": "enabled"}` — DeepSeek V4.
+    EffortAndThinkingToggle,
 }
 
 /// OpenAI GPT provider.
@@ -162,6 +208,16 @@ impl OpenAIProvider {
                 }
             }
         }
+        // The DeepSeek `thinking` toggle is specific to DeepSeek's official API.
+        // The same `deepseek-v4` model name fronted by other endpoints
+        // (nvidia/vllm/wisemodel) uses different — or no — reasoning controls, so
+        // don't emit DeepSeek-specific fields there by default. Operators opt in
+        // per route via `model_hints` (with_hints, applied after this, still wins).
+        if self.hints.reasoning_style == ReasoningStyle::EffortAndThinkingToggle
+            && !url.contains("api.deepseek.com")
+        {
+            self.hints.reasoning_style = ReasoningStyle::None;
+        }
         self.base_url = url;
         self
     }
@@ -186,13 +242,70 @@ impl OpenAIProvider {
         self
     }
 
+    /// POST a non-streaming chat request. Factored so the graceful
+    /// image-modality fallback can re-send a rebuilt (text-only) request
+    /// without duplicating the wire setup.
+    async fn post_chat(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
+        self.client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+            ))
+            .json(request)
+            .send()
+            .await
+            .wrap_err("failed to send request to OpenAI")
+    }
+
+    /// POST a streaming chat request (adds `stream` + `stream_options`).
+    /// Factored for the same image-modality fallback as [`Self::post_chat`].
+    async fn post_chat_stream(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
+        let mut body =
+            serde_json::to_value(request).wrap_err("failed to serialize OpenAI request")?;
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
+        obj.insert("stream".into(), true.into());
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
+        self.client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send streaming request to OpenAI")
+    }
+
     /// Build the shared request struct used by both chat() and chat_stream().
+    ///
+    /// `force_text_only` strips user-uploaded images even when the model is
+    /// treated as vision-capable. It is set on the retry leg of the graceful
+    /// image-modality fallback (see `chat()` / `chat_stream()`): when an
+    /// endpoint rejects `image_url` parts with a 400, the request is rebuilt
+    /// text-only so the turn still proceeds.
     fn build_request<'a>(
         &'a self,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
         config: &ChatConfig,
+        force_text_only: bool,
     ) -> OpenAIRequest<'a> {
+        // Effective content hints: honour the configured `lacks_vision`, and
+        // additionally strip images on the text-only retry leg.
+        let mut content_hints = self.hints.clone();
+        content_hints.lacks_vision = content_hints.lacks_vision || force_text_only;
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
             .filter(|m| {
@@ -217,23 +330,37 @@ impl OpenAIProvider {
                         })
                         .collect()
                 });
-                // Kimi-k2 (and similar thinking models) require reasoning_content
-                // to be present (even empty) on ALL assistant messages when thinking
-                // is enabled. When omitted, the API returns 400 "reasoning_content
-                // is missing in assistant tool call message".
-                // Only synthesize a stub for models that actually need it (detected
-                // via fixed_temperature + model name containing "kimi-k2").
+                // We do NOT re-send prior assistant reasoning_content for ordinary
+                // openai-compat models. Reasoning models re-derive their chain of
+                // thought each turn, so round-tripping the full verbose reasoning is
+                // pure context bloat (and grows unboundedly across a tool loop) —
+                // OpenAI's own API and codex both drop it.
+                //
+                // kimi-k2 is the exception. With thinking enabled it (a) returns 400
+                // "reasoning_content is missing in assistant tool call message" if the
+                // field is absent, AND (b) per kimi's docs preserves historical
+                // assistant reasoning for multi-step tool-use continuity. So for
+                // kimi-k2 we keep the REAL reasoning when present, and fall back to a
+                // minimal "." stub only to satisfy the presence check when it's absent.
+                //
+                // kimi-k2 is detected via fixed_temperature + model name containing
+                // "kimi-k2". Other models (e.g. deepseek-v4, verified live to return
+                // 200 without the field, and non-official nvidia/vllm endpoints that
+                // don't expect it) get no reasoning_content at all.
                 let needs_reasoning_stub =
                     self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
-                let reasoning = match m.reasoning_content.as_deref() {
-                    Some(r) if !r.is_empty() => Some(r),
-                    _ if role == "assistant" && needs_reasoning_stub => Some("."),
-                    _ => None,
+                let reasoning = if role == "assistant" && needs_reasoning_stub {
+                    match m.reasoning_content.as_deref() {
+                        Some(r) if !r.is_empty() => Some(r),
+                        _ => Some("."),
+                    }
+                } else {
+                    None
                 };
 
                 OpenAIMessage {
                     role,
-                    content: build_openai_content(m, &self.hints),
+                    content: build_openai_content(m, &content_hints),
                     reasoning_content: reasoning,
                     tool_call_id: m.tool_call_id.as_deref(),
                     tool_calls,
@@ -294,6 +421,33 @@ impl OpenAIProvider {
             }
         });
 
+        // Translate the provider-agnostic `reasoning_effort` into the chat-path
+        // request fields the model's ReasoningStyle expects. Emitted only when
+        // an effort is configured AND the model declares a non-None style, so
+        // it stays a no-op for models/endpoints that don't accept it.
+        let (reasoning_effort, thinking) =
+            match (config.reasoning_effort, self.hints.reasoning_style) {
+                (Some(effort), style) if style != ReasoningStyle::None => {
+                    use crate::config::ReasoningEffort as RE;
+                    let effort_str = match (effort, style) {
+                        (RE::Low, _) => "low",
+                        (RE::Medium, _) => "medium",
+                        (RE::High, _) => "high",
+                        // DeepSeek V4 accepts "max"; Effort-style providers
+                        // (OpenAI/Grok) have no max tier, so clamp to "high".
+                        (RE::Max, ReasoningStyle::EffortAndThinkingToggle) => "max",
+                        (RE::Max, _) => "high",
+                    };
+                    let thinking = if style == ReasoningStyle::EffortAndThinkingToggle {
+                        Some(serde_json::json!({ "type": "enabled" }))
+                    } else {
+                        None
+                    };
+                    (Some(effort_str), thinking)
+                }
+                _ => (None, None),
+            };
+
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
@@ -310,6 +464,8 @@ impl OpenAIProvider {
             temperature,
             tools: openai_tools,
             response_format,
+            reasoning_effort,
+            thinking,
         }
     }
 }
@@ -322,23 +478,35 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let request = self.build_request(messages, tools, config);
+        let request = self.build_request(messages, tools, config, false);
+        let mut response = self.post_chat(&request).await?;
 
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(
-                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
-            ))
-            .json(&request)
-            .send()
-            .await
-            .wrap_err("failed to send request to OpenAI")?;
+        // Graceful image-modality fallback: a vision-capable model behind a
+        // proxy that rejects `image_url` parts (or a genuinely text-only
+        // model) returns a 400 when images are present. Retry once text-only
+        // so the turn proceeds instead of erroring — the agent can still
+        // `read_file` the attachment via the media note. See
+        // `is_image_modality_error` / `ModelHints::detect`.
+        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+            let body = response.text().await.unwrap_or_default();
+            if is_image_modality_error(&body) {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    "endpoint rejected image content (400); retrying text-only"
+                );
+                let retry = self.build_request(messages, tools, config, true);
+                response = self.post_chat(&retry).await?;
+            } else {
+                let body = crate::provider::truncate_error_body(&body);
+                return Err(crate::error::LlmError::from_status_with_label(
+                    400,
+                    &body,
+                    format!("{}/{}", self.provider_label, self.model),
+                )
+                .into());
+            }
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -435,31 +603,31 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let request = self.build_request(messages, tools, config);
+        let request = self.build_request(messages, tools, config, false);
+        let mut response = self.post_chat_stream(&request).await?;
 
-        let mut body =
-            serde_json::to_value(&request).wrap_err("failed to serialize OpenAI request")?;
-        let obj = body
-            .as_object_mut()
-            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
-        obj.insert("stream".into(), true.into());
-        obj.insert(
-            "stream_options".into(),
-            serde_json::json!({"include_usage": true}),
-        );
-
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .wrap_err("failed to send streaming request to OpenAI")?;
+        // Graceful image-modality fallback (see `chat()`): retry once
+        // text-only if the endpoint rejected the image content parts.
+        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+            let text = response.text().await.unwrap_or_default();
+            if is_image_modality_error(&text) {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    "endpoint rejected image content (400); retrying text-only (stream)"
+                );
+                let retry = self.build_request(messages, tools, config, true);
+                response = self.post_chat_stream(&retry).await?;
+            } else {
+                let body = crate::provider::truncate_error_body(&text);
+                return Err(crate::error::LlmError::from_status_with_label(
+                    400,
+                    &body,
+                    format!("{}/{}", self.provider_label, self.model),
+                )
+                .into());
+            }
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -518,6 +686,13 @@ struct OpenAIRequest<'a> {
     tools: Option<Vec<OpenAITool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
+    /// Reasoning effort ("low"|"medium"|"high"), emitted only for models whose
+    /// `ReasoningStyle` accepts it (OpenAI reasoning models, Grok, DeepSeek V4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    /// DeepSeek V4 thinking toggle (`{"type": "enabled"}`); other styles omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -583,6 +758,36 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
         result.push(msg);
     }
     result
+}
+
+/// Whether a provider 400 means "this endpoint/model can't accept image
+/// content parts" — as opposed to any other bad request. Vision-capable
+/// models fronted by a text-only proxy, and genuinely text-only models,
+/// return these when `image_url` parts are present. Matched case-insensitively
+/// against the (truncated) error body.
+///
+/// Examples seen in production (mini3 `dspfac`): kimi via the autodl proxy
+/// returns `400 InvalidParameter: incorrect modal "image" was entered, which
+/// may not be supported by the model`.
+fn is_image_modality_error(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("incorrect modal")
+        || (b.contains("modal") && b.contains("image"))
+        || b.contains("does not support image")
+        || b.contains("image input is not supported")
+        || b.contains("not support vision")
+        || b.contains("vision is not supported")
+        || (b.contains("image_url") && b.contains("not support"))
+}
+
+/// Whether the request carries at least one user-uploaded image we would have
+/// inlined (i.e. images are not already stripped by the configured
+/// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
+fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
+    !hints.lacks_vision
+        && messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_image(p)))
 }
 
 fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
@@ -775,8 +980,13 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
 
     if let Some(choices) = data["choices"].as_array() {
         for choice in choices {
-            // Reasoning/thinking content (kimi-k2.5, o1, etc.)
-            if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
+            // Reasoning/thinking content (kimi-k2.5, o1, etc.). OpenRouter
+            // uses `reasoning`; most OpenAI-compatible providers use
+            // `reasoning_content`.
+            if let Some(reasoning) = choice["delta"]["reasoning_content"]
+                .as_str()
+                .or_else(|| choice["delta"]["reasoning"].as_str())
+            {
                 if !reasoning.is_empty() {
                     events.push(StreamEvent::ReasoningDelta(reasoning.to_string()));
                 }
@@ -905,31 +1115,86 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_kimi_k25() {
+    fn test_detect_kimi_k25_is_not_pre_stripped() {
         let h = ModelHints::detect("kimi-k2.5");
         assert!(!h.uses_completion_tokens);
         assert!(h.fixed_temperature);
-        // 2026-05-18: empirically kimi-k2.5 returns
-        //   `400 InvalidParameter: incorrect modal "image" was entered`
-        // when sent image_url content parts. Reproduced live on mini3
-        // (dspfac profile, session slides-1779130130502-th18yr) with
-        // a user-uploaded PNG. Treat kimi as text-only.
-        assert!(h.lacks_vision);
+        // Vision is NO LONGER inferred from the model name. Kimi K2.5/K2.6 are
+        // natively multimodal; the old heuristic wrongly stripped images from
+        // them. The same model name can also front a vision endpoint
+        // (moonshot@api) or an image-rejecting proxy (moonshot@autodl), which a
+        // name check can't distinguish — so we attempt images and let the
+        // graceful image-modality fallback retry text-only if the endpoint 400s.
+        assert!(!h.lacks_vision);
     }
 
     #[test]
-    fn test_detect_deepseek() {
+    fn test_detect_deepseek_is_not_pre_stripped() {
+        // deepseek-chat is text-only, but deepseek-v4/VL are vision; we no
+        // longer pre-strip by name. A text-only endpoint that 400s on an image
+        // is handled by the image-modality fallback, not a hardcoded flag.
         let h = ModelHints::detect("deepseek-chat");
         assert!(!h.uses_completion_tokens);
         assert!(!h.fixed_temperature);
-        assert!(h.lacks_vision);
+        assert!(!h.lacks_vision);
     }
 
     #[test]
-    fn test_detect_minimax() {
+    fn test_detect_minimax_is_not_pre_stripped() {
         let h = ModelHints::detect("MiniMax-Text-01");
-        assert!(h.lacks_vision);
+        assert!(!h.lacks_vision);
         assert!(h.merge_system_messages);
+    }
+
+    #[test]
+    fn is_image_modality_error_matches_known_provider_400s() {
+        // The exact string observed live on mini3 (kimi via the autodl proxy).
+        assert!(is_image_modality_error(
+            "InvalidParameter: incorrect modal \"image\" was entered, which may not be supported by the model"
+        ));
+        assert!(is_image_modality_error(
+            "This model does not support image input"
+        ));
+        assert!(is_image_modality_error(
+            "vision is not supported by this endpoint"
+        ));
+        // Unrelated 400s must NOT trigger the text-only retry.
+        assert!(!is_image_modality_error("invalid api key"));
+        assert!(!is_image_modality_error("context length exceeded"));
+        assert!(!is_image_modality_error("rate limit reached"));
+    }
+
+    #[test]
+    fn request_has_user_images_gates_the_fallback() {
+        let img = Message {
+            role: MessageRole::User,
+            content: "look at this".into(),
+            media: vec!["/tmp/pic.png".into()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let vision = ModelHints::default();
+        assert!(request_has_user_images(std::slice::from_ref(&img), &vision));
+        // Already configured text-only ⇒ images were never sent ⇒ no retry.
+        let text_only = ModelHints {
+            lacks_vision: true,
+            ..ModelHints::default()
+        };
+        assert!(!request_has_user_images(
+            std::slice::from_ref(&img),
+            &text_only
+        ));
+        // A non-image attachment is not an image-modality concern.
+        let mut doc = img.clone();
+        doc.media = vec!["/tmp/data.csv".into()];
+        assert!(!request_has_user_images(
+            std::slice::from_ref(&doc),
+            &vision
+        ));
     }
 
     #[test]
@@ -948,6 +1213,7 @@ mod tests {
             fixed_temperature: false,
             lacks_vision: true,
             merge_system_messages: false,
+            reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
         };
         let json = serde_json::to_string(&hints).unwrap();
         let parsed: ModelHints = serde_json::from_str(&json).unwrap();
@@ -962,6 +1228,242 @@ mod tests {
         assert!(!h.fixed_temperature);
         assert!(!h.lacks_vision);
         assert!(h.merge_system_messages);
+        assert_eq!(h.reasoning_style, ReasoningStyle::None);
+    }
+
+    #[test]
+    fn detect_reasoning_style_per_model_family() {
+        // DeepSeek V4 (pro + flash, incl. provider-prefixed) -> effort + thinking toggle.
+        assert_eq!(
+            ModelHints::detect("deepseek-v4-pro").reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        assert_eq!(
+            ModelHints::detect("deepseek-ai/deepseek-v4-flash").reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        // deepseek-reasoner is a V4-Flash thinking alias.
+        assert_eq!(
+            ModelHints::detect("deepseek-reasoner").reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        // grok-4.x + OpenAI reasoning models -> plain reasoning_effort.
+        assert_eq!(
+            ModelHints::detect("grok-4.3").reasoning_style,
+            ReasoningStyle::Effort
+        );
+        assert_eq!(
+            ModelHints::detect("gpt-5.3-codex").reasoning_style,
+            ReasoningStyle::Effort
+        );
+        // Non-thinking / unknown-control models emit nothing. grok-3 is
+        // excluded (only grok-4.x is known to accept reasoning_effort).
+        for m in [
+            "deepseek-chat",
+            "MiniMax-M3",
+            "kimi-k2.6",
+            "gpt-4o",
+            "grok-3",
+        ] {
+            assert_eq!(
+                ModelHints::detect(m).reasoning_style,
+                ReasoningStyle::None,
+                "{m} should not declare a reasoning style"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_style_downgraded_off_official_endpoint() {
+        // Official endpoint keeps the DeepSeek-specific thinking toggle.
+        let official = OpenAIProvider::new("k", "deepseek-v4-pro")
+            .with_base_url("https://api.deepseek.com/v1");
+        assert_eq!(
+            official.hints.reasoning_style,
+            ReasoningStyle::EffortAndThinkingToggle
+        );
+        // The same model name on a non-DeepSeek endpoint must not inherit it.
+        let nvidia = OpenAIProvider::new("k", "deepseek-ai/deepseek-v4-pro")
+            .with_base_url("https://integrate.api.nvidia.com/v1");
+        assert_eq!(nvidia.hints.reasoning_style, ReasoningStyle::None);
+        // Explicit config override still wins (with_hints runs after with_base_url).
+        let overridden = OpenAIProvider::new("k", "deepseek-ai/deepseek-v4-pro")
+            .with_base_url("https://integrate.api.nvidia.com/v1")
+            .with_hints(ModelHints {
+                reasoning_style: ReasoningStyle::Effort,
+                ..Default::default()
+            });
+        assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::Effort);
+    }
+
+    #[test]
+    fn build_request_emits_effort_and_thinking_for_deepseek_v4() {
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
+        assert_eq!(v["thinking"], serde_json::json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn build_request_maps_max_effort_by_style() {
+        let msgs = [msg("hi")];
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::Max),
+            ..Default::default()
+        };
+        // deepseek (EffortAndThinkingToggle) emits DeepSeek's real "max".
+        let ds = OpenAIProvider::new("k", "deepseek-v4-pro");
+        let v = serde_json::to_value(ds.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["reasoning_effort"], "max");
+        // Effort-style providers (grok) have no max tier -> clamp to "high".
+        let grok = OpenAIProvider::new("k", "grok-4.3");
+        let v2 = serde_json::to_value(grok.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v2["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn build_request_emits_only_effort_for_grok() {
+        let p = OpenAIProvider::new("key", "grok-4.3");
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["reasoning_effort"], "low");
+        assert!(
+            v.get("thinking").is_none(),
+            "grok must not emit a thinking toggle"
+        );
+    }
+
+    #[test]
+    fn build_request_omits_reasoning_when_unset_or_unsupported() {
+        let msgs = [msg("hi")];
+        // Effort configured but the model has no reasoning control -> nothing.
+        let p = OpenAIProvider::new("key", "deepseek-chat");
+        let cfg = ChatConfig {
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert!(v.get("reasoning_effort").is_none());
+        assert!(v.get("thinking").is_none());
+
+        // Supported model but no effort configured -> nothing.
+        let p2 = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let cfg2 = ChatConfig {
+            reasoning_effort: None,
+            ..Default::default()
+        };
+        let v2 = serde_json::to_value(p2.build_request(&msgs, &[], &cfg2, false)).unwrap();
+        assert!(v2.get("reasoning_effort").is_none());
+        assert!(v2.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_does_not_stub_reasoning_content_for_deepseek_v4() {
+        // deepseek-v4's official API was verified live NOT to require
+        // reasoning_content on assistant tool-call messages (multi-round returns
+        // 200 without it), and a "." stub could break non-official endpoints
+        // (nvidia/vllm). So no stub — only kimi-k2 gets one.
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert!(
+            a.get("reasoning_content").is_none(),
+            "deepseek-v4 assistant message must not get a reasoning_content stub"
+        );
+    }
+
+    #[test]
+    fn build_request_drops_prior_reasoning_content_for_non_kimi_model() {
+        // (a) A non-kimi reasoning model must NOT have prior verbose
+        // reasoning_content round-tripped back into the request — reasoning
+        // models re-derive their chain of thought each turn, so re-sending it
+        // is pure context bloat. The field must be absent entirely.
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let mut assistant = msg("the final answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content =
+            Some("a very long prior chain of thought that should not be re-sent".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert!(
+            a.get("reasoning_content").is_none(),
+            "non-kimi model must drop prior reasoning_content, got: {:?}",
+            a.get("reasoning_content")
+        );
+    }
+
+    #[test]
+    fn build_request_preserves_reasoning_for_kimi_k2() {
+        // kimi-k2 (a) returns 400 "reasoning_content is missing in assistant tool
+        // call message" if the field is absent, AND (b) per kimi's docs preserves
+        // historical reasoning for multi-step tool-use continuity. So kimi keeps the
+        // REAL reasoning when present, and falls back to a "." stub only when absent.
+        let p = OpenAIProvider::new("key", "moonshotai/kimi-k2").with_hints(ModelHints {
+            fixed_temperature: true,
+            ..Default::default()
+        });
+        // (a) real reasoning present -> preserved verbatim (tool-use continuity)
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content =
+            Some("real prior reasoning kept for tool continuity".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("real prior reasoning kept for tool continuity"),
+            "kimi-k2 must preserve real prior reasoning_content for tool-use continuity"
+        );
+        // (b) no reasoning present -> "." stub to satisfy the 400 presence check
+        let mut assistant2 = msg("the answer");
+        assistant2.role = MessageRole::Assistant;
+        assistant2.reasoning_content = None;
+        let msgs2 = [assistant2];
+        let v2 = serde_json::to_value(p.build_request(&msgs2, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a2 = v2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a2.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("."),
+            "kimi-k2 must get the \".\" stub when reasoning_content is absent"
+        );
     }
 
     #[test]
@@ -971,6 +1473,7 @@ mod tests {
             fixed_temperature: true,
             lacks_vision: true,
             merge_system_messages: false,
+            reasoning_style: ReasoningStyle::None,
         });
         assert!(p.hints.uses_completion_tokens);
         assert!(p.hints.fixed_temperature);

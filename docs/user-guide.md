@@ -41,7 +41,7 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
 Octos is a Rust-native AI agent platform that runs in three modes:
 
 - **`octos serve`** — Control plane with admin dashboard + ~140 REST endpoints. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels. On first launch with no admin profile, the embedded dashboard runs the **setup wizard**.
-- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
+- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, DingTalk, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
 ### Architecture
@@ -78,10 +78,10 @@ The admin dashboard is a React web application embedded in the `octos serve` bin
 
 ```bash
 # Start the control plane
-octos serve --host 0.0.0.0 --port 3000
+octos serve --host 0.0.0.0
 
 # Dashboard is available at:
-# http://localhost:3000
+# http://localhost:50080
 ```
 
 If you're running behind a reverse proxy (e.g., Caddy or Nginx), configure it to forward to the serve port.
@@ -692,7 +692,7 @@ Profiles are bot instances managed through the admin dashboard or API. Each prof
 #### Via Admin API
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/profiles \
+curl -X POST http://localhost:50080/api/admin/profiles \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-bot",
@@ -722,16 +722,16 @@ Use the Start / Stop / Restart buttons on each profile card.
 
 ```bash
 # Start a profile's gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/start
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/start
 
 # Stop a profile's gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/stop
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/stop
 
 # Restart (stop + start)
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/restart
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/restart
 
 # Check status
-curl http://localhost:3000/api/admin/profiles/my-bot/status
+curl http://localhost:50080/api/admin/profiles/my-bot/status
 ```
 
 **Start validation:** The start endpoint validates that an LLM provider is configured before launching the gateway. If the provider or API key is missing, it returns an error.
@@ -741,7 +741,7 @@ curl http://localhost:3000/api/admin/profiles/my-bot/status
 Updates use **JSON merge** — only the fields you include are modified. All other fields are preserved.
 
 ```bash
-curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
+curl -X PUT http://localhost:50080/api/admin/profiles/my-bot \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Updated Bot Name",
@@ -757,7 +757,7 @@ curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
 ### 8.4 Deleting a Profile
 
 ```bash
-curl -X DELETE http://localhost:3000/api/admin/profiles/my-bot
+curl -X DELETE http://localhost:50080/api/admin/profiles/my-bot
 ```
 
 This stops the gateway process (if running) and cascades to all sub-accounts.
@@ -766,21 +766,21 @@ This stops the gateway process (if running) and cascades to all sub-accounts.
 
 ```bash
 # Gateway subprocess SSE log stream (real-time)
-curl http://localhost:3000/api/admin/profiles/my-bot/logs
+curl http://localhost:50080/api/admin/profiles/my-bot/logs
 
 # Main daemon SSE log stream with initial replay and optional filters
 curl -H "Authorization: Bearer $OCTOS_ADMIN_TOKEN" \
-  'http://localhost:3000/api/admin/serve/logs?tail_n=200&grep=.*error.*'
+  'http://localhost:50080/api/admin/serve/logs?tail_n=200&grep=.*error.*'
 
 # Provider metrics
-curl http://localhost:3000/api/admin/profiles/my-bot/metrics
+curl http://localhost:50080/api/admin/profiles/my-bot/metrics
 ```
 
 ### 8.6 API Overview Endpoint
 
 ```bash
 # Get summary of all profiles
-curl http://localhost:3000/api/admin/overview
+curl http://localhost:50080/api/admin/overview
 ```
 
 Returns total count, running/stopped counts, and status of each profile.
@@ -790,7 +790,7 @@ Returns total count, running/stopped counts, and status of each profile.
 Before deploying, test a provider configuration:
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/test-provider \
+curl -X POST http://localhost:50080/api/admin/test-provider \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "moonshot",
@@ -971,7 +971,7 @@ Each channel:chat_id pair maintains its own session (conversation history).
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
 - **Session forking:** `/new` creates a branched conversation with parent_key tracking
 - **Context compaction:** Three-tier (M8.5) — working / cold / archived. When the conversation exceeds the LLM's context window, older messages are summarized to first lines (tool arguments stripped) and the oldest are pushed into the entity bank as long-term memory.
-- **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first SSE emission and carried on every subsequent event (`token`, `tool_progress`, `task_status`, `session_result`). The `done` event additionally carries `committed_seq` — the durable history sequence number of the terminal write — so a web client can replay deterministically after reconnect via `GET /sessions/:id/events/stream`. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
+- **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first streamed event and carried on subsequent UI Protocol updates. Terminal events include `committed_seq` — the durable history sequence number of the final write — so a web client can replay deterministically after reconnect. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
 - **Structured resume (M8.6)** — when a worktree is missing or a sub-agent fails, the supervisor refuses to silently drop the turn and re-engages the LLM with a structured-resume payload describing the failure.
 
 ### 11.3 Memory System
@@ -1132,9 +1132,9 @@ When a user sends messages while the agent is processing:
 
 `spawn_only` skill tools (long-running research, deep crawls, voice-clone training, etc.) run as background tasks under the per-profile `task_supervisor`. Users can:
 
-- Receive progress as periodic plugin protocol v2 events surfaced as `tool_progress` SSE events
+- Receive progress as periodic plugin protocol v2 events surfaced through UI Protocol task/progress updates
 - Inspect outstanding background work with the `check_background_tasks` tool
-- Get terminal status via the dedicated session events stream — the supervisor commits a `session_result` event with `committed_seq` (#629) so the dashboard updates deterministically once the work is durable
+- Get terminal status via the UI Protocol session/task event stream — the supervisor commits a terminal event with `committed_seq` (#629) so the dashboard updates deterministically once the work is durable
 
 **Fleet stability** (#610): `spawn`, pipeline fan-out, and swarm dispatch share a global concurrency cap so a runaway agent cannot exhaust runner CPU/memory. Orphan tasks (whose owning session has terminated) are reaped by `task_supervisor`.
 
@@ -1153,7 +1153,7 @@ Check for new issues in the GitHub repo and summarize any urgent ones.
 
 ## 12. Bundled App Skills
 
-Bundled app skills ship as compiled binaries alongside the `octos` binary. On gateway startup they are written into `~/.octos/bundled-app-skills/<name>/` (a separate directory from user-installed skills under `~/.octos/skills/`, so a re-deploy never overwrites operator/user customizations). The full list lives in `BUNDLED_APP_SKILLS` (`crates/octos-agent/src/bundled_app_skills.rs`):
+Bundled app skills ship as compiled binaries alongside the `octos` binary. On gateway startup they are written into `<octos_home>/bundled-app-skills/<name>/`, while operator or user customizations are installed into the active profile's `~/.octos/profiles/<profile>/data/skills/` directory so a re-deploy never overwrites them. The full list lives in `BUNDLED_APP_SKILLS` (`crates/octos-agent/src/bundled_app_skills.rs`):
 
 > **Bundled (auto-installed):** news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve. Plus the platform-skill `voice`.
 
@@ -1598,18 +1598,18 @@ Or via admin API:
 
 ```bash
 # Start OminiX
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/start
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/start
 
 # Check health
-curl http://localhost:3000/api/admin/platform-skills/asr/health
+curl http://localhost:50080/api/admin/platform-skills/asr/health
 
 # Download a model
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/models/download \
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/models/download \
   -H "Content-Type: application/json" \
   -d '{"model_id": "Qwen3-ASR-1.7B-8bit"}'
 
 # View logs
-curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
+curl http://localhost:50080/api/admin/platform-skills/ominix-api/logs?lines=100
 ```
 
 ### 13.3 Voice Transcription (`voice_transcribe`)
@@ -1739,7 +1739,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # Install into a specific profile
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 **Installation process:**
@@ -1868,16 +1868,16 @@ The tool binary receives JSON input on stdin and outputs JSON on stdout:
 
 ### 14.6 Skill Resolution Order
 
-Skills are loaded from these directories (in priority order):
+Profile gateways load skills from these directories, in priority order:
 
-1. `.octos/plugins/` (legacy)
-2. `.octos/skills/` (user-installed custom skills)
-3. `.octos/bundled-app-skills/` (bundled: news, deep-search, etc.)
-4. `.octos/platform-skills/` (platform: asr/tts)
-5. `~/.octos/plugins/` (global legacy)
-6. `~/.octos/skills/` (global custom)
+1. `~/.octos/profiles/<profile>/data/skills/` (profile-scoped custom skills)
+2. `<octos_home>/bundled-app-skills/` (bundled: news, deep-search, etc.)
+3. `<octos_home>/platform-skills/` (admin-loaded platform skills, such as ASR/TTS)
 
-User-installed skills override bundled skills with the same name.
+Standalone project runs can also load `<project>/.octos/plugins/` and
+`<project>/.octos/skills/`. The old HOME-rooted global directories
+`~/.octos/plugins/` and `~/.octos/skills/` are migration-only and are no longer
+part of the normal scan path.
 
 ### 14.7 Creating a Custom Skill
 
@@ -2122,6 +2122,8 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **Channels** | |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
+| `DINGTALK_BOT_WEBHOOK` | DingTalk custom robot webhook URL |
+| `DINGTALK_BOT_SECRET` | DingTalk robot signing secret |
 | `SLACK_BOT_TOKEN` | Slack bot token |
 | `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu/Lark app ID |

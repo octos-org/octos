@@ -30,6 +30,15 @@ pub struct PipelineGraph {
     /// upper bound rather than rely on the LLM to estimate correctly.
     #[serde(default)]
     pub default_timeout_secs: Option<u64>,
+    /// Gap 3.4 — optional per-pipeline result-size fidelity annotation.
+    /// Set via the DOT graph attribute `result_fidelity` (e.g.
+    /// `result_fidelity="truncate:50000"`, `"summary:200"`, `"compact"`,
+    /// or `"full"`). When present it WINS over the default result ceiling
+    /// applied by `RunPipelineTool`; an explicit `full` is an opt-out of
+    /// the default ceiling. When absent (`None`), the default ceiling
+    /// degrades an oversized result so it can never wedge the frame layer.
+    #[serde(default)]
+    pub result_fidelity: Option<crate::fidelity::FidelityMode>,
     /// Nodes keyed by their ID.
     pub nodes: HashMap<String, PipelineNode>,
     /// Directed edges.
@@ -142,6 +151,18 @@ pub struct PipelineNode {
     pub planner_model: Option<String>,
     /// For `DynamicParallel`: maximum number of dynamic tasks (default 8).
     pub max_tasks: Option<u32>,
+    /// Marks this gate as human-input backed rather than a pure expression gate.
+    #[serde(default)]
+    pub human_gate: bool,
+    /// Resolver name used by human-input gates.
+    #[serde(default)]
+    pub resolver: Option<String>,
+    /// Artifact references this node expects to read before execution.
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+    /// Mission checkpoint references this node expects to resume from or inspect.
+    #[serde(default)]
+    pub checkpoint_refs: Vec<String>,
     /// Deadline in seconds for this node's execution. On expiry, `deadline_action` fires.
     /// Uses `f64` to allow sub-second precision (e.g. `0.5` for 500ms).
     #[serde(default)]
@@ -179,6 +200,10 @@ impl Default for PipelineNode {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: Vec::new(),
+            checkpoint_refs: Vec::new(),
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,

@@ -12,6 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 octos-core = { workspace = true }
+# `github` feature on for Stage 2: enables the shared GitHub Releases client so
+# `octos update --check` + `octos doctor`'s Network category can reach the public
+# Releases API. Self-update mutation stays on the existing `updater.rs` (Stage 3).
+octos-diagnostics = { workspace = true, features = ["github"] }
 octos-agent = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
@@ -32,6 +36,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 colored = { workspace = true }
 chrono = { workspace = true }
+iana-time-zone = { workspace = true }
 tokio = { workspace = true }
 eyre = { workspace = true }
 uuid = { workspace = true }
@@ -42,6 +47,7 @@ tracing-appender = { workspace = true }
 rustyline = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+fs2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 getrandom = "0.2"
 constant_time_eq = "0.3"
@@ -65,8 +71,17 @@ base64 = { workspace = true }
 # `octos_agent::workspace_policy::WorkspacePolicy` as the canonical schema
 # and only needs the `toml` deserializer entry point here.
 toml = { workspace = true }
+# `octos acp` speaks the Agent Client Protocol (Zed editor <-> agent standard)
+# over stdio. The official Rust SDK provides the JSON-RPC framing, the schema
+# types (initialize/session-new/prompt/cancel + session/update notifications),
+# and the connection runtime; `acp.rs` implements the agent side on top of the
+# existing octos agent loop. Pinned to the published 1.2.0 line.
+agent-client-protocol = "1.2.0"
 keyring = { workspace = true }
 flate2 = { workspace = true }
+qrcode = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
 tar = { workspace = true }
 # Optional deps gated by feature flags (api, admin-bot)
 axum = { workspace = true, optional = true }
@@ -79,6 +94,7 @@ lettre = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
+redb.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for the symlink-safe preview file serve in
@@ -104,10 +120,15 @@ keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api"]
+# `matrix` is pulled in unconditionally: the `/api/my/profile/matrix/*`
+# handlers and the admin dashboard's Matrix invite UI reference matrix-only
+# types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
+# without it.
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]
+dingtalk = ["octos-bus/dingtalk"]
 slack = ["octos-bus/slack"]
 whatsapp = ["octos-bus/whatsapp"]
 email = ["octos-bus/email"]
@@ -139,6 +160,7 @@ axum = { workspace = true }
 # failover-surfacing tests can call `publish_failover_for_subscribers`.
 # Production builds don't see this; only `cargo test -p octos-cli`.
 octos-llm = { workspace = true, features = ["test-utils"] }
+tokio-tungstenite.workspace = true
 
 [[test]]
 name = "build_output_dir_validation"

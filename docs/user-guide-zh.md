@@ -78,10 +78,10 @@ octos serve（控制面板 + 仪表盘，约 140 个 REST 端点）
 
 ```bash
 # 启动控制面板
-octos serve --host 0.0.0.0 --port 3000
+octos serve --host 0.0.0.0
 
 # 仪表盘地址：
-# http://localhost:3000
+# http://localhost:50080
 ```
 
 如果在反向代理（如 Caddy 或 Nginx）后运行，请配置转发到 serve 端口。
@@ -622,7 +622,7 @@ export PERPLEXITY_API_KEY="pplx-your-key"
 #### 通过管理 API
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/profiles \
+curl -X POST http://localhost:50080/api/admin/profiles \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-bot",
@@ -652,16 +652,16 @@ curl -X POST http://localhost:3000/api/admin/profiles \
 
 ```bash
 # 启动配置文件的 gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/start
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/start
 
 # 停止配置文件的 gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/stop
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/stop
 
 # 重启（停止 + 启动）
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/restart
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/restart
 
 # 检查状态
-curl http://localhost:3000/api/admin/profiles/my-bot/status
+curl http://localhost:50080/api/admin/profiles/my-bot/status
 ```
 
 **启动验证：** 启动端点会在启动 gateway 之前验证 LLM 提供商是否已配置。如果提供商或 API 密钥缺失，将返回错误。
@@ -671,7 +671,7 @@ curl http://localhost:3000/api/admin/profiles/my-bot/status
 更新使用 **JSON 合并** — 只有你包含的字段会被修改。所有其他字段保持不变。
 
 ```bash
-curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
+curl -X PUT http://localhost:50080/api/admin/profiles/my-bot \
   -H "Content-Type: application/json" \
   -d '{
     "name": "更新后的机器人名称",
@@ -687,7 +687,7 @@ curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
 ### 8.4 删除配置文件
 
 ```bash
-curl -X DELETE http://localhost:3000/api/admin/profiles/my-bot
+curl -X DELETE http://localhost:50080/api/admin/profiles/my-bot
 ```
 
 这将停止 gateway 进程（如果正在运行）并级联删除所有子账户。
@@ -696,21 +696,21 @@ curl -X DELETE http://localhost:3000/api/admin/profiles/my-bot
 
 ```bash
 # Gateway 子进程 SSE 日志流（实时）
-curl http://localhost:3000/api/admin/profiles/my-bot/logs
+curl http://localhost:50080/api/admin/profiles/my-bot/logs
 
 # 主 daemon SSE 日志流，支持初始回放和可选过滤
 curl -H "Authorization: Bearer $OCTOS_ADMIN_TOKEN" \
-  'http://localhost:3000/api/admin/serve/logs?tail_n=200&grep=.*error.*'
+  'http://localhost:50080/api/admin/serve/logs?tail_n=200&grep=.*error.*'
 
 # 提供商指标
-curl http://localhost:3000/api/admin/profiles/my-bot/metrics
+curl http://localhost:50080/api/admin/profiles/my-bot/metrics
 ```
 
 ### 8.6 API 总览端点
 
 ```bash
 # 获取所有配置文件的摘要
-curl http://localhost:3000/api/admin/overview
+curl http://localhost:50080/api/admin/overview
 ```
 
 返回总数、运行中/已停止数量以及每个配置文件的状态。
@@ -720,7 +720,7 @@ curl http://localhost:3000/api/admin/overview
 部署前测试提供商配置：
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/test-provider \
+curl -X POST http://localhost:50080/api/admin/test-provider \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "moonshot",
@@ -900,7 +900,7 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
 - **最大历史记录：** 通过 `gateway.max_history` 配置（默认：50 条消息）
 - **会话分叉：** `/new` 创建带有 parent_key 追踪的分支对话
 - **三层上下文压缩（M8.5）：** 工作层 / 冷层 / 归档层。当对话超过 LLM 的上下文窗口时，较旧的消息按首行摘要（工具参数被剥离），最早的消息被推入实体库作为长期记忆。
-- **Sticky `thread_id` 与 `committed_seq`（M8.10）：** 每个会话拥有稳定的 `thread_id`，在首次 SSE 发送之前完成绑定，并在后续每个事件（`token`、`tool_progress`、`task_status`、`session_result`）上携带。`done` 事件还携带 `committed_seq`（终态写入的持久序号），客户端因此能够通过 `GET /sessions/:id/events/stream` 在断线重连后做确定性回放。详情见 [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md)。
+- **Sticky `thread_id` 与 `committed_seq`（M8.10）：** 每个会话拥有稳定的 `thread_id`，在首次流式事件之前完成绑定，并在后续 UI Protocol 更新中携带。终态事件还携带 `committed_seq`（最终写入的持久序号），客户端因此能够在断线重连后做确定性回放。详情见 [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md)。
 - **结构化恢复（M8.6）：** 当工作树缺失或子 Agent 失败时，监督者拒绝静默丢弃当前轮次，而是用一个描述失败原因的结构化恢复负载重新驱动 LLM。
 
 ### 11.3 记忆系统
@@ -1070,9 +1070,9 @@ octos cron enable <job-id> --disable
 
 `spawn_only` 技能工具（长时间研究、深度爬取、音色训练等）作为后台任务在每个配置文件的 `task_supervisor` 下运行。用户可以：
 
-- 通过插件协议 v2 事件（以 `tool_progress` SSE 形式）接收周期性进度
+- 通过插件协议 v2 事件（经 UI Protocol 任务/进度更新转发）接收周期性进度
 - 使用 `check_background_tasks` 工具查看待处理后台任务
-- 通过专用会话事件流接收终态：监督者在持久化完成后提交带 `committed_seq` 的 `session_result` 事件（#629），仪表盘据此确定性更新
+- 通过 UI Protocol 会话/任务事件流接收终态：监督者在持久化完成后提交带 `committed_seq` 的终态事件（#629），仪表盘据此确定性更新
 
 **Fleet 稳定性（#610）**：`spawn`、Pipeline 扇出与 swarm 调度共用全局并发上限，避免单个失控 Agent 耗尽运行资源。归属会话已结束的孤立任务由 `task_supervisor` 清理。
 
@@ -1082,7 +1082,7 @@ octos cron enable <job-id> --disable
 
 ## 12. 内置应用技能
 
-内置应用技能作为编译好的二进制文件随 `octos` 一起发布。Gateway 启动时会写入 `~/.octos/bundled-app-skills/<name>/`（与用户自定义的 `~/.octos/skills/` 分开，重新部署不会覆盖运维/用户的修改）。完整列表见 `BUNDLED_APP_SKILLS`（`crates/octos-agent/src/bundled_app_skills.rs`）：
+内置应用技能作为编译好的二进制文件随 `octos` 一起发布。Gateway 启动时会写入 `<octos_home>/bundled-app-skills/<name>/`，运维或用户自定义技能安装到当前 profile 的 `~/.octos/profiles/<profile>/data/skills/`，因此重新部署不会覆盖自定义内容。完整列表见 `BUNDLED_APP_SKILLS`（`crates/octos-agent/src/bundled_app_skills.rs`）：
 
 > **自动安装的内置技能：** news、deep-search、deep-crawl、send-email、account-manager、time（二进制名 `clock`）、weather、pipeline-guard、skill-evolve。加上平台技能 `voice`。
 
@@ -1519,18 +1519,18 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 
 ```bash
 # 启动 OminiX
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/start
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/start
 
 # 检查健康状态
-curl http://localhost:3000/api/admin/platform-skills/asr/health
+curl http://localhost:50080/api/admin/platform-skills/asr/health
 
 # 下载模型
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/models/download \
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/models/download \
   -H "Content-Type: application/json" \
   -d '{"model_id": "Qwen3-ASR-1.7B-8bit"}'
 
 # 查看日志
-curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
+curl http://localhost:50080/api/admin/platform-skills/ominix-api/logs?lines=100
 ```
 
 ### 13.3 语音转录 (`voice_transcribe`)
@@ -1660,7 +1660,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # 安装到特定配置文件
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 **安装过程：**
@@ -1789,16 +1789,15 @@ requires_env: MY_API_KEY
 
 ### 14.6 技能解析顺序
 
-技能从以下目录加载（按优先级排序）：
+配置文件 gateway 按以下优先级加载技能：
 
-1. `.octos/plugins/`（旧版）
-2. `.octos/skills/`（用户安装的自定义技能）
-3. `.octos/bundled-app-skills/`（内置：news、deep-search 等）
-4. `.octos/platform-skills/`（平台：asr/tts）
-5. `~/.octos/plugins/`（全局旧版）
-6. `~/.octos/skills/`（全局自定义）
+1. `~/.octos/profiles/<profile>/data/skills/`（配置文件作用域的自定义技能）
+2. `<octos_home>/bundled-app-skills/`（内置：news、deep-search 等）
+3. `<octos_home>/platform-skills/`（管理员加载的平台技能，如 ASR/TTS）
 
-用户安装的技能覆盖同名的内置技能。
+独立项目运行还可以加载 `<project>/.octos/plugins/` 和
+`<project>/.octos/skills/`。旧的 HOME 全局目录 `~/.octos/plugins/` 和
+`~/.octos/skills/` 仅用于迁移，不再属于常规扫描路径。
 
 ### 14.7 创建自定义技能
 

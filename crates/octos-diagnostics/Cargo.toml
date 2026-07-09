@@ -1,0 +1,34 @@
+[package]
+name = "octos-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared, product-agnostic diagnostics + update-planning for octos binaries (doctor)"
+
+[dependencies]
+octos-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+# Stage 2: blocking GitHub Releases client. OPTIONAL — pulled in ONLY when the
+# `github` feature is enabled. The default build (`default = []`) must NOT carry
+# reqwest. We reuse the workspace pin (rustls-tls, blocking, json) so the TLS
+# stack stays consistent with octos-llm/octos-agent rather than introducing a
+# second `rustls-tls-native-roots` variant that would feature-unify the whole
+# workspace onto a different TLS-roots backend.
+reqwest = { workspace = true, optional = true }
+
+[features]
+# Stage 1 stays dependency-light: `default = []` carries NO network/update deps.
+# Stage 2 adds an OPTIONAL `github` feature gating the reqwest GitHub client +
+# `update --check` planning. Self-update (axoupdater) is still Stage 3 and is
+# NOT introduced here.
+default = []
+github = ["dep:reqwest"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

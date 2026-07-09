@@ -9,6 +9,7 @@ description = "DOT-based pipeline orchestration engine for octos"
 [dependencies]
 octos-core = { workspace = true }
 octos-agent = { workspace = true }
+octos-plugin = { workspace = true }
 octos-llm = { workspace = true }
 octos-memory = { workspace = true }
 async-trait = { workspace = true }

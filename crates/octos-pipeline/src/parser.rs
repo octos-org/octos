@@ -23,6 +23,24 @@ pub fn parse_dot(input: &str) -> Result<PipelineGraph> {
     parser.parse()
 }
 
+/// Maximum byte length the graph id is kept to at parse time. Matches the
+/// harness-event `workflow` validator cap so a parsed graph id can never make a
+/// node-progress event un-emittable (Gap 4.2 / Blocker 3).
+const MAX_GRAPH_ID_BYTES: usize = 128;
+
+/// Truncate a parsed graph id to [`MAX_GRAPH_ID_BYTES`] at a UTF-8 char
+/// boundary. Returns the id unchanged when it already fits (the common case).
+fn bound_graph_id(id: String) -> String {
+    if id.len() <= MAX_GRAPH_ID_BYTES {
+        return id;
+    }
+    let mut end = MAX_GRAPH_ID_BYTES;
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    id[..end].to_string()
+}
+
 /// Internal parser state.
 struct DotParser<'a> {
     input: &'a str,
@@ -49,6 +67,15 @@ impl<'a> DotParser<'a> {
             self.parse_identifier()
                 .wrap_err("expected graph name or '{'")?
         };
+        // Gap 4.2 / Blocker 3 — bound the graph id at PARSE time so it can never
+        // exceed the harness-event `workflow` validator cap (128 B). The graph id
+        // flows into every node-progress event's `workflow` field; an
+        // over-long id (a pathological LLM-emitted DOT) would otherwise make the
+        // emit-site truncation the only thing standing between the run and a
+        // silently-dropped event. This makes the in-memory id itself provably
+        // safe (the emit-site bound in `executor::emit_node_event_to_sink` is the
+        // must-have belt; this is the suspenders).
+        let id = bound_graph_id(id);
         self.skip_ws();
 
         // Parse opening brace
@@ -60,6 +87,7 @@ impl<'a> DotParser<'a> {
             default_model: None,
             max_total_tokens: None,
             default_timeout_secs: None,
+            result_fidelity: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
@@ -504,6 +532,12 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     if let Some(timeout) = attrs.get("default_timeout_secs") {
         graph.default_timeout_secs = parse_duration_secs(timeout);
     }
+    // Gap 3.4: per-pipeline result-size fidelity. Accepts "full",
+    // "compact", "truncate:N", "summary:N". An unparseable value leaves
+    // `result_fidelity` as `None`, so the default ceiling still applies.
+    if let Some(fidelity) = attrs.get("result_fidelity") {
+        graph.result_fidelity = crate::fidelity::FidelityMode::parse(fidelity);
+    }
 }
 
 /// Parse a duration string like "900s", "15m", "2h" into seconds.
@@ -534,6 +568,14 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+fn parse_csv_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
     // Resolution: explicit handler > shape-based > default (codergen)
     let handler = attrs
@@ -542,10 +584,22 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         .or_else(|| attrs.get("shape").and_then(|s| HandlerKind::from_shape(s)))
         .unwrap_or(HandlerKind::Codergen);
 
-    let tools = attrs
-        .get("tools")
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-        .unwrap_or_default();
+    // `tools` is special vs other CSV lists: an EXPLICIT `tools=""` (present
+    // but empty) is a deny-all signal the handler distinguishes from an
+    // omitted attribute (`CodergenHandler` checks `!node.tools.is_empty()` and
+    // then `allowed.is_empty()` -> `deny: ["*"]`). `parse_csv_list` filters
+    // empty entries, which would collapse `tools=""` to `[]` and make it look
+    // omitted — so a text-only node would silently regain the default toolset
+    // (codex pre-merge P1). Preserve the legacy contract: when the attribute
+    // is PRESENT but has no non-empty tokens, keep a single `""` marker.
+    let tools = attrs.get("tools").map_or_else(Vec::new, |s| {
+        let parsed = parse_csv_list(s);
+        if parsed.is_empty() {
+            vec![String::new()] // explicit deny-all marker (tools="")
+        } else {
+            parsed
+        }
+    });
 
     let deadline_secs = attrs
         .get("deadline_secs")
@@ -580,6 +634,23 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         worker_prompt: attrs.get("worker_prompt").cloned(),
         planner_model: attrs.get("planner_model").cloned(),
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
+        human_gate: attrs
+            .get("human_gate")
+            .or_else(|| attrs.get("requires_human"))
+            .and_then(|s| parse_bool(s))
+            .unwrap_or_else(|| attrs.contains_key("input_type")),
+        resolver: attrs
+            .get("resolver")
+            .or_else(|| attrs.get("gate_resolver"))
+            .cloned(),
+        artifact_refs: attrs
+            .get("artifact_refs")
+            .or_else(|| attrs.get("requires_artifact"))
+            .map_or_else(Vec::new, |s| parse_csv_list(s)),
+        checkpoint_refs: attrs
+            .get("checkpoint_refs")
+            .or_else(|| attrs.get("requires_checkpoint"))
+            .map_or_else(Vec::new, |s| parse_csv_list(s)),
         deadline_secs,
         deadline_action,
         continue_on_error: attrs
@@ -795,6 +866,28 @@ mod tests {
         let graph = parse_dot(dot).unwrap();
         let node = &graph.nodes["search"];
         assert_eq!(node.tools, vec!["web_search", "web_fetch"]);
+    }
+
+    #[test]
+    fn explicit_empty_tools_is_deny_all_marker_not_omitted() {
+        // codex pre-merge P1: `tools=""` (explicit deny-all) must be
+        // distinguishable from an omitted `tools` attribute. The handler keys
+        // off `!node.tools.is_empty()` then `allowed.is_empty()` -> deny ["*"],
+        // so an explicit-empty must yield a single `""` marker, NOT `[]` (which
+        // would silently grant the default toolset).
+        let with_empty = parse_dot(r#"digraph t { n [prompt="text only", tools=""] }"#).unwrap();
+        assert_eq!(
+            with_empty.nodes["n"].tools,
+            vec![String::new()],
+            "tools=\"\" must keep a single empty marker (deny-all signal)"
+        );
+
+        // Omitted tools -> empty vec (default toolset path).
+        let omitted = parse_dot(r#"digraph t { n [prompt="hi"] }"#).unwrap();
+        assert!(
+            omitted.nodes["n"].tools.is_empty(),
+            "omitted tools must be an empty vec (distinct from deny-all)"
+        );
     }
 
     #[test]
@@ -1173,6 +1266,55 @@ mod tests {
         assert!(graph.default_timeout_secs.is_none());
     }
 
+    /// Gap 3.4: the DOT graph attribute `result_fidelity` is parsed into
+    /// `PipelineGraph::result_fidelity` so a pipeline can explicitly annotate
+    /// how its result is bounded, overriding the default ceiling.
+    #[test]
+    fn should_parse_graph_result_fidelity_truncate() {
+        let dot = r#"
+            digraph test {
+                graph [result_fidelity="truncate:50000"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.result_fidelity,
+            Some(crate::fidelity::FidelityMode::Truncate { max_chars: 50000 })
+        );
+    }
+
+    /// `result_fidelity="full"` is the explicit opt-out of the default
+    /// result ceiling.
+    #[test]
+    fn should_parse_graph_result_fidelity_full() {
+        let dot = r#"
+            digraph test {
+                graph [result_fidelity="full"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.result_fidelity,
+            Some(crate::fidelity::FidelityMode::Full)
+        );
+    }
+
+    /// Backward-compat: when `result_fidelity` is absent the field stays
+    /// `None`, so `RunPipelineTool` applies the DEFAULT ceiling.
+    #[test]
+    fn should_leave_result_fidelity_none_when_attribute_absent() {
+        let dot = r#"
+            digraph test {
+                graph [label="no fidelity here"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.result_fidelity.is_none());
+    }
+
     #[test]
     fn should_parse_continue_on_error() {
         let dot = r#"
@@ -1212,5 +1354,56 @@ mod tests {
         );
         assert_eq!(parse_deadline_action("retry:0"), None);
         assert_eq!(parse_deadline_action("bogus"), None);
+    }
+
+    /// Gap 4.2 / Blocker 3 — a pathological >128-byte graph id (an LLM-emitted
+    /// DOT) is truncated to the harness-event `workflow` validator cap at PARSE
+    /// time, so the in-memory id can never make a node-progress event
+    /// un-emittable. The truncated id is still a prefix of the original.
+    #[test]
+    fn parse_bounds_oversized_graph_id() {
+        let huge = "g".repeat(512);
+        let dot = format!("digraph {huge} {{ a [prompt=\"x\"] }}");
+        let graph = parse_dot(&dot).unwrap();
+        assert!(
+            graph.id.len() <= MAX_GRAPH_ID_BYTES,
+            "graph id must be bounded at parse time; got {} bytes",
+            graph.id.len()
+        );
+        assert!(
+            huge.starts_with(&graph.id),
+            "the bounded id must be a prefix of the original"
+        );
+    }
+
+    /// A normal-length graph id must pass through the bound UNCHANGED (no false
+    /// truncation of the common case).
+    #[test]
+    fn parse_keeps_short_graph_id_unchanged() {
+        let graph = parse_dot("digraph research { a [prompt=\"x\"] }").unwrap();
+        assert_eq!(graph.id, "research");
+    }
+
+    #[test]
+    fn should_parse_human_gate_resolver_and_refs() {
+        let graph = parse_dot(
+            r#"
+            digraph test {
+                gate [
+                    handler="gate",
+                    human_gate="true",
+                    resolver="operator",
+                    requires_artifact="draft, report",
+                    requires_checkpoint="post_draft"
+                ]
+            }
+            "#,
+        )
+        .unwrap();
+        let gate = &graph.nodes["gate"];
+        assert!(gate.human_gate);
+        assert_eq!(gate.resolver.as_deref(), Some("operator"));
+        assert_eq!(gate.artifact_refs, vec!["draft", "report"]);
+        assert_eq!(gate.checkpoint_refs, vec!["post_draft"]);
     }
 }
