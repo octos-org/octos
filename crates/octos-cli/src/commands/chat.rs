@@ -1049,12 +1049,13 @@ pub(crate) fn resolve_provider_policy(
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
     // `api_key_env` was declared on EmbeddingConfig but never honored —
-    // it wins over the provider-default key lookup so an OpenAI-compatible
-    // endpoint (DashScope etc.) can use its own key variable.
-    let key = match cfg.api_key_env.as_deref() {
-        Some(var) => std::env::var(var).ok()?,
-        None => config.get_api_key(&cfg.provider).ok()?,
-    };
+    // it wins over the provider-default var name, resolving through the
+    // SAME credential chain as every other key (auth store, env_vars +
+    // keychain, process env), so `octos auth login` / config-stored keys
+    // keep working (codex P2).
+    let key = config
+        .get_api_key_with_env(&cfg.provider, cfg.api_key_env.as_deref())
+        .ok()?;
     let mut e = OpenAIEmbedder::new(key);
     if let Some(ref url) = cfg.base_url {
         e = e.with_base_url(url);

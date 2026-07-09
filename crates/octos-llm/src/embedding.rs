@@ -127,6 +127,12 @@ impl EmbeddingProvider for OpenAIEmbedder {
     }
 
     fn dimension(&self) -> usize {
+        // An explicit requested dimension IS the output size (the API
+        // truncates/projects to it) — the model-default table only applies
+        // when unset. Consumers size indexes from this value.
+        if let Some(d) = self.dimensions {
+            return d as usize;
+        }
         match self.model.as_str() {
             "text-embedding-3-large" => 3072,
             _ => 1536, // text-embedding-3-small, ada-002
@@ -171,6 +177,19 @@ mod tests {
         };
         let json = serde_json::to_string(&with).unwrap();
         assert!(json.contains("\"dimensions\":1536"), "{json}");
+    }
+
+    #[test]
+    fn dimension_reflects_requested_dimensions() {
+        let default = OpenAIEmbedder::new("k");
+        assert_eq!(EmbeddingProvider::dimension(&default), 1536);
+        let large = OpenAIEmbedder::new("k").with_model("text-embedding-3-large");
+        assert_eq!(EmbeddingProvider::dimension(&large), 3072);
+        // Requested size wins over the model default table.
+        let pinned = OpenAIEmbedder::new("k")
+            .with_model("text-embedding-3-large")
+            .with_dimensions(1536);
+        assert_eq!(EmbeddingProvider::dimension(&pinned), 1536);
     }
 
     #[test]

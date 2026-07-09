@@ -1699,6 +1699,17 @@ impl Config {
     }
 
     /// Get the API key: auth store first, then environment variable.
+    /// [`Self::get_api_key`] with an explicit env-var override (e.g. the
+    /// embedding block's `api_key_env`): resolves through the SAME chain —
+    /// secret registration, auth store, `env_vars` (keychain-resolved),
+    /// process env — instead of a bare `std::env::var` read.
+    pub fn get_api_key_with_env(&self, provider: &str, env_var: Option<&str>) -> Result<String> {
+        match env_var {
+            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            None => self.get_api_key(provider),
+        }
+    }
+
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Resolve the env var name we expect to hold this provider's key, and
         // mark it as a secret FIRST — before any early return — so the
@@ -1716,6 +1727,12 @@ impl Config {
                 .map(String::from)
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
+        self.resolve_api_key(provider, env_var)
+    }
+
+    /// Shared resolution body: auth store → env_vars (keychain) → process
+    /// env, with the var name secret-registered first.
+    fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
         octos_agent::register_secret_env_names([env_var.as_str()]);
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
@@ -2892,6 +2909,21 @@ mod tests {
             MemoryConfig::effective_max_inject_tokens(Some(&on)),
             octos_memory::DEFAULT_MAX_INJECT_TOKENS
         );
+    }
+
+    #[test]
+    fn get_api_key_with_env_resolves_through_config_env_vars() {
+        // The override var must resolve through the same chain as normal
+        // keys — here via the config's env_vars map, NOT the process env.
+        let mut config = Config::default();
+        config.env_vars.insert(
+            "CUSTOM_EMBED_KEY".to_string(),
+            "from-config-map".to_string(),
+        );
+        let key = config
+            .get_api_key_with_env("openai", Some("CUSTOM_EMBED_KEY"))
+            .expect("resolves via env_vars map");
+        assert_eq!(key, "from-config-map");
     }
 
     #[test]
