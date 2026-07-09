@@ -3,7 +3,7 @@ name = "octos-sandbox"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85.0"
-description = "AppContainer sandbox helper for octos on Windows"
+description = "Platform sandbox helper for octos"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -15,6 +15,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_Security",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.5"
+libc.workspace = true
+seccompiler = "0.5.0"
 
 [lints]
 workspace = true

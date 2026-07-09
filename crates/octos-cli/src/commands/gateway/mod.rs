@@ -7,7 +7,7 @@ mod gateway_runtime;
 mod matrix_integration;
 mod message_preprocessing;
 pub(crate) mod profile_factory;
-mod prompt;
+pub mod prompt;
 pub(crate) mod session_ui;
 mod skills_handler;
 
@@ -298,6 +298,7 @@ mod tests {
                 base_data_dir.join("subagent-out"),
             )),
             host_plugins: Default::default(),
+            host_memory: None,
         };
 
         let factory = builder.build("botfather--researcher").await.unwrap();

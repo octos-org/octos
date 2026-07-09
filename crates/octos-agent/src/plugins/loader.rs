@@ -11,7 +11,7 @@ use crate::agent::MAX_TOOL_TIMEOUT_SECS;
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{MakeTypeEntry, Tool, ToolRegistry};
 
 use super::extras::{SKILL_EXPLORATION_PREAMBLE, SkillExtras, resolve_extras};
 use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
@@ -42,6 +42,13 @@ pub struct PluginLoadResult {
     pub hooks: Vec<HookConfig>,
     /// Prompt fragments read from skill directories.
     pub prompt_fragments: Vec<String>,
+    /// RFC-1 (issue #1290): dispatcher entries collected from manifests
+    /// that declare `make_type`. The host (CLI / serve / chat) uses
+    /// this list to register the `mofa_make` dispatcher AND hide the
+    /// individual target tools from the LLM-visible spec list. Empty
+    /// means no mofa-* skills were discovered — the dispatcher is not
+    /// registered (avoids publishing an unusable tool).
+    pub make_type_entries: Vec<MakeTypeEntry>,
 }
 
 struct LoadedPluginTool {
@@ -111,6 +118,22 @@ impl PluginLoadResult {
                 have_preamble = true;
             }
             self.prompt_fragments.push(frag);
+        }
+        // RFC-1: collect dispatcher entries. Last-write-wins by
+        // content_type so per-profile skills shadow global skills
+        // (matches the existing "first occurrence wins" semantics
+        // applied at the manifest layer above, then dedup by
+        // content_type here).
+        for entry in extras.make_type_entries {
+            if let Some(existing) = self
+                .make_type_entries
+                .iter_mut()
+                .find(|e| e.content_type == entry.content_type)
+            {
+                *existing = entry;
+            } else {
+                self.make_type_entries.push(entry);
+            }
         }
     }
 }
@@ -252,6 +275,78 @@ impl PluginLoader {
             }
         }
 
+        // RFC-1 (issue #1290): after every per-plugin registration is
+        // done, install the `mofa_make` dispatcher + its describe
+        // companion and hide the individual target tools from the
+        // LLM-visible spec list.
+        //
+        // Hiding uses `mark_internal_hidden` (not `defer`, not unregister)
+        // so the target tools:
+        //   - remain reachable via `registry.get(name)` — the dispatcher
+        //     forwards to them by name, and legacy/internal callers
+        //     (e.g. pre-existing test paths) can still invoke them.
+        //   - are invisible to `specs()` — the LLM never sees them.
+        //   - are invisible to `activate_tools` enumeration AND
+        //     non-promotable via `activate(name)` — the LLM cannot
+        //     resurrect them as siblings, which would defeat the
+        //     RFC-1 consolidation. (codex P1 fixup: `defer` allowed
+        //     `activate_tools` to advertise + re-promote them.)
+        //
+        // The LLM only sees `mofa_make` + `mofa_describe_content_type`,
+        // never the individual `mofa_slides` / `mofa_cards` / ...
+        // tools that the loader registered.
+        if !result.make_type_entries.is_empty() {
+            for entry in &result.make_type_entries {
+                if registry.get(&entry.target_tool).is_some() {
+                    registry.mark_internal_hidden(&entry.target_tool);
+                } else {
+                    warn!(
+                        content_type = %entry.content_type,
+                        target_tool = %entry.target_tool,
+                        "mofa_make dispatcher target not in registry — \
+                         skill load may have failed; dispatch will surface \
+                         DISPATCHER_ERROR at invocation"
+                    );
+                }
+            }
+            // Mint dispatcher pair (returns None only when entries
+            // is empty, ruled out by the outer guard).
+            if let Some((dispatcher, describe)) =
+                crate::tools::make_dispatcher_with_entries(result.make_type_entries.clone())
+            {
+                let dispatcher = std::sync::Arc::new(dispatcher);
+                let describe = std::sync::Arc::new(describe);
+                registry.register_arc(dispatcher.clone());
+                registry.register_arc(describe.clone());
+                // The dispatcher itself is spawn_only so the execution
+                // loop intercepts it and runs the forward in a
+                // background tokio task — matches the spawn_only
+                // contract every individual mofa_* skill historically
+                // had, and lets the chat UI anchor every long-running
+                // generation to a single bubble.
+                registry.mark_spawn_only(
+                    "mofa_make",
+                    Some(
+                        "SUCCESS: content generation started in the background. \
+                         The result will be delivered to the user automatically when ready. \
+                         No further action needed for this request."
+                            .into(),
+                    ),
+                );
+                // `mofa_describe_content_type` is a synchronous catalog
+                // query (no skill spawn), so it stays foreground.
+                tracing::info!(
+                    entries = result.make_type_entries.len(),
+                    "registered mofa_make dispatcher (RFC-1)"
+                );
+                // The dispatcher's Weak<ToolRegistry> back-reference is
+                // wired by `wire_mofa_make_registry_back_ref` AFTER
+                // the host wraps the registry in `Arc`.
+                result.tool_names.push("mofa_make".into());
+                result.tool_names.push("mofa_describe_content_type".into());
+            }
+        }
+
         if result.tool_count > 0 {
             info!(tools = result.tool_count, "loaded plugin tools");
         }
@@ -265,6 +360,31 @@ impl PluginLoader {
         }
 
         Ok(result)
+    }
+
+    /// RFC-1: wire the dispatcher's registry back-reference after the
+    /// host wraps the registry in `Arc`. The dispatcher's `execute`
+    /// path needs a `Weak<ToolRegistry>` to look up forwarding targets.
+    /// Without this call the dispatcher returns a `DISPATCHER_ERROR`
+    /// on every invocation.
+    ///
+    /// Idempotent and silent on registries with no mofa-* skills —
+    /// hosts can call it unconditionally after every load.
+    pub fn wire_mofa_make_registry_back_ref(registry: &std::sync::Arc<ToolRegistry>) {
+        let weak = std::sync::Arc::downgrade(registry);
+        if let Some(arc) = registry.get("mofa_make") {
+            if let Some(t) = arc.as_any().downcast_ref::<crate::tools::MofaMakeTool>() {
+                t.set_registry(weak.clone());
+            }
+        }
+        if let Some(arc) = registry.get("mofa_describe_content_type") {
+            if let Some(t) = arc
+                .as_any()
+                .downcast_ref::<crate::tools::MofaDescribeContentTypeTool>()
+            {
+                t.set_registry(weak);
+            }
+        }
     }
 
     /// Load a single plugin directory and return its tools and extras.
@@ -578,6 +698,17 @@ impl PluginLoader {
             .collect();
 
         let plugin_name = manifest.name.clone();
+        // RFC-1: snapshot the dispatcher metadata BEFORE `manifest.tools`
+        // is consumed by `into_iter()` below. Resolution of the target
+        // tool name uses [`PluginManifest::make_target_tool_name`] which
+        // walks `manifest.tools` — so we materialise the strings here
+        // and consume them after `tools` is built (so we can verify the
+        // target survived per-tool validation filtering).
+        let manifest_make_type: Option<String> = manifest.make_type.clone();
+        let manifest_content_desc: Option<String> = manifest.content_type_description.clone();
+        let manifest_make_target: Option<String> =
+            manifest.make_target_tool_name().map(|s| s.to_string());
+
         let tools: Vec<LoadedPluginTool> = manifest
             .tools
             .into_iter()
@@ -676,6 +807,55 @@ impl PluginLoader {
         extras.spawn_only_tools = spawn_only_names;
         extras.spawn_only_messages = spawn_only_msgs;
 
+        // RFC-1: if the manifest declares `make_type`, build a
+        // dispatcher entry now using the snapshot captured above.
+        // The aggregating loader (`load_into_with_options`) dedups
+        // these by content_type for per-profile shadowing and uses
+        // them to register the dispatcher + hide target tools.
+        //
+        // Tools that failed manifest validation above were filtered
+        // out of `tools`. If the target tool is one of those skipped
+        // tools the dispatcher entry would be a dead pointer at
+        // dispatch time, so we verify the target tool survived first.
+        if let Some(make_type) = manifest_make_type.as_deref() {
+            if let Some(target_tool) = manifest_make_target.as_deref() {
+                let target_survived = tools.iter().any(|loaded| loaded.tool.name() == target_tool);
+                if !target_survived {
+                    warn!(
+                        skill = %plugin_name,
+                        target_tool = %target_tool,
+                        "make_type declared but resolved target tool was \
+                         filtered out by manifest validation; dispatcher \
+                         entry skipped"
+                    );
+                } else {
+                    let description = manifest_content_desc.unwrap_or_else(|| {
+                        // Fall back to the tool's description so the
+                        // dispatcher spec still has something useful.
+                        tools
+                            .iter()
+                            .find(|loaded| loaded.tool.name() == target_tool)
+                            .map(|loaded| loaded.tool.description().to_string())
+                            .unwrap_or_default()
+                    });
+                    extras.make_type_entries.push(MakeTypeEntry::new(
+                        make_type.to_string(),
+                        plugin_name.clone(),
+                        target_tool.to_string(),
+                        description,
+                    ));
+                }
+            } else {
+                warn!(
+                    skill = %plugin_name,
+                    make_type = %make_type,
+                    "make_type declared but no resolvable target tool \
+                     (no `mofa_<make_type>`, no spawn_only tool, no tools \
+                     declared); dispatcher entry skipped"
+                );
+            }
+        }
+
         Ok((tools, extras))
     }
 }
@@ -769,39 +949,9 @@ fn ensure_plugin_executable_for_manifest(
 
     let main_path = plugin_dir.join("main");
 
-    // mofa-publish: shell-script skill with JSON-over-stdin plugin protocol.
-    if manifest.name == "mofa-publish"
-        && manifest
-            .tools
-            .iter()
-            .any(|tool| tool.name == "mofa_publish")
-        && plugin_dir.join("scripts/publish_site.sh").exists()
-    {
-        write_executable_wrapper(&main_path, mofa_publish_wrapper_script())?;
-        info!(
-            plugin = %manifest.name,
-            executable = %main_path.display(),
-            "generated fallback executable wrapper"
-        );
-        return Ok(true);
-    }
-
-    // mofa-site: scaffold helper scripts routed through a thin wrapper.
-    if manifest.name == "mofa-site"
-        && manifest.tools.iter().any(|tool| tool.name == "mofa_site")
-        && plugin_dir
-            .join("scripts/bootstrap_quarto_lesson.sh")
-            .exists()
-        && plugin_dir.join("scripts/bootstrap_template.sh").exists()
-    {
-        write_executable_wrapper(&main_path, mofa_site_wrapper_script())?;
-        info!(
-            plugin = %manifest.name,
-            executable = %main_path.display(),
-            "generated fallback executable wrapper"
-        );
-        return Ok(true);
-    }
+    // mofa-publish / mofa-site are now Cargo-based Rust skills (they ship a
+    // Cargo.toml + [[bin]]), so they fall through to the generic Cargo path
+    // below alongside mofa-podcast — no bespoke bash+python wrapper.
 
     // Cargo-based skills: create a lazy launcher so runtime can self-heal if
     // install-time build/download was skipped or unavailable.
@@ -880,149 +1030,6 @@ fn write_executable_wrapper(path: &Path, content: &str) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
-}
-
-fn mofa_publish_wrapper_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOL="${1:-}"
-
-if [[ "$TOOL" != "mofa_publish" ]]; then
-  printf '{"output":"Unknown tool: %s","success":false}\n' "$TOOL"
-  exit 0
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '{"output":"python3 is required to run mofa-publish.","success":false}\n'
-  exit 0
-fi
-
-INPUT="$(cat)"
-OCTOS_PLUGIN_INPUT="$INPUT" python3 - "$SCRIPT_DIR/scripts/publish_site.sh" <<'PY'
-import json
-import os
-import subprocess
-import sys
-
-script_path = sys.argv[1]
-raw = (os.environ.get("OCTOS_PLUGIN_INPUT") or "").strip() or "{}"
-try:
-    payload = json.loads(raw)
-except Exception as exc:
-    print(f'{{"output":"invalid JSON input: {exc}","success":false}}')
-    sys.exit(0)
-
-cmd = ["bash", script_path]
-
-def add_value(key: str, flag: str) -> None:
-    value = payload.get(key)
-    if value is None:
-        return
-    if isinstance(value, bool):
-        if value:
-            cmd.append(flag)
-        return
-    text = str(value).strip()
-    if text:
-        cmd.extend([flag, text])
-
-add_value("site_dir", "--site-dir")
-add_value("target", "--target")
-add_value("slug", "--slug")
-add_value("repo", "--repo")
-add_value("repo_root", "--repo-root")
-add_value("mini_host", "--mini-host")
-add_value("mini_user", "--mini-user")
-add_value("ssh_key", "--ssh-key")
-add_value("ssh_password_env", "--ssh-password-env")
-add_value("ssh_port", "--ssh-port")
-add_value("remote_root", "--remote-root")
-add_value("cname", "--cname")
-add_value("setup_ci", "--setup-ci")
-
-proc = subprocess.run(cmd)
-sys.exit(proc.returncode)
-PY
-"#
-}
-
-fn mofa_site_wrapper_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOL="${1:-}"
-
-if [[ "$TOOL" != "mofa_site" ]]; then
-  printf '{"output":"Unknown tool: %s","success":false}\n' "$TOOL"
-  exit 0
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '{"output":"python3 is required to run mofa-site.","success":false}\n'
-  exit 0
-fi
-
-INPUT="$(cat)"
-OCTOS_PLUGIN_INPUT="$INPUT" python3 - \
-  "$SCRIPT_DIR/scripts/bootstrap_quarto_lesson.sh" \
-  "$SCRIPT_DIR/scripts/bootstrap_template.sh" <<'PY'
-import json
-import os
-import subprocess
-import sys
-
-quarto_script = sys.argv[1]
-template_script = sys.argv[2]
-raw = (os.environ.get("OCTOS_PLUGIN_INPUT") or "").strip() or "{}"
-try:
-    payload = json.loads(raw)
-except Exception as exc:
-    print(f'{{"output":"invalid JSON input: {exc}","success":false}}')
-    sys.exit(0)
-
-template = str(payload.get("template") or "quarto-lesson").strip() or "quarto-lesson"
-title = str(payload.get("title") or "Generated Site").strip() or "Generated Site"
-content_dir = payload.get("content_dir")
-out_dir = payload.get("out_dir")
-if not out_dir:
-    if isinstance(content_dir, str) and content_dir.strip():
-        out_dir = os.path.join(content_dir, "site")
-    else:
-        out_dir = "skill-output/mofa-site"
-
-language = payload.get("language")
-theme = payload.get("theme")
-description = payload.get("description")
-
-if template == "quarto-lesson":
-    cmd = ["bash", quarto_script, "--out-dir", str(out_dir), "--title", title]
-    if isinstance(description, str) and description.strip():
-        cmd.extend(["--description", description.strip()])
-    if isinstance(theme, str) and theme.strip():
-        cmd.extend(["--theme", theme.strip()])
-    if isinstance(language, str) and language.strip():
-        cmd.extend(["--language", language.strip()])
-else:
-    cmd = [
-        "bash",
-        template_script,
-        "--template",
-        template,
-        "--out-dir",
-        str(out_dir),
-        "--site-name",
-        title,
-    ]
-    if isinstance(description, str) and description.strip():
-        cmd.extend(["--description", description.strip()])
-    if isinstance(language, str) and language.strip():
-        cmd.extend(["--locale", language.strip()])
-
-proc = subprocess.run(cmd)
-sys.exit(proc.returncode)
-PY
-"#
 }
 
 fn lazy_cargo_wrapper_script(bin_name: &str) -> String {
@@ -1156,7 +1163,6 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_load_nonexistent_dir() {
@@ -1996,10 +2002,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_loader_bootstraps_script_skill_wrapper() {
+    fn test_loader_bootstraps_cargo_skill_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
-        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+        std::fs::create_dir(&plugin_dir).unwrap();
 
         std::fs::write(
             plugin_dir.join("manifest.json"),
@@ -2010,9 +2016,18 @@ mod tests {
 }"#,
         )
         .unwrap();
+        // mofa-publish now ships as a Cargo-based Rust skill.
         std::fs::write(
-            plugin_dir.join("scripts/publish_site.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-publish"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-publish"
+path = "src/main.rs"
+"#,
         )
         .unwrap();
 
@@ -2098,12 +2113,10 @@ edition = "2021"
 
     #[cfg(unix)]
     #[test]
-    fn test_mofa_publish_wrapper_executes_script() {
-        use std::process::{Command, Stdio};
-
+    fn test_ensure_plugin_executable_creates_lazy_cargo_wrapper_for_mofa_publish() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
-        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+        std::fs::create_dir(&plugin_dir).unwrap();
 
         std::fs::write(
             plugin_dir.join("manifest.json"),
@@ -2114,31 +2127,66 @@ edition = "2021"
 }"#,
         )
         .unwrap();
+        // mofa-publish now ships as a Cargo-based Rust skill with an explicit
+        // [[bin]] name, so it gets the generic lazy-cargo wrapper.
         std::fs::write(
-            plugin_dir.join("scripts/publish_site.sh"),
-            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-publish-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-publish"
+path = "src/main.rs"
+"#,
         )
         .unwrap();
 
-        ensure_plugin_executable(&plugin_dir).unwrap();
-        let mut child = Command::new(plugin_dir.join("main"))
-            .arg("mofa_publish")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(br#"{"site_dir":"./docs","slug":"demo","setup_ci":true}"#)
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success());
-        assert!(stdout.contains("--site-dir ./docs"));
-        assert!(stdout.contains("--slug demo"));
-        assert!(stdout.contains("--setup-ci"));
+        let changed = ensure_plugin_executable(&plugin_dir).unwrap();
+        assert!(changed);
+        let wrapper = std::fs::read_to_string(plugin_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-publish"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_plugin_executable_creates_lazy_cargo_wrapper_for_mofa_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-site");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-site",
+  "version": "0.1.0",
+  "tools": [{"name": "mofa_site", "description": "site", "input_schema": {"type": "object", "properties": {}}}]
+}"#,
+        )
+        .unwrap();
+        // mofa-site now ships as a Cargo-based Rust skill with an explicit
+        // [[bin]] name, so it gets the generic lazy-cargo wrapper.
+        std::fs::write(
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-site-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofa-site"
+path = "src/main.rs"
+"#,
+        )
+        .unwrap();
+
+        let changed = ensure_plugin_executable(&plugin_dir).unwrap();
+        assert!(changed);
+        let wrapper = std::fs::read_to_string(plugin_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-site"));
     }
 
     #[cfg(unix)]
@@ -2661,6 +2709,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            make_type_entries: vec![],
         };
         result.merge_extras(e1);
 
@@ -2674,6 +2723,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            make_type_entries: vec![],
         };
         result.merge_extras(e2);
 
@@ -2687,6 +2737,7 @@ edition = "2021"
             ],
             spawn_only_tools: vec![],
             spawn_only_messages: Default::default(),
+            make_type_entries: vec![],
         };
         result.merge_extras(e3);
 
@@ -2729,6 +2780,488 @@ edition = "2021"
             4,
             "expected 4 fragments (1 preamble + 3 cards); got {:?}",
             result.prompt_fragments
+        );
+    }
+
+    /// RFC-1 fixup (codex P1): the `mofa_make` dispatcher's
+    /// `Weak<ToolRegistry>` back-reference must be wired centrally so
+    /// every plugin-loading path — chat, gateway, serve, spawn child
+    /// registries, pipeline node agents — produces a dispatcher that
+    /// can actually resolve its forwarding target. Pre-fixup, only
+    /// callers that explicitly called `agent.wire_mofa_make_dispatcher()`
+    /// got a working dispatcher; chat (`SessionActor::process_chat`),
+    /// `SpawnTool` child registries, and pipeline node agents skipped
+    /// that wiring and every `mofa_make` call returned
+    /// `[DISPATCHER_ERROR]`.
+    ///
+    /// This test mints a real plugin with a `make_type` declaration,
+    /// runs it through `PluginLoader::load_into` (the same entry-point
+    /// every host uses), then constructs an `Agent` via `Agent::new`
+    /// (the typical chat-session entry-point). Without the central
+    /// wire in `Agent::new`, the dispatcher's `Weak` would be empty
+    /// and dispatch would surface `[DISPATCHER_ERROR]`. With the fix,
+    /// the wire happens automatically and the dispatcher forwards to
+    /// the registered target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mofa_make_dispatcher_wired_in_chat_session_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::agent::Agent;
+        use crate::tools::MofaMakeTool;
+        use async_trait::async_trait;
+        use octos_core::AgentId;
+        use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+        use octos_memory::EpisodeStore;
+
+        // Minimal LlmProvider stub so we can construct an Agent without
+        // pulling in a real backend. `chat` is never called by this test.
+        struct NoopLlm;
+        #[async_trait]
+        impl LlmProvider for NoopLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                eyre::bail!("not exercised in this test")
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "noop"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-slides");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // Manifest declares `make_type: "slides"` so the loader's RFC-1
+        // path mints a dispatcher + describe pair and routes the
+        // `mofa_slides` target through it.
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mofa-slides",
+                "version": "1.0",
+                "make_type": "slides",
+                "content_type_description": "PPTX decks",
+                "tools": [{
+                    "name": "mofa_slides",
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("mofa-slides");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"slides ready\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Load via the standard `load_into` entry-point. The loader
+        // registers `mofa_slides`, mints `mofa_make` + `mofa_describe_content_type`,
+        // and hides the target. The Weak<ToolRegistry> is NOT yet set —
+        // that's `Agent::new`'s job in this fix.
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert!(
+            result.tool_names.iter().any(|n| n == "mofa_make"),
+            "loader must register mofa_make dispatcher for make_type plugins; got {:?}",
+            result.tool_names
+        );
+
+        // Confirm the dispatcher's Weak is empty BEFORE Agent::new
+        // (precondition; locks in the failing path).
+        let pre_arc = std::sync::Arc::new(registry);
+        let pre_dispatcher = pre_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("mofa_make registered");
+        let exec_result = pre_dispatcher
+            .execute(&serde_json::json!({
+                "content_type": "slides",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        assert!(
+            exec_result.output.contains("[DISPATCHER_ERROR]"),
+            "pre-Agent::new dispatcher must NOT be wired; got {:?}",
+            exec_result.output
+        );
+
+        // Now exercise the central wire via `Agent::new`. Use a fresh
+        // load + a fresh `Agent::new` so we measure THIS fix in
+        // isolation (the previous `pre_arc` was a sanity probe).
+        let mut registry = ToolRegistry::new();
+        let _ = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        let memory = std::sync::Arc::new(
+            EpisodeStore::open(dir.path().join("episodes"))
+                .await
+                .expect("episode store"),
+        );
+        let llm: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::new(NoopLlm);
+        let agent = Agent::new(AgentId::new("test-chat-session"), llm, registry, memory);
+
+        // After `Agent::new`, the dispatcher must be able to upgrade
+        // its Weak<ToolRegistry> and reach the target tool. With the
+        // central wire in `Agent::new`, this dispatch resolves.
+        let dispatcher = agent
+            .tool_registry()
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("mofa_make registered after Agent::new");
+        let result = dispatcher
+            .execute(&serde_json::json!({
+                "content_type": "slides",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.output.contains("[DISPATCHER_ERROR]"),
+            "post-Agent::new dispatcher must be wired (no DISPATCHER_ERROR); got {:?}",
+            result.output
+        );
+    }
+
+    /// RFC-1 fixup (codex P1, Finding #2): when a `make_type` skill is
+    /// loaded, the resolved target tool (e.g. `mofa_slides`) MUST NOT
+    /// appear in `activate_tools`'s description-side enumeration of
+    /// deferred tools. Pre-fixup, the loader put each target into
+    /// `deferred`, which made `ToolRegistry::specs()` append the name
+    /// to `activate_tools`'s description ("Currently deferred tools
+    /// available to load: mofa_slides, …") and let weaker models read
+    /// the sibling out and call `activate_tools(["mofa_slides"])` to
+    /// re-promote it — defeating the entire RFC-1 consolidation.
+    #[cfg(unix)]
+    #[test]
+    fn mofa_make_targets_not_listed_in_activate_tools_description() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-slides");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mofa-slides",
+                "version": "1.0",
+                "make_type": "slides",
+                "content_type_description": "PPTX decks",
+                "tools": [{
+                    "name": "mofa_slides",
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("mofa-slides");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::tools::ActivateToolsTool::new());
+        let _ = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        // Sanity: the target tool IS registered (callable via get()),
+        // just hidden from the LLM-facing spec set.
+        assert!(
+            registry.get("mofa_slides").is_some(),
+            "mofa_slides target tool must remain registered for dispatcher forwarding"
+        );
+
+        // The LLM-facing spec set MUST NOT include the target tool.
+        let visible: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
+        assert!(
+            !visible.contains(&"mofa_slides".to_string()),
+            "mofa_slides must NOT appear in LLM-visible specs after RFC-1 \
+             internal-hidden registration; got {:?}",
+            visible
+        );
+
+        // The critical assertion for this fixup: `activate_tools`'s
+        // description (which `specs()` augments with the deferred-list
+        // enumeration) MUST NOT mention the target tool name. With the
+        // old `defer()` path, `specs()` appended "Currently deferred
+        // tools available to load: mofa_slides, …" to the description,
+        // giving the LLM a clear signal to re-promote the sibling.
+        let activate_spec = registry
+            .specs()
+            .into_iter()
+            .find(|s| s.name == "activate_tools")
+            .expect("activate_tools must be in the visible spec set");
+        assert!(
+            !activate_spec.description.contains("mofa_slides"),
+            "activate_tools description must NOT enumerate mofa_make's hidden \
+             target tools (mofa_slides); RFC-1 says the LLM is supposed to \
+             only see mofa_make. Got description: {:?}",
+            activate_spec.description
+        );
+    }
+
+    /// RFC-1 fixup (codex P1, Finding #2): even if the LLM tries to
+    /// call `activate_tools` with an explicit dispatcher-target name
+    /// (e.g. it cached the name from a prior session, or read it out
+    /// of a tool-error message), the registry MUST refuse to re-promote
+    /// it. The dispatcher is the only supported LLM entry-point for
+    /// these tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn make_target_not_re_promotable_via_activate_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::tools::ActivateToolsTool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-slides");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mofa-slides",
+                "version": "1.0",
+                "make_type": "slides",
+                "content_type_description": "PPTX decks",
+                "tools": [{
+                    "name": "mofa_slides",
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("mofa-slides");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let activate_tool = ActivateToolsTool::new();
+        registry.register_arc(std::sync::Arc::new(activate_tool));
+        let _ = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        // Wire activate_tools back-ref so its execute path can reach
+        // the registry (mirrors what `Agent::new` + `wire_activate_tools`
+        // does in production).
+        let registry_arc = std::sync::Arc::new(registry);
+        if let Some(arc) = registry_arc.get("activate_tools") {
+            if let Some(t) = arc.as_any().downcast_ref::<ActivateToolsTool>() {
+                t.set_registry(std::sync::Arc::downgrade(&registry_arc));
+            }
+        }
+
+        // Pre-condition: `mofa_slides` is NOT in the visible spec set.
+        let visible_before: Vec<String> =
+            registry_arc.specs().into_iter().map(|s| s.name).collect();
+        assert!(!visible_before.contains(&"mofa_slides".to_string()));
+
+        // The LLM tries to re-promote the dispatcher target by name.
+        // The registry's `activate()` must refuse — internal-hidden
+        // tools are not promotable.
+        let activated = registry_arc.activate("mofa_slides");
+        assert!(
+            activated.is_empty(),
+            "internal-hidden mofa_slides must NOT be activatable by name; \
+             got activated={:?}",
+            activated
+        );
+
+        // Post-condition: `mofa_slides` is still NOT visible to the LLM.
+        let visible_after: Vec<String> = registry_arc.specs().into_iter().map(|s| s.name).collect();
+        assert!(
+            !visible_after.contains(&"mofa_slides".to_string()),
+            "post-activate, mofa_slides must remain hidden; got visible={:?}",
+            visible_after
+        );
+
+        // And the `activate_tools` tool itself (when invoked through
+        // its execute path) MUST NOT advertise mofa_slides in its
+        // "Available tools to load" output.
+        let activate_arc = registry_arc
+            .get("activate_tools")
+            .expect("activate_tools registered");
+        let result = activate_arc.execute(&serde_json::json!({})).await.unwrap();
+        assert!(
+            !result.output.contains("mofa_slides"),
+            "activate_tools output must NOT mention mofa_slides; got {:?}",
+            result.output
+        );
+    }
+
+    /// RFC-1 fixup (codex round 3 P2): when an owned `ToolRegistry`
+    /// arrives at `Agent::new` carrying a SHARED dispatcher Arc (e.g.
+    /// from `octos-pipeline`'s cached plugin registration that
+    /// `register_arc`s the same `Arc<MofaMakeTool>` into every node
+    /// registry), the central wire MUST mint a fresh dispatcher
+    /// before wiring its `Weak<ToolRegistry>` — otherwise that wire
+    /// would mutate the shared dispatcher and overlapping pipeline
+    /// nodes would race on its `Mutex<Weak>`.
+    ///
+    /// This test simulates the pipeline pattern: build a shared
+    /// `Arc<MofaMakeTool>`, `register_arc` it into TWO independent
+    /// `ToolRegistry` instances, construct two `Agent`s, and assert
+    /// the two agents' dispatchers are SEPARATE Arc objects (so
+    /// wiring one's Weak doesn't touch the other's).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_new_mints_fresh_dispatcher_when_input_is_shared() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::agent::Agent;
+        use crate::tools::MofaMakeTool;
+        use async_trait::async_trait;
+        use octos_core::AgentId;
+        use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+        use octos_memory::EpisodeStore;
+
+        struct NoopLlm;
+        #[async_trait]
+        impl LlmProvider for NoopLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                eyre::bail!("unused")
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "noop"
+            }
+        }
+
+        // Build a make_type plugin once.
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-slides");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mofa-slides",
+                "version": "1.0",
+                "make_type": "slides",
+                "content_type_description": "PPTX decks",
+                "tools": [{
+                    "name": "mofa_slides",
+                    "description": "Render slides",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("mofa-slides");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Stage a registry once and pull out the dispatcher `Arc` so
+        // we can `register_arc` it into multiple per-node registries
+        // (mirrors `octos-pipeline::CachedPluginRegistration::apply_to`).
+        let mut staging = ToolRegistry::new();
+        let _ = PluginLoader::load_into(&mut staging, &[dir.path().to_path_buf()], &[]).unwrap();
+        let shared_dispatcher_arc = staging
+            .get_tool("mofa_make")
+            .expect("staging mofa_make registered");
+
+        // Build TWO independent registries that share the same
+        // dispatcher Arc — the pre-fix hazard.
+        let make_registry = || -> ToolRegistry {
+            let mut reg = ToolRegistry::new();
+            // Register the target tool so the dispatcher's catalog
+            // entry has somewhere to forward to.
+            let target = staging
+                .get_tool("mofa_slides")
+                .expect("staging mofa_slides registered");
+            reg.register_arc(target);
+            reg.register_arc(shared_dispatcher_arc.clone());
+            reg
+        };
+        let registry_a = make_registry();
+        let registry_b = make_registry();
+
+        // Construct two agents through `Agent::new`. With the round-3
+        // fixup each call mints a FRESH dispatcher for that agent.
+        let memory_a = std::sync::Arc::new(
+            EpisodeStore::open(dir.path().join("episodes-a"))
+                .await
+                .expect("episode store"),
+        );
+        let memory_b = std::sync::Arc::new(
+            EpisodeStore::open(dir.path().join("episodes-b"))
+                .await
+                .expect("episode store"),
+        );
+        let llm: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::new(NoopLlm);
+        let agent_a = Agent::new(AgentId::new("a"), llm.clone(), registry_a, memory_a);
+        let agent_b = Agent::new(AgentId::new("b"), llm, registry_b, memory_b);
+
+        // Identity assertion: the two agents' dispatchers are separate
+        // Arc objects. If the freshen step were skipped, both would
+        // point at `shared_dispatcher_arc` and wiring one's Weak
+        // would mutate the other's.
+        let disp_a = agent_a.tool_registry().get("mofa_make").cloned().unwrap();
+        let disp_b = agent_b.tool_registry().get("mofa_make").cloned().unwrap();
+        let shared_ptr = std::sync::Arc::as_ptr(&shared_dispatcher_arc) as *const ();
+        let a_ptr = std::sync::Arc::as_ptr(&disp_a) as *const ();
+        let b_ptr = std::sync::Arc::as_ptr(&disp_b) as *const ();
+        assert_ne!(
+            a_ptr, shared_ptr,
+            "Agent::new must mint a fresh dispatcher for agent A"
+        );
+        assert_ne!(
+            b_ptr, shared_ptr,
+            "Agent::new must mint a fresh dispatcher for agent B"
+        );
+        assert_ne!(
+            a_ptr, b_ptr,
+            "agent A and agent B must have SEPARATE dispatcher Arcs \
+             (share-mutate hazard would have produced the same Arc)"
+        );
+
+        // Each agent's dispatcher must resolve through its OWN
+        // registry (proving its Weak points at the right place).
+        let disp_a_typed = disp_a
+            .as_any()
+            .downcast_ref::<MofaMakeTool>()
+            .expect("downcast");
+        let result_a = disp_a_typed
+            .execute(&serde_json::json!({
+                "content_type": "slides",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        // The target IS in agent A's registry (registered above), so
+        // dispatch should succeed (no DISPATCHER_ERROR for missing
+        // registry or missing target).
+        assert!(
+            !result_a.output.contains("[DISPATCHER_ERROR]"),
+            "agent A's dispatcher must resolve through agent A's \
+             registry; got {:?}",
+            result_a.output
         );
     }
 }

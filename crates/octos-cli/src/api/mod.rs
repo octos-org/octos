@@ -8,6 +8,7 @@
 //! process-wide [`EventBroadcaster`] over SSE (admin-only).
 
 pub mod admin;
+pub mod admin_audit;
 pub mod admin_setup;
 pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
@@ -20,10 +21,12 @@ pub(crate) mod goal_loop_runtime;
 mod handlers;
 pub(crate) mod master_continuation_scheduler;
 pub mod metrics;
+pub(crate) mod ominix_runtime;
 pub mod preview;
 pub mod preview_tokens;
 pub mod purge;
 mod router;
+pub(crate) mod session_ingress;
 pub(crate) mod solo_auth;
 pub(crate) mod specialist_runner;
 mod static_files;
@@ -47,6 +50,7 @@ mod ui_protocol_reasoning_effort;
 mod ui_protocol_sanitize;
 mod ui_protocol_scope;
 mod ui_protocol_task_output;
+pub mod usage;
 pub mod user_admin;
 pub(crate) mod voice_turn;
 pub mod voices;
@@ -108,6 +112,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::admin_audit_store::AdminAuditStore;
 use crate::admin_token_store::AdminTokenStore;
 use crate::content_catalog::ContentCatalogManager;
 use crate::login_allowlist::LoginAllowlistStore;
@@ -220,6 +225,8 @@ pub struct AppState {
     pub user_store: Option<Arc<UserStore>>,
     /// Allowlist for pre-authorized email-based signup.
     pub allowlist_store: Option<Arc<LoginAllowlistStore>>,
+    /// Persistent audit log for state-changing admin actions.
+    pub admin_audit_store: Option<Arc<AdminAuditStore>>,
     /// Auth manager for email OTP and sessions.
     pub auth_manager: Option<Arc<AuthManager>>,
     /// Shared HTTP client for webhook proxying.
@@ -260,6 +267,10 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// Resolved HOST-level memory policy (top-level config). Threaded into
+    /// lazily-bootstrapped profile runtimes so a host opt-out of memory
+    /// refresh (DEFAULT-ON) also binds profiles created after startup.
+    pub host_memory: Option<crate::config::MemoryConfig>,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
@@ -314,6 +325,13 @@ pub struct AppState {
     /// invalidates every outstanding grant. See
     /// [`crate::api::preview_tokens`] for full design rationale.
     pub preview_tokens: SharedPreviewTokens,
+    /// Persistent session-ingress grant store for external CLI agents.
+    ///
+    /// `octos auth issue-work-secret` writes short-lived grants here and
+    /// `/v1/session_ingress/ws/{session_id}` revalidates the token on
+    /// every frame, so revocation applies to already-open sockets without
+    /// requiring a daemon restart.
+    pub work_secret_store: Arc<octos_agent::bridge::work_secret::WorkSecretGrantStore>,
     /// Owning handle to the background sweeper task spawned for
     /// `preview_tokens` (issue #1009). Storing it here ties the
     /// task's lifetime to `AppState`: when the last `Arc<AppState>` is
@@ -357,6 +375,7 @@ impl AppState {
             process_manager: None,
             user_store: None,
             allowlist_store: None,
+            admin_audit_store: None,
             auth_manager: None,
             http_client: reqwest::Client::new(),
             config_path: None,
@@ -371,6 +390,7 @@ impl AppState {
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
             solo_login_enabled: false,
+            host_memory: None,
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,
@@ -380,6 +400,9 @@ impl AppState {
             task_query_store: None,
             appui_default_session_cwd: None,
             preview_tokens: Arc::new(PreviewTokens::new()),
+            work_secret_store: Arc::new(
+                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&tmp),
+            ),
             // Tests don't spawn the sweeper. Tests that exercise the
             // sweeper either drive `sweep_expired_all` directly or
             // build their own `PreviewSweeperHandle::spawn(...)`.

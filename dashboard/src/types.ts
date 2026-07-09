@@ -191,13 +191,14 @@ export interface BulkActionResponse {
   count: number
 }
 
-export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'feishu' | 'line' | 'email'
+export type ChannelType = 'telegram' | 'discord' | 'dingtalk' | 'slack' | 'whatsapp' | 'feishu' | 'line' | 'email'
 
-export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'line', 'email']
+export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'dingtalk', 'slack', 'whatsapp', 'feishu', 'line', 'email']
 
 export const CHANNEL_COLORS: Record<ChannelType, string> = {
   telegram: 'bg-blue-500',
   discord: 'bg-indigo-500',
+  dingtalk: 'bg-sky-500',
   slack: 'bg-purple-500',
   whatsapp: 'bg-green-500',
   feishu: 'bg-cyan-500',
@@ -208,6 +209,7 @@ export const CHANNEL_COLORS: Record<ChannelType, string> = {
 export const CHANNEL_LABELS: Record<ChannelType, string> = {
   telegram: 'TG',
   discord: 'DC',
+  dingtalk: 'DT',
   slack: 'SL',
   whatsapp: 'WA',
   feishu: 'FS',
@@ -250,6 +252,24 @@ export interface AllowlistEntry {
   registered_user_id?: string | null
   registered_name?: string | null
   last_login_at?: string | null
+}
+
+export interface AdminAuditEntry {
+  schema_version: number
+  id: string
+  timestamp: string
+  actor: string
+  action: string
+  target_id: string
+  before_summary?: unknown
+  after_summary?: unknown
+}
+
+export interface AdminAuditResponse {
+  entries: AdminAuditEntry[]
+  total: number
+  limit: number
+  offset: number
 }
 
 /// The active tenant scope derived from the request `Host` /
@@ -346,6 +366,36 @@ export interface SharedMetrics {
   updated_at: string
   policy: SharedPolicy
   providers: SharedProviderMetrics[]
+}
+
+// ── Persistent Usage Analytics ──────────────────────────────────────
+
+export interface UsageTotals {
+  run_count: number
+  input_tokens: number
+  output_tokens: number
+  estimated_cost_usd: number
+}
+
+export interface UsageRollup {
+  key: string
+  totals: UsageTotals
+}
+
+export interface UsageAnalytics {
+  totals: UsageTotals
+  by_day: UsageRollup[]
+  by_month: UsageRollup[]
+  by_profile: UsageRollup[]
+  by_provider: UsageRollup[]
+  by_model: UsageRollup[]
+  by_channel: UsageRollup[]
+}
+
+export interface UsageQueryParams {
+  session_id?: string
+  from?: string
+  to?: string
 }
 
 // ── Admin Bot Config (legacy, kept for backwards compat) ─────────────

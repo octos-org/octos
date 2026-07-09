@@ -6,10 +6,11 @@
 #![allow(dead_code)]
 
 use octos_core::ui_protocol::{
-    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, TaskRuntimeState as UiTaskRuntimeState,
-    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnId,
-    UiFileMutationNotice, UiNotification, UiProgressEvent, UiProgressMetadata, UiRetryBackoff,
-    UiTokenCostUpdate, WarningEvent, file_mutation_operations, progress_kinds,
+    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, ReasoningDeltaEvent,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnId, UiFileMutationNotice, UiNotification,
+    UiProgressEvent, UiProgressMetadata, UiRetryBackoff, UiTokenCostUpdate, WarningEvent,
+    file_mutation_operations, progress_kinds,
 };
 use octos_core::{SessionKey, TaskId};
 use serde_json::{Value, json};
@@ -98,6 +99,7 @@ pub(crate) fn map_progress_json(
 
     match event_type {
         "token" => map_token(context, event),
+        "reasoning_chunk" => map_reasoning_chunk(context, event),
         "tool_start" => map_tool_start(context, event),
         "tool_progress" => map_tool_progress(context, event),
         "tool_end" => map_tool_end(context, event),
@@ -336,6 +338,23 @@ fn map_token(context: &ProgressMappingContext, event: &Value) -> UiProgressMappi
     })])
 }
 
+fn map_reasoning_chunk(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let Some(text) = string_field(event, &["text"]) else {
+        return UiProgressMapping::warning(
+            context,
+            "invalid_progress",
+            "reasoning_chunk progress event is missing string field `text`".to_string(),
+        );
+    };
+
+    UiProgressMapping::notifications(vec![UiNotification::ReasoningDelta(ReasoningDeltaEvent {
+        session_id: context.session_id.clone(),
+        topic: None,
+        turn_id: context.turn_id.clone(),
+        text,
+    })])
+}
+
 fn map_tool_start(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
     let tool_name = string_field(event, &["tool", "tool_name"]).unwrap_or_else(|| "tool".into());
     let tool_call_id =
@@ -431,6 +450,9 @@ fn map_cost_update(context: &ProgressMappingContext, event: &Value) -> UiProgres
     // sniff `metadata.label` continue to work (we still emit the field
     // omitted when absent).
     update.model = string_field(event, &["model"]);
+    // Carry the model context window so clients render an honest ctx-fill
+    // gauge against the real window instead of a hardcoded default.
+    update.context_window = u64_field(event, &["context_window"]);
 
     let mut metadata = UiProgressMetadata::token_cost(update);
     metadata.message = string_field(event, &["message", "status"]);
@@ -693,6 +715,21 @@ mod tests {
     }
 
     #[test]
+    fn ui_protocol_progress_maps_reasoning_chunk_to_reasoning_delta() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({ "type": "reasoning_chunk", "text": "thinking" }),
+        );
+
+        assert_eq!(mapping.status, None);
+        assert_eq!(mapping.warning, None);
+        let [UiNotification::ReasoningDelta(delta)] = mapping.notifications.as_slice() else {
+            panic!("expected reasoning delta notification");
+        };
+        assert_eq!(delta.text, "thinking");
+    }
+
+    #[test]
     fn ui_protocol_progress_preserves_tool_progress_call_id() {
         let mapping = map_progress_json(
             &context(),
@@ -894,6 +931,28 @@ mod tests {
             .token_cost
             .expect("token cost metadata");
         assert_eq!(cost.model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn ui_protocol_progress_cost_update_carries_context_window_into_token_cost_metadata() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "cost_update",
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "model": "deepseek-v4-pro",
+                "context_window": 131072
+            }),
+        );
+
+        let status = mapping.status.expect("cost status");
+        let cost = status
+            .event
+            .metadata
+            .token_cost
+            .expect("token cost metadata");
+        assert_eq!(cost.context_window, Some(131072));
     }
 
     #[test]

@@ -152,6 +152,19 @@ The complete configuration structure with all available fields:
   // Email (for email channel)
   "email": null,
 
+  // Memory injection + automatic refresh (see Memory & Skills)
+  "memory": {
+    "max_inject_tokens": 2500,
+    "refresh": {
+      "enabled": true,          // tri-state: absent = ON (default)
+      "extract_model": null,    // null = profile provider
+      "consolidate_model": null,
+      "max_extractions_per_day": 20,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30
+    }
+  },
+
   // Dashboard auth (serve mode only)
   "dashboard_auth": null,
 
@@ -159,6 +172,8 @@ The complete configuration structure with all available fields:
   "monitor": null
 }
 ```
+
+> The `memory.refresh` pipeline is **on by default**. See [Memory & Skills → Automatic Memory Refresh](./memory-skills.md) for the full field list and the `octos memory` command. Opt out with `"enabled": false` or `OCTOS_MEMORY_REFRESH_ENABLED=0`.
 
 ## Human Approval Rules
 
@@ -227,6 +242,8 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
+| `DINGTALK_BOT_WEBHOOK` | DingTalk custom robot webhook URL |
+| `DINGTALK_BOT_SECRET` | DingTalk robot signing secret |
 | `SLACK_BOT_TOKEN` | Slack bot token |
 | `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu/Lark app ID |

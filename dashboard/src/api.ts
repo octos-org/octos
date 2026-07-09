@@ -12,12 +12,16 @@ import type {
   SoloLoginResult,
   SoloCreateResult,
   User,
+  UserRole,
   AllowlistEntry,
   SharedMetrics,
   MonitorStatus,
   MonitorProfileStatus,
   SystemMetrics,
   PurgeReport,
+  AdminAuditResponse,
+  UsageAnalytics,
+  UsageQueryParams,
 } from './types'
 
 const BASE = '/api/admin'
@@ -139,10 +143,40 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json()
 }
 
+function queryPath(path: string, params: Record<string, string | number | undefined | null>): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && `${value}`.trim() !== '') {
+      query.set(key, `${value}`)
+    }
+  }
+  const suffix = query.toString()
+  return suffix ? `${path}?${suffix}` : path
+}
+
+function usageQuery(query?: UsageQueryParams): string {
+  const params = new URLSearchParams()
+  if (query?.session_id) params.set('session_id', query.session_id)
+  if (query?.from) params.set('from', query.from)
+  if (query?.to) params.set('to', query.to)
+  const encoded = params.toString()
+  return encoded ? `?${encoded}` : ''
+}
+
 // ── Admin API (existing) ────────────────────────────────────────────
 
 export const api = {
   overview: () => request<OverviewResponse>('/overview'),
+
+  listAudit: (params?: {
+    actor?: string
+    action?: string
+    target_id?: string
+    from?: string
+    to?: string
+    limit?: number
+    offset?: number
+  }) => request<AdminAuditResponse>(queryPath('/audit', params ?? {})),
 
   listProfiles: () => request<ProfileResponse[]>('/profiles'),
 
@@ -201,6 +235,17 @@ export const api = {
   providerMetrics: (id: string) =>
     request<SharedMetrics | null>(`/profiles/${id}/metrics`),
 
+  usage: (query?: UsageQueryParams) =>
+    request<UsageAnalytics>(`/usage${usageQuery(query)}`),
+
+  profileUsage: (id: string, query?: UsageQueryParams) =>
+    request<UsageAnalytics>(`/profiles/${id}/usage${usageQuery(query)}`),
+
+  profileSessionUsage: (id: string, sessionId: string, query?: Omit<UsageQueryParams, 'session_id'>) =>
+    request<UsageAnalytics>(
+      `/profiles/${id}/usage/sessions/${encodeURIComponent(sessionId)}${usageQuery(query)}`,
+    ),
+
   // Sub-account management
   listSubAccounts: (parentId: string) =>
     request<ProfileResponse[]>(`/profiles/${parentId}/accounts`),
@@ -213,6 +258,12 @@ export const api = {
 
   // User management (admin)
   listUsers: () => request<{ users: User[] }>('/users'),
+
+  updateUserRole: (id: string, role: UserRole) =>
+    request<User>(`/users/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    }),
 
   listAllowedEmails: () => request<{ entries: AllowlistEntry[] }>('/allowed-emails'),
 
@@ -483,6 +534,14 @@ export const myApi = {
 
   providerMetrics: () =>
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
+
+  usage: (query?: UsageQueryParams) =>
+    authedRequest<UsageAnalytics>(`/my/usage${usageQuery(query)}`),
+
+  sessionUsage: (sessionId: string, query?: Omit<UsageQueryParams, 'session_id'>) =>
+    authedRequest<UsageAnalytics>(
+      `/my/usage/sessions/${encodeURIComponent(sessionId)}${usageQuery(query)}`,
+    ),
 
   listProfileSkills: () =>
     authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(

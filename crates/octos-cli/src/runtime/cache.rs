@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::Result;
-use octos_agent::EffectivePermissions;
+use octos_agent::{EffectivePermissions, SandboxConfig};
 use octos_core::SessionKey;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -277,6 +277,28 @@ impl SessionRuntimeCache {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
     ) -> Result<Arc<SessionRuntime>> {
+        self.get_or_init_with_permissions_and_sandbox(
+            profile,
+            session_key,
+            workspace_hint,
+            permissions,
+            None,
+        )
+        .await
+    }
+
+    /// Look up or build a session runtime using explicit effective
+    /// permissions plus an optional, already-validated sandbox override.
+    /// Cache hits intentionally keep the first bootstrapped runtime for a
+    /// session key, including its sandbox policy.
+    pub async fn get_or_init_with_permissions_and_sandbox(
+        &self,
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        permissions: EffectivePermissions,
+        sandbox_override: Option<SandboxConfig>,
+    ) -> Result<Arc<SessionRuntime>> {
         let key = (profile.profile_id.clone(), session_key.clone());
 
         loop {
@@ -362,11 +384,12 @@ impl SessionRuntimeCache {
                     continue;
                 }
                 InflightOutcome::OwnGuard(guard) => {
-                    let result = SessionRuntime::bootstrap_with_permissions(
+                    let result = SessionRuntime::bootstrap_with_permissions_and_sandbox(
                         profile,
                         session_key.clone(),
                         workspace_hint,
                         permissions,
+                        sandbox_override,
                     )
                     .await;
                     match result {
@@ -580,8 +603,16 @@ mod tests {
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,

@@ -363,6 +363,7 @@ expected_artifacts = [
   "websocket-transcript.jsonl",
   "tui-capture-replay-lossy.txt",
   "tui-capture-backpressure-final.txt",
+  "tui-capture-backpressure-post-recovery.txt",
 ]
 acceptance = [
   "appui.backpressure_warning_present",
@@ -370,4 +371,4 @@ acceptance = [
   "appui.next_prompt_succeeds",
   "dropped_completion_backpressure_contract",
 ]
-notes = "Uses the current octos-tui onboarding runner plus a WebSocket sidecar probe to cover fixture-backed protocol/replay_lossy recovery. This does not yet force a true dropped turn/completed writer-channel failure."
+notes = "Uses the current octos-tui onboarding runner plus a WebSocket sidecar probe to force a local dropped turn/completed writer-channel failure, replay recovery, and next-prompt success."

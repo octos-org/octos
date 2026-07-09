@@ -28,11 +28,13 @@ git clone https://github.com/octos-org/octos
 cd octos
 
 # Recommended: canonical feature set (matches scripts/milestone-ci.sh).
-# Includes the REST API + dashboard (`octos serve`) and every messaging
-# channel adapter. Build this first if you don't know which features
-# you need — it's what release artifacts ship.
+# Includes the REST API + dashboard (`octos serve`) and the common
+# messaging channel adapters — this is the set CI builds. (Release
+# workflows use a similar set; check .github/workflows for the exact
+# release features.) Add any other channel you need (slack, email,
+# matrix, line, qq-bot, wechat) from the list below.
 cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # Minimal: CLI + chat + gateway with CLI channel only.
 # This produces a binary that does NOT have `octos serve` (the api
@@ -41,10 +43,11 @@ cargo install --path crates/octos-cli \
 cargo install --path crates/octos-cli
 
 # Trim the feature list to your needs. Available channel features:
-#   telegram, discord, slack, whatsapp, feishu, email, wecom, wecom-bot,
-#   matrix, qq-bot, twilio, wechat
+#   telegram, discord, dingtalk, slack, whatsapp, feishu, email, wecom, wecom-bot,
+#   matrix, line, qq-bot, twilio, wechat
 # Required for `octos serve`: api
-# Other features: git (gitoxide), ast (tree-sitter)
+# Other features: git (gitoxide), ast (tree-sitter),
+#   audio_mp3 (MP3 decoding for audio workspace-contract validation)
 # Note: the browser tool (headless Chrome via CDP) is always compiled
 # in — there is no `browser` feature.
 cargo install --path crates/octos-cli --features "api,telegram,slack"
@@ -192,7 +195,7 @@ rustup-init.exe
 git clone https://github.com/octos-org/octos.git
 cd octos
 cargo install --path crates/octos-cli `
-    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # 3. Set API key and run
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
@@ -232,7 +235,7 @@ docker compose --profile gateway up -d
 Options:
   --minimal          CLI + chat only (no channels, no dashboard)
   --full             All channels + dashboard + app-skills
-  --channels LIST    Comma-separated: telegram,discord,slack,whatsapp,feishu,email,twilio,wecom
+  --channels LIST    Comma-separated: telegram,discord,dingtalk,slack,whatsapp,feishu,email,twilio,wecom
   --no-skills        Skip building app-skills
   --no-service       Skip launchd/systemd service setup
   --uninstall        Remove binaries and service files

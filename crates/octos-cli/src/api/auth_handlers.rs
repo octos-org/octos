@@ -58,6 +58,40 @@ fn request_host(headers: &HeaderMap) -> Option<String> {
     Some(strip_port_from_host(&raw).to_string())
 }
 
+/// The endpoint URL a scanning client should dial: original authority
+/// (host AND port — `request_host` strips the port, which would send
+/// scanners to :80/:443, codex P2) plus `X-Forwarded-Proto` when a
+/// reverse proxy supplies it, else https with a loopback http fallback.
+fn request_endpoint(headers: &HeaderMap) -> Option<String> {
+    let authority = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|p| p == "http" || p == "https");
+    let scheme = forwarded_proto.unwrap_or_else(|| {
+        let host_only = strip_port_from_host(&authority);
+        if host_only == "localhost" || host_only.starts_with("127.") || host_only == "::1" {
+            "http".to_string()
+        } else {
+            "https".to_string()
+        }
+    });
+    Some(format!("{scheme}://{authority}"))
+}
+
 fn strip_port_from_host(host: &str) -> &str {
     if let Some(stripped) = host.strip_prefix('[') {
         return stripped.split(']').next().unwrap_or(host);
@@ -668,7 +702,7 @@ pub async fn verify(
                 (None, Some(RootLoginTarget::Allowlisted)) => {
                     user_store.get_by_email(&requested_email).ok().flatten()
                 }
-                (None, None) => None,
+                (None, None) => user_store.get_by_email(&requested_email).ok().flatten(),
             };
 
             if matches!(root_login_target, Some(RootLoginTarget::Allowlisted)) {
@@ -922,6 +956,163 @@ pub async fn my_profile(
         status,
     }))
 }
+
+#[derive(Deserialize, Default)]
+pub struct MyProfileQrQuery {
+    #[serde(default)]
+    pub include_secrets: bool,
+    /// Endpoint URL to embed; defaults to the request host.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// Whether an env-var value may be resolved into a QR export for
+/// `profile_id`: plain values always; `keychain:` markers ONLY when they
+/// point at the profile's own scoped account (`VAR::profile_id`). Bare
+/// (`keychain:VAR`) and foreign-scoped markers are refused — both can
+/// address keychain items the profile does not own.
+pub(crate) fn marker_allowed_for_export(raw: &str, var: &str, profile_id: &str) -> bool {
+    if !crate::auth::keychain::is_marker(raw) {
+        return true;
+    }
+    raw == crate::auth::keychain::marker_for(&crate::auth::keychain::scoped_account(
+        var, profile_id,
+    ))
+}
+
+/// Build the QR wire payload from a stored [`crate::profiles::UserProfile`].
+///
+/// Secrets are the profile's OWN `env_vars` entries referenced by its
+/// LLM routes (`api_key_env` on primary + fallbacks) — never the host
+/// process env or auth store, so a tenant export can only ever carry
+/// tenant-scoped credentials. Sub-account inheritance is NOT resolved
+/// here: the payload mirrors the profile as stored.
+pub(crate) fn payload_from_user_profile(
+    profile: &crate::profiles::UserProfile,
+    include_secrets: bool,
+) -> eyre::Result<crate::profile_qr::ProfileQrPayload> {
+    use eyre::WrapErr;
+
+    let mut payload = crate::profile_qr::ProfileQrPayload::new(&profile.id);
+    payload.name = Some(profile.name.clone());
+    if let Some(ref llm) = profile.config.llm {
+        payload.llm = Some(serde_json::to_value(llm).wrap_err("serialize llm config")?);
+    }
+    if let Some(ref memory) = profile.config.memory {
+        payload.memory = Some(serde_json::to_value(memory).wrap_err("serialize memory config")?);
+    }
+    payload.voice_default = profile.config.voice_default.clone();
+
+    if include_secrets {
+        if let Some(ref llm) = profile.config.llm {
+            let routes = llm
+                .primary
+                .iter()
+                .chain(llm.fallbacks.iter())
+                .filter_map(|selection| selection.route.as_ref());
+            for route in routes {
+                let Some(ref var) = route.api_key_env else {
+                    continue;
+                };
+                let Some(raw) = profile.config.env_vars.get(var) else {
+                    continue;
+                };
+                if !marker_allowed_for_export(raw, var, &profile.id) {
+                    // A profile may persist an ARBITRARY keychain marker
+                    // suffix ("keychain:VERTEX_SA_JSON::admin"); resolving
+                    // it here would exfiltrate another tenant's (or the
+                    // host's) keychain item through the QR (codex P1).
+                    continue;
+                }
+                let Some(value) = crate::auth::keychain::resolve_value(var, raw)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                payload.secrets.entry(var.clone()).or_insert(value);
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+/// GET /api/my/profile/qr
+///
+/// Export the caller's profile as an `OCTOS1:`/`OCTOS1E:` payload for
+/// client-side QR rendering. With `include_secrets=true` the payload is
+/// ALWAYS PIN-wrapped (`OCTOS1E`) — there is no plain-secrets override
+/// over the API — and the one-time PIN is returned beside the payload,
+/// so a screenshotted or logged QR image alone reveals nothing.
+pub async fn my_profile_qr(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Query(query): Query<MyProfileQrQuery>,
+) -> Result<
+    (
+        axum::response::AppendHeaders<[(axum::http::HeaderName, &'static str); 2]>,
+        Json<serde_json::Value>,
+    ),
+    (StatusCode, String),
+> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "profile store not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+
+    let mut payload = payload_from_user_profile(&profile, query.include_secrets)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    payload.endpoint = query.endpoint.or_else(|| request_endpoint(&headers));
+
+    let (encoded, pin) = if payload.has_secrets() {
+        // The Argon2id profile is deliberately heavy (64 MiB, t=3) — run
+        // it OFF the async workers, and bound concurrent secret exports
+        // so parallel requests can't pin N×64 MiB + all Tokio workers
+        // (codex round-2 P2).
+        let _permit = SECRET_EXPORT_LIMIT.try_acquire().map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent secret exports; retry shortly".to_string(),
+            )
+        })?;
+        let pin = crate::profile_qr::generate_pin();
+        let sealed_payload = payload.clone();
+        let sealed_pin = pin.clone();
+        let encoded = tokio::task::spawn_blocking(move || {
+            crate::profile_qr::encode_encrypted(&sealed_payload, &sealed_pin)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, Some(pin))
+    } else {
+        let encoded = crate::profile_qr::encode_plain(&payload, false)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, None)
+    };
+
+    // The response body carries everything needed to decrypt the exported
+    // keys (payload + transfer secret) — it must never land in a shared
+    // cache or be persisted by an intermediary (codex round-2 P2).
+    Ok((
+        axum::response::AppendHeaders([
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ]),
+        Json(serde_json::json!({
+            "payload": encoded,
+            "pin": pin,
+            "profile_id": profile.id,
+        })),
+    ))
+}
+
+/// Bounded concurrency for PIN-wrapped profile exports: each runs a
+/// 64 MiB Argon2id derivation on the blocking pool.
+static SECRET_EXPORT_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// GET /api/my/profile/skills
 pub async fn my_profile_skills(
@@ -1468,12 +1659,8 @@ fn matrix_test_channel_config(
         if let Some(value) = non_empty_string_opt(channel.user_id.as_deref()) {
             config.user_id = Some(value);
         }
-        if let Some(value) = non_display_secret_string_opt(channel.access_token.as_deref()) {
-            config.access_token = Some(value);
-        }
-        if let Some(value) = non_display_secret_string_opt(channel.password.as_deref()) {
-            config.password = Some(value);
-        }
+        apply_matrix_draft_secret(&mut config.access_token, channel.access_token.as_deref());
+        apply_matrix_draft_secret(&mut config.password, channel.password.as_deref());
         if let Some(value) = non_empty_string_opt(channel.device_name.as_deref()) {
             config.device_name = Some(value);
         }
@@ -1521,15 +1708,19 @@ fn non_empty_string_opt(value: Option<&str>) -> Option<String> {
     value.and_then(non_empty_string)
 }
 
-fn non_display_secret_string_opt(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() || is_display_secret_value(trimmed) {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
+fn apply_matrix_draft_secret(target: &mut Option<String>, draft: Option<&str>) {
+    let Some(value) = draft else {
+        return;
+    };
+    let trimmed = value.trim();
+    if is_display_secret_value(trimmed) {
+        return;
+    }
+    if trimmed.is_empty() {
+        *target = None;
+    } else {
+        *target = Some(trimmed.to_string());
+    }
 }
 
 fn validate_matrix_user_id(user_id: &str) -> Result<(), (StatusCode, String)> {
@@ -1589,6 +1780,8 @@ fn matrix_percent_encode_path(s: &str) -> String {
     encoded
 }
 
+const MATRIX_ERROR_BODY_MAX_BYTES: usize = 2048;
+
 fn matrix_api_url(homeserver: &str, path: &str) -> String {
     format!("{}{}", homeserver.trim_end_matches('/'), path)
 }
@@ -1601,8 +1794,65 @@ fn matrix_api_url(homeserver: &str, path: &str) -> String {
 fn matrix_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to build Matrix HTTP client")
+}
+
+async fn matrix_error_body(resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut truncated = resp
+        .content_length()
+        .map(|len| len > MATRIX_ERROR_BODY_MAX_BYTES as u64)
+        .unwrap_or(false);
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if buf.len() + chunk.len() > MATRIX_ERROR_BODY_MAX_BYTES {
+                    let remaining = MATRIX_ERROR_BODY_MAX_BYTES.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    sanitize_matrix_error_body(&String::from_utf8_lossy(&buf), truncated)
+}
+
+fn sanitize_matrix_error_body(raw: &str, truncated: bool) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in raw.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+
+    let mut out = out.trim().to_string();
+    if truncated {
+        if out.is_empty() {
+            out.push_str("[truncated]");
+        } else {
+            out.push_str(" ... [truncated]");
+        }
+    }
+    out
 }
 
 async fn resolve_matrix_login(
@@ -1619,7 +1869,7 @@ async fn resolve_matrix_login(
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = matrix_error_body(resp).await;
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("Matrix whoami failed (status={status}): {body}"),
@@ -1673,7 +1923,7 @@ async fn resolve_matrix_login(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((StatusCode::BAD_GATEWAY, matrix_login_error(status, &body)));
     }
     let payload: serde_json::Value = resp
@@ -1769,7 +2019,7 @@ async fn matrix_join_room(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Matrix join room failed (status={status}): {body}"),
@@ -1798,7 +2048,7 @@ async fn matrix_leave_room(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Matrix reject invite failed (status={status}): {body}"),
@@ -1821,7 +2071,7 @@ async fn matrix_probe_sync(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = matrix_error_body(resp).await;
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Matrix sync probe failed (status={status}): {body}"),
@@ -3099,7 +3349,7 @@ pub(crate) fn is_authorized_for_profile(
 ///
 /// For regular users, returns their user ID. For admin token, returns the admin's own profile ID
 /// (auto-creating the admin profile if it doesn't exist yet).
-fn resolve_my_profile_id(
+pub(crate) fn resolve_my_profile_id(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
     state: &AppState,
@@ -3394,6 +3644,152 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::Request;
 
+    // --- payload_from_user_profile (profile QR export) ---
+
+    fn qr_profile_fixture() -> crate::profiles::UserProfile {
+        let mut profile = crate::profiles::UserProfile {
+            id: "ada".into(),
+            name: "Ada".into(),
+            public_subdomain: None,
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-pro".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    route_id: None,
+                    label: None,
+                    base_url: None,
+                    api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                    api_type: None,
+                }),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: vec![],
+        });
+        profile
+            .config
+            .env_vars
+            .insert("DEEPSEEK_API_KEY".into(), "sk-profile-key".into());
+        profile.config.env_vars.insert(
+            "TELEGRAM_BOT_TOKEN".into(),
+            "bot-token-must-not-leak".into(),
+        );
+        profile
+    }
+
+    #[test]
+    fn qr_payload_without_secrets_masks_nothing_because_nothing_is_included() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, false).unwrap();
+        assert_eq!(payload.id, "ada");
+        assert_eq!(payload.name.as_deref(), Some("Ada"));
+        assert!(payload.llm.is_some());
+        assert!(payload.secrets.is_empty());
+        assert!(!payload.has_secrets());
+    }
+
+    #[test]
+    fn qr_payload_with_secrets_includes_only_llm_route_referenced_vars() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        assert_eq!(payload.secrets["DEEPSEEK_API_KEY"], "sk-profile-key");
+        assert!(
+            !payload.secrets.contains_key("TELEGRAM_BOT_TOKEN"),
+            "env vars not referenced by an LLM route must not ride along"
+        );
+    }
+
+    #[test]
+    fn qr_export_refuses_foreign_and_bare_keychain_markers() {
+        // plain values export
+        assert!(marker_allowed_for_export(
+            "sk-plain",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // own scoped marker exports
+        assert!(marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // ANOTHER tenant's scoped account: refuse (exfiltration vector)
+        assert!(!marker_allowed_for_export(
+            "keychain:VERTEX_SA_JSON::admin",
+            "VERTEX_SA_JSON",
+            "ada"
+        ));
+        // bare marker addresses a host-level item: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // marker under a DIFFERENT var name than referenced: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:OTHER_VAR::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+    }
+
+    #[test]
+    fn qr_endpoint_keeps_port_and_honors_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://localhost:50080"),
+            "authority (incl. port) must survive; loopback defaults to http"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "ada.crew.example.com".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("https://ada.crew.example.com")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::1]:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://[::1]:50080"),
+            "bracketed IPv6 loopback is local, not https"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            "ada.crew.example.com:8443".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://ada.crew.example.com:8443"),
+            "reverse-proxy proto must win over the https default"
+        );
+    }
+
+    #[test]
+    fn qr_payload_secrets_round_trip_pin_wrapped() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        let encoded = crate::profile_qr::encode_encrypted(&payload, "246810").unwrap();
+        let decoded = crate::profile_qr::decode(&encoded, Some("246810")).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(crate::profile_qr::decode(&encoded, Some("000000")).is_err());
+    }
+
     // --- relocate_secret_to_keychain ---
 
     use std::cell::RefCell;
@@ -3667,6 +4063,42 @@ mod tests {
     }
 
     #[test]
+    fn matrix_error_body_sanitizes_and_marks_truncation() {
+        let summary = sanitize_matrix_error_body("line1\nline2\t\u{0}secret", true);
+
+        assert_eq!(summary, "line1 line2 secret ... [truncated]");
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn matrix_http_client_does_not_follow_redirects() {
+        use axum::Router;
+        use axum::response::Redirect;
+        use axum::routing::get;
+
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { Redirect::temporary("/target") }),
+            )
+            .route("/target", get(|| async { "target" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = matrix_http_client()
+            .get(format!("http://{addr}/redirect"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[test]
     fn matrix_accept_adds_room_to_allowlist_once() {
         let mut profile = make_user_profile("matrix-user", "Matrix User");
         profile.config.channels.push(ChannelCredentials::Matrix {
@@ -3784,6 +4216,47 @@ mod tests {
         );
         assert_eq!(config.password.as_deref(), Some("real-password"));
         assert_eq!(config.device_name.as_deref(), Some("new-device"));
+    }
+
+    #[test]
+    fn matrix_test_config_empty_access_token_clears_saved_token() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_real_access_token".into(),
+            password: String::new(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: None,
+                user_id: None,
+                access_token: Some(String::new()),
+                password: Some("new-password".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.access_token, None);
+        assert_eq!(config.password.as_deref(), Some("new-password"));
     }
 
     #[test]
@@ -4720,6 +5193,68 @@ mod tests {
         let allowlist_entry = allowlist_store.get("newuser@example.com").unwrap().unwrap();
         assert_eq!(allowlist_entry.claimed_user_id.as_deref(), Some("newuser"));
         assert!(allowlist_entry.claimed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn root_self_registration_can_complete_login_and_provision_profile() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+        auth_mgr.set_allow_self_registration(true);
+        let state = Arc::new(state);
+
+        let Json(send_resp) = send_code(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "selfreg@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(send_resp.ok);
+
+        let code = auth_mgr
+            .test_pending_code("selfreg@example.com", None)
+            .await
+            .expect("self-registration should create a global OTP");
+
+        let Json(verify_resp) = verify(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(VerifyRequest {
+                email: "selfreg@example.com".into(),
+                code,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(verify_resp.ok);
+        assert!(verify_resp.token.is_some());
+        let user = verify_resp
+            .user
+            .expect("verify should return the self-registered user");
+        assert_eq!(user.id, "selfreg");
+
+        let saved_user = user_store
+            .get_by_email("selfreg@example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_user.id, "selfreg");
+        assert!(profile_store.get("selfreg").unwrap().is_some());
+
+        let Json(me_resp) = me(
+            State(state),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "selfreg".into(),
+                role: UserRole::User,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(me_resp.user.id, "selfreg");
+        assert_eq!(me_resp.portal.home_profile_id, "selfreg");
     }
 
     #[tokio::test]
