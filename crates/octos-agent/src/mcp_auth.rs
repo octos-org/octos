@@ -50,8 +50,14 @@ pub struct StoredTokens {
 }
 
 /// Stable keyring key for a server URL: `"<normalized-url>|<sha256[..16]>"`.
+///
+/// Normalizes only the case-insensitive parts (scheme + host) via `url::Url`
+/// while preserving path/query case — `https://h/MCP` and `https://h/mcp` are
+/// *different* endpoints and must not share (or clobber) a token entry.
 pub fn keyring_key(url: &str) -> String {
-    let normalized = url.trim_end_matches('/').to_ascii_lowercase();
+    let normalized = url::Url::parse(url)
+        .map(|u| u.as_str().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| url.trim_end_matches('/').to_string());
     let digest = Sha256::digest(normalized.as_bytes());
     let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!("{normalized}|{short}")
@@ -97,7 +103,7 @@ pub fn delete_tokens(url: &str) -> Result<bool> {
 /// Connect to an OAuth-gated streamable-HTTP MCP server using keyring-stored
 /// tokens. rmcp's `AuthClient` refreshes the access token as needed.
 pub async fn connect_oauth(
-    _config: &McpServerConfig,
+    config: &McpServerConfig,
     url: &str,
     client_info: ClientInfo,
 ) -> Result<McpService> {
@@ -108,10 +114,13 @@ pub async fn connect_oauth(
     let token: OAuthTokenResponse = serde_json::from_value(stored.token_response.clone())
         .map_err(|e| eyre::eyre!("parse stored oauth token: {e}"))?;
 
-    // SSRF-validated + DNS-pinned + no-redirect client for the MCP transport.
-    let client = crate::mcp::build_pinned_http_client(url, &_config.headers).await?;
+    // One SSRF-filtered, no-redirect client used for BOTH the OAuth HTTP
+    // operations (discovery / token / refresh, via OAuthState) and the MCP
+    // transport (via AuthClient) — so every host, including endpoints the
+    // server advertises, is SSRF-checked.
+    let client = crate::mcp::build_ssrf_http_client(&config.headers)?;
 
-    let mut oauth_state = OAuthState::new(url.to_string(), None)
+    let mut oauth_state = OAuthState::new(url.to_string(), Some(client.clone()))
         .await
         .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
     oauth_state
@@ -124,16 +133,24 @@ pub async fn connect_oauth(
         _ => eyre::bail!("unexpected OAuth state after loading credentials"),
     };
 
-    // `set_credentials` resets rmcp's token receipt time to now, so it would
-    // treat a token that expired while octos was stopped as fresh and send it.
-    // If our persisted wall-clock expiry says it's stale, force a refresh and
-    // persist the new token before the handshake.
-    if token_expired(stored.expires_at_ms) {
-        manager
-            .refresh_token()
-            .await
-            .map_err(|e| eyre::eyre!("refresh expired oauth token for '{url}': {e}"))?;
-        persist_manager_credentials(url, &manager).await;
+    // `set_credentials` resets rmcp's token receipt time to now, so rmcp's
+    // auto-refresh timer would be wrong (it assumes a full `expires_in` from
+    // startup) and it would keep sending the token past its real expiry. If we
+    // have a persisted expiry, refresh once on load so the receipt time is
+    // correct — falling back to the stored token if refresh fails but it isn't
+    // actually expired yet.
+    if stored.expires_at_ms.is_some() {
+        match manager.refresh_token().await {
+            Ok(_) => persist_manager_credentials(url, &manager).await,
+            Err(e) if token_expired(stored.expires_at_ms) => {
+                return Err(eyre::eyre!(
+                    "stored oauth token for '{url}' expired and refresh failed: {e}"
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(server = url, error = %e, "oauth token refresh on load failed; using stored token (may expire mid-session)");
+            }
+        }
     }
 
     let auth_client = AuthClient::new(client, manager);
@@ -155,7 +172,10 @@ pub async fn connect_oauth(
 pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
-    let mut oauth_state = OAuthState::new(url.to_string(), None)
+    // SSRF-filtered client so metadata discovery / dynamic registration / token
+    // exchange during login can't be pointed at private/metadata endpoints.
+    let client = crate::mcp::build_ssrf_http_client(&std::collections::HashMap::new())?;
+    let mut oauth_state = OAuthState::new(url.to_string(), Some(client))
         .await
         .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
 
@@ -187,12 +207,14 @@ pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
     // terminates — a plain outer `timeout` would leave `recv()` wedged and the
     // runtime would hang on drop.
     let deadline = Instant::now() + LOGIN_TIMEOUT;
-    let (code, state) = tokio::task::spawn_blocking(move || wait_for_callback(&server, deadline))
+    let callback_url = tokio::task::spawn_blocking(move || wait_for_callback(&server, deadline))
         .await
         .map_err(|e| eyre::eyre!("callback task failed: {e}"))??;
 
+    // Pass the full callback URL so rmcp also sees the RFC 9207 `iss` parameter
+    // (some authorization servers require it or the exchange fails).
     oauth_state
-        .handle_callback(&code, &state)
+        .handle_callback_url(&callback_url)
         .await
         .map_err(|e| eyre::eyre!("exchange authorization code for tokens: {e}"))?;
 
@@ -255,9 +277,10 @@ async fn persist_manager_credentials(url: &str, manager: &AuthorizationManager) 
 }
 
 /// Block until the OAuth redirect hits the loopback server (or `deadline`);
-/// return `(code, state)`. Uses `recv_timeout` so the caller can bound the wait
-/// without leaving a wedged blocking task.
-fn wait_for_callback(server: &tiny_http::Server, deadline: Instant) -> Result<(String, String)> {
+/// return the FULL callback URL (so the caller can forward `code`/`state`/`iss`
+/// to rmcp). Uses `recv_timeout` so the caller can bound the wait without
+/// leaving a wedged blocking task.
+fn wait_for_callback(server: &tiny_http::Server, deadline: Instant) -> Result<String> {
     loop {
         if Instant::now() >= deadline {
             eyre::bail!("timed out waiting for authorization (>{LOGIN_TIMEOUT:?})");
@@ -268,15 +291,15 @@ fn wait_for_callback(server: &tiny_http::Server, deadline: Instant) -> Result<(S
             Err(e) => eyre::bail!("receive callback request: {e}"),
         };
         // `req.url()` is just the path+query; wrap it so `url` can parse it.
-        let full = format!("http://localhost{}", req.url());
+        let full = format!("http://127.0.0.1{}", req.url());
         let parsed =
             url::Url::parse(&full).map_err(|e| eyre::eyre!("parse callback url: {e}"))?;
 
-        let (mut code, mut state, mut err) = (None, None, None);
+        let (mut has_code, mut has_state, mut err) = (false, false, None);
         for (k, v) in parsed.query_pairs() {
             match k.as_ref() {
-                "code" => code = Some(v.into_owned()),
-                "state" => state = Some(v.into_owned()),
+                "code" => has_code = true,
+                "state" => has_state = true,
                 "error" => err = Some(v.into_owned()),
                 _ => {}
             }
@@ -288,11 +311,12 @@ fn wait_for_callback(server: &tiny_http::Server, deadline: Instant) -> Result<(S
             )));
             eyre::bail!("authorization denied by provider: {e}");
         }
-        if let (Some(c), Some(s)) = (code, state) {
+        if has_code && has_state {
             let _ = req.respond(tiny_http::Response::from_string(
                 "octos authorization complete \u{2014} you can close this tab.",
             ));
-            return Ok((c, s));
+            // Return the full URL (incl. any `iss`) for rmcp to parse.
+            return Ok(full);
         }
         // Stray request (e.g. favicon) — 404 and keep waiting.
         let _ = req.respond(
@@ -319,6 +343,20 @@ mod tests {
         assert_ne!(
             keyring_key("https://a.example/mcp"),
             keyring_key("https://b.example/mcp")
+        );
+    }
+
+    #[test]
+    fn keyring_key_preserves_case_sensitive_path() {
+        // Scheme/host are case-insensitive (normalize equal), but paths are not
+        // — /MCP and /mcp must map to distinct keyring entries.
+        assert_eq!(
+            keyring_key("HTTPS://Host.Example/mcp"),
+            keyring_key("https://host.example/mcp")
+        );
+        assert_ne!(
+            keyring_key("https://host.example/MCP"),
+            keyring_key("https://host.example/mcp")
         );
     }
 }

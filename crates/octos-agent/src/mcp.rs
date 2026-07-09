@@ -123,30 +123,50 @@ fn octos_client_info() -> ClientInfo {
     info
 }
 
+/// A reqwest DNS resolver that rejects any host resolving to a private,
+/// loopback, link-local, or otherwise-blocked address. Applied to EVERY request
+/// the client makes — the MCP transport *and* (for OAuth) every metadata /
+/// registration / token / refresh endpoint the server advertises — so a public
+/// MCP server can't point us at `127.0.0.1` / `169.254.169.254` / RFC1918. Also
+/// re-checks on each resolve, defeating DNS rebinding.
+#[derive(Debug)]
+struct SsrfDnsResolver;
+
+impl reqwest_rmcp::dns::Resolve for SsrfDnsResolver {
+    fn resolve(&self, name: reqwest_rmcp::dns::Name) -> reqwest_rmcp::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0u16))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("no addresses resolved for '{host}'").into());
+            }
+            if let Some(bad) = addrs.iter().find(|a| crate::tools::ssrf::is_private_ip(&a.ip())) {
+                return Err(format!(
+                    "SSRF blocked: '{host}' resolves to private/blocked address {}",
+                    bad.ip()
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest_rmcp::dns::Addrs)
+        })
+    }
+}
+
 /// Build a reqwest client (rmcp's 0.13 major) for talking to a remote MCP
-/// server: SSRF-validated, DNS-pinned to the vetted resolved addresses, with
-/// redirects refused (a 3xx must not smuggle us to a private/metadata host),
-/// carrying the configured headers verbatim. Shared by the static-HTTP and
-/// OAuth transports.
-pub(crate) async fn build_pinned_http_client(
-    url: &str,
+/// server: SSRF-filtered on every host via [`SsrfDnsResolver`], redirects
+/// refused (a 3xx must not smuggle us to a private/metadata host), carrying the
+/// configured headers verbatim. Shared by the static-HTTP and OAuth transports
+/// (and, for OAuth, reused for the discovery/token client so those requests are
+/// SSRF-filtered too).
+pub(crate) fn build_ssrf_http_client(
     headers: &HashMap<String, String>,
 ) -> Result<reqwest_rmcp::Client> {
-    let check = crate::tools::ssrf::check_ssrf_with_addrs(url)
-        .await
-        .map_err(|e| eyre::eyre!("SSRF check failed for MCP url '{url}': {e}"))?;
-    let host = reqwest_rmcp::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .ok_or_else(|| eyre::eyre!("MCP url '{url}' has no host"))?;
-
-    let mut builder =
-        reqwest_rmcp::Client::builder().redirect(reqwest_rmcp::redirect::Policy::none());
-    // Pin the vetted addresses so a rebind can't swap in a private target
-    // between the check and the connection (empty for literal public IPs).
-    if !check.resolved_addrs.is_empty() {
-        builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
-    }
+    let mut builder = reqwest_rmcp::Client::builder()
+        .redirect(reqwest_rmcp::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(SsrfDnsResolver) as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>);
     if !headers.is_empty() {
         let mut hmap = reqwest_rmcp::header::HeaderMap::new();
         for (k, v) in headers {
@@ -326,6 +346,12 @@ impl McpClient {
             cmd.env(k, v);
         }
 
+        // NOTE: rmcp's child-process transport reads JSON-RPC frames with an
+        // unbounded `read_until`, so it lacks the old client's MAX_LINE_BYTES
+        // guard. A malicious frame could grow memory before schema validation.
+        // Accepted for now: stdio servers are operator-configured local binaries
+        // (the operator already trusts the executable they named). A bounded
+        // frame codec would require a custom transport; tracked as a follow-up.
         let (transport, _stderr) = TokioChildProcess::builder(cmd)
             .stderr(Stdio::inherit())
             .spawn()
@@ -350,9 +376,9 @@ impl McpClient {
             return crate::mcp_auth::connect_oauth(config, url, octos_client_info()).await;
         }
 
-        // SSRF-validated + DNS-pinned + no-redirect client carrying the
-        // configured headers verbatim (no double `Bearer`, custom headers kept).
-        let client = build_pinned_http_client(url, &config.headers).await?;
+        // SSRF-filtered + no-redirect client carrying the configured headers
+        // verbatim (no double `Bearer`, custom headers kept).
+        let client = build_ssrf_http_client(&config.headers)?;
         let transport = StreamableHttpClientTransport::with_client(
             client,
             StreamableHttpClientTransportConfig::with_uri(url.to_string()),
