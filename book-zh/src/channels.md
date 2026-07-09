@@ -356,10 +356,13 @@ export DINGTALK_BOT_SECRET="SEC..."
 }
 ```
 
-入站事件请将钉钉 outgoing 机器人的回调 URL 配置为：
+入站事件请配置钉钉 outgoing 机器人的回调 URL。在 `octos serve` 之后使用代理路由；在独立的 `octos gateway` 模式下，则指向该渠道自带的 webhook 服务器（`webhook_port`）：
 
 ```text
+# 在 octos serve 之后（代理）
 https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
+# 独立的 octos gateway
+http://YOUR_OCTOS_HOST:<webhook_port>/dingtalk/webhook
 ```
 
 使用 `dingtalk` 特性标志编译：
@@ -397,7 +400,7 @@ Matrix 是一等公民频道，也是本章多处提到的「人工审批」与�
 }
 ```
 
-登录时提供 `access_token`（推荐）或 `password` 之一。`auto_join`（`off` / `allowlist` / `always`）控制邀请的自动接受；在 `allowlist` 下，`auto_join_allowlist` 列出被接受邀请的**房间 ID / 别名**（或 `*`）——按房间匹配，而非邀请者用户 ID——为空时回退到 `rooms`。`OCTOS_MATRIX_BOT_USER_ID` 与 `MATRIX_APPROVER` 也可通过环境变量提供。
+使用 `access_token`（推荐）登录，或使用 `user_id` + `password`（密码登录两者都必需）。`auto_join`（`off` / `allowlist` / `always`）控制邀请的自动接受；在 `allowlist` 下，`auto_join_allowlist` 列出被接受邀请的**房间 ID / 别名**（或 `*`）——按房间匹配，而非邀请者用户 ID——为空时回退到 `rooms`。`OCTOS_MATRIX_BOT_USER_ID` 与 `MATRIX_APPROVER` 也可通过环境变量提供。
 
 ### appservice 模式
 

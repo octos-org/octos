@@ -99,10 +99,13 @@ export DINGTALK_BOT_SECRET="SEC..."
 }
 ```
 
-For inbound events, configure the DingTalk outgoing robot callback URL as:
+For inbound events, configure the DingTalk outgoing robot callback URL. Behind `octos serve`, use the proxy route; in standalone `octos gateway` mode, point at the channel's own webhook server on `webhook_port`:
 
 ```text
+# behind octos serve (proxy)
 https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
+# standalone octos gateway
+http://YOUR_OCTOS_HOST:<webhook_port>/dingtalk/webhook
 ```
 
 Build with the `dingtalk` feature flag:
@@ -397,7 +400,7 @@ When `mode` is omitted the gateway falls back to **`appservice`** (which then re
 }
 ```
 
-Provide either an `access_token` (preferred) or a `password` to log in. `auto_join` (`off` / `allowlist` / `always`) controls invite auto-accept; under `allowlist`, `auto_join_allowlist` lists the **room IDs / aliases** (or `*`) whose invites are accepted — matched against rooms, not inviter user IDs — and falls back to `rooms` when empty. `OCTOS_MATRIX_BOT_USER_ID` and `MATRIX_APPROVER` may be supplied via the environment.
+Log in with an `access_token` (preferred), or with `user_id` + `password` (both are required for password login). `auto_join` (`off` / `allowlist` / `always`) controls invite auto-accept; under `allowlist`, `auto_join_allowlist` lists the **room IDs / aliases** (or `*`) whose invites are accepted — matched against rooms, not inviter user IDs — and falls back to `rooms` when empty. `OCTOS_MATRIX_BOT_USER_ID` and `MATRIX_APPROVER` may be supplied via the environment.
 
 ### Appservice mode
 

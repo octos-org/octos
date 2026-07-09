@@ -520,7 +520,7 @@ When the conversation exceeds the LLM's context window, older messages are autom
 
 | Command | Description |
 |---------|-------------|
-| `/new [name]` | Fork a new session (copies the last 10 messages, tracks `parent_key`); `/new slides <name>` / `/new site <preset>` scaffold a project |
+| `/new [name]` | Start (or switch to) a session; `/new <name>` names it, `/new slides <name>` / `/new site <preset>` scaffold a project |
 | `/clear` | Wipe the current session's history |
 | `/s`, `/switch <name>` | Switch to a named session |
 | `/sessions` | List sessions for this chat |
