@@ -94,6 +94,7 @@ use super::master_continuation_scheduler::{
 };
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
+use super::skill_action_jobs::{SkillActionJobRecord, SkillActionJobStore};
 use super::specialist_runner::{
     AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
     SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
@@ -195,6 +196,8 @@ const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 const APPUI_METHOD_SKILL_ACTION_LIST: &str = "skill/action/list";
 const APPUI_METHOD_SKILL_ACTION_INVOKE: &str = "skill/action/invoke";
+const APPUI_METHOD_SKILL_ACTION_JOB_LIST: &str = "skill/action/job/list";
+const APPUI_METHOD_SKILL_ACTION_JOB_READ: &str = "skill/action/job/read";
 /// #1057: M22 TUI Solo Onboarding backend support contract.
 ///
 /// Backend-owned workspace validation/status for onboarding. Resolves the
@@ -212,6 +215,7 @@ const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 const APPUI_FEATURE_SKILL_ACTIONS_V1: &str = "skill.actions.v1";
+const APPUI_FEATURE_SKILL_ACTION_JOBS_V1: &str = "skill.action_jobs.v1";
 /// #1057: backend onboarding support contract — TUI Solo Onboarding (M22).
 /// Advertises `onboarding/workspace_probe`, which canonicalizes a workspace
 /// candidate path, reports existence/writability, surfaces
@@ -245,6 +249,8 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_SKILL_ACTION_LIST,
     APPUI_METHOD_SKILL_ACTION_INVOKE,
+    APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+    APPUI_METHOD_SKILL_ACTION_JOB_READ,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
@@ -1429,6 +1435,10 @@ impl ConnectionUiFeatures {
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_SKILL_ACTIONS_V1,
             );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
+            );
         }
         // #965 / UPCR-2026-019 — advertise the M13-A canonical capability
         // names alongside the consolidated `coding.agent_control.v1` so
@@ -1490,6 +1500,8 @@ fn is_profile_skill_appui_method(method: &str) -> bool {
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
             | APPUI_METHOD_SKILL_ACTION_LIST
             | APPUI_METHOD_SKILL_ACTION_INVOKE
+            | APPUI_METHOD_SKILL_ACTION_JOB_LIST
+            | APPUI_METHOD_SKILL_ACTION_JOB_READ
     )
 }
 
@@ -5466,6 +5478,26 @@ struct RawSkillActionInvokeParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawSkillActionJobListParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    batch_id: Option<String>,
+    #[serde(default)]
+    action_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSkillActionJobReadParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    session_id: SessionKey,
+    job_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawProfileSkillsRegistrySearchParams {
     #[serde(default)]
     profile_id: Option<String>,
@@ -7433,6 +7465,113 @@ async fn raw_skill_action_invoke(
     .await
 }
 
+fn skill_action_job_store_for_profile(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+) -> Result<(String, SkillActionJobStore), RpcError> {
+    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string();
+    if let Some(runtime) = state.profiles.get(&profile_id) {
+        return Ok((
+            profile_id,
+            SkillActionJobStore::open(runtime.data_dir.as_path()),
+        ));
+    }
+
+    let store = profile_store(state)?;
+    let profile = store
+        .get(&profile_id)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?
+        .ok_or_else(|| profile_unresolved_error(&profile_id))?;
+    let data_dir = store.resolve_data_dir(&profile);
+    Ok((profile_id, SkillActionJobStore::open(data_dir)))
+}
+
+fn skill_action_job_record_to_value(job: SkillActionJobRecord) -> Result<Value, RpcError> {
+    serde_json::to_value(job).map_err(|error| {
+        RpcError::internal_error(format!("failed to serialize skill action job: {error}"))
+    })
+}
+
+fn raw_skill_action_job_list(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionJobListParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let active_profile_id = validate_session_scope(
+        &session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let (profile_id, store) =
+        skill_action_job_store_for_profile(state, active_profile_id.as_deref())?;
+    let mut jobs = store.list(&session_id).map_err(|error| {
+        RpcError::internal_error(format!("failed to list skill action jobs: {error}"))
+    })?;
+    if let Some(batch_id) = params
+        .batch_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        jobs.retain(|job| job.batch_id == batch_id);
+    }
+    if let Some(action_id) = params
+        .action_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        jobs.retain(|job| job.action_id == action_id);
+    }
+    let jobs = jobs
+        .into_iter()
+        .map(skill_action_job_record_to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "profile_id": profile_id,
+        "session_id": session_id,
+        "count": jobs.len(),
+        "jobs": jobs,
+    }))
+}
+
+fn raw_skill_action_job_read(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionJobReadParams = parse_raw_params(request)?;
+    let active_profile_id = validate_session_scope(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let (_profile_id, store) =
+        skill_action_job_store_for_profile(state, active_profile_id.as_deref())?;
+    let Some(job) = store
+        .read(&params.session_id, &params.job_id)
+        .map_err(|error| {
+            RpcError::internal_error(format!("failed to read skill action job: {error}"))
+        })?
+    else {
+        return Err(RpcError::invalid_params(format!(
+            "skill action job '{}' was not found",
+            params.job_id
+        ))
+        .with_data(json!({
+            "kind": "skill_action_job_not_found",
+            "job_id": params.job_id,
+        })));
+    };
+    Ok(json!({
+        "job": skill_action_job_record_to_value(job)?,
+    }))
+}
+
 async fn raw_profile_skills_registry_search(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
@@ -8393,6 +8532,12 @@ async fn handle_raw_appui_rpc(
         }
         APPUI_METHOD_SKILL_ACTION_INVOKE => {
             raw_skill_action_invoke(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
+            raw_skill_action_job_list(state, request, connection_profile_id)
+        }
+        APPUI_METHOD_SKILL_ACTION_JOB_READ => {
+            raw_skill_action_job_read(state, request, connection_profile_id)
         }
         APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
             raw_profile_skills_registry_search(state, request, connection_profile_id).await
@@ -23817,6 +23962,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_)
             | UiNotification::VoiceExit(_)
+            | UiNotification::SkillActionJobUpdated(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)
@@ -24096,6 +24242,26 @@ mod tests {
             | APPUI_METHOD_REVIEW_START => json!({}),
             APPUI_METHOD_PROFILE_SKILLS_LIST | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
                 json!({ "profile_id": 42 })
+            }
+            APPUI_METHOD_SKILL_ACTION_LIST => {
+                json!({ "session_id": session_id, "profile_id": "dispatch-parity" })
+            }
+            APPUI_METHOD_SKILL_ACTION_INVOKE => {
+                json!({
+                    "session_id": session_id,
+                    "profile_id": "dispatch-parity",
+                    "action_id": "missing-action"
+                })
+            }
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
+                json!({ "session_id": session_id, "profile_id": "dispatch-parity" })
+            }
+            APPUI_METHOD_SKILL_ACTION_JOB_READ => {
+                json!({
+                    "session_id": session_id,
+                    "profile_id": "dispatch-parity",
+                    "job_id": "missing-job"
+                })
             }
             APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => json!({ "path": "." }),
             methods::AGENT_LIST
@@ -26046,6 +26212,85 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+    }
+
+    #[test]
+    fn skill_action_job_methods_are_advertised_when_profile_store_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile_state(dir.path());
+        let local_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&local);
+
+        for method in [
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+            APPUI_METHOD_SKILL_ACTION_JOB_READ,
+        ] {
+            assert!(
+                local_capabilities
+                    .supported_methods
+                    .iter()
+                    .any(|advertised| advertised == method),
+                "{method} should be advertised with a profile store"
+            );
+        }
+        assert!(local_capabilities.supports_feature(APPUI_FEATURE_SKILL_ACTION_JOBS_V1));
+
+        let no_profile_capabilities =
+            ConnectionUiFeatures::default().advertised_capabilities(&AppState::empty_for_tests());
+        assert!(
+            !no_profile_capabilities
+                .supported_methods
+                .iter()
+                .any(|method| {
+                    method == APPUI_METHOD_SKILL_ACTION_JOB_LIST
+                        || method == APPUI_METHOD_SKILL_ACTION_JOB_READ
+                })
+        );
+        assert!(!no_profile_capabilities.supports_feature(APPUI_FEATURE_SKILL_ACTION_JOBS_V1));
+    }
+
+    #[test]
+    fn skill_action_job_list_requires_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let request = RpcRequest::new(
+            "job-list-missing-session",
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+            json!({ "profile_id": "alan0x" }),
+        );
+
+        let error = raw_skill_action_job_list(&state, &request, None).unwrap_err();
+
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert!(error.message.contains("session_id is required"));
+    }
+
+    #[test]
+    fn skill_action_job_read_returns_unknown_job_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .save(&default_profile("alan0x"))
+            .unwrap();
+        let request = RpcRequest::new(
+            "job-read-missing",
+            APPUI_METHOD_SKILL_ACTION_JOB_READ,
+            json!({
+                "profile_id": "alan0x",
+                "session_id": "web-abc",
+                "job_id": "missing-job"
+            }),
+        );
+
+        let error = raw_skill_action_job_read(&state, &request, None).unwrap_err();
+
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("skill_action_job_not_found"))
+        );
     }
 
     #[test]

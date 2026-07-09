@@ -1072,6 +1072,9 @@ pub mod methods {
     /// playing — it must NOT navigate before the reply audio drains. Ungated;
     /// emitted on the same ledger-backed live path as `file/attached`.
     pub const VOICE_EXIT: &str = "voice/exit";
+    /// UPCR-2026-027 `skill/action/job/updated` — latest persisted snapshot
+    /// for a manifest-declared background skill action job.
+    pub const SKILL_ACTION_JOB_UPDATED: &str = "skill/action/job/updated";
     /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
     /// envelope notification (spec § 14). γ-1 reserves the method name
     /// in the notification methods list as part of capability negotiation
@@ -1254,6 +1257,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::VISUAL_SUCCEEDED,
     methods::VISUAL_FAILED,
     methods::VOICE_EXIT,
+    methods::SKILL_ACTION_JOB_UPDATED,
     methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
     methods::ROUTER_STATUS,
@@ -5609,6 +5613,17 @@ pub struct QueueStateEvent {
     pub head_client_message_id: Option<String>,
 }
 
+/// UPCR-2026-027 — latest background skill action job snapshot.
+///
+/// `job` is intentionally a generic JSON object at the core protocol layer so
+/// octos-core does not depend on a specific host-side job store type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillActionJobUpdatedEvent {
+    pub profile_id: String,
+    pub session_id: SessionKey,
+    pub job: Value,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -5627,6 +5642,8 @@ pub enum UiNotification {
     /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
     /// goodbye / mute intent; the client returns home after the farewell audio.
     VoiceExit(VoiceExitEvent),
+    /// UPCR-2026-027: latest background skill action job snapshot.
+    SkillActionJobUpdated(SkillActionJobUpdatedEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
     ToolCompleted(ToolCompletedEvent),
@@ -5726,6 +5743,7 @@ impl UiNotification {
             Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
             Self::VisualFailed(_) => methods::VISUAL_FAILED,
             Self::VoiceExit(_) => methods::VOICE_EXIT,
+            Self::SkillActionJobUpdated(_) => methods::SKILL_ACTION_JOB_UPDATED,
             Self::ToolStarted(_) => methods::TOOL_STARTED,
             Self::ToolProgress(_) => methods::TOOL_PROGRESS,
             Self::ToolCompleted(_) => methods::TOOL_COMPLETED,
@@ -5773,6 +5791,7 @@ impl UiNotification {
             Self::VisualSucceeded(event) => &event.session_id,
             Self::VisualFailed(event) => &event.session_id,
             Self::VoiceExit(event) => &event.session_id,
+            Self::SkillActionJobUpdated(event) => &event.session_id,
             Self::ToolStarted(event) => &event.session_id,
             Self::ToolProgress(event) => &event.session_id,
             Self::ToolCompleted(event) => &event.session_id,
@@ -5921,6 +5940,7 @@ impl UiNotification {
             Self::VisualSucceeded(params) => serde_json::to_value(params),
             Self::VisualFailed(params) => serde_json::to_value(params),
             Self::VoiceExit(params) => serde_json::to_value(params),
+            Self::SkillActionJobUpdated(params) => serde_json::to_value(params),
             Self::ToolStarted(params) => serde_json::to_value(params),
             Self::ToolProgress(params) => serde_json::to_value(params),
             Self::ToolCompleted(params) => serde_json::to_value(params),
@@ -6025,6 +6045,9 @@ impl UiNotification {
             methods::VISUAL_SUCCEEDED => Ok(Self::VisualSucceeded(decode_params(method, params)?)),
             methods::VISUAL_FAILED => Ok(Self::VisualFailed(decode_params(method, params)?)),
             methods::VOICE_EXIT => Ok(Self::VoiceExit(decode_params(method, params)?)),
+            methods::SKILL_ACTION_JOB_UPDATED => {
+                Ok(Self::SkillActionJobUpdated(decode_params(method, params)?))
+            }
             methods::TOOL_STARTED => Ok(Self::ToolStarted(decode_params(method, params)?)),
             methods::TOOL_PROGRESS => Ok(Self::ToolProgress(decode_params(method, params)?)),
             methods::TOOL_COMPLETED => Ok(Self::ToolCompleted(decode_params(method, params)?)),
@@ -6111,6 +6134,11 @@ impl UiNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn skill_action_job_updated_notification_method_is_registered() {
+        assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::SKILL_ACTION_JOB_UPDATED));
+    }
 
     #[test]
     fn compare_protocol_compatible_for_full_protocol_with_known_features() {
