@@ -899,7 +899,9 @@ fn build_volcano(
 
 /// HTTPS Volcano TTS hosts the token may be sent to. Keep this tight — it is the
 /// SSRF / token-exfiltration boundary for the partly tenant-controlled endpoint.
-const VOLCANO_ALLOWED_HOSTS: &[&str] = &["openspeech.bytedance.com"];
+/// Shared with the ws_binary streaming path ([`crate::api::volcano_ws`]) so both
+/// transports enforce the same boundary.
+pub(crate) const VOLCANO_ALLOWED_HOSTS: &[&str] = &["openspeech.bytedance.com"];
 
 /// True only for an `https://` URL whose host is in [`VOLCANO_ALLOWED_HOSTS`].
 fn is_allowed_volcano_endpoint(endpoint: &str) -> bool {
@@ -934,18 +936,27 @@ fn resolve_volcano(cloud: Option<&CloudTtsConfig>) -> Option<VolcanoTts> {
     )
 }
 
-/// HTTP client for Volcano TTS, with redirects DISABLED. Even though the
+/// Process-wide HTTP client for Volcano TTS, with redirects DISABLED. Even though the
 /// endpoint is allowlisted to an HTTPS Volcano host, that host could still
 /// respond with a 3xx to an off-allowlist address; `reqwest` would otherwise
 /// follow it and 307/308 preserve the POST body — replaying the token to the
 /// redirect target. `Policy::none()` makes a redirect a terminal response we
-/// never follow, closing that exfiltration path.
-fn volcano_http_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"))
-        .ok()
+/// never follow, closing that exfiltration path. The client is reused across
+/// per-sentence syntheses so each sentence does not pay a fresh TCP+TLS
+/// handshake to Volcano.
+fn volcano_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"),
+                )
+                .ok()
+        })
+        .as_ref()
 }
 
 /// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
@@ -1012,6 +1023,48 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
 ///
 /// `voice` is the on-device voice preset (voices.json); the cloud route uses
 /// its own `VOLC_TTS_VOICE` env instead. Returns `None` on failure.
+/// Streaming cloud-TTS variant: synthesize `text` over the Volcano v1 ws
+/// `submit` protocol and invoke `on_chunk(bytes, is_last, mime)` for each audio
+/// frame as it arrives. Returns `Some(())` when the cloud stream completed (the
+/// caller delivered audio progressively and should NOT also write a file), or
+/// `None` when the request is not cloud-routed / env is missing / the stream
+/// failed — in which case the caller falls back to [`synthesize_reply`].
+///
+/// Only the cloud (`"auto"`/`"cloud"`/`"volcano"`) route streams; on-device
+/// engines keep the whole-file path. Voice/speed come from the same resolved
+/// cloud config as the non-streaming cloud path.
+pub(crate) async fn synthesize_reply_streaming(
+    text: &str,
+    provider: &str,
+    cloud: Option<&CloudTtsConfig>,
+    mut on_chunk: impl FnMut(&[u8], bool, &str),
+) -> Option<()> {
+    if !wants_cloud(provider) {
+        return None;
+    }
+    let speak = ensure_terminal_punctuation(&clean_for_tts(text));
+    if speak.trim().is_empty() {
+        return None;
+    }
+    let cfg = resolve_volcano(cloud)?;
+    let mime = match cfg.encoding.as_str() {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "ogg_opus" => "audio/ogg",
+        _ => "audio/mpeg",
+    };
+    crate::api::volcano_ws::synthesize_ws_stream(
+        &cfg.appid,
+        &cfg.token,
+        &cfg.cluster,
+        &cfg.voice,
+        &cfg.encoding,
+        &speak,
+        |bytes, last| on_chunk(bytes, last, mime),
+    )
+    .await
+}
+
 pub(crate) async fn synthesize_reply(
     text: &str,
     voice: &str,
@@ -1067,6 +1120,104 @@ pub(crate) async fn synthesize_reply(
             tracing::warn!(error = %e, "voice_turn: synthesis failed");
             None
         }
+    }
+}
+
+// Voice fail-fast spoken-error lines. Wording is示意 and tweakable; the
+// bucketing / precedence is what matters.
+const SPEAK_QUOTA: &str = "我这会儿有点忙不过来，稍后再跟我说一次好吗？";
+const SPEAK_RATE: &str = "请求有点多，等几秒再说一遍？";
+const SPEAK_NET: &str = "网络好像不太稳，再说一遍试试？";
+const SPEAK_CTX: &str = "我们聊得有点长了，新开一段再聊吧。";
+const SPEAK_FILTERED: &str = "这个我可能没法回答。";
+const SPEAK_GENERIC: &str = "抱歉，我这边出了点小问题，稍后再试。";
+const SPEAK_EMPTY: &str = "我好像没太听清，再说一遍？";
+
+/// Map a fail-fast [`octos_agent::TurnFailure`] to a short spoken line.
+///
+/// Strongly-typed [`octos_agent::HarnessError`] variants map directly;
+/// `Internal` / `ProviderUnavailable` (where a streaming 429 loses its
+/// quota/rate-limit signal through `classify_report`) fall back to a
+/// raw-detail substring scan so the most common 429 still hits the right
+/// line. `ContentFiltered` is never spoken as "didn't catch that". Returns a
+/// `&'static str` so the caller feeds it straight through the normal TTS path.
+pub(crate) fn voice_error_speech(f: &octos_agent::TurnFailure) -> &'static str {
+    use octos_agent::{HarnessError as H, TurnFailure};
+    let (error, raw) = match f {
+        TurnFailure::EmptyResponse => return SPEAK_EMPTY,
+        TurnFailure::LlmError { error, raw_detail } => (error, raw_detail.to_lowercase()),
+    };
+    match error {
+        H::Quota { .. } => SPEAK_QUOTA,
+        H::RateLimited { .. } => SPEAK_RATE,
+        H::Network { .. } | H::Timeout { .. } => SPEAK_NET,
+        H::ContextOverflow { .. } => SPEAK_CTX,
+        H::ContentFiltered { .. } => SPEAK_FILTERED,
+        H::Authentication { .. } | H::InvalidRequest { .. } => SPEAK_GENERIC,
+        H::Internal { .. } | H::ProviderUnavailable { .. } => {
+            if raw.contains("token_quota_exceeded") || raw.contains("quota") {
+                SPEAK_QUOTA
+            } else if raw.contains("429") || raw.contains("rate limit") {
+                SPEAK_RATE
+            } else if raw.contains("timeout") || raw.contains("network") {
+                SPEAK_NET
+            } else {
+                SPEAK_GENERIC
+            }
+        }
+        _ => SPEAK_GENERIC,
+    }
+}
+
+#[cfg(test)]
+mod voice_error_speech_tests {
+    use octos_agent::{HarnessError, TurnFailure};
+
+    use super::voice_error_speech;
+
+    fn llm(error: HarnessError, raw: &str) -> TurnFailure {
+        TurnFailure::LlmError {
+            error,
+            raw_detail: raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn typed_quota_speaks_busy() {
+        let f = llm(
+            HarnessError::Quota {
+                message: "..".into(),
+            },
+            "..",
+        );
+        assert!(voice_error_speech(&f).contains('忙'));
+    }
+
+    #[test]
+    fn streaming_429_internal_rescued_to_quota_via_raw_detail() {
+        let f = llm(
+            HarnessError::Internal {
+                message: "stream".into(),
+            },
+            r#"{"code":"token_quota_exceeded"} HTTP 429"#,
+        );
+        assert!(voice_error_speech(&f).contains('忙'));
+    }
+
+    #[test]
+    fn empty_response_speaks_didnt_catch() {
+        assert!(voice_error_speech(&TurnFailure::EmptyResponse).contains("没太听清"));
+    }
+
+    #[test]
+    fn content_filtered_is_not_didnt_catch() {
+        let f = llm(
+            HarnessError::ContentFiltered {
+                message: "..".into(),
+            },
+            "..",
+        );
+        assert!(voice_error_speech(&f).contains("没法回答"));
     }
 }
 
@@ -1244,6 +1395,19 @@ mod tests {
             resp.status().as_u16(),
             307,
             "redirects must NOT be followed (token would leak to the target)"
+        );
+    }
+
+    #[test]
+    fn volcano_client_is_reused_across_calls() {
+        // Per-sentence synthesis must not rebuild the HTTP client each time —
+        // a fresh client per sentence pays a new TCP+TLS handshake to bytedance.
+        // A shared process-wide client returns the same instance every call.
+        let a = volcano_http_client().expect("client builds");
+        let b = volcano_http_client().expect("client builds");
+        assert!(
+            std::ptr::eq(a, b),
+            "volcano TTS client should be a shared instance, not rebuilt per call"
         );
     }
 

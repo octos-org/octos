@@ -2268,8 +2268,10 @@ impl LlmProvider for AdaptiveRouter {
             "adaptive router selected provider"
         );
 
+        let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+
         // ── Hedged racing: fire to 2 providers, take the winner ────────
-        if mode == AdaptiveMode::Hedge && self.slots.len() > 1 {
+        if !fail_fast && mode == AdaptiveMode::Hedge && self.slots.len() > 1 {
             if let Some(result) = self.hedged_chat(start_idx, messages, tools, config).await {
                 return result;
             }
@@ -2283,7 +2285,7 @@ impl LlmProvider for AdaptiveRouter {
         match self.try_chat(start_idx, messages, tools, config).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                if self.slots.len() == 1 {
+                if self.slots.len() == 1 || fail_fast {
                     return Err(e);
                 }
 
@@ -2355,6 +2357,7 @@ impl LlmProvider for AdaptiveRouter {
         // Classify the turn before lane selection (see invariant #5 above).
         let _classifier_decision = self.classify_turn(messages);
         let (start_idx, _is_probe) = self.select_provider();
+        let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
 
         // Wave4-A: failover elapsed-time anchor — see equivalent comment
         // in `chat()` above.
@@ -2365,7 +2368,7 @@ impl LlmProvider for AdaptiveRouter {
         {
             Ok(stream) => Ok(stream),
             Err(e) => {
-                if self.slots.len() == 1 {
+                if self.slots.len() == 1 || fail_fast {
                     return Err(e);
                 }
 
@@ -4779,5 +4782,167 @@ mod tests {
         // to single-provider path against the primary (anthropic
         // is in-lane).
         assert_eq!(resp.content.as_deref(), Some("from-anthropic"));
+    }
+
+    // ── FailFast policy tests ─────────────────────────────────────────────
+
+    /// FailFast must skip hedged_chat entirely: two successful providers
+    /// under Hedge mode should see a combined call count of exactly 1.
+    #[tokio::test]
+    async fn should_call_single_provider_when_failfast_in_hedge_mode() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider {
+            name: &'static str,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for CountingProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ChatResponse {
+                    content: Some(format!("from-{}", self.name)),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+
+            fn model_id(&self) -> &str {
+                "m1"
+            }
+
+            fn provider_name(&self) -> &str {
+                self.name
+            }
+        }
+
+        let calls0 = Arc::new(AtomicUsize::new(0));
+        let calls1 = Arc::new(AtomicUsize::new(0));
+
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(CountingProvider {
+                    name: "provider-a",
+                    calls: calls0.clone(),
+                }),
+                Arc::new(CountingProvider {
+                    name: "provider-b",
+                    calls: calls1.clone(),
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        let _ = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        let total = calls0.load(Ordering::SeqCst) + calls1.load(Ordering::SeqCst);
+        assert_eq!(
+            total, 1,
+            "FailFast must skip hedged_chat (no proactive double-call); got {total}"
+        );
+    }
+
+    /// FailFast must NOT failover after an error: with two providers where
+    /// the first fails, FailFast should return the error without trying
+    /// the second provider.
+    #[tokio::test]
+    async fn should_not_failover_when_failfast_and_primary_fails() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider {
+            name: &'static str,
+            fail: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for CountingProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail {
+                    eyre::bail!("500 server error from {}", self.name);
+                }
+                Ok(ChatResponse {
+                    content: Some(format!("from-{}", self.name)),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+
+            fn model_id(&self) -> &str {
+                "m1"
+            }
+
+            fn provider_name(&self) -> &str {
+                self.name
+            }
+        }
+
+        let calls0 = Arc::new(AtomicUsize::new(0));
+        let calls1 = Arc::new(AtomicUsize::new(0));
+
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(CountingProvider {
+                    name: "failing-primary",
+                    fail: true,
+                    calls: calls0.clone(),
+                }),
+                Arc::new(CountingProvider {
+                    name: "good-fallback",
+                    fail: false,
+                    calls: calls1.clone(),
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err(), "FailFast should propagate the error");
+        assert_eq!(
+            calls0.load(Ordering::SeqCst),
+            1,
+            "primary should be called exactly once"
+        );
+        assert_eq!(
+            calls1.load(Ordering::SeqCst),
+            0,
+            "FailFast must NOT call fallback provider"
+        );
     }
 }

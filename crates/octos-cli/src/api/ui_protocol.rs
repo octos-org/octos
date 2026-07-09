@@ -56,13 +56,14 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
+    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
+    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
+    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
     progress_kinds, thread_status,
 };
 use octos_core::{
@@ -1021,6 +1022,11 @@ struct ConnectionUiFeatures {
     /// where the richer envelopes' placement logic dropped PPTX
     /// deliveries on the SPA's chat thread.
     file_attached: bool,
+    /// `event.voice_audio.v1` negotiated. When set, the voice turn streams
+    /// reply audio as `voice/audio_chunk` notifications (base64 frames) for
+    /// progressive MSE playback; otherwise it falls back to whole-file
+    /// `file/attached` audio.
+    voice_audio: bool,
     /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
     /// the client opts in to the canonical [`Envelope`] shape (spec
     /// § 14) for projected events. γ-1 wires capability negotiation
@@ -1111,6 +1117,7 @@ impl ConnectionUiFeatures {
             ),
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
+            voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             projection_envelope: has_ui_feature(
                 headers,
                 query,
@@ -1167,6 +1174,7 @@ impl ConnectionUiFeatures {
             message_persisted: true,
             spawn_complete: true,
             file_attached: true,
+            voice_audio: true,
             // Do NOT auto-enable `projection.envelope.v1` for stdio
             // connections. Legacy `turn/completed` is the turn-lifecycle
             // source for clients that do not consume `projection/envelope`
@@ -1219,6 +1227,7 @@ impl ConnectionUiFeatures {
             message_persisted: has(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
+            voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
@@ -1282,6 +1291,9 @@ impl ConnectionUiFeatures {
         }
         if self.file_attached {
             requested.push(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1);
+        }
+        if self.voice_audio {
+            requested.push(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1);
         }
         if self.projection_envelope {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
@@ -8967,6 +8979,14 @@ fn live_event_passes_capability_filter(
     // clients see `file/attached` as an additional dedicated signal.
     if !features.file_attached {
         if let UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_)) = event {
+            return false;
+        }
+    }
+    // `event.voice_audio.v1` gate: streamed reply-audio chunks only reach
+    // connections that negotiated progressive playback. Others keep the
+    // whole-file `file/attached` audio path.
+    if !features.voice_audio {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::VoiceAudioChunk(_)) = event {
             return false;
         }
     }
@@ -19019,6 +19039,20 @@ async fn run_standalone_turn(
         // the agent into calling `voice_transcribe` / exploring the workspace.
         turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
     }
+    // Voice fail-fast activation: `had_audio_input` (ASR produced spoken text)
+    // is the authoritative voice flag. Run the agent under the FailFast LLM
+    // call policy (single attempt — no retry/failover/hedge, so a 429/quota
+    // stall releases the session lock fast instead of retrying for ~30s+) and
+    // capture one classified `TurnFailure` so the error path can speak a short
+    // apology. Text turns leave the sink unset and keep the default Normal
+    // policy (full retry ladder), byte-for-byte unchanged.
+    let mut voice_failure_rx = if had_audio_input {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<octos_agent::TurnFailure>();
+        request_agent.set_voice_failure_sink(tx);
+        Some(rx)
+    } else {
+        None
+    };
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
@@ -19127,12 +19161,24 @@ async fn run_standalone_turn(
             }
             None => Box::pin(message_future),
         };
-        let result = octos_llm::with_router_context(
-            router_ctx,
-            octos_llm::with_lane_context(
-                lane_ctx,
-                octos_agent::tools::TOOL_APPROVAL_CTX
-                    .scope(approval_requester, scoped_message_future),
+        // Voice fail-fast: wrap the whole provider stack outermost so every
+        // wrapper + the leaf provider short-circuit retry/failover/hedge no
+        // matter how deep the agent loop recurses into `chat()`. Text turns run
+        // Normal (full retry ladder), unchanged.
+        let call_policy = if had_audio_input {
+            octos_llm::LlmCallPolicy::FailFast
+        } else {
+            octos_llm::LlmCallPolicy::Normal
+        };
+        let result = octos_llm::with_llm_call_policy(
+            call_policy,
+            octos_llm::with_router_context(
+                router_ctx,
+                octos_llm::with_lane_context(
+                    lane_ctx,
+                    octos_agent::tools::TOOL_APPROVAL_CTX
+                        .scope(approval_requester, scoped_message_future),
+                ),
             ),
         )
         .await;
@@ -19794,7 +19840,7 @@ async fn run_standalone_turn(
         None
     };
     let mut voice_streamed_count: usize = 0;
-    let (voice_tx, voice_handle) = if had_audio_input {
+    let (mut voice_tx, mut voice_handle) = if had_audio_input {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
         let w_ledger = ledger.clone();
         let w_session = session_id.clone();
@@ -19808,9 +19854,48 @@ async fn run_standalone_turn(
         );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
         let w_cloud = session_runtime.profile.voice.cloud.clone();
+        let w_ws = ws.clone();
+        let w_voice_audio = features.voice_audio;
         let handle = tokio::spawn(async move {
+            use base64::Engine as _;
             let mut n: usize = 0;
             while let Some(sentence) = rx.recv().await {
+                // Streaming cloud path: push reply audio as `voice/audio_chunk`
+                // frames so a negotiated client plays progressively. Falls
+                // through to the whole-file path when the client did not
+                // negotiate, the turn is not cloud-routed, or the stream fails.
+                if w_voice_audio {
+                    let segment_id = uuid::Uuid::now_v7().to_string();
+                    let mut seq: u32 = 0;
+                    let streamed = crate::api::voice_turn::synthesize_reply_streaming(
+                        &sentence,
+                        &w_provider,
+                        w_cloud.as_ref(),
+                        |bytes, last, mime| {
+                            let ev = VoiceAudioChunkEvent {
+                                session_id: w_session.clone(),
+                                topic: None,
+                                turn_id: w_turn.clone(),
+                                segment_id: segment_id.clone(),
+                                seq,
+                                mime: mime.to_string(),
+                                audio_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                last,
+                            };
+                            let _ = send_notification_ephemeral(
+                                &w_ws,
+                                &w_ledger,
+                                UiNotification::VoiceAudioChunk(ev),
+                            );
+                            seq += 1;
+                        },
+                    )
+                    .await;
+                    if streamed.is_some() {
+                        n += 1;
+                        continue;
+                    }
+                }
                 if let Some(path) = crate::api::voice_turn::synthesize_reply(
                     &sentence,
                     &w_voice,
@@ -19951,6 +20036,37 @@ async fn run_standalone_turn(
                     .and_then(Value::as_str)
                     .unwrap_or("turn failed")
                     .to_string();
+                // Voice fail-fast: a classified `TurnFailure` rode the side
+                // channel. Speak a short apology through the SAME TTS worker as
+                // a normal reply, and DRAIN the worker before the terminal so
+                // the audio is emitted ahead of the terminal frame (a canonical
+                // client's post-completion barrier would otherwise drop a
+                // file/attached envelope emitted after the terminal). Surface
+                // the classified variant as the terminal code + the friendly
+                // spoken text as the message. Text turns: unchanged.
+                let voice_failure = voice_failure_rx.as_mut().and_then(|rx| rx.try_recv().ok());
+                let (code, wire_msg): (&str, String) = match &voice_failure {
+                    Some(failure) => {
+                        let speech = crate::api::voice_turn::voice_error_speech(failure);
+                        if let Some(tx) = voice_tx.as_ref() {
+                            let _ = tx.try_send(speech.to_string());
+                        }
+                        if let Some(tx) = voice_tx.take() {
+                            drop(tx);
+                        }
+                        if let Some(handle) = voice_handle.take() {
+                            voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
+                        }
+                        let code = match failure {
+                            octos_agent::TurnFailure::LlmError { error, .. } => {
+                                error.variant_name()
+                            }
+                            octos_agent::TurnFailure::EmptyResponse => "empty_response",
+                        };
+                        (code, speech.to_string())
+                    }
+                    None => ("runtime_error", message),
+                };
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
                 try_emit_terminal(
                     &turn_state,
@@ -19959,7 +20075,7 @@ async fn run_standalone_turn(
                     &ledger,
                     &session_id,
                     &turn_id,
-                    Some(("runtime_error", message.as_str())),
+                    Some((code, wire_msg.as_str())),
                     None,
                 )
                 .await;
@@ -20023,7 +20139,7 @@ async fn run_standalone_turn(
 
     // Voice turn: flush the trailing partial sentence (marker already held back
     // by the splitter), close the channel, and wait for the FIFO TTS worker.
-    if let Some(tx) = voice_tx {
+    if let Some(tx) = voice_tx.take() {
         if let Some(sp) = voice_splitter.take() {
             let (tail, _directive) = sp.finish();
             if !interrupt_observed {
@@ -20056,7 +20172,7 @@ async fn run_standalone_turn(
             }
         }
         drop(tx);
-        if let Some(handle) = voice_handle {
+        if let Some(handle) = voice_handle.take() {
             voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
         }
     }
@@ -23604,6 +23720,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // would re-loop the replay flag onto itself.
             | UiNotification::ReplayLossy(_)
             | UiNotification::FileAttached(_)
+            // Streamed reply-audio chunks are ephemeral; their ordering lives
+            // in the segment_id/seq, not a durable ledger cursor.
+            | UiNotification::VoiceAudioChunk(_)
             | UiNotification::SessionEventBridged(_)
             // Wave4-A: router/queue notifications don't carry their own
             // cursor — they're stateless lifecycle pushes.
@@ -28269,6 +28388,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -28332,6 +28452,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -28440,6 +28561,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -28503,6 +28625,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -28559,6 +28682,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -28658,6 +28782,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -30887,6 +31012,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
