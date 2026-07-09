@@ -470,7 +470,7 @@ export TWILIO_AUTH_TOKEN="..."
 }
 ```
 
-Point your Twilio number's inbound webhook at the channel's own webhook server: `http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`. Twilio's `X-Twilio-Signature` is verified against that exact path, so if you front it with a reverse proxy it must preserve the `/twilio/webhook` path (and the public host). Build with the `twilio` feature flag.
+Point your Twilio number's inbound webhook at the channel's own webhook server: `http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`. Twilio's `X-Twilio-Signature` is verified against the full reconstructed URL, which the channel builds from the request's `Host` and `X-Forwarded-Proto` headers (scheme defaults to `http`). Behind an HTTPS reverse proxy, the proxy must preserve the `/twilio/webhook` path and forward both the public host and `X-Forwarded-Proto: https` — otherwise the reconstructed URL is `http://…` and signature verification fails (403). Build with the `twilio` feature flag.
 
 ---
 

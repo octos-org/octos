@@ -470,7 +470,7 @@ export TWILIO_AUTH_TOKEN="..."
 }
 ```
 
-将你的 Twilio 号码的入站 webhook 指向该渠道自带的 webhook 服务器：`http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`。Twilio 的 `X-Twilio-Signature` 会针对该确切路径校验，因此若在其前面加反向代理，必须保留 `/twilio/webhook` 路径（以及公网主机名）。使用 `twilio` 特性标志编译。
+将你的 Twilio 号码的入站 webhook 指向该渠道自带的 webhook 服务器：`http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`。Twilio 的 `X-Twilio-Signature` 会针对完整重建的 URL 校验，而该 URL 由请求的 `Host` 与 `X-Forwarded-Proto` 头构建（scheme 默认为 `http`）。在 HTTPS 反向代理之后，代理必须保留 `/twilio/webhook` 路径，并转发公网主机名与 `X-Forwarded-Proto: https`——否则重建出的 URL 是 `http://…`，签名校验会失败（403）。使用 `twilio` 特性标志编译。
 
 ---
 
