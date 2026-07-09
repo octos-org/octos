@@ -119,17 +119,22 @@ pub async fn connect_oauth(
     require_https(url)?;
     crate::mcp::reject_private_url_host(url)?;
 
-    // Two SSRF-filtered, no-redirect clients. The OAuth operations
-    // (discovery/registration/token/refresh) can hit a *different* authorization
-    // server than the MCP resource server, so they must NOT carry the resource
-    // server's static headers/secret — build that client header-free. The
-    // transport client keeps the configured headers.
+    // Transport client keeps the configured headers. OAuth operations
+    // (discovery/registration/token/refresh) run through SsrfOAuthHttpClient,
+    // which SSRF-validates EVERY endpoint URL (incl. literal-IP ones the DNS
+    // resolver skips) and carries no resource-server headers/secret — those
+    // requests can target a *different* authorization-server host.
     let transport_client = crate::mcp::build_ssrf_http_client(&config.headers)?;
-    let oauth_client = crate::mcp::build_ssrf_http_client(&std::collections::HashMap::new())?;
+    let oauth_http = std::sync::Arc::new(crate::mcp::SsrfOAuthHttpClient::new()?)
+        as std::sync::Arc<dyn rmcp::transport::auth::OAuthHttpClient>;
 
-    let mut oauth_state = OAuthState::new(url.to_string(), Some(oauth_client))
-        .await
-        .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
+    let mut oauth_state = timeout(
+        HANDSHAKE_TIMEOUT,
+        OAuthState::new_with_oauth_http_client(url.to_string(), oauth_http),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("oauth metadata discovery for '{url}' timed out"))?
+    .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
     oauth_state
         .set_credentials(&stored.client_id, token)
         .await
@@ -181,13 +186,18 @@ pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
 
     require_https(url)?;
     crate::mcp::reject_private_url_host(url)?;
-    // SSRF-filtered client so metadata discovery / dynamic registration / token
-    // exchange during login can't be pointed at private/metadata endpoints.
-    let client = crate::mcp::build_ssrf_http_client(&std::collections::HashMap::new())?;
-    let mut oauth_state = timeout(HANDSHAKE_TIMEOUT, OAuthState::new(url.to_string(), Some(client)))
-        .await
-        .map_err(|_| eyre::eyre!("oauth metadata discovery for '{url}' timed out"))?
-        .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
+    // Route metadata discovery / dynamic registration / token exchange through
+    // the SSRF-validating OAuth client so none of those endpoints can be pointed
+    // at private/metadata addresses (incl. literal IPs the resolver skips).
+    let oauth_http = std::sync::Arc::new(crate::mcp::SsrfOAuthHttpClient::new()?)
+        as std::sync::Arc<dyn rmcp::transport::auth::OAuthHttpClient>;
+    let mut oauth_state = timeout(
+        HANDSHAKE_TIMEOUT,
+        OAuthState::new_with_oauth_http_client(url.to_string(), oauth_http),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("oauth metadata discovery for '{url}' timed out"))?
+    .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
 
     // Loopback catcher on an ephemeral localhost port.
     let server = tiny_http::Server::http("127.0.0.1:0")

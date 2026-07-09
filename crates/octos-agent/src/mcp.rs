@@ -182,8 +182,23 @@ pub(crate) fn reject_private_url_host(url: &str) -> Result<()> {
 pub(crate) fn build_ssrf_http_client(
     headers: &HashMap<String, String>,
 ) -> Result<reqwest_rmcp::Client> {
+    build_ssrf_client_inner(headers, false)
+}
+
+fn build_ssrf_client_inner(
+    headers: &HashMap<String, String>,
+    follow_redirects: bool,
+) -> Result<reqwest_rmcp::Client> {
+    let redirect = if follow_redirects {
+        // Even followed hops re-resolve through SsrfDnsResolver (hostname hosts
+        // are re-checked); the initial URL's literal-IP host is checked by the
+        // caller. Bound the hop count.
+        reqwest_rmcp::redirect::Policy::limited(5)
+    } else {
+        reqwest_rmcp::redirect::Policy::none()
+    };
     let mut builder = reqwest_rmcp::Client::builder()
-        .redirect(reqwest_rmcp::redirect::Policy::none())
+        .redirect(redirect)
         .dns_resolver(std::sync::Arc::new(SsrfDnsResolver) as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>);
     if !headers.is_empty() {
         let mut hmap = reqwest_rmcp::header::HeaderMap::new();
@@ -199,6 +214,79 @@ pub(crate) fn build_ssrf_http_client(
     builder
         .build()
         .map_err(|e| eyre::eyre!("build MCP http client: {e}"))
+}
+
+/// An rmcp `OAuthHttpClient` that SSRF-validates EVERY OAuth request URL before
+/// executing it. reqwest skips [`SsrfDnsResolver`] for literal-IP hosts, so a
+/// server that advertises a discovery / registration / token endpoint at a
+/// literal private IP would otherwise be reached — this closes that gap by
+/// checking each request's host up front, then running it through an
+/// SSRF-filtered client (hostname endpoints stay covered by the resolver).
+pub(crate) struct SsrfOAuthHttpClient {
+    follow: reqwest_rmcp::Client,
+    stop: reqwest_rmcp::Client,
+}
+
+impl SsrfOAuthHttpClient {
+    pub(crate) fn new() -> Result<Self> {
+        let empty = HashMap::new();
+        Ok(Self {
+            follow: build_ssrf_client_inner(&empty, true)?,
+            stop: build_ssrf_client_inner(&empty, false)?,
+        })
+    }
+}
+
+impl rmcp::transport::auth::OAuthHttpClient for SsrfOAuthHttpClient {
+    fn execute(
+        &self,
+        req: rmcp::transport::auth::OAuthHttpRequest,
+    ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRedirectPolicy, OAuthHttpRequest};
+        let follow = self.follow.clone();
+        let stop = self.stop.clone();
+        Box::pin(async move {
+            let OAuthHttpRequest {
+                request,
+                redirect_policy,
+                ..
+            } = req;
+            // Reject literal private/loopback OAuth endpoint hosts (the DNS
+            // resolver is skipped for literal IPs).
+            if let Some(host) = request.uri().host()
+                && crate::tools::ssrf::is_private_host(host)
+            {
+                return Err(OAuthHttpClientError::new(format!(
+                    "SSRF blocked: OAuth endpoint host '{host}' is private/loopback"
+                )));
+            }
+            let client = match redirect_policy {
+                OAuthHttpRedirectPolicy::Follow => &follow,
+                OAuthHttpRedirectPolicy::Stop => &stop,
+                // `OAuthHttpRedirectPolicy` is non_exhaustive — default an
+                // unknown policy to the no-redirect (safer) client.
+                _ => &stop,
+            };
+            let rq = reqwest_rmcp::Request::try_from(request)
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))?;
+            let resp = client
+                .execute(rq)
+                .await
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))?;
+            let mut builder = oauth2::http::Response::builder().status(resp.status());
+            for (name, value) in resp.headers() {
+                builder = builder.header(name, value);
+            }
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))?
+                .to_vec();
+            builder
+                .body(body)
+                .map_err(|e| OAuthHttpClientError::new(e.to_string()))
+        })
+    }
 }
 
 /// Validate an MCP-provided input schema for reasonable complexity.
