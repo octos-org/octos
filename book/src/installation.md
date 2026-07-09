@@ -29,9 +29,10 @@ cd octos
 
 # Recommended: canonical feature set (matches scripts/milestone-ci.sh).
 # Includes the REST API + dashboard (`octos serve`) and the common
-# messaging channel adapters — this is the exact set CI and release
-# artifacts build. Add any other channel you need (slack, email, matrix,
-# line, qq-bot, wechat) from the list below.
+# messaging channel adapters — this is the set CI builds. (Release
+# workflows use a similar set; check .github/workflows for the exact
+# release features.) Add any other channel you need (slack, email,
+# matrix, line, qq-bot, wechat) from the list below.
 cargo install --path crates/octos-cli \
     --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 

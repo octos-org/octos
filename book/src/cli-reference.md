@@ -249,7 +249,7 @@ octos office thumbnail <file> [OPTIONS]         # Render slide/page thumbnails (
 octos office soffice <args...>                  # Passthrough to a sandboxed soffice
 ```
 
-`make-slide` composes a rendered background image plus JSON text overlays into a `.pptx` slide (used by the slides pipeline). Office is **CLI-only** — it is not exposed as an agent tool. Run `octos office <subcommand> --help` for the exact arguments.
+`make-slide` composes a rendered background image plus JSON text overlays into a `.pptx` slide (used by the slides pipeline). `comment` inserts its text into the DOCX XML verbatim, so pass **pre-escaped** XML (`&amp;`, `&lt;`, …). Office is **CLI-only** — it is not exposed as an agent tool. Run `octos office <subcommand> --help` for the exact arguments.
 
 ---
 

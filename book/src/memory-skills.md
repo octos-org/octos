@@ -67,7 +67,7 @@ When configured, the agent embeds each episode summary in a fire-and-forget back
 
 **Daily notes** (`.octos/memory/YYYY-MM-DD.md`) provide a rolling window of recent activity. The last **7 days** of daily notes are automatically included in the agent's context. These files are created manually or via the `write_file` tool — the memory-refresh pipeline below consolidates into `MEMORY.md`, not the daily notes.
 
-`MEMORY.md` can always be edited by hand — the refresh pipeline treats it as authoritative and consolidates into it without clobbering manual edits.
+`MEMORY.md` can be edited by hand, but once the refresh pipeline has migrated it, every blank-line-separated block must keep its trailing `^m…` id. Adding an un-id'd block by hand makes the parser treat the file as mixed and fail closed, pausing consolidation until it's repaired — so for new facts prefer `octos memory remember`.
 
 ### Automatic Memory Refresh (capture + consolidation)
 

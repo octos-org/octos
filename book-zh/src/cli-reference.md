@@ -238,7 +238,7 @@ octos office thumbnail <file> [OPTIONS]         # 渲染幻灯片/页面缩略�
 octos office soffice <args...>                  # 透传到沙箱化的 soffice
 ```
 
-`make-slide` 将渲染好的背景图与 JSON 叠加文本合成为一张 `.pptx` 幻灯片（供 slides 流水线使用）。Office 是**仅 CLI** 功能——不作为 agent 工具暴露。运行 `octos office <子命令> --help` 查看确切参数。
+`make-slide` 将渲染好的背景图与 JSON 叠加文本合成为一张 `.pptx` 幻灯片（供 slides 流水线使用）。`comment` 会将文本原样插入 DOCX XML，因此需传入**已转义**的 XML（`&amp;`、`&lt;` 等）。Office 是**仅 CLI** 功能——不作为 agent 工具暴露。运行 `octos office <子命令> --help` 查看确切参数。
 
 ---
 
