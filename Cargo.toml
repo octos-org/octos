@@ -92,6 +92,7 @@ colored = "2"
 dirs = "5"
 rustyline = "15"
 open = "5"
+url = "2"
 
 # Keychain (platform-native secure credential storage)
 keyring = { version = "3", default-features = false }
@@ -196,9 +197,6 @@ flate2 = "1"
 tar = "0.4"
 
 tower = { version = "0.5", features = ["util"] }
-
-# URL parsing
-url = "2"
 
 # Testing
 tokio-test = "0.4"
