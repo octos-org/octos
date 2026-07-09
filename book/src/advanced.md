@@ -509,7 +509,7 @@ A **goal** is a persistent objective attached to a session. Once set, the agent 
 
 A **loop** is a recurring agent run. Loops are either **fixed-interval** (fire every N seconds) or **self-paced** — the model decides its own next cadence by emitting a `<<loop-next-in: …>>` hint (default 15 minutes when it doesn't). A loop keeps firing until paused, deleted, or the fire cap (10,000) is reached.
 
-- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete` (notifications `loop/fired`, `loop/completed`, `loop/updated`). Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
+- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete`, `loop/fire_now` (fire once immediately) — notifications `loop/fired`, `loop/completed`, `loop/updated`. Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
 - Use it for polling, monitoring, and self-paced background agents.
 
 ### Rewind
@@ -519,7 +519,7 @@ A **loop** is a recurring agent run. Loops are either **fixed-interval** (fire e
 ### Task & turn control
 
 - **Background tasks** (spawned work, deep-search, pipelines) can be listed, cancelled, and restarted: `task/list`, `task/cancel`, `task/restart_from_node`, with output/artifacts via `task/output/read` and `task/artifact/list`. Also reachable over REST at `POST /api/tasks/{id}/cancel` and `/restart-from-node`.
-- **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are cancelled and the partial turn is persisted).
+- **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are cancelled and the partial turn is persisted). `turn/start` and `turn/interrupt` are **not** capability-gated — they're always available. The separate **sub-agent** controls (`agent/list`, `agent/status/read`, `agent/interrupt`, `agent/close`) and task artifacts (`task/artifact/list|read`) require `coding.autonomy.v1` + `coding.agent_control.v1`.
 
 ### Capability negotiation
 
@@ -527,9 +527,10 @@ A client advertises which protocol features it supports when it connects (the `u
 
 | Flag | Unlocks |
 |------|---------|
-| `coding.autonomy.v1` | Autonomy root — required *together with* the goal/loop flags below (and, for `turn/*` control, `coding.agent_control.v1`) |
+| `coding.autonomy.v1` | Autonomy root — required *together with* the goal/loop/agent-control flags below |
 | `coding.goal_runtime.v1` | Goals (`session/goal/*`) — needs `coding.autonomy.v1` too |
 | `coding.loop_runtime.v1` | Loops (`loop/*`) — needs `coding.autonomy.v1` too |
+| `coding.agent_control.v1` | Sub-agent controls (`agent/*`) and task artifacts (`task/artifact/*`) — needs `coding.autonomy.v1` too |
 | `harness.task_control.v1` | Task list/cancel/restart |
 | `harness.task_artifacts.v1` | Task artifacts |
 | `state.session_hydrate.v1` | `session/hydrate` resume |

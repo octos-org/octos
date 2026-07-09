@@ -1181,7 +1181,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 - **Config/profile**: `profile/llm/*`, `profile/skills/*`, `permission/profile/*`, `content/list`, `config/capabilities/list`.
 - **Notifications** (server→client): `message/delta`, `message/persisted`, `tool/*`, `turn/spawn_complete`, `session/goal/updated`, `loop/fired`, `context/compaction_started`, etc.
 
-Each method/notification is gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) that the client advertises at connect time via `ui_feature`/`X-Octos-Ui-Features`; the server exposes only what the client negotiated, so older clients keep working as new capabilities ship.
+Many methods/notifications are gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) that the client advertises at connect time via `ui_feature`/`X-Octos-Ui-Features`. A connection that sends **no** feature header gets the legacy first-server capability slice — those methods stay callable (backward compatibility). Gating only bites when a client **does** advertise a feature set but omits a specific flag; then the omitted method returns `method_not_supported`. Core methods (chat/turn) are always available; the autonomy, task-artifact, and auxiliary groups are the ones behind flags.
 
 **Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 
