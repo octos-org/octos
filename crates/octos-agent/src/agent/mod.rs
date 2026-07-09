@@ -11,7 +11,9 @@ mod loop_runner;
 pub mod loop_state;
 pub mod memory;
 mod message_repair;
+pub mod prompt_segments;
 pub mod realtime;
+pub mod rich_output;
 mod streaming;
 mod turn_state;
 pub mod verifier;
@@ -24,6 +26,8 @@ use octos_core::{AgentId, Message, SessionScope, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
+pub use prompt_segments::PromptSegmentProvider;
+
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
@@ -32,6 +36,7 @@ use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 use verifier::AgentVerifierConfig;
 
+pub use message_repair::normalize_tool_call_id;
 pub use realtime::RealtimeController;
 
 tokio::task_local! {
@@ -63,13 +68,79 @@ pub struct AgentConfig {
     pub worker_prompt: Option<String>,
     /// Maximum seconds for all parallel tool calls to complete. Default: 300.
     pub tool_timeout_secs: u64,
+    /// Default timeout (seconds) for a batch of ordinary interactive/fast
+    /// tools (`glob`, `list_dir`, `read_file`, `grep`, ...) when the LLM does
+    /// NOT request a per-call `timeout_secs`. Genuinely long-running tools
+    /// (`shell`, `spawn`, `run_pipeline`, `browser`, deep research/crawl)
+    /// keep `tool_timeout_secs` / `MAX_TOOL_TIMEOUT_SECS` instead.
+    ///
+    /// Default 120s; env override `OCTOS_INTERACTIVE_TOOL_TIMEOUT_SECS`
+    /// (clamped [1, 1800]). mini5 soak motivation: a read-only `glob`/
+    /// `list_dir` over an unscoped home dir must not inherit the 1800s
+    /// ceiling and hang the whole turn.
+    pub default_interactive_tool_timeout_secs: u64,
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Reasoning effort for thinking models. Flows into `ChatConfig::reasoning_effort`;
+    /// providers translate it per model (no-op for models without a reasoning style).
+    pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
     /// Suppress the generic auto-send loop for tool `files_to_send`.
     /// Background spawned workers rely on their outer workflow/session runtime
     /// to persist terminal results exactly once.
     pub suppress_auto_send_files: bool,
+    /// Grace period awaiting the FIRST streamed chunk (time-to-first-token).
+    /// Reasoning models (e.g. `deepseek-v4-pro`) can legitimately take minutes
+    /// before the first token, so this is generous. Default 180s; env override
+    /// `OCTOS_LLM_FIRST_TOKEN_GRACE_SECS`.
+    pub llm_first_token_grace: std::time::Duration,
+    /// Inter-chunk idle timeout once streaming has begun. A stalled provider
+    /// that stops yielding tokens trips this and aborts the call (retryable).
+    /// Default 90s; env override `OCTOS_LLM_STREAM_IDLE_SECS`.
+    pub llm_stream_idle: std::time::Duration,
+    /// Overall wall-clock cap on a single streaming LLM call, measured from
+    /// call start. Final backstop so a stream that keeps trickling a token
+    /// every <idle> seconds forever still terminates. Default 1200s (20 min);
+    /// env override `OCTOS_LLM_CALL_MAX_SECS`.
+    pub llm_call_max: std::time::Duration,
+    /// Config-driven human-approval rules for the suspend-and-resume flow
+    /// (see `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). When a tool call
+    /// matches a rule, the conversation loop returns early with
+    /// [`ConversationResponse::pending_approval`] instead of executing the
+    /// tool; the host projects the request to the channel and resumes via
+    /// [`Agent::execute_approved_tool`]. `None` disables the flow.
+    pub human_approval_rules: Option<crate::approval::HumanApprovalRules>,
+}
+
+/// Default time-to-first-token grace for streaming LLM calls (180s).
+pub const DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS: u64 = 180;
+/// Default inter-chunk idle timeout for streaming LLM calls (90s).
+pub const DEFAULT_LLM_STREAM_IDLE_SECS: u64 = 90;
+/// Default overall wall-clock cap for a single streaming LLM call (1200s / 20m).
+pub const DEFAULT_LLM_CALL_MAX_SECS: u64 = 1200;
+
+/// Read an env-overridable seconds value, mirroring the convention in
+/// `octos-cli/src/session_actor.rs` (`std::env::var(...).parse()` with a clamp
+/// so a misconfigured value cannot disable the guard entirely). A parsed `0`
+/// is clamped up to `1` so the timeout is always live.
+fn env_secs_or(var: &str, default_secs: u64) -> std::time::Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|v| v.clamp(1, 86_400))
+        .unwrap_or(default_secs);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Like [`env_secs_or`] but returns a raw `u64` seconds value clamped to
+/// `[1, MAX_TOOL_TIMEOUT_SECS]`. Used for the interactive-tool-timeout knob,
+/// which is stored as a `u64` on [`AgentConfig`] (not a `Duration`).
+fn env_secs_u64_or(var: &str, default_secs: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|v| v.clamp(1, MAX_TOOL_TIMEOUT_SECS))
+        .unwrap_or(default_secs)
 }
 
 /// Default tool execution timeout in seconds.
@@ -79,6 +150,11 @@ pub struct AgentConfig {
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1800;
 /// Maximum tool timeout the LLM can request (30 minutes).
 pub const MAX_TOOL_TIMEOUT_SECS: u64 = 1800;
+/// Default timeout (seconds) for a batch of ordinary interactive/fast tools
+/// (`glob`, `list_dir`, `read_file`, `grep`, ...) when the LLM omits a
+/// per-call `timeout_secs`. Genuinely long-running tools keep the 1800s
+/// default. See [`AgentConfig::default_interactive_tool_timeout_secs`].
+pub const DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS: u64 = 120;
 /// Default session processing timeout in seconds.
 pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
 
@@ -91,8 +167,23 @@ impl Default for AgentConfig {
             save_episodes: true,
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
+            default_interactive_tool_timeout_secs: env_secs_u64_or(
+                "OCTOS_INTERACTIVE_TOOL_TIMEOUT_SECS",
+                DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS,
+            ),
             chat_max_tokens: None,
+            reasoning_effort: None,
             suppress_auto_send_files: false,
+            llm_first_token_grace: env_secs_or(
+                "OCTOS_LLM_FIRST_TOKEN_GRACE_SECS",
+                DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS,
+            ),
+            llm_stream_idle: env_secs_or(
+                "OCTOS_LLM_STREAM_IDLE_SECS",
+                DEFAULT_LLM_STREAM_IDLE_SECS,
+            ),
+            llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
+            human_approval_rules: None,
         }
     }
 }
@@ -130,6 +221,13 @@ pub struct ConversationResponse {
     /// "two bubbles per turn" shape into a single preamble row.
     /// Defaults to `false`; only set in the spawn_only synthesis path.
     pub synthesized_from_spawn_only: bool,
+    /// Set when a tool call matched a [`AgentConfig::human_approval_rules`]
+    /// rule: the turn was suspended before executing that tool and the host
+    /// must project this request to the channel, await a human decision, and
+    /// resume via [`Agent::execute_approved_tool`]
+    /// (`docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). `content` is empty in
+    /// that case. `None` for every ordinary turn.
+    pub pending_approval: Option<crate::approval::PendingApprovalDraft>,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
@@ -165,8 +263,12 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
-    /// System prompt for this agent (RwLock for hot-reload support).
-    pub(super) system_prompt: RwLock<String>,
+    /// System prompt for this agent, as ordered segments (RwLock for
+    /// hot-reload support). See [`prompt_segments::PromptSegments`].
+    pub(super) system_prompt: RwLock<prompt_segments::PromptSegments>,
+    /// Providers that refresh named prompt segments between turns
+    /// (e.g. the memory block). Run by [`Agent::refresh_prompt_segments`].
+    pub(super) segment_providers: RwLock<Vec<Arc<dyn PromptSegmentProvider>>>,
     /// Agent configuration.
     pub(super) config: AgentConfig,
     /// Progress reporter (RwLock for interior-mutable swap without &mut self).
@@ -303,14 +405,40 @@ impl Agent {
         memory: Arc<EpisodeStore>,
     ) -> Self {
         let system_prompt = include_str!("../prompts/worker.txt").to_string();
+        // RFC-1 fixup (codex P1 + round-3 P2): refresh the `mofa_make`
+        // dispatcher pair before wrapping the registry in `Arc`, then
+        // wire the (fresh) dispatcher's `Weak<ToolRegistry>` back-reference.
+        //
+        // Why the refresh: callers that build per-node/per-turn
+        // registries from CACHED `Arc<dyn Tool>` instances (notably
+        // `octos-pipeline`, which caches plugin tool Arcs once and
+        // registers the SAME `Arc<MofaMakeTool>` into every node
+        // registry) would otherwise have the central wire below mutate
+        // the SHARED dispatcher object. Two overlapping pipeline nodes
+        // would then race on the dispatcher's `Mutex<Weak>` and one
+        // node's `mofa_make` call could resolve through the OTHER
+        // node's registry — or, once one node's registry drops, the
+        // shared dispatcher's Weak would point at a dropped registry
+        // and surface `[DISPATCHER_ERROR]`.
+        //
+        // Minting fresh instances seeded from the existing catalog
+        // gives each registry its own dispatcher object; the cached
+        // Arc kept by the caller is untouched. Mirrors the same
+        // share-mutate-hazard fix the per-turn WS path applies (see
+        // `ui_protocol.rs::process_chat_message_streaming`).
+        let mut tools = tools;
+        Self::refresh_mofa_make_dispatcher_in_place(&mut tools);
+        let tools = Arc::new(tools);
+        crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
             id,
             llm,
-            tools: Arc::new(tools),
+            tools,
             memory,
             embedder: None,
-            system_prompt: RwLock::new(system_prompt),
+            system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
+            segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
@@ -342,6 +470,25 @@ impl Agent {
 
     /// Create a new agent sharing pre-existing Arc-wrapped resources.
     /// Useful for per-request agents that share tools/memory with a base agent.
+    ///
+    /// **Share-mutate hazard for `mofa_make`**: this method calls
+    /// [`Self::wire_mofa_make_dispatcher`] which mutates the dispatcher's
+    /// internal `Mutex<Weak<ToolRegistry>>`. If `tools` carries a
+    /// dispatcher Arc that is ALSO held by another `Arc<ToolRegistry>`
+    /// (typical for per-turn snapshots built from `snapshot_excluding`,
+    /// or per-node pipeline registries built from a shared plugin tool
+    /// cache), that other registry will silently lose its back-reference.
+    ///
+    /// Callers MUST mint fresh `MofaMakeTool` / `MofaDescribeContentTypeTool`
+    /// instances seeded from the existing dispatcher's catalog and
+    /// `register_arc` them on `tools` BEFORE calling `Agent::new_shared`
+    /// (the ui_protocol.rs per-turn path is the canonical example). The
+    /// constructor cannot do this itself because `Arc<ToolRegistry>` is
+    /// shared-immutable.
+    ///
+    /// `Agent::new` does the freshen internally (it owns the
+    /// `ToolRegistry` and can mutate it before the Arc wrap); use that
+    /// entry-point when the caller has an owned registry.
     pub fn new_shared(
         id: AgentId,
         llm: Arc<dyn LlmProvider>,
@@ -349,6 +496,12 @@ impl Agent {
         memory: Arc<EpisodeStore>,
     ) -> Self {
         let system_prompt = include_str!("../prompts/worker.txt").to_string();
+        // RFC-1 fixup (codex P1 + round-3 P2): wire the dispatcher's
+        // `Weak<ToolRegistry>` back-reference. The freshen step that
+        // `Agent::new` does in-place cannot happen here (the registry
+        // is shared-immutable behind `Arc`), so callers must freshen
+        // before construction. See the doc comment above for details.
+        crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
             id,
@@ -356,7 +509,8 @@ impl Agent {
             tools,
             memory,
             embedder: None,
-            system_prompt: RwLock::new(system_prompt),
+            system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
+            segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
@@ -433,6 +587,66 @@ impl Agent {
         }
     }
 
+    /// RFC-1 (issue #1290): wire the `mofa_make` dispatcher + companion
+    /// `mofa_describe_content_type` to the shared tool registry. The
+    /// dispatcher needs a `Weak<ToolRegistry>` so its `execute` path
+    /// can look up the forwarding target by name.
+    ///
+    /// Idempotent and silent on agents whose registry has no mofa-*
+    /// skills (no dispatcher registered → no-op). Hosts that call
+    /// `wire_activate_tools` after agent construction should call
+    /// this in the same site.
+    pub fn wire_mofa_make_dispatcher(&self) {
+        crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&self.tools);
+    }
+
+    /// RFC-1 fixup (codex P2 round 3): mint a fresh `MofaMakeTool` +
+    /// `MofaDescribeContentTypeTool` pair seeded from the existing
+    /// dispatcher's catalog, then re-register them on `tools` so the
+    /// per-agent dispatcher is a SEPARATE Arc object from whatever
+    /// the caller cached / cloned in.
+    ///
+    /// Why: when `octos-pipeline` (and similar callers) build per-node
+    /// registries from a shared `Arc<MofaMakeTool>` cache, the central
+    /// wire in `Agent::new` would otherwise mutate the SHARED
+    /// dispatcher's `Mutex<Weak<ToolRegistry>>` and let one node's
+    /// `mofa_make` call resolve through another node's registry. After
+    /// the refresh, each node owns its own dispatcher instance whose
+    /// Weak can be wired safely.
+    ///
+    /// No-op when the registry has no mofa-* skills (no dispatcher to
+    /// freshen). Internal-hidden markers, spawn_only markers, and
+    /// every other registry side-state survive the refresh because
+    /// only the dispatcher tool instances are replaced.
+    fn refresh_mofa_make_dispatcher_in_place(tools: &mut ToolRegistry) {
+        use crate::tools::{MofaDescribeContentTypeTool, MofaMakeTool};
+
+        let entries = match tools.get("mofa_make") {
+            Some(arc) => match arc.as_any().downcast_ref::<MofaMakeTool>() {
+                Some(dispatcher) => dispatcher.entries(),
+                None => return,
+            },
+            None => return,
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        let fresh_dispatcher = MofaMakeTool::new();
+        for entry in &entries {
+            fresh_dispatcher.register_or_replace(entry.clone());
+        }
+        tools.register(fresh_dispatcher);
+
+        if tools.get("mofa_describe_content_type").is_some() {
+            let fresh_describe = MofaDescribeContentTypeTool::new();
+            for entry in &entries {
+                fresh_describe.register_or_replace(entry.clone());
+            }
+            tools.register(fresh_describe);
+        }
+    }
+
     /// Set the agent configuration.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         // Apply worker_prompt override if provided.
@@ -440,10 +654,10 @@ impl Agent {
         // A poisoned lock means a prior holder panicked, but the String
         // data itself is still valid and overwritten here.
         if let Some(ref wp) = config.worker_prompt {
-            *self
-                .system_prompt
+            self.system_prompt
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = wp.clone();
+                .unwrap_or_else(|e| e.into_inner())
+                .replace_all(wp.clone());
         }
         self.config = config;
         self
@@ -805,30 +1019,97 @@ impl Agent {
     }
 
     /// Override the system prompt (e.g. for gateway mode).
+    ///
+    /// Full replace: drops any named segments (re-set them afterwards if
+    /// still wanted).
     pub fn with_system_prompt(self, prompt: String) -> Self {
-        *self.system_prompt.write().unwrap_or_else(|e| {
-            tracing::warn!("system prompt lock was poisoned, recovering");
-            e.into_inner()
-        }) = prompt;
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .replace_all(prompt);
         self
     }
 
     /// Append additional content to the current system prompt (e.g. bootstrap files).
     pub fn append_system_prompt(&self, extra: &str) {
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .append(extra);
+    }
+
+    /// Insert (first call) or replace in place (later calls) a named prompt
+    /// segment such as the memory block. The segment keeps its insertion
+    /// position across replacements, so bootstrap-before / skills-after
+    /// ordering is preserved when the content refreshes.
+    pub fn set_prompt_segment(&self, name: &str, content: String) {
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .set_named(name, content);
+    }
+
+    /// Register a provider that refreshes a named segment between turns.
+    pub fn add_prompt_segment_provider(&self, provider: Arc<dyn PromptSegmentProvider>) {
+        self.segment_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(provider);
+    }
+
+    /// Run all registered segment providers, applying any changed content.
+    ///
+    /// Called by the conversation loop at turn start; a no-op when no
+    /// providers are registered, and providers keep the unchanged path
+    /// cheap (typically one stat).
+    pub async fn refresh_prompt_segments(&self) {
+        let providers: Vec<Arc<dyn PromptSegmentProvider>> = self
+            .segment_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if providers.is_empty() {
+            return;
+        }
+        let mut updates = Vec::new();
+        for provider in providers {
+            if let Some(content) = provider.refresh().await {
+                updates.push((provider.segment_name().to_string(), content));
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
         let mut guard = self.system_prompt.write().unwrap_or_else(|e| {
             tracing::warn!("system prompt lock was poisoned, recovering");
             e.into_inner()
         });
-        guard.push_str("\n\n");
-        guard.push_str(extra);
+        for (name, content) in updates {
+            guard.set_named(&name, content);
+        }
     }
 
     /// Update the system prompt at runtime (hot-reload).
+    ///
+    /// Full replace: drops any named segments (re-set them afterwards if
+    /// still wanted).
     pub fn set_system_prompt(&self, prompt: String) {
-        *self.system_prompt.write().unwrap_or_else(|e| {
-            tracing::warn!("system prompt lock was poisoned, recovering");
-            e.into_inner()
-        }) = prompt;
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .replace_all(prompt);
     }
 
     /// The LLM model ID in use.
@@ -930,7 +1211,7 @@ impl Agent {
         self.system_prompt
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .render()
     }
 
     /// Whether the loop-detector warning has fired since the last reset.

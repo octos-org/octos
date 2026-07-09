@@ -203,17 +203,17 @@ fn emit_delegation_event(sink_path: Option<&str>, event: &DelegationEvent) -> st
     // Progress/Phase events.
     let json = serde_json::to_string(event)
         .map_err(|error| std::io::Error::other(format!("serialize delegation event: {error}")))?;
-    let path = if let Some(rest) = path.strip_prefix("file://") {
-        PathBuf::from(rest.strip_prefix("localhost").unwrap_or(rest))
-    } else {
-        PathBuf::from(path)
-    };
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    use std::io::Write;
-    writeln!(file, "{json}")
+    // Blocker 4 — funnel through the shared atomic, per-(canonical-)path-locked
+    // append helper instead of a raw `writeln!`. `writeln!` is NOT a single
+    // atomic write syscall and is UNLOCKED, so a delegation line could interleave
+    // with concurrent heartbeat / pipeline node-event writes to the SAME sink and
+    // corrupt the NDJSON stream. `write_event_line_to_sink` takes a pre-serialized
+    // line (so it preserves this event's custom `{schema, kind: "delegation", …}`
+    // shape, which is NOT a `HarnessEvent` payload variant) and appends it whole
+    // under the same lock every other sink writer holds. It also handles the
+    // `file://`/`localhost` prefix stripping, so the prior manual stripping is
+    // dropped.
+    crate::harness_events::write_event_line_to_sink(path, &json)
 }
 
 /// Build the tool policy applied to a delegated child registry.
@@ -885,5 +885,94 @@ mod tests {
         assert_eq!(DelegationOutcome::Completed.label(), "completed");
         assert_eq!(DelegationOutcome::Failed.label(), "failed");
         assert_eq!(DelegationOutcome::DepthExceeded.label(), "depth_exceeded");
+    }
+
+    /// Blocker 4 (RED on the prior raw `writeln!`) — `emit_delegation_event`
+    /// must funnel through the shared atomic, per-path-locked sink helper so a
+    /// delegation line never interleaves with concurrent harness-event writes to
+    /// the SAME sink. We hammer the sink with delegation events and large
+    /// harness events at once; every persisted line must be whole, parseable
+    /// NDJSON. The old unlocked `writeln!` could split a delegation line across
+    /// a concurrent harness write and corrupt the stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delegation_events_funnel_through_atomic_sink() {
+        use crate::harness_events::{
+            HarnessEvent, HarnessEventSinkContext, attach_event_sink_context,
+            detach_event_sink_context, write_event_to_sink,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-delegate-atomic".to_string(),
+            },
+        );
+
+        const N: usize = 16;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let sink = sink_uri.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // The delegate write path under test.
+                    let event = DelegationEvent::new(
+                        1,
+                        format!("parent-{i}"),
+                        format!("child-{i}"),
+                        DelegationOutcome::Completed,
+                    );
+                    emit_delegation_event(Some(&sink), &event).expect("emit delegation");
+                } else {
+                    // A concurrent large harness event to widen the window.
+                    let mut extra = std::collections::HashMap::new();
+                    extra.insert(
+                        "node".to_string(),
+                        serde_json::Value::String(format!("n-{i}")),
+                    );
+                    extra.insert(
+                        "preview".to_string(),
+                        serde_json::Value::String("h".repeat(6 * 1024)),
+                    );
+                    let event = HarnessEvent::progress_with_extra(
+                        "api:session",
+                        "tc-delegate-atomic",
+                        Some("research"),
+                        "node_completed",
+                        Some(format!("hev {i}")),
+                        Some(1.0),
+                        extra,
+                    );
+                    write_event_to_sink(&sink, &event).expect("write harness event");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("writer task");
+        }
+
+        detach_event_sink_context(&sink_uri);
+
+        let contents = std::fs::read_to_string(sink_file.path()).expect("read sink");
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            N,
+            "expected one whole line per writer (delegation funnels through the \
+             atomic helper); got {} lines",
+            lines.len()
+        );
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("delegation/harness line must be whole: {e}; {line:?}"));
+            assert_eq!(v["schema"], HARNESS_EVENT_SCHEMA_V1, "line={line:?}");
+        }
+        let delegations = lines
+            .iter()
+            .filter(|l| l.contains("\"delegation\""))
+            .count();
+        assert_eq!(delegations, N / 2, "all delegation lines present and whole");
     }
 }

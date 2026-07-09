@@ -119,6 +119,9 @@ pub enum ProgressEvent {
     /// Streaming text chunk from LLM.
     StreamChunk { text: String, iteration: u32 },
 
+    /// Streaming reasoning chunk from LLM.
+    ReasoningChunk { text: String, iteration: u32 },
+
     /// Streaming completed.
     StreamDone { iteration: u32 },
 
@@ -140,6 +143,10 @@ pub enum ProgressEvent {
         /// `None` when the reporter cannot resolve a model id (e.g.
         /// synthetic test fixtures).
         model: Option<String>,
+        /// Model context window in tokens, when the provider exposes it.
+        /// Lets clients render an honest ctx-fill gauge against the real
+        /// window instead of a hardcoded default.
+        context_window: Option<u32>,
     },
 }
 
@@ -432,6 +439,7 @@ impl ProgressReporter for ConsoleReporter {
                     }
                 }
             }
+            ProgressEvent::ReasoningChunk { .. } => {}
             ProgressEvent::StreamDone { .. } => {
                 use std::io::Write;
                 if let Ok(mut buf) = self.stdout.lock() {

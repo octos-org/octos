@@ -5,7 +5,7 @@
 # Options:
 #   --minimal          CLI + chat only (no channels, no dashboard)
 #   --full             All channels + dashboard + app-skills
-#   --channels LIST    Comma-separated channels (telegram,discord,slack,whatsapp,feishu,email,twilio,wecom)
+#   --channels LIST    Comma-separated channels (telegram,discord,dingtalk,slack,whatsapp,feishu,email,twilio,wecom)
 #   --no-skills        Skip building app-skills
 #   --no-service       Skip launchd/systemd service setup
 #   --uninstall        Remove binaries and service files
@@ -310,7 +310,7 @@ case "$MODE" in
         echo "    Mode: minimal (CLI + chat only)"
         ;;
     full)
-        CLI_FEATURES="api,telegram,discord,slack,whatsapp,feishu,email,twilio,wecom,audio_mp3"
+        CLI_FEATURES="api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,twilio,wecom,audio_mp3"
         echo "    Mode: full (all channels + dashboard + skills)"
         ;;
 esac
@@ -581,7 +581,7 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
 
     if [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Enter the per-tenant tunnel token issued by your cloud operator"
+        echo "    Enter the shared frps auth token from your operator or cloud host"
         echo "    (registered in the cloud node's tenant store; written to metadatas.token):"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty

@@ -204,6 +204,26 @@ impl SessionRuntime {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_with_permissions_and_sandbox(
+            profile,
+            session_key,
+            workspace_hint,
+            permissions,
+            None,
+        )
+        .await
+    }
+
+    /// Construct a [`SessionRuntime`] with explicit effective permissions and
+    /// an optional, already-validated sandbox override. The override must be
+    /// derived from and no wider than the profile-level sandbox policy.
+    pub async fn bootstrap_with_permissions_and_sandbox(
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        permissions: EffectivePermissions,
+        sandbox_override: Option<SandboxConfig>,
+    ) -> Result<Arc<Self>> {
         // Step 1: resolve workspace_root.
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
@@ -246,7 +266,8 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = permissions.apply_to_sandbox(&profile.default_sandbox);
+        let sandbox = sandbox_override
+            .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
             create_sandbox(&sandbox),
@@ -460,6 +481,8 @@ impl SessionRuntime {
             // background tasks that need more iterations.
             max_iterations: resolve_session_max_iterations(profile.max_iterations),
             save_episodes: true,
+            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
+            human_approval_rules: profile.human_approval_rules.clone(),
             ..Default::default()
         })
         // M11-F regression fix (#891): propagate the pre-assembled
@@ -472,7 +495,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.system_prompt.clone())
+        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -484,6 +507,38 @@ impl SessionRuntime {
         // behaviour byte-for-byte (no consumer reads the field yet).
         if let Some(scope) = session_scope {
             agent = agent.with_session_scope(scope);
+        }
+
+        // Memory rides the per-session agent as a NAMED prompt segment
+        // (chat.rs pattern) instead of being frozen into the profile's
+        // bootstrap prompt String: serve profiles bootstrapped before any
+        // consolidation carried an empty block forever (the model then
+        // fabricates a "memory bank" when asked). The provider re-renders
+        // the segment at each turn start when MEMORY.md / daily notes /
+        // bank change on disk (one fingerprint stat per turn otherwise).
+        let memory_ctx = profile
+            .memory_store
+            .get_injectable_context(profile.memory_inject_tokens)
+            .await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
+        );
+        // Contract parity with chat.rs: `memory.refresh.enabled = false`
+        // means NO per-turn memory re-read — the segment stays as seeded
+        // at session bootstrap. Default-on makes disabled an explicit
+        // opt-out.
+        if profile.memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                profile.memory_store.clone(),
+                profile.memory_inject_tokens,
+                true,
+            )));
+        }
+        // Post-memory half AFTER the named segment — the pre-refactor
+        // order (memory before skills/tool guidance).
+        if !profile.prompt_parts.post_memory.is_empty() {
+            agent.append_system_prompt(&profile.prompt_parts.post_memory);
         }
 
         // M11-F regression fix REG-3: propagate the profile-scope
@@ -507,6 +562,10 @@ impl SessionRuntime {
         // and the LLM cannot pull a deferred group back on demand.
         // Gateway does the equivalent at `session_actor.rs:2500`.
         agent.wire_activate_tools();
+        // RFC-1 (issue #1290): same pattern for the `mofa_make`
+        // dispatcher. The loader registered it but its `Weak<ToolRegistry>`
+        // back-reference needs the Arc-wrapped registry; we plant it here.
+        agent.wire_mofa_make_dispatcher();
 
         let agent = Arc::new(agent);
 
@@ -754,11 +813,19 @@ mod tests {
         data_dir: PathBuf,
         system_prompt: String,
     ) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt_and_sandbox(data_dir, system_prompt, SandboxConfig::default())
+            .await
+    }
+
+    async fn make_profile_with_prompt_and_sandbox(
+        data_dir: PathBuf,
+        system_prompt: String,
+        sandbox: SandboxConfig,
+    ) -> Arc<ProfileRuntime> {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
-        let sandbox = SandboxConfig::default();
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
         Arc::new(ProfileRuntime {
@@ -781,15 +848,113 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: system_prompt.clone(),
+                post_memory: String::new(),
+            },
             system_prompt,
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
+    }
+
+    async fn make_profile_with_sandbox(
+        data_dir: PathBuf,
+        sandbox: SandboxConfig,
+    ) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt_and_sandbox(data_dir, "test-system-prompt".to_string(), sandbox)
+            .await
+    }
+
+    #[tokio::test]
+    async fn session_agent_renders_fresh_memory_segment() {
+        // Serve sessions read MEMORY.md via the per-session agent's NAMED
+        // segment + turn-start refresh — NOT a value frozen into the
+        // profile bootstrap prompt (which fabricated-memory bugs came
+        // from). Consolidations landing AFTER the session was created
+        // must be visible on the next refresh.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Monday. (updated: 2026-07-08) ^mvzercg\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "mem"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Deploy day is Monday"),
+            "session agent must inject MEMORY.md: {prompt}"
+        );
+
+        // A consolidation AFTER session creation becomes visible on the
+        // next turn-start refresh (fingerprint change).
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Friday again. (updated: 2026-07-09) ^mvzercg\n",
+        )
+        .unwrap();
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Friday again"),
+            "read-refresh must pick up post-bootstrap consolidations: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_segment_keeps_pre_skills_slot() {
+        // codex round-3 P2: the memory block must keep its pre-refactor
+        // position — after bootstrap/soul, BEFORE the skills/tool-prefs
+        // half — or persisted user memory gains precedence over guidance
+        // that always followed it.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "A very durable fact. (updated: 2026-07-09) ^mvvvvvv\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "order"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        let memory_pos = prompt
+            .find("A very durable fact")
+            .expect("memory segment present");
+        if let Some(tool_prefs_pos) = prompt.find("## Tool Preferences") {
+            assert!(
+                memory_pos < tool_prefs_pos,
+                "memory must precede the tool-prefs half: mem={memory_pos} prefs={tool_prefs_pos}"
+            );
+        }
+        if let Some(skills_pos) = prompt.find("## Available Skills") {
+            assert!(
+                memory_pos < skills_pos,
+                "memory must precede the skills half: mem={memory_pos} skills={skills_pos}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -863,6 +1028,50 @@ mod tests {
         assert!(scope.shared_zones().is_empty());
         // Critical for propagation: scope.workspace() == workspace_root.
         assert_eq!(scope.workspace(), rt.workspace_root.as_path());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_explicit_sandbox_overrides_are_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile_with_sandbox(
+            data_dir,
+            SandboxConfig {
+                allow_network: true,
+                ..SandboxConfig::default()
+            },
+        )
+        .await;
+
+        let gamma_sandbox = SandboxConfig {
+            allow_network: false,
+            ..profile.default_sandbox.clone()
+        };
+
+        let gamma = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+            &profile,
+            SessionKey::new("api", "gamma"),
+            Some(tmp.path().join("gamma")),
+            EffectivePermissions::workspace_write(),
+            Some(gamma_sandbox),
+        )
+        .await
+        .expect("gamma bootstrap");
+        let delta = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+            &profile,
+            SessionKey::new("api", "delta"),
+            Some(tmp.path().join("delta")),
+            EffectivePermissions::workspace_write(),
+            None,
+        )
+        .await
+        .expect("delta bootstrap");
+
+        assert!(profile.default_sandbox.allow_network);
+        assert!(!gamma.sandbox.allow_network);
+        assert!(delta.sandbox.allow_network);
+        assert_ne!(gamma.workspace_root, delta.workspace_root);
+        assert!(!Arc::ptr_eq(&gamma.tools, &delta.tools));
     }
 
     #[tokio::test]
@@ -1308,14 +1517,23 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: Some(executor),
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 
@@ -1361,14 +1579,23 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         });
         let key = SessionKey::new("api", "activate-tools-probe");
         let rt = SessionRuntime::bootstrap(&profile, key, None)
@@ -1442,14 +1669,23 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         });
 
         let rt_a = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-a"), None)

@@ -4,6 +4,7 @@
 //! enabling real-time LLM text streaming to Telegram, WhatsApp, etc.
 //! Text is accumulated and the channel message is edited at a throttled rate.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,17 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::StreamChunk { text, iteration } => {
                 StreamProgressEvent::Chunk { text, iteration }
             }
+            ProgressEvent::ReasoningChunk { text, iteration } => {
+                let mut payload = serde_json::json!({
+                    "type": "reasoning_chunk",
+                    "text": text,
+                    "iteration": iteration,
+                });
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             ProgressEvent::StreamDone { iteration } => {
                 StreamProgressEvent::StreamDone { iteration }
             }
@@ -176,6 +188,7 @@ impl ProgressReporter for ChannelStreamReporter {
                 session_output_tokens,
                 session_cost,
                 model,
+                context_window,
                 ..
             } => {
                 // Codex round-1 P2: every wire-shape mapper for
@@ -193,6 +206,12 @@ impl ProgressReporter for ChannelStreamReporter {
                 });
                 if let Some(model) = model.as_deref() {
                     payload["model"] = serde_json::Value::String(model.to_string());
+                }
+                // Carry the context window too so channel/web clients on this
+                // path render an honest ctx gauge, matching the BoundedChannel
+                // (`event_to_json`) path.
+                if let Some(window) = context_window {
+                    payload["context_window"] = serde_json::json!(window);
                 }
                 inject_thread_id(&mut payload, thread_id);
                 StreamProgressEvent::RawSse {
@@ -277,6 +296,12 @@ pub struct StreamResult {
     pub message_id: Option<String>,
     /// The full accumulated text that was streamed.
     pub text: String,
+    /// Set when an `app_reply`-tagged tool (e.g. `send_app_card`) succeeded and
+    /// the forwarder suppressed the LLM's follow-up text: the GPU card IS the
+    /// reply on capable clients. The session actor must then NOT also send
+    /// `conv_response.content` through the final-reply path, or the user sees
+    /// the card plus a duplicate text bubble (review finding #6).
+    pub suppressed_by_app_reply: bool,
 }
 
 /// Check if a session is currently the active session for its chat.
@@ -329,12 +354,21 @@ pub async fn run_stream_forwarder(
     sender_user_id: Option<String>,
     operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     thread_id: Option<String>,
+    matrix_app_reply_tools: Arc<HashSet<String>>,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
     let mut last_edit = Instant::now() - EDIT_THROTTLE; // allow immediate first edit
     let mut first_chunk = true;
     let mut last_chunk_iteration: u32 = 0;
+    // Matrix app-reply hook: when an app_reply-tagged tool is registered and
+    // we're on matrix, the GPU card IS the reply on capable clients —
+    // suppress transient tool status edits, and once an app-reply tool
+    // succeeds, drop the LLM's follow-up text so the user doesn't see a
+    // duplicate chat-style summary under the card.
+    let suppress_matrix_transient_status =
+        channel.name() == "matrix" && !matrix_app_reply_tools.is_empty();
+    let mut suppress_follow_up_text_after_app_reply = false;
     // When true, the channel doesn't support send_with_id (returned None),
     // so we stop streaming edits and let the final reply go through out_tx.
     let mut no_edit_support = false;
@@ -342,6 +376,9 @@ pub async fn run_stream_forwarder(
     while let Some(event) = rx.recv().await {
         match event {
             StreamProgressEvent::Chunk { text, iteration } => {
+                if suppress_follow_up_text_after_app_reply {
+                    continue;
+                }
                 // When a new LLM iteration starts streaming, clear tool progress
                 // markers from the buffer so the final response is clean.
                 // This prevents testers from capturing "✓ shell ✓ read_file..."
@@ -407,6 +444,9 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::StreamDone { .. } => {
+                if suppress_follow_up_text_after_app_reply {
+                    continue;
+                }
                 // Flush remaining buffer — strip think tags. Use finish flush
                 // so channels like WeCom can send `finish: true`.
                 if !no_edit_support
@@ -429,6 +469,9 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolStarted { name } => {
+                if suppress_matrix_transient_status {
+                    continue;
+                }
                 // Update status bar operation layer with tool name
                 if let Some(ref updater) = operation_updater {
                     updater(&format!("Running {name}"));
@@ -457,6 +500,14 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolCompleted { name, success } => {
+                if success && matrix_app_reply_tools.contains(&name) {
+                    suppress_follow_up_text_after_app_reply = true;
+                    buffer.clear();
+                    continue;
+                }
+                if suppress_matrix_transient_status {
+                    continue;
+                }
                 let icon = if success { "✓" } else { "✗" };
                 // Update tool status in the existing message
                 if !no_edit_support && !buffer.is_empty() {
@@ -485,6 +536,9 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolProgress { name, message } => {
+                if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
+                    continue;
+                }
                 // Update the tool status line with the progress message
                 let pending = format!("⚙ `{name}`...");
                 let progress = format!("⚙ `{name}`: {message}");
@@ -523,6 +577,9 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::LlmStatus { message } => {
+                if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
+                    continue;
+                }
                 // Cancel the status indicator before showing retry/failover info
                 if first_chunk {
                     first_chunk = false;
@@ -555,6 +612,9 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::FileWritten { path } => {
+                if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
+                    continue;
+                }
                 // Show file-saved notification immediately so the user knows
                 // the file was written even if the final LLM response is slow.
                 let filename = std::path::Path::new(&path)
@@ -582,6 +642,9 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::BufferReset => {
+                if suppress_follow_up_text_after_app_reply {
+                    continue;
+                }
                 // Clear accumulated text so a retry starts fresh.
                 // Keep the message_id so the retry edits the same message
                 // instead of creating a new one.
@@ -628,6 +691,7 @@ pub async fn run_stream_forwarder(
     StreamResult {
         message_id,
         text: buffer,
+        suppressed_by_app_reply: suppress_follow_up_text_after_app_reply,
     }
 }
 
@@ -916,12 +980,17 @@ mod tests {
             content: "answer".into(),
             iteration: 1,
         });
+        reporter.report(ProgressEvent::ReasoningChunk {
+            text: "thinking".into(),
+            iteration: 1,
+        });
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 10,
             session_output_tokens: 20,
             response_cost: None,
             session_cost: None,
             model: None,
+            context_window: None,
         });
 
         let mut raw_payloads: Vec<String> = Vec::new();
@@ -932,11 +1001,11 @@ mod tests {
         }
 
         // ToolStarted, ToolCompleted, ToolProgress emit RawSse + a typed
-        // mapped event each, so 6 reports → 6 RawSse JSON payloads.
+        // mapped event each, so 7 reports → 7 RawSse JSON payloads.
         assert_eq!(
             raw_payloads.len(),
-            6,
-            "expected 6 RawSse payloads, got {}: {:?}",
+            7,
+            "expected 7 RawSse payloads, got {}: {:?}",
             raw_payloads.len(),
             raw_payloads
         );
@@ -970,6 +1039,7 @@ mod tests {
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
+            context_window: None,
         });
 
         let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
@@ -978,6 +1048,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "cost_update");
         assert_eq!(parsed["model"], "deepseek-v4-pro");
+    }
+
+    /// The channel-stream path must also carry the model context window so
+    /// channel/web clients render an honest ctx gauge, matching the
+    /// BoundedChannel (`event_to_json`) path.
+    #[test]
+    fn cost_update_carries_context_window_into_raw_sse_payload() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 12,
+            session_output_tokens: 7,
+            response_cost: None,
+            session_cost: None,
+            model: None,
+            context_window: Some(131_072),
+        });
+
+        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+            panic!("expected RawSse for CostUpdate");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "cost_update");
+        assert_eq!(parsed["context_window"], 131_072);
     }
 
     /// Symmetric to the test above: a `CostUpdate` without `model`
@@ -997,6 +1094,7 @@ mod tests {
             response_cost: None,
             session_cost: None,
             model: None,
+            context_window: None,
         });
 
         let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
@@ -1114,6 +1212,62 @@ mod tests {
                 .get(METADATA_SENDER_USER_ID)
                 .and_then(|v| v.as_str()),
             Some("@bot_mybot:localhost")
+        );
+    }
+
+    /// Matrix app-reply hook: once an app_reply-tagged tool succeeds, the
+    /// GPU card IS the reply — the forwarder must drop the transient tool
+    /// status edits and the LLM's follow-up text so the user doesn't see a
+    /// duplicate chat-style summary under the card.
+    #[tokio::test]
+    async fn should_skip_transcript_and_follow_up_chunks_when_matrix_app_reply_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let active_sessions = Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap()));
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(StreamProgressEvent::ToolStarted {
+            name: "send_app_card".to_string(),
+        })
+        .unwrap();
+        tx.send(StreamProgressEvent::ToolCompleted {
+            name: "send_app_card".to_string(),
+            success: true,
+        })
+        .unwrap();
+        tx.send(StreamProgressEvent::Chunk {
+            text: "hallucinated weather summary".to_string(),
+            iteration: 1,
+        })
+        .unwrap();
+        tx.send(StreamProgressEvent::StreamDone { iteration: 1 })
+            .unwrap();
+        drop(tx);
+
+        let result = run_stream_forwarder(
+            rx,
+            channel,
+            "!room:localhost".to_string(),
+            None,
+            None,
+            active_sessions,
+            octos_core::SessionKey::new("matrix", "!room:localhost"),
+            Some("@octosbot:localhost".to_string()),
+            None,
+            None,
+            Arc::new(HashSet::from(["send_app_card".to_string()])),
+        )
+        .await;
+
+        assert!(result.message_id.is_none());
+        assert!(result.text.is_empty());
+        assert!(mock.sent.lock().await.is_empty());
+        // Review finding #6: the suppression decision must be propagated so the
+        // session actor's final-reply path can skip conv_response.content.
+        assert!(
+            result.suppressed_by_app_reply,
+            "app-reply suppression must be reported to the caller"
         );
     }
 

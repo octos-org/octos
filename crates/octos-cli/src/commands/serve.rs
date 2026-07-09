@@ -280,6 +280,22 @@ pub struct ServeCommand {
     pub swarm_backend_url: Option<String>,
 }
 
+/// Wire a `task_query_store` for `octos serve --stdio` (the in-process
+/// AppUI/TUI deployment); leave it `None` for HTTP/gateway serve.
+///
+/// `--stdio` runs session turns in *this* process with no gateway to proxy
+/// `task/cancel` to. The per-turn `tool_registry.supervisor()` self-registers
+/// into this store (see `ui_protocol.rs`, the `store.register(..)` guarded on
+/// `task_query_store.is_some()`, holding a `Weak<TaskSupervisor>` so it prunes
+/// at end of turn), which lets `handle_task_cancel` reach the live supervisor
+/// and actually cancel a running `spawn_only` background task. Without it the
+/// AppUI task commands fail `runtime_unavailable` ("task supervisor not wired
+/// for AppUI task commands"). HTTP/gateway serve must stay `None` so
+/// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
+fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
+    stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+}
+
 impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
@@ -296,15 +312,17 @@ impl ServeCommand {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
-        // Resolve data directory once and treat it as the canonical home for
-        // runtime state and config unless an explicit --config path is given.
-        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
+        // Resolve the canonical config context once (data_dir for runtime
+        // state; config_home/is_default for config; auth_home for global auth)
+        // and run migrations.
+        let ctx = super::resolve_command_context(self.data_dir.clone())?;
+        let data_dir = ctx.data_dir.clone();
 
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
-            Config::load_with_path(&cwd, &data_dir)?
+            Config::load_with_context_path(&cwd, &ctx)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
         if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
@@ -314,6 +332,21 @@ impl ServeCommand {
                 %error,
                 "failed to configure durable agent supervisor store; continuing with in-process supervision only"
             );
+        } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+        {
+            // Solo-boot loop safety: restored loops must not silently resume
+            // firing model turns on a single-operator box. Park them paused;
+            // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
+            for (loop_id, session_id) in
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .pause_restored_loops_for_solo_boot()
+            {
+                tracing::info!(
+                    loop_id = %loop_id,
+                    session_id = %session_id.0,
+                    "solo boot: restored loop parked as paused (resume with /loop resume)"
+                );
+            }
         }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
@@ -398,6 +431,25 @@ impl ServeCommand {
         // per-profile loop free of redundant disk writes.
         octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
         octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+        // Preflight: if the sibling app-skill binaries are missing beside the
+        // running `octos` executable, bootstrap silently skipped them and the
+        // affected tools (get_weather, etc.) will NOT register. Warn loudly so
+        // a bare-binary deploy is diagnosable instead of a silent plugin_count=0.
+        let missing = octos_agent::bootstrap::missing_bundled_skill_binaries();
+        if !missing.is_empty() {
+            tracing::warn!(
+                missing = ?missing,
+                "bundled skill binaries missing beside the octos executable — this looks like a bare-binary install; app-skill tools (get_weather, etc.) will NOT register. Deploy the full bundle (scripts/build-local-bundle.sh / scripts/install.sh), not just the octos binary."
+            );
+        }
+        // Gap 4.1: bundle generic pipelines (deep_research) into the
+        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
+        // always discovers them even when the `mofa-research` skill carrying
+        // `deep_research.dot` has drifted off a profile. Per-profile
+        // `RunPipelineTool`s register that dir as the LOWEST-precedence
+        // search path via `with_octos_home` (bootstrap-dir == search-dir).
+        // Installed pipelines of the same name always win (no clobber).
+        octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
 
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
@@ -437,6 +489,8 @@ impl ServeCommand {
                 Some(&data_dir),
                 crate::runtime::BootstrapRole::Serve,
                 Some(&config.plugins),
+                config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -473,7 +527,13 @@ impl ServeCommand {
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
                 // gateway's effective `plugins.require_signed`.
-                .with_host_plugins_require_signed(config.plugins.require_signed),
+                .with_host_plugins_require_signed(config.plugins.require_signed)
+                .with_host_max_inject_tokens(
+                    config.memory.as_ref().and_then(|m| m.max_inject_tokens),
+                )
+                .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
+                    config.memory.as_ref(),
+                )),
         );
         process_manager.set_self_ref();
 
@@ -484,6 +544,10 @@ impl ServeCommand {
         let allowlist_store = Arc::new(
             crate::login_allowlist::LoginAllowlistStore::open(&data_dir)
                 .wrap_err("failed to open login allowlist store")?,
+        );
+        let admin_audit_store = Arc::new(
+            crate::admin_audit_store::AdminAuditStore::open(&data_dir)
+                .wrap_err("failed to open admin audit store")?,
         );
         let auth_manager = {
             let (auth_config, derived_profile_password) = match config.dashboard_auth.clone() {
@@ -616,9 +680,16 @@ impl ServeCommand {
             process_manager: Some(process_manager.clone()),
             user_store: Some(user_store),
             allowlist_store: Some(allowlist_store),
+            admin_audit_store: Some(admin_audit_store),
             auth_manager,
             http_client: reqwest::Client::new(),
-            config_path: resolved_config_path,
+            // If a config file was loaded, admin edits target that exact file.
+            // If none existed at startup, fall back to THIS serve's resolved
+            // config_home (which already accounts for the `--data-dir` FLAG —
+            // not just env), so admin writes under `serve --data-dir T` land in
+            // `T/config.json`, not a recomputed XDG path. (admin_setup's own
+            // None branch can't see the CLI flag; this closes that leak.)
+            config_path: resolved_config_path.or_else(|| Some(ctx.config_home.join("config.json"))),
             watchdog_enabled: watchdog_flag.clone(),
             alerts_enabled: alerts_flag.clone(),
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
@@ -643,6 +714,7 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            host_memory: config.memory.clone(),
             solo_login_enabled: self.solo
                 || std::env::var("OCTOS_SOLO_LOGIN")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -665,12 +737,15 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
-            // The serve command is the API server proper — all session
-            // actors live in gateway processes, so `task_query_store`
-            // stays `None` and the cancel/restart handlers proxy via
-            // `resolve_api_port`. The gateway runtime sets its own
-            // store on the embedded api channel.
-            task_query_store: None,
+            // HTTP/gateway serve: session actors live in gateway
+            // processes, so `task_query_store` stays `None` and the
+            // cancel/restart handlers proxy via `resolve_api_port` (the
+            // gateway runtime sets its own store on the embedded api
+            // channel). `--stdio` runs actors in-process with no gateway,
+            // so it wires an empty store the per-turn supervisor
+            // self-registers into — letting AppUI `task/cancel` reach live
+            // `spawn_only` tasks. See `stdio_task_query_store`.
+            task_query_store: stdio_task_query_store(self.stdio),
             // Mirror the operator-configured Tier-2 default cwd so
             // `session_tool_registry` can distinguish "operator chose this
             // dir for sessions" from the boot fallback baked in by
@@ -685,6 +760,9 @@ impl ServeCommand {
             // invalidates every grant (see
             // `crate::api::preview_tokens` for the design rationale).
             preview_tokens,
+            work_secret_store: Arc::new(
+                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&data_dir),
+            ),
             // Issue #1009: owning sweeper handle. `Drop` aborts the
             // tokio task when the last `Arc<AppState>` is released,
             // replacing the previous `_preview_sweeper` local that
@@ -927,6 +1005,16 @@ impl ServeCommand {
             }
         }
 
+        // mini5 soak gap #1: drain queued master continuations
+        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
+        // even when NO ws/stdio client is connected. The per-connection
+        // `appui_continuation_tick` only runs inside a live handler loop, so a
+        // sub-agent finishing while the TUI is disconnected (or a continuation
+        // re-loaded after a serve restart) would otherwise sit undrained until
+        // a client reconnects. Shares the process-global active-turns registry
+        // with the per-connection ticks, so there is no double-run.
+        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
+
         let app = build_router(state);
         let addr = format!("{}:{}", self.host, self.port);
 
@@ -1106,6 +1194,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stdio_serve_wires_task_query_store_for_in_process_cancel() {
+        // `--stdio` runs session actors in-process with no gateway to
+        // proxy `task/cancel` to, so the store must be present for the
+        // per-turn supervisor to self-register into — otherwise AppUI
+        // task commands fail `runtime_unavailable` and octos-tui Esc/`x`
+        // cannot cancel a spawned background task (the reported bug).
+        assert!(
+            stdio_task_query_store(true).is_some(),
+            "stdio serve must wire a task_query_store"
+        );
+    }
+
+    #[test]
+    fn non_stdio_serve_leaves_task_query_store_none_for_gateway_proxy() {
+        // HTTP/gateway serve must leave it `None` so `handle_task_cancel`
+        // takes the gateway-proxy path; a non-`None` store would skip it.
+        assert!(
+            stdio_task_query_store(false).is_none(),
+            "gateway/http serve must leave task_query_store None"
+        );
+    }
+
+    fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: dashboard SMTP env tests hold `dashboard_smtp_test_env_lock`,
+            // serializing mutation of process-wide environment variables.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: callers keep the env lock for the full guard lifetime.
+            match self.previous.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
     fn deployment_mode_is_explicit_and_ignores_tunnel_settings() {
         let config = Config {
             mode: crate::config::DeploymentMode::Local,
@@ -1182,6 +1326,8 @@ mod tests {
 
     #[test]
     fn dashboard_smtp_password_prefers_matching_admin_profile_email_tool() {
+        let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
         let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
         store
@@ -1219,7 +1365,7 @@ mod tests {
                 host: "smtp.example.com".into(),
                 port: 465,
                 username: "admin@example.com".into(),
-                password_env: "SMTP_PASSWORD".into(),
+                password_env: "OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD".into(),
                 from_address: "admin@example.com".into(),
             }),
             session_expiry_hours: 24,
@@ -1304,6 +1450,8 @@ mod tests {
 
     #[test]
     fn dashboard_smtp_password_prefers_matching_non_admin_profile_email_tool() {
+        let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
         let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
         store
@@ -1345,7 +1493,7 @@ mod tests {
                 host: "smtp.gmail.com".into(),
                 port: 465,
                 username: "dspfac@gmail.com".into(),
-                password_env: "SMTP_PASSWORD".into(),
+                password_env: "OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD".into(),
                 from_address: "dspfac@gmail.com".into(),
             }),
             session_expiry_hours: 24,

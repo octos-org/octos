@@ -16,6 +16,11 @@
 .DS_Store
 Thumbs.db
 
+# Claude Code agent worktrees (Agent-tool isolation creates these as nested
+# git checkouts). They must never be tracked — committed as gitlinks they
+# break every git consumer of this repo (e.g. cargo git dependencies).
+.claude/worktrees/
+
 # Octos runtime state (keep config, ignore runtime data)
 .octos/*
 !.octos/AGENTS.md
@@ -38,6 +43,9 @@ crates/octos-cli/static/admin/
 
 # Swarm-app build output
 crates/octos-cli/static/swarm/
+
+# octos-web build output (scripts/build-web-app.sh; embedded at /app)
+crates/octos-cli/static/web/
 
 # Environment
 .env
@@ -63,9 +71,12 @@ test_a2.md
 !CLAUDE.md
 !CHANGELOG.md
 !.octos/AGENTS.md
+!specs/task-approval-post-tool-continuation.spec.md
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md
+!workstreams/
+!workstreams/open-issue-closure-contract-2026-05-23.md
 !docs/app-skill-dev-guide.md
 !docs/app-skill-dev-guide-zh.md
 !docs/TESTING.md
@@ -85,6 +96,7 @@ test_a2.md
 !docs/OCTOS_HARNESS_ABI_VERSIONING.md
 !docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md
 !docs/OCTOS_HARNESS_M4_1A_LIVE_GATE.md
+!docs/OCTOS_SWARM_M7_LIVE_GATE.md
 !docs/OCTOS_HARNESS_SKILL_COMPAT.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
@@ -101,9 +113,11 @@ test_a2.md
 !docs/M9-ALPHA-SOLE-TRANSPORT-ADR.md
 !docs/M9-GAMMA-SERVER-PROJECTION-ADR.md
 !docs/M11-PROFILE-SESSION-RUNTIME-ADR.md
+!docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md
 !docs/SKILL_DEPLOYMENT.md
 !workstreams/M11-runtime-unification.md
 !workstreams/M11-SOAK-TESTS.md
+!workstreams/robrix-integration.md
 # Canonical product/engineering spec docs under api/. The UI Protocol v1
 # spec (api/OCTOS_UI_PROTOCOL_V1_SPEC_*.md) was tracked manually before
 # this rule existed; the server/app/tui feature-requirement specs added
@@ -145,3 +159,11 @@ test_a2.md
 !e2e/fixtures/compat-test-skill/manifest.json
 !e2e/fixtures/compat-test-skill/main
 tsconfig.tsbuildinfo
+.superpowers/
+.claude/scheduled_tasks.lock
+
+# Runtime data dirs accidentally committed once (#200) — never track
+.crew/
+**/.crew/
+# Stray Astro scaffold guard (no Astro project in this repo)
+.astro/

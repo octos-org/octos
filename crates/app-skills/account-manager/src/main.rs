@@ -101,7 +101,7 @@ struct Input {
     /// Toggle sandbox: true = on, false = off
     #[serde(default)]
     sandbox: Option<bool>,
-    /// Sandbox mode override: "auto", "macos", "docker", "bwrap"
+    /// Sandbox mode override: "auto", "macos", "docker", "bwrap", "landlock", "appcontainer"
     #[serde(default)]
     sandbox_mode: Option<String>,
     /// Allow network inside sandbox

@@ -30,6 +30,15 @@ pub struct PipelineGraph {
     /// upper bound rather than rely on the LLM to estimate correctly.
     #[serde(default)]
     pub default_timeout_secs: Option<u64>,
+    /// Gap 3.4 — optional per-pipeline result-size fidelity annotation.
+    /// Set via the DOT graph attribute `result_fidelity` (e.g.
+    /// `result_fidelity="truncate:50000"`, `"summary:200"`, `"compact"`,
+    /// or `"full"`). When present it WINS over the default result ceiling
+    /// applied by `RunPipelineTool`; an explicit `full` is an opt-out of
+    /// the default ceiling. When absent (`None`), the default ceiling
+    /// degrades an oversized result so it can never wedge the frame layer.
+    #[serde(default)]
+    pub result_fidelity: Option<crate::fidelity::FidelityMode>,
     /// Nodes keyed by their ID.
     pub nodes: HashMap<String, PipelineNode>,
     /// Directed edges.

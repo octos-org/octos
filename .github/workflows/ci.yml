@@ -11,8 +11,8 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
-  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
-  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard -p skill-evolve"
+  FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p skill-evolve"
 
 jobs:
   dashboard:
@@ -87,6 +87,52 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: crate-ci/typos@v1.33.1
+
+  windows-deploy-script:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Windows deploy dry run
+        shell: pwsh
+        run: |
+          $deploy = & .\scripts\deploy.ps1 `
+            -HostName win.example.invalid `
+            -User deploy `
+            -Port 2222 `
+            -Version v0.0.0-test `
+            -RemoteRoot 'C:\octos-ci' `
+            -ServiceName OctosServeTest `
+            -ServePort 50080 `
+            -AuthToken test-token `
+            -DryRun 2>&1
+          $deployText = $deploy | Out-String
+          Write-Host $deployText
+          if ($deployText -notmatch '\$nssmExe install') {
+            throw 'deploy dry run did not include NSSM service registration'
+          }
+          if ($deployText -notmatch 'C:\\octos-ci') {
+            throw 'deploy dry run did not include the requested remote root'
+          }
+          if ($deployText -notmatch 'ssh -p 2222') {
+            throw 'deploy dry run did not include SSH port handling'
+          }
+
+          $uninstall = & .\scripts\deploy.ps1 `
+            -HostName win.example.invalid `
+            -RemoteRoot 'C:\octos-ci' `
+            -ServiceName OctosServeTest `
+            -Uninstall `
+            -Purge `
+            -DryRun 2>&1
+          $uninstallText = $uninstall | Out-String
+          Write-Host $uninstallText
+          if ($uninstallText -notmatch 'sc\.exe delete') {
+            throw 'uninstall dry run did not include sc.exe fallback'
+          }
+          if ($uninstallText -notmatch 'Remove-Item -Recurse -Force') {
+            throw 'uninstall dry run did not include purge behavior'
+          }
 
   check:
     runs-on: ubuntu-latest
@@ -165,6 +211,9 @@ jobs:
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
+
       # RFC-2 (issue #1291): validate every bundled `crates/app-skills/*/manifest.json`
       # against the strict octos JSON schema validator. A failure here means a
       # bundled skill ships a manifest shape that strict LLM-provider validators
@@ -230,6 +279,7 @@ jobs:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -315,7 +365,7 @@ jobs:
           shared-key: matrix-feature
 
       - name: Check octos-cli with matrix feature
-        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,slack,whatsapp,feishu,email,matrix,audio_mp3
+        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3
 
   check-arm:
     if: github.event_name != 'pull_request'
@@ -354,6 +404,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
@@ -410,6 +462,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
@@ -461,6 +515,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Test octos-sandbox
+        run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
@@ -491,14 +547,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
@@ -519,14 +587,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
@@ -549,14 +629,26 @@ jobs:
           shared-key: arm64-release
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
@@ -579,15 +671,27 @@ jobs:
           shared-key: windows-release
 
       - name: Build release
+        shell: bash
         run: |
+          # rust_embed bakes static/{admin,web} in at compile time → build both
+          # SPAs before cargo so the bundle artifact serves /admin and /app.
+          # One command per line so `set -e` aborts on ANY failure (a chained
+          # `&&` can mask an early failure → an artifact missing /admin or /app).
+          cd dashboard
+          npm ci
+          npm run build
+          cd ..
+          git submodule update --init octos-web
+          bash scripts/build-web-app.sh
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release -p octos-sandbox
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
         shell: bash
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
             cp "target/release/${b}.exe" dist/ 2>/dev/null || true
           done
           cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
@@ -702,4 +806,4 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
-          cargo test -p crew-agent --test security_sandbox -- --nocapture
+          cargo test -p octos-agent --test security_sandbox -- --nocapture

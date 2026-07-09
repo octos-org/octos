@@ -160,6 +160,8 @@ fn base_config(dir: &TempDir, memory: Arc<EpisodeStore>, ctx: PipelineContext) -
         shutdown: Arc::new(AtomicBool::new(false)),
         max_parallel_workers: 4,
         max_pipeline_fanout_total: None,
+        guards: Vec::new(),
+        max_concurrent_llm_calls: None,
         checkpoint_store: None,
         hook_executor: None,
         workspace_context: ctx,

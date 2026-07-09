@@ -24,6 +24,7 @@ mod ollama;
 mod openai;
 mod openrouter;
 mod r9s;
+mod vertex;
 mod vllm;
 mod zai;
 mod zhipu;
@@ -90,6 +91,7 @@ static ALL: &[ProviderEntry] = &[
     anthropic::ENTRY,
     openai::ENTRY,
     gemini::ENTRY,
+    vertex::ENTRY,
     r9s::ENTRY,
     openrouter::ENTRY,
     deepseek::ENTRY,
@@ -203,7 +205,18 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 15);
+        assert_eq!(all_entries().len(), 16);
+    }
+
+    #[test]
+    fn vertex_entry_is_registered_with_sa_json_credential() {
+        let e = lookup("vertex").expect("vertex provider should be registered");
+        assert_eq!(e.name, "vertex");
+        // Credential is the SA JSON, resolved through the VERTEX_SA_JSON channel.
+        assert_eq!(e.api_key_env, Some("VERTEX_SA_JSON"));
+        assert!(e.requires_api_key);
+        // bare gemini model names must NOT auto-route to vertex.
+        assert_eq!(detect_provider("gemini-2.5-flash"), Some("gemini"));
     }
 
     #[test]

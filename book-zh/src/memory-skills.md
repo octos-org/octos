@@ -65,9 +65,58 @@ Octos 采用三层记忆架构，结合自动记录与智能体驱动的知识�
 
 **长期记忆**（`.octos/memory/MEMORY.md`）保存跨会话的持久化事实和笔记。可通过手动编辑或 `write_file` 工具写入——其内容会在每轮对话中完整注入系统提示词。
 
-**每日笔记**（`.octos/memory/YYYY-MM-DD.md`）提供近期活动的滚动窗口。最近 **7 天**的每日笔记会自动纳入智能体上下文。这些文件可以手动创建或通过 `write_file` 工具生成。
+**每日笔记**（`.octos/memory/YYYY-MM-DD.md`）提供近期活动的滚动窗口。最近 **7 天**的每日笔记会自动纳入智能体上下文。这些文件通过手动创建或 `write_file` 工具生成——下文的记忆刷新流水线整合进 `MEMORY.md`，不写入每日笔记。
 
-> **注意：** 每日笔记由系统提示词构建器读取，但不会自动填充内容。你可以手动写入或指示智能体通过 `write_file` 工具写入。
+`MEMORY.md` 可以手动编辑，但一旦刷新流水线迁移过它，每个以空行分隔的块都必须保留其结尾的 `^m…` id。手动添加没有 id 的块会让解析器判定文件为混合状态并 fail-closed，从而暂停整合直到修复——因此新增事实时优先使用 `octos memory remember`。
+
+### 自动记忆刷新（抽取 + 整合）
+
+Octos 内置一套自动记忆流水线，从你的对话中读取持久化事实并整合进 `MEMORY.md`——无需手动编辑文件即可让长期记忆自动生长。该功能**默认开启**。
+
+**运行位置。** 后台扫描只在持有该 profile 刷新锁的长期运行进程中执行——即 `octos serve` 或 `octos gateway`。普通的 `octos chat` 从不运行后台扫描（否则会争用锁）。流水线分三部分：
+
+1. **捕获（Capture）**——一轮对话中，轻量的 `memory_note` 工具 + 捕获策略让智能体记下候选事实。
+2. **抽取扫描（Extraction sweep）**——按定时器扫描空闲会话并抽取持久事实（增量游标保证每条消息至多读取一次，后续扫描不会重复计费）。
+3. **整合（Consolidation）**——把候选合并进 `MEMORY.md`（每条条目获得稳定 id，如 `^m4k2abq`），归档陈旧条目，并将文件保持在大小上限内。
+
+**手动控制——`octos memory`：**
+
+```bash
+octos memory refresh          # 立即执行一次抽取 + 整合
+octos memory status           # 锁持有者、待处理积压、每日预算
+octos memory remember "..."   # 本地暂存一条事实（写入时不调用 LLM；整合时应用）
+octos memory forget "..."     # 自由文本遗忘 → 进入确认流程
+octos memory forget --id ^m4k2abq   # 硬删除某条精确的 MEMORY.md 条目
+```
+
+即使后台扫描被禁用，`refresh` 仍可运行；但当运行中的服务持有锁时会拒绝（请先停止它，或让它自行扫描）。
+
+**配置**（全部可选，均有合理默认）位于 `config.json` 的 `memory.refresh` 下：
+
+```json
+{
+  "memory": {
+    "max_inject_tokens": 2500,
+    "refresh": {
+      "enabled": true,
+      "extract_model": null,
+      "consolidate_model": null,
+      "min_idle_minutes": 30,
+      "max_session_age_days": 10,
+      "max_sessions_per_pass": 2,
+      "max_extractions_per_day": 20,
+      "max_consolidations_per_day": 12,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30,
+      "max_memory_file_tokens": 8000
+    }
+  }
+}
+```
+
+- **`enabled`** 是三态：**缺省即开启**（产品默认）。设为 `false`——或 `OCTOS_MEMORY_REFRESH_ENABLED=0`——可彻底退出（无捕获工具、无每轮重读、无扫描）。宿主级别的退出会被子 profile 继承。
+- **`extract_model` / `consolidate_model`** 默认使用 profile 的服务商；可指向便宜的模型以降低刷新成本。
+- 每日预算（`max_extractions_per_day`、`max_consolidations_per_day`、`max_daily_tokens`）按 profile 计并在本地日期翻转时重置；持久状态位于 `memory/refresh_state.json`。
 
 ### 第三层：实体知识库（工具驱动）
 
@@ -307,7 +356,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # 安装到指定配置文件
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 安装程序会优先从技能注册表下载预编译二进制文件（SHA-256 校验），如有 `Cargo.toml` 则回退到 `cargo build --release`，如有 `package.json` 则运行 `npm install`。
@@ -325,16 +374,14 @@ octos skills search "web scraping"   # 搜索在线注册表
 
 ### 技能解析顺序
 
-技能按以下目录加载（优先级从高到低）：
+配置文件 gateway 按以下优先级加载技能：
 
-1. `.octos/plugins/`（旧版兼容）
-2. `.octos/skills/`（用户安装的自定义技能）
-3. `.octos/bundled-app-skills/`（预装应用技能）
-4. `.octos/platform-skills/`（平台技能：ASR/TTS）
-5. `~/.octos/plugins/`（全局旧版兼容）
-6. `~/.octos/skills/`（全局自定义技能）
+1. `~/.octos/profiles/<profile>/data/skills/`（配置文件作用域的自定义技能）
+2. `<octos_home>/bundled-app-skills/`（预装应用技能）
+3. `<octos_home>/platform-skills/`（管理员加载的平台技能）
 
-用户安装的技能会覆盖同名的预装技能。
+独立项目运行还可以加载 `<project>/.octos/plugins/` 和
+`<project>/.octos/skills/`。旧的 HOME 全局目录仅用于迁移，不再属于常规扫描路径。
 
 ---
 

@@ -221,6 +221,10 @@ pub struct ProfileRuntime {
     /// the heavy work (memory context, skills summary, bootstrap
     /// files) off the per-request hot path.
     pub system_prompt: String,
+    /// The same prompt split at the memory slot — per-session agents
+    /// compose `pre → [memory segment] → post` to keep the pre-refactor
+    /// precedence (memory before skills/tool guidance).
+    pub prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts,
 
     /// Hook configurations contributed by loaded plugins (skill
     /// manifests can declare `before_tool_call` / `after_tool_call` /
@@ -237,6 +241,10 @@ pub struct ProfileRuntime {
     /// workflow resolve specialists from the same profile runtime that
     /// owns model, memory, sandbox, and tools.
     pub review_config: Option<ReviewConfig>,
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): per-profile
+    /// human-approval rules, converted once at bootstrap and inherited by
+    /// every per-session Agent this profile spawns.
+    pub human_approval_rules: Option<octos_agent::HumanApprovalRules>,
 
     /// Long-lived [`EpisodeStore`] for this profile (redb at
     /// `<data_dir>/episodes.redb`). Shared across all sessions of
@@ -247,6 +255,16 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    pub memory_inject_tokens: usize,
+    /// Resolved `memory.refresh.enabled` — gates the capture-policy text in
+    /// the memory segment and the per-turn refresh provider.
+    pub memory_refresh_enabled: bool,
+    /// Background memory-refresh sweep (extraction over idle sessions).
+    /// `Some` only when `memory.refresh.enabled` and this process won the
+    /// profile's refresh lock; dropping the runtime stops the sweep and
+    /// releases the lock.
+    pub memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
 
     /// Shared [`ToolConfigStore`] for the profile (per-tool
     /// runtime overrides, e.g. `deep_crawl.page_settle_ms`).
@@ -326,6 +344,13 @@ pub struct ProfileRuntime {
     /// change because the [`octos_llm::AdaptiveRouter`] silently falls
     /// through when zero candidates match.
     pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
+
+    /// The profile's resolved voice (ASR/TTS) configuration, captured at
+    /// bootstrap from `config.voice` (defaults applied when the profile has no
+    /// `voice` block). The serve voice-turn path reads this for the STT
+    /// language hint and the TTS voice / route (`tts_provider`) so those are
+    /// configurable per profile instead of hardcoded.
+    pub voice: crate::config::VoiceConfig,
 }
 
 /// Which OS process is calling [`ProfileRuntime::bootstrap`].
@@ -400,7 +425,8 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None).await
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None, None)
+            .await
     }
 
     /// Section B (codex review round-3): bootstrap a profile runtime while
@@ -416,6 +442,8 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
         host_plugins: Option<&crate::config::PluginsConfig>,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
@@ -426,6 +454,11 @@ impl ProfileRuntime {
                 config.plugins.require_signed = true;
             }
         }
+        // Host memory settings apply field-by-field when the profile doesn't
+        // override them (same host-default pattern as plugins/voice). A
+        // profile serialized with an empty `memory: {}` block must still
+        // inherit the host budget.
+        crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
@@ -613,7 +646,7 @@ impl ProfileRuntime {
                     // `config_from_profile` so operators can opt into
                     // strict signature enforcement per deployment.
                     require_signed: config.plugins.require_signed,
-                    verified_cache_dir: None,
+                    verified_cache_dir: Some(effective_octos_home.join("cache").join("verified")),
                 },
             ) {
                 Ok(result) => plugin_result = result,
@@ -688,6 +721,9 @@ impl ProfileRuntime {
         // session inherits the same memory_store.
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+        }
 
         // REG-7 follow-up: register `run_pipeline` at profile scope so
         // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
@@ -908,19 +944,24 @@ impl ProfileRuntime {
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
         let skills_loader = build_account_skills_loader(data_dir);
-        let mut system_prompt = build_system_prompt(
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        let mut prompt_parts = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
             data_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            prompt_parts.post_memory.push_str("\n\n");
+            prompt_parts.post_memory.push_str(fragment);
         }
+        let system_prompt = prompt_parts.joined();
+        let prompt_parts_for_runtime = prompt_parts.clone();
 
         // M11-F regression fix REG-3: assemble the lifecycle hook
         // executor once per profile and propagate the `Arc` onto every
@@ -962,6 +1003,40 @@ impl ProfileRuntime {
             "ProfileRuntime: bootstrapped"
         );
 
+        // Validate the per-profile approval policy with the SAME checks the
+        // top-level config load applies, so a bad profile rule fails fast
+        // instead of gating unexpectedly / creating unanswerable or
+        // instantly-expiring requests (review finding #4).
+        if let Some(policy) = profile.config.approval_policy.as_ref() {
+            policy
+                .validate()
+                .wrap_err("invalid profile approval_policy")?;
+        }
+
+        // Start the background memory-refresh sweep when enabled. The
+        // flock decides ownership when serve and gateway share a profile
+        // dir; the loser just logs and skips.
+        let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.to_path_buf(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -982,14 +1057,40 @@ impl ProfileRuntime {
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
             review_config: profile.config.review.clone(),
+            human_approval_rules: profile
+                .config
+                .approval_policy
+                .as_ref()
+                .map(|policy| policy.to_runtime_rules()),
             system_prompt,
+            prompt_parts: prompt_parts_for_runtime,
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             memory,
             memory_store,
+            memory_refresh,
             tool_config,
             cron_service: Some(cron_service),
             pipeline_factory,
             hook_executor,
             lane_routing: profile.config.lane_routing.clone(),
+            // Voice (ASR/TTS) route/ASR settings are a serve-level platform
+            // setting living on the top-level config.json, not on per-profile
+            // JSON. `config_from_profile` drops it, so the caller (serve/gateway)
+            // passes the host's `config.voice` here; fall back to defaults when
+            // absent. Per-tenant settings (*timbre*, TTS route, cloud config) are
+            // overlaid: `voice_default` (reply voice via `PUT /api/my/voice`),
+            // `tts_provider` (route: auto/local/cloud), and `tts_cloud` (cloud
+            // credentials).
+            voice: config
+                .voice
+                .clone()
+                .or_else(|| host_voice.cloned())
+                .unwrap_or_default()
+                .with_default_voice_override(profile.config.voice_default.as_deref())
+                .with_tts_provider_override(profile.config.tts_provider.as_deref())
+                .with_cloud_override(profile.config.tts_cloud.as_ref())
+                .with_cloud_token_from_env(&profile.config.env_vars),
         }))
     }
 }
@@ -1028,8 +1129,10 @@ mod tests {
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
     };
+    use crate::runtime::SessionRuntime;
     use chrono::Utc;
     use octos_agent::SandboxConfig;
+    use octos_core::SessionKey;
     use std::collections::HashMap;
 
     /// Build a minimal `UserProfile` with no LLM contract. M11-D
@@ -1569,6 +1672,112 @@ mod tests {
         );
     }
 
+    /// Issue #87: sub-account profile skill loading must not strand the
+    /// runtime without `shell` or a usable `activate_tools` back-reference.
+    /// The original report showed a sub-account bot that had loaded skills
+    /// but could not call any tool, including `activate_tools`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subaccount_skill_loading_preserves_shell_and_activate_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _key = ScopedEnvKey::set("OCTOS_ISSUE_87_SUBACCOUNT_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let octos_home = tmp.path().join("octos-home");
+        let data_dir = octos_home.join("profiles").join("mofa-child").join("data");
+        let skill_dir = data_dir.join("skills").join("issue-87-probe");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
+                "name": "issue-87-probe",
+                "version": "1.0",
+                "tools": [
+                    {
+                        "name": "issue_87_probe",
+                        "description": "Issue #87 profile skill probe",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = skill_dir.join("issue-87-probe");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut profile = fixture_profile("mofa-child", "OCTOS_ISSUE_87_SUBACCOUNT_KEY");
+        profile.parent_id = Some("mofa-parent".to_string());
+        profile.public_subdomain = Some("mofa-child-public".to_string());
+
+        let rt =
+            ProfileRuntime::bootstrap(&profile, &data_dir, Some(&octos_home), BootstrapRole::Serve)
+                .await
+                .expect("sub-account profile bootstrap should succeed");
+
+        assert!(
+            rt.tool_specs.get("issue_87_probe").is_some(),
+            "per-profile skill tool must load for sub-account profiles; plugin_dirs={:?}; plugin_tool_names={:?}; registered_tools={:?}",
+            rt.plugin_dirs,
+            rt.plugin_tool_names,
+            rt.tool_specs
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            rt.tool_specs.get("shell").is_some(),
+            "sub-account skill loading must not drop the shell tool"
+        );
+        assert!(
+            rt.tool_specs.get("activate_tools").is_some(),
+            "sub-account skill loading must leave activate_tools available"
+        );
+
+        let profile_runtime = Arc::new(rt);
+        let session_a =
+            SessionRuntime::bootstrap(&profile_runtime, SessionKey::new("api", "issue-87-a"), None)
+                .await
+                .expect("session A bootstrap");
+        let session_b =
+            SessionRuntime::bootstrap(&profile_runtime, SessionKey::new("api", "issue-87-b"), None)
+                .await
+                .expect("session B bootstrap");
+
+        for session in [&session_a, &session_b] {
+            assert!(
+                session.tools.get("shell").is_some(),
+                "session {} must retain shell after workspace rebind",
+                session.session_key
+            );
+            let activate_tools = session
+                .tools
+                .get("activate_tools")
+                .expect("session activate_tools");
+            let result = activate_tools
+                .execute(&serde_json::json!({"tools": ["shell"]}))
+                .await
+                .expect("activate_tools must be wired to the session registry");
+            assert!(
+                result.success,
+                "activate_tools should be able to resolve shell for {}; got: {}",
+                session.session_key, result.output
+            );
+            assert!(
+                result.output.contains("shell"),
+                "activate_tools output should name shell for {}; got: {}",
+                session.session_key,
+                result.output
+            );
+        }
+    }
+
     /// Section B (codex review round-3): the host's `plugins.require_signed`
     /// policy must reach the per-profile bootstrap so an unsigned skill
     /// installed under `<data_dir>/skills/` is rejected even when the
@@ -1614,6 +1823,8 @@ mod tests {
             Some(&octos_home),
             BootstrapRole::Serve,
             Some(&host_plugins),
+            None,
+            None,
         )
         .await
         .expect("bootstrap should succeed (the rejection only suppresses the plugin)");

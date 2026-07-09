@@ -375,6 +375,79 @@ pub struct SpawnOnlyFailureSignal {
 /// the raw `BackgroundTask`.
 type OnFailureCallback = Box<dyn Fn(&SpawnOnlyFailureSignal) + Send + Sync>;
 
+/// Terminal outcome carried by a [`TerminalEvent`]. Distinguishes the
+/// success path (→ `ChildCompleted` re-entry) from the failure path
+/// (→ recovery re-entry, prompt-selected on `synth_ack_emitted`).
+//
+// `large_enum_variant`: the `Failed` variant carries a
+// [`SpawnOnlyFailureSignal`], which holds a `serde_json::Value`
+// (`tool_input`). When any workspace crate enables serde_json's
+// `preserve_order` feature (the `octos acp` bridge's `agent-client-protocol`
+// dependency requires it, and Cargo unifies features workspace-wide),
+// `Value::Object` switches from `BTreeMap` to `IndexMap` and the struct grows
+// past the lint's threshold. Boxing the payload here would ripple through the
+// `pub` API and every match site for a terminal (cold) event; the size
+// difference is immaterial on this non-hot path, so we allow it instead.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    /// Task reached `Completed`. Drives the autonomous `ChildCompleted`
+    /// progress-update re-entry.
+    Completed,
+    /// Task reached `Failed` / `Cancelled`. Drives the recovery re-entry.
+    /// The failure payload mirrors today's [`SpawnOnlyFailureSignal`] so
+    /// the consumer can render the recovery prompt without re-parsing the
+    /// raw task.
+    Failed(SpawnOnlyFailureSignal),
+}
+
+/// Gap-1 unification: a single terminal-transition event fired from every
+/// terminal path (`mark_completed`, `mark_failed`, cascade-fail,
+/// orphan-sweep). Carries the union of today's three divergent payloads so
+/// ONE consumer can route success AND failure through the master
+/// continuation queue with a single profile-resolving call path.
+///
+/// `synth_ack_emitted` lifts the load-bearing failure gate from delivery
+/// (today's `notify_failure` two-phase stash) to PROMPT SELECTION: the
+/// consumer suppresses the recovery body for a failure whose synth-ack was
+/// never emitted (sibling-error / pre-flight short-circuit) rather than the
+/// supervisor deciding whether the event is delivered at all. The boolean
+/// is captured at fire-time from
+/// [`TaskSupervisor::was_synth_ack_emitted`]; for the rare fail-before-ack
+/// race the legacy two-phase path (kept live during the strangler
+/// migration) re-emits the deferred signal on ack and the shared dedupe key
+/// collapses the two deliveries to one continuation.
+#[derive(Debug, Clone)]
+pub struct TerminalEvent {
+    /// Snapshot of the task at the moment it went terminal.
+    pub task: BackgroundTask,
+    /// Whether the spawn_only synth-ack ("Background work started …") was
+    /// emitted to the LLM for this task's `tool_call_id`. Only meaningful
+    /// for [`TerminalOutcome::Failed`]; `false` for completions.
+    pub synth_ack_emitted: bool,
+    /// Success vs failure, carrying the failure recovery payload.
+    pub outcome: TerminalOutcome,
+}
+
+impl TerminalEvent {
+    /// True when this event represents a failure transition.
+    pub fn is_failure(&self) -> bool {
+        matches!(self.outcome, TerminalOutcome::Failed(_))
+    }
+
+    /// The failure signal payload, when this is a failure event.
+    pub fn failure_signal(&self) -> Option<&SpawnOnlyFailureSignal> {
+        match &self.outcome {
+            TerminalOutcome::Failed(signal) => Some(signal),
+            TerminalOutcome::Completed => None,
+        }
+    }
+}
+
+/// Callback invoked on EVERY terminal background-task transition. The
+/// single sink the Gap-1 unification routes all terminal re-entry through.
+type OnTerminalCallback = Box<dyn Fn(&TerminalEvent) + Send + Sync>;
+
 /// Options for `TaskSupervisor::relaunch`. Mirrors the
 /// `POST /api/tasks/{id}/restart-from-node` request body.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -609,6 +682,69 @@ fn is_terminal_runtime_state(state: &TaskRuntimeState) -> bool {
     )
 }
 
+/// Process-global set of task ids whose DETACHED worker is currently live in
+/// THIS process.
+///
+/// fix/orphan-sweep-liveness-gate — root cause: the WS turn path builds a
+/// BRAND-NEW per-turn [`TaskSupervisor`] every turn (`run_standalone_turn` →
+/// `ToolRegistry::snapshot_excluding` → `TaskSupervisor::new()`) and calls
+/// [`TaskSupervisor::enable_persistence`] every turn over the SHARED per-session
+/// ledger. The orphan-sweep inside `enable_persistence` *assumes* "non-terminal
+/// ⇒ no live worker" (true only at true cross-process startup). But a detached
+/// `spawn_only` task (e.g. `run_pipeline deep_research`, up to ~3600s) outlives
+/// the turn that launched it: when turn N+1 opens, its fresh supervisor restores
+/// turn N's still-`Running` row and falsely reaps it as "orphaned across
+/// restart" — even though the worker is alive on turn N's supervisor and will
+/// `mark_completed` shortly (evidence: 23/23 tasks ever marked orphaned ended
+/// `completed`).
+///
+/// The set CHECKS that precondition instead of assuming it. It is a
+/// `static`/`OnceLock` so it survives the per-turn supervisor rebuild within one
+/// process (the different per-turn `TaskSupervisor` instances are distinct
+/// objects, so per-supervisor state cannot carry liveness across the rebuild),
+/// yet starts EMPTY after a genuine cross-process restart (new process ⇒ no
+/// entries ⇒ stale rows still reaped). No `unsafe` — the workspace is
+/// `deny(unsafe_code)`.
+///
+/// Membership is owned by the detached worker via [`TaskTerminalGuard`]:
+/// constructed (insert) in the FOREGROUND, before the `tokio::spawn`, so the
+/// id is live within the spawning turn (closing the pre-poll window where a
+/// fast next-turn sweep could reap a scheduled-but-not-yet-polled worker); the
+/// guard is then moved into the worker future and dropped (clear) on EVERY
+/// exit path — success, failure, cancel, panic-unwind, or unpolled drop — so a
+/// finished task is never kept "live" forever.
+fn live_detached_tasks() -> &'static Mutex<HashSet<String>> {
+    static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record that the detached worker for `task_id` is live in this process.
+/// Called by [`TaskTerminalGuard::new`]; idempotent.
+fn mark_task_live(task_id: &str) {
+    live_detached_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(task_id.to_string());
+}
+
+/// Remove `task_id` from the live-set once its worker terminates. Called by
+/// [`TaskTerminalGuard`]'s `Drop` on every exit path; idempotent.
+fn clear_task_live(task_id: &str) {
+    live_detached_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_id);
+}
+
+/// Whether the detached worker for `task_id` is currently live in this process.
+/// Used by the orphan-sweep filter to skip still-live detached tasks.
+fn is_task_live(task_id: &str) -> bool {
+    live_detached_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(task_id)
+}
+
 fn record_workflow_phase_transition(workflow_kind: &str, from_phase: &str, to_phase: &str) {
     counter!(
         "octos_workflow_phase_transition_total",
@@ -679,6 +815,7 @@ impl std::fmt::Debug for TaskSupervisor {
             .field("tasks", &self.tasks)
             .field("on_change", &"<callback>")
             .field("on_failure", &"<callback>")
+            .field("on_terminal", &"<callback>")
             .field("on_relaunch", &"<callback>")
             .field("progress_reporter", &progress_reporter_attached)
             .field(
@@ -725,6 +862,11 @@ pub struct TaskSupervisor {
     poisoned_parents: Arc<Mutex<HashSet<String>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
+    /// Gap-1 unification: single terminal-transition sink. Fired from
+    /// every terminal path alongside the legacy `on_change` / `on_failure`
+    /// callbacks (strangler — both live during migration; shared dedupe
+    /// keys collapse double-delivery to one continuation).
+    on_terminal: Arc<Mutex<Option<OnTerminalCallback>>>,
     on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
     /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
@@ -846,6 +988,15 @@ struct AckAndPending {
     emitted_task_ids: HashSet<String>,
     /// FIFO insertion order for `emitted_task_ids`.
     emitted_insertion_order: VecDeque<String>,
+    /// Gap-1 unification: per-task idempotency guard for the unified
+    /// `on_terminal` callback. Keyed by `task_id` (unique) so each task
+    /// fires its terminal event at most once even across the live →
+    /// cascade-fail → orphan-sweep re-mark paths. Bounded by
+    /// [`MAX_FAILURE_SIGNAL_EMITTED_IDS`] with FIFO eviction (same class
+    /// as `emitted_task_ids`).
+    terminal_notified_task_ids: HashSet<String>,
+    /// FIFO insertion order for `terminal_notified_task_ids`.
+    terminal_notified_insertion_order: VecDeque<String>,
 }
 
 impl AckAndPending {
@@ -970,6 +1121,33 @@ impl AckAndPending {
         }
         true
     }
+
+    /// Gap-1 unification: mark `task_id` as having fired its unified
+    /// terminal event. Returns `true` on the first call (caller should
+    /// invoke the callback), `false` on subsequent calls (caller must
+    /// suppress). Bounded by [`MAX_FAILURE_SIGNAL_EMITTED_IDS`] with FIFO
+    /// eviction — same idempotency class as [`Self::mark_emitted`].
+    fn mark_terminal_notified(&mut self, task_id: &str) -> bool {
+        if !self.terminal_notified_task_ids.insert(task_id.to_string()) {
+            return false;
+        }
+        self.terminal_notified_insertion_order
+            .push_back(task_id.to_string());
+        while self.terminal_notified_task_ids.len() > MAX_FAILURE_SIGNAL_EMITTED_IDS {
+            if let Some(stale) = self.terminal_notified_insertion_order.pop_front() {
+                if self.terminal_notified_task_ids.remove(&stale) {
+                    tracing::warn!(
+                        evicted_task_id = %stale,
+                        cap = MAX_FAILURE_SIGNAL_EMITTED_IDS,
+                        "evicting oldest terminal-notified id: cap exceeded",
+                    );
+                }
+            } else {
+                break;
+            }
+        }
+        true
+    }
 }
 
 /// Pending failure entry — see the field-level doc on
@@ -999,6 +1177,7 @@ impl TaskSupervisor {
             poisoned_parents: Arc::new(Mutex::new(HashSet::new())),
             on_change: Arc::new(Mutex::new(None)),
             on_failure: Arc::new(Mutex::new(None)),
+            on_terminal: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
@@ -1149,9 +1328,59 @@ impl TaskSupervisor {
         // load and sweep.
         let orphans: Vec<(String, String, String)> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+
+            // fix/orphan-sweep-liveness-gate (codex round-2): a live detached
+            // parent (e.g. `run_pipeline deep_research`) registers
+            // `pipeline:<node>` CHILD rows that SHARE its `tool_call_id` but
+            // carry their OWN task ids — and only the PARENT worker arms a
+            // `TaskTerminalGuard`, so the children are never inserted into the
+            // live-set. Gating solely on `is_task_live(&task.id)` therefore
+            // protects the live parent yet still falsely reaps its active
+            // children. Collect the `tool_call_id` of every currently-live
+            // task so the sweep can exempt the children: while a parent worker
+            // is live it OWNS its tool_call_id family (it drives the children
+            // to terminal, or cascade-fails them on its own timeout via
+            // `mark_descendants_failed`), so none of them is an orphan. Empty
+            // tcids are skipped so an id-less row cannot blanket-exempt every
+            // other empty-tcid row.
+            let live_tool_call_ids: HashSet<&str> = tasks
+                .values()
+                .filter(|task| !task.tool_call_id.is_empty() && is_task_live(&task.id))
+                .map(|task| task.tool_call_id.as_str())
+                .collect();
+
+            // True for a row that is live-by-proxy: a `pipeline:<node>` child
+            // whose live parent shares its `tool_call_id`. Synthesized
+            // `tool_call_id`s are process-unique (codex round-3/4 made Gemini +
+            // inline-invoke so), and native provider ids are unique, so the
+            // only rows sharing a live tcid are that parent and its pipeline
+            // children. The `pipeline:` guard is defense-in-depth: it bounds
+            // the proxy-exemption to genuine pipeline nodes, so even a FUTURE
+            // non-unique producer could at worst spare a stray `pipeline:` row,
+            // never an arbitrary dead task. The live parent itself is exempted
+            // by its own unique id below, not by this proxy.
+            let is_live_pipeline_child = |task: &BackgroundTask| {
+                task.tool_name.starts_with("pipeline:")
+                    && live_tool_call_ids.contains(task.tool_call_id.as_str())
+            };
+
             tasks
                 .values()
-                .filter(|task| !is_terminal_runtime_state(&task.runtime_state))
+                // CHECK the sweep's "non-terminal ⇒ no live worker"
+                // precondition instead of assuming it. A still-live DETACHED
+                // spawn_only worker (alive on a prior per-turn supervisor in
+                // THIS process) is in the process-global live-set, so it is
+                // NEVER swept — its own worker will drive it terminal. A
+                // pipeline child of such a worker is live-by-proxy and is
+                // likewise exempt. A genuinely dead task from a true
+                // cross-process restart is absent from the live-set (new
+                // process ⇒ empty set) and shares no live tcid ⇒ still
+                // correctly reaped below.
+                .filter(|task| {
+                    !is_terminal_runtime_state(&task.runtime_state)
+                        && !is_task_live(&task.id)
+                        && !is_live_pipeline_child(task)
+                })
                 .map(|task| {
                     (
                         task.id.clone(),
@@ -1214,6 +1443,24 @@ impl TaskSupervisor {
         cb: impl Fn(&SpawnOnlyFailureSignal) + Send + Sync + 'static,
     ) {
         let mut guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Box::new(cb));
+    }
+
+    /// Gap-1 unification: set the single terminal-transition callback. Fired
+    /// (once per task, idempotently) from `mark_completed` / `mark_failed` /
+    /// cascade-fail / orphan-sweep with a [`TerminalEvent`] union payload.
+    ///
+    /// This is the unified sink the consumer routes BOTH success
+    /// (`ChildCompleted`) AND failure (recovery) re-entry through, with one
+    /// profile-resolving call path. It fires ALONGSIDE the legacy
+    /// `on_change` / `on_failure` callbacks during the strangler migration;
+    /// shared dedupe keys collapse the double delivery to one continuation.
+    ///
+    /// Like `on_failure`, the terminal callback fires at most once per task:
+    /// re-marking an already-terminal task (live + cascade, idempotent
+    /// re-marks) is a no-op for this callback.
+    pub fn set_on_terminal(&self, cb: impl Fn(&TerminalEvent) + Send + Sync + 'static) {
+        let mut guard = self.on_terminal.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Box::new(cb));
     }
 
@@ -1702,12 +1949,18 @@ impl TaskSupervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(parent_session_key);
             if already_poisoned {
+                // Diagnostic count for the error payload — live children
+                // (status-active OR worker-still-running), matching the
+                // semantics of the gating count below.
                 let count = self
                     .tasks
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && (task.status.is_active() || is_task_live(&task.id))
+                    })
                     .count();
                 let error = RegisterTaskError::ChildFanoutExceeded {
                     parent_session_key: parent_session_key.to_string(),
@@ -1735,9 +1988,27 @@ impl TaskSupervisor {
             // continue to hit the cap path as before.
             let (current_count, parent_terminal_status) = {
                 let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Count LIVE children only. `tasks` is never pruned, so an
+                // unfiltered count is the session's lifetime total — a
+                // long-lived session that merely completed `cap` tasks over
+                // its life would trip the cap, poison the key forever, and
+                // force-fail its active work. The cap's job is to bound
+                // runaway CONCURRENT fan-out; terminal children are done and
+                // hold no resources this cap protects.
+                //
+                // "Live" is status-active OR worker-still-running (codex P2):
+                // `cancel` flips the STATUS to Cancelled immediately, but the
+                // detached worker keeps executing until it observes the token
+                // — status alone would let a spawn→cancel-all→spawn cycle run
+                // 2× the cap concurrently. The process-global live-set
+                // (armed by `TaskTerminalGuard::new`, cleared on its Drop at
+                // every worker exit path) tracks actual worker liveness.
                 let count = tasks
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && (task.status.is_active() || is_task_live(&task.id))
+                    })
                     .count();
                 let terminal = parent_terminal_check_tool_call_id
                     .filter(|tcid| !tcid.is_empty())
@@ -2119,6 +2390,12 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            // Gap-1 unification: fire the single terminal sink for the
+            // success path (→ ChildCompleted re-entry). Runs alongside the
+            // legacy `on_change` → `upsert_background_task_agent` path during
+            // the strangler migration; shared dedupe keys collapse the two
+            // `ChildCompleted` enqueues to one continuation.
+            self.notify_terminal(task);
             self.emit_progress_for_state(task);
             // Codex round-4 BLOCKER (PR #1324 follow-up): drain any
             // pending failure stash for this task's unique task_id.
@@ -2180,6 +2457,16 @@ impl TaskSupervisor {
             if !was_already_failed {
                 self.emit_progress_for_state(task);
                 self.notify_failure(task);
+                // Gap-1 unification: fire the single terminal sink for the
+                // failure path (→ recovery re-entry). Runs alongside the
+                // legacy `notify_failure` → `on_failure` path during the
+                // strangler migration. The consumer resolves the runtime
+                // profile here (killing `_main` stranding for failures) and
+                // shares the failure dedupe key with the legacy
+                // gateway/WS deliveries, so double-delivery collapses to one
+                // continuation. Synth-ack gating moves to prompt selection
+                // inside the consumer (carried on the `TerminalEvent`).
+                self.notify_terminal(task);
             }
         }
     }
@@ -2690,7 +2977,7 @@ impl TaskSupervisor {
             Err(error) => return Err(error),
         };
 
-        let mut restored = HashMap::new();
+        let mut restored: HashMap<String, BackgroundTask> = HashMap::new();
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else {
                 continue;
@@ -2704,9 +2991,96 @@ impl TaskSupervisor {
             if record.schema_version > CURRENT_TASK_LEDGER_SCHEMA {
                 continue;
             }
-            restored.insert(record.task.id.clone(), record.task);
+            // Keep the freshest snapshot per id by `updated_at`, not blindly
+            // the last JSONL row: SUP1 and a later per-turn supervisor both
+            // append to the SAME per-session ledger, so rows can interleave
+            // such that an older snapshot lands after a newer one. (codex P2.)
+            match restored.get(&record.task.id) {
+                Some(existing) if existing.updated_at >= record.task.updated_at => {}
+                _ => {
+                    restored.insert(record.task.id.clone(), record.task);
+                }
+            }
         }
         Ok(restored)
+    }
+
+    /// Re-read the persistence ledger and merge any snapshot newer (by
+    /// `updated_at`) than the in-memory copy into `self.tasks`. Unlike
+    /// [`Self::enable_persistence`] this does NOT run the orphan sweep, persist
+    /// snapshots, or fire callbacks — it only freshens stale in-memory rows.
+    ///
+    /// Per-turn supervisors share a per-session ledger: a later turn's
+    /// supervisor restores a copy of an earlier turn's still-running task but
+    /// never receives that task's later status updates (those go to the owning
+    /// supervisor). Calling this before projecting/acting on tasks lets the
+    /// later supervisor pick up the owner's terminal write, so a finished
+    /// cross-turn task can't surface as `running` or accept a stale cancel.
+    /// Returns the number of rows refreshed; `Ok(0)` if persistence is off.
+    pub fn refresh_from_persistence(&self) -> std::io::Result<usize> {
+        let path = {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(path) => path.clone(),
+                None => return Ok(0),
+            }
+        };
+        let restored = Self::load_persisted_tasks(&path)?;
+        let mut refreshed = 0;
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        for (task_id, task) in restored {
+            // Only freshen tasks THIS supervisor already owns — never import a
+            // row absent here. Importing would let an older supervisor
+            // accumulate copies of a later supervisor's tasks, and
+            // `cancel_task`/`relaunch_task` (oldest-first) would then fire the
+            // wrong supervisor's token while the real worker runs on (codex P1).
+            if let Some(existing) = tasks.get(&task_id) {
+                if task.updated_at > existing.updated_at {
+                    tasks.insert(task_id, task);
+                    refreshed += 1;
+                }
+            }
+        }
+        Ok(refreshed)
+    }
+
+    /// Like [`Self::refresh_from_persistence`] but only for `task_id`. Returns
+    /// the freshened task (newer of ledger vs in-memory), or `None` if absent
+    /// in both. Used before cancel/relaunch act on a task so a stale in-memory
+    /// `Running` copy in a later supervisor can't accept a doomed cancel.
+    pub fn refresh_task_from_persistence(
+        &self,
+        task_id: &str,
+    ) -> std::io::Result<Option<BackgroundTask>> {
+        let path = {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        if let Some(path) = path {
+            let restored = Self::load_persisted_tasks(&path)?;
+            if let Some(task) = restored.get(task_id) {
+                let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Update only if this supervisor already owns the task — never
+                // import an absent row (codex P1; see `refresh_from_persistence`).
+                if let Some(existing) = tasks.get(task_id) {
+                    if task.updated_at > existing.updated_at {
+                        tasks.insert(task_id.to_string(), task.clone());
+                    }
+                }
+            }
+        }
+        Ok(self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .cloned())
     }
 
     /// Fire the on_change callback (if set) with a task snapshot.
@@ -2714,6 +3088,72 @@ impl TaskSupervisor {
         let guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref cb) = *guard {
             cb(task);
+        }
+    }
+
+    /// Gap-1 unification: fire the unified `on_terminal` callback (if set)
+    /// exactly once per task for a terminal transition. Builds the
+    /// [`TerminalEvent`] union payload — for failures it captures the
+    /// failure signal AND the synth-ack boolean (lifted from delivery-gate
+    /// to prompt-selection) so the consumer decides recovery-prompt vs
+    /// suppression. The per-task idempotency guard collapses live +
+    /// cascade-fail + orphan-sweep re-marks to one event.
+    ///
+    /// The callback is invoked AFTER releasing the `ack_and_pending` mutex
+    /// — it is user code that may take other locks (notably the orchestrator
+    /// state mutex).
+    fn notify_terminal(&self, task: &BackgroundTask) {
+        // Cheap early-out: nothing to do without a wired callback.
+        {
+            let guard = self.on_terminal.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                return;
+            }
+        }
+        let outcome = match task.status {
+            TaskStatus::Completed => TerminalOutcome::Completed,
+            TaskStatus::Failed | TaskStatus::Cancelled => {
+                TerminalOutcome::Failed(SpawnOnlyFailureSignal {
+                    task_id: task.id.clone(),
+                    tool_name: task.tool_name.clone(),
+                    tool_input: task.tool_input.clone().unwrap_or(Value::Null),
+                    error_message: task.error.clone().unwrap_or_default(),
+                    suggested_alternatives: parse_alternatives(task.error.as_deref().unwrap_or("")),
+                    parent_session_key: task
+                        .parent_session_key
+                        .clone()
+                        .or_else(|| task.session_key.clone()),
+                    originating_client_message_id: task.originating_client_message_id.clone(),
+                })
+            }
+            // Non-terminal status — defensive; callers only invoke this on
+            // terminal transitions.
+            TaskStatus::Spawned | TaskStatus::Running => return,
+        };
+        // Idempotency under the shared mutex so the live → cascade → orphan
+        // re-mark paths cannot double-fire.
+        {
+            let mut guard = self
+                .ack_and_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !guard.mark_terminal_notified(&task.id) {
+                return;
+            }
+        }
+        // Synth-ack is only consulted for prompt selection on failures.
+        let synth_ack_emitted = match &outcome {
+            TerminalOutcome::Failed(_) => self.was_synth_ack_emitted(&task.tool_call_id),
+            TerminalOutcome::Completed => false,
+        };
+        let event = TerminalEvent {
+            task: task.clone(),
+            synth_ack_emitted,
+            outcome,
+        };
+        let guard = self.on_terminal.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cb) = *guard {
+            cb(&event);
         }
     }
 
@@ -2749,6 +3189,75 @@ impl TaskSupervisor {
         tasks.values().filter(|t| t.status.is_active()).count()
     }
 }
+
+/// RAII guard that drives a background task to a terminal state if its
+/// owning worker body is dropped (panicked, aborted, or torn down with the
+/// runtime) before reaching its own terminal `mark_*` arm.
+///
+/// C1 step 2: a background `tokio::spawn` body that panics or is cancelled
+/// after `mark_running` but before its `mark_completed`/`mark_failed` arm
+/// would otherwise leave the task `Running` forever — the TUI task count
+/// never decrements and the chip stays "Orchestrating".
+///
+/// Construct the guard in the FOREGROUND (before `tokio::spawn`) and move it
+/// into the background body. No explicit disarm is needed: on normal
+/// completion the body's own `mark_*` arm has already moved the task terminal,
+/// so by the time `Drop` runs the task is no longer `is_active()` and the
+/// guard's `mark_failed` is a no-op (the terminal guards inside `mark_failed` /
+/// `mark_completed` make this idempotent).
+pub struct TaskTerminalGuard {
+    supervisor: Arc<TaskSupervisor>,
+    task_id: String,
+}
+
+impl TaskTerminalGuard {
+    /// Arm a guard for `task_id` on `supervisor`.
+    ///
+    /// fix/orphan-sweep-liveness-gate: arming the guard also records the task
+    /// id in the process-global live-set ([`mark_task_live`]). The guard is
+    /// constructed in the FOREGROUND, before each detached `spawn_only` worker
+    /// is spawned (`execution.rs`, `spawn.rs`), then moved into the worker
+    /// future — so the id enters the live-set synchronously within the
+    /// spawning turn (closing the pre-poll window) and this is the single
+    /// insert site for "a detached worker is live". The matching clear happens
+    /// in `Drop`, which runs on EVERY exit path (success, failure, cancel,
+    /// panic-unwind, or unpolled drop).
+    pub fn new(supervisor: Arc<TaskSupervisor>, task_id: String) -> Self {
+        mark_task_live(&task_id);
+        Self {
+            supervisor,
+            task_id,
+        }
+    }
+}
+
+impl Drop for TaskTerminalGuard {
+    fn drop(&mut self) {
+        // fix/orphan-sweep-liveness-gate: clear the live-set entry FIRST so the
+        // task is no longer "live" the instant its worker future terminates —
+        // on every exit path, including panic-unwind. After this, a genuinely
+        // stale row from a later restart is correctly reapable.
+        clear_task_live(&self.task_id);
+        // Only fire if the task is still active. For already-terminal tasks
+        // this lookup short-circuits and we leave the recorded outcome
+        // (Completed/Failed/Cancelled) untouched — and even if we raced and
+        // called `mark_failed` anyway, the supervisor's terminal guard would
+        // no-op it. The active-check keeps the common (success) path from
+        // touching the lock twice and avoids a spurious failure-signal fire.
+        let still_active = self
+            .supervisor
+            .get_task(&self.task_id)
+            .map(|task| task.status.is_active())
+            .unwrap_or(false);
+        if still_active {
+            self.supervisor.mark_failed(
+                &self.task_id,
+                "worker dropped before reaching terminal state".to_string(),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2895,6 +3404,185 @@ mod tests {
             notifications.lock().unwrap().len(),
             1,
             "no-op call must NOT fire on_change"
+        );
+    }
+
+    /// Gap-1 unification: the unified `on_terminal` callback fires exactly
+    /// once per task for both success and failure transitions, carrying the
+    /// correct outcome + (for failures) the synth-ack-as-prompt-selection
+    /// boolean. Idempotent under repeated terminal marks.
+    #[test]
+    fn on_terminal_fires_once_for_success_and_failure_with_correct_payload() {
+        use std::sync::{Arc, Mutex};
+
+        // ── success ──────────────────────────────────────────────────
+        let supervisor = TaskSupervisor::new();
+        let events: Arc<Mutex<Vec<TerminalEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        supervisor.set_on_terminal(move |event: &TerminalEvent| {
+            sink.lock().unwrap().push(event.clone());
+        });
+
+        let ok = supervisor.register("run_pipeline", "call-ok", Some("web:s1"));
+        supervisor.mark_running(&ok);
+        supervisor.mark_completed(&ok, vec!["/tmp/octos/out.md".to_owned()]);
+        // Idempotent: a defensive double mark must not re-fire.
+        supervisor.mark_completed(&ok, vec!["/tmp/octos/out.md".to_owned()]);
+
+        {
+            let observed = events.lock().unwrap();
+            let completed: Vec<_> = observed
+                .iter()
+                .filter(|e| matches!(e.outcome, TerminalOutcome::Completed))
+                .collect();
+            assert_eq!(
+                completed.len(),
+                1,
+                "exactly one Completed terminal event must fire (idempotent)"
+            );
+            assert_eq!(completed[0].task.id, ok);
+            assert!(
+                !completed[0].synth_ack_emitted,
+                "completion events do not consult synth-ack"
+            );
+            assert!(!completed[0].is_failure());
+        }
+
+        // ── failure WITH synth-ack (recovery body should be selected) ──
+        let with_ack = supervisor.register_with_input_and_cmid(
+            "mofa_slides",
+            "call-fail-ack",
+            Some("web:s1"),
+            Some(serde_json::json!({"topic": "rust"})),
+            Some("cmid-42".to_owned()),
+        );
+        supervisor.mark_synth_ack_emitted("call-fail-ack");
+        supervisor.mark_running(&with_ack);
+        supervisor.mark_failed(
+            &with_ack,
+            "plugin exited 137. available: a, b, c".to_owned(),
+        );
+        // Idempotent re-mark (live + cascade collapse to one event).
+        supervisor.mark_failed(&with_ack, "second mark".to_owned());
+
+        // ── failure WITHOUT synth-ack (suppression at prompt selection) ─
+        let no_ack = supervisor.register_with_input_and_cmid(
+            "mofa_slides",
+            "call-fail-noack",
+            Some("web:s1"),
+            Some(serde_json::json!({"topic": "go"})),
+            None,
+        );
+        supervisor.mark_running(&no_ack);
+        supervisor.mark_failed(&no_ack, "sibling suppressed".to_owned());
+
+        let observed = events.lock().unwrap();
+        let with_ack_event = observed
+            .iter()
+            .find(|e| e.task.id == with_ack)
+            .expect("failure-with-ack event present");
+        assert!(with_ack_event.is_failure());
+        assert!(
+            with_ack_event.synth_ack_emitted,
+            "failure-with-ack must carry synth_ack_emitted=true so the consumer renders the recovery body"
+        );
+        let sig = with_ack_event.failure_signal().expect("failure signal");
+        assert_eq!(sig.tool_name, "mofa_slides");
+        assert_eq!(
+            sig.originating_client_message_id.as_deref(),
+            Some("cmid-42")
+        );
+        assert_eq!(
+            sig.suggested_alternatives,
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            "alternatives must be parsed off the error text",
+        );
+
+        let no_ack_event = observed
+            .iter()
+            .find(|e| e.task.id == no_ack)
+            .expect("failure-without-ack event present");
+        assert!(no_ack_event.is_failure());
+        assert!(
+            !no_ack_event.synth_ack_emitted,
+            "failure-without-ack must carry synth_ack_emitted=false so the consumer suppresses the recovery body"
+        );
+
+        // Exactly one event per task id.
+        let with_ack_count = observed.iter().filter(|e| e.task.id == with_ack).count();
+        assert_eq!(
+            with_ack_count, 1,
+            "failure event must fire exactly once per task"
+        );
+    }
+
+    /// Gap-1 unification: cascade-fail (`mark_descendants_failed`) and the
+    /// orphan-sweep (`enable_persistence`) both reach the unified terminal
+    /// sink — they funnel through `mark_failed`, so no extra wiring is
+    /// needed, but pin it so a refactor cannot silently regress autonomous
+    /// recovery for those paths.
+    #[test]
+    fn on_terminal_fires_for_cascade_and_orphan_sweep_failures() {
+        use std::sync::{Arc, Mutex};
+
+        // ── cascade-fail ─────────────────────────────────────────────
+        let supervisor = TaskSupervisor::new();
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        supervisor.set_on_terminal(move |event: &TerminalEvent| {
+            if event.is_failure() {
+                sink.lock().unwrap().push(event.task.id.clone());
+            }
+        });
+
+        // A running run_pipeline parent + two pipeline node children under
+        // its tool_call_id.
+        let parent = supervisor.register("run_pipeline", "call-pipe", Some("web:s2"));
+        supervisor.mark_running(&parent);
+        let child_a = supervisor
+            .try_register_node_task("pipeline:analyze", "call-pipe", Some("web:s2"))
+            .expect("node a");
+        let child_b = supervisor
+            .try_register_node_task("pipeline:render", "call-pipe", Some("web:s2"))
+            .expect("node b");
+        supervisor.mark_running(&child_a);
+        supervisor.mark_running(&child_b);
+        let cascaded = supervisor.mark_descendants_failed("call-pipe", "parent timed out");
+        assert_eq!(cascaded, 2, "both node children must cascade-fail");
+
+        {
+            let observed = events.lock().unwrap();
+            assert!(
+                observed.contains(&child_a),
+                "cascade child A must reach terminal sink"
+            );
+            assert!(
+                observed.contains(&child_b),
+                "cascade child B must reach terminal sink"
+            );
+        }
+
+        // ── orphan-sweep ─────────────────────────────────────────────
+        let dir = tempfile::TempDir::new().unwrap();
+        let temp = dir.path().join("task_ledger.jsonl");
+        let supervisor2 = TaskSupervisor::new();
+        let events2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink2 = Arc::clone(&events2);
+        supervisor2.set_on_terminal(move |event: &TerminalEvent| {
+            if event.is_failure() {
+                sink2.lock().unwrap().push(event.task.id.clone());
+            }
+        });
+        let orphan = supervisor2.register("run_pipeline", "call-orphan", Some("web:s3"));
+        supervisor2.mark_running(&orphan);
+        // enable_persistence sweeps the non-terminal in-flight task into
+        // Failed("orphaned across restart") → mark_failed → notify_terminal.
+        supervisor2
+            .enable_persistence(&temp)
+            .expect("enable_persistence");
+        assert!(
+            events2.lock().unwrap().contains(&orphan),
+            "orphan-sweep failure must reach the unified terminal sink"
         );
     }
 
@@ -4934,6 +5622,71 @@ mod tests {
         assert!(!other.is_empty());
     }
 
+    /// The fan-out cap bounds LIVE children, not the session's lifetime
+    /// total. Regression: the cap count had no `is_active()` filter and
+    /// `tasks` is never pruned, so a long-lived session that merely
+    /// COMPLETED `MAX_CHILDREN_PER_PARENT` background tasks over its life
+    /// (tts / podcast / pipeline nodes) tripped the cap on the next
+    /// register — poisoning the session key forever and force-failing
+    /// every currently-active legitimate task.
+    #[test]
+    fn completed_children_do_not_count_toward_fanout_cap() {
+        let parent_session = "api:long-lived-parent";
+        let supervisor = TaskSupervisor::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("tts", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Every child finishes cleanly — the session is long-lived,
+            // not runaway.
+            supervisor.mark_completed(&id, Vec::new());
+        }
+
+        let id = supervisor
+            .try_register_with_input("tts", "call-after-long-life", Some(parent_session), None)
+            .expect("a session with only COMPLETED children must not trip the fan-out cap");
+        assert!(!id.is_empty());
+
+        // And the session must not have been poisoned or had work
+        // force-failed by the register above.
+        let tasks = supervisor.get_tasks_for_session(parent_session);
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.error.as_deref().is_none_or(|e| !e.contains("fanout"))),
+            "no child may be force-failed with a fan-out reason on a healthy session"
+        );
+    }
+
+    /// codex P2 on the active-only cap count: `cancel` flips a task's STATUS
+    /// to Cancelled immediately, but the detached worker keeps running until
+    /// it observes the token — a status-only count would let a session spawn
+    /// the cap, cancel everything, and spawn another cap while the first
+    /// workers still execute. A child whose worker is still LIVE (in the
+    /// process-global live-set armed by [`TaskTerminalGuard::new`]) must keep
+    /// counting toward the cap until the guard drops.
+    #[test]
+    fn cancelled_but_still_live_children_still_count_toward_cap() {
+        let parent_session = "api:cancel-bypass-parent";
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let mut guards = Vec::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("busy", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Arm the production liveness guard (worker "running"), then
+            // cancel: status flips Cancelled but the worker is still live.
+            guards.push(TaskTerminalGuard::new(supervisor.clone(), id.clone()));
+            let _ = supervisor.cancel(&id);
+        }
+
+        let err = supervisor
+            .try_register_with_input("busy", "call-bypass", Some(parent_session), None)
+            .expect_err("cancelled-but-still-LIVE workers must still bound the fan-out cap");
+        assert!(matches!(err, RegisterTaskError::ChildFanoutExceeded { .. }));
+        drop(guards);
+    }
+
     /// The legacy `register_with_input` entry point keeps returning a
     /// `String`; on cap rejection it returns an empty-string sentinel
     /// rather than panicking so existing call sites still type-check.
@@ -5646,6 +6399,571 @@ mod tests {
             "on_change must fire for each cascade-failed child terminal transition; \
              got {} failed pipeline snapshots",
             failed_snapshots.len()
+        );
+    }
+
+    /// STEP 1 contract: the orphan sweep that runs INSIDE
+    /// `enable_persistence` fires terminal `mark_failed("orphaned across
+    /// restart")` transitions. For the TUI task-count chain to learn the
+    /// task failed, the `on_change` callback MUST be installed BEFORE
+    /// `enable_persistence` — otherwise the sweep's `notify_change` hits
+    /// `on_change == None` and the terminal transition is silently dropped.
+    /// This is the supervisor-level invariant the CLI wiring (session_actor
+    /// + ui_protocol `run_standalone_turn`) depends on.
+    #[test]
+    fn on_change_installed_before_enable_persistence_observes_orphan_sweep() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // First runtime: register + mark_running, persist a non-terminal
+        // task, then drop the supervisor (simulating a restart).
+        let first = TaskSupervisor::new();
+        first.enable_persistence(&ledger_path).unwrap();
+        let id =
+            first.register_with_lineage("mofa_slides", "call-orphan", Some("api:session"), None);
+        first.mark_running(&id);
+        assert_eq!(
+            first.get_task(&id).expect("task").status,
+            TaskStatus::Running
+        );
+        drop(first);
+
+        // Second runtime: install on_change FIRST, then enable_persistence.
+        // The orphan sweep should fire the callback with the now-Failed task.
+        let restored = TaskSupervisor::new();
+        let observed: Arc<Mutex<Vec<BackgroundTask>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        restored.set_on_change(move |task: &BackgroundTask| {
+            sink.lock().unwrap().push(task.clone());
+        });
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let snapshots = observed.lock().unwrap();
+        let orphan_failure = snapshots
+            .iter()
+            .find(|t| t.id == id && t.status == TaskStatus::Failed)
+            .expect("on_change MUST observe the orphaned task transition to Failed");
+        assert_eq!(
+            orphan_failure.error.as_deref(),
+            Some("orphaned across restart"),
+        );
+    }
+
+    /// Inverse of the above: installing `on_change` AFTER
+    /// `enable_persistence` (the pre-fix ordering) means the orphan sweep's
+    /// terminal transition is NEVER observed by the callback. Documents WHY
+    /// the wiring order matters — the supervisor's stored task is Failed
+    /// either way, but the live notification chain stays cold.
+    #[test]
+    fn on_change_installed_after_enable_persistence_misses_orphan_sweep() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let first = TaskSupervisor::new();
+        first.enable_persistence(&ledger_path).unwrap();
+        let id =
+            first.register_with_lineage("mofa_slides", "call-orphan2", Some("api:session"), None);
+        first.mark_running(&id);
+        drop(first);
+
+        let restored = TaskSupervisor::new();
+        // Sweep runs HERE, before any callback is installed.
+        restored.enable_persistence(&ledger_path).unwrap();
+        let observed: Arc<Mutex<Vec<BackgroundTask>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        restored.set_on_change(move |task: &BackgroundTask| {
+            sink.lock().unwrap().push(task.clone());
+        });
+
+        // Stored task is Failed (sweep ran), but the callback never saw it.
+        assert_eq!(
+            restored.get_task(&id).expect("task").status,
+            TaskStatus::Failed
+        );
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "on_change installed AFTER enable_persistence must NOT observe the sweep's transition",
+        );
+    }
+
+    /// STEP 2: a guard armed after `mark_running` and dropped WITHOUT a
+    /// terminal call drives the task to `Failed` with the dropped-worker
+    /// reason.
+    #[test]
+    fn terminal_guard_marks_failed_when_dropped_while_active() {
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("mofa_slides", "call-guard", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        {
+            let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+            // No terminal call inside the scope — simulate an aborted body.
+        }
+
+        let task = supervisor.get_task(&id).expect("task");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.error.as_deref(),
+            Some("worker dropped before reaching terminal state"),
+        );
+    }
+
+    /// STEP 2: a guard whose body reached `mark_completed` before drop must
+    /// leave the task `Completed` — the Drop is a no-op for terminal tasks.
+    #[test]
+    fn terminal_guard_noop_when_task_already_completed() {
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("mofa_slides", "call-guard2", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        {
+            let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+            supervisor.mark_completed(&id, vec!["deck.pdf".to_string()]);
+        }
+
+        let task = supervisor.get_task(&id).expect("task");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "guard Drop must not overwrite a completed task",
+        );
+        assert!(task.error.is_none());
+    }
+
+    /// STEP 2: a `tokio::spawn` body that `panic!`s after `mark_running`
+    /// (with the guard armed) leaves the supervisor in `Failed` once the
+    /// JoinHandle resolves with the panic. Mirrors the production spawn body
+    /// shape where the guard is the first thing constructed.
+    #[tokio::test]
+    async fn terminal_guard_marks_failed_when_body_panics() {
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("mofa_slides", "call-guard-panic", Some("api:session"));
+
+        let sup = Arc::clone(&supervisor);
+        let task_id = id.clone();
+        let handle = tokio::spawn(async move {
+            sup.mark_running(&task_id);
+            let _guard = TaskTerminalGuard::new(Arc::clone(&sup), task_id.clone());
+            panic!("simulated worker panic after mark_running");
+        });
+
+        let join = handle.await;
+        assert!(join.is_err(), "spawned body should have panicked");
+
+        let task = supervisor.get_task(&id).expect("task");
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "guard Drop on panic-unwind must drive the task to Failed",
+        );
+        assert_eq!(
+            task.error.as_deref(),
+            Some("worker dropped before reaching terminal state"),
+        );
+    }
+
+    // ── Orphan-sweep liveness gate (fix/orphan-sweep-liveness-gate) ──
+    //
+    // The WS turn path rebuilds a BRAND-NEW per-turn `TaskSupervisor`
+    // every turn and calls `enable_persistence(...)` over the SHARED
+    // per-session ledger. `enable_persistence`'s orphan-sweep ASSUMES
+    // "non-terminal ⇒ no live worker", so it FALSELY marks a still-Running
+    // DETACHED spawn_only task (run_pipeline deep_research, up to ~3600s)
+    // as "orphaned across restart" — even though the worker is alive on the
+    // PREVIOUS turn's supervisor and will mark_completed shortly. The fix
+    // gates the sweep on a process-global live-set that survives the
+    // per-turn supervisor rebuild and is empty after a true cross-process
+    // restart.
+
+    /// RED→GREEN: a task in the process-global live-set + a `Running` row in
+    /// the shared ledger must NOT be swept as "orphaned across restart" by a
+    /// NEW supervisor's `enable_persistence`. Mirrors the real bug: turn N's
+    /// detached worker is alive (id in live-set) when turn N+1's fresh
+    /// supervisor opens the same ledger.
+    #[test]
+    fn live_detached_task_is_not_swept_as_orphan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Turn N: supervisor registers + runs a detached spawn_only task and
+        // persists a still-Running row.
+        let turn_n = TaskSupervisor::new();
+        turn_n.enable_persistence(&ledger_path).unwrap();
+        let id = turn_n.register("run_pipeline", "call-live-1", Some("api:sess"));
+        turn_n.mark_running(&id);
+
+        // The detached worker is alive: its id is in the process-global
+        // live-set (in production the TaskTerminalGuard inserts it).
+        mark_task_live(&id);
+        // RAII clear at scope end so the global set does not leak across tests.
+        struct ClearOnDrop<'a>(&'a str);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                clear_task_live(self.0);
+            }
+        }
+        let _clear = ClearOnDrop(&id);
+
+        // Turn N+1: a BRAND-NEW supervisor opens the SAME ledger. Pre-fix this
+        // sweep marks the still-Running row "orphaned across restart".
+        let turn_n1 = TaskSupervisor::new();
+        turn_n1.enable_persistence(&ledger_path).unwrap();
+
+        let restored = turn_n1.get_task(&id).expect("row restored");
+        assert_eq!(
+            restored.status,
+            TaskStatus::Running,
+            "a LIVE detached task (id in live-set) must NOT be swept as orphan",
+        );
+        assert_ne!(
+            restored.error.as_deref(),
+            Some("orphaned across restart"),
+            "live detached task must never carry the false-orphan reason",
+        );
+    }
+
+    /// A `Running` row whose id is NOT in the live-set (a true cross-process
+    /// restart: new process ⇒ empty live-set) is STILL reaped. Reaping
+    /// behaviour for genuinely-orphaned tasks is preserved.
+    #[test]
+    fn dead_task_not_in_live_set_is_still_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let writer = TaskSupervisor::new();
+        writer.enable_persistence(&ledger_path).unwrap();
+        let id = writer.register("run_pipeline", "call-dead-1", Some("api:sess"));
+        writer.mark_running(&id);
+        drop(writer);
+
+        // Simulate a true cross-process restart: the live-set is empty for
+        // this id (no live worker in this process). Defensive clear in case a
+        // prior test leaked the id.
+        clear_task_live(&id);
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let task = restored.get_task(&id).expect("row restored");
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "a dead task absent from the live-set must still be reaped",
+        );
+        assert_eq!(
+            task.error.as_deref(),
+            Some("orphaned across restart"),
+            "genuine orphan must still carry the standard reason",
+        );
+    }
+
+    /// The RAII drop-guard removes the id from the live-set when the worker
+    /// future completes/drops, so a finished task is not kept "live" forever
+    /// and a later genuine restart can reap a stale row.
+    #[test]
+    fn live_set_cleared_on_task_terminal() {
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let id = supervisor.register("run_pipeline", "call-clear-1", Some("api:sess"));
+        supervisor.mark_running(&id);
+
+        {
+            // Constructing the guard (production: top of the spawn_only body)
+            // inserts the id into the live-set.
+            let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+            assert!(
+                is_task_live(&id),
+                "guard construction must mark the task live",
+            );
+            supervisor.mark_completed(&id, vec!["deck.pdf".to_string()]);
+            // Guard still in scope: id stays live until the worker future drops.
+            assert!(is_task_live(&id), "task stays live until the future drops");
+        }
+
+        // Drop ran (worker future terminated): id is cleared.
+        assert!(
+            !is_task_live(&id),
+            "guard Drop must clear the id from the live-set on every exit path",
+        );
+    }
+
+    /// Higher-level guard mirroring the real bug: turn-1 spawns a (mock) long
+    /// detached spawn_only task whose worker stays alive; turn-2 supervisor
+    /// rebuild + sweep does NOT orphan it; then the task completes normally.
+    #[tokio::test]
+    async fn turn_rebuild_does_not_orphan_live_detached_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Turn 1: register + spawn a detached worker (guarded), persist Running.
+        let turn1 = Arc::new(TaskSupervisor::new());
+        turn1.enable_persistence(&ledger_path).unwrap();
+        let id = turn1.register("run_pipeline", "call-real-bug", Some("api:sess"));
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker_sup = Arc::clone(&turn1);
+        let worker_id = id.clone();
+        let worker = tokio::spawn(async move {
+            worker_sup.mark_running(&worker_id);
+            // Production: TaskTerminalGuard armed right after mark_running.
+            let _guard = TaskTerminalGuard::new(Arc::clone(&worker_sup), worker_id.clone());
+            // Long detached work: block until the test releases us.
+            let _ = release_rx.await;
+            worker_sup.mark_completed(&worker_id, vec!["report.md".to_string()]);
+        });
+
+        // Spin until the worker has marked the task Running + live.
+        for _ in 0..1000 {
+            if is_task_live(&id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            is_task_live(&id),
+            "worker should be live before turn-2 sweep"
+        );
+
+        // Turn 2: a fresh per-turn supervisor opens the SAME ledger and sweeps.
+        let turn2 = TaskSupervisor::new();
+        turn2.enable_persistence(&ledger_path).unwrap();
+        let mid_turn = turn2.get_task(&id).expect("row restored on turn-2");
+        assert_ne!(
+            mid_turn.error.as_deref(),
+            Some("orphaned across restart"),
+            "turn-2 sweep must NOT falsely orphan the still-live detached task",
+        );
+
+        // The detached worker finishes normally and returns its artifact.
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+
+        let done = turn1.get_task(&id).expect("task");
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.output_files, vec!["report.md".to_string()]);
+        // Worker future dropped ⇒ live-set cleared.
+        assert!(
+            !is_task_live(&id),
+            "live-set cleared after the worker completes"
+        );
+    }
+
+    /// codex round-2 DO-NOT-SHIP regression: a live `run_pipeline` parent
+    /// registers `pipeline:<node>` CHILD rows that SHARE its `tool_call_id`
+    /// but carry their OWN task ids. Only the PARENT worker arms a
+    /// `TaskTerminalGuard`, so the children are never inserted into the
+    /// live-set. The turn N+1 sweep must NOT reap those active children as
+    /// orphans while their parent is live — otherwise `run_pipeline
+    /// deep_research` shows the mini3 "spinner stuck orchestrating" symptom:
+    /// children falsely marked "orphaned across restart" (direct sweep) /
+    /// "parent task orphaned across restart" (cascade) even though the
+    /// pipeline is still running on the prior turn's live worker.
+    #[test]
+    fn live_pipeline_child_is_not_swept_when_parent_is_live() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Turn N: a detached run_pipeline parent + its active pipeline child,
+        // both persisted Running under the SAME tool_call_id.
+        let turn_n = TaskSupervisor::new();
+        turn_n.enable_persistence(&ledger_path).unwrap();
+        let parent = turn_n.register("run_pipeline", "call-pipe-1", Some("api:sess"));
+        turn_n.mark_running(&parent);
+        let child = turn_n.register("pipeline:research_node", "call-pipe-1", Some("api:sess"));
+        turn_n.mark_running(&child);
+
+        // Only the PARENT worker is live (pipeline children don't arm guards).
+        mark_task_live(&parent);
+        struct ClearOnDrop<'a>(Vec<&'a str>);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                for id in &self.0 {
+                    clear_task_live(id);
+                }
+            }
+        }
+        let _clear = ClearOnDrop(vec![&parent, &child]);
+
+        // Turn N+1: a brand-new supervisor opens the SAME ledger and sweeps.
+        let turn_n1 = TaskSupervisor::new();
+        turn_n1.enable_persistence(&ledger_path).unwrap();
+
+        let restored_parent = turn_n1.get_task(&parent).expect("parent restored");
+        assert_eq!(
+            restored_parent.status,
+            TaskStatus::Running,
+            "live run_pipeline parent must not be swept",
+        );
+
+        let restored_child = turn_n1.get_task(&child).expect("child restored");
+        assert_eq!(
+            restored_child.status,
+            TaskStatus::Running,
+            "an active pipeline child of a LIVE parent must NOT be reaped",
+        );
+        assert_ne!(
+            restored_child.error.as_deref(),
+            Some("orphaned across restart"),
+            "child must not carry the direct-sweep false-orphan reason",
+        );
+        assert_ne!(
+            restored_child.error.as_deref(),
+            Some("parent task orphaned across restart"),
+            "child must not carry the cascade false-orphan reason either",
+        );
+    }
+
+    /// Boundary counterpart: when NO member of the tool_call_id family is live
+    /// (a true cross-process restart ⇒ empty live-set), BOTH the parent and
+    /// its pipeline children are still reaped. The proxy-exemption only fires
+    /// for a genuinely live family, so reaping of real orphans is preserved.
+    #[test]
+    fn dead_pipeline_family_is_still_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let writer = TaskSupervisor::new();
+        writer.enable_persistence(&ledger_path).unwrap();
+        let parent = writer.register("run_pipeline", "call-pipe-dead", Some("api:sess"));
+        writer.mark_running(&parent);
+        let child = writer.register("pipeline:node", "call-pipe-dead", Some("api:sess"));
+        writer.mark_running(&child);
+        drop(writer);
+
+        // True restart: empty live-set for the whole family. Defensive clears
+        // in case a prior test leaked an id.
+        clear_task_live(&parent);
+        clear_task_live(&child);
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        assert_eq!(
+            restored.get_task(&parent).expect("parent").status,
+            TaskStatus::Failed,
+            "dead parent absent from the live-set must still be reaped",
+        );
+        assert_eq!(
+            restored.get_task(&child).expect("child").status,
+            TaskStatus::Failed,
+            "dead pipeline child must still be reaped when no parent is live",
+        );
+    }
+
+    /// Defense-in-depth (codex round-4): the proxy-exemption is bounded to
+    /// `pipeline:<node>` rows. Even if a future non-unique producer let an
+    /// UNRELATED dead task collide on a live task's `tool_call_id`, that dead
+    /// task — being a NON-pipeline tool — must still be reaped. Only genuine
+    /// pipeline children may be spared by proxy; the live owner is spared by
+    /// its own unique id, not by sharing a tcid.
+    #[test]
+    fn non_pipeline_task_sharing_live_tcid_is_still_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let turn_n = TaskSupervisor::new();
+        turn_n.enable_persistence(&ledger_path).unwrap();
+        // A live detached parent.
+        let live = turn_n.register("run_pipeline", "call-collide", Some("api:sess"));
+        turn_n.mark_running(&live);
+        // A SEPARATE, genuinely-dead NON-pipeline task that (hypothetically)
+        // collides on the same tcid — simulating a future non-unique producer.
+        let dead = turn_n.register("tts", "call-collide", Some("api:sess"));
+        turn_n.mark_running(&dead);
+
+        mark_task_live(&live);
+        struct ClearOnDrop<'a>(&'a str);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                clear_task_live(self.0);
+            }
+        }
+        let _clear = ClearOnDrop(&live);
+
+        let turn_n1 = TaskSupervisor::new();
+        turn_n1.enable_persistence(&ledger_path).unwrap();
+
+        assert_eq!(
+            turn_n1.get_task(&live).expect("live").status,
+            TaskStatus::Running,
+            "the live task is exempt via its own unique id",
+        );
+        assert_eq!(
+            turn_n1.get_task(&dead).expect("dead").status,
+            TaskStatus::Failed,
+            "a NON-pipeline task sharing a live tcid must still be reaped \
+             (proxy-exemption is bounded to pipeline children)",
+        );
+    }
+
+    /// codex round-5 DO-NOT-SHIP regression: the terminal guard is now armed in
+    /// the FOREGROUND (in `execution.rs` / `spawn.rs`, before `tokio::spawn`),
+    /// not inside the spawned worker future. This mirrors the real call-site
+    /// ordering — register (persist `Spawned`) → arm guard (foreground) →
+    /// spawn → [a fast next turn sweeps] → the worker future finally runs. The
+    /// pre-fix code armed the guard INSIDE the future, so a sweep that ran
+    /// before the worker future had progressed (the test gates it explicitly)
+    /// saw the row non-terminal AND not-live and falsely reaped a
+    /// scheduled-but-not-yet-run worker. With
+    /// foreground arming the id is in the live-set before the spawning turn
+    /// returns, so the pre-poll sweep skips it.
+    #[tokio::test]
+    async fn foreground_armed_guard_survives_sweep_before_worker_polls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let turn1 = Arc::new(TaskSupervisor::new());
+        turn1.enable_persistence(&ledger_path).unwrap();
+        // Foreground: register persists a Spawned row, THEN the guard is armed
+        // in the foreground (the fix), BEFORE the worker future is spawned.
+        let id = turn1.register("run_pipeline", "call-fg-guard", Some("api:sess"));
+        let guard = TaskTerminalGuard::new(Arc::clone(&turn1), id.clone());
+
+        // The worker future is spawned but blocked on a gate: it has NOT yet
+        // polled past the gate, so it has NOT called mark_running. In the
+        // pre-fix world the guard would not exist yet either.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker_sup = Arc::clone(&turn1);
+        let worker_id = id.clone();
+        let worker = tokio::spawn(async move {
+            // Foreground-armed guard moved into the future; Drop fires at end.
+            let _guard = guard;
+            let _ = release_rx.await;
+            worker_sup.mark_running(&worker_id);
+            worker_sup.mark_completed(&worker_id, vec!["report.md".to_string()]);
+        });
+
+        // Turn 2 sweeps the SAME ledger BEFORE the worker future progresses
+        // past the gate. Pre-fix (guard armed inside the future) this reaps the
+        // still-`Spawned`, not-yet-live row.
+        let turn2 = TaskSupervisor::new();
+        turn2.enable_persistence(&ledger_path).unwrap();
+        let mid = turn2.get_task(&id).expect("row restored on turn-2");
+        assert_ne!(
+            mid.error.as_deref(),
+            Some("orphaned across restart"),
+            "a foreground-armed guard must keep a pre-poll worker out of the sweep",
+        );
+
+        // The worker finishes normally.
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert_eq!(
+            turn1.get_task(&id).expect("task").status,
+            TaskStatus::Completed,
+        );
+        assert!(
+            !is_task_live(&id),
+            "live-set cleared after the worker future drops"
         );
     }
 }
