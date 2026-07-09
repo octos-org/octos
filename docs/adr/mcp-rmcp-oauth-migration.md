@@ -1,6 +1,10 @@
 # ADR: Migrate the MCP client to the `rmcp` SDK (stdio + streamable-HTTP + OAuth 2.1)
 
-Status: in progress (branch `feat/mcp-rmcp-oauth`)
+Status: implemented (branch `feat/mcp-rmcp-oauth`) — all four increments landed:
+1. ✅ stdio via rmcp (live-validated: real Gmail through better-email-mcp, clean child reap)
+2. ✅ streamable-HTTP + static bearer (`Authorization` header → rmcp `auth_header`)
+3. ✅ OAuth 2.1 transport + `octos mcp login`/`logout` + keyring token storage
+4. ✅ tests (36 pass, 0 warnings in octos-agent) + live stdio validation
 
 ## Context
 

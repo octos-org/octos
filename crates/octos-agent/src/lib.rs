@@ -29,6 +29,7 @@ pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod mcp_server;
 pub mod memory_segment;
 pub mod permissions;

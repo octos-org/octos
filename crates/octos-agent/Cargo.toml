@@ -42,7 +42,17 @@ rmcp = { version = "1.8", default-features = false, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 oauth2 = "5"
-keyring = { workspace = true }
+# rmcp's `AuthClient` wraps a reqwest 0.13 client (rmcp's own reqwest major).
+# Aliased so it coexists with octos's reqwest 0.12; cargo unifies both 0.13
+# users to the same crate instance, so the type matches rmcp's expectations.
+reqwest_rmcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+# Interactive OAuth login (`octos mcp login`): open the consent URL + catch the
+# loopback redirect.
+tiny_http = "0.12"
+webbrowser = "1"
+# Platform keyring backend for MCP OAuth token storage. macOS covered here for
+# local validation; Linux/Windows backends are a cross-platform follow-up.
+keyring = { workspace = true, features = ["apple-native"] }
 url = { workspace = true }
 htmd = { workspace = true }
 dirs = { workspace = true }
