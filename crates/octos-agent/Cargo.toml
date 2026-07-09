@@ -31,6 +31,18 @@ regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+# MCP client over the official rmcp SDK: stdio + streamable-HTTP + OAuth 2.1.
+rmcp = { version = "1.8", default-features = false, features = [
+    "client",
+    "auth",
+    "macros",
+    "base64",
+    "transport-async-rw",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+oauth2 = "5"
+keyring = { workspace = true }
 url = { workspace = true }
 htmd = { workspace = true }
 dirs = { workspace = true }
