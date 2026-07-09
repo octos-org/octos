@@ -239,11 +239,11 @@ octos office clean <dir>                        # Remove orphaned files from unp
 octos office validate <file>                    # Validate an Office file's structure
 octos office make-slide <image> -o <pptx>       # Compose a slide (bg image + --texts JSON overlays) into a .pptx
 octos office add-slide <unpacked-dir> <source>  # Add a slide to an unpacked PPTX (dup slideN.xml or apply slideLayoutN.xml)
-octos office overlay-text <file> [OPTIONS]      # Overlay text onto slides
+octos office overlay-text <image> <text>        # Burn text onto a PNG/JPEG (--x/--y position)
 octos office comment <unpacked-dir> <id> <text> # Add a comment to an unpacked DOCX
-octos office accept-changes <input> <output>    # Accept tracked changes (DOCX) → clean copy
 
 # LibreOffice-backed (require `soffice` on PATH)
+octos office accept-changes <input> <output>    # Accept tracked changes (DOCX) → clean copy
 octos office recalc <file>                      # Recalculate XLSX formulas
 octos office thumbnail <file> [OPTIONS]         # Render slide/page thumbnails
 octos office soffice <args...>                  # Passthrough to a sandboxed soffice

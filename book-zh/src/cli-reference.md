@@ -228,11 +228,11 @@ octos office clean <dir>                        # 清理解包后 PPTX 中的孤
 octos office validate <file>                    # 校验 Office 文件的结构
 octos office make-slide <image> -o <pptx>       # 将背景图 + --texts JSON 叠加文本合成为一张 .pptx 幻灯片
 octos office add-slide <unpacked-dir> <source>  # 向解包后的 PPTX 添加幻灯片（复制 slideN.xml 或套用 slideLayoutN.xml）
-octos office overlay-text <file> [OPTIONS]      # 在幻灯片上叠加文本
+octos office overlay-text <image> <text>        # 将文本烧录到 PNG/JPEG 图片上（--x/--y 定位）
 octos office comment <unpacked-dir> <id> <text> # 向解包后的 DOCX 添加批注
-octos office accept-changes <input> <output>    # 接受修订（DOCX）→ 干净副本
 
 # 依赖 LibreOffice（需 PATH 中有 `soffice`）
+octos office accept-changes <input> <output>    # 接受修订（DOCX）→ 干净副本
 octos office recalc <file>                      # 重新计算 XLSX 公式
 octos office thumbnail <file> [OPTIONS]         # 渲染幻灯片/页面缩略图
 octos office soffice <args...>                  # 透传到沙箱化的 soffice

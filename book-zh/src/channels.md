@@ -467,7 +467,7 @@ export TWILIO_AUTH_TOKEN="..."
 }
 ```
 
-将你的 Twilio 号码的入站 webhook 指向 `https://YOUR_OCTOS_HOST/webhook/twilio/<profile_id>`。使用 `twilio` 特性标志编译。
+将你的 Twilio 号码的入站 webhook 指向该渠道自带的 webhook 服务器：`http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`。Twilio 的 `X-Twilio-Signature` 会针对该确切路径校验，因此若在其前面加反向代理，必须保留 `/twilio/webhook` 路径（以及公网主机名）。使用 `twilio` 特性标志编译。
 
 ---
 
