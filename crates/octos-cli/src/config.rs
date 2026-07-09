@@ -1705,13 +1705,28 @@ impl Config {
     /// process env — instead of a bare `std::env::var` read.
     pub fn get_api_key_with_env(&self, provider: &str, env_var: Option<&str>) -> Result<String> {
         match env_var {
-            // An EXPLICIT var means "use this variable": the provider-
-            // scoped auth store must not win, or a stored `octos auth
-            // login -p openai` token would be sent to a custom
-            // OpenAI-compatible endpoint that the override targets.
-            Some(var) => self.resolve_env_var_only(var),
-            None => self.get_api_key(provider),
+            // A CUSTOM var means "use this variable": the provider-scoped
+            // auth store must not win, or a stored `octos auth login -p
+            // openai` token would be sent to the custom OpenAI-compatible
+            // endpoint the override targets. But when the override IS the
+            // provider's default var name (a redundant-but-legal config),
+            // the full provider chain — auth store included — still
+            // applies, preserving pre-existing login-based setups.
+            Some(var) if Some(var) != Self::provider_default_env_var(provider).as_deref() => {
+                self.resolve_env_var_only(var)
+            }
+            _ => self.get_api_key(provider),
         }
+    }
+
+    /// The env-var name the provider chain would use by default.
+    fn provider_default_env_var(provider: &str) -> Option<String> {
+        Some(
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase())),
+        )
     }
 
     /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
@@ -2952,6 +2967,23 @@ mod tests {
                 .get_api_key_with_env("openai", Some("NOPE_MISSING_VAR"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn provider_default_env_var_name_keeps_full_chain() {
+        // api_key_env set to the provider's OWN default name is redundant
+        // but legal — it must keep the full provider chain (auth store
+        // included), not the custom-var-only path. Here the chain falls
+        // through to env_vars, same as get_api_key would.
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "from-chain".to_string());
+        let via_override = config
+            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
+            .expect("resolves");
+        let via_default = config.get_api_key("openai").expect("resolves");
+        assert_eq!(via_override, via_default);
     }
 
     #[test]

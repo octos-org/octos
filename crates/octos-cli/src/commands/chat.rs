@@ -1064,7 +1064,29 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
         e = e.with_model(model);
     }
     if let Some(dimensions) = cfg.dimensions {
+        if dimensions as usize != octos_memory::EPISODIC_INDEX_DIMENSION {
+            tracing::warn!(
+                dimensions,
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "embedding.dimensions differs from the episodic index dimension — \
+                 vectors will be dropped to BM25-only"
+            );
+        }
         e = e.with_dimensions(dimensions);
+    } else if e.dimension() != octos_memory::EPISODIC_INDEX_DIMENSION {
+        // A model whose native size differs from the fixed index (e.g.
+        // text-embedding-3-large @3072, DashScope v4 @1024) would have
+        // every vector silently dropped to BM25-only. Pin the request to
+        // the index dimension (OpenAI-standard `dimensions` truncation;
+        // compatible providers accept it — ones that don't will error
+        // visibly at request time instead of degrading silently).
+        tracing::info!(
+            model = %e.model(),
+            native = e.dimension(),
+            pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
+            "pinning embedding dimensions to the episodic index size"
+        );
+        e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
     }
     Some(Arc::new(e))
 }

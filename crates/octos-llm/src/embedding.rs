@@ -55,6 +55,11 @@ impl OpenAIEmbedder {
         self
     }
 
+    /// The configured embedding model id.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Set a custom base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
