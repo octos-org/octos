@@ -203,17 +203,17 @@ fn emit_delegation_event(sink_path: Option<&str>, event: &DelegationEvent) -> st
     // Progress/Phase events.
     let json = serde_json::to_string(event)
         .map_err(|error| std::io::Error::other(format!("serialize delegation event: {error}")))?;
-    let path = if let Some(rest) = path.strip_prefix("file://") {
-        PathBuf::from(rest.strip_prefix("localhost").unwrap_or(rest))
-    } else {
-        PathBuf::from(path)
-    };
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    use std::io::Write;
-    writeln!(file, "{json}")
+    // Blocker 4 — funnel through the shared atomic, per-(canonical-)path-locked
+    // append helper instead of a raw `writeln!`. `writeln!` is NOT a single
+    // atomic write syscall and is UNLOCKED, so a delegation line could interleave
+    // with concurrent heartbeat / pipeline node-event writes to the SAME sink and
+    // corrupt the NDJSON stream. `write_event_line_to_sink` takes a pre-serialized
+    // line (so it preserves this event's custom `{schema, kind: "delegation", …}`
+    // shape, which is NOT a `HarnessEvent` payload variant) and appends it whole
+    // under the same lock every other sink writer holds. It also handles the
+    // `file://`/`localhost` prefix stripping, so the prior manual stripping is
+    // dropped.
+    crate::harness_events::write_event_line_to_sink(path, &json)
 }
 
 /// Build the tool policy applied to a delegated child registry.
@@ -256,6 +256,10 @@ pub struct DelegateTool {
     harness_event_sink: Option<String>,
     /// Agent config inherited by child workers.
     worker_config: Option<AgentConfig>,
+    /// Parent's embedding provider, propagated onto child workers so
+    /// their saved episodes are embedded and their episodic recall runs
+    /// (same NEW-06 propagation contract as SpawnTool / RunPipelineTool).
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     /// Caller-owned context-manager factory for delegated child agents.
     child_prompt_context_manager_factory: Option<ChildPromptContextManagerFactory>,
 }
@@ -276,6 +280,7 @@ impl DelegateTool {
             parent_task_id: None,
             harness_event_sink: None,
             worker_config: None,
+            embedder: None,
             child_prompt_context_manager_factory: None,
         }
     }
@@ -317,6 +322,27 @@ impl DelegateTool {
         self
     }
 
+    /// Propagate the parent's embedding provider onto delegated children.
+    pub fn with_embedder(mut self, embedder: Arc<dyn octos_llm::EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Test-only visibility: whether an embedder was threaded through.
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn octos_llm::EmbeddingProvider>> {
+        self.embedder.as_ref()
+    }
+
+    /// Like [`Self::with_embedder`] but tolerates `None` — call-site
+    /// sugar for optional parent embedders.
+    pub fn with_optional_embedder(
+        mut self,
+        embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    ) -> Self {
+        self.embedder = embedder.or(self.embedder);
+        self
+    }
+
     pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
         self.worker_config = Some(config);
         self
@@ -354,6 +380,7 @@ impl DelegateTool {
             parent_task_id: self.parent_task_id.clone(),
             harness_event_sink: self.harness_event_sink.clone(),
             worker_config: self.worker_config.clone(),
+            embedder: self.embedder.clone(),
             child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
         })
     }
@@ -587,6 +614,7 @@ impl Tool for DelegateTool {
             // still reaches grandchildren even if only the ToolContext set it.
             harness_event_sink: effective_sink.map(|s| s.to_string()),
             worker_config: self.worker_config.clone(),
+            embedder: self.embedder.clone(),
             child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
         };
         tools.register_arc(Arc::new(child_delegate));
@@ -622,6 +650,12 @@ impl Tool for DelegateTool {
         let worker_id = AgentId::new(format!("delegate-{child_num}"));
         let worker_id_for_context = worker_id.to_string();
         let mut worker = Agent::new(worker_id, self.llm.clone(), tools, self.memory.clone());
+        // Embed-on-save + recall parity (see SpawnTool): children save
+        // episodes via the inherited config; embed them and let their
+        // build_initial_messages recall run instead of silently skipping.
+        if let Some(ref embedder) = self.embedder {
+            worker = worker.with_embedder(embedder.clone());
+        }
         // Keep an Arc handle to the child's tool registry so we can run
         // declared validators against it after `run_task` returns. `Agent::new`
         // wraps the passed registry in an `Arc`, so we clone that Arc here
@@ -801,6 +835,78 @@ impl Tool for DelegateTool {
 mod tests {
     use super::*;
 
+    /// Stub embedder — never invoked; asserts only that the Arc is
+    /// threaded through (mirrors the SpawnTool / pipeline tests).
+    struct StubEmbedder;
+
+    #[async_trait]
+    impl octos_llm::EmbeddingProvider for StubEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0_f32; 1]; texts.len()])
+        }
+
+        fn dimension(&self) -> usize {
+            1
+        }
+    }
+
+    struct NoopLlm;
+
+    #[async_trait]
+    impl octos_llm::LlmProvider for NoopLlm {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            eyre::bail!("not called in these tests")
+        }
+        fn provider_name(&self) -> &str {
+            "noop"
+        }
+        fn model_id(&self) -> &str {
+            "noop-1"
+        }
+    }
+
+    async fn embedder_probe_tool() -> DelegateTool {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory = Arc::new(
+            EpisodeStore::open(dir.path().join("mem"))
+                .await
+                .expect("episode store"),
+        );
+        DelegateTool::new(
+            Arc::new(NoopLlm) as Arc<dyn LlmProvider>,
+            memory,
+            std::env::temp_dir(),
+        )
+    }
+
+    /// Delegated children inherit `worker_config` (and with it
+    /// `save_episodes`) — without the embedder their episodes are stored
+    /// vectorless and their recall silently skips.
+    #[tokio::test]
+    async fn should_store_embedder_and_fork_it_into_child_tools() {
+        let embedder = Arc::new(StubEmbedder) as Arc<dyn octos_llm::EmbeddingProvider>;
+        let tool = embedder_probe_tool().await.with_embedder(embedder);
+        assert!(tool.embedder_for_test().is_some());
+
+        let child = tool.child_tool().expect("depth budget allows a child");
+        assert!(
+            child.embedder_for_test().is_some(),
+            "child_tool() must fork the embedder so grandchildren keep \
+             embed-on-save + hybrid recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_default_to_no_embedder_when_not_provided() {
+        let tool = embedder_probe_tool().await;
+        assert!(tool.embedder_for_test().is_none());
+    }
+
     #[test]
     fn should_serde_round_trip_depth_budget() {
         let budget = DepthBudget { current: 1, max: 2 };
@@ -885,5 +991,94 @@ mod tests {
         assert_eq!(DelegationOutcome::Completed.label(), "completed");
         assert_eq!(DelegationOutcome::Failed.label(), "failed");
         assert_eq!(DelegationOutcome::DepthExceeded.label(), "depth_exceeded");
+    }
+
+    /// Blocker 4 (RED on the prior raw `writeln!`) — `emit_delegation_event`
+    /// must funnel through the shared atomic, per-path-locked sink helper so a
+    /// delegation line never interleaves with concurrent harness-event writes to
+    /// the SAME sink. We hammer the sink with delegation events and large
+    /// harness events at once; every persisted line must be whole, parseable
+    /// NDJSON. The old unlocked `writeln!` could split a delegation line across
+    /// a concurrent harness write and corrupt the stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delegation_events_funnel_through_atomic_sink() {
+        use crate::harness_events::{
+            HarnessEvent, HarnessEventSinkContext, attach_event_sink_context,
+            detach_event_sink_context, write_event_to_sink,
+        };
+
+        let sink_file = tempfile::NamedTempFile::new().expect("sink file");
+        let sink_uri = sink_file.path().display().to_string();
+        attach_event_sink_context(
+            sink_uri.clone(),
+            HarnessEventSinkContext {
+                session_id: "api:session".to_string(),
+                task_id: "tc-delegate-atomic".to_string(),
+            },
+        );
+
+        const N: usize = 16;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let sink = sink_uri.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // The delegate write path under test.
+                    let event = DelegationEvent::new(
+                        1,
+                        format!("parent-{i}"),
+                        format!("child-{i}"),
+                        DelegationOutcome::Completed,
+                    );
+                    emit_delegation_event(Some(&sink), &event).expect("emit delegation");
+                } else {
+                    // A concurrent large harness event to widen the window.
+                    let mut extra = std::collections::HashMap::new();
+                    extra.insert(
+                        "node".to_string(),
+                        serde_json::Value::String(format!("n-{i}")),
+                    );
+                    extra.insert(
+                        "preview".to_string(),
+                        serde_json::Value::String("h".repeat(6 * 1024)),
+                    );
+                    let event = HarnessEvent::progress_with_extra(
+                        "api:session",
+                        "tc-delegate-atomic",
+                        Some("research"),
+                        "node_completed",
+                        Some(format!("hev {i}")),
+                        Some(1.0),
+                        extra,
+                    );
+                    write_event_to_sink(&sink, &event).expect("write harness event");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("writer task");
+        }
+
+        detach_event_sink_context(&sink_uri);
+
+        let contents = std::fs::read_to_string(sink_file.path()).expect("read sink");
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            N,
+            "expected one whole line per writer (delegation funnels through the \
+             atomic helper); got {} lines",
+            lines.len()
+        );
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("delegation/harness line must be whole: {e}; {line:?}"));
+            assert_eq!(v["schema"], HARNESS_EVENT_SCHEMA_V1, "line={line:?}");
+        }
+        let delegations = lines
+            .iter()
+            .filter(|l| l.contains("\"delegation\""))
+            .count();
+        assert_eq!(delegations, N / 2, "all delegation lines present and whole");
     }
 }

@@ -40,6 +40,7 @@
 //! PID + nanos seeded round-robin start indices keep concurrent
 //! pipelines from herd-routing to the same model on every call.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -146,6 +147,26 @@ pub fn assign_from_catalog_dir(graph: &mut PipelineGraph, data_dir: &Path) {
     };
 
     assign_to_graph(graph, &pools);
+}
+
+/// Return every model routing key present in the profile/system pipeline
+/// catalog. This lets the pre-execution validator enforce explicit `model=`
+/// attributes without doing I/O inside the pure validation pass.
+pub fn known_model_keys_from_catalog_dir(data_dir: &Path) -> BTreeSet<String> {
+    let Some(catalog) = load_catalog(data_dir) else {
+        return BTreeSet::new();
+    };
+    catalog
+        .models
+        .iter()
+        .flat_map(|entry| {
+            let mut keys = vec![entry.provider.clone(), entry.model_key().to_string()];
+            if let Some((provider, _)) = entry.provider.split_once('/') {
+                keys.push(provider.to_string());
+            }
+            keys
+        })
+        .collect()
 }
 
 /// Test-friendly entry point that takes pre-built pools directly so we
@@ -398,6 +419,7 @@ mod tests {
             default_model: None,
             max_total_tokens: None,
             default_timeout_secs: None,
+            result_fidelity: None,
             nodes: nodes.into_iter().collect::<HashMap<_, _>>(),
             edges: Vec::new(),
             subgraphs: Vec::new(),

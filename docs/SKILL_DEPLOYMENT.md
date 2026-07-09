@@ -28,7 +28,7 @@ pushing mofa-skills onto the fleet. Differences from the old script:
 
 | Concern                | `deploy-mini.sh` (legacy)            | `fleet-install-skills.sh` (new)                              |
 |------------------------|--------------------------------------|---------------------------------------------------------------|
-| Transport              | raw `scp` of each file               | `rsync` to staging + `octos skills install <staging-path>`    |
+| Transport              | raw `scp` of each file               | `rsync` to staging + `octos skills --profile <id> install <staging-path>` |
 | sha256 verification    | none                                 | yes, via `manage_skills::download_binary` when manifest binaries are declared |
 | Install path           | hard-coded `~/.octos/profiles/dspfac/data/skills/` | resolved server-side by `--profile <id>`                      |
 | Multi-profile          | one profile per run                  | iterates every profile on the host (or explicit `--profile`)  |

@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Deep Research Pipeline — Dynamic Parallel Fan-Out
+// LLM plans N search angles at runtime, runs them in parallel, then analyze + synthesize.
+//
+// Flow:
+//   plan_and_search ──(N dynamic workers)──→ analyze ──→ synthesize
+//
+// Tool contract:
+//   search       — runs web search + crawl; saves each page as a markdown file
+//                  under .octos/research/<query>/ and returns an index
+//   read_file    — reads search results and individual source files
+//   write_file   — used by synthesize node to save the final report
+
+digraph deep_research {
+    graph [label="Deep Research Pipeline", default_model="cheap"]
+
+    // --- Dynamic fan-out: LLM plans search angles, then executes in parallel ---
+    plan_and_search [
+        handler="dynamic_parallel",
+        converge="analyze",
+        prompt="Generate 4-6 research search angles for this query. Each angle should cover a different aspect of the topic — do NOT just rephrase the same query.\n\nRequirements:\n- 4-6 distinct angles\n- Include at least one angle in Chinese and one in English for cross-language coverage\n- Cover: core topic, alternatives/comparisons, technical architecture, recent trends\n- Keep each task description under 80 characters\n\nRespond with ONLY a JSON array of objects with \"task\" and \"label\" fields.\nExample: [{\"task\": \"Search for Manus AI official docs and features\", \"label\": \"Official docs\"}, ...]",
+        worker_prompt="You are a research search specialist.\n\n{task}\n\nUse the search tool to find the most relevant and authoritative sources. After search completes, use read_file to read the returned index and at least 3 of the most relevant source files.\n\nInclude ALL URLs, specific data points, and quotes in your output.",
+        label="Search",
+        model="cheap",
+        planner_model="strong",
+        tools="search,read_file",
+        max_tasks="8",
+        timeout_secs="1800"
+    ]
+
+    // --- Analysis: cross-reference all search results ---
+    analyze [
+        prompt="You are a research analyst. You have been given raw search results from multiple parallel search agents covering different angles of the research topic.\n\nYour task is to:\n1. Identify the most important facts, data points, and insights across ALL sources\n2. Cross-reference information — note where sources agree or disagree\n3. Identify gaps in coverage and areas that need more investigation\n4. Organize findings by subtopic, merging related information from different search angles\n5. Rate source credibility (official docs > research papers > news > blogs > forums)\n6. Flag any contradictions between sources\n\nBe thorough and preserve ALL specific data: numbers, dates, names, quotes, and URLs. Do not summarize away details — the synthesis phase needs raw material.",
+        label="Analysis",
+        model="strong",
+        tools="read_file",
+        timeout_secs="1800"
+    ]
+
+    // --- Synthesis: produce the final report ---
+    synthesize [
+        prompt="You are a research synthesis expert. Produce a comprehensive, well-structured research report that includes:\n\n1. Executive Summary (2-3 sentences)\n2. Key Findings organized by topic\n3. Detailed Analysis with specific data, quotes, and citations\n4. Areas of Uncertainty or conflicting information\n5. Conclusions and implications\n\nRules:\n- Include specific numbers, dates, and quotes — never generalize when you have specifics\n- Cite sources with URLs in [title](url) format\n- Note confidence level (high/medium/low) for each major finding\n- Write in a clear, professional style\n- Match the language of the original query (Chinese query → Chinese report, English query → English report)\n- Save the final report using write_file",
+        label="Synthesis",
+        model="strong",
+        tools="write_file",
+        goal_gate="true",
+        timeout_secs="1800"
+    ]
+
+    // --- Edges ---
+    plan_and_search -> analyze
+    analyze -> synthesize
+}

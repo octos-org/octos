@@ -34,6 +34,10 @@ const CHANNEL_NAME: &str = "matrix";
 const EVENT_ROOM_MESSAGE: &str = "m.room.message";
 const EVENT_ROOM_MEMBER: &str = "m.room.member";
 const MSGTYPE_TEXT: &str = "m.text";
+const MSGTYPE_IMAGE: &str = "m.image";
+const MSGTYPE_AUDIO: &str = "m.audio";
+const MSGTYPE_VIDEO: &str = "m.video";
+const MSGTYPE_FILE: &str = "m.file";
 const MEMBERSHIP_INVITE: &str = "invite";
 const REL_TYPE_REPLACE: &str = "m.replace";
 const LIVE_MARKER: &str = "org.matrix.msc4357.live";
@@ -43,12 +47,17 @@ const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
 const CONTENT_APP: &str = "org.octos.app";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
+const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
+const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
+const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
 const MAX_EVENT_SENDER_CACHE: usize = 4;
+/// Upper bound on child bots a single `/allbots` broadcast may fan out to.
+const MAX_ALLBOTS_TARGETS: usize = 8;
 
 // ── Bot Manager trait ────────────────────────────────────────────────────────
 
@@ -74,6 +83,21 @@ pub trait BotManager: Send + Sync {
 
     /// List all registered bots. Returns a formatted list.
     async fn list_bots(&self, sender: &str) -> Result<String>;
+
+    /// Create a natural-language schedule for the current room context.
+    async fn schedule_bot_task(&self, request: &str, sender: &str, room_id: &str)
+    -> Result<String>;
+
+    /// List schedule jobs visible to the current room context.
+    async fn list_schedules(&self, sender: &str, room_id: &str) -> Result<String>;
+
+    /// Remove a schedule job visible to the current room context.
+    async fn unschedule_bot_task(
+        &self,
+        job_id: &str,
+        sender: &str,
+        room_id: &str,
+    ) -> Result<String>;
 }
 
 // ── Bot Router ───────────────────────────────────────────────────────────────
@@ -261,6 +285,18 @@ impl BotRouter {
         Ok(())
     }
 
+    /// Whether the given profile (child bot) is bound to the given room.
+    ///
+    /// Server-side authority for `/allbots`: a broadcast may only reach bots
+    /// actually bound to the originating room, regardless of what
+    /// `org.octos.broadcast_targets` a (possibly forged) event claims.
+    pub async fn is_profile_in_room(&self, room_id: &str, profile_id: &str) -> bool {
+        let room_bots = self.room_bots.read().await;
+        room_bots
+            .get(room_id)
+            .is_some_and(|profiles| profiles.contains(profile_id))
+    }
+
     /// Return all room IDs that a given profile is in.
     pub async fn rooms_for_profile(&self, profile_id: &str) -> Vec<String> {
         let room_bots = self.room_bots.read().await;
@@ -416,6 +452,26 @@ async fn route_by_explicit_target(bot_router: &BotRouter, content: &Value) -> Op
     bot_router.route(target_user_id).await
 }
 
+/// Extract the deduplicated `org.octos.broadcast_targets` list from event
+/// content. Capable clients (Robrix management rooms) attach the room's
+/// bound child-bot user IDs here so `/allbots` knows where to fan out.
+fn broadcast_target_matrix_user_ids(content: &Value) -> Vec<String> {
+    let Some(targets) = content
+        .get(CONTENT_BROADCAST_TARGETS)
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut deduped = Vec::new();
+    for target in targets.iter().filter_map(|value| value.as_str()) {
+        if !deduped.iter().any(|existing| existing == target) {
+            deduped.push(target.to_string());
+        }
+    }
+    deduped
+}
+
 async fn route_by_matrix_mention(
     bot_router: &BotRouter,
     content: &Value,
@@ -463,6 +519,8 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
+    /// Directory for downloaded media files (inbound images, files, audio, video).
+    media_dir: PathBuf,
 }
 
 fn error_json_response(
@@ -510,6 +568,8 @@ pub struct MatrixChannel {
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
+    /// Directory for downloaded media files (inbound images, files, audio, video).
+    media_dir: PathBuf,
 }
 
 impl MatrixChannel {
@@ -544,7 +604,14 @@ impl MatrixChannel {
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
+            media_dir: std::env::temp_dir().join("octos-matrix-media"),
         }
+    }
+
+    /// Set the directory for downloaded media files.
+    pub fn with_media_dir(mut self, media_dir: PathBuf) -> Self {
+        self.media_dir = media_dir;
+        self
     }
 
     /// Restrict bot-management slash commands to the given Matrix user IDs.
@@ -728,7 +795,7 @@ impl MatrixChannel {
 /// Encodes characters that are not unreserved (per RFC 3986) and also encodes
 /// characters commonly found in Matrix identifiers that could conflict with
 /// URL parsing (`:`, `@`, `!`, `#`).
-fn percent_encode_path(s: &str) -> String {
+pub(crate) fn percent_encode_path(s: &str) -> String {
     let mut encoded = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {
@@ -742,6 +809,50 @@ fn percent_encode_path(s: &str) -> String {
         }
     }
     encoded
+}
+
+/// Reject an outbound media file whose on-disk size exceeds `cap`, by reading
+/// metadata only (never the whole file). Prevents a runaway producer from
+/// OOMing the gateway via `upload_media`'s `std::fs::read`.
+fn check_upload_within_cap(file_path: &std::path::Path, cap: u64) -> Result<u64> {
+    let file_size = std::fs::metadata(file_path)
+        .map(|m| m.len())
+        .wrap_err_with(|| format!("failed to stat media file: {}", file_path.display()))?;
+    if file_size > cap {
+        eyre::bail!(
+            "media file exceeds max upload size ({file_size} bytes > {cap} byte cap): {}",
+            file_path.display()
+        );
+    }
+    Ok(file_size)
+}
+
+/// Guess a MIME content type from a file path's extension for Matrix media
+/// uploads. Unknown extensions fall back to `application/octet-stream`
+/// (rendered as `m.file` on the receiving side).
+fn media_content_type(file_path: &std::path::Path) -> &'static str {
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Check if a Matrix user ID is managed by this appservice (bot or virtual user).
@@ -1121,20 +1232,71 @@ async fn handle_transaction(
             .get("msgtype")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if msgtype != MSGTYPE_TEXT {
+
+        // Accept text and media message types; skip everything else
+        // (e.g. m.location, m.notice from other bots).
+        let is_media = matches!(
+            msgtype,
+            MSGTYPE_IMAGE | MSGTYPE_FILE | MSGTYPE_AUDIO | MSGTYPE_VIDEO
+        );
+        if msgtype != MSGTYPE_TEXT && !is_media {
             continue;
         }
 
         let body_text = content.get("body").and_then(|v| v.as_str()).unwrap_or("");
-        if body_text.is_empty() {
-            continue;
+
+        // For media messages, download the file from the mxc:// URL so the
+        // agent can use it for vision/tool input. Download failure degrades
+        // to a text-only inbound message.
+        let mut media = vec![];
+        if is_media {
+            if let Some(mxc_url) = content.get("url").and_then(|v| v.as_str()) {
+                // Use the filename field if available, fall back to body
+                // (which is the filename per the Matrix spec).
+                let filename = content
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .or(Some(body_text))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("file");
+
+                let download_url = format!(
+                    "{}/_matrix/media/v3/download/{}",
+                    state.homeserver,
+                    mxc_url.strip_prefix("mxc://").unwrap_or(mxc_url),
+                );
+                let unique_filename = format!(
+                    "matrix_{}_{}",
+                    chrono::Utc::now().timestamp_millis(),
+                    filename,
+                );
+                match crate::media::download_media(
+                    &state.http,
+                    &download_url,
+                    &[("Authorization", &format!("Bearer {}", state.as_token))],
+                    &state.media_dir,
+                    &unique_filename,
+                )
+                .await
+                {
+                    Ok(local_path) => {
+                        info!(
+                            mxc_url,
+                            filename,
+                            ?local_path,
+                            "downloaded Matrix media file"
+                        );
+                        media.push(local_path.to_string_lossy().into_owned());
+                    }
+                    Err(e) => {
+                        warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
+                    }
+                }
+            }
         }
 
-        // Intercept slash commands before routing to agent
-        if let Some(response) = handle_slash_command(&state, sender, room_id, body_text).await {
-            if let Err(e) = send_text_to_room(&state, room_id, &response).await {
-                warn!(error = %e, room_id, "failed to send slash command response");
-            }
+        // For text messages, body must be non-empty. For media, allow empty body.
+        if !is_media && body_text.is_empty() {
             continue;
         }
 
@@ -1147,6 +1309,11 @@ async fn handle_transaction(
         let mut metadata = json!({});
         if let Some(action_response) = content.get(CONTENT_ACTION_RESPONSE) {
             metadata[CONTENT_ACTION_RESPONSE] = action_response.clone();
+        }
+        // Phase 4: approval responses (Approve/Deny button presses) flow back
+        // to the session actor via InboundMessage metadata.
+        if let Some(approval_response) = content.get(CONTENT_APPROVAL_RESPONSE) {
+            metadata[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
         }
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
@@ -1188,20 +1355,66 @@ async fn handle_transaction(
             }
         }
 
+        // Intercept slash commands before routing to the agent. Runs AFTER
+        // routing so commands explicitly aimed at a child bot (mention /
+        // explicit target) flow through to that bot instead of being
+        // swallowed by BotFather.
+        if let Some(response) = handle_slash_command(
+            &state,
+            sender,
+            room_id,
+            body_text,
+            metadata
+                .get(METADATA_TARGET_MATRIX_USER_ID)
+                .and_then(|value| value.as_str()),
+            content,
+            event_id.as_deref(),
+        )
+        .await
+        {
+            // `/allbots` answers with an empty string on success (the fanned
+            // out child-bot replies are the visible outcome) — skip the echo.
+            if !response.trim().is_empty()
+                && let Err(e) = send_text_to_room(&state, room_id, &response).await
+            {
+                warn!(error = %e, room_id, "failed to send slash command response");
+            }
+            continue;
+        }
+
+        // For media messages with an empty body, provide a descriptive placeholder.
+        let content_text = if body_text.is_empty() && !media.is_empty() {
+            "[User sent a file]".to_string()
+        } else {
+            body_text.to_string()
+        };
+
         let inbound = InboundMessage {
             channel: CHANNEL_NAME.into(),
             sender_id: sender.to_string(),
             chat_id: room_id.to_string(),
-            content: body_text.to_string(),
+            content: content_text,
             timestamp: Utc::now(),
-            media: vec![],
+            media,
             metadata,
             message_id: event_id,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if state.inbound_tx.send(inbound).await.is_err() {
-            warn!("inbound channel closed while processing Matrix transaction");
-            break;
+            warn!(
+                txn_id,
+                "inbound channel closed while processing Matrix transaction; \
+                 returning 500 so the homeserver retries"
+            );
+            // The dedup check above already recorded this txn_id as seen.
+            // Forget it so the homeserver's retry of the same transaction is
+            // accepted instead of being dropped as a duplicate. Events
+            // enqueued before this failure may be delivered again on retry —
+            // at-least-once beats acking a dropped message with 200 OK
+            // (which the appservice spec treats as "processed, never retry").
+            state.dedup.forget(&txn_id);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "{}").into_response();
         }
     }
 
@@ -1212,13 +1425,23 @@ async fn handle_transaction(
 
 /// Check if a message is a slash command and handle it.
 /// Returns `Some(response_text)` if it was a slash command, `None` otherwise.
+#[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
     state: &AppserviceState,
     sender: &str,
-    _room_id: &str,
+    room_id: &str,
     body: &str,
+    target_matrix_user_id: Option<&str>,
+    content: &Value,
+    source_event_id: Option<&str>,
 ) -> Option<String> {
     let bot_manager = state.bot_manager.as_ref()?;
+
+    // A slash command explicitly aimed at a child bot (mention / explicit
+    // target) belongs to that bot's conversation — don't intercept it.
+    if target_matrix_user_id.is_some_and(|target| target != state.bot_user_id) {
+        return None;
+    }
 
     let trimmed = body.trim();
     if !trimmed.starts_with('/') {
@@ -1233,6 +1456,20 @@ async fn handle_slash_command(
         "/createbot" => Some(dispatch_createbot(bot_manager.as_ref(), args_str, sender).await),
         "/deletebot" => Some(dispatch_deletebot(bot_manager.as_ref(), args_str, sender).await),
         "/listbots" | "/listbot" => Some(dispatch_listbots(bot_manager.as_ref(), sender).await),
+        "/schedule" => {
+            Some(dispatch_schedule(bot_manager.as_ref(), args_str, sender, room_id).await)
+        }
+        "/schedules" => Some(dispatch_schedules(bot_manager.as_ref(), sender, room_id).await),
+        "/unschedule" => {
+            Some(dispatch_unschedule(bot_manager.as_ref(), args_str, sender, room_id).await)
+        }
+        "/allbots" => {
+            match dispatch_allbots(state, sender, room_id, args_str, content, source_event_id).await
+            {
+                Ok(()) => Some(String::new()),
+                Err(error) => Some(error),
+            }
+        }
         "/bothelp" => Some(SLASH_HELP.to_string()),
         _ => None,
     }
@@ -1245,9 +1482,185 @@ const SLASH_HELP: &str = "\
 • Missing visibility defaults to `private`
 • `/deletebot <matrix_user_id>`
 • `/listbots` (public bots + your private bots)
+• `/schedule <task>` (natural-language scheduling in this chat)
+• `/schedules` (list this chat's schedules)
+• `/unschedule <job-id>`
+• `/allbots <message>` (management rooms only)
 • `/bothelp`
 
 **Tip:** I'm BotFather — you can chat with me directly, or create your own bot with `/createbot` for a dedicated AI assistant.";
+
+/// Fan a BotFather-room command out to the room's bound child bots.
+///
+/// Targets come from the event's `org.octos.broadcast_targets` content field
+/// (attached by capable clients). Stale bindings — targets with no router
+/// entry — are skipped with a warning; private bots reject broadcasts from
+/// non-owners. Returns `Ok(())` on dispatch (the child-bot replies are the
+/// visible outcome) or `Err(user-facing message)` when nothing was sent.
+async fn dispatch_allbots(
+    state: &AppserviceState,
+    sender: &str,
+    room_id: &str,
+    args_str: &str,
+    content: &Value,
+    source_event_id: Option<&str>,
+) -> std::result::Result<(), String> {
+    if args_str.is_empty() {
+        return Err("Usage: `/allbots <message>`".to_string());
+    }
+
+    let target_matrix_user_ids = broadcast_target_matrix_user_ids(content)
+        .into_iter()
+        .filter(|user_id| user_id != &state.bot_user_id)
+        .collect::<Vec<_>>();
+
+    if target_matrix_user_ids.is_empty() {
+        return Err("No bound child bots were found for this room.".to_string());
+    }
+
+    if target_matrix_user_ids.len() > MAX_ALLBOTS_TARGETS {
+        return Err(format!(
+            "/allbots can target at most {MAX_ALLBOTS_TARGETS} bound child bots at once."
+        ));
+    }
+
+    let mut deliveries = Vec::new();
+    let mut unresolved_targets = Vec::new();
+    let mut unbound_targets = Vec::new();
+    for target_matrix_user_id in target_matrix_user_ids {
+        let Some(entry) = state.bot_router.get_entry(&target_matrix_user_id).await else {
+            unresolved_targets.push(target_matrix_user_id);
+            continue;
+        };
+
+        // Server-side authority: the client-supplied broadcast_targets are
+        // untrusted. Only deliver to bots actually bound to THIS room — a
+        // forged event must not be able to fan out to a public bot in some
+        // other room, or to the sender's own private bot bound elsewhere.
+        if !state
+            .bot_router
+            .is_profile_in_room(room_id, &entry.profile_id)
+            .await
+        {
+            unbound_targets.push(target_matrix_user_id);
+            continue;
+        }
+
+        if entry.visibility == BotVisibility::Private && sender != entry.owner {
+            return Err(format!(
+                "You do not have permission to broadcast to private bot `{target_matrix_user_id}`."
+            ));
+        }
+
+        deliveries.push((target_matrix_user_id, entry.profile_id));
+    }
+
+    if deliveries.is_empty() {
+        if !unbound_targets.is_empty() {
+            return Err(format!(
+                "None of the requested bots are bound to this room: {}",
+                unbound_targets.join(", ")
+            ));
+        }
+        if !unresolved_targets.is_empty() {
+            return Err(format!(
+                "Could not resolve any bound child bots for /allbots. Stale bindings: {}",
+                unresolved_targets.join(", ")
+            ));
+        }
+        return Err("No bound child bots were found for this room.".to_string());
+    }
+
+    let request_id = source_event_id.unwrap_or("allbots");
+    info!(
+        requester = sender,
+        room_id,
+        request_id,
+        targets = ?deliveries.iter().map(|(target, _)| target).collect::<Vec<_>>(),
+        "dispatching /allbots broadcast"
+    );
+    if !unresolved_targets.is_empty() {
+        warn!(
+            requester = sender,
+            room_id,
+            request_id,
+            stale_targets = ?unresolved_targets,
+            "skipping unresolved stale /allbots bindings"
+        );
+    }
+    if !unbound_targets.is_empty() {
+        warn!(
+            requester = sender,
+            room_id,
+            request_id,
+            unbound_targets = ?unbound_targets,
+            "rejecting /allbots targets not bound to this room"
+        );
+    }
+
+    for (target_matrix_user_id, profile_id) in deliveries {
+        let inbound = InboundMessage {
+            channel: CHANNEL_NAME.into(),
+            sender_id: sender.to_string(),
+            chat_id: room_id.to_string(),
+            content: args_str.to_string(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: json!({
+                METADATA_TARGET_PROFILE_ID: profile_id,
+                METADATA_TARGET_MATRIX_USER_ID: target_matrix_user_id,
+                "org.octos.broadcast_request_id": request_id,
+                "org.octos.broadcast_origin_room_id": room_id,
+                "org.octos.broadcast_source_event_id": source_event_id,
+            }),
+            message_id: source_event_id.map(str::to_string),
+            origin: octos_core::MessageOrigin::ExternalUser,
+        };
+
+        state.inbound_tx.send(inbound).await.map_err(|_| {
+            "broadcast dispatch failed because the inbound channel is closed".to_string()
+        })?;
+    }
+
+    Ok(())
+}
+
+async fn dispatch_schedule(
+    bot_manager: &dyn BotManager,
+    request: &str,
+    sender: &str,
+    room_id: &str,
+) -> String {
+    if request.trim().is_empty() {
+        return "Usage: `/schedule <natural-language task>`".to_string();
+    }
+    bot_manager
+        .schedule_bot_task(request.trim(), sender, room_id)
+        .await
+        .unwrap_or_else(|e| format!("Failed to create schedule: {e}"))
+}
+
+async fn dispatch_schedules(bot_manager: &dyn BotManager, sender: &str, room_id: &str) -> String {
+    bot_manager
+        .list_schedules(sender, room_id)
+        .await
+        .unwrap_or_else(|e| format!("Failed to list schedules: {e}"))
+}
+
+async fn dispatch_unschedule(
+    bot_manager: &dyn BotManager,
+    job_id: &str,
+    sender: &str,
+    room_id: &str,
+) -> String {
+    if job_id.trim().is_empty() {
+        return "Usage: `/unschedule <job-id>`".to_string();
+    }
+    bot_manager
+        .unschedule_bot_task(job_id.trim(), sender, room_id)
+        .await
+        .unwrap_or_else(|e| format!("Failed to remove schedule: {e}"))
+}
 
 async fn dispatch_createbot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
@@ -1530,6 +1943,7 @@ impl Channel for MatrixChannel {
             dedup: self.dedup.clone(),
             bot_router: self.bot_router.clone(),
             bot_manager: self.bot_manager.get().cloned(),
+            media_dir: self.media_dir.clone(),
         };
 
         let app = Router::new()
@@ -1581,6 +1995,68 @@ impl Channel for MatrixChannel {
                     "sender_user_id {uid} is not registered as a managed user"
                 ));
             }
+        }
+
+        // Handle media files (images, documents, audio, video): upload each
+        // to the Matrix media repo, then send one m.* media event per file.
+        if !msg.media.is_empty() {
+            let caption = if msg.content.is_empty() {
+                None
+            } else {
+                Some(msg.content.as_str())
+            };
+            let mut last_event_id = None;
+
+            for (i, path_str) in msg.media.iter().enumerate() {
+                let file_path = std::path::Path::new(path_str);
+                let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+                let filename = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                let content_type = media_content_type(file_path);
+
+                info!(
+                    path = path_str,
+                    size = file_size,
+                    content_type,
+                    "sending media file via Matrix"
+                );
+
+                let mxc_url = self
+                    .upload_media(file_path, content_type, sender_user_id)
+                    .await?;
+
+                // Only the first file gets the caption.
+                let cap = if i == 0 { caption } else { None };
+                let event_id = self
+                    .send_media_message(
+                        &msg.chat_id,
+                        &mxc_url,
+                        filename,
+                        content_type,
+                        file_size,
+                        cap,
+                        sender_user_id,
+                    )
+                    .await?;
+                last_event_id = Some(event_id);
+            }
+
+            // Remember which sender sent this event so edit_message can use
+            // the same identity.
+            if let (Some(uid), Some(event_id)) = (sender_user_id, &last_event_id) {
+                let mut event_senders = self.event_senders.write().await;
+                if let Some(pos) = event_senders.iter().position(|(id, _)| id == event_id) {
+                    event_senders.remove(pos);
+                }
+                event_senders.push_back((event_id.clone(), uid.to_string()));
+                while event_senders.len() > MAX_EVENT_SENDER_CACHE {
+                    event_senders.pop_front();
+                }
+            }
+
+            return Ok(last_event_id);
         }
 
         let live = msg
@@ -1753,6 +2229,16 @@ impl MatrixChannel {
         if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
             body[CONTENT_ACTION_RESPONSE] = action_response.clone();
         }
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): human-approval
+        // request envelopes ride the same metadata→content projection as app
+        // cards; Robrix renders Approve/Deny buttons, other clients show the
+        // plain-text fallback body.
+        if let Some(approval_request) = metadata.get(CONTENT_APPROVAL_REQUEST) {
+            body[CONTENT_APPROVAL_REQUEST] = approval_request.clone();
+        }
+        if let Some(approval_response) = metadata.get(CONTENT_APPROVAL_RESPONSE) {
+            body[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
+        }
 
         let resp = self
             .http
@@ -1780,6 +2266,157 @@ impl MatrixChannel {
                 .unwrap_or("");
             return Err(eyre::eyre!(
                 "Matrix send failed: status={status} errcode={errcode} error={error}"
+            ));
+        }
+
+        let event_id = resp_body
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(event_id)
+    }
+
+    /// Upload a file to the Matrix media repository and return the `mxc://` URI.
+    async fn upload_media(
+        &self,
+        file_path: &std::path::Path,
+        content_type: &str,
+        sender_user_id: Option<&str>,
+    ) -> Result<String> {
+        // Bound outbound uploads by the same cap as inbound downloads: check
+        // the file size via metadata before reading the whole file into memory,
+        // so a runaway producer can't OOM the gateway.
+        check_upload_within_cap(file_path, crate::media::max_media_bytes())?;
+
+        let data = std::fs::read(file_path)
+            .wrap_err_with(|| format!("failed to read media file: {}", file_path.display()))?;
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        let effective_sender = sender_user_id.unwrap_or(&self.bot_user_id);
+        let url = self.make_api_url(&format!(
+            "/_matrix/media/v3/upload?filename={}&user_id={}",
+            percent_encode_path(filename),
+            percent_encode_path(effective_sender),
+        ));
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .header("Content-Type", content_type)
+            .body(data)
+            .send()
+            .await
+            .wrap_err("failed to upload media to Matrix")?;
+
+        let status = resp.status();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .wrap_err("failed to parse Matrix upload response")?;
+
+        if !status.is_success() {
+            let errcode = resp_body
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let error = resp_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return Err(eyre::eyre!(
+                "Matrix media upload failed: status={status} errcode={errcode} error={error}"
+            ));
+        }
+
+        let content_uri = resp_body
+            .get("content_uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| eyre::eyre!("Matrix upload response missing content_uri"))?
+            .to_string();
+
+        Ok(content_uri)
+    }
+
+    /// Send a media message (`m.image`, `m.audio`, `m.video`, or `m.file`) to a Matrix room.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_media_message(
+        &self,
+        room_id: &str,
+        mxc_url: &str,
+        filename: &str,
+        content_type: &str,
+        file_size: u64,
+        caption: Option<&str>,
+        sender_user_id: Option<&str>,
+    ) -> Result<String> {
+        let txn_id = uuid::Uuid::now_v7().to_string();
+        let effective_sender = sender_user_id.unwrap_or(&self.bot_user_id);
+        let mut path = format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            percent_encode_path(room_id),
+            percent_encode_path(&txn_id),
+        );
+        path.push_str("?user_id=");
+        path.push_str(&percent_encode_path(effective_sender));
+        let url = self.make_api_url(&path);
+
+        // Select msgtype by MIME type prefix.
+        let msgtype = if content_type.starts_with("image/") {
+            MSGTYPE_IMAGE
+        } else if content_type.starts_with("audio/") {
+            MSGTYPE_AUDIO
+        } else if content_type.starts_with("video/") {
+            MSGTYPE_VIDEO
+        } else {
+            MSGTYPE_FILE
+        };
+
+        let body_text = caption.unwrap_or(filename);
+
+        let body = json!({
+            "msgtype": msgtype,
+            "body": body_text,
+            "url": mxc_url,
+            "filename": filename,
+            "info": {
+                "mimetype": content_type,
+                "size": file_size,
+            },
+        });
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send media message to Matrix")?;
+
+        let status = resp.status();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .wrap_err("failed to parse Matrix send response")?;
+
+        if !status.is_success() {
+            let errcode = resp_body
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let error = resp_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return Err(eyre::eyre!(
+                "Matrix media send failed: status={status} errcode={errcode} error={error}"
             ));
         }
 
@@ -2859,6 +3496,7 @@ mod tests {
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: None,
+            media_dir: std::env::temp_dir().join("octos-matrix-test-media"),
         }
     }
 
@@ -2945,6 +3583,11 @@ mod tests {
             )
             .route(
                 "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
+                any(capture_homeserver_request),
+            )
+            .route("/_matrix/media/v3/upload", any(capture_homeserver_request))
+            .route(
+                "/_matrix/media/v3/download/{server_name}/{media_id}",
                 any(capture_homeserver_request),
             )
             .with_state(state);
@@ -3286,6 +3929,86 @@ mod tests {
 
         let msg = inbound_rx.try_recv().unwrap();
         assert_eq!(msg.content, "retry should still deliver");
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_enqueue_failure_returns_500_and_does_not_poison_txn_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Close the inbound channel by dropping the receiver so every
+        // enqueue fails. The homeserver must NOT be told 200 OK (which
+        // means "processed, never retry") for a message we dropped.
+        let (closed_tx, closed_rx) = mpsc::channel::<InboundMessage>(16);
+        drop(closed_rx);
+
+        let state = make_test_state(closed_tx);
+        let dedup = state.dedup.clone();
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:elsewhere.org",
+                "room_id": "!room:localhost",
+                "event_id": "$ev_enqueue_fail",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "must not be acked when dropped"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_enqueue_fail?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed enqueue must not be acked with 200 OK"
+        );
+
+        // The failed transaction must not be recorded as processed:
+        // the homeserver retries the same txn_id, and that retry must be
+        // accepted, not dropped as a duplicate. Simulate the retry against
+        // a healthy inbound channel sharing the same dedup cache.
+        let (retry_tx, mut retry_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut retry_state = make_test_state(retry_tx);
+        retry_state.dedup = dedup;
+
+        let retry_app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(retry_state);
+
+        let retry_req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_enqueue_fail?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let retry_resp = retry_app.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::OK);
+
+        let msg = retry_rx
+            .try_recv()
+            .expect("retried transaction must be delivered, not deduped");
+        assert_eq!(msg.content, "must not be acked when dropped");
     }
 
     #[tokio::test]
@@ -3987,6 +4710,244 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_upload_and_send_m_image_when_outbound_has_media() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver_with_response(
+            StatusCode::OK,
+            json!({
+                "event_id": "$media_event",
+                "content_uri": "mxc://localhost/abc123"
+            }),
+        )
+        .await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("photo.png");
+        std::fs::write(&file, b"fake png bytes").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "look at this".into(),
+            reply_to: None,
+            media: vec![file.to_string_lossy().into_owned()],
+            metadata: json!({}),
+        };
+
+        let event_id = ch.send_with_id(&msg).await.unwrap();
+        assert_eq!(event_id.as_deref(), Some("$media_event"));
+
+        wait_for_request_count(&requests, 2).await;
+        let reqs = requests.lock().await;
+
+        let upload = reqs
+            .iter()
+            .find(|r| r.path.contains("/_matrix/media/v3/upload"))
+            .expect("should have an upload request");
+        assert_eq!(upload.method, Method::POST);
+        let query = upload.query.as_deref().unwrap_or("");
+        assert!(query.contains("filename=photo.png"), "query: {query}");
+
+        let send = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a media send request");
+        assert_eq!(send.body["msgtype"], json!("m.image"));
+        assert_eq!(send.body["url"], json!("mxc://localhost/abc123"));
+        assert_eq!(send.body["body"], json!("look at this"));
+        assert_eq!(send.body["filename"], json!("photo.png"));
+        assert_eq!(send.body["info"]["mimetype"], json!("image/png"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_caption_first_file_only_when_outbound_has_multiple_media() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver_with_response(
+            StatusCode::OK,
+            json!({
+                "event_id": "$media_event",
+                "content_uri": "mxc://localhost/abc123"
+            }),
+        )
+        .await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let img = dir.path().join("a.png");
+        let doc = dir.path().join("b.pdf");
+        std::fs::write(&img, b"img").unwrap();
+        std::fs::write(&doc, b"doc").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "the caption".into(),
+            reply_to: None,
+            media: vec![
+                img.to_string_lossy().into_owned(),
+                doc.to_string_lossy().into_owned(),
+            ],
+            metadata: json!({}),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 4).await;
+        let reqs = requests.lock().await;
+        let sends: Vec<_> = reqs.iter().filter(|r| r.path.contains("/send/")).collect();
+        assert_eq!(sends.len(), 2, "expected one send per media file");
+        assert_eq!(sends[0].body["msgtype"], json!("m.image"));
+        assert_eq!(sends[0].body["body"], json!("the caption"));
+        assert_eq!(sends[1].body["msgtype"], json!("m.file"));
+        // Second file gets its filename as body, not the caption.
+        assert_eq!(sends[1].body["body"], json!("b.pdf"));
+        assert_eq!(sends[1].body["info"]["mimetype"], json!("application/pdf"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_download_media_and_attach_path_when_inbound_image_event() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Mock homeserver serves the media download endpoint with canned bytes.
+        let (homeserver, hs_requests, hs_handle) =
+            spawn_mock_homeserver_with_response(StatusCode::OK, json!({"bytes": "fake"})).await;
+
+        let media_dir = tempfile::TempDir::new().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.homeserver = homeserver;
+        state.media_dir = media_dir.path().to_path_buf();
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ev_media",
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.png",
+                    "url": "mxc://localhost/catmedia",
+                    "filename": "cat.png"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_media?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inbound = inbound_rx.recv().await.expect("inbound media message");
+        assert_eq!(inbound.content, "cat.png");
+        assert_eq!(inbound.media.len(), 1, "media path should be attached");
+        let local = std::path::Path::new(&inbound.media[0]);
+        assert!(local.exists(), "downloaded file should exist: {local:?}");
+        assert!(
+            inbound.media[0].contains("cat.png"),
+            "local path should keep the original filename: {}",
+            inbound.media[0]
+        );
+
+        let reqs = hs_requests.lock().await;
+        assert!(
+            reqs.iter().any(|r| r
+                .path
+                .contains("/_matrix/media/v3/download/localhost/catmedia")),
+            "should have hit the media download endpoint"
+        );
+
+        hs_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_deliver_text_only_when_media_download_fails() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let media_dir = tempfile::TempDir::new().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        // Unreachable homeserver — download must fail, message must still flow.
+        state.homeserver = "http://127.0.0.1:1".to_string();
+        state.media_dir = media_dir.path().to_path_buf();
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ev_media_fail",
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.png",
+                    "url": "mxc://localhost/gonemedia"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_media_fail?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inbound = inbound_rx.recv().await.expect("inbound message");
+        assert_eq!(inbound.content, "cat.png");
+        assert!(
+            inbound.media.is_empty(),
+            "failed download should degrade to text-only"
+        );
     }
 
     #[tokio::test]
@@ -5714,8 +6675,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let state = make_test_state(tx);
         // bot_manager is None, so slash commands should not be intercepted
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -5725,9 +6694,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "hello world")
-                .await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "hello world",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -5737,8 +6713,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -5754,6 +6738,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --prompt \"你是天气助手\"",
+            None,
+            &json!({}),
+            None,
         )
         .await;
         assert!(result.is_some());
@@ -5772,6 +6759,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot",
+            None,
+            &json!({}),
+            None,
         )
         .await;
 
@@ -5794,6 +6784,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --public",
+            None,
+            &json!({}),
+            None,
         )
         .await;
 
@@ -5813,6 +6806,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/deletebot @bot_weather:localhost",
+            None,
+            &json!({}),
+            None,
         )
         .await;
         assert!(result.is_some());
@@ -5825,8 +6821,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/createbot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/createbot",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -5837,8 +6841,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/deletebot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/deletebot",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -5849,8 +6861,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbot",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -5861,11 +6881,573 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/unknown").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/unknown",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(
             result.is_none(),
             "unknown slash commands should pass through to agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_intercept_slash_command_when_aimed_at_child_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/schedule 每天早上 9 点提醒我看天气",
+            Some("@octos_child:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "slash commands aimed at a child bot must flow through to that bot"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_intercept_schedule_command_when_aimed_at_primary_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/schedule 每天早上 9 点提醒我看天气",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("mock schedule: 每天早上 9 点提醒我看天气 in !room:localhost".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_intercept_schedules_command_when_aimed_at_primary_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/schedules",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("mock schedules for !room:localhost".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn should_intercept_unschedule_command_when_aimed_at_primary_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/unschedule cron_deadbeef",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("mock unschedule: cron_deadbeef in !room:localhost".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_require_message_body_when_allbots_invoked() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/allbots",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Some("Usage: `/allbots <message>`".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_reject_allbots_when_no_broadcast_targets() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/allbots summarize this issue",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("No bound child bots were found for this room.".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_enforce_target_cap_when_allbots_invoked() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let targets = (0..=MAX_ALLBOTS_TARGETS)
+            .map(|i| format!("@octos_child_{i}:localhost"))
+            .collect::<Vec<_>>();
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/allbots summarize this issue",
+            Some("@octos_bot:localhost"),
+            &json!({
+                "org.octos.broadcast_targets": targets,
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "/allbots can target at most {MAX_ALLBOTS_TARGETS} bound child bots at once."
+            )),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fan_out_allbots_to_bound_child_bots() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "profile-parent")
+            .await
+            .unwrap();
+        router
+            .register("@octos_alex:localhost", "profile-alex")
+            .await
+            .unwrap();
+        router
+            .register("@octos_bob:localhost", "profile-bob")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-alex")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-bob")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$allbots-fanout-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "/allbots summarize this issue",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.broadcast_targets": [
+                        "@octos_alex:localhost",
+                        "@octos_bob:localhost"
+                    ]
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut seen = Vec::new();
+        while let Ok(msg) = inbound_rx.try_recv() {
+            seen.push((
+                msg.content,
+                msg.metadata
+                    .get(METADATA_TARGET_PROFILE_ID)
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
+            ));
+        }
+
+        seen.sort();
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "summarize this issue".to_string(),
+                    Some("profile-alex".to_string()),
+                ),
+                (
+                    "summarize this issue".to_string(),
+                    Some("profile-bob".to_string()),
+                ),
+            ],
+            "/allbots should internally fan out to the bound child bots",
+        );
+    }
+
+    #[tokio::test]
+    async fn should_skip_stale_bindings_when_allbots_fans_out() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "profile-parent")
+            .await
+            .unwrap();
+        router
+            .register("@octos_alexbot:localhost", "profile-alex")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-alex")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        // "@octos_alex:localhost" has no router entry — a stale binding.
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$allbots-fanout-stale-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "/allbots summarize this issue",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.broadcast_targets": [
+                        "@octos_alex:localhost",
+                        "@octos_alexbot:localhost"
+                    ]
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-stale-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut seen = Vec::new();
+        while let Ok(msg) = inbound_rx.try_recv() {
+            seen.push((
+                msg.content,
+                msg.metadata
+                    .get(METADATA_TARGET_PROFILE_ID)
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            vec![(
+                "summarize this issue".to_string(),
+                Some("profile-alex".to_string()),
+            )],
+            "/allbots should skip stale bindings and still fan out to valid child bots",
+        );
+    }
+
+    #[test]
+    fn should_reject_outbound_media_file_over_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("big.bin");
+        std::fs::write(&file, vec![0u8; 2048]).unwrap();
+
+        // 2048-byte file, cap = 1024 → rejected.
+        let err = check_upload_within_cap(&file, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max upload size"),
+            "got: {err}"
+        );
+
+        // Same file, cap = 4096 → accepted, returns the size.
+        assert_eq!(check_upload_within_cap(&file, 4096).unwrap(), 2048);
+    }
+
+    #[tokio::test]
+    async fn should_reject_allbots_targets_not_bound_to_this_room() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "profile-parent")
+            .await
+            .unwrap();
+        // A public bot that exists globally but is bound to a DIFFERENT room.
+        router
+            .register("@octos_elsewhere:localhost", "profile-elsewhere")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!other:localhost", "profile-elsewhere")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        // Forged event tries to broadcast to a bot bound to "!other:localhost"
+        // from within "!room:localhost".
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$allbots-cross-room",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "/allbots leak to other room",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.broadcast_targets": ["@octos_elsewhere:localhost"]
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-allbots-cross-room?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No broadcast should have been dispatched to the cross-room bot.
+        let mut dispatched = Vec::new();
+        while let Ok(msg) = inbound_rx.try_recv() {
+            if let Some(p) = msg
+                .metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str())
+            {
+                dispatched.push(p.to_string());
+            }
+        }
+        assert!(
+            !dispatched.iter().any(|p| p == "profile-elsewhere"),
+            "/allbots must not fan out to a bot bound to a different room: {dispatched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_project_approval_request_into_event_content() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "Approval required: Approve shell command".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({
+                CONTENT_APPROVAL_REQUEST: {
+                    "request_id": "req_1_1",
+                    "tool_name": "shell",
+                    "tool_args_digest": "sha256:abc",
+                    "title": "Approve shell command",
+                    "summary": "rm -rf tmp",
+                    "risk_level": "critical",
+                    "authorized_approvers": ["@alice:localhost"],
+                    "expires_at": "2026-06-13T12:00:00Z",
+                    "on_timeout": "notify"
+                },
+                CONTENT_ACTIONS: [
+                    { "id": "approve", "label": "Approve", "style": "primary" },
+                    { "id": "deny", "label": "Deny", "style": "danger" }
+                ]
+            }),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(
+            req.body[CONTENT_APPROVAL_REQUEST]["request_id"],
+            json!("req_1_1")
+        );
+        assert_eq!(
+            req.body[CONTENT_APPROVAL_REQUEST]["tool_name"],
+            json!("shell")
+        );
+        assert_eq!(req.body[CONTENT_ACTIONS][0]["id"], json!("approve"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_copy_approval_response_into_inbound_metadata() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let state = make_test_state(inbound_tx);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$approval_resp",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "approve",
+                    "org.octos.approval_response": {
+                        "request_id": "req_1_1",
+                        "decision": "approve",
+                        "source_event_id": "$approval_resp",
+                        "tool_args_digest": "sha256:abc"
+                    }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_approval?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inbound = inbound_rx.recv().await.expect("inbound message");
+        assert_eq!(
+            inbound.metadata[CONTENT_APPROVAL_RESPONSE]["request_id"],
+            json!("req_1_1")
+        );
+        assert_eq!(
+            inbound.metadata[CONTENT_APPROVAL_RESPONSE]["decision"],
+            json!("approve")
         );
     }
 
@@ -5893,6 +7475,26 @@ mod tests {
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
         }
+
+        async fn schedule_bot_task(
+            &self,
+            request: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock schedule: {request} in {room_id}"))
+        }
+        async fn list_schedules(&self, _sender: &str, room_id: &str) -> Result<String> {
+            Ok(format!("mock schedules for {room_id}"))
+        }
+        async fn unschedule_bot_task(
+            &self,
+            job_id: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock unschedule: {job_id} in {room_id}"))
+        }
     }
 
     #[async_trait]
@@ -5914,6 +7516,26 @@ mod tests {
 
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
+        }
+
+        async fn schedule_bot_task(
+            &self,
+            request: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock schedule: {request} in {room_id}"))
+        }
+        async fn list_schedules(&self, _sender: &str, room_id: &str) -> Result<String> {
+            Ok(format!("mock schedules for {room_id}"))
+        }
+        async fn unschedule_bot_task(
+            &self,
+            job_id: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock unschedule: {job_id} in {room_id}"))
         }
     }
 }

@@ -47,8 +47,8 @@ impl Executable for ChannelsCommand {
 }
 
 fn cmd_status(cwd: &std::path::Path) -> Result<()> {
-    let data_dir = super::resolve_data_dir(None)?;
-    let config = Config::load(cwd, &data_dir)?;
+    let ctx = super::resolve_command_context(None)?;
+    let config = Config::load_with_context(cwd, &ctx)?;
 
     let channels = match &config.gateway {
         Some(gw) => &gw.channels,
@@ -115,6 +115,8 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "telegram" => true,
         #[cfg(feature = "discord")]
         "discord" => true,
+        #[cfg(feature = "dingtalk")]
+        "dingtalk" => true,
         #[cfg(feature = "slack")]
         "slack" => true,
         #[cfg(feature = "whatsapp")]
@@ -197,6 +199,24 @@ fn channel_config_summary(channel_type: &str, settings: &serde_json::Value) -> S
                 format!("{env}: set")
             } else {
                 format!("{env}: not set")
+            }
+        }
+        "dingtalk" => {
+            let webhook_env = settings
+                .get("webhook_url_env")
+                .and_then(|v| v.as_str())
+                .unwrap_or("DINGTALK_BOT_WEBHOOK");
+            let secret_env = settings
+                .get("secret_env")
+                .and_then(|v| v.as_str())
+                .unwrap_or("DINGTALK_BOT_SECRET");
+            let webhook_set = std::env::var(webhook_env).is_ok();
+            let secret_set = std::env::var(secret_env).is_ok();
+            match (webhook_set, secret_set) {
+                (true, true) => "webhook + signing secret: set".into(),
+                (true, false) => format!("{webhook_env}: set, {secret_env}: not set"),
+                (false, true) => format!("{webhook_env}: not set, {secret_env}: set"),
+                (false, false) => format!("{webhook_env}/{secret_env}: not set"),
             }
         }
         "slack" => {

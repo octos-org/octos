@@ -571,6 +571,7 @@ fn is_channel_name(value: &str) -> bool {
         value,
         "api"
             | "cli"
+            | "dingtalk"
             | "discord"
             | "email"
             | "feishu"

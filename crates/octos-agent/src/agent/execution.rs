@@ -36,9 +36,13 @@ use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
-use crate::task_supervisor::TaskRuntimeState;
+use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
-use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
+use crate::tools::{
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprovalRequester, ToolContext, USER_QUESTION_CTX,
+    UserQuestionRequester,
+};
 use crate::workspace_contract::{
     SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
 };
@@ -69,6 +73,103 @@ fn should_auto_send_tool_files(
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
 }
 
+/// Names of tools whose work can legitimately run for many minutes and so
+/// must keep the long [`MAX_TOOL_TIMEOUT_SECS`] (1800s) default when the LLM
+/// omits a per-call `timeout_secs`. Everything NOT in this set is treated as
+/// an interactive/fast tool and defaults to the much shorter
+/// `default_interactive_tool_timeout_secs`.
+///
+/// mini5 soak motivation: a read-only `glob`/`list_dir` that walks an
+/// unscoped home dir used to inherit the 1800s ceiling and hang the whole
+/// turn with no output. Fast read-only tools have no business waiting 30
+/// minutes; only genuinely long-running tools (shells, background spawns,
+/// pipelines, browser sessions, deep research/crawl) do.
+///
+/// Names verified against the registered `Tool::name()` impls:
+/// - `shell` (`tools/shell.rs`), `bash` alias
+/// - `spawn` (`tools/spawn.rs`), `spawn_agent` alias
+/// - `run_pipeline` (spawn_only pipeline tool registered via manifest)
+/// - `browser` (`tools/browser.rs`)
+/// - `delegate_task` (`tools/delegate.rs`)
+/// - `search` (`tools/deep_search.rs`), `deep_crawl` (`tools/site_crawl.rs`)
+/// - `synthesize_research` (`tools/synthesize_research.rs`)
+///
+/// NOTE: human-wait tools (`ask_user_question`) are deliberately NOT in this
+/// list. A batch containing one gets NO batch-level timeout at all (see
+/// [`compute_batch_timeout_secs`] / `any_human_wait`), so the long-vs-short
+/// classification never applies to it — wrapping it in even the 1800s ceiling
+/// would detach the still-running tool task and leak the pending question
+/// (UPCR-2026-023). They remain fully timeout-exempt at the registry dispatch
+/// boundary too, via `Tool::blocks_on_human_input`.
+const LONG_RUNNING_TOOLS: &[&str] = &[
+    "shell",
+    "bash",
+    "spawn",
+    "spawn_agent",
+    "run_pipeline",
+    "browser",
+    "delegate_task",
+    "search",
+    "deep_crawl",
+    "site_crawl",
+    "synthesize_research",
+];
+
+/// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
+fn is_long_running_tool(name: &str) -> bool {
+    LONG_RUNNING_TOOLS.contains(&name)
+}
+
+/// Compute the timeout for a parallel/serial tool batch.
+///
+/// Returns `None` when the batch must run with NO finite batch-level timeout,
+/// and `Some(secs)` otherwise.
+///
+/// Behaviour:
+/// - **Human-wait batch (UPCR-2026-023):** when `any_human_wait` is `true`
+///   (some tool in the batch reports [`crate::tools::Tool::blocks_on_human_input`],
+///   e.g. `ask_user_question`), return `None`. Such a batch MUST NOT be wrapped
+///   in `tokio::time::timeout`: a human may legitimately take longer than any
+///   finite ceiling, and firing the ceiling would detach the still-running tool
+///   task (its `JoinHandle` dropped, not awaited), so its
+///   `PendingQuestionWaiterGuard` never drops → the pending question leaks and
+///   is later replayed as a stale prompt after the turn moved on. Cleanup for a
+///   human-wait batch comes from the user answering (resolves the oneshot) or a
+///   turn interrupt/abort (the interrupt drains pending questions and aborts the
+///   turn task), NEVER from the batch timeout. NON-human-wait tools sharing the
+///   batch keep their own per-tool registry timeouts, applied INSIDE each tool's
+///   registry dispatch — unaffected by removing this outer wrap.
+/// - When the LLM requested a per-call `timeout_secs` (`llm_requested > 0`),
+///   honour it: clamp to [`MAX_TOOL_TIMEOUT_SECS`] and floor at the batch's
+///   default (so an explicit request never makes a batch flakier than its
+///   own baseline). This mirrors the pre-fix `.min(MAX).max(default)`.
+/// - When the LLM omitted `timeout_secs`, the default depends on the batch:
+///   a batch containing ANY long-running tool keeps `config_tool_timeout`
+///   (1800s today); a batch of only fast/interactive tools uses the much
+///   shorter `interactive_default`.
+fn compute_batch_timeout_secs(
+    tool_names: &[&str],
+    any_human_wait: bool,
+    llm_requested: u64,
+    config_tool_timeout: u64,
+    interactive_default: u64,
+) -> Option<u64> {
+    // A human-wait batch is unbounded at the batch layer — see the doc above.
+    if any_human_wait {
+        return None;
+    }
+    let batch_default = if tool_names.iter().any(|n| is_long_running_tool(n)) {
+        config_tool_timeout
+    } else {
+        interactive_default
+    };
+    Some(if llm_requested > 0 {
+        llm_requested.min(MAX_TOOL_TIMEOUT_SECS).max(batch_default)
+    } else {
+        batch_default
+    })
+}
+
 /// Issue #896 — spawn_only filename propagation (Layer 1).
 ///
 /// Build a short follow-up notification that lists the workspace-relative
@@ -81,6 +182,18 @@ fn should_auto_send_tool_files(
 /// Returns `None` when `files` is empty — the caller MUST suppress the
 /// follow-up notification in that case so we never persist an empty
 /// "produced files:" stub. Token-budget invariant (M10 Phase 4): paths
+/// Whether a Satisfied spawn_only contract's delivery counts as a FAILURE.
+///
+/// `delivery` encodes the background-notification outcome:
+/// - `None` — no background sender is wired (chat mode). The contract is
+///   Satisfied and there is simply nowhere to deliver the notification; this
+///   is NOT a failure. (The bug this fixes recorded it as Failed.)
+/// - `Some(true)` — a sender ran and persisted the result. Success.
+/// - `Some(false)` — a sender ran and genuinely failed to persist. Failure.
+fn satisfied_delivery_is_failure(delivery: Option<bool>) -> bool {
+    delivery == Some(false)
+}
+
 /// only, never file contents.
 ///
 /// `workspace_root`, when supplied, is used to convert absolute paths
@@ -171,12 +284,12 @@ pub(super) fn satisfied_completion_content(output_files: &[String], tool_output:
 /// Empirical validation (llm-benchmark replay of mini3 session
 /// slides-1780013669236-8w2ime, the production failure that motivated
 /// this fix):
-///   - kimi-k2.5 + only `check_workspace_contract`:
-///     loop rate 5/5 → 3/5 with this block (40% break out)
-///   - kimi-k2.5 + check + read_file + list_dir:
-///     no consistent change (within noise)
-///   - claude-opus-4.7:
-///     already 0/5 loops in both arms; block has no effect on Opus
+/// - kimi-k2.5 + only `check_workspace_contract`:
+///   loop rate 5/5 → 3/5 with this block (40% break out)
+/// - kimi-k2.5 + check + read_file + list_dir:
+///   no consistent change (within noise)
+/// - claude-opus-4.7:
+///   already 0/5 loops in both arms; block has no effect on Opus
 ///
 /// The block follows hermes-agent's prompt-time-injection pattern (in
 /// `agent/prompt_builder.py`), but applied universally rather than
@@ -206,7 +319,123 @@ pub(super) fn compose_system_prompt(agent: &Agent) -> String {
     content
 }
 
+/// Auto-approves the in-tool approval gate when re-running a tool whose human
+/// approval was already granted through the gateway approval flow
+/// (`docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). Scoped only around
+/// [`Agent::execute_approved_tool`], so it can never auto-approve an ordinary
+/// turn — that path never installs this requester.
+struct ApprovedToolAutoApprover;
+
+#[async_trait::async_trait]
+impl ToolApprovalRequester for ApprovedToolAutoApprover {
+    async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+        ToolApprovalDecision::Approve
+    }
+}
+
 impl Agent {
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): re-check a pending
+    /// human approval just before executing it. Policies may have changed
+    /// while the approval waited (config hot-reload, hook edits), so the
+    /// approver list is re-checked and `before_tool_call` hooks are re-run
+    /// against the original arguments. A hook that now denies — or modifies
+    /// the arguments away from the digest the human approved — invalidates
+    /// the approval.
+    pub async fn revalidate_pending_approval(
+        &self,
+        pending: &crate::approval::PendingApproval,
+        sender_user_id: &str,
+    ) -> std::result::Result<(), String> {
+        if !pending
+            .request
+            .authorized_approvers
+            .iter()
+            .any(|approver| approver == sender_user_id)
+        {
+            return Err("approver is not authorized".to_string());
+        }
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::before_tool(
+                &pending.request.tool_name,
+                pending.tool_args.clone(),
+                &pending.tool_id,
+                self.hook_ctx().as_ref(),
+            );
+            match hooks.run(HookEvent::BeforeToolCall, &payload).await {
+                HookResult::Allow => Ok(()),
+                HookResult::Modified(new_args) => {
+                    if crate::approval::digest_tool_args(&new_args)
+                        == pending.request.tool_args_digest
+                    {
+                        Ok(())
+                    } else {
+                        Err("tool arguments changed since approval request was created".to_string())
+                    }
+                }
+                HookResult::Deny(reason) => {
+                    if reason.is_empty() {
+                        Err("current policy denied the approved tool call".to_string())
+                    } else {
+                        Err(reason)
+                    }
+                }
+                HookResult::Error(err) => Err(err),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): execute a tool call
+    /// whose human approval was granted. Runs the tool directly with the
+    /// digest-bound arguments — no LLM round trip — and fires the
+    /// `after_tool_call` hooks. The caller is responsible for validating and
+    /// consuming the pending approval first
+    /// (`PendingApprovalStore::consume` + [`Agent::revalidate_pending_approval`]).
+    pub async fn execute_approved_tool(
+        &self,
+        pending: &crate::approval::PendingApproval,
+    ) -> Result<crate::tools::ToolResult> {
+        let tool_start = Instant::now();
+        let ctx = ToolContext {
+            tool_id: pending.tool_id.clone(),
+            ..ToolContext::zero()
+        };
+        // The human already approved this exact (digest-bound) call through the
+        // gateway approval flow. Some tools (e.g. `shell` on a SafePolicy
+        // `Decision::Ask` command — sudo / rm -rf / git push --force) run a
+        // SECOND, in-tool approval gate that reads `TOOL_APPROVAL_CTX` and
+        // denies when absent. Scope an auto-approving requester so the
+        // already-approved call is not re-denied by that inner gate.
+        let approver: std::sync::Arc<dyn ToolApprovalRequester> =
+            std::sync::Arc::new(ApprovedToolAutoApprover);
+        let result = TOOL_APPROVAL_CTX
+            .scope(
+                approver,
+                TOOL_CTX.scope(
+                    ctx,
+                    self.tools
+                        .execute(&pending.request.tool_name, &pending.tool_args),
+                ),
+            )
+            .await?;
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::after_tool(
+                &pending.request.tool_name,
+                &pending.tool_id,
+                octos_core::truncated_utf8(&result.output, 500, "..."),
+                result.success,
+                tool_start.elapsed().as_millis() as u64,
+                self.hook_ctx().as_ref(),
+            );
+            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+        }
+
+        Ok(result)
+    }
+
     /// Spawn a single tool call as a detached `tokio::spawn` task.
     ///
     /// The returned [`JoinHandle`] yields the per-call [`ToolCallResult`]:
@@ -281,6 +510,23 @@ impl Agent {
         // in Phase 2.
         let session_scope = self.session_scope.clone();
 
+        // UPCR-2026-023 live-soak BUG 1: capture the per-turn human-blocking
+        // bridges (`TOOL_APPROVAL_CTX`, `USER_QUESTION_CTX`) HERE — in the turn
+        // task where they are still scoped — before the `tokio::spawn` below.
+        // tokio task-locals are NOT inherited across `tokio::spawn`, so without
+        // re-establishing them inside the spawned task a tool that reads either
+        // requester (`shell`/`edit_file` approval, `ask_user_question`) would
+        // find NONE and silently degrade (the live mini5 soak symptom: a valid
+        // `ask_user_question` call emitted its "no synchronous host response
+        // channel" text fallback even though the serve turn handler had
+        // installed a `SessionUserQuestionRequester`). `try_with` returns the
+        // `Arc` clone when scoped and `None` for a non-interactive turn (e.g.
+        // CLI / gateway batch), preserving the graceful-degradation contract.
+        let captured_approval_ctx: Option<std::sync::Arc<dyn ToolApprovalRequester>> =
+            TOOL_APPROVAL_CTX.try_with(std::sync::Arc::clone).ok();
+        let captured_user_question_ctx: Option<std::sync::Arc<dyn UserQuestionRequester>> =
+            USER_QUESTION_CTX.try_with(std::sync::Arc::clone).ok();
+
         tokio::spawn(async move {
             let tool_start = Instant::now();
             debug!(tool = %tc_name, tool_id = %tc_id, "executing tool");
@@ -313,6 +559,17 @@ impl Agent {
                                 tc_name, reason
                             )
                         };
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever.
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&deny_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -369,6 +626,17 @@ impl Agent {
                             "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
                             tc_name, reason
                         );
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever.
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&deny_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -410,6 +678,19 @@ impl Agent {
                             "[VALIDATION FAILED] Tool '{tc_name}' rejected input: {msg}\n\n\
                              Fix the input and retry."
                         );
+                        // Clear the activity chip: this early-return skips the
+                        // normal completion paths, so emit the matching
+                        // ToolCompleted the ToolStarted (above) requires. Without
+                        // it the TUI shows a phantom "Using <tool>" chip forever
+                        // (reproduced live on mini5: a bad run_pipeline name left
+                        // an "Orchestrating… (1 active)" chip stuck 15+ min).
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: false,
+                            output_preview: octos_core::truncated_utf8(&err_msg, 200, "..."),
+                            duration: tool_start.elapsed(),
+                        });
                         return (
                             Message {
                                 role: MessageRole::Tool,
@@ -476,6 +757,51 @@ impl Agent {
                     Some(effective_args.clone()),
                     bg_originating_thread_id.clone(),
                 );
+                // Cap refusal: the legacy register entry points signal a
+                // per-session child-fanout rejection with an empty-string
+                // sentinel. Spawning anyway would run a worker that is
+                // invisible to `task/list`, uncancellable (`cancel("")`
+                // no-ops), and hand the LLM a task_handle with an empty id —
+                // the cap would bound tracking, not execution. Refuse the
+                // call synchronously instead, mirroring the policy-deny
+                // early-return above (chip clear included).
+                if task_id.is_empty() {
+                    tracing::error!(
+                        tool = %tc_name,
+                        "spawn_only register refused (child fanout cap); not spawning"
+                    );
+                    let cap_msg = format!(
+                        "[TASK LIMIT] Cannot start background task '{tc_name}': this \
+                         session reached its background-task fanout cap. Wait for \
+                         running tasks to finish (or cancel them) before starting more. \
+                         Do not retry immediately."
+                    );
+                    reporter.report(ProgressEvent::ToolCompleted {
+                        name: tc_name.clone(),
+                        tool_id: tc_id.clone(),
+                        success: false,
+                        output_preview: octos_core::truncated_utf8(&cap_msg, 200, "..."),
+                        duration: tool_start.elapsed(),
+                    });
+                    return (
+                        Message {
+                            role: MessageRole::Tool,
+                            content: cap_msg,
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: Some(tc_id),
+                            reasoning_content: None,
+                            client_message_id: None,
+                            thread_id: None,
+                            timestamp: chrono::Utc::now(),
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 tools.mark_spawn_only_invoked();
                 let bg_supervisor = tools.supervisor();
                 // F004 B2: bridge supervised runtime-state transitions onto
@@ -524,8 +850,39 @@ impl Agent {
                 // `tokio::spawn` moves `task_id` into the closure) can carry
                 // the same handle the supervisor and the SubAgentOutputRouter
                 // know it by.
+                // C1 step 2 / codex round-5 (orphan-sweep liveness): arm the
+                // RAII terminal guard HERE, in the FOREGROUND, before the
+                // `tokio::spawn`. `register_task_with_input_and_cmid` above
+                // already persisted a non-terminal `Spawned` row; arming the
+                // guard inside the spawned future (its previous home) left a
+                // window where a fast next-turn orphan-sweep could see the row
+                // non-terminal AND not-live and falsely reap a
+                // scheduled-but-not-yet-polled worker. Constructing it
+                // synchronously within the spawning turn inserts the id into
+                // the process-global live-set before the turn returns (turns
+                // are serialized per session, so this completes before any
+                // next-turn `enable_persistence` sweep). The guard is MOVED
+                // into the future below so its Drop — which clears the live-set
+                // and drives an unfinished task to Failed (so the TUI task
+                // count decrements instead of hanging on "N running") — still
+                // fires when the worker terminates. Idempotent on normal
+                // completion: the body's own terminal mark wins; Drop no-ops.
+                let terminal_guard = TaskTerminalGuard::new(bg_supervisor.clone(), task_id.clone());
                 let task_id_for_handle = task_id.clone();
+                // Esc/`/stop`/`turn/interrupt` cancellation: acquire the
+                // supervisor's per-task cancel token in the FOREGROUND (so it
+                // exists before any `supervisor.cancel(task_id)` race) and move
+                // it into the detached worker. Without this the spawn_only
+                // background task — a `run_pipeline` / `deep_research` fan-out —
+                // runs to completion regardless of a turn interrupt: aborting
+                // the foreground agent loop never touches this independent
+                // `tokio::spawn`, and the body never polled a cancel signal. We
+                // race the tool future against `cancel_token.cancelled()` below
+                // so the in-flight pipeline/LLM/web_search await is DROPPED at
+                // the next poll and the worker terminates promptly.
+                let cancel_token = bg_supervisor.cancel_token(&task_id);
                 tokio::spawn(async move {
+                    let _terminal_guard = terminal_guard;
                     bg_supervisor.mark_running(&task_id);
                     // M8.7 (item 4): start a periodic-summary watcher for
                     // this background task. The watcher honours
@@ -604,12 +961,60 @@ impl Agent {
                     // `file_state_cache` through to the tool. The TOOL_CTX
                     // scope still wraps the call so plugin/MCP tools that
                     // read the task-local see the same fields.
-                    let mut result = TOOL_CTX
-                        .scope(
+                    let mut result = {
+                        // Bind the inner ctx to a `let` so the `&exec_ctx`
+                        // borrow lives across the `select!` (the previous
+                        // inline `&make_ctx()` temporary was freed at the end
+                        // of the statement, which the longer-lived `exec`
+                        // future would outlive).
+                        let exec_ctx = make_ctx();
+                        let exec = TOOL_CTX.scope(
                             make_ctx(),
-                            bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
-                        )
-                        .await;
+                            bg_tools.execute_with_context(&exec_ctx, &bg_name, &bg_args),
+                        );
+                        tokio::select! {
+                            biased;
+                            // Interrupt won the race: a `turn/interrupt` (or any
+                            // `supervisor.cancel(task_id)`) fired the token while
+                            // the tool was mid-await. Drop `exec` (the pipeline /
+                            // LLM / web_search future) on the spot and short-
+                            // circuit the worker so a hung pipeline stops promptly
+                            // instead of running to completion.
+                            _ = cancel_token.cancelled() => {
+                                tracing::info!(
+                                    tool = %bg_name,
+                                    task_id = %task_id,
+                                    "spawn_only background tool cancelled (turn interrupt)"
+                                );
+                                // `supervisor.cancel` already transitioned the
+                                // record to `Cancelled`; mark again defensively
+                                // for the path where the token fires without a
+                                // supervisor transition (idempotent — the
+                                // terminal guard inside `mark_*` no-ops on an
+                                // already-terminal task).
+                                bg_supervisor.mark_failed(&task_id, "cancelled by turn interrupt".to_string());
+                                if let Some(ref router) = bg_output_router {
+                                    let _ = router.append(
+                                        bg_session_id_for_watcher.as_str(),
+                                        task_id.as_str(),
+                                        b"[cancelled] turn interrupted by client\n",
+                                    );
+                                    // Codex #1429 P2: a cancelled spawn_only task must run
+                                    // the same terminal teardown as the completion path.
+                                    // Otherwise the output handle stays in the running
+                                    // phase and the summary watcher keeps polling —
+                                    // AgentSummaryGenerator does NOT treat `Cancelled` as
+                                    // terminal, so it would re-summarise an aborted task.
+                                    router.mark_terminal(&task_id);
+                                }
+                                if let Some(ref summary_gen) = bg_summary_generator {
+                                    summary_gen.stop_watcher(&task_id);
+                                }
+                                return;
+                            }
+                            res = exec => res,
+                        }
+                    };
 
                     // M8.7 (item 4): route the tool's textual output to
                     // the router so it lands on disk for the dashboard
@@ -637,13 +1042,48 @@ impl Agent {
                                 || r.output.contains("connection refused"))
                         {
                             tracing::warn!(tool = %bg_name, "spawn_only tool failed (transient), retrying in 5s");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            result = TOOL_CTX
-                                .scope(
-                                    make_ctx(),
-                                    bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
-                                )
-                                .await;
+                            // Cancel-aware backoff + retry: a `turn/interrupt`
+                            // during the 5s wait or the retried execute must
+                            // still abort the worker rather than soldier on.
+                            let retry = async {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                TOOL_CTX
+                                    .scope(
+                                        make_ctx(),
+                                        bg_tools.execute_with_context(
+                                            &make_ctx(),
+                                            &bg_name,
+                                            &bg_args,
+                                        ),
+                                    )
+                                    .await
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = cancel_token.cancelled() => {
+                                    tracing::info!(
+                                        tool = %bg_name,
+                                        task_id = %task_id,
+                                        "spawn_only background tool cancelled during retry (turn interrupt)"
+                                    );
+                                    bg_supervisor
+                                        .mark_failed(&task_id, "cancelled by turn interrupt".to_string());
+                                    // Codex #1429 P2: same terminal teardown as the
+                                    // completion path so a task cancelled during the
+                                    // transient-retry wait doesn't leave its output
+                                    // handle running / summary watcher registered.
+                                    if let Some(ref router) = bg_output_router {
+                                        router.mark_terminal(&task_id);
+                                    }
+                                    if let Some(ref summary_gen) = bg_summary_generator {
+                                        summary_gen.stop_watcher(&task_id);
+                                    }
+                                    return;
+                                }
+                                res = retry => {
+                                    result = res;
+                                }
+                            }
                         }
                     }
 
@@ -737,25 +1177,44 @@ impl Agent {
                                     } else {
                                         r.output.clone()
                                     };
-                                    let result_persisted = if let Some(ref sender) = bg_sender {
-                                        sender(BackgroundResultPayload {
-                                            task_label: bg_name.clone(),
-                                            content: bubble_content,
-                                            kind: BackgroundResultKind::Notification,
-                                            media: output_files.clone(),
-                                            envelope_media: vec![],
-                                            originating_thread_id: bg_originating_thread_id.clone(),
-                                            task_id: Some(task_id.clone()),
-                                            originating_client_message_id:
-                                                bg_originating_client_message_id.clone(),
-                                            tool_call_id: Some(bg_tc_id.clone()),
-                                        })
-                                        .await
+                                    // `None` = no background channel is wired
+                                    // (chat mode): the contract is Satisfied and
+                                    // there is simply nowhere to deliver the
+                                    // notification — that is NOT a failure.
+                                    // `Some(false)` = a sender ran and genuinely
+                                    // failed to persist. Keeping these apart
+                                    // stops a Satisfied chat-mode contract from
+                                    // being recorded as Failed.
+                                    let delivery = if let Some(ref sender) = bg_sender {
+                                        Some(
+                                            sender(BackgroundResultPayload {
+                                                task_label: bg_name.clone(),
+                                                content: bubble_content,
+                                                kind: BackgroundResultKind::Notification,
+                                                media: output_files.clone(),
+                                                envelope_media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
+                                                task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: contract-Satisfied success path
+                                                // (mark_completed below).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Completed,
+                                                ),
+                                            })
+                                            .await,
+                                        )
                                     } else {
-                                        false
+                                        None
                                     };
 
-                                    if result_persisted {
+                                    // A Satisfied contract is a success unless a
+                                    // wired sender actually failed to persist.
+                                    let delivery_failed = satisfied_delivery_is_failure(delivery);
+                                    if !delivery_failed {
                                         // Workspace contract already verified
                                         // the declared artifacts. Trust it —
                                         // the supervisor's job is to record
@@ -811,6 +1270,11 @@ impl Agent {
                                                                 bg_originating_client_message_id
                                                                     .clone(),
                                                             tool_call_id: Some(bg_tc_id.clone()),
+                                                            // C1 step 3: produced-files
+                                                            // follow-up after mark_completed.
+                                                            terminal_status: Some(
+                                                                crate::task_supervisor::TaskStatus::Completed,
+                                                            ),
                                                         })
                                                         .await;
                                                 }
@@ -856,6 +1320,11 @@ impl Agent {
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
                                             tool_call_id: Some(bg_tc_id.clone()),
+                                            // C1 step 3: contract-rejected failure
+                                            // (mark_failed above).
+                                            terminal_status: Some(
+                                                crate::task_supervisor::TaskStatus::Failed,
+                                            ),
                                         })
                                         .await;
                                     }
@@ -885,6 +1354,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: required-but-unconfigured
+                                                // contract failure (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -943,6 +1417,11 @@ impl Agent {
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
                                                     tool_call_id: Some(bg_tc_id.clone()),
+                                                    // C1 step 3: text-only success
+                                                    // (mark_completed above).
+                                                    terminal_status: Some(
+                                                        crate::task_supervisor::TaskStatus::Completed,
+                                                    ),
                                                 })
                                                 .await;
                                             }
@@ -980,6 +1459,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: no-files-no-text failure
+                                                // (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -1115,6 +1599,11 @@ impl Agent {
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
                                                 tool_call_id: Some(bg_tc_id.clone()),
+                                                // C1 step 3: file-delivery failure
+                                                // (mark_failed above).
+                                                terminal_status: Some(
+                                                    crate::task_supervisor::TaskStatus::Failed,
+                                                ),
                                             })
                                             .await;
                                         }
@@ -1225,6 +1714,11 @@ impl Agent {
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
                                                     tool_call_id: Some(bg_tc_id.clone()),
+                                                    // C1 step 3: file-delivery success
+                                                    // (mark_completed above).
+                                                    terminal_status: Some(
+                                                        crate::task_supervisor::TaskStatus::Completed,
+                                                    ),
                                                 })
                                                 .await;
 
@@ -1299,6 +1793,11 @@ impl Agent {
                                                                 bg_originating_client_message_id
                                                                     .clone(),
                                                             tool_call_id: Some(bg_tc_id.clone()),
+                                                            // C1 step 3: produced-files
+                                                            // follow-up after mark_completed.
+                                                            terminal_status: Some(
+                                                                crate::task_supervisor::TaskStatus::Completed,
+                                                            ),
                                                         })
                                                         .await;
                                                     }
@@ -1329,6 +1828,11 @@ impl Agent {
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
                                     tool_call_id: Some(bg_tc_id.clone()),
+                                    // C1 step 3: tool returned non-success
+                                    // (mark_failed above).
+                                    terminal_status: Some(
+                                        crate::task_supervisor::TaskStatus::Failed,
+                                    ),
                                 })
                                 .await;
                             }
@@ -1352,6 +1856,11 @@ impl Agent {
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
                                     tool_call_id: Some(bg_tc_id.clone()),
+                                    // C1 step 3: tool execution errored
+                                    // (mark_failed above).
+                                    terminal_status: Some(
+                                        crate::task_supervisor::TaskStatus::Failed,
+                                    ),
                                 })
                                 .await;
                             }
@@ -1462,12 +1971,40 @@ impl Agent {
             // whose trait impl only overrides `execute` still work via the
             // default delegation path; migrated tools read the typed fields.
             // TOOL_CTX is still scoped for plugin tools that read the task-local.
-            let result = TOOL_CTX
-                .scope(
-                    ctx.clone(),
-                    tools.execute_with_context(&ctx, &tc_name, &effective_args),
-                )
-                .await;
+            //
+            // UPCR-2026-023 live-soak BUG 1: re-establish the per-turn
+            // human-blocking bridges (captured above before this `tokio::spawn`)
+            // INSIDE the spawned task so approval-gated tools (`shell`,
+            // `edit_file`, …) and `ask_user_question` see their requester via
+            // `try_with`. Without this, both the parallel (`join_all`) and
+            // serial dispatch paths — which BOTH run the tool through this
+            // `spawn_tool_task` `tokio::spawn` — would lose the task-local and
+            // the tool would degrade (approval denied / question text fallback).
+            // We scope each bridge ONLY when it was scoped in the parent
+            // (`Some(_)`), so a non-interactive turn (CLI / gateway batch with
+            // no requester) keeps the graceful-degradation path unchanged.
+            let exec_future = TOOL_CTX.scope(ctx.clone(), async {
+                tools
+                    .execute_with_context(&ctx, &tc_name, &effective_args)
+                    .await
+            });
+            let result = match (&captured_approval_ctx, &captured_user_question_ctx) {
+                (Some(approval), Some(question)) => {
+                    TOOL_APPROVAL_CTX
+                        .scope(
+                            approval.clone(),
+                            USER_QUESTION_CTX.scope(question.clone(), exec_future),
+                        )
+                        .await
+                }
+                (Some(approval), None) => {
+                    TOOL_APPROVAL_CTX.scope(approval.clone(), exec_future).await
+                }
+                (None, Some(question)) => {
+                    USER_QUESTION_CTX.scope(question.clone(), exec_future).await
+                }
+                (None, None) => exec_future.await,
+            };
 
             let duration = tool_start.elapsed();
 
@@ -1710,14 +2247,34 @@ impl Agent {
             .filter_map(|tc| tc.arguments.get("timeout_secs").and_then(|v| v.as_u64()))
             .max()
             .unwrap_or(0);
-        let tool_timeout_secs = if llm_requested_timeout > 0 {
-            llm_requested_timeout
-                .min(MAX_TOOL_TIMEOUT_SECS)
-                .max(self.config.tool_timeout_secs)
-        } else {
-            self.config.tool_timeout_secs
-        };
-        let tool_timeout = Duration::from_secs(tool_timeout_secs);
+        // UPCR-2026-023: a batch containing a human-wait tool
+        // (`ask_user_question`) must run with NO finite batch timeout — the
+        // human may take arbitrarily long, and a fired ceiling would detach the
+        // still-running tool task and leak the pending question (replayed later
+        // as a stale prompt). `compute_batch_timeout_secs` returns `None` for
+        // such a batch; the dispatch paths below branch on that. NON-human-wait
+        // peers keep their per-tool registry timeouts (applied inside each
+        // tool's registry dispatch), unaffected by skipping this outer wrap.
+        let any_human_wait = response
+            .tool_calls
+            .iter()
+            .any(|tc| self.tools.blocks_on_human_input(&tc.name));
+
+        // mini5 soak fix: when the LLM omits `timeout_secs`, a batch of only
+        // fast/interactive tools (e.g. `glob`, `list_dir`) defaults to the
+        // short `default_interactive_tool_timeout_secs` instead of inheriting
+        // the 1800s ceiling that hung the turn. A batch containing any
+        // genuinely long-running tool keeps the long default; an explicit
+        // LLM-requested timeout is still honoured (clamped + floored). A
+        // human-wait batch yields `None` (no batch timeout at all).
+        let tool_timeout_secs = compute_batch_timeout_secs(
+            &tool_names,
+            any_human_wait,
+            llm_requested_timeout,
+            self.config.tool_timeout_secs,
+            self.config.default_interactive_tool_timeout_secs,
+        );
+        let tool_timeout = tool_timeout_secs.map(Duration::from_secs);
 
         let results: Vec<ToolCallResult> = if any_exclusive {
             // Serial admission: run each tool in LLM call order, bail out of
@@ -1746,56 +2303,56 @@ impl Agent {
                 })
                 .collect();
 
-            match tokio::time::timeout(tool_timeout, futures::future::join_all(handles)).await {
-                Ok(results) => results
+            // UPCR-2026-023: a human-wait batch (`tool_timeout == None`) awaits
+            // `join_all` DIRECTLY, with no timeout wrap, so the human-wait
+            // tool task is never detached by a fired ceiling. It is unblocked
+            // by the user answering or by a turn interrupt/abort (which drains
+            // the pending question).
+            //
+            // All other batches share ONE absolute deadline, but each handle
+            // is raced against it INDIVIDUALLY (`tokio::time::timeout_at`): a
+            // call that already resolved keeps its REAL result even when a
+            // sibling overruns the ceiling — only the still-pending calls get
+            // the synthetic "timed out" message (success=false, so the
+            // spawn_only synth-ack gate in loop_runner still suppresses the
+            // fabricated "Background work started" bubble for them). The
+            // previous shape — one `timeout()` wrapped around the whole
+            // `join_all` — dropped the joined future on expiry and fabricated
+            // a timeout message for EVERY call, discarding the real output of
+            // calls (including spawn_only acks) that had already completed.
+            // `timeout_at` polls the inner handle before the timer, so a
+            // handle that completed by the time we reach it yields its result
+            // even at/past the deadline. Timed-out tasks are NOT aborted —
+            // they keep running detached for cleanup, exactly as before.
+            match tool_timeout {
+                Some(dur) => {
+                    let deadline = tokio::time::Instant::now() + dur;
+                    let elapsed_secs = dur.as_secs();
+                    let mut results: Vec<ToolCallResult> =
+                        Vec::with_capacity(response.tool_calls.len());
+                    for (handle, tc) in handles.into_iter().zip(response.tool_calls.iter()) {
+                        match tokio::time::timeout_at(deadline, handle).await {
+                            Ok(Ok(result)) => results.push(result),
+                            Ok(Err(e)) => results.push(panic_result(tc, &e.to_string())),
+                            Err(_elapsed) => {
+                                tracing::error!(
+                                    timeout_secs = elapsed_secs,
+                                    tool = %tc.name,
+                                    tool_id = %tc.id,
+                                    "tool execution timed out -- spawned task continues running for cleanup"
+                                );
+                                results.push(timed_out_result(tc, elapsed_secs));
+                            }
+                        }
+                    }
+                    results
+                }
+                None => futures::future::join_all(handles)
+                    .await
                     .into_iter()
                     .zip(response.tool_calls.iter())
                     .map(|(r, tc)| r.unwrap_or_else(|e| panic_result(tc, &e.to_string())))
                     .collect(),
-                Err(_) => {
-                    tracing::error!(
-                        timeout_secs = tool_timeout_secs,
-                        tool_count = response.tool_calls.len(),
-                        tools = %tool_names.join(", "),
-                        "tool execution timed out -- spawned tasks continue running for cleanup"
-                    );
-                    let messages: Vec<Message> = response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| Message {
-                            role: MessageRole::Tool,
-                            content: format!(
-                                "Tool '{}' timed out after {} seconds",
-                                tc.name, tool_timeout_secs
-                            ),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: Some(tc.id.clone()),
-                            reasoning_content: None,
-                            client_message_id: None,
-                            thread_id: None,
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .collect();
-                    // Batch-wide timeout: every tool in the batch failed.
-                    // Surface the success bit (false for all) so the
-                    // spawn_only synth-ack gate in loop_runner can suppress
-                    // the fabricated "Background work started" bubble
-                    // without depending on content-prefix matching.
-                    let success_by_id: Vec<(String, bool)> = response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| (tc.id.clone(), false))
-                        .collect();
-                    return Ok((
-                        messages,
-                        vec![],
-                        vec![],
-                        TokenUsage::default(),
-                        Vec::new(),
-                        success_by_id,
-                    ));
-                }
             }
         };
 
@@ -1874,13 +2431,22 @@ impl Agent {
     /// single-call [`JoinHandle`] in `tokio::time::timeout`. A timeout on any
     /// one call fails that call and cascades to its peers the same way a
     /// regular error does.
+    ///
+    /// UPCR-2026-023: when the batch contains a human-wait tool the caller
+    /// passes `tool_timeout == None`; every call in the batch is then awaited
+    /// DIRECTLY with no `tokio::time::timeout` wrap, so the human-wait tool is
+    /// never detached by a fired ceiling. NON-human-wait peers in the same
+    /// (now-unbounded) batch keep their own per-tool registry timeouts, applied
+    /// inside `spawn_tool_task` → `ToolRegistry::execute_with_context`. Cleanup
+    /// of the human-wait call comes from the user answering or a turn
+    /// interrupt/abort draining the pending question — never from this wrap.
     async fn execute_serial_batch(
         &self,
         response: &ChatResponse,
         explicit_send_file_requested: bool,
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
-        tool_timeout: Duration,
-        tool_timeout_secs: u64,
+        tool_timeout: Option<Duration>,
+        tool_timeout_secs: Option<u64>,
     ) -> Vec<ToolCallResult> {
         let mut results: Vec<ToolCallResult> = Vec::with_capacity(response.tool_calls.len());
         let mut cancelled = false;
@@ -1901,7 +2467,18 @@ impl Agent {
             let handle =
                 self.spawn_tool_task(tool_call, explicit_send_file_requested, turn_attachment_ctx);
 
-            let outcome = match tokio::time::timeout(tool_timeout, handle).await {
+            // `None` (human-wait batch) awaits the handle directly — no finite
+            // wrap — so the human-wait call cannot be detached by a ceiling.
+            // The `Err(())` arm is unreachable in that case.
+            let join_outcome = match tool_timeout {
+                Some(dur) => match tokio::time::timeout(dur, handle).await {
+                    Ok(joined) => Ok(joined),
+                    Err(_) => Err(()),
+                },
+                None => Ok(handle.await),
+            };
+
+            let outcome = match join_outcome {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
                     tracing::warn!(
@@ -1911,34 +2488,15 @@ impl Agent {
                     );
                     panic_result(tool_call, &e.to_string())
                 }
-                Err(_) => {
+                Err(()) => {
+                    let elapsed_secs = tool_timeout_secs.unwrap_or(0);
                     tracing::error!(
-                        timeout_secs = tool_timeout_secs,
+                        timeout_secs = elapsed_secs,
                         tool = %tool_call.name,
                         tool_id = %tool_call.id,
                         "serial tool execution timed out"
                     );
-                    (
-                        Message {
-                            role: MessageRole::Tool,
-                            content: format!(
-                                "Tool '{}' timed out after {} seconds",
-                                tool_call.name, tool_timeout_secs
-                            ),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: Some(tool_call.id.clone()),
-                            reasoning_content: None,
-                            client_message_id: None,
-                            thread_id: None,
-                            timestamp: chrono::Utc::now(),
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                        false,
-                        None,
-                    )
+                    timed_out_result(tool_call, elapsed_secs)
                 }
             };
 
@@ -1983,6 +2541,36 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
     )
 }
 
+/// Build a synthetic tool-result message for a call that was still pending
+/// when the batch deadline fired (parallel dispatch) or whose own wrap
+/// expired (serial dispatch). `success` is `false` so the spawn_only
+/// synth-ack gate in loop_runner can suppress the fabricated "Background
+/// work started" bubble without content-prefix matching. The spawned task
+/// itself is NOT aborted — it keeps running detached for cleanup.
+fn timed_out_result(tool_call: &octos_core::ToolCall, elapsed_secs: u64) -> ToolCallResult {
+    (
+        Message {
+            role: MessageRole::Tool,
+            content: format!(
+                "Tool '{}' timed out after {} seconds",
+                tool_call.name, elapsed_secs
+            ),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tool_call.id.clone()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        },
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        None,
+    )
+}
+
 /// Build a tool-result message describing a panic inside a spawned tool task.
 fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResult {
     (
@@ -2009,8 +2597,29 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 mod tests {
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
-        satisfied_completion_content, should_auto_send_tool_files,
+        satisfied_completion_content, satisfied_delivery_is_failure, should_auto_send_tool_files,
     };
+
+    #[test]
+    fn satisfied_contract_in_chat_mode_is_not_a_failure() {
+        // P2 (tri-repo #1529): a Satisfied spawn_only contract in chat mode
+        // (no background sender: delivery == None) was recorded as Failed
+        // because "no channel to notify" was conflated with "sender failed to
+        // persist". None and Some(true) are BOTH success; only Some(false) —
+        // a wired sender that actually failed — is a failure.
+        assert!(
+            !satisfied_delivery_is_failure(None),
+            "chat mode (no background sender) must not be a failure"
+        );
+        assert!(
+            !satisfied_delivery_is_failure(Some(true)),
+            "a delivered result is a success"
+        );
+        assert!(
+            satisfied_delivery_is_failure(Some(false)),
+            "a wired sender that failed to persist is a real failure"
+        );
+    }
 
     #[test]
     fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
@@ -2190,6 +2799,393 @@ mod tests {
              reference exactly — any wording drift breaks the harness's \
              `isFinalArrived` heuristic plus any downstream regex \
              matchers in dashboards / debugging tooling"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // FIX 1: fast read-only tools must not inherit the 1800s timeout.
+    // ------------------------------------------------------------------
+
+    use super::{MAX_TOOL_TIMEOUT_SECS, compute_batch_timeout_secs, is_long_running_tool};
+
+    #[test]
+    fn long_running_tools_are_recognised() {
+        // The genuinely-long-running set keeps the 1800s ceiling.
+        for name in [
+            "shell",
+            "bash",
+            "spawn",
+            "spawn_agent",
+            "run_pipeline",
+            "browser",
+            "delegate_task",
+            "deep_crawl",
+            "search",
+            "synthesize_research",
+        ] {
+            assert!(
+                is_long_running_tool(name),
+                "{name} should be classified long-running"
+            );
+        }
+    }
+
+    #[test]
+    fn human_wait_tool_is_not_in_long_running_set() {
+        // UPCR-2026-023: `ask_user_question` is NOT classified long-running.
+        // A batch containing it gets NO batch timeout at all (the
+        // `any_human_wait` short-circuit), so the long-vs-short ceiling never
+        // applies — wrapping it in even the 1800s ceiling would detach the
+        // still-running tool task and leak the pending question.
+        assert!(
+            !is_long_running_tool("ask_user_question"),
+            "ask_user_question must be handled by the any_human_wait no-timeout \
+             path, not the long-running ceiling"
+        );
+    }
+
+    #[test]
+    fn batch_with_human_wait_tool_has_no_batch_timeout() {
+        // UPDATED for UPCR-2026-023 (was `batch_with_ask_user_question_keeps_
+        // the_long_ceiling`, which asserted 1800s). A batch containing a
+        // human-wait tool must run with NO finite batch timeout: the previous
+        // 1800s ceiling, while long, would still eventually FIRE and detach the
+        // still-running `ask_user_question` task (its `JoinHandle` dropped, not
+        // awaited), so its `PendingQuestionWaiterGuard` never drops → the
+        // pending question leaks and is later replayed as a stale prompt. The
+        // human may take arbitrarily long; cleanup comes from the user
+        // answering or a turn interrupt/abort, never from the batch timeout.
+        let secs = compute_batch_timeout_secs(
+            &["ask_user_question"],
+            /* any_human_wait */ true,
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(
+            secs, None,
+            "a human-wait batch must yield None (no finite batch timeout)"
+        );
+    }
+
+    #[test]
+    fn human_wait_batch_has_no_timeout_even_with_llm_requested_secs() {
+        // The `any_human_wait` short-circuit wins over an explicit
+        // LLM-requested `timeout_secs`: a human-wait tool is unbounded at the
+        // batch layer regardless of what the LLM asked for, so a bogus tiny or
+        // huge `timeout_secs` cannot reintroduce the detach/leak.
+        let secs = compute_batch_timeout_secs(
+            &["ask_user_question"],
+            /* any_human_wait */ true,
+            /* llm_requested */ 30,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, None);
+    }
+
+    #[test]
+    fn mixed_human_wait_batch_is_unbounded_normal_tool_keeps_per_tool_timeout() {
+        // A mixed batch (human-wait + a normal/long-running tool) is unbounded
+        // at the BATCH layer (None). The normal tool does NOT lose its bound —
+        // its per-tool registry timeout is applied INSIDE the tool's own
+        // registry dispatch (`ToolRegistry::execute_with_context`), which is
+        // untouched by removing the outer batch wrap. So the human-wait call
+        // waits for the human while the `shell` peer is still bounded by its
+        // registry-level ceiling.
+        let secs = compute_batch_timeout_secs(
+            &["ask_user_question", "shell"],
+            /* any_human_wait */ true,
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(
+            secs, None,
+            "a mixed human-wait batch is unbounded at the batch layer; \
+             normal peers keep their per-tool registry timeouts"
+        );
+    }
+
+    #[test]
+    fn fast_read_only_tools_are_not_long_running() {
+        for name in [
+            "glob",
+            "list_dir",
+            "read_file",
+            "grep",
+            "write_file",
+            "edit_file",
+            "web_search",
+            "web_fetch",
+        ] {
+            assert!(
+                !is_long_running_tool(name),
+                "{name} must NOT be classified long-running"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_of_only_fast_tools_uses_short_interactive_default() {
+        // mini5 soak shape: `list_dir` + `glob` with NO LLM-requested
+        // timeout must default to the short interactive timeout, NOT the
+        // 1800s tool ceiling that hung the turn.
+        let secs = compute_batch_timeout_secs(
+            &["list_dir", "glob"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(120));
+    }
+
+    #[test]
+    fn batch_with_a_long_running_tool_keeps_the_long_ceiling() {
+        // A `shell` (or `run_pipeline`) in the batch keeps the long
+        // config-default timeout when the LLM omits `timeout_secs`.
+        let secs = compute_batch_timeout_secs(
+            &["glob", "shell"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 0,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(1800));
+    }
+
+    #[test]
+    fn llm_requested_timeout_still_honoured_for_fast_batch() {
+        // An explicit LLM `timeout_secs` is clamped to MAX and floored at
+        // the config default — unchanged from the pre-fix behaviour. For a
+        // fast-only batch the floor is the interactive default, not 1800.
+        let secs = compute_batch_timeout_secs(
+            &["glob"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 300,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(300));
+
+        // Over-the-cap request is clamped to MAX_TOOL_TIMEOUT_SECS.
+        let capped = compute_batch_timeout_secs(
+            &["glob"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 99_999,
+            1800,
+            120,
+        );
+        assert_eq!(capped, Some(MAX_TOOL_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn llm_requested_below_interactive_floor_is_raised_for_fast_batch() {
+        // A fast-only batch floors at the interactive default so a tiny
+        // LLM-requested value cannot make the batch flakier than baseline.
+        let secs = compute_batch_timeout_secs(
+            &["glob"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 5,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(120));
+    }
+
+    #[test]
+    fn long_batch_llm_request_floors_at_config_default() {
+        // A long batch floors at the config tool timeout (existing
+        // behaviour preserved).
+        let secs = compute_batch_timeout_secs(
+            &["shell"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 10,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(1800));
+    }
+
+    // ------------------------------------------------------------------
+    // Parallel batch timeout must NOT discard already-completed results.
+    // ------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_core::{AgentId, ToolCall};
+    use octos_llm::{
+        ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage, ToolSpec,
+    };
+    use octos_memory::EpisodeStore;
+
+    use crate::agent::{Agent, AgentConfig};
+    use crate::tools::{Tool, ToolRegistry, ToolResult};
+
+    /// `execute_tools` never talks to the LLM, so the provider only has to
+    /// satisfy the trait bounds (mirrors loop_runner's `InertProvider`).
+    struct NoChatProvider;
+
+    #[async_trait]
+    impl LlmProvider for NoChatProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            unreachable!("execute_tools must not call the provider");
+        }
+
+        fn model_id(&self) -> &str {
+            "inert"
+        }
+
+        fn provider_name(&self) -> &str {
+            "inert"
+        }
+    }
+
+    /// Completes immediately with a distinctive real output.
+    struct InstantTool;
+
+    #[async_trait]
+    impl Tool for InstantTool {
+        fn name(&self) -> &str {
+            "fast_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that completes immediately"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "FAST_TOOL_REAL_OUTPUT".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Sleeps far past the batch ceiling so the batch timeout always fires
+    /// while this call is still pending.
+    struct SleepingTool;
+
+    #[async_trait]
+    impl Tool for SleepingTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that outlives the batch timeout"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(ToolResult {
+                output: "SLOW_TOOL_REAL_OUTPUT".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_keep_completed_call_results_when_batch_timeout_fires() {
+        // Regression: the parallel dispatch used to wrap the WHOLE `join_all`
+        // in one `tokio::time::timeout`; when the ceiling fired, every call in
+        // the batch — including ones that had already resolved — was replaced
+        // by a synthetic "timed out" message, discarding real output.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(InstantTool);
+        tools.register(SleepingTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("batch-timeout"), provider, tools, memory).with_config(
+            AgentConfig {
+                // Neither test tool is in LONG_RUNNING_TOOLS and no call
+                // requests `timeout_secs`, so this 1s interactive default is
+                // the whole batch's ceiling (see compute_batch_timeout_secs).
+                default_interactive_tool_timeout_secs: 1,
+                tool_timeout_secs: 1,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                tool_call("call_fast", "fast_tool"),
+                tool_call("call_slow", "slow_tool"),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, _files_modified, _files_to_send, _tokens, _structured, success_by_id) =
+            agent
+                .execute_tools(&response)
+                .await
+                .expect("execute_tools must not error on a batch timeout");
+
+        // 1:1 mapping in LLM call order is preserved.
+        assert_eq!(messages.len(), 2, "one result message per tool call");
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_fast"));
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_slow"));
+
+        // The fast call COMPLETED before the ceiling fired: its REAL output
+        // must survive, not be overwritten by a fabricated timeout message.
+        assert!(
+            messages[0].content.contains("FAST_TOOL_REAL_OUTPUT"),
+            "completed call's real output was discarded: {:?}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("timed out"),
+            "completed call must not carry a synthetic timeout message: {:?}",
+            messages[0].content
+        );
+
+        // The still-pending slow call gets the synthetic timeout message in
+        // the existing (pinned) format.
+        assert_eq!(
+            messages[1].content,
+            "Tool 'slow_tool' timed out after 1 seconds"
+        );
+
+        // Per-call success bits follow the same split.
+        assert!(
+            success_by_id.contains(&("call_fast".to_string(), true)),
+            "completed call must keep success=true: {success_by_id:?}"
+        );
+        assert!(
+            success_by_id.contains(&("call_slow".to_string(), false)),
+            "timed-out call must report success=false: {success_by_id:?}"
         );
     }
 }

@@ -8,7 +8,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use octos_core::{AgentId, Task, TaskContext, TaskKind, TokenUsage};
-use octos_llm::{ContextWindowOverride, EmbeddingProvider, LlmProvider, ProviderRouter};
+use octos_llm::{
+    ContextWindowOverride, EmbeddingProvider, LlmProvider, ProviderRouter,
+    SemaphoreThrottledProvider,
+};
 use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
@@ -185,6 +188,26 @@ impl ProgressReporter for PipelineNodeReporter {
                     self.node_id, self.model, iteration
                 )
             }
+            ProgressEvent::LlmStatus { message, iteration } => {
+                format!(
+                    "{} [{}]: {} (iteration {})",
+                    self.node_id, self.model, message, iteration
+                )
+            }
+            ProgressEvent::ActivityTimeoutReached { limit, .. } => {
+                format!(
+                    "{} [{}]: activity timeout after {}s",
+                    self.node_id,
+                    self.model,
+                    limit.as_secs()
+                )
+            }
+            ProgressEvent::TaskInterrupted { iterations } => {
+                format!(
+                    "{} [{}]: interrupted after {} iteration(s)",
+                    self.node_id, self.model, iterations
+                )
+            }
             // Bug 3 / Gap 3.3 — per-node cost updates from inner agents must
             // reach the parent SSE stream. The legacy `_ => return` arm
             // swallowed these silently, leaving the W1.G4 CostBreakdown
@@ -272,6 +295,7 @@ pub struct CodergenHandler {
     memory: Arc<EpisodeStore>,
     working_dir: PathBuf,
     provider_router: Option<Arc<ProviderRouter>>,
+    llm_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     provider_policy: Option<octos_agent::ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
     /// Section B (codex review P1.1): pipeline-level strict-signing
@@ -335,6 +359,7 @@ impl CodergenHandler {
             memory,
             working_dir,
             provider_router: None,
+            llm_semaphore: None,
             provider_policy: None,
             plugin_dirs: Vec::new(),
             plugin_require_signed: false,
@@ -419,6 +444,13 @@ impl CodergenHandler {
 
     pub fn with_provider_router(mut self, router: Arc<ProviderRouter>) -> Self {
         self.provider_router = Some(router);
+        self
+    }
+
+    /// Attach the per-pipeline LLM call throttle. The semaphore is shared
+    /// across every codergen worker in a single pipeline run.
+    pub fn with_llm_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.llm_semaphore = Some(semaphore);
         self
     }
 
@@ -530,6 +562,13 @@ impl CodergenHandler {
         self.cached_plugin_registration().tool_names.clone()
     }
 
+    #[doc(hidden)]
+    pub fn llm_available_permits_for_test(&self) -> Option<usize> {
+        self.llm_semaphore
+            .as_ref()
+            .map(|semaphore| semaphore.available_permits())
+    }
+
     /// Resolve LLM provider for a node, following SpawnTool pattern.
     ///
     /// When a model is explicitly specified and a `ProviderRouter` is available,
@@ -580,6 +619,12 @@ impl Handler for CodergenHandler {
             Some(cw) => Arc::new(ContextWindowOverride::new(base_provider, cw)),
             None => base_provider,
         };
+        let provider: Arc<dyn LlmProvider> = match &self.llm_semaphore {
+            Some(semaphore) => {
+                Arc::new(SemaphoreThrottledProvider::new(provider, semaphore.clone()))
+            }
+            None => provider,
+        };
 
         // Build tool registry (same pattern as SpawnTool sync, spawn.rs:269-278)
         let mut tools = octos_agent::ToolRegistry::with_builtins(&self.working_dir);
@@ -620,6 +665,15 @@ impl Handler for CodergenHandler {
                     "run_pipeline".into(),
                     "send_file".into(),
                     "message".into(),
+                    // Shell is arbitrary code execution — banned in pipelines.
+                    // Denied unconditionally so no node's agent can run shell,
+                    // even via an empty tool-list (which widens to all builtins).
+                    // `write_stdin` drives existing exec sessions → also denied.
+                    "shell".into(),
+                    "exec_command".into(),
+                    "bash".into(),
+                    "exec".into(),
+                    "write_stdin".into(),
                 ],
                 ..Default::default()
             }
@@ -858,7 +912,39 @@ impl Handler for CodergenHandler {
             "executing codergen node"
         );
 
-        match worker.run_task(&task).await {
+        let run_task = worker.run_task(&task);
+        let result = if let Some(timeout_secs) = node.timeout_secs.filter(|secs| *secs > 0) {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), run_task).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let message = format!(
+                        "Node '{}' timed out after {timeout_secs}s while waiting for worker '{}'",
+                        node.id, worker_id
+                    );
+                    warn!(
+                        node = %node.id,
+                        worker = %worker_id,
+                        timeout_secs,
+                        "pipeline codergen worker hard timeout"
+                    );
+                    crate::executor::report_progress(&format!(
+                        "{} [{}]: timed out after {}s; cancelling stalled worker",
+                        node.id, resolved_model, timeout_secs
+                    ));
+                    return Ok(NodeOutcome {
+                        node_id: node.id.clone(),
+                        status: OutcomeStatus::Error,
+                        content: message,
+                        token_usage: TokenUsage::default(),
+                        files_modified: vec![],
+                    });
+                }
+            }
+        } else {
+            run_task.await
+        };
+
+        match result {
             Ok(result) => {
                 if !result.files_modified.is_empty() {
                     info!(
@@ -1176,6 +1262,7 @@ mod tests {
                     response_cost: Some(0.0008),
                     session_cost: Some(0.0008),
                     model: Some("claude-sonnet".into()),
+                    context_window: None,
                 });
             })
             .await;
@@ -1263,6 +1350,10 @@ mod tests {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: vec![],
+            checkpoint_refs: vec![],
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,
@@ -1332,6 +1423,10 @@ mod tests {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: vec![],
+            checkpoint_refs: vec![],
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,
@@ -1385,6 +1480,10 @@ mod tests {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: vec![],
+            checkpoint_refs: vec![],
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,
@@ -1448,6 +1547,10 @@ mod tests {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: vec![],
+            checkpoint_refs: vec![],
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,
@@ -1511,6 +1614,10 @@ mod tests {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: vec![],
+            checkpoint_refs: vec![],
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,
@@ -1572,6 +1679,10 @@ mod tests {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            human_gate: false,
+            resolver: None,
+            artifact_refs: vec![],
+            checkpoint_refs: vec![],
             deadline_secs: None,
             deadline_action: None,
             continue_on_error: false,
