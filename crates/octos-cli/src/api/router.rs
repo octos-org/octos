@@ -209,11 +209,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        .route("/api/my/profile/qr", get(auth_handlers::my_profile_qr))
         // Reply-voice selection: list synthesizable voices + set this user's
         // sticky default. Both need the caller's identity, so they live in the
         // authenticated `my_api` group.
         .route("/api/voices", get(auth_handlers::list_voices))
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
+        // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
+        .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))

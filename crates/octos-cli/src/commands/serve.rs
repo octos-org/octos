@@ -490,6 +490,7 @@ impl ServeCommand {
                 crate::runtime::BootstrapRole::Serve,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -538,7 +539,13 @@ impl ServeCommand {
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
                 // gateway's effective `plugins.require_signed`.
-                .with_host_plugins_require_signed(config.plugins.require_signed),
+                .with_host_plugins_require_signed(config.plugins.require_signed)
+                .with_host_max_inject_tokens(
+                    config.memory.as_ref().and_then(|m| m.max_inject_tokens),
+                )
+                .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
+                    config.memory.as_ref(),
+                )),
         );
         process_manager.set_self_ref();
 
@@ -719,6 +726,7 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            host_memory: config.memory.clone(),
             solo_login_enabled: self.solo
                 || std::env::var("OCTOS_SOLO_LOGIN")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

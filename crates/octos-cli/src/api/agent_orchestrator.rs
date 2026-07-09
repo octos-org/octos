@@ -624,6 +624,22 @@ impl InProcessAgentOrchestrator {
     /// the operator resume explicitly (`/loop resume <id>`). The transition
     /// is persisted so the pause survives further restarts. Returns the
     /// paused `(loop_id, session_id)` pairs so the caller can log them.
+    ///
+    /// Parking also retires any boot-restored queued `LoopFire` belonging to
+    /// a loop parked here. Left queued, such a fire is a permanent zombie:
+    /// unschedulable at every drain (`pending_continuation_is_schedulable`
+    /// rejects non-active loops), deliberately spared by the drain path's
+    /// `stale_drop_should_tombstone` pause carve-out, and resurrected from
+    /// the ledger on every future boot. Unlike the drain path we DO write
+    /// the terminal ledger record here: the ledger's only consumer is boot
+    /// restore, and after a solo park the fire must not come back — while a
+    /// later `/loop resume` re-fires from the loop record's own persisted
+    /// schedule (`next_run_at_ms`), which never consults this ledger entry.
+    /// (The `Completed > Queued` upsert rank means a post-resume queued fire
+    /// won't re-persist under the same dedupe key, but that is already true
+    /// today after any loop's first drained fire completes — see
+    /// `mark_continuation_completed` — so parking loses no durability the
+    /// steady state ever had.)
     pub(crate) fn pause_restored_loops_for_solo_boot(&self) -> Vec<(String, SessionKey)> {
         let mut state = self.state();
         let state = &mut *state;
@@ -638,6 +654,42 @@ impl InProcessAgentOrchestrator {
             loop_record.updated_at_ms = now;
             persist_loop_state_with_store(supervisor_store, loop_record);
             paused.push((loop_record.loop_id.clone(), loop_record.session_id.clone()));
+        }
+        let parked: std::collections::HashSet<&str> =
+            paused.iter().map(|(loop_id, _)| loop_id.as_str()).collect();
+        let orphaned_fires: Vec<_> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                item.reason == MasterContinuationReason::LoopFire
+                    && item
+                        .loop_id
+                        .as_ref()
+                        .is_some_and(|loop_id| parked.contains(loop_id.as_str()))
+            })
+            .map(|item| {
+                (
+                    item.group_id.clone(),
+                    item.dedupe_key.clone(),
+                    item.loop_id.clone(),
+                )
+            })
+            .collect();
+        for (group_id, dedupe_key, loop_id) in orphaned_fires {
+            state.continuations.cancel(&dedupe_key);
+            if let Some(store) = supervisor_store {
+                let _ = store.record_continuation_completed(
+                    group_id.as_str(),
+                    dedupe_key.as_str(),
+                    now_ms_u64(),
+                    Some("discarded:solo_boot_parked_loop".into()),
+                );
+            }
+            tracing::info!(
+                loop_id = ?loop_id.as_ref().map(|id| id.as_str()),
+                dedupe_key = %dedupe_key.as_str(),
+                "solo boot: retired queued loop fire alongside its parked loop"
+            );
         }
         paused
     }
@@ -1219,8 +1271,84 @@ impl InProcessAgentOrchestrator {
         max_items: usize,
     ) -> Vec<QueuedMasterContinuation> {
         let mut state = self.state();
+        Self::drain_ready_continuations_locked(
+            &mut state,
+            session_id,
+            profile_id,
+            runtime_state,
+            max_items,
+        )
+    }
+
+    /// Atomic drain-and-claim for the cross-subsystem occupancy race (#1529).
+    /// Runs the enqueue + pop AND the in-flight claim under a SINGLE state
+    /// lock, returning the drained continuations plus a clearing guard when
+    /// anything was drained. This is the only way to claim without a race
+    /// window: setting the marker BEFORE the drain self-suppresses the
+    /// session's own due-goal enqueue (which skips in-flight sessions);
+    /// setting it AFTER the drain releases the lock in between, letting a
+    /// concurrent AppUI tick re-enqueue and spawn a duplicate turn for the
+    /// same due goal (both caught by codex re-review). Because the marker is
+    /// set in the same lock scope as the pop, once this returns a continuation
+    /// no other subsystem can re-enqueue for the session until the guard drops
+    /// at the end of the turn. A session already in-flight drains nothing (its
+    /// enqueue is suppressed) → the caller defers.
+    pub(crate) fn drain_and_claim_ready_continuation_for_session(
+        &'static self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        runtime_state: MasterContinuationRuntimeState,
+        max_items: usize,
+    ) -> (
+        Vec<QueuedMasterContinuation>,
+        Option<GoalDispatchInFlightGuard>,
+    ) {
+        let mut state = self.state();
+        // Defer ENTIRELY if a turn is already in flight for this session —
+        // before draining anything. The enqueue suppression only covers
+        // goal/loop DUE-scans; a pre-queued loop / ChildCompleted / External
+        // continuation would otherwise still be popped here, run concurrently
+        // with the other subsystem's turn, AND its returned guard's drop would
+        // clear that turn's marker (codex re-review). Checking first, under
+        // the same lock, makes the whole claim generation-safe.
+        if state.in_flight_goal_sessions.contains(session_id) {
+            return (Vec::new(), None);
+        }
+        let kept = Self::drain_ready_continuations_locked(
+            &mut state,
+            session_id,
+            profile_id,
+            runtime_state,
+            max_items,
+        );
+        let guard = if kept.is_empty() {
+            None
+        } else {
+            state.in_flight_goal_sessions.insert(session_id.clone());
+            Some(GoalDispatchInFlightGuard {
+                orchestrator: self,
+                session_id: session_id.clone(),
+                disarmed: false,
+            })
+        };
+        (kept, guard)
+    }
+
+    /// Enqueue due continuations for `(session, profile)` and drain up to
+    /// `max_items` schedulable ones — the shared body of
+    /// [`Self::drain_ready_continuations_for_session`] and
+    /// [`Self::drain_and_claim_ready_continuation_for_session`], run under a
+    /// caller-held state lock so the latter can claim the in-flight marker
+    /// atomically with the pop.
+    fn drain_ready_continuations_locked(
+        state: &mut AutonomyRuntimeState,
+        session_id: &SessionKey,
+        profile_id: &str,
+        runtime_state: MasterContinuationRuntimeState,
+        max_items: usize,
+    ) -> Vec<QueuedMasterContinuation> {
         let now = now_ms();
-        enqueue_due_loop_continuations(&mut state, session_id, profile_id, runtime_state, now);
+        enqueue_due_loop_continuations(state, session_id, profile_id, runtime_state, now);
         // #1129 codex P1 follow-up: active goals whose
         // `last_continued_at_ms + GOAL_MIN_CONTINUATION_INTERVAL_MS`
         // is past must also be re-queued here. Previously the only
@@ -1228,7 +1356,7 @@ impl InProcessAgentOrchestrator {
         // (which had just stamped `last_continued_at_ms = now`,
         // tripping the min-delay gate), so an active goal only ran
         // its initial continuation and never recurred.
-        enqueue_due_goal_continuations(&mut state, session_id, profile_id, runtime_state, now);
+        enqueue_due_goal_continuations(state, session_id, profile_id, runtime_state, now);
         // #1150 codex P2 follow-up to #1145: `pending_continuation_is_schedulable`
         // gates which sessions `due_loop_targets` surfaces, but the
         // scheduler's drain pops by `(session_key, profile)` without
@@ -1268,7 +1396,7 @@ impl InProcessAgentOrchestrator {
                 break;
             }
             for item in drained {
-                if pending_continuation_is_schedulable(&state, &item) {
+                if pending_continuation_is_schedulable(&*state, &item) {
                     kept.push(item);
                 } else {
                     // #1159 codex P2 follow-up: only TOMBSTONE drops whose
@@ -1281,7 +1409,7 @@ impl InProcessAgentOrchestrator {
                     // same dedupe_key, and a Completed tombstone would
                     // make `upsert_continuation` silently drop the new
                     // Queued event because Completed outranks Queued.
-                    if stale_drop_should_tombstone(&state, &item)
+                    if stale_drop_should_tombstone(&*state, &item)
                         && let Some(store) = state.supervisor_store.as_ref()
                     {
                         let _ = store.record_continuation_completed(
@@ -1569,6 +1697,16 @@ impl InProcessAgentOrchestrator {
         self.state().in_flight_goal_sessions.remove(session_id);
     }
 
+    /// True when a continuation turn for `session_id` is currently in flight
+    /// (the in-flight marker is set). The due-scan already excludes such
+    /// sessions; this accessor lets a SECOND dispatch surface — the AppUI
+    /// serve tick — also skip a session whose continuation turn is running in
+    /// the session actor, closing the cross-subsystem drain race where both
+    /// spawn a concurrent turn on the same session (#1529).
+    pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
+        self.state().in_flight_goal_sessions.contains(session_id)
+    }
+
     /// #1140 codex P1 re-review #4 — RAII drop-guard for the
     /// in-flight marker. Use this from the AppUI tick path so the
     /// marker is cleared on ANY exit path (cancellation,
@@ -1844,8 +1982,15 @@ impl InProcessAgentOrchestrator {
     /// `session/orchestration` status — `active` is true when any of the three
     /// is non-zero, so the client's job indicator stays live across the
     /// sub-agent-complete → master-re-entry gap.
+    ///
+    /// Only continuations that pass `pending_continuation_is_schedulable`
+    /// count: an unschedulable item (e.g. a boot-restored `LoopFire` whose
+    /// owning loop is paused) is skipped by every scheduler drain and can
+    /// never become a turn, so counting it would pin the client's
+    /// "re-entering" indicator on forever with zero actual work.
     pub(crate) fn session_orchestration_counts(&self, session_id: &SessionKey) -> (u32, u32) {
         let state = self.state();
+        let state = &*state;
         let running_agents = state
             .agents
             .values()
@@ -1857,19 +2002,26 @@ impl InProcessAgentOrchestrator {
         let pending_continuations = state
             .continuations
             .pending_items()
-            .filter(|item| item.session_id.as_str() == session_str)
+            .filter(|item| {
+                item.session_id.as_str() == session_str
+                    && pending_continuation_is_schedulable(state, item)
+            })
             .count() as u32;
         (running_agents, pending_continuations)
     }
 
     /// Sessions that currently have active orchestration from the
     /// orchestrator's view: a non-terminal sub-agent OR a queued master
-    /// continuation. The AppUI tick unions this with its in-flight-turn set to
-    /// decide which sessions to emit `session/orchestration` for.
+    /// continuation that the scheduler would actually run (same
+    /// schedulability gate as `session_orchestration_counts` — unschedulable
+    /// zombies must not keep a session's job indicator alive). The AppUI tick
+    /// unions this with its in-flight-turn set to decide which sessions to
+    /// emit `session/orchestration` for.
     pub(crate) fn sessions_with_active_orchestration(
         &self,
     ) -> std::collections::HashSet<SessionKey> {
         let state = self.state();
+        let state = &*state;
         let mut sessions = std::collections::HashSet::new();
         for agent in state.agents.values() {
             if !is_agent_terminal_status(&agent.status) {
@@ -1877,6 +2029,9 @@ impl InProcessAgentOrchestrator {
             }
         }
         for item in state.continuations.pending_items() {
+            if !pending_continuation_is_schedulable(state, item) {
+                continue;
+            }
             sessions.insert(SessionKey(item.session_id.as_str().to_owned()));
         }
         sessions
@@ -2644,6 +2799,28 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             }
             LoopControlKind::Resume => {
                 loop_record.status = "active".into();
+                // Re-arm the schedule if it was cleared. A self-paced /
+                // maintenance loop paused between its due-fire (which sets
+                // `next_run_at_ms = None`, agent_orchestrator ~3046) and the
+                // continuation that would re-stamp it (`apply_self_paced_
+                // response`) is left with `next_run_at_ms = None` — and BOTH
+                // due-scans (`due_loop_targets_with_filter` and
+                // `enqueue_due_loop_continuations`) skip a `None` next-run
+                // forever, so the resumed loop would never fire again.
+                // Re-arm to `now + interval` (or `now`, due immediately, for a
+                // pure self-paced loop with no interval) so resume always
+                // yields a schedulable loop. A still-valid future next-run is
+                // left untouched — resume respects the existing schedule.
+                if loop_record.next_run_at_ms.is_none() {
+                    loop_record.next_run_at_ms = Some(
+                        loop_record
+                            .interval_seconds
+                            .and_then(|seconds| i64::try_from(seconds).ok())
+                            .and_then(|seconds| seconds.checked_mul(1_000))
+                            .and_then(|delay_ms| now.checked_add(delay_ms))
+                            .unwrap_or(now),
+                    );
+                }
                 loop_record.updated_at_ms = now;
                 persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
                 Ok(json!({
@@ -2714,6 +2891,20 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     SystemTime::now(),
                 )
                 .with_loop_id(loop_id.clone())
+                // Identity-only dedupe key SHARED with the scheduled
+                // due-tick enqueue (`enqueue_due_loop_continuations`).
+                // The auto-derived key folds metadata in, and the two
+                // paths' metadata differs (`scheduled_for_ms`,
+                // resolved-vs-record maintenance prompt), so a manual
+                // fire_now racing the tick used to enqueue a SECOND
+                // LoopFire for the same due moment. With the shared
+                // key the later path collapses as a Duplicate while a
+                // fire is pending.
+                .with_dedupe_key(loop_fire_dedupe_key(
+                    "coding-autonomy",
+                    &profile_id,
+                    &loop_id,
+                ))
                 .with_metadata("prompt", resolved_prompt)
                 .with_metadata("prompt_source", prompt_source_label);
                 let outcome = enqueue_and_persist_continuation(&mut state, continuation);
@@ -3070,6 +3261,18 @@ fn enqueue_due_loop_continuations(
             MasterContinuationReason::LoopFire,
             SystemTime::now(),
         )
+        // Identity-only dedupe key SHARED with the manual fire_now
+        // enqueue (`control_loop` FireNow arm) so the two paths racing
+        // over one due moment collapse to ONE pending LoopFire instead
+        // of double-firing. `scheduled_for_ms` stays observability
+        // metadata below — it must NOT split the key, and distinct due
+        // moments still fire because a claimed key leaves
+        // `pending_by_key`.
+        .with_dedupe_key(loop_fire_dedupe_key(
+            "coding-autonomy",
+            &fire.profile_id,
+            &fire.loop_id,
+        ))
         .with_loop_id(fire.loop_id)
         .with_metadata("prompt", fire.prompt)
         .with_metadata("prompt_source", prompt_source_label)
@@ -3822,6 +4025,25 @@ fn enqueue_agent_terminal_continuations(
 /// strangler double-delivery or repeated terminal marks.
 fn child_completed_dedupe_key(group_id: &str, session_id: &str, agent_id: &str) -> String {
     format!("child/{group_id}/{session_id}/{agent_id}")
+}
+
+/// Explicit `LoopFire` dedupe key shared by BOTH enqueue paths — the
+/// manual `control_loop(FireNow)` arm and the scheduled
+/// `enqueue_due_loop_continuations` tick. Keyed ONLY on stable identity
+/// (group + profile + loop_id): the auto-derived `stable_dedupe_key`
+/// folds every metadata pair into the key, and the two paths' metadata
+/// deliberately differs (`scheduled_for_ms` exists only on the tick;
+/// maintenance loops resolve prompt / prompt_source at fire time vs the
+/// legacy "record" label), so a fire_now racing the tick used to MISS
+/// `pending_by_key` and enqueue a SECOND LoopFire — two turns for one
+/// due moment. The identity key makes whichever path lands second
+/// collapse as a Duplicate while a fire is pending-and-unclaimed.
+/// Distinct due moments are unaffected: LoopFire is not `External`, so
+/// a CLAIMED (drained) key leaves `pending_by_key` immediately and the
+/// next due moment re-enqueues freely (see the recently-claimed guard
+/// scoping in `master_continuation_scheduler.rs`).
+fn loop_fire_dedupe_key(group_id: &str, profile_id: &str, loop_id: &str) -> String {
+    format!("loop_fire/{group_id}/{profile_id}/{loop_id}")
 }
 
 fn agent_continuation_group_id(agent: &AutonomyAgentRecord) -> String {
@@ -6400,6 +6622,206 @@ mod tests {
         );
     }
 
+    /// Zombie "Re-entering" indicator, prong (a) — honest counts. A queued
+    /// `LoopFire` whose owning loop is paused fails
+    /// `pending_continuation_is_schedulable`, so every scheduler drain skips
+    /// it: it can never become a turn. If `session_orchestration_counts` /
+    /// `sessions_with_active_orchestration` still count it, the AppUI
+    /// `session/orchestration` tick reports `pending > 0` with no running
+    /// turn forever — a permanent "re-entering" spinner with zero actual
+    /// work. Pin that only schedulable continuations drive the indicator.
+    #[test]
+    fn should_not_count_pending_loop_fire_toward_orchestration_when_owning_loop_paused() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "orch-count-paused-loop");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("poll the build".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: None,
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop_id").to_owned();
+
+        // Queue a fire exactly like the scheduled due-tick enqueue.
+        {
+            let mut state = orchestrator.state();
+            let fire = MasterContinuationRequest::new(
+                "coding-autonomy",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::LoopFire,
+                SystemTime::now(),
+            )
+            .with_dedupe_key(loop_fire_dedupe_key(
+                "coding-autonomy",
+                "tenant-a",
+                &loop_id,
+            ))
+            .with_loop_id(loop_id.clone())
+            .with_metadata("prompt", "poll the build");
+            assert!(
+                enqueue_and_persist_continuation(&mut state, fire)
+                    .queued()
+                    .is_some(),
+                "loop fire must enqueue"
+            );
+        }
+
+        // Sanity: while the loop is active the queued fire is real pending
+        // work and must keep counting.
+        assert_eq!(
+            orchestrator.session_orchestration_counts(&session_id),
+            (0, 1),
+            "an active loop's queued fire must count as pending orchestration",
+        );
+        assert!(
+            orchestrator
+                .sessions_with_active_orchestration()
+                .contains(&session_id),
+            "an active loop's queued fire must keep the session in the active set",
+        );
+
+        // Park the loop (what solo boot does to restored loops; pause/clear
+        // control paths do not cancel queued items). The fire is now
+        // unschedulable and must stop driving the indicator.
+        orchestrator
+            .state()
+            .loops
+            .get_mut(&loop_id)
+            .expect("loop record")
+            .status = "paused".to_owned();
+
+        assert_eq!(
+            orchestrator.session_orchestration_counts(&session_id),
+            (0, 0),
+            "a paused loop's queued fire is unschedulable and must not count",
+        );
+        assert!(
+            !orchestrator
+                .sessions_with_active_orchestration()
+                .contains(&session_id),
+            "an unschedulable fire must not keep the session in the active-orchestration set",
+        );
+    }
+
+    /// Zombie "Re-entering" indicator, prong (b) — no zombie creation. A
+    /// loop fire queued+persisted when the process dies is resurrected by
+    /// `configure_supervisor_store` on the next boot; if that solo boot then
+    /// parks the restored loop as paused, the resurrected fire becomes a
+    /// permanent orphan: unschedulable at every drain, deliberately spared
+    /// by `stale_drop_should_tombstone`, and re-resurrected at every future
+    /// boot. Parking must retire the parked loop's queued fires — out of
+    /// the in-memory queue AND terminal in the supervisor ledger.
+    #[test]
+    fn should_retire_queued_loop_fire_when_solo_boot_parks_restored_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_dir = dir.path().join("supervisor");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "solo-loop-fire-retire");
+        let loop_id;
+        {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            orchestrator
+                .configure_supervisor_store(&store_dir)
+                .expect("store");
+            let created = orchestrator
+                .create_loop(LoopCreateRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    prompt: Some("keep poking".into()),
+                    command: None,
+                    interval_seconds: Some(60),
+                    mode: None,
+                })
+                .expect("create loop");
+            loop_id = created["loop_id"].as_str().expect("loop_id").to_owned();
+            // Queue + persist a due fire exactly like the scheduled tick,
+            // then "crash" with the fire still pending.
+            let mut state = orchestrator.state();
+            let fire = MasterContinuationRequest::new(
+                "coding-autonomy",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::LoopFire,
+                SystemTime::now(),
+            )
+            .with_dedupe_key(loop_fire_dedupe_key(
+                "coding-autonomy",
+                "tenant-a",
+                &loop_id,
+            ))
+            .with_loop_id(loop_id.clone())
+            .with_metadata("prompt", "keep poking");
+            assert!(
+                enqueue_and_persist_continuation(&mut state, fire)
+                    .queued()
+                    .is_some(),
+                "loop fire must enqueue"
+            );
+        }
+
+        // Restart: boot restore resurrects the queued fire, then the solo
+        // boot parks the restored loop.
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay");
+        assert_eq!(
+            restarted.pending_continuation_count_for_test(),
+            1,
+            "boot restore must resurrect the queued fire (precondition)",
+        );
+        let paused = restarted.pause_restored_loops_for_solo_boot();
+        assert_eq!(paused.len(), 1, "the restored active loop must be parked");
+
+        // The parked loop's fire must be retired with it: gone from the
+        // in-memory queue (no zombie this boot)...
+        assert_eq!(
+            restarted.pending_continuation_count_for_test(),
+            0,
+            "parking must retire the parked loop's queued fire from the in-memory queue",
+        );
+        assert_eq!(
+            restarted.session_orchestration_counts(&session_id),
+            (0, 0),
+            "the parked loop's session must report no pending orchestration",
+        );
+
+        // ...terminal in the supervisor ledger...
+        let replayed = SupervisorStore::new(&store_dir)
+            .load_state()
+            .expect("ledger state");
+        let fire_key = loop_fire_dedupe_key("coding-autonomy", "tenant-a", &loop_id);
+        let record = replayed
+            .continuations
+            .values()
+            .find(|record| record.continuation_id == fire_key)
+            .expect("fire's ledger record");
+        assert_eq!(
+            record.status,
+            ContinuationStatus::Completed,
+            "parking must write the terminal continuation record",
+        );
+
+        // ...and never resurrected again (no zombie on any future boot).
+        let third = InProcessAgentOrchestrator::default();
+        third
+            .configure_supervisor_store(&store_dir)
+            .expect("replay 2");
+        assert_eq!(
+            third.pending_continuation_count_for_test(),
+            0,
+            "the next boot must not resurrect the retired fire",
+        );
+        assert!(
+            third.pause_restored_loops_for_solo_boot().is_empty(),
+            "already-paused loops must not be re-parked"
+        );
+    }
+
     #[test]
     fn list_agents_uses_connection_profile_scope_value() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -6595,6 +7017,62 @@ mod tests {
         assert_eq!(
             err.data.expect("error data")["kind"],
             json!(kinds::LOOP_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn resume_rearms_next_run_for_a_loop_interrupted_mid_fire() {
+        // P2 (tri-repo #1529): a self-paced loop paused between its due-fire
+        // (which sets next_run_at_ms = None) and the continuation that would
+        // re-stamp it is left unschedulable — both due-scans skip a None
+        // next-run. Resume must re-arm it.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-resume");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("keep going".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Simulate the interrupted-mid-fire state: next_run cleared, paused.
+        {
+            let mut state = orchestrator.state();
+            let record = state.loops.get_mut(&loop_id).expect("loop record");
+            record.next_run_at_ms = None;
+            record.status = "paused".into();
+        }
+
+        let resumed = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id: loop_id.clone(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::Resume,
+            })
+            .expect("resume");
+        assert_eq!(resumed["status"], json!("active"));
+        assert!(
+            resumed["loop"]["next_run_at_ms"].is_i64(),
+            "resume must re-arm next_run_at_ms so the loop is schedulable again; got {}",
+            resumed["loop"]["next_run_at_ms"]
+        );
+
+        // And the re-armed loop is actually due (now, since it has no interval).
+        let due = orchestrator
+            .state()
+            .loops
+            .get(&loop_id)
+            .unwrap()
+            .next_run_at_ms;
+        assert!(
+            due.is_some_and(|n| n <= now_ms() + 1_000),
+            "re-armed to fire promptly"
         );
     }
 
@@ -8817,6 +9295,155 @@ mod tests {
         );
     }
 
+    /// A manual `loop/fire_now` racing the scheduled due-tick must not
+    /// double-fire the loop. The two enqueue paths historically derived
+    /// DIFFERENT auto keys — the tick folds `scheduled_for_ms` into the
+    /// continuation metadata (and maintenance loops resolve a different
+    /// prompt / prompt_source at fire time) — so `pending_by_key` missed
+    /// and BOTH continuations queued: two LoopFire turns for one due
+    /// moment. Both paths must share one identity-only dedupe key so the
+    /// second enqueue collapses onto the pending fire.
+    #[test]
+    fn fire_now_racing_scheduled_due_tick_collapses_to_one_loop_fire() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-firenow-race");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check build health".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+        orchestrator.force_loop_due_for_test(&loop_id);
+
+        // The scheduled tick claims the due moment first…
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1);
+
+        // …then the racing manual fire_now lands before the queued
+        // continuation is claimed. FireNow skips the schedule gate
+        // (`decide_fire` only applies `next_due` to `ScheduledDue`),
+        // so only the queue's dedupe stands between this and a
+        // second turn for the same due moment.
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                loop_id: loop_id.clone(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("fire_now");
+        assert_eq!(
+            fired["fire"]["duplicate"].as_bool(),
+            Some(true),
+            "fire_now must collapse onto the pending scheduled fire, got: {fired}"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "one due moment must enqueue exactly ONE LoopFire continuation"
+        );
+        // #1138 semantics extend across paths: the deduplicated
+        // fire must not burn the safety budget a second time.
+        assert_eq!(
+            orchestrator
+                .state()
+                .loops
+                .get(&loop_id)
+                .expect("loop record")
+                .fires_used,
+            1,
+            "a deduplicated fire_now must not increment fires_used"
+        );
+    }
+
+    /// Over-dedupe guard for the shared LoopFire key: the identity-only
+    /// key must only collapse enqueues while a fire is PENDING. Once the
+    /// pending continuation is claimed (drained), the key leaves
+    /// `pending_by_key` — LoopFire is not `External`, so no
+    /// recently-claimed guard applies — and the next genuine due
+    /// moment, scheduled or manual, must enqueue a fresh continuation.
+    #[test]
+    fn distinct_due_moments_still_enqueue_distinct_loop_fires() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-distinct-fires");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check build health".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Due moment 1: scheduled tick queues, then the turn claims it.
+        orchestrator.force_loop_due_for_test(&loop_id);
+        assert_eq!(
+            orchestrator.tick_due_loops_for_session(
+                &session_id,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+            ),
+            1
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+
+        // Due moment 2: a manual fire_now after the claim is a genuine
+        // new fire, not a duplicate of the already-claimed one.
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                loop_id: loop_id.clone(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("fire_now");
+        assert_eq!(
+            fired["fire"]["duplicate"].as_bool(),
+            Some(false),
+            "fire_now after the prior fire was claimed must queue fresh, got: {fired}"
+        );
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::LoopFire);
+
+        // Due moment 3: the next scheduled tick also queues fresh.
+        orchestrator.force_loop_due_for_test(&loop_id);
+        assert_eq!(
+            orchestrator.tick_due_loops_for_session(
+                &session_id,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+            ),
+            1,
+            "a later scheduled due moment must enqueue its own continuation"
+        );
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+    }
+
     /// UPCR-2026-021: "`/loop 5m /foo` creates a fixed loop and immediately
     /// fires once", and a self-paced loop needs an INITIAL fire for the
     /// model to select a delay at all. Every freshly created loop must be
@@ -10307,5 +10934,230 @@ mod tests {
             due_after.iter().any(|(s, _)| s == &session_id),
             "after clearing in-flight, goal must be due again (got {due_after:?})",
         );
+    }
+
+    #[test]
+    fn is_goal_dispatch_in_flight_reflects_mark_and_clear() {
+        // P2 (tri-repo #1529): the accessor the AppUI serve tick reads to skip
+        // a session whose continuation turn is already running in the session
+        // actor (which marks in-flight for the turn's duration). Closing the
+        // cross-subsystem drain race relies on this reflecting the marker set
+        // by mark_goal_dispatch_in_flight / the RAII guard.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "in-flight-accessor");
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a session with no in-flight turn must read false"
+        );
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a marked session must read true so the AppUI tick skips it"
+        );
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "clearing the marker must let dispatch resume"
+        );
+    }
+
+    #[test]
+    fn setting_in_flight_before_drain_blocks_the_owner_due_goal_enqueue() {
+        // P1 (tri-repo #1529, codex re-review): `drain_ready_continuations_for
+        // _session` runs `enqueue_due_goal_continuations` internally, which
+        // skips any session already in `in_flight_goal_sessions`. So the
+        // marker must be set AFTER the drain (the actor's own due-goal enqueue
+        // must not be suppressed), not before — claiming before the drain
+        // wedged recurring session-actor goal dispatch. This pins the
+        // interaction: with the marker CLEAR the drain enqueues+returns the
+        // due goal continuation; with it pre-SET the drain returns nothing.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "enqueue-not-blocked");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "recurring goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial set_goal continuation so the session is idle, then
+        // age last_continued_at past the min-delay so the goal is due again.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+
+        // Marker CLEAR: the drain enqueues the due goal continuation and pops it.
+        let with_clear_marker = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            !with_clear_marker.is_empty(),
+            "a due active goal must enqueue+drain a continuation when not in-flight"
+        );
+
+        // Re-age (the drain above stamped last_continued_at) and pre-SET the
+        // marker: now the internal enqueue is suppressed → nothing drains.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        let with_set_marker = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            with_set_marker.is_empty(),
+            "pre-setting the marker suppresses the owner's due-goal enqueue \
+             (which is why the actor reads, not sets, before draining)"
+        );
+    }
+
+    #[test]
+    fn drain_and_claim_sets_marker_atomically_and_defers_when_already_in_flight() {
+        // P1 (tri-repo #1529, codex re-review): the actor drains AND claims the
+        // in-flight marker under ONE state lock. A due goal must (1) enqueue +
+        // drain (the claim does NOT suppress the owner's own enqueue, because
+        // the marker is set AFTER the pop in the same lock) and leave the
+        // marker SET via the returned guard; and (2) when the session is
+        // already in-flight, drain NOTHING and yield NO guard (defer).
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "drain-and-claim");
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "atomic claim goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+
+        // (1) Due + not in-flight: drains a continuation AND claims the marker.
+        let (drained, guard) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(!drained.is_empty(), "a due goal must drain a continuation");
+        assert!(guard.is_some(), "draining must claim the in-flight marker");
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "the marker is set while the guard is held"
+        );
+
+        // (2) While in-flight, a concurrent drain-and-claim yields nothing and
+        // no guard — the second dispatcher defers instead of double-running.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+        let (drained2, guard2) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            drained2.is_empty() && guard2.is_none(),
+            "an already-in-flight session must drain nothing and yield no guard"
+        );
+
+        drop(guard);
+        assert!(!orchestrator.is_goal_dispatch_in_flight(&session_id));
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+    }
+
+    #[test]
+    fn drain_and_claim_does_not_pop_a_pre_queued_continuation_while_in_flight() {
+        // P1 (tri-repo #1529, codex re-review): the enqueue suppression only
+        // covers DUE-scans; a LoopFire (or ChildCompleted / External) already
+        // QUEUED before the session was marked in-flight would still be popped
+        // by the drain, run concurrently with the other subsystem's turn, and
+        // its guard's drop would clear that turn's marker. The atomic
+        // drain-and-claim must DEFER entirely — pop nothing — while a turn is
+        // already in flight, leaving the queued item for the next dispatch.
+        let orchestrator = default_agent_orchestrator();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "pre-queued-defer");
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check health".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+        orchestrator.force_loop_due_for_test(&loop_id);
+        // Queue a LoopFire BEFORE marking in-flight.
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1, "a due loop must queue one LoopFire");
+        let queued_before = orchestrator.pending_continuation_count_for_test();
+        assert!(queued_before >= 1);
+
+        // Now a turn is in flight (e.g. an AppUI goal turn on the same session).
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        let (drained, guard) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            drained.is_empty() && guard.is_none(),
+            "must defer — not pop the pre-queued LoopFire — while in flight"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            queued_before,
+            "the pre-queued LoopFire must remain queued for the next dispatch"
+        );
+
+        // Clearing the marker lets the queued LoopFire drain normally.
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        let (drained_after, guard_after) = orchestrator
+            .drain_and_claim_ready_continuation_for_session(
+                &session_id,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+        assert!(
+            !drained_after.is_empty() && guard_after.is_some(),
+            "after the other turn ends, the queued LoopFire drains and claims"
+        );
+        drop(guard_after);
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
     }
 }

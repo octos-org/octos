@@ -2734,7 +2734,7 @@ pub struct ActorFactory {
     /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
     pub llm_strong: Arc<dyn LlmProvider>,
     pub memory: Arc<EpisodeStore>,
-    pub system_prompt: Arc<std::sync::RwLock<String>>,
+    pub system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     pub hooks: Option<Arc<HookExecutor>>,
     pub hook_context_template: Option<HookContext>,
     /// Data directory for creating per-actor SessionHandle instances.
@@ -2790,6 +2790,11 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    /// Paired with `memory_store`; `memory_refresh_enabled` gates the
+    /// capture-policy text and the per-turn refresh provider.
+    pub memory_inject_tokens: usize,
+    pub memory_refresh_enabled: bool,
     /// Profile id (= tenant id in [`SessionScope::multi_tenant`]). Used
     /// to construct a per-session [`SessionScope`] when spawning gateway
     /// session actors. `None` for the top-level admin factory (the
@@ -3348,6 +3353,11 @@ impl ActorFactory {
             session_key.to_string(),
             task_state_path.clone(),
         )
+        // Embed-on-save + recall parity: without the profile's embedder
+        // spawn workers store their episodes vectorless and their
+        // episodic recall silently skips (same contract as the
+        // `agent.with_embedder` wiring below).
+        .with_optional_embedder(self.embedder.clone())
         // M8 Runtime Parity W2.B1: parent → child cache inheritance.
         // Without these the spawned child Agent observes
         // `file_state_cache: None` and `subagent_output_router: None`
@@ -3486,6 +3496,7 @@ impl ActorFactory {
             octos_agent::DelegateTool::new(self.llm.clone(), self.memory.clone(), self.cwd.clone())
                 .with_provider_policy(self.provider_policy.clone())
                 .with_agent_config(self.agent_config.clone())
+                .with_optional_embedder(self.embedder.clone())
                 .with_task_supervisor(supervisor.clone(), session_key.to_string())
                 .with_child_prompt_context_manager_factory(delegate_factory);
         if let Some(ref prompt) = self.worker_prompt {
@@ -3644,14 +3655,25 @@ impl ActorFactory {
         };
         let agent_id = AgentId::new(format!("session-{}", session_key));
         let has_deferred = tools.has_deferred();
-        let mut system_prompt = system_prompt_override.unwrap_or_else(|| {
-            self.system_prompt
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
+        // Pre/post-memory split: the memory segment must keep its
+        // pre-refactor slot (after bootstrap/soul, BEFORE skills/tool
+        // guidance) — see GatewayPromptParts. Per-session tails (slides
+        // availability, deferred-tools teaching) belong to the post half.
+        let (mut system_prompt, mut post_memory_tail) = match system_prompt_override {
+            // An override replaces the whole base prompt; memory still
+            // takes the slot right after it.
+            Some(override_prompt) => (override_prompt, String::new()),
+            None => {
+                let parts = self
+                    .system_prompt
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                (parts.pre_memory, parts.post_memory)
+            }
+        };
         if is_slides && !slides_generation_available {
-            system_prompt.push_str(
+            post_memory_tail.push_str(
                 "\n\n## Slides Generation Availability\n\n\
                  `mofa_slides` is not available on this host. You may still design and edit slide projects, \
                  but you must tell the user that PPTX/image generation is unavailable here. \
@@ -3670,8 +3692,9 @@ impl ActorFactory {
                 }
             }
             let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
-            system_prompt.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
+            post_memory_tail.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
         }
+        let _ = &mut system_prompt;
 
         // M8 fix-first item 8 (gap 2): build a per-actor
         // AgentSummaryGenerator now that the supervisor handle and the
@@ -3733,6 +3756,44 @@ impl ActorFactory {
             .with_subagent_summary_generator(subagent_summary_generator);
         if let Some(scope) = session_scope_arc.clone() {
             agent = agent.with_session_scope(scope);
+        }
+
+        // Memory as a NAMED per-agent prompt segment (chat.rs pattern):
+        // the factory's base prompt String no longer inlines it, so both
+        // gateway channel actors and serve WS/stdio actors read a fresh
+        // block each turn instead of whatever was on disk at
+        // build_system_prompt time (gateway persona tick = 6h; serve
+        // profile bootstrap = forever). This builder is synchronous, so
+        // the segment is not pre-seeded: the provider composes it during
+        // the turn-start refresh, which runs BEFORE the first model call.
+        // The provider is ALWAYS registered — this synchronous builder
+        // cannot pre-seed the segment, so the provider's first turn-start
+        // refresh is what injects memory at all. The refresh-disabled
+        // contract ("no per-turn memory re-read") is honored via snapshot
+        // mode: one render, then silence — parity with the old
+        // inlined-at-build behavior, minus the staleness.
+        if let Some(ref memory_store) = self.memory_store {
+            // RESERVE the named slot before the post tail lands: set_named
+            // on a missing segment APPENDS, so without this the provider's
+            // first refresh would place memory AFTER the tail
+            // (pre → post → memory). Empty segments render as nothing.
+            agent.set_prompt_segment(octos_agent::MEMORY_SEGMENT_NAME, String::new());
+            let provider = octos_agent::MemorySegmentProvider::new(
+                memory_store.clone(),
+                self.memory_inject_tokens,
+                self.memory_refresh_enabled,
+            );
+            let provider = if self.memory_refresh_enabled {
+                provider
+            } else {
+                provider.static_snapshot()
+            };
+            agent.add_prompt_segment_provider(Arc::new(provider));
+        }
+        // Post-memory half (skills, tool prefs, per-session tails) lands
+        // AFTER the named memory segment — the pre-refactor order.
+        if !post_memory_tail.is_empty() {
+            agent.append_system_prompt(&post_memory_tail);
         }
 
         if let Some(ref embedder) = self.embedder {
@@ -3843,6 +3904,7 @@ impl ActorFactory {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -4388,6 +4450,14 @@ struct SessionActor {
     /// cleared at the end. `None` outside command handling — `send_reply`
     /// then falls back to legacy behavior (stamping no thread_id).
     current_command_cmid: Option<String>,
+
+    /// Total tokens (input + output) attributed to the MOST RECENT turn run
+    /// by `process_inbound`. Set on every LLM turn; read by
+    /// `maybe_advance_goal_runtime_after_turn` so a goal continuation's token
+    /// budget is charged the turn's real usage instead of a hardcoded 0
+    /// (which let a goal recur past its token budget). Reset to 0 at the top
+    /// of each turn so a failed/no-response turn charges nothing.
+    last_turn_total_tokens: u64,
 }
 
 impl SessionActor {
@@ -4801,12 +4871,25 @@ impl SessionActor {
             .profile_id()
             .unwrap_or(MAIN_PROFILE_ID)
             .to_owned();
-        let continuations = default_agent_orchestrator().drain_ready_continuations_for_session(
-            &self.session_key,
-            &profile_id,
-            runtime_state,
-            1,
-        );
+        // Cross-subsystem occupancy (#1529): drain AND claim the in-flight
+        // marker under a SINGLE state lock (see
+        // `drain_and_claim_ready_continuation_for_session`). This is the only
+        // race-free ordering — setting the marker before the drain
+        // self-suppresses the actor's own due-goal enqueue; setting it after
+        // the drain opens a window for a concurrent AppUI tick to re-enqueue
+        // and spawn a duplicate turn (both caught by codex re-review). A
+        // session already in-flight (an AppUI goal turn running) drains
+        // nothing and yields no guard, so the actor defers. The guard is held
+        // across the whole turn and clears the marker on ANY exit at the end
+        // of the loop iteration, suppressing the AppUI due-scan/drain until
+        // the turn completes.
+        let (continuations, _in_flight_guard) = default_agent_orchestrator()
+            .drain_and_claim_ready_continuation_for_session(
+                &self.session_key,
+                &profile_id,
+                runtime_state,
+                1,
+            );
         let drained = !continuations.is_empty();
         for continuation in continuations {
             info!(
@@ -4933,13 +5016,11 @@ impl SessionActor {
     /// continuation only when the runtime stays idle AND the per-goal
     /// policy still allows another fire.
     ///
-    /// Token tracking is wired through the goal record's `tokens_used`
-    /// only when the orchestrator-level `record_goal_turn` is called
-    /// with a non-zero `tokens_consumed`. The per-turn LLM token usage
-    /// is currently still attributed via existing audit paths; surfacing
-    /// it into this hook is a deliberate follow-up so the first
-    /// production cut closes the recurrence + budget-state-machine
-    /// bullets cleanly without restructuring `process_inbound`.
+    /// The goal record's `tokens_used` is charged this turn's real token
+    /// usage (`last_turn_total_tokens`, set by `process_inbound` from the LLM
+    /// response's input+output tokens — the same per-turn total the AppUI
+    /// dispatch path attributes). Passing 0 here previously let the token
+    /// budget gate never trip, so a goal recurred past its token budget.
     #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
@@ -4947,8 +5028,14 @@ impl SessionActor {
         goal_turn_start: Instant,
     ) {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
+        let tokens_consumed = self.last_turn_total_tokens;
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(&self.session_key, profile_id, 0, elapsed_seconds);
+        orchestrator.record_goal_turn(
+            &self.session_key,
+            profile_id,
+            tokens_consumed,
+            elapsed_seconds,
+        );
         // Capture the most recent assistant turn's text content to feed
         // the completion-sentinel detector. Reading from the durable
         // session handle keeps the wiring narrow — `process_inbound`
@@ -8770,6 +8857,10 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // Reset per-turn token accounting so a turn that fails / produces no
+        // response charges 0 to the goal budget (set to the real usage below
+        // once the LLM response is in hand).
+        self.last_turn_total_tokens = 0;
         // Consecutive-recovery cap reset
         // (feat/spawn-only-failure-feedback-loop): user-initiated turns
         // break the "recovery chain" — once the user re-engages we no
@@ -9112,6 +9203,11 @@ impl SessionActor {
         if let Ok(Ok(ref cr)) = result {
             self.record_usage_event(cr, client_message_id.as_deref(), None)
                 .await;
+            // Attribute this turn's real token usage so a goal continuation
+            // charges its budget correctly (read by
+            // `maybe_advance_goal_runtime_after_turn`).
+            self.last_turn_total_tokens = u64::from(cr.token_usage.input_tokens)
+                .saturating_add(u64::from(cr.token_usage.output_tokens));
         }
 
         match result {
@@ -11695,6 +11791,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11775,6 +11872,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11852,6 +11950,110 @@ mod tests {
             "internal master-continuation prompt must not leak into chat history: {:?}",
             session.messages
         );
+        drop(tx);
+        handle.abort();
+    }
+
+    /// #1529 P2 — a goal continuation drained by the SESSION ACTOR must
+    /// charge the goal's `tokens_used` the turn's REAL token usage.
+    ///
+    /// End-to-end: an active goal enqueues a `GoalContinue` continuation;
+    /// the actor's periodic tick drains it into `process_inbound`, which
+    /// stamps `last_turn_total_tokens` from the LLM response's
+    /// input+output tokens; the post-turn hook
+    /// (`maybe_advance_goal_runtime_after_turn`) then passes that value to
+    /// `record_goal_turn`. Before the fix the hook passed a hardcoded 0,
+    /// so `tokens_used` never advanced on the CLI/session-actor path and
+    /// the token-budget gate never tripped.
+    ///
+    /// The goal is registered under `MAIN_PROFILE_ID` because the actor's
+    /// drain loop resolves its goal profile as
+    /// `session_key.profile_id().unwrap_or(MAIN_PROFILE_ID)` and the bare
+    /// `cli:{tag}` test key has no profile segment — `record_goal_turn`
+    /// silently no-ops on a profile mismatch.
+    #[cfg(feature = "api")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // `make_response` carries TokenUsage { input: 50, output: 10 } —
+        // the turn's real total is 60 tokens.
+        let provider = Arc::new(DelayedMockProvider::new(
+            "goal-token-test",
+            vec![(Duration::ZERO, make_response("advancing the goal"))],
+        ));
+        let (tx, _out_rx, handle, _session_mgr) =
+            setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
+        let session_id = test_session_key(dir.path());
+
+        let orchestrator = default_agent_orchestrator();
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: MAIN_PROFILE_ID.into(),
+                objective: "keep the build green".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Pre-condition: nothing accounted before the actor runs the turn.
+        let (tokens_before, continuations_before, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_before, 0);
+        assert_eq!(continuations_before, 0);
+
+        // Cross the actor's continuation tick so it drains the queued
+        // GoalContinue into process_inbound (which calls the provider).
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            if provider.call_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert!(
+            provider.call_count.load(Ordering::Relaxed) > 0,
+            "periodic actor tick must drain the queued goal continuation into process_inbound"
+        );
+
+        // The post-turn accountant runs after process_inbound returns, and
+        // the tail of process_inbound does REAL blocking I/O (the session
+        // JSONL append runs on the spawn_blocking pool) that the paused
+        // virtual clock cannot fast-forward. Wait for it in small bounded
+        // REAL-time slices: each slice parks the runtime on the blocking
+        // pool, so the actor's I/O completion (a real wakeup) gets CPU
+        // time. Bounded at 500 x 2ms = 1s real time; typically a couple of
+        // slices suffice.
+        let mut counters = None;
+        for _ in 0..500 {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(2));
+            })
+            .await
+            .unwrap();
+            let current = orchestrator
+                .goal_counters_for_test(&session_id)
+                .expect("goal still exists");
+            if current.1 >= 1 {
+                counters = Some(current);
+                break;
+            }
+        }
+        let (tokens_used, continuations_used, _window) =
+            counters.expect("goal turn must be recorded within the polling window");
+        assert_eq!(
+            continuations_used, 1,
+            "exactly one goal turn should be accounted"
+        );
+        assert_eq!(
+            tokens_used, 60,
+            "goal budget must be charged the turn's real usage \
+             (50 input + 10 output tokens), not a hardcoded 0"
+        );
+
         drop(tx);
         handle.abort();
     }
@@ -11936,6 +12138,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12069,6 +12272,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12198,6 +12402,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12299,6 +12504,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -12399,6 +12605,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -14877,7 +15084,14 @@ mod tests {
             llm_for_compaction: provider.clone(),
             llm_strong: provider.clone(),
             memory,
-            system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            system_prompt: Arc::new(std::sync::RwLock::new(
+                crate::commands::gateway::prompt::GatewayPromptParts {
+                    pre_memory: "default prompt".to_string(),
+                    post_memory: String::new(),
+                },
+            )),
             hooks: None,
             hook_context_template: None,
             data_dir: dir.path().to_path_buf(),
@@ -17823,6 +18037,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
             usage_ledger: None,
             usage_profile_id: "test-profile".to_string(),
         };

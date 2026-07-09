@@ -335,14 +335,153 @@ octos gateway
 
 ---
 
+## DingTalk（钉钉）
+
+钉钉支持通过自定义机器人向外发送消息，以及接收 outgoing-robot 回调。
+
+```bash
+export DINGTALK_BOT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
+export DINGTALK_BOT_SECRET="SEC..."
+```
+
+```json
+{
+  "type": "dingtalk",
+  "allowed_senders": ["staff-id-1"],
+  "settings": {
+    "webhook_url_env": "DINGTALK_BOT_WEBHOOK",
+    "secret_env": "DINGTALK_BOT_SECRET",
+    "webhook_port": 8650
+  }
+}
+```
+
+入站事件请配置钉钉 outgoing 机器人的回调 URL。在 `octos serve` 之后使用代理路由；在独立的 `octos gateway` 模式下，则指向该渠道自带的 webhook 服务器（`webhook_port`）：
+
+```text
+# 在 octos serve 之后（代理）
+https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
+# 独立的 octos gateway
+http://YOUR_OCTOS_HOST:<webhook_port>/dingtalk/webhook
+```
+
+使用 `dingtalk` 特性标志编译：
+
+```bash
+cargo build --release -p octos-cli --features dingtalk
+```
+
+---
+
+## Matrix
+
+Matrix 是一等公民频道，也是本章多处提到的「人工审批」与「管理机器人」功能背后的传输层。由 `matrix` 特性门控。通过 `mode` 设置支持两种模式：
+
+- **`user`**——以普通 Matrix 账户身份通过 Client-Server API 与 `/sync` 登录。可用于任意 homeserver 上的任意账户，无需服务端注册。
+- **`appservice`**——以应用服务（application service）身份注册到你自控的 homeserver（Conduit/conduwuit/Synapse），可为每个用户提供 bot 分身。
+
+当省略 `mode` 时，网关会回退到 **`appservice`**（此时需要 `as_token`/`hs_token`），因此进行普通账户登录时请显式设置 `"mode": "user"`。
+
+### user 模式
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "user",
+    "homeserver": "https://matrix.org",
+    "user_id": "@mybot:matrix.org",
+    "access_token": "syt_...",
+    "device_name": "octos",
+    "rooms": ["!roomid:matrix.org"],
+    "auto_join": "allowlist",
+    "auto_join_allowlist": ["!roomid:matrix.org", "#alias:matrix.org"]
+  }
+}
+```
+
+使用 `access_token`（推荐）登录，或使用 `user_id` + `password`（密码登录两者都必需）。这些凭据以字面 `settings` 值读取——**不会**从环境变量展开。`auto_join`（`off` / `allowlist` / `always`）控制邀请的自动接受；在 `allowlist` 下，`auto_join_allowlist` 列出被接受邀请的**房间 ID / 别名**（或 `*`）——按房间匹配，而非邀请者用户 ID——为空时回退到 `rooms`。
+
+### appservice 模式
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "appservice",
+    "homeserver": "http://localhost:6167",
+    "server_name": "localhost",
+    "as_token": "...",
+    "hs_token": "...",
+    "sender_localpart": "bot",
+    "user_prefix": "bot_"
+  }
+}
+```
+
+使用 `matrix` 特性标志编译。在 **appservice / 管理机器人**房间中，Matrix 会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并处理 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。而普通的 `mode: "user"` 账户渠道本身并不解释这些管理命令；它会把消息文本转发给 agent，但**默认仅在机器人被 @ 提及时**转发（`require_mention` 默认为 `true`——在其 settings 中设置 `"require_mention": false` 可转发每一条消息）。
+
+---
+
+## LINE
+
+入站 webhook + 出站 Messaging API。由 `line` 特性门控。
+
+```bash
+export LINE_CHANNEL_SECRET="..."
+export LINE_CHANNEL_ACCESS_TOKEN="..."
+```
+
+```json
+{
+  "type": "line",
+  "settings": {
+    "channel_secret_env": "LINE_CHANNEL_SECRET",
+    "channel_access_token_env": "LINE_CHANNEL_ACCESS_TOKEN",
+    "webhook_port": 9323,
+    "bot_user_id": "U...",
+    "require_mention": false
+  }
+}
+```
+
+在独立的 `octos gateway` 模式下，LINE 将事件推送到该渠道自带的 webhook 服务器 `http://YOUR_OCTOS_HOST:<webhook_port>/line/webhook`；在 `octos serve` 之后，则改用代理路由 `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`。入站签名针对请求**体**用 channel secret 校验（HMAC-SHA256），因此两种 URL 均可用。使用 `line` 特性标志编译。
+
+---
+
+## Twilio（短信）
+
+通过 Twilio Programmable Messaging webhook 实现双向短信。由 `twilio` 特性门控。
+
+```bash
+export TWILIO_ACCOUNT_SID="AC..."
+export TWILIO_AUTH_TOKEN="..."
+```
+
+```json
+{
+  "type": "twilio",
+  "settings": {
+    "account_sid_env": "TWILIO_ACCOUNT_SID",
+    "auth_token_env": "TWILIO_AUTH_TOKEN",
+    "from_number": "+15551234567",
+    "webhook_port": 9324
+  }
+}
+```
+
+将你的 Twilio 号码的入站 webhook 指向该渠道自带的 webhook 服务器：`http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`。Twilio 的 `X-Twilio-Signature` 会针对完整重建的 URL 校验，而该 URL 由请求的 `Host` 与 `X-Forwarded-Proto` 头构建（scheme 默认为 `http`）。在 HTTPS 反向代理之后，代理必须保留 `/twilio/webhook` 路径，并转发公网主机名与 `X-Forwarded-Proto: https`——否则重建出的 URL 是 `http://…`，签名校验会失败（403）。使用 `twilio` 特性标志编译。
+
+---
+
 ## 会话控制命令
 
 在任何网关频道中，以下命令用于管理对话会话：
 
 | 命令 | 说明 |
 |---------|-------------|
-| `/new` | 创建新会话（从当前对话的最近 10 条消息分叉） |
-| `/new <name>` | 创建命名会话 |
+| `/new` | 清空当前会话（裸 `/new` 会清空历史，等同于 `/clear`） |
+| `/new <name>` | 切换到（或创建）具名会话 |
 | `/s <name>` | 切换到指定名称的会话 |
 | `/s` | 切换到默认会话 |
 | `/sessions` | 列出当前聊天的所有会话 |

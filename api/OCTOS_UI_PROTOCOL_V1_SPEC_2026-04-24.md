@@ -530,7 +530,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
-- `context/compaction_completed`, `context/normalization_reported`
+- `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
 
 ## 7. Command Semantics
 
@@ -1965,6 +1965,26 @@ Required fields: `session_id`, `context_state`, `compaction`. Full field
 set, `UiContextState` shape, and `UiContextCompactionRecord` shape
 documented by
 [UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `context/compaction_started`
+
+Notification that a server-owned context-manager compaction pass is about
+to run. Emitted immediately before the pass with the PRE-compaction
+`context_state` (its `token_estimate` is the "before" size), the `trigger`
+label that the eventual `context/compaction_completed` record repeats, and
+`threshold_tokens` (the context-window-derived limit that tripped the
+pass) so clients can render an honest fullness percentage and an
+in-progress state (spinner/progress bar).
+
+Always followed by `context/compaction_completed` for the same pass.
+Today's serve compaction is synchronous, so both notifications may arrive
+in one delivery batch; clients MUST tolerate a zero-duration window.
+
+Capability gate: `context.lifecycle.v1`.
+
+Required fields: `session_id`, `context_state`, `trigger`,
+`threshold_tokens`. Documented by
+[UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
 
 ### `context/normalization_reported`
 

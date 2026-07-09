@@ -982,6 +982,7 @@ pub async fn session_messages(
                         role: m.role.to_string(),
                         content: m.content.clone(),
                         timestamp: m.timestamp.to_rfc3339(),
+                        media: m.media.clone(),
                         thread_id: m.thread_id.clone(),
                     })
                     .collect();
@@ -1025,6 +1026,11 @@ pub struct MessageInfo {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    /// File attachments stored with this row. Kept additive and omitted when
+    /// empty so legacy clients that only read text continue to see the same
+    /// shape, while reload paths can restore user-uploaded image/video bubbles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
     /// M8.10 PR #1 thread grouping key. Lets the web client render chat
     /// history as `Vec<Thread>` rather than a flat message list. Omitted
     /// from the JSON when `None` so legacy clients that don't read the
@@ -2014,6 +2020,39 @@ pub async fn serve_file(
     .await
 }
 
+/// Read a file's bytes through an `O_NOFOLLOW` open (Unix) so a symlink leaf
+/// swapped in after a path was validated cannot redirect the read. On
+/// non-Unix, re-checks `symlink_metadata` before reading (best-effort, still
+/// racy but matches the platform's capabilities). The blocking I/O runs on a
+/// blocking thread.
+async fn read_file_no_follow(path: std::path::PathBuf) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 async fn serve_file_impl(
     data_dir: &std::path::Path,
     filename: &str,
@@ -2026,7 +2065,14 @@ async fn serve_file_impl(
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
-    let data = match tokio::fs::read(&path).await {
+    // Read through an O_NOFOLLOW open rather than `tokio::fs::read(&path)`:
+    // `resolve_scoped_download_path` canonicalizes + containment-checks the
+    // path, but the final read still races that check — a leaf swapped to a
+    // symlink after resolution (time-of-check) would be followed by a plain
+    // read (time-of-use), serving an off-tenant / out-of-workspace file
+    // (e.g. a symlink to /etc/passwd). O_NOFOLLOW makes the open fail closed
+    // on a symlink leaf.
+    let data = match read_file_no_follow(path.clone()).await {
         Ok(d) => d,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -2114,6 +2160,7 @@ async fn read_profile_session_messages(
                 role: m.role.to_string(),
                 content: m.content.clone(),
                 timestamp: m.timestamp.to_rfc3339(),
+                media: m.media.clone(),
                 thread_id: m.thread_id.clone(),
             })
             .collect();
@@ -3985,6 +4032,42 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn read_file_no_follow_reads_regular_file_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("doc.pdf");
+        std::fs::write(&file, b"%PDF-1.7 body bytes").unwrap();
+        let bytes = read_file_no_follow(file).await.unwrap();
+        assert_eq!(bytes, b"%PDF-1.7 body bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_no_follow_rejects_a_symlink_leaf() {
+        // P2 (tri-repo #1529): a served path whose leaf is a symlink (e.g.
+        // swapped in after resolve_scoped_download_path canonicalized it)
+        // must NOT be followed — O_NOFOLLOW fails the open closed instead of
+        // serving the off-tenant target.
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, "off-tenant secret").unwrap();
+        let link = dir.path().join("served.pdf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_file_no_follow(link).await.unwrap_err();
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the symlink leaf must be rejected at open, not silently followed"
+        );
+        // The target's content must never be returned.
+        assert!(
+            read_file_no_follow(dir.path().join("served.pdf"))
+                .await
+                .is_err()
+        );
+    }
+
     // Legacy `POST /api/chat` REST tests (chat_request_*, chat_response_*)
     // were retired with the handler in the cleanup follow-up to PR #908.
     // Wire-level chat coverage now lives in
@@ -4063,6 +4146,7 @@ mod tests {
             role: "user".into(),
             content: "hello".into(),
             timestamp: "2025-01-01T00:00:00Z".into(),
+            media: Vec::new(),
             thread_id: None,
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -4071,6 +4155,8 @@ mod tests {
         assert_eq!(json["timestamp"], "2025-01-01T00:00:00Z");
         // None thread_id must be omitted so legacy clients keep round-tripping.
         assert!(json.get("thread_id").is_none());
+        // Empty media must be omitted for the same legacy wire-shape reason.
+        assert!(json.get("media").is_none());
     }
 
     #[test]
@@ -4082,6 +4168,7 @@ mod tests {
             role: "assistant".into(),
             content: "answer".into(),
             timestamp: "2026-04-26T00:00:00Z".into(),
+            media: Vec::new(),
             thread_id: Some("thread-cmid-1".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -4292,9 +4379,9 @@ mod tests {
             SessionKey("slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string());
         {
             let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
-            mgr.add_message(&bare_key, octos_core::Message::user("hello"))
-                .await
-                .unwrap();
+            let mut user = octos_core::Message::user("hello");
+            user.media = vec!["uploads/photo.png".to_string()];
+            mgr.add_message(&bare_key, user).await.unwrap();
             // PR F (M8.10 thread-binding): assistant persists require a
             // caller-supplied thread_id.
             let mut assistant = octos_core::Message::assistant("hi back");
@@ -4315,6 +4402,8 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
+        let first = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(first["media"], serde_json::json!(["uploads/photo.png"]));
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi back");
     }

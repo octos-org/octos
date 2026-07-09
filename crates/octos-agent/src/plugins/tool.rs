@@ -19,6 +19,7 @@ use crate::harness_events::{
     OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
     OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context, write_event_to_sink,
 };
+use crate::policy::ApprovalPolicy;
 use crate::progress::ProgressEvent;
 use crate::subprocess_env::{
     EnvAllowlist, sanitize_command_env, sanitize_command_env_strict, should_forward_env_name,
@@ -118,6 +119,21 @@ pub struct PluginTool {
     /// `verified_exe_sha256` must be `Some`). When `false`, the gate is
     /// skipped on unverified plugins to keep the legacy path cheap.
     require_signed: bool,
+    /// yolo GAP #2: runtime approval behavior for the manifest risk gate.
+    /// Threaded from the session's `EffectivePermissions::approval_policy`
+    /// (same as `ShellTool`). Under [`ApprovalPolicy::Never`] a `high`/
+    /// `critical`-risk plugin is DENIED without prompting — parity with
+    /// shell.rs's fail-closed "approval_policy is never" — UNLESS
+    /// `auto_approve_high_risk` is set (a DangerFullAccess / AllowAll
+    /// context, which auto-allows the gate).
+    approval_policy: ApprovalPolicy,
+    /// yolo GAP #2: when `true`, the manifest risk gate auto-allows without
+    /// prompting. Set for a DangerFullAccess / AllowAll ("yolo") context,
+    /// mirroring how the same context swaps `SafePolicy` for `AllowAllPolicy`
+    /// on the shell tools. Takes precedence over `approval_policy` so a
+    /// dangerous session (whose `approval_policy` is `Never`) still runs
+    /// high-risk plugins rather than denying them.
+    auto_approve_high_risk: bool,
 }
 
 impl PluginTool {
@@ -138,7 +154,29 @@ impl PluginTool {
             manifest_sha256: None,
             manifest_path: None,
             require_signed: false,
+            approval_policy: ApprovalPolicy::Ask,
+            auto_approve_high_risk: false,
         }
+    }
+
+    /// yolo GAP #2: set the runtime approval behavior for the manifest risk
+    /// gate. Threaded from the session's
+    /// [`EffectivePermissions::approval_policy`](crate::policy::EffectivePermissions),
+    /// the same way `ShellTool::with_approval_policy` is wired. Under
+    /// [`ApprovalPolicy::Never`] a `high`/`critical`-risk plugin is denied
+    /// without prompting (unless [`Self::with_auto_approve_high_risk`] is set).
+    pub fn with_approval_policy(mut self, approval_policy: ApprovalPolicy) -> Self {
+        self.approval_policy = approval_policy;
+        self
+    }
+
+    /// yolo GAP #2: when `true`, the manifest risk gate auto-allows without
+    /// prompting. Set for a DangerFullAccess / AllowAll ("yolo") context —
+    /// this takes precedence over the `approval_policy` so a dangerous
+    /// session (whose policy is `Never`) still runs high-risk plugins.
+    pub fn with_auto_approve_high_risk(mut self, auto_approve: bool) -> Self {
+        self.auto_approve_high_risk = auto_approve;
+        self
     }
 
     /// Attach the load-time SHA-256 of the verified-exe bytes so the pre-spawn
@@ -194,6 +232,33 @@ impl PluginTool {
     #[cfg(test)]
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// yolo GAP #2 test accessor: the risk-gate approval policy this tool
+    /// carries. Used by the registry wiring test to prove
+    /// `apply_permissions_to_plugin_tools` threaded the session policy.
+    #[cfg(test)]
+    pub(crate) fn approval_policy(&self) -> ApprovalPolicy {
+        self.approval_policy
+    }
+
+    /// yolo GAP #2 test accessor: whether this tool auto-allows the risk gate
+    /// (a DangerFullAccess / AllowAll context).
+    #[cfg(test)]
+    pub(crate) fn auto_approve_high_risk(&self) -> bool {
+        self.auto_approve_high_risk
+    }
+
+    /// The construction-time working directory bound to this tool (`None`
+    /// when unbound). Mirrors the public [`Self::with_work_dir`] setter.
+    ///
+    /// Load-bearing for the chat/session cwd-rebind: a Host-scope ("yolo")
+    /// session omits `session_scope`, so `execute` derives the plugin's
+    /// `current_dir`/`OCTOS_WORK_DIR` from `work_dir` alone — it MUST be
+    /// bound to the resolved `--cwd`, not left `None` (else plugins run in
+    /// the process launch dir). Callers assert this to prove the binding.
+    pub fn work_dir(&self) -> Option<&Path> {
+        self.work_dir.as_deref()
     }
 
     /// S2 plumbing: set the synthesis LLM provider config injected into the
@@ -326,6 +391,37 @@ impl PluginTool {
             manifest_sha256: self.manifest_sha256.clone(),
             manifest_path: self.manifest_path.clone(),
             require_signed: self.require_signed,
+            approval_policy: self.approval_policy,
+            auto_approve_high_risk: self.auto_approve_high_risk,
+        }
+    }
+
+    /// yolo GAP #2: create a copy of this plugin tool carrying the session's
+    /// risk-gate approval context (everything else, including the current
+    /// `work_dir`, is preserved). The registry applies this per session in
+    /// [`ToolRegistry::apply_permissions_to_plugin_tools`] so a `never` /
+    /// DangerFullAccess session's plugin tools honor the same
+    /// `ApprovalPolicy` the shell/coding tools already do.
+    pub fn clone_with_permissions(
+        &self,
+        approval_policy: ApprovalPolicy,
+        auto_approve_high_risk: bool,
+    ) -> Self {
+        Self {
+            plugin_name: self.plugin_name.clone(),
+            tool_def: self.tool_def.clone(),
+            executable: self.executable.clone(),
+            blocked_env: self.blocked_env.clone(),
+            extra_env: self.extra_env.clone(),
+            work_dir: self.work_dir.clone(),
+            timeout: self.timeout,
+            synthesis_config: self.synthesis_config.clone(),
+            verified_exe_sha256: self.verified_exe_sha256.clone(),
+            manifest_sha256: self.manifest_sha256.clone(),
+            manifest_path: self.manifest_path.clone(),
+            require_signed: self.require_signed,
+            approval_policy,
+            auto_approve_high_risk,
         }
     }
 
@@ -1001,24 +1097,46 @@ impl PluginTool {
             }
         }
 
-        // Host workspace metadata is opt-in. It is injected after path rewriting
-        // so it is treated as metadata, not as a file argument to normalize.
+        // Host workspace metadata is opt-in and HOST-OWNED. It is injected
+        // after path rewriting so it is treated as metadata, not as a file
+        // argument to normalize. The host-computed value ALWAYS wins: a
+        // caller-supplied `workspace_root` is overwritten (or stripped when
+        // the host cannot compute one) so a spoofed tool call can't point the
+        // plugin at a workspace outside the session root.
         if self.tool_def.accepts_host_config_key("workspace_root") {
             if let Some(obj) = effective_args.as_object_mut() {
-                if !obj.contains_key("workspace_root") {
-                    if let Some(root) =
-                        self.workspace_root_for_host_injection(effective_scope.as_deref())
-                    {
-                        obj.insert(
-                            "workspace_root".into(),
-                            serde_json::Value::String(root.to_string_lossy().into_owned()),
-                        );
+                let caller_supplied = obj.get("workspace_root").cloned();
+                match self.workspace_root_for_host_injection(effective_scope.as_deref()) {
+                    Some(root) => {
+                        let host_value =
+                            serde_json::Value::String(root.to_string_lossy().into_owned());
+                        if let Some(prev) = caller_supplied.filter(|prev| *prev != host_value) {
+                            tracing::warn!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                caller_workspace_root = %prev,
+                                host_workspace_root = %root.display(),
+                                "overriding caller-supplied workspace_root with host-computed value (host-owned metadata)"
+                            );
+                        }
+                        obj.insert("workspace_root".into(), host_value);
                         tracing::info!(
                             plugin = %self.plugin_name,
                             tool = %self.tool_def.name,
                             workspace_root = %root.display(),
                             "injected workspace_root into plugin args"
                         );
+                    }
+                    None => {
+                        if let Some(prev) = caller_supplied {
+                            obj.remove("workspace_root");
+                            tracing::warn!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                caller_workspace_root = %prev,
+                                "stripping caller-supplied workspace_root; host has no computed value (host-owned metadata)"
+                            );
+                        }
                     }
                 }
             }
@@ -2341,7 +2459,42 @@ impl Tool for PluginTool {
         // so existing skills that don't declare `risk` keep working
         // unchanged.
         let risk_gate = ManifestRiskGate::classify(self.tool_def.risk.as_deref());
-        if risk_gate.requires_approval() {
+        // yolo GAP #2: the manifest risk gate must honor `ApprovalPolicy`,
+        // just like shell.rs's `Decision::Ask` path. Two overrides sit ahead
+        // of the interactive prompt:
+        //   1. A DangerFullAccess / AllowAll ("yolo") context auto-allows —
+        //      parity with the shell tools swapping `SafePolicy` for
+        //      `AllowAllPolicy` under danger. This takes precedence so a
+        //      dangerous session (whose `approval_policy` is `Never`) still
+        //      runs high-risk plugins instead of denying them.
+        //   2. Otherwise `ApprovalPolicy::Never` denies WITHOUT prompting —
+        //      fail-closed parity with shell.rs ("approval_policy is never").
+        // Only when neither override applies (`ApprovalPolicy::Ask`) do we
+        // fall through to the interactive approval round-trip below.
+        if risk_gate.requires_approval() && self.auto_approve_high_risk {
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                tool = %self.tool_def.name,
+                risk = ?self.tool_def.risk,
+                "manifest risk gate auto-allowed (danger full access context)"
+            );
+        } else if risk_gate.requires_approval() && !self.approval_policy.allows_prompt() {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                tool = %self.tool_def.name,
+                risk = ?self.tool_def.risk,
+                "plugin tool requires approval but approval_policy is never — denied"
+            );
+            return Ok(ToolResult {
+                output: format!(
+                    "Plugin tool '{}' requires approval (manifest risk={:?}) but approval_policy is never: denied without prompting.",
+                    self.tool_def.name,
+                    self.tool_def.risk.as_deref().unwrap_or("unspecified")
+                ),
+                success: false,
+                ..Default::default()
+            });
+        } else if risk_gate.requires_approval() {
             let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
             let Some(requester) = requester else {
                 tracing::warn!(
@@ -4198,8 +4351,11 @@ mod tests {
         assert!(prepared.get("workspace_root").is_none());
     }
 
+    /// `workspace_root` is host-owned metadata: when the manifest opts in,
+    /// the host-computed value ALWAYS wins over a caller-supplied one, so a
+    /// spoofed tool call can't point the plugin outside the session root.
     #[test]
-    fn prepare_effective_args_does_not_overwrite_explicit_workspace_root() {
+    fn prepare_effective_args_overwrites_caller_supplied_workspace_root_with_host_value() {
         let workspace = tempfile::tempdir().unwrap();
         let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
         let ctx = ToolContext {
@@ -4222,7 +4378,40 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(prepared["workspace_root"], "/caller/workspace");
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref(),
+            "host-computed workspace_root must override the caller-supplied value"
+        );
+        assert_ne!(prepared["workspace_root"], "/caller/workspace");
+    }
+
+    /// When the manifest opts in but the host cannot compute a workspace
+    /// root (no scope, no work dir), a caller-supplied value is STRIPPED
+    /// rather than preserved — host-owned metadata never passes through
+    /// from the caller.
+    #[test]
+    fn prepare_effective_args_strips_caller_supplied_workspace_root_without_host_value() {
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool
+            .prepare_effective_args(
+                &json!({
+                    "path": "docs/report.md",
+                    "workspace_root": "/caller/workspace"
+                }),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prepared.get("workspace_root").is_none(),
+            "caller-supplied workspace_root must be stripped when the host has no computed value"
+        );
     }
 
     #[test]
@@ -5321,6 +5510,190 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output, "unprompted");
         assert!(last.lock().unwrap().is_none());
+    }
+
+    // ---- risk gate honors ApprovalPolicy (yolo GAP #2) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn should_deny_high_risk_plugin_without_prompt_when_approval_policy_never() {
+        // yolo GAP #2: the manifest risk gate previously ignored
+        // `ApprovalPolicy`, so a `never`/full-access session still got an
+        // approval prompt. Parity with shell.rs's fail-closed
+        // "approval_policy is never": under `Never` (and NOT a dangerous
+        // auto-allow context) a high-risk plugin must be DENIED without ever
+        // issuing an approval request.
+        use crate::policy::ApprovalPolicy;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"should_not_run\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_never", "danger");
+        def.risk = Some("high".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5))
+            .with_approval_policy(ApprovalPolicy::Never);
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute returns Ok with deny message");
+
+        assert!(!result.success, "never policy must fail the high-risk call");
+        assert!(
+            result.output.contains("approval_policy is never"),
+            "deny message should cite the never policy; got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("should_not_run"));
+        assert!(
+            last.lock().unwrap().is_none(),
+            "no approval request may be issued under approval_policy=never"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn should_auto_allow_high_risk_plugin_without_prompt_when_danger_full_access() {
+        // yolo GAP #2: a DangerFullAccess / AllowAll context auto-approves the
+        // risk gate (parity with shell's AllowAllPolicy under danger) — the
+        // plugin runs without a prompt even though its `approval_policy` is
+        // `Never` (which danger implies).
+        use crate::policy::ApprovalPolicy;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\necho '{\"output\":\"ran_under_yolo\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_yolo", "danger");
+        def.risk = Some("critical".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5))
+            .with_approval_policy(ApprovalPolicy::Never)
+            .with_auto_approve_high_risk(true);
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(
+            result.success,
+            "danger full access must auto-allow the risk gate"
+        );
+        assert_eq!(result.output, "ran_under_yolo");
+        assert!(
+            last.lock().unwrap().is_none(),
+            "no approval request may be issued under a danger auto-allow context"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn should_request_approval_for_high_risk_plugin_when_approval_policy_ask() {
+        // Regression pin: the default Ask policy still routes a high-risk
+        // plugin through the interactive approval bridge.
+        use crate::policy::ApprovalPolicy;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\necho '{\"output\":\"ran\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_ask", "danger");
+        def.risk = Some("high".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5))
+            .with_approval_policy(ApprovalPolicy::Ask);
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "ran");
+        assert!(
+            last.lock().unwrap().is_some(),
+            "Ask policy must still request approval for a high-risk plugin"
+        );
+    }
+
+    #[test]
+    fn should_thread_session_approval_context_into_plugin_tools_on_rebind() {
+        // yolo GAP #2 wiring: `apply_permissions_to_plugin_tools` (invoked by
+        // `rebind_cwd_with_permissions`) must replace each plugin tool with a
+        // copy carrying the session's approval context, so a plugin registered
+        // at profile-build time inherits the per-session `ApprovalPolicy`.
+        use crate::policy::{ApprovalPolicy, EffectivePermissions, PermissionProfile, RuntimeMode};
+        use crate::tools::ToolRegistry;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(&script_path, "#!/bin/sh\necho '{}'\n");
+        let mut def = make_tool_def("risky", "risky");
+        def.risk = Some("high".into());
+
+        // A plugin tool starts with the interactive default (Ask, no auto-allow).
+        let mut registry = ToolRegistry::new();
+        registry.register(PluginTool::new("p".into(), def, script_path));
+        {
+            let base = registry.get("risky").expect("plugin registered");
+            let pt = base
+                .as_any()
+                .downcast_ref::<PluginTool>()
+                .expect("is a PluginTool");
+            assert_eq!(pt.approval_policy(), ApprovalPolicy::Ask);
+            assert!(!pt.auto_approve_high_risk());
+        }
+
+        // A `never` workspace session: the risk gate must fail closed.
+        let never =
+            EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
+        registry.apply_permissions_to_plugin_tools(never);
+        {
+            let pt_arc = registry.get("risky").unwrap();
+            let pt = pt_arc.as_any().downcast_ref::<PluginTool>().unwrap();
+            assert_eq!(pt.approval_policy(), ApprovalPolicy::Never);
+            assert!(
+                !pt.auto_approve_high_risk(),
+                "workspace-write never is NOT an auto-allow context"
+            );
+        }
+
+        // A DangerFullAccess ("yolo") session: the risk gate auto-allows.
+        let danger = EffectivePermissions::for_runtime(
+            PermissionProfile::DangerFullAccess,
+            RuntimeMode::Solo,
+        )
+        .expect("solo danger");
+        registry.apply_permissions_to_plugin_tools(danger);
+        {
+            let pt_arc = registry.get("risky").unwrap();
+            let pt = pt_arc.as_any().downcast_ref::<PluginTool>().unwrap();
+            assert!(
+                pt.auto_approve_high_risk(),
+                "DangerFullAccess must set the auto-allow flag on plugin tools"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

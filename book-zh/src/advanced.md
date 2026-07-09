@@ -227,7 +227,22 @@ Octos 通过将工具分为**活跃**和**延迟**两组来管理庞大的工具
 
 ### 事件
 
-四个生命周期事件，每个都有特定的载荷：
+十个生命周期事件。只有三个 **`before_*`** 事件可以拒绝（exit 1）；其余事件均为只读观察（非零退出会被记录，但不会阻断操作）。
+
+| 事件 | 触发时机 | 可拒绝 |
+|-------|---------------|----------|
+| `before_tool_call` | 每次工具执行之前 | ✅ |
+| `after_tool_call` | 每次工具执行之后 | — |
+| `before_llm_call` | 每次 LLM API 调用之前 | ✅ |
+| `after_llm_call` | 每次成功的 LLM 响应之后 | — |
+| `before_spawn_verify` | 派生子 agent 的验证步骤之前 | ✅ |
+| `on_spawn_verify` | 派生子 agent 的验证步骤时 | — |
+| `on_spawn_complete` | 派生（后台）任务完成时 | — |
+| `on_spawn_failure` | 派生任务失败时 | — |
+| `on_turn_end` | 一轮 agent 结束时 | — |
+| `on_resume` | 会话/轮次恢复时（如客户端重连后） | — |
+
+四个核心事件携带最丰富的载荷（如下所示）；spawn/turn/resume 事件携带相关的任务/会话标识符，外加 `event`、`session_id` 和 `profile_id`。
 
 #### `before_tool_call`
 
@@ -326,7 +341,7 @@ Octos 通过将工具分为**活跃**和**延迟**两组来管理庞大的工具
 
 | 字段 | 必填 | 默认值 | 说明 |
 |-------|----------|---------|-------------|
-| `event` | 是 | -- | 四种事件类型之一 |
+| `event` | 是 | -- | 十种事件类型之一（见上文「事件」） |
 | `command` | 是 | -- | argv 数组（不经过 shell 解释） |
 | `timeout_ms` | 否 | 5000 | 超时后终止钩子进程 |
 | `tool_filter` | 否 | 全部 | 仅对这些工具名称触发（仅限工具事件） |
@@ -447,15 +462,15 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 ## 会话管理
 
-### 会话分支
+### 新建与具名会话
 
-发送 `/new` 创建一个分支对话：
+发送裸 `/new`（等同于 `/clear`）会清空当前会话历史，从头开始：
 
 ```
 /new
 ```
 
-这会创建一个新会话，复制当前对话的最近 10 条消息。子会话通过 `parent_key` 引用原始会话。每个分支获得一个由发送者和时间戳组成的唯一键。
+使用 `/new <name>` 切换到——或创建——一个**具名**会话（如 `/new research`）；`/new slides <name>` / `/new site <preset>` 则脚手架生成项目会话。会话按发送者/渠道建键；会话存储还带有一个 `parent_key` 字段，用于内部派生的子会话（如后台 spawn）。
 
 ### 会话持久化
 
@@ -463,7 +478,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 - **存储**：`.octos/sessions/` 中的 JSONL 文件
 - **最大历史**：通过 `gateway.max_history` 配置（默认：50 条消息）
-- **会话分支**：`/new` 创建带有 parent_key 追踪的分支对话
+- **会话**：裸 `/new` 清空当前会话；具名会话按发送者/渠道建键，并带有用于内部派生子会话的 `parent_key` 字段
 
 ### 配置热重载
 
@@ -505,10 +520,23 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 | 命令 | 说明 |
 |---------|-------------|
-| `/new` | 分支对话（创建复制最近 10 条消息的新会话） |
+| `/new [name]` | 裸 `/new` 清空当前会话；`/new <name>` 切换到（或创建）具名会话；`/new slides <name>` / `/new site <preset>` 脚手架生成项目 |
+| `/clear` | 清空当前会话历史 |
+| `/s`、`/switch <name>` | 切换到具名会话 |
+| `/sessions` | 列出本聊天的会话 |
+| `/back`、`/b` | 切换到上一个活跃会话 |
+| `/delete`、`/d` | 删除当前会话 |
 | `/config` | 查看和修改工具配置 |
 | `/queue` | 查看或更改队列模式 |
+| `/thinking` | 查看或设置推理强度（取决于传输通道） |
+| `/router`、`/adaptive` | 查看或更改路由/自适应模式 |
+| `/soul` | 查看或编辑 profile 的 SOUL（人格） |
+| `/skills` | 内联列出/安装/移除技能 |
+| `/status` | 显示会话/运行时状态 |
+| `/help` | 列出当前传输通道可用的命令 |
 | `/exit`、`/quit`、`:q` | 退出聊天（仅 CLI 模式） |
+
+具体命令集因传输通道（CLI、网关渠道、Web、TUI）而异。Matrix 管理房间额外提供定时（`/schedule`、`/schedules`、`/unschedule`）与多机器人（`/createbot`、`/deletebot`、`/listbots`、`/allbots`、`/bothelp`）命令——见[网关与频道](./channels.md)。
 
 ### 聊天中切换提供商
 
@@ -525,7 +553,7 @@ Bot: Current model: deepseek/deepseek-chat
        - anthropic (default: claude-sonnet-4-20250514) [ready]
        - openai (default: gpt-4o) [ready]
        - deepseek (default: deepseek-chat) [ready]
-       - gemini (default: gemini-2.0-flash) [ready]
+       - gemini (default: gemini-2.5-flash) [ready]
        ...
 ```
 
