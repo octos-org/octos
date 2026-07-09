@@ -442,7 +442,7 @@ export LINE_CHANNEL_ACCESS_TOKEN="..."
 }
 ```
 
-LINE pushes events to `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`; inbound signatures are verified with the channel secret (HMAC-SHA256). Build with the `line` feature flag.
+In standalone `octos gateway` mode, LINE pushes events to the channel's own webhook server at `http://YOUR_OCTOS_HOST:<webhook_port>/line/webhook`; behind `octos serve`, use the proxy route `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>` instead. Inbound signatures are verified over the request **body** with the channel secret (HMAC-SHA256), so either URL works. Build with the `line` feature flag.
 
 ---
 

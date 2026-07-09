@@ -520,7 +520,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 | 命令 | 说明 |
 |---------|-------------|
-| `/new [name]` | 新建会话（裸 `/new` 会清空当前会话）；`/new slides <name>` / `/new site <preset>` 脚手架生成项目 |
+| `/new [name]` | 分支出新会话（复制最近 10 条消息，记录 `parent_key`）；`/new slides <name>` / `/new site <preset>` 脚手架生成项目 |
 | `/clear` | 清空当前会话历史 |
 | `/s`、`/switch <name>` | 切换到具名会话 |
 | `/sessions` | 列出本聊天的会话 |

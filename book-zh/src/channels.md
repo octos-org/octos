@@ -442,7 +442,7 @@ export LINE_CHANNEL_ACCESS_TOKEN="..."
 }
 ```
 
-LINE 将事件推送到 `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`；入站签名用 channel secret 校验（HMAC-SHA256）。使用 `line` 特性标志编译。
+在独立的 `octos gateway` 模式下，LINE 将事件推送到该渠道自带的 webhook 服务器 `http://YOUR_OCTOS_HOST:<webhook_port>/line/webhook`；在 `octos serve` 之后，则改用代理路由 `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`。入站签名针对请求**体**用 channel secret 校验（HMAC-SHA256），因此两种 URL 均可用。使用 `line` 特性标志编译。
 
 ---
 

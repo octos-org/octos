@@ -65,13 +65,13 @@ When configured, the agent embeds each episode summary in a fire-and-forget back
 
 **Long-term memory** (`.octos/memory/MEMORY.md`) holds persistent facts and notes that survive across all sessions. Edit this file manually or via the `write_file` tool — it is injected verbatim into the system prompt on every turn.
 
-**Daily notes** (`.octos/memory/YYYY-MM-DD.md`) provide a rolling window of recent activity. The last **7 days** of daily notes are automatically included in the agent's context. These files can be created manually, via the `write_file` tool, or populated automatically by the **memory-refresh pipeline** (below).
+**Daily notes** (`.octos/memory/YYYY-MM-DD.md`) provide a rolling window of recent activity. The last **7 days** of daily notes are automatically included in the agent's context. These files are created manually or via the `write_file` tool — the memory-refresh pipeline below consolidates into `MEMORY.md`, not the daily notes.
 
-Both files can always be edited by hand — the refresh pipeline treats MEMORY.md as authoritative and consolidates into it without clobbering manual edits.
+`MEMORY.md` can always be edited by hand — the refresh pipeline treats it as authoritative and consolidates into it without clobbering manual edits.
 
 ### Automatic Memory Refresh (capture + consolidation)
 
-Octos ships an automatic memory pipeline that reads durable facts out of your conversations and consolidates them into `MEMORY.md` and daily notes — so long-term memory grows without you hand-editing files. It is **on by default**.
+Octos ships an automatic memory pipeline that reads durable facts out of your conversations and consolidates them into `MEMORY.md` — so long-term memory grows without you hand-editing files. It is **on by default**.
 
 **Where it runs.** The background sweep runs only inside the long-running process that owns the profile's refresh lock — `octos serve` or `octos gateway`. Plain `octos chat` never runs background passes (it would contend the lock). The pipeline has three parts:
 
