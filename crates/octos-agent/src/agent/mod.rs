@@ -606,26 +606,14 @@ impl Agent {
         self.profile.clone()
     }
 
-    /// Wire the `activate_tools` tool's back-reference to the shared tool registry.
-    /// Must be called after construction if `ActivateToolsTool` was registered.
-    pub fn wire_activate_tools(&self) {
-        use crate::tools::activate_tools::ActivateToolsTool;
-        if let Some(tool) = self.tools.get("activate_tools") {
-            if let Some(at) = tool.as_any().downcast_ref::<ActivateToolsTool>() {
-                at.set_registry(Arc::downgrade(&self.tools));
-            }
-        }
-    }
-
     /// RFC-1 (issue #1290): wire the `mofa_make` dispatcher + companion
     /// `mofa_describe_content_type` to the shared tool registry. The
     /// dispatcher needs a `Weak<ToolRegistry>` so its `execute` path
     /// can look up the forwarding target by name.
     ///
     /// Idempotent and silent on agents whose registry has no mofa-*
-    /// skills (no dispatcher registered → no-op). Hosts that call
-    /// `wire_activate_tools` after agent construction should call
-    /// this in the same site.
+    /// skills (no dispatcher registered → no-op). Hosts should call
+    /// this after agent construction.
     pub fn wire_mofa_make_dispatcher(&self) {
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&self.tools);
     }
@@ -1223,16 +1211,6 @@ impl Agent {
     /// so we still anchor a fresh registry rather than silently dropping
     /// the request.
     ///
-    /// **Call ordering:** invoke this builder BEFORE
-    /// [`Self::wire_activate_tools`]. `wire_activate_tools` plants a
-    /// `Weak<ToolRegistry>` inside the `ActivateToolsTool` instance; if
-    /// this builder hits the fallback `snapshot_excluding(&[])` branch
-    /// (because the `Arc` was already shared by then), the Weak ref will
-    /// still point at the pre-copy registry and `ActivateToolsTool`
-    /// would observe a stale view. The current `serve.rs`/`session_actor`
-    /// flow calls `wire_activate_tools` strictly later (in
-    /// `session_actor.rs`), so this is fine; future refactors should
-    /// preserve that order or re-wire after copying.
     pub fn with_workspace_root(mut self, cwd: PathBuf) -> Self {
         if let Some(tools) = Arc::get_mut(&mut self.tools) {
             tools.set_workspace_root(cwd);
@@ -1240,8 +1218,7 @@ impl Agent {
             // The Arc is already shared. Fall back to a deep copy so the
             // new workspace_root still wins. ToolRegistry is intentionally
             // not Clone, so use the existing snapshot helper which handles
-            // interior mutex state correctly. See call-ordering note
-            // above re: `wire_activate_tools`.
+            // interior mutex state correctly.
             let mut copy = self.tools.snapshot_excluding(&[]);
             copy.set_workspace_root(cwd);
             self.tools = Arc::new(copy);

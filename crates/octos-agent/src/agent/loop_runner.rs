@@ -941,17 +941,8 @@ impl Agent {
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
-                    // LRU tool management: tick iteration counter and auto-evict idle tools
-                    self.tools.tick();
-                    let evicted = self.tools.auto_evict();
-                    if !evicted.is_empty() {
-                        tracing::info!(
-                            evicted = %evicted.join(", "),
-                            count = evicted.len(),
-                            "auto-evicted idle tools"
-                        );
-                    }
-
+                    // RFC-0 (#1289): LRU tool deferral removed — every enabled
+                    // tool is emitted every turn (full schema).
                     let tools_spec = self.tools.specs();
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
@@ -1786,16 +1777,8 @@ impl Agent {
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
-                // LRU tool management
-                self.tools.tick();
-                let evicted = self.tools.auto_evict();
-                if !evicted.is_empty() {
-                    tracing::info!(
-                        evicted = %evicted.join(", "),
-                        "auto-evicted idle tools in task"
-                    );
-                }
-
+                // RFC-0 (#1289): LRU tool deferral removed — every enabled
+                // tool is emitted every turn (full schema).
                 let tools_spec = self.tools.specs();
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.

@@ -133,7 +133,7 @@ octos memory forget --id ^m4k2abq   # 硬删除某条精确的 MEMORY.md 条目
 - **`save_memory`** — 创建或更新实体页面。智能体被要求先通过 `recall_memory` 读取已有内容，然后合并新信息再保存（避免数据丢失）。
 - **`recall_memory`** — 加载指定实体的完整内容。如果实体不存在，则返回所有可用实体列表。
 
-> **自动延迟：** 当工具总数超过 15 个时，记忆工具会被移入 `group:memory` 延迟组。智能体需先使用 `activate_tools` 启用它们，然后才能保存或回忆知识。
+> **可用性：** 记忆工具（`save_memory`、`recall_memory`）是每轮发送给模型的完整工具集的一部分——无需任何激活步骤。（早期版本曾通过 `activate_tools` 元工具将其延迟加载；该方案已在 RFC-0 中移除。）
 
 ## 文件结构
 

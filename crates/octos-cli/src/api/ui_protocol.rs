@@ -6641,16 +6641,12 @@ fn registered_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<St
     names
 }
 
-/// Names of tools currently in the deferred set (registered but filtered
-/// out of `specs()` for LRU efficiency). These remain recoverable via
-/// `activate_tools`, so the M14 coding tool contract treats them as
-/// available — otherwise core P0 tools like `shell`, `exec_command`, and
-/// `spawn_agent` would be reported as missing whenever a profile carries
-/// enough skill plugins to trip the auto-defer threshold. #970.
-fn deferred_model_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
-    registry
-        .map(|registry| registry.deferred_tool_names())
-        .unwrap_or_default()
+/// RFC-0 (#1289): LRU tool deferral was removed, so no tool is ever deferred.
+/// Retained (returning an empty set) so the coding tool contract's
+/// disabled-vs-deferred bookkeeping keeps compiling; every registered-but-
+/// -not-visible tool is now genuinely disabled (internal-hidden / policy).
+fn deferred_model_tool_names(_registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+    Vec::new()
 }
 
 async fn tool_status_list_result(
@@ -17659,18 +17655,8 @@ async fn run_standalone_turn(
     // `SessionTaskQueryStore` below. Mirrors `session_actor.rs:2671`
     // for the WS path.
     tool_registry.set_session_key(session_id.to_string());
-    // M11-F regression fix REG-1 follow-up round 2 (codex review):
-    // re-register a fresh `ActivateToolsTool` on this per-turn
-    // snapshot so `wire_activate_tools()` below rewires THIS
-    // registry's Weak, not the cached SessionRuntime's. Without this,
-    // the per-turn rebuild would mutate the shared
-    // `Arc<ActivateToolsTool>` (clones share the same Mutex<Weak>)
-    // and the SessionRuntime's cached agent would silently lose its
-    // back-reference once the per-turn registry dropped at end of
-    // turn.
-    if tool_registry.get("activate_tools").is_some() {
-        tool_registry.register(octos_agent::ActivateToolsTool::new());
-    }
+    // RFC-0 (#1289): the `activate_tools` meta-tool was removed — no per-turn
+    // re-registration/rewiring needed.
     // RFC-1 fixup (codex P2): apply the SAME freshness pattern to the
     // `mofa_make` / `mofa_describe_content_type` dispatcher pair.
     // `snapshot_excluding` clones `Arc<dyn Tool>` instances, so the
@@ -17722,15 +17708,14 @@ async fn run_standalone_turn(
     // `mofa_list_styles`, `mofa_site`, `mofa_youtube`, etc. instead of
     // following the prompt's `glob("styles/*.toml")` + `mofa_slides`
     // discipline (see `prompts/slides_default.txt`). Mirror the gateway
-    // pattern byte-for-byte: activate `group:media` so `mofa_slides`
-    // moves out of the deferred set, then retain only `mofa_slides`
-    // among the `mofa_*` skills. Non-`mofa_*` tools (file ops, web,
-    // shell, send_file, contract checks) are untouched.
+    // pattern: retain only `mofa_slides` among the `mofa_*` skills.
+    // Non-`mofa_*` tools (file ops, web, shell, send_file, contract
+    // checks) are untouched. RFC-0 (#1289): no `activate("group:media")`
+    // step — deferral was removed, so all enabled tools are already visible.
     let is_slides_session = session_id
         .topic()
         .is_some_and(|topic| topic.starts_with("slides"));
     if is_slides_session {
-        tool_registry.activate("group:media");
         tool_registry.retain(octos_agent::keep_tool_in_slides_session);
     }
 
@@ -18545,7 +18530,7 @@ async fn run_standalone_turn(
                 spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
         }
         tool_registry.register(spawn_tool);
-        tool_registry.add_base_tools(["spawn", "check_background_tasks", "read_task_output"]);
+        // RFC-0 (#1289): LRU deferral removed — no base-tool pin needed.
 
         // Wire the PARENT `send_file` for the legacy non-contract
         // `files_to_send` path and any explicit agent calls. The
@@ -18622,19 +18607,9 @@ async fn run_standalone_turn(
     let progress_workspace_root = workspace_root
         .clone()
         .or_else(|| tool_registry.workspace_root().map(Path::to_path_buf));
-    // Voice turn: defer all non-essential tools on this per-turn snapshot so
-    // the (usually single) spoken-reply LLM call is not taxed by the full tool
-    // set. The per-turn snapshot is private to this turn, so this never leaks
-    // into other turns / sessions. Deferred tools stay recoverable via
-    // `activate_tools`. Must run BEFORE the `Arc::new` wrap below — `defer`
-    // takes `&mut self`.
-    if voice_turn_hint {
-        let deferred = crate::api::voice_turn::defer_tools_for_voice_turn(&mut tool_registry);
-        tracing::info!(
-            deferred,
-            "voice turn: deferred non-essential tools for a lean prefill"
-        );
-    }
+    // RFC-0 (#1289): LRU tool deferral + the `activate_tools` recovery
+    // meta-tool were removed. Voice turns now carry the full enabled tool set
+    // like every other turn.
     // Wrap the per-turn `ToolRegistry` in an `Arc` here so we retain a
     // handle after `Agent::new_shared` consumes its own clone. The
     // post-terminal drain task (issue #961) inspects
@@ -18810,8 +18785,7 @@ async fn run_standalone_turn(
     // `specs()` but `activate_tools` is unable to reach the registry
     // (its internal `Weak<ToolRegistry>` is empty). Gateway does the
     // equivalent at `session_actor.rs:2500`.
-    request_agent.wire_activate_tools();
-    // RFC-1: wire mofa_make at the same site.
+    // RFC-1: wire mofa_make.
     request_agent.wire_mofa_make_dispatcher();
 
     let agent_session_id = session_id.clone();
@@ -27738,8 +27712,8 @@ ignore = []
             "topic predicate must match the gateway path's \
              `session_key.topic().is_some_and(|t| t.starts_with(\"slides\"))`",
         );
-        // Mirror the production wiring at `run_standalone_turn`.
-        registry.activate("group:media");
+        // Mirror the production wiring at `run_standalone_turn`. RFC-0
+        // (#1289): no `activate("group:media")` — deferral was removed.
         registry.retain(octos_agent::keep_tool_in_slides_session);
 
         // `mofa_slides` survives — it is the canonical slides skill.
@@ -28216,182 +28190,6 @@ ignore = []
         assert_ne!(
             exec_command["status"],
             json!(coding_tool_contract::TOOL_STATUS_MISSING)
-        );
-    }
-
-    #[test]
-    fn lru_deferred_required_tools_are_reported_deferred_not_disabled_by_policy() {
-        // Regression: the live `tool_status_list_result` path computes the
-        // disabled set as `registered ∧ ¬visible`, which subsumes the
-        // LRU-deferred set (deferred tools are registered but filtered out
-        // of `specs()`). The coding tool contract checks `disabled` before
-        // `deferred`, so without excluding the deferred names the canonical
-        // P0 runtime/subagent tools regress to `disabled_by_policy` and the
-        // contract reports `status: incomplete` on a healthy solo session.
-        // Mirror the exact live-path computation here so the call site stays
-        // honest. #970 / M14-E.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
-        // Auto-defer (not context-filter) the canonical runtime + subagent
-        // groups, exactly as the per-session LRU resolver does once a
-        // profile carries enough tools to trip the defer threshold.
-        registry.defer_group("group:runtime");
-        registry.defer_group("group:sessions");
-
-        let deferred = deferred_model_tool_names(Some(&registry));
-        assert!(
-            deferred.iter().any(|name| name == "exec_command"),
-            "test precondition: exec_command must be deferred, got {deferred:?}"
-        );
-
-        let visible = model_visible_tool_names(Some(&registry));
-        let registered = registered_tool_names(Some(&registry));
-        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
-        // Mirror the live path: only deferred tools that survive the effective
-        // policy post-activation are recoverable-deferred. No tool is denied
-        // here, so every deferred tool is recoverable.
-        let recoverable_deferred: Vec<String> = deferred
-            .iter()
-            .filter(|name| registry.is_tool_visible_post_activation(name))
-            .cloned()
-            .collect();
-        let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
-        // This is the production computation under test: disabled must NOT
-        // include deferred-but-recoverable tools.
-        let disabled = registered
-            .iter()
-            .filter(|name| {
-                !visible_set.contains(name.as_str()) && !deferred_set.contains(name.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
-        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
-        let deferred_refs = recoverable_deferred
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let payload = coding_tool_contract::tool_status_list_payload(
-            coding_tool_contract::ToolStatusListContext {
-                available_model_tools: &visible_refs,
-                disabled_model_tools: &disabled_refs,
-                deferred_model_tools: &deferred_refs,
-                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
-            },
-        );
-        let contract = &payload["coding_tool_contract"];
-        assert_eq!(
-            contract["status"],
-            json!("ready"),
-            "LRU-deferred P0 tools must keep the contract ready; missing={:?}",
-            contract["missing_required_tools"]
-        );
-        assert_eq!(contract["missing_required_tools"], json!([]));
-        let required = contract["required_tools"].as_array().expect("required");
-        let exec_command = required
-            .iter()
-            .find(|tool| tool["name"] == json!("exec_command"))
-            .expect("exec_command status");
-        assert_eq!(
-            exec_command["status"],
-            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
-        );
-    }
-
-    #[test]
-    fn deferred_but_policy_denied_required_tool_stays_disabled_by_policy() {
-        // Codex BLOCK (#1419 review): excluding the RAW deferred set from the
-        // disabled set mislabels a tool that is both LRU-deferred AND
-        // policy-denied. Such a tool can never be recovered by `activate_tools`
-        // (`is_tool_visible_post_activation` stays false), so it MUST remain
-        // `disabled_by_policy` and MUST NOT be advertised as a recoverable
-        // `deferred` tool (the PR #865 standard). Mirror the live-path
-        // computation with a required tool that is BOTH deferred and denied,
-        // and pin the classification both at the set level and through the
-        // coding-tool contract payload.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
-        // Defer the canonical runtime + subagent groups (as the per-session LRU
-        // resolver does), then deny one required runtime tool via provider
-        // policy — the deferred + denied combination codex flagged.
-        registry.defer_group("group:runtime");
-        registry.defer_group("group:sessions");
-        let mut policy = octos_agent::ToolPolicy::default();
-        policy.deny.push("exec_command".to_string());
-        registry.set_provider_policy(policy);
-
-        let deferred = deferred_model_tool_names(Some(&registry));
-        assert!(
-            deferred.iter().any(|name| name == "exec_command"),
-            "precondition: exec_command must be deferred, got {deferred:?}"
-        );
-
-        // Production computation under test: only deferred tools that survive
-        // the effective policy post-activation are recoverable-deferred.
-        let recoverable_deferred: Vec<String> = deferred
-            .iter()
-            .filter(|name| registry.is_tool_visible_post_activation(name))
-            .cloned()
-            .collect();
-        assert!(
-            !recoverable_deferred
-                .iter()
-                .any(|name| name == "exec_command"),
-            "denied+deferred exec_command must NOT be recoverable, got {recoverable_deferred:?}"
-        );
-        assert!(
-            !recoverable_deferred.is_empty(),
-            "other allowed+deferred tools must remain recoverable, got {recoverable_deferred:?}"
-        );
-
-        let visible = model_visible_tool_names(Some(&registry));
-        let registered = registered_tool_names(Some(&registry));
-        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
-        let recoverable_set: HashSet<&str> =
-            recoverable_deferred.iter().map(String::as_str).collect();
-        let disabled = registered
-            .iter()
-            .filter(|name| {
-                !visible_set.contains(name.as_str()) && !recoverable_set.contains(name.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            disabled.iter().any(|name| name == "exec_command"),
-            "denied+deferred exec_command must be in the disabled set, got {disabled:?}"
-        );
-
-        // End-to-end through the contract: exec_command must report
-        // disabled_by_policy, NOT deferred (the bug would report it deferred).
-        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
-        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
-        let deferred_refs = recoverable_deferred
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let payload = coding_tool_contract::tool_status_list_payload(
-            coding_tool_contract::ToolStatusListContext {
-                available_model_tools: &visible_refs,
-                disabled_model_tools: &disabled_refs,
-                deferred_model_tools: &deferred_refs,
-                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
-            },
-        );
-        let contract = &payload["coding_tool_contract"];
-        let exec_command = contract["required_tools"]
-            .as_array()
-            .expect("required")
-            .iter()
-            .find(|tool| tool["name"] == json!("exec_command"))
-            .expect("exec_command status");
-        assert_eq!(
-            exec_command["status"],
-            json!(coding_tool_contract::TOOL_STATUS_DISABLED_BY_POLICY),
-            "denied+deferred exec_command must be disabled_by_policy, not deferred"
-        );
-        assert_ne!(
-            exec_command["status"],
-            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
         );
     }
 
