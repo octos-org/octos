@@ -43,6 +43,10 @@ struct ParsedMetricSample {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OperatorSummaryCollection {
     pub running_gateways: usize,
+    /// Profiles surfaced by the process manager in a non-running state
+    /// (configuration errors). Kept out of `running_gateways` and the
+    /// api-port counters so a broken config does not read as a live gateway.
+    pub configuration_error_gateways: usize,
     pub gateways_with_api_port: usize,
     pub gateways_missing_api_port: usize,
     pub scrape_failures: usize,
@@ -86,6 +90,10 @@ pub struct OperatorSummary {
 pub struct OperatorSummarySourceInput {
     pub scope: String,
     pub profile_id: Option<String>,
+    /// Whether the underlying process is actually running. Non-running rows
+    /// (e.g. `ProcessState::ConfigurationError`) are surfaced as their own
+    /// state instead of being counted as running gateways.
+    pub running: bool,
     pub scrape_status: String,
     pub scrape_error: Option<String>,
     pub api_port: Option<u16>,
@@ -135,6 +143,7 @@ where
     let mut combined_samples = Vec::new();
     let mut source_rows = Vec::new();
     let mut running_gateways = 0;
+    let mut configuration_error_gateways = 0;
     let mut gateways_with_api_port = 0;
     let mut gateways_missing_api_port = 0;
     let mut scrape_failures = 0;
@@ -149,14 +158,20 @@ where
         let totals = build_totals(&samples);
 
         if source.scope == "gateway" {
-            running_gateways += 1;
-            if source.api_port.is_some() {
-                gateways_with_api_port += 1;
+            if source.running {
+                running_gateways += 1;
+                if source.api_port.is_some() {
+                    gateways_with_api_port += 1;
+                } else {
+                    gateways_missing_api_port += 1;
+                }
+                if source.scrape_status == "failed" {
+                    scrape_failures += 1;
+                }
             } else {
-                gateways_missing_api_port += 1;
-            }
-            if source.scrape_status == "failed" {
-                scrape_failures += 1;
+                // Configuration-error profiles are surfaced by all_statuses()
+                // without a live process; count them as their own state.
+                configuration_error_gateways += 1;
             }
         }
 
@@ -192,6 +207,7 @@ where
         available,
         collection: OperatorSummaryCollection {
             running_gateways,
+            configuration_error_gateways,
             gateways_with_api_port,
             gateways_missing_api_port,
             scrape_failures,
@@ -213,6 +229,7 @@ where
 fn empty_collection() -> OperatorSummaryCollection {
     OperatorSummaryCollection {
         running_gateways: 0,
+        configuration_error_gateways: 0,
         gateways_with_api_port: 0,
         gateways_missing_api_port: 0,
         scrape_failures: 0,
@@ -1132,6 +1149,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "serve".into(),
                 profile_id: None,
+                running: true,
                 scrape_status: "local".into(),
                 scrape_error: None,
                 api_port: None,
@@ -1143,6 +1161,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "gateway".into(),
                 profile_id: Some("alpha".into()),
+                running: true,
                 scrape_status: "scraped".into(),
                 scrape_error: None,
                 api_port: Some(51001),
@@ -1156,6 +1175,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "gateway".into(),
                 profile_id: Some("beta".into()),
+                running: true,
                 scrape_status: "failed".into(),
                 scrape_error: Some("http 503".into()),
                 api_port: Some(51002),
@@ -1167,6 +1187,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "gateway".into(),
                 profile_id: Some("gamma".into()),
+                running: true,
                 scrape_status: "missing_api_port".into(),
                 scrape_error: None,
                 api_port: None,
@@ -1175,17 +1196,44 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
                 uptime_secs: Some(30),
                 metrics_text: None,
             },
+            // Non-running profile surfaced by all_statuses() with a
+            // configuration error: must NOT count as a running gateway nor as
+            // a running gateway missing its API port.
+            OperatorSummarySourceInput {
+                scope: "gateway".into(),
+                profile_id: Some("delta".into()),
+                running: false,
+                scrape_status: "configuration_error".into(),
+                scrape_error: Some("missing environment variable WISEMODEL_API_KEY".into()),
+                api_port: None,
+                pid: None,
+                started_at: None,
+                uptime_secs: None,
+                metrics_text: None,
+            },
         ]);
 
         assert!(summary.available);
         assert_eq!(summary.collection.running_gateways, 3);
+        assert_eq!(summary.collection.configuration_error_gateways, 1);
         assert_eq!(summary.collection.gateways_with_api_port, 2);
         assert_eq!(summary.collection.gateways_missing_api_port, 1);
         assert_eq!(summary.collection.scrape_failures, 1);
-        assert_eq!(summary.collection.sources_observed, 4);
+        assert_eq!(summary.collection.sources_observed, 5);
         assert_eq!(summary.collection.sources_with_metrics, 2);
-        assert_eq!(summary.collection.sources_without_metrics, 2);
+        assert_eq!(summary.collection.sources_without_metrics, 3);
         assert!(summary.collection.partial);
+
+        let delta = summary
+            .sources
+            .iter()
+            .find(|source| source.profile_id.as_deref() == Some("delta"))
+            .unwrap();
+        assert_eq!(delta.scrape_status, "configuration_error");
+        assert_eq!(
+            delta.scrape_error.as_deref(),
+            Some("missing environment variable WISEMODEL_API_KEY")
+        );
         assert_eq!(summary.totals.get("timeouts"), Some(&2));
         assert_eq!(summary.totals.get("retries"), Some(&3));
 
@@ -1214,6 +1262,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "serve".into(),
                 profile_id: None,
+                running: true,
                 scrape_status: "local".into(),
                 scrape_error: None,
                 api_port: None,
@@ -1225,6 +1274,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "gateway".into(),
                 profile_id: Some("alpha".into()),
+                running: true,
                 scrape_status: "scraped".into(),
                 scrape_error: None,
                 api_port: Some(51001),
@@ -1259,6 +1309,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "serve".into(),
                 profile_id: None,
+                running: true,
                 scrape_status: "local".into(),
                 scrape_error: None,
                 api_port: None,
@@ -1270,6 +1321,7 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
             OperatorSummarySourceInput {
                 scope: "gateway".into(),
                 profile_id: Some("alpha".into()),
+                running: true,
                 scrape_status: "scraped".into(),
                 scrape_error: None,
                 api_port: Some(51001),

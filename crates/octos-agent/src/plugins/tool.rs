@@ -1097,6 +1097,51 @@ impl PluginTool {
             }
         }
 
+        // Host workspace metadata is opt-in and HOST-OWNED. It is injected
+        // after path rewriting so it is treated as metadata, not as a file
+        // argument to normalize. The host-computed value ALWAYS wins: a
+        // caller-supplied `workspace_root` is overwritten (or stripped when
+        // the host cannot compute one) so a spoofed tool call can't point the
+        // plugin at a workspace outside the session root.
+        if self.tool_def.accepts_host_config_key("workspace_root") {
+            if let Some(obj) = effective_args.as_object_mut() {
+                let caller_supplied = obj.get("workspace_root").cloned();
+                match self.workspace_root_for_host_injection(effective_scope.as_deref()) {
+                    Some(root) => {
+                        let host_value =
+                            serde_json::Value::String(root.to_string_lossy().into_owned());
+                        if let Some(prev) = caller_supplied.filter(|prev| *prev != host_value) {
+                            tracing::warn!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                caller_workspace_root = %prev,
+                                host_workspace_root = %root.display(),
+                                "overriding caller-supplied workspace_root with host-computed value (host-owned metadata)"
+                            );
+                        }
+                        obj.insert("workspace_root".into(), host_value);
+                        tracing::info!(
+                            plugin = %self.plugin_name,
+                            tool = %self.tool_def.name,
+                            workspace_root = %root.display(),
+                            "injected workspace_root into plugin args"
+                        );
+                    }
+                    None => {
+                        if let Some(prev) = caller_supplied {
+                            obj.remove("workspace_root");
+                            tracing::warn!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                caller_workspace_root = %prev,
+                                "stripping caller-supplied workspace_root; host has no computed value (host-owned metadata)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // S2 plumbing: inject synthesis_config when the manifest opts in via
         // `x-octos-host-config-keys: ["synthesis_config"]` and the host has a
         // configured `SynthesisConfig`. The plugin still falls back to env if
@@ -1124,6 +1169,20 @@ impl PluginTool {
         }
 
         Ok(effective_args)
+    }
+
+    fn workspace_root_for_host_injection(
+        &self,
+        effective_scope: Option<&SessionScope>,
+    ) -> Option<PathBuf> {
+        if let Some(scope) = effective_scope {
+            return Some(scope.workspace().to_path_buf());
+        }
+        let work_dir = self.work_dir.as_deref()?;
+        if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
+            return work_dir.parent().map(Path::to_path_buf);
+        }
+        Some(work_dir.to_path_buf())
     }
 
     async fn detect_output_file(
@@ -4102,6 +4161,26 @@ mod tests {
         }
     }
 
+    fn notebook_source_def_with_workspace_root_opt_in() -> PluginToolDef {
+        PluginToolDef {
+            name: "source_import".to_string(),
+            description: "Import notebook source".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "workspace_root": {"type": "string"}
+                },
+                "x-octos-host-config-keys": ["workspace_root"]
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
     fn full_synthesis_config() -> SynthesisConfig {
         SynthesisConfig {
             endpoint: "https://api.deepseek.com/v1".to_string(),
@@ -4220,6 +4299,140 @@ mod tests {
         assert!(
             prepared["synthesis_config"].get("endpoint").is_none(),
             "host config must not be merged into caller-supplied synthesis_config",
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_injects_workspace_root_when_opted_in() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ToolContext {
+            session_scope: Some(Arc::new(scope)),
+            ..ToolContext::zero()
+        };
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_work_dir(skill_output);
+
+        let prepared = tool
+            .prepare_effective_args(&json!({"path": "docs/report.md"}), Some(&ctx))
+            .unwrap();
+
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_workspace_root_when_manifest_does_not_opt_in() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ToolContext {
+            session_scope: Some(Arc::new(scope)),
+            ..ToolContext::zero()
+        };
+        let mut def = notebook_source_def_with_workspace_root_opt_in();
+        def.input_schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        });
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+
+        let prepared = tool
+            .prepare_effective_args(&json!({"path": "docs/report.md"}), Some(&ctx))
+            .unwrap();
+
+        assert!(prepared.get("workspace_root").is_none());
+    }
+
+    /// `workspace_root` is host-owned metadata: when the manifest opts in,
+    /// the host-computed value ALWAYS wins over a caller-supplied one, so a
+    /// spoofed tool call can't point the plugin outside the session root.
+    #[test]
+    fn prepare_effective_args_overwrites_caller_supplied_workspace_root_with_host_value() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let ctx = ToolContext {
+            session_scope: Some(Arc::new(scope)),
+            ..ToolContext::zero()
+        };
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool
+            .prepare_effective_args(
+                &json!({
+                    "path": "docs/report.md",
+                    "workspace_root": "/caller/workspace"
+                }),
+                Some(&ctx),
+            )
+            .unwrap();
+
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref(),
+            "host-computed workspace_root must override the caller-supplied value"
+        );
+        assert_ne!(prepared["workspace_root"], "/caller/workspace");
+    }
+
+    /// When the manifest opts in but the host cannot compute a workspace
+    /// root (no scope, no work dir), a caller-supplied value is STRIPPED
+    /// rather than preserved — host-owned metadata never passes through
+    /// from the caller.
+    #[test]
+    fn prepare_effective_args_strips_caller_supplied_workspace_root_without_host_value() {
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool
+            .prepare_effective_args(
+                &json!({
+                    "path": "docs/report.md",
+                    "workspace_root": "/caller/workspace"
+                }),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prepared.get("workspace_root").is_none(),
+            "caller-supplied workspace_root must be stripped when the host has no computed value"
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_infers_workspace_root_from_skill_output_without_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let tool = PluginTool::new(
+            "mofa-notebook-source".into(),
+            notebook_source_def_with_workspace_root_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_work_dir(skill_output);
+
+        let prepared = tool
+            .prepare_effective_args(&json!({"path": "docs/report.md"}), None)
+            .unwrap();
+
+        assert_eq!(
+            prepared["workspace_root"],
+            workspace.path().to_string_lossy().as_ref()
         );
     }
 

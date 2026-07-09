@@ -297,6 +297,36 @@ pub(crate) async fn runtime_status(client: &reqwest::Client) -> OminixRuntimeSta
     runtime_status_with_config(&config, client).await
 }
 
+/// Whether the on-device ASR model is ready in the probed runtime.
+///
+/// ASR is always on-device (there is no cloud ASR route — only TTS has a cloud
+/// option), so the voice pipeline requires this regardless of the chosen TTS
+/// mode. Pure over the probed inputs so it can be unit-tested without a live
+/// runtime.
+pub(crate) fn asr_ready(health_healthy: bool, voice_models: &[OminixVoiceModelStatus]) -> bool {
+    health_healthy
+        && voice_models
+            .iter()
+            .any(|model| model.role == "asr" && model.ready)
+}
+
+/// Whether the on-device TTS model is ready in the probed runtime.
+///
+/// The local TTS leg needs the GPT-SoVITS MODEL itself, not just a
+/// synthesizable voice in the registry: a ready ASR plus a present voice with
+/// a missing TTS model would otherwise report ready and then fail inside
+/// `synthesize_reply`. Pure over the probed inputs so it can be unit-tested
+/// without a live runtime (mirrors [`asr_ready`]).
+pub(crate) fn tts_engine_ready(
+    health_healthy: bool,
+    voice_models: &[OminixVoiceModelStatus],
+) -> bool {
+    health_healthy
+        && voice_models
+            .iter()
+            .any(|model| model.role == "tts" && model.ready)
+}
+
 pub(crate) async fn repair_runtime(
     client: &reqwest::Client,
 ) -> Result<OminixRepairResponse, String> {
@@ -1312,6 +1342,47 @@ mod tests {
     use std::net::TcpListener as StdTcpListener;
     use std::thread;
     use tar::{Builder, Header};
+
+    fn vm(role: &str, ready: bool) -> OminixVoiceModelStatus {
+        OminixVoiceModelStatus {
+            id: format!("{role}-model"),
+            role: role.to_string(),
+            status: if ready { "ready" } else { "not_downloaded" }.to_string(),
+            ready,
+            name: None,
+            size: None,
+        }
+    }
+
+    #[test]
+    fn asr_ready_requires_health_and_a_ready_asr_model() {
+        let models = [vm("asr", true), vm("tts", false)];
+        // TTS not ready is irrelevant to ASR; healthy + asr ready → true.
+        assert!(asr_ready(true, &models));
+        // Unhealthy runtime → not ready even if a model claims ready.
+        assert!(!asr_ready(false, &models));
+        // No ready ASR model → not ready (even if TTS is ready).
+        assert!(!asr_ready(true, &[vm("asr", false), vm("tts", true)]));
+        // No ASR model at all → not ready.
+        assert!(!asr_ready(true, &[vm("tts", true)]));
+    }
+
+    #[test]
+    fn tts_engine_ready_requires_health_and_a_ready_tts_model() {
+        let models = [vm("tts", true), vm("asr", false)];
+        // ASR not ready is irrelevant to the TTS engine; healthy + tts ready → true.
+        assert!(tts_engine_ready(true, &models));
+        // Unhealthy runtime → not ready even if a model claims ready.
+        assert!(!tts_engine_ready(false, &models));
+        // No ready TTS model → not ready (even if ASR is ready) — the
+        // false-positive the readiness probe used to report.
+        assert!(!tts_engine_ready(
+            true,
+            &[vm("tts", false), vm("asr", true)]
+        ));
+        // No TTS model at all → not ready.
+        assert!(!tts_engine_ready(true, &[vm("asr", true)]));
+    }
 
     fn test_config(root: &Path) -> OminixRuntimeConfig {
         let bin_dir = root.join(".local/bin");
