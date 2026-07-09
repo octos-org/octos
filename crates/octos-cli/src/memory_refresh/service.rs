@@ -853,9 +853,13 @@ async fn extract_one_session(
             wrote: false,
         });
     }
-    memory_store
+    let wrote = memory_store
         .write_staging_extraction(Some(&key.0), provider.model_id(), &items)
-        .await?;
+        .await?
+        .is_some();
+    // `None` means the content guard dropped every item — count it like an
+    // empty extraction (wrote: false) but still advance the cursor below:
+    // re-extracting the same poisoned turns would loop forever.
     // Only now is the extraction durable — advancing earlier would let a
     // failed write mark these turns consumed and the retry would skip
     // them forever.
@@ -868,7 +872,7 @@ async fn extract_one_session(
     );
     Ok(ExtractOutcome {
         called_provider: true,
-        wrote: true,
+        wrote,
     })
 }
 
