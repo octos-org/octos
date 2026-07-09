@@ -495,7 +495,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.system_prompt.clone())
+        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -534,6 +534,11 @@ impl SessionRuntime {
                 profile.memory_inject_tokens,
                 true,
             )));
+        }
+        // Post-memory half AFTER the named segment — the pre-refactor
+        // order (memory before skills/tool guidance).
+        if !profile.prompt_parts.post_memory.is_empty() {
+            agent.append_system_prompt(&profile.prompt_parts.post_memory);
         }
 
         // M11-F regression fix REG-3: propagate the profile-scope
@@ -844,6 +849,10 @@ mod tests {
             plugin_hooks: Vec::new(),
             review_config: None,
             human_approval_rules: None,
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: system_prompt.clone(),
+                post_memory: String::new(),
+            },
             system_prompt,
             memory,
             memory_store,
@@ -908,6 +917,44 @@ mod tests {
             prompt.contains("Friday again"),
             "read-refresh must pick up post-bootstrap consolidations: {prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_segment_keeps_pre_skills_slot() {
+        // codex round-3 P2: the memory block must keep its pre-refactor
+        // position — after bootstrap/soul, BEFORE the skills/tool-prefs
+        // half — or persisted user memory gains precedence over guidance
+        // that always followed it.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "A very durable fact. (updated: 2026-07-09) ^mvvvvvv\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "order"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        let memory_pos = prompt
+            .find("A very durable fact")
+            .expect("memory segment present");
+        if let Some(tool_prefs_pos) = prompt.find("## Tool Preferences") {
+            assert!(
+                memory_pos < tool_prefs_pos,
+                "memory must precede the tool-prefs half: mem={memory_pos} prefs={tool_prefs_pos}"
+            );
+        }
+        if let Some(skills_pos) = prompt.find("## Available Skills") {
+            assert!(
+                memory_pos < skills_pos,
+                "memory must precede the skills half: mem={memory_pos} skills={skills_pos}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1472,6 +1519,10 @@ mod tests {
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
             memory_inject_tokens: 2500,
@@ -1530,6 +1581,10 @@ mod tests {
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
             memory_inject_tokens: 2500,
@@ -1616,6 +1671,10 @@ mod tests {
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
             memory_inject_tokens: 2500,

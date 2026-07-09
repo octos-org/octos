@@ -606,8 +606,8 @@ impl ProfileActorFactoryBuilder {
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            system_prompt.post_memory.push_str("\n\n");
+            system_prompt.post_memory.push_str(fragment);
         }
         let mut pipeline_factory = self.pipeline_factory.clone();
         let mut provider_policy = self.provider_policy.clone();
@@ -936,8 +936,8 @@ impl ProfileActorFactoryBuilder {
 
         if !child_plugin_prompt_fragments.is_empty() {
             for fragment in &child_plugin_prompt_fragments {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(fragment);
+                system_prompt.post_memory.push_str("\n\n");
+                system_prompt.post_memory.push_str(fragment);
             }
         }
 

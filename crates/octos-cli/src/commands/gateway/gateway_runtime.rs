@@ -176,7 +176,7 @@ pub(super) struct GatewayRuntime {
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
 
     // Config / hot-reload
-    system_prompt: Arc<std::sync::RwLock<String>>,
+    system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     max_history: Arc<AtomicUsize>,
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
@@ -1169,16 +1169,15 @@ impl GatewayRuntime {
         )
         .await;
 
-        // Append skill prompt fragments
-        let system_prompt = if plugin_result.prompt_fragments.is_empty() {
-            system_prompt
-        } else {
-            let mut prompt = system_prompt;
+        // Append skill prompt fragments (post-memory tail: fragments came
+        // after the memory slot pre-refactor too).
+        let system_prompt = {
+            let mut parts = system_prompt;
             for fragment in &plugin_result.prompt_fragments {
-                prompt.push_str("\n\n");
-                prompt.push_str(fragment);
+                parts.post_memory.push_str("\n\n");
+                parts.post_memory.push_str(fragment);
             }
-            prompt
+            parts
         };
 
         // Shared system prompt for hot-reload (factory reads this at actor spawn time)
@@ -1779,10 +1778,13 @@ impl GatewayRuntime {
                             max_history: new_max,
                         } => {
                             if let Some(prompt) = system_prompt {
-                                *self
-                                    .system_prompt
+                                // A hot-reloaded config prompt replaces the
+                                // PRE-memory half only; the built post half
+                                // (skills/tool prefs) stays.
+                                self.system_prompt
                                     .write()
-                                    .unwrap_or_else(|e| e.into_inner()) = prompt;
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .pre_memory = prompt;
                                 info!(
                                     "System prompt updated via hot-reload (new actors will use it)"
                                 );

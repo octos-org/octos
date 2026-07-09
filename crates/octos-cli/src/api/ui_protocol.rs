@@ -40100,6 +40100,10 @@ ignore = []
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
             memory_inject_tokens: 2500,

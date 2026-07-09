@@ -2734,7 +2734,7 @@ pub struct ActorFactory {
     /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
     pub llm_strong: Arc<dyn LlmProvider>,
     pub memory: Arc<EpisodeStore>,
-    pub system_prompt: Arc<std::sync::RwLock<String>>,
+    pub system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     pub hooks: Option<Arc<HookExecutor>>,
     pub hook_context_template: Option<HookContext>,
     /// Data directory for creating per-actor SessionHandle instances.
@@ -3649,14 +3649,25 @@ impl ActorFactory {
         };
         let agent_id = AgentId::new(format!("session-{}", session_key));
         let has_deferred = tools.has_deferred();
-        let mut system_prompt = system_prompt_override.unwrap_or_else(|| {
-            self.system_prompt
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
+        // Pre/post-memory split: the memory segment must keep its
+        // pre-refactor slot (after bootstrap/soul, BEFORE skills/tool
+        // guidance) — see GatewayPromptParts. Per-session tails (slides
+        // availability, deferred-tools teaching) belong to the post half.
+        let (mut system_prompt, mut post_memory_tail) = match system_prompt_override {
+            // An override replaces the whole base prompt; memory still
+            // takes the slot right after it.
+            Some(override_prompt) => (override_prompt, String::new()),
+            None => {
+                let parts = self
+                    .system_prompt
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                (parts.pre_memory, parts.post_memory)
+            }
+        };
         if is_slides && !slides_generation_available {
-            system_prompt.push_str(
+            post_memory_tail.push_str(
                 "\n\n## Slides Generation Availability\n\n\
                  `mofa_slides` is not available on this host. You may still design and edit slide projects, \
                  but you must tell the user that PPTX/image generation is unavailable here. \
@@ -3675,8 +3686,9 @@ impl ActorFactory {
                 }
             }
             let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
-            system_prompt.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
+            post_memory_tail.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
         }
+        let _ = &mut system_prompt;
 
         // M8 fix-first item 8 (gap 2): build a per-actor
         // AgentSummaryGenerator now that the supervisor handle and the
@@ -3766,6 +3778,11 @@ impl ActorFactory {
                 provider.static_snapshot()
             };
             agent.add_prompt_segment_provider(Arc::new(provider));
+        }
+        // Post-memory half (skills, tool prefs, per-session tails) lands
+        // AFTER the named memory segment — the pre-refactor order.
+        if !post_memory_tail.is_empty() {
+            agent.append_system_prompt(&post_memory_tail);
         }
 
         if let Some(ref embedder) = self.embedder {
@@ -15058,7 +15075,12 @@ mod tests {
             memory,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,
-            system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),
+            system_prompt: Arc::new(std::sync::RwLock::new(
+                crate::commands::gateway::prompt::GatewayPromptParts {
+                    pre_memory: "default prompt".to_string(),
+                    post_memory: String::new(),
+                },
+            )),
             hooks: None,
             hook_context_template: None,
             data_dir: dir.path().to_path_buf(),

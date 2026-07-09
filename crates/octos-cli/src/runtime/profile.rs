@@ -221,6 +221,10 @@ pub struct ProfileRuntime {
     /// the heavy work (memory context, skills summary, bootstrap
     /// files) off the per-request hot path.
     pub system_prompt: String,
+    /// The same prompt split at the memory slot — per-session agents
+    /// compose `pre → [memory segment] → post` to keep the pre-refactor
+    /// precedence (memory before skills/tool guidance).
+    pub prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts,
 
     /// Hook configurations contributed by loaded plugins (skill
     /// manifests can declare `before_tool_call` / `after_tool_call` /
@@ -944,7 +948,7 @@ impl ProfileRuntime {
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let memory_refresh_enabled =
             crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
-        let mut system_prompt = build_system_prompt(
+        let mut prompt_parts = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
             data_dir,
@@ -953,9 +957,11 @@ impl ProfileRuntime {
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            prompt_parts.post_memory.push_str("\n\n");
+            prompt_parts.post_memory.push_str(fragment);
         }
+        let system_prompt = prompt_parts.joined();
+        let prompt_parts_for_runtime = prompt_parts.clone();
 
         // M11-F regression fix REG-3: assemble the lifecycle hook
         // executor once per profile and propagate the `Arc` onto every
@@ -1057,6 +1063,7 @@ impl ProfileRuntime {
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
             system_prompt,
+            prompt_parts: prompt_parts_for_runtime,
             memory_inject_tokens: max_inject_tokens,
             memory_refresh_enabled,
             memory,
