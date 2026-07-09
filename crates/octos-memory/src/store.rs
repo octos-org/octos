@@ -19,8 +19,44 @@ const CWD_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("cwd_i
 /// Table for episode embeddings: key = episode_id, value = bincode-serialized Vec<f32>
 const EMBEDDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
 
-/// Default embedding dimension (OpenAI text-embedding-3-small).
-const DEFAULT_DIMENSION: usize = 1536;
+/// Default embedding dimension (OpenAI text-embedding-3-small). Public:
+/// embedder configuration pins non-1536 models to this value so their
+/// vectors are not dropped by the fixed-dimension episodic index.
+pub const DEFAULT_DIMENSION: usize = 1536;
+
+/// Parse a cwd-index JSON array of episode IDs. On corrupt JSON, salvage any
+/// quoted strings that look like episode IDs instead of silently replacing
+/// the list with an empty one (which would orphan every other episode
+/// indexed under that cwd). Shared by the store, scan, and delete paths so
+/// corruption handling stays consistent.
+fn parse_episode_ids_with_salvage(raw: &str) -> Vec<String> {
+    match serde_json::from_str(raw) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(
+                "failed to parse cwd index JSON ({} bytes): {e}; attempting salvage",
+                raw.len()
+            );
+            let salvaged: Vec<String> = raw
+                .split('"')
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    // Odd indices are inside quotes in valid JSON arrays
+                    if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            warn!(
+                "salvaged {} episode IDs from corrupted index",
+                salvaged.len()
+            );
+            salvaged
+        }
+    }
+}
 
 /// Store for episodes using redb (pure Rust embedded database).
 ///
@@ -252,29 +288,7 @@ impl EpisodeStore {
                 let mut index = write_txn.open_table(CWD_INDEX_TABLE)?;
                 let existing: Vec<String> = index
                     .get(cwd.as_str())?
-                    .map(|v| match serde_json::from_str(v.value()) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            // Don't replace with empty Vec — try to salvage by
-                            // extracting any quoted strings that look like episode IDs.
-                            let raw = v.value();
-                            warn!("failed to parse cwd index JSON ({} bytes): {e}; attempting salvage", raw.len());
-                            let salvaged: Vec<String> = raw
-                                .split('"')
-                                .enumerate()
-                                .filter_map(|(i, s)| {
-                                    // Odd indices are inside quotes in valid JSON arrays
-                                    if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
-                                        Some(s.to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            warn!("salvaged {} episode IDs from corrupted index", salvaged.len());
-                            salvaged
-                        }
-                    })
+                    .map(|v| parse_episode_ids_with_salvage(v.value()))
                     .unwrap_or_default();
 
                 let mut ids = existing;
@@ -442,23 +456,7 @@ impl EpisodeStore {
             // Get episode IDs for this cwd
             let episode_ids: Vec<String> = index_table
                 .get(cwd_str.as_str())?
-                .map(|v| match serde_json::from_str(v.value()) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        let raw = v.value();
-                        warn!("failed to parse episode index JSON ({} bytes): {e}; attempting salvage", raw.len());
-                        raw.split('"')
-                            .enumerate()
-                            .filter_map(|(i, s)| {
-                                if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
-                                    Some(s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    }
-                })
+                .map(|v| parse_episode_ids_with_salvage(v.value()))
                 .unwrap_or_default();
 
             // Tokenize query consistently (#127): split on non-alphanumeric, filter short tokens
@@ -584,11 +582,14 @@ impl EpisodeStore {
                     if let Ok(episode) = serde_json::from_str::<Episode>(old_json.value()) {
                         let cwd = episode.working_dir.to_string_lossy().to_string();
                         let mut cwd_index = write_txn.open_table(CWD_INDEX_TABLE)?;
-                        // Read and drop the immutable borrow before mutating
-                        let existing: Option<Vec<String>> =
-                            cwd_index.get(cwd.as_str())?.map(|ids_json| {
-                                serde_json::from_str(ids_json.value()).unwrap_or_default()
-                            });
+                        // Read and drop the immutable borrow before mutating.
+                        // Salvage on corrupt JSON (parity with `store`):
+                        // defaulting to an empty list here would remove the
+                        // whole cwd entry and orphan every other episode
+                        // indexed under it.
+                        let existing: Option<Vec<String>> = cwd_index
+                            .get(cwd.as_str())?
+                            .map(|ids_json| parse_episode_ids_with_salvage(ids_json.value()));
                         if let Some(mut ids) = existing {
                             ids.retain(|id| id != &ep_id);
                             if ids.is_empty() {
@@ -781,6 +782,76 @@ mod tests {
             summary.into(),
             EpisodeOutcome::Success,
         )
+    }
+
+    #[test]
+    fn parse_episode_ids_salvages_corrupt_json() {
+        // Valid JSON parses normally.
+        assert_eq!(
+            parse_episode_ids_with_salvage(r#"["ep-1","ep-2"]"#),
+            vec!["ep-1".to_string(), "ep-2".to_string()]
+        );
+        // Corrupt JSON (truncated array) salvages the quoted IDs instead of
+        // silently dropping the list — the pre-fix `delete_by_id` behavior
+        // would have emptied the cwd index and orphaned ep-1/ep-2.
+        assert_eq!(
+            parse_episode_ids_with_salvage(r#"["ep-1","ep-2""#),
+            vec!["ep-1".to_string(), "ep-2".to_string()]
+        );
+    }
+
+    /// End-to-end pin for the delete-path salvage: corrupt the on-disk cwd
+    /// index, delete ONE episode, and assert the other episode's ID survives
+    /// in the index. Pre-fix, `delete_by_id` parsed the corrupt JSON with
+    /// `unwrap_or_default()`, saw an empty list, and removed the whole cwd
+    /// entry — orphaning every other episode indexed under that cwd.
+    #[tokio::test]
+    async fn delete_by_id_salvages_corrupt_cwd_index_and_keeps_other_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (id_keep, id_delete);
+        {
+            let store = EpisodeStore::open(dir.path()).await.unwrap();
+            let keeper = make_episode("keeper episode", "/proj");
+            let doomed = make_episode("doomed episode", "/proj");
+            id_keep = keeper.id.clone();
+            id_delete = doomed.id.clone();
+            store.store(keeper).await.unwrap();
+            store.store(doomed).await.unwrap();
+        } // drop the store to release the redb lock
+
+        // Corrupt the cwd index: truncated JSON array (no closing bracket).
+        {
+            let db = Database::create(dir.path().join("episodes.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(CWD_INDEX_TABLE).unwrap();
+                let corrupt = format!("[\"{id_keep}\",\"{id_delete}\"");
+                table.insert("/proj", corrupt.as_str()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        {
+            let store = EpisodeStore::open(dir.path()).await.unwrap();
+            assert!(store.delete_by_id(&id_delete).await.unwrap());
+        }
+
+        // Inspect the index directly: the keeper must have been salvaged.
+        let db = Database::create(dir.path().join("episodes.redb")).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(CWD_INDEX_TABLE).unwrap();
+        let raw = table
+            .get("/proj")
+            .unwrap()
+            .expect("cwd entry must survive when it still lists episodes")
+            .value()
+            .to_string();
+        let ids: Vec<String> = serde_json::from_str(&raw).expect("rewritten index is valid JSON");
+        assert_eq!(
+            ids,
+            vec![id_keep.clone()],
+            "keeper must remain indexed after deleting through a corrupt cwd index"
+        );
     }
 
     #[tokio::test]

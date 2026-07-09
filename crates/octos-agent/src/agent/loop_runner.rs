@@ -17,6 +17,7 @@ use super::loop_compaction::{prepare_conversation_messages, prepare_task_message
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState};
+use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
@@ -30,6 +31,51 @@ const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const MAX_TOKENS_CONTINUATION_LIMIT: usize = 2;
 const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the token limit. Continue directly from where you stopped. Do not repeat or summarize what you already wrote.";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
+
+/// Prepended to the user content on a live video-call turn so the model treats
+/// the attached image as the user's real-time camera view rather than a file
+/// they uploaded.
+const VIDEO_CALL_NOTE: &str =
+    "[Live video call — the attached image is the user's current camera frame.]";
+
+/// Compose the user message content for a turn.
+///
+/// - `is_video_call` (the turn carries both an audio attachment AND an image)
+///   prepends [`VIDEO_CALL_NOTE`] so a real-time camera frame isn't mistaken
+///   for an uploaded file — applied whether or not the spoken turn was
+///   transcribed into non-empty text.
+/// - With empty `user_content` and media present (but not a video call), the
+///   legacy `[User sent an image]` placeholder is kept.
+/// - Any per-turn `prompt_summary` is appended, mirroring the previous
+///   behaviour.
+///
+/// Pure (no task-locals) so it is unit-testable in isolation.
+fn compose_turn_user_content(
+    user_content: &str,
+    has_media: bool,
+    is_video_call: bool,
+    prompt_summary: Option<&str>,
+) -> String {
+    let base_content = if user_content.is_empty() {
+        if is_video_call {
+            VIDEO_CALL_NOTE.to_string()
+        } else if has_media {
+            "[User sent an image]".to_string()
+        } else {
+            String::new()
+        }
+    } else if is_video_call {
+        format!("{VIDEO_CALL_NOTE}\n\n{user_content}")
+    } else {
+        user_content.to_string()
+    };
+
+    match prompt_summary {
+        Some(summary) if base_content.trim().is_empty() => summary.to_string(),
+        Some(summary) => format!("{base_content}\n\n{summary}"),
+        None => base_content,
+    }
+}
 
 /// Audit Gap-8 helper: consult the workspace-contract layer at EndTurn time
 /// and return a human-readable summary of failing validators when the
@@ -433,7 +479,13 @@ impl Agent {
                     iteration,
                     "loop retry: compacting context before retry"
                 );
-                self.maybe_run_turn_compaction(messages, iteration);
+                if let Err(error) = self.maybe_run_turn_compaction(messages, iteration) {
+                    tracing::warn!(
+                        error = %error,
+                        "loop retry: compaction preservation failed; bailing"
+                    );
+                    return LoopErrorAction::Bail;
+                }
                 self.prepare_prompt_with_context_manager(
                     messages,
                     PromptContextPhase::Retry,
@@ -595,6 +647,7 @@ impl Agent {
         if let Some(max) = self.config.chat_max_tokens {
             c.max_tokens = Some(max);
         }
+        c.reasoning_effort = self.config.reasoning_effort;
         c
     }
 
@@ -695,6 +748,12 @@ impl Agent {
                 self.tools.reset_spawn_only_invoked();
                 self.reset_loop_detected_recently();
 
+                // Refresh provider-backed prompt segments (e.g. the memory
+                // block when MEMORY.md changed on disk) before composing.
+                // No-op unless providers are registered; providers keep the
+                // unchanged path to a single stat.
+                self.refresh_prompt_segments().await;
+
                 // Build the system prompt via the shared helper in
                 // execution.rs so conversation + task loops compose the same
                 // prompt. This is where realtime sensor summary gets appended
@@ -713,24 +772,35 @@ impl Agent {
 
                 messages.extend_from_slice(history);
 
-                let base_content = if user_content.is_empty() && !media.is_empty() {
-                    "[User sent an image]".to_string()
-                } else {
-                    user_content.to_string()
-                };
-                let content = if let Some(summary) = TURN_ATTACHMENT_CTX
+                // A turn carrying BOTH an audio attachment (a spoken/voice turn)
+                // and an image is a live video call: the image is the user's
+                // current camera frame, not an uploaded file. Tell the model so
+                // it treats the picture as a real-time view. `had_audio` comes
+                // from the per-turn attachment context (the audio is already
+                // transcribed into `user_content` by this point), and image
+                // detection looks at the outgoing `media`.
+                let has_image = media.iter().any(|p| octos_llm::vision::is_image(p));
+                // Live-video is an EXPLICIT per-turn signal carried on the turn
+                // context (set by the ingress from `inbound.metadata.live_video`),
+                // not inferred from attachments: a spoken note plus an uploaded
+                // image is not a camera frame, and the AppUI voice path strips
+                // the audio attachment before this point — so an `audio && image`
+                // heuristic both mis-fires and misses the real voice+image path.
+                // Only treat the image as a live camera frame when the client said so.
+                let live_video = TURN_ATTACHMENT_CTX
+                    .try_with(|ctx| ctx.live_video)
+                    .ok()
+                    .unwrap_or(false);
+                let summary = TURN_ATTACHMENT_CTX
                     .try_with(|ctx| ctx.prompt_summary.clone())
                     .ok()
-                    .flatten()
-                {
-                    if base_content.trim().is_empty() {
-                        summary
-                    } else {
-                        format!("{base_content}\n\n{summary}")
-                    }
-                } else {
-                    base_content
-                };
+                    .flatten();
+                let content = compose_turn_user_content(
+                    user_content,
+                    !media.is_empty(),
+                    live_video && has_image,
+                    summary.as_deref(),
+                );
 
                 let current_user = Message {
                     role: MessageRole::User,
@@ -788,8 +858,14 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                let mut turn_ledger = self.new_turn_ledger();
 
-                loop {
+                // Labeled so the loop-detector recovery arms below can re-enter
+                // the AGENT loop (skip tool execution for this spiraling
+                // response), not merely the inner `for tc in &response.tool_calls`
+                // loop — an unlabeled `continue` there fell through to
+                // `handle_tool_use` and executed the spiraling tools anyway.
+                'agent_loop: loop {
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -810,6 +886,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                     }
@@ -839,7 +916,7 @@ impl Agent {
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
                     if iteration == 1 {
-                        self.maybe_run_preflight_compaction(&mut messages);
+                        self.maybe_run_preflight_compaction(&mut messages)?;
                     }
                     // Harness M8.5 tier 1: cheap in-place stale/oversized
                     // tool-result pruning. Runs every iteration (including
@@ -852,7 +929,7 @@ impl Agent {
                     // runner sees the final shape of the conversation (after
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
-                    self.maybe_run_turn_compaction(&mut messages, iteration);
+                    self.maybe_run_turn_compaction(&mut messages, iteration)?;
                     self.prepare_prompt_with_context_manager(
                         &mut messages,
                         if iteration == 1 {
@@ -980,9 +1057,23 @@ impl Agent {
 
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
+                            let content = response.content.clone().unwrap_or_default();
+                            if !self
+                                .verifier_allows_termination(
+                                    &mut messages,
+                                    turn_ledger.as_mut(),
+                                    &content,
+                                    iteration,
+                                    &mut turn,
+                                    tracker,
+                                )
+                                .await?
+                            {
+                                continue;
+                            }
                             self.emit_cost_update(turn.total_usage(), &response);
                             return Ok(ConversationResponse {
-                                content: response.content.unwrap_or_default(),
+                                content,
                                 reasoning_content: response.reasoning_content.clone(),
                                 provider_metadata: Some(
                                     self.llm.provider_metadata_for_index(response.provider_index),
@@ -994,6 +1085,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                         StopReason::ToolUse => {
@@ -1057,7 +1149,7 @@ impl Agent {
                                                 warn!(
                                                     "shell spiral fired pre-execution; injected recovery notice into latest shell Tool and continuing for LLM summary"
                                                 );
-                                                continue;
+                                                continue 'agent_loop;
                                             }
                                         }
                                         let terminal_content = if matches!(
@@ -1087,6 +1179,7 @@ impl Agent {
                                             messages: turn_output_log.clone(),
                                             tool_results: tool_structured_metadata.clone(),
                                             synthesized_from_spawn_only: false,
+                                pending_approval: None,
                                         });
                                     }
                                     // Two-stage loop-detector recovery:
@@ -1131,7 +1224,7 @@ impl Agent {
                                             warn!(
                                                 "loop detected — injected synthetic tool results with warning and continuing for ONE more iteration"
                                             );
-                                            continue;
+                                            continue 'agent_loop;
                                         }
                                         Err(_) => {
                                             warn!(
@@ -1148,6 +1241,7 @@ impl Agent {
                                                 messages: turn_output_log.clone(),
                                                 tool_results: tool_structured_metadata.clone(),
                                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                                             });
                                         }
                                     }
@@ -1171,6 +1265,9 @@ impl Agent {
                             // duplicate) — and the content-fallback in the
                             // gate also keys on the original id, so it
                             // misses too. See doc on `handle_tool_use`.
+                            let mut iter_pending_approval: Option<
+                                crate::approval::PendingApprovalDraft,
+                            > = None;
                             let sanitized_response = match self
                                 .handle_tool_use(
                                     &response,
@@ -1184,6 +1281,8 @@ impl Agent {
                                     Some(&mut iter_tool_success),
                                     Some(&mut turn_output_log),
                                     &mut loop_detector,
+                                    turn_ledger.as_mut(),
+                                    Some(&mut iter_pending_approval),
                                 )
                                 .await
                             {
@@ -1200,6 +1299,55 @@ impl Agent {
                                     }
                                 }
                             };
+
+                            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md):
+                            // a tool call matched a human-approval rule —
+                            // suspend the turn. The host (session actor)
+                            // projects the request to the channel, stores
+                            // the pending approval, and resumes via
+                            // `Agent::execute_approved_tool` when an
+                            // authorized human answers.
+                            if let Some(draft) = iter_pending_approval {
+                                self.emit_cost_update(turn.total_usage(), &sanitized_response);
+                                return Ok(ConversationResponse {
+                                    content: String::new(),
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(
+                                            sanitized_response.provider_index,
+                                        ),
+                                    ),
+                                    token_usage: turn.total_usage().clone(),
+                                    files_modified,
+                                    files_to_send,
+                                    streamed,
+                                    messages: turn_output_log.clone(),
+                                    tool_results: tool_structured_metadata.clone(),
+                                    synthesized_from_spawn_only: false,
+                                    pending_approval: Some(draft),
+                                });
+                            }
+
+                            if let Err(e) = self
+                                .maybe_run_verifier_after_tool_batch(
+                                    &mut messages,
+                                    turn_ledger.as_mut(),
+                                    iteration,
+                                    &mut turn,
+                                    tracker,
+                                )
+                                .await
+                            {
+                                match self.handle_loop_error_with_dispatch(
+                                    &e,
+                                    &mut retry_state,
+                                    iteration,
+                                    &mut messages,
+                                ) {
+                                    LoopErrorAction::Retry => continue,
+                                    LoopErrorAction::Bail => return Err(e),
+                                }
+                            }
 
                             let spiral_iteration = turn.iteration();
                             if let Some(outcome) = self.dispatch_shell_retry_recovery(
@@ -1266,6 +1414,7 @@ impl Agent {
                                     messages: turn_output_log.clone(),
                                     tool_results: tool_structured_metadata.clone(),
                                     synthesized_from_spawn_only: false,
+                                pending_approval: None,
                                 });
                             }
 
@@ -1338,6 +1487,23 @@ impl Agent {
                                         "tool invocation errored in spawn_only turn — suppressing synthesized 'Background work started' ack and letting the LLM react to the error"
                                     );
                                 } else {
+                                    let should_gate_spawn_ack = turn_ledger
+                                        .as_ref()
+                                        .is_some_and(TurnLedger::ready_gate_active);
+                                    if should_gate_spawn_ack
+                                        && !self
+                                            .verifier_allows_termination(
+                                                &mut messages,
+                                                turn_ledger.as_mut(),
+                                                "Background work started.",
+                                                iteration,
+                                                &mut turn,
+                                                tracker,
+                                            )
+                                            .await?
+                                    {
+                                        continue;
+                                    }
                                     self.emit_cost_update(turn.total_usage(), &response);
                                     // Post-spawn failure feedback loop
                                     // (feat/spawn-only-failure-feedback-loop):
@@ -1433,6 +1599,7 @@ impl Agent {
                                         // the capability) still see the ack as
                                         // an assistant row — backward-compatible.
                                         synthesized_from_spawn_only: true,
+                                pending_approval: None,
                                     });
                                 }
                             }
@@ -1452,6 +1619,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                         StopReason::ContentFiltered => {
@@ -1476,6 +1644,7 @@ impl Agent {
                                 messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
+                                pending_approval: None,
                             });
                         }
                     }
@@ -1525,6 +1694,7 @@ impl Agent {
             // can run the no-progress soft check on tool results here too.
             // Matches the conversation-loop's window of 12.
             let mut loop_detector = LoopDetector::new(12);
+            let mut turn_ledger = self.new_turn_ledger();
             let config = self.chat_config();
 
             loop {
@@ -1634,6 +1804,20 @@ impl Agent {
                     StopReason::EndTurn | StopReason::StopSequence => {
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
+                        let proposed = final_response.content.clone().unwrap_or_default();
+                        if !self
+                            .verifier_allows_termination(
+                                &mut messages,
+                                turn_ledger.as_mut(),
+                                &proposed,
+                                iteration,
+                                &mut turn,
+                                None,
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
                         if self.config.save_episodes {
                             let summary = final_response.content.clone().unwrap_or_default();
                             let summary_truncated =
@@ -1776,6 +1960,31 @@ impl Agent {
                                 None,
                                 None,
                                 &mut loop_detector,
+                                turn_ledger.as_mut(),
+                                // Background task loop: no resume host —
+                                // rule-matched tools are denied, not
+                                // suspended (see handle_tool_use doc).
+                                None,
+                            )
+                            .await
+                        {
+                            match self.handle_loop_error_with_dispatch(
+                                &e,
+                                &mut retry_state,
+                                iteration,
+                                &mut messages,
+                            ) {
+                                LoopErrorAction::Retry => continue,
+                                LoopErrorAction::Bail => return Err(e),
+                            }
+                        }
+                        if let Err(e) = self
+                            .maybe_run_verifier_after_tool_batch(
+                                &mut messages,
+                                turn_ledger.as_mut(),
+                                iteration,
+                                &mut turn,
+                                None,
                             )
                             .await
                         {
@@ -1938,6 +2147,18 @@ impl Agent {
         // appended to the matching Tool message's content and the
         // conversation continues.
         loop_detector: &mut LoopDetector,
+        turn_ledger: Option<&mut TurnLedger>,
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): out-parameter
+        // for the suspend-and-resume human-approval flow. When a tool call
+        // matches a configured `human_approval_rules` rule:
+        // - `Some(slot)` (conversation loop): the slot receives the pending
+        //   draft, placeholder tool-results are recorded, and NO tool in the
+        //   batch executes — the caller suspends the turn so the host can
+        //   project the request to the channel and resume later.
+        // - `None` (background/task loop): there is no resume host, so the
+        //   matched call is denied with an "approval not available" tool
+        //   result instead of being silently bypassed.
+        pending_approval_out: Option<&mut Option<crate::approval::PendingApprovalDraft>>,
     ) -> Result<ChatResponse> {
         // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
         // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
@@ -1973,6 +2194,122 @@ impl Agent {
         }
         let assistant_msg = self.response_to_message(&response);
         messages.push(assistant_msg.clone());
+
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): human-approval
+        // interception. When any callable tool call in this batch matches a
+        // configured rule, no tool in the batch executes — every call gets a
+        // placeholder tool-result so the LLM history stays consistent, and
+        // the turn suspends with the first matching call's approval draft.
+        // This intentionally deviates from the PR #345 reference (which
+        // executed non-matching peers): not executing anything around a
+        // gated call is simpler and strictly safer.
+        if let Some(rules) = self.config.human_approval_rules.as_ref() {
+            let matched = response
+                .tool_calls
+                .iter()
+                .find(|tc| {
+                    self.tools.get(&tc.name).is_some() && rules.matching_rule(&tc.name).is_some()
+                })
+                .map(|tc| (tc.name.clone(), tc.id.clone(), tc.arguments.clone()));
+            if let Some((matched_name, matched_id, matched_args)) = matched {
+                let has_resume_host = pending_approval_out.is_some();
+                let outcome = rules.draft_for_tool_call(
+                    &matched_name,
+                    &matched_id,
+                    matched_args,
+                    chrono::Utc::now(),
+                );
+                let tool_placeholder = |tc_id: &str, content: String| Message {
+                    role: MessageRole::Tool,
+                    content,
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: Some(tc_id.to_string()),
+                    reasoning_content: None,
+                    client_message_id: None,
+                    thread_id: None,
+                    timestamp: chrono::Utc::now(),
+                };
+                match outcome {
+                    Ok(Some(draft)) => {
+                        let placeholders: Vec<Message> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                let content = if tc.id == matched_id {
+                                    if has_resume_host {
+                                        format!(
+                                            "[APPROVAL REQUESTED] Tool '{}' is waiting for human \
+                                             approval (request {}).",
+                                            tc.name, draft.request.request_id
+                                        )
+                                    } else {
+                                        format!(
+                                            "[APPROVAL REQUIRED] Tool '{}' requires human \
+                                             approval, which is not available in this background \
+                                             context. Do not retry.",
+                                            tc.name
+                                        )
+                                    }
+                                } else {
+                                    format!(
+                                        "[SKIPPED] Tool call suspended: this batch is waiting \
+                                         for human approval of '{matched_name}'."
+                                    )
+                                };
+                                tool_placeholder(&tc.id, content)
+                            })
+                            .collect();
+                        if let Some(log) = turn_output_log {
+                            log.push(assistant_msg);
+                            log.extend(placeholders.iter().cloned());
+                        }
+                        messages.extend(placeholders);
+                        if let Some(slot) = pending_approval_out {
+                            tracing::info!(
+                                tool = %matched_name,
+                                request_id = %draft.request.request_id,
+                                "suspending turn pending human approval"
+                            );
+                            *slot = Some(draft);
+                        } else {
+                            tracing::warn!(
+                                tool = %matched_name,
+                                "human-approval rule matched in a context without a resume \
+                                 host; denying instead of suspending"
+                            );
+                        }
+                        return Ok(response);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        // Rule produced an invalid spec (config validation
+                        // should prevent this). Fail the batch visibly
+                        // without suspending.
+                        let placeholders: Vec<Message> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                tool_placeholder(
+                                    &tc.id,
+                                    format!(
+                                        "[APPROVAL POLICY ERROR] Tool '{matched_name}' matched \
+                                         an invalid approval rule: {err}"
+                                    ),
+                                )
+                            })
+                            .collect();
+                        if let Some(log) = turn_output_log {
+                            log.push(assistant_msg);
+                            log.extend(placeholders.iter().cloned());
+                        }
+                        messages.extend(placeholders);
+                        return Ok(response);
+                    }
+                }
+            }
+        }
+
         let (limited_response, blocked_messages) =
             self.enforce_session_limits_on_tool_calls(&response);
         let tool_batches = split_tool_calls(
@@ -2022,6 +2359,7 @@ impl Agent {
         if let Some(sink) = tool_structured_metadata {
             sink.extend(tool_metadata);
         }
+        let tool_success_for_ledger = tool_success.clone();
         if let Some(sink) = tool_success_by_id {
             sink.extend(tool_success);
         }
@@ -2048,6 +2386,12 @@ impl Agent {
                 .iter()
                 .map(|tc| (tc.id.as_str(), (tc.name.as_str(), &tc.arguments)))
                 .collect();
+            let success_by_id: HashMap<&str, bool> = tool_success_for_ledger
+                .iter()
+                .map(|(id, success)| (id.as_str(), *success))
+                .collect();
+            let stated_intent = response.content.as_deref();
+            let mut turn_ledger = turn_ledger;
             for message in merged.iter_mut() {
                 if message.role != MessageRole::Tool {
                     continue;
@@ -2058,8 +2402,25 @@ impl Agent {
                 let Some(&(name, args)) = id_to_call.get(id) else {
                     continue;
                 };
-                if let Some(hint) = loop_detector.record_result(name, args, &message.content) {
+                let result_before_hint = message.content.clone();
+                let repeating = if let Some(hint) =
+                    loop_detector.record_result(name, args, &result_before_hint)
+                {
                     message.content.push_str(&hint);
+                    true
+                } else {
+                    false
+                };
+                if let Some(ledger) = turn_ledger.as_deref_mut() {
+                    ledger.push_entry(ledger_entry_from_tool_result(
+                        turn.iteration(),
+                        stated_intent,
+                        name,
+                        args,
+                        success_by_id.get(id).copied(),
+                        &result_before_hint,
+                        repeating,
+                    ));
                 }
             }
         }
@@ -2343,9 +2704,22 @@ fn recover_shell_retry(
         .filter(|content| !is_successful_shell_output(content))
         .count();
 
-    shell_results
-        .iter()
-        .find(|content| is_diff_like_shell_output(content))
+    // Every recovery arm below is gated on `failed_shells` because this is a
+    // shell-SPIRAL detector: it only intervenes when the model is stuck
+    // retrying failing shell calls, not when it is deliberately running a
+    // streak of successful commands. DiffLikeSuccess must be gated too —
+    // otherwise a legitimate turn that runs `git diff`/`git show` >= threshold
+    // times (all exit 0) is short-circuited, surfacing the raw diff as the
+    // assistant answer and terminating the turn before the model can reply. A
+    // genuine stuck-on-identical-success loop is caught by the separate
+    // loop-detector, not here. `>= 1` mirrors the UsefulSuccess sibling.
+    (failed_shells >= 1)
+        .then(|| {
+            shell_results
+                .iter()
+                .find(|content| is_diff_like_shell_output(content))
+        })
+        .flatten()
         .map(|content| ShellRetryRecovery {
             kind: ShellRetryRecoveryKind::DiffLikeSuccess,
             content: strip_success_exit_suffix(content),
@@ -2736,16 +3110,418 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
     use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
+
+    // --- compose_turn_user_content (video-call context hint) ---
+
+    #[test]
+    fn should_use_video_call_hint_when_turn_is_flagged_live_video() {
+        // `is_video_call` is now the EXPLICIT live-video signal (set from the
+        // turn ingress via `inbound.metadata.live_video`), no longer inferred
+        // from audio+image attachments.
+        let out = compose_turn_user_content("what am I holding", true, true, None);
+        assert!(out.starts_with(VIDEO_CALL_NOTE), "got: {out}");
+        assert!(out.contains("what am I holding"));
+    }
+
+    #[test]
+    fn should_use_video_call_hint_even_when_transcript_empty() {
+        let out = compose_turn_user_content("", true, true, None);
+        assert_eq!(out, VIDEO_CALL_NOTE);
+    }
+
+    #[test]
+    fn should_keep_uploaded_image_hint_when_not_flagged_video() {
+        // Image present but the turn is NOT flagged a live video call → legacy
+        // placeholder kept. (A voice note + uploaded image lands here: it must
+        // NOT be treated as a camera frame.)
+        let out = compose_turn_user_content("", true, false, None);
+        assert_eq!(out, "[User sent an image]");
+    }
+
+    #[test]
+    fn should_not_add_hint_when_no_image() {
+        // No image and not flagged → plain transcript passes through.
+        let out = compose_turn_user_content("hello there", false, false, None);
+        assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn should_append_prompt_summary_unchanged_for_non_video_turn() {
+        let out = compose_turn_user_content("hi", true, false, Some("SUMMARY"));
+        assert_eq!(out, "hi\n\nSUMMARY");
+    }
+
+    #[test]
+    fn should_combine_video_hint_and_summary() {
+        let out = compose_turn_user_content("look", true, true, Some("SUMMARY"));
+        assert!(out.starts_with(VIDEO_CALL_NOTE));
+        assert!(out.contains("look"));
+        assert!(out.ends_with("SUMMARY"));
+    }
     use octos_llm::{
         ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
+        ToolChoice,
     };
     use octos_memory::EpisodeStore;
 
     use crate::plugins::PluginTool;
+    use crate::{AgentConfig, AgentVerifierConfig};
+
+    fn tool_use(tool_calls: Vec<ToolCall>, input_tokens: u32, output_tokens: u32) -> ChatResponse {
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            provider_index: None,
+        }
+    }
+
+    fn end_turn(content: &str, input_tokens: u32, output_tokens: u32) -> ChatResponse {
+        ChatResponse {
+            content: Some(content.to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            usage: LlmTokenUsage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            provider_index: None,
+        }
+    }
+
+    struct ScriptedProvider {
+        responses: StdMutex<Vec<ChatResponse>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: StdMutex::new(responses.into_iter().rev().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.responses
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop()
+                .ok_or_else(|| eyre::eyre!("scripted provider exhausted"))
+        }
+
+        fn model_id(&self) -> &str {
+            "planner-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct StaticResultTool {
+        name: &'static str,
+        output: &'static str,
+        success: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StaticResultTool {
+        fn new(
+            name: &'static str,
+            output: &'static str,
+            success: bool,
+            calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name,
+                output,
+                success,
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for StaticResultTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test tool for verifier loop tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ToolResult {
+                output: self.output.to_string(),
+                success: self.success,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct NoCallVerifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for NoCallVerifier {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            eyre::bail!("verifier should have been skipped for quiet progress")
+        }
+
+        fn model_id(&self) -> &str {
+            "haiku-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-verifier"
+        }
+    }
+
+    struct RepeatAwarePlanner {
+        calls: AtomicUsize,
+        saw_repeating_note: AtomicBool,
+    }
+
+    impl RepeatAwarePlanner {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                saw_repeating_note: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RepeatAwarePlanner {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            let saw_repeating = messages.iter().any(|message| {
+                message.content.contains("[verifier]")
+                    && message.content.contains("verdict: Repeating")
+            });
+            if saw_repeating {
+                self.saw_repeating_note.store(true, AtomicOrdering::SeqCst);
+            }
+            let fix_ran = messages.iter().any(|message| {
+                message.role == MessageRole::Tool && message.content.contains("fixed style")
+            });
+            if fix_ran {
+                return Ok(end_turn("fixed answer", 12, 6));
+            }
+            if saw_repeating {
+                return Ok(tool_use(
+                    vec![ToolCall {
+                        id: "fix_call".into(),
+                        name: "fix_tool".into(),
+                        arguments: serde_json::json!({"path": "style.toml", "repair": true}),
+                        metadata: None,
+                    }],
+                    10,
+                    5,
+                ));
+            }
+            Ok(tool_use(
+                vec![ToolCall {
+                    id: format!("fail_call_{call}"),
+                    name: "fail_tool".into(),
+                    arguments: serde_json::json!({"path": "style.toml"}),
+                    metadata: None,
+                }],
+                10,
+                5,
+            ))
+        }
+
+        fn model_id(&self) -> &str {
+            "planner-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct LedgerDrivenVerifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for LedgerDrivenVerifier {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            assert!(
+                matches!(config.tool_choice, ToolChoice::None),
+                "verifier call must not expose tools"
+            );
+            assert_eq!(
+                octos_llm::current_lane_context().lane,
+                Some(octos_llm::Lane::FastChat),
+                "verifier call should use the cheap fast-chat lane"
+            );
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let verdict = if prompt.contains("tool=fix_tool") {
+                r#"{"verdict":"ReadyToAnswer"}"#
+            } else if prompt.contains("repeating=true") {
+                r#"{"verdict":"Repeating","error_class":"ContractFail"}"#
+            } else {
+                r#"{"verdict":"Insufficient","reason":"need a different action"}"#
+            };
+            Ok(ChatResponse {
+                content: Some(verdict.to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "haiku-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-verifier"
+        }
+    }
+
+    struct PrematureEndPlanner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PrematureEndPlanner {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                return Ok(tool_use(
+                    vec![ToolCall {
+                        id: "fail_once".into(),
+                        name: "fail_tool".into(),
+                        arguments: serde_json::json!({"path": "style.toml"}),
+                        metadata: None,
+                    }],
+                    8,
+                    4,
+                ));
+            }
+            if call == 1 {
+                return Ok(end_turn("premature answer", 8, 4));
+            }
+            Ok(end_turn("ready answer", 8, 4))
+        }
+
+        fn model_id(&self) -> &str {
+            "planner-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct GateVerifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for GateVerifier {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let verdict = if prompt.contains("Proposed answer:\nready answer") {
+                r#"{"verdict":"ReadyToAnswer"}"#
+            } else if call == 0 {
+                r#"{"verdict":"Blocked","reason":"tool failed"}"#
+            } else {
+                r#"{"verdict":"Insufficient","reason":"not ready yet"}"#
+            };
+            Ok(ChatResponse {
+                content: Some(verdict.to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "haiku-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-verifier"
+        }
+    }
     use crate::plugins::manifest::PluginToolDef;
     use crate::prompt_context::{
         PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
@@ -3558,6 +4334,7 @@ printf '{"output":"voice saved","success":true}\n'
                     audio_attachment_paths: vec![first_audio.clone()],
                     file_attachment_paths: vec![],
                     prompt_summary: Some("[Attached audio files]\n- yangmi_ref2.wav".to_string()),
+                    live_video: false,
                 },
             )
             .await
@@ -3574,6 +4351,7 @@ printf '{"output":"voice saved","success":true}\n'
                     audio_attachment_paths: vec![second_audio.clone()],
                     file_attachment_paths: vec![],
                     prompt_summary: Some("[Attached audio files]\n- douwentao.wav".to_string()),
+                    live_video: false,
                 },
             )
             .await
@@ -3730,6 +4508,54 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
         assert!(recovered.content.contains("diff --git"));
         assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
+        // P2 (tri-repo #1529): DiffLikeSuccess used to fire whenever ANY recent
+        // shell result was diff-like, regardless of failures. A legitimate turn
+        // that runs `git diff` >= threshold times (all exit 0) is NOT a spiral
+        // and must NOT be short-circuited into surfacing the raw diff as the
+        // assistant answer. Build a 4-shell all-success diff streak and assert
+        // recovery does not fire.
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n\nExit code: 0";
+        let mut messages = vec![Message::user("show me every diff")];
+        for i in 0..4 {
+            let id = format!("call_diff_{i}");
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+            messages.push(Message {
+                role: MessageRole::Tool,
+                content: diff.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        assert!(
+            recover_shell_retry(&messages, 4).is_none(),
+            "an all-success diff streak must not trigger shell-spiral recovery"
+        );
     }
 
     #[test]
@@ -4862,6 +5688,168 @@ printf '{"output":"voice saved","success":true}\n'
         out
     }
 
+    #[tokio::test]
+    async fn verifier_skips_quiet_successful_tool_batch_and_persists_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("turn_ledger.jsonl");
+        let planner: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "quiet_call".into(),
+                    name: "quiet_tool".into(),
+                    arguments: serde_json::json!({"path": "ok.txt"}),
+                    metadata: None,
+                }],
+                10,
+                5,
+            ),
+            end_turn("done", 10, 5),
+        ]));
+        let verifier = Arc::new(NoCallVerifier {
+            calls: AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "quiet_tool",
+            "healthy progress\n\nExit code: 0",
+            true,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("verifier-skip"), planner, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            })
+            .with_verifier_config(
+                AgentVerifierConfig::with_provider(verifier.clone(), "haiku-test")
+                    .with_ledger_path(&ledger_path),
+            );
+
+        let response = agent
+            .process_message("do one safe thing", &[], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "done");
+        assert_eq!(verifier.calls.load(AtomicOrdering::SeqCst), 0);
+        let persisted = std::fs::read_to_string(&ledger_path).expect("turn ledger persisted");
+        assert!(
+            persisted.contains("\"tool\":\"quiet_tool\""),
+            "quiet successful tool call should still be ledgered: {persisted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier_repeating_note_changes_next_planner_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("turn_ledger.jsonl");
+        let planner = Arc::new(RepeatAwarePlanner::new());
+        let verifier = Arc::new(LedgerDrivenVerifier {
+            calls: AtomicUsize::new(0),
+        });
+        let fail_calls = Arc::new(AtomicUsize::new(0));
+        let fix_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "fail_tool",
+            "[VALIDATION FAILED] style TOML is malformed",
+            false,
+            fail_calls.clone(),
+        ));
+        tools.register(StaticResultTool::new(
+            "fix_tool",
+            "fixed style\n\nExit code: 0",
+            true,
+            fix_calls.clone(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("verifier-repeat"),
+            planner.clone(),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            max_iterations: 12,
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_verifier_config(
+            AgentVerifierConfig::with_provider(verifier.clone(), "haiku-test")
+                .with_ledger_path(&ledger_path),
+        );
+
+        let response = agent
+            .process_message("repair the generated style", &[], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "fixed answer");
+        assert!(
+            planner.saw_repeating_note.load(AtomicOrdering::SeqCst),
+            "planner must observe the injected Repeating verifier note"
+        );
+        assert_eq!(fail_calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(fix_calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            verifier.calls.load(AtomicOrdering::SeqCst) >= 4,
+            "verifier should classify failures and the ready gate"
+        );
+        let persisted = std::fs::read_to_string(&ledger_path).expect("turn ledger persisted");
+        assert!(persisted.contains("\"tool\":\"fail_tool\""));
+        assert!(persisted.contains("\"tool\":\"fix_tool\""));
+    }
+
+    #[tokio::test]
+    async fn verifier_ready_to_answer_gates_endturn_after_problem_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let planner = Arc::new(PrematureEndPlanner {
+            calls: AtomicUsize::new(0),
+        });
+        let verifier = Arc::new(GateVerifier {
+            calls: AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "fail_tool",
+            "[VALIDATION FAILED] artifact missing",
+            false,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("verifier-gate"),
+            planner.clone(),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            max_iterations: 8,
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_verifier_config(AgentVerifierConfig::with_provider(
+            verifier.clone(),
+            "haiku-test",
+        ));
+
+        let response = agent
+            .process_message("try then answer too early", &[], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "ready answer");
+        assert!(
+            planner.calls.load(AtomicOrdering::SeqCst) >= 3,
+            "premature EndTurn must be rejected until ReadyToAnswer"
+        );
+        assert!(
+            verifier.calls.load(AtomicOrdering::SeqCst) >= 3,
+            "failure classification plus two termination checks expected"
+        );
+    }
+
     // ── is_productive_tool_message (M6.2) ───────────────────────────────
 
     #[test]
@@ -5584,6 +6572,103 @@ printf '{"output":"voice saved","success":true}\n'
             total_calls >= 5,
             "expected at least 5 LLM calls (4 to trigger first detection + \
              1 recovery iteration); got {total_calls}"
+        );
+    }
+
+    /// LLM mock that always calls a named tool, so the loop detector fires
+    /// repeatedly on a tool whose EXECUTION count the test can observe.
+    struct CountingAlwaysNamedToolProvider {
+        calls: AtomicUsize,
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingAlwaysNamedToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loopy".to_string(),
+                    name: self.tool_name.to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
+        // Regression: the loop-detector `continue` after injecting synthetic
+        // results must re-enter the AGENT loop, not merely the inner
+        // `for tc in &response.tool_calls` loop. When it bound to the `for`,
+        // control fell through to `handle_tool_use` and the spiraling tool
+        // EXECUTED anyway (extra side effects + a duplicate tool_call_id row),
+        // defeating the detector's "inject a warning, do NOT call the tools"
+        // contract.
+        //
+        // With the same-tool provider the detector trips on the 4th call, so:
+        //   - iterations 1..=3 execute the tool  (3 executions)
+        //   - iteration 4 (FIRST fire) injects synthetic results and re-enters
+        //     the loop WITHOUT executing
+        //   - iteration 5 (SECOND fire) terminates before executing
+        // ⇒ executions == total_llm_calls - 2. The buggy fall-through executed
+        // on the first-fire iteration too (executions == total_llm_calls - 1).
+        let dir = tempfile::tempdir().unwrap();
+        let exec_count = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingAlwaysNamedToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_name: "loopy_tool",
+        });
+        let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "loopy_tool",
+            output: "looped",
+            calls: exec_count.clone(),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let result = agent
+            .process_message("please loop", &[], vec![])
+            .await
+            .expect("process_message should return Ok even when the loop terminates");
+        assert_eq!(result.content, loop_detected_terminal_message());
+
+        let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+        let executions = exec_count.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            executions,
+            total_calls - 2,
+            "the spiraling tool must NOT execute on the first-fire (synthetic-\
+             injection) iteration; got {executions} executions across \
+             {total_calls} LLM calls (buggy fall-through would be {})",
+            total_calls - 1
         );
     }
 
@@ -6723,6 +7808,247 @@ printf '{"output":"voice saved","success":true}\n'
             result.success,
             "ready workspace must keep Success (got {:?})",
             result.output
+        );
+    }
+
+    // ── Phase 4: human-approval suspend-and-resume (ROBRIX-PHASE4 ADR) ──────
+
+    struct AlphaToolThenEndProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlphaToolThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_alpha".to_string(),
+                        name: "alpha".to_string(),
+                        arguments: serde_json::json!({"value": "x"}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn human_approval_rules_for(tool: &str) -> crate::approval::HumanApprovalRules {
+        crate::approval::HumanApprovalRules::new(vec![crate::approval::ApprovalRule {
+            tools: vec![tool.to_string()],
+            risk_level: crate::approval::ApprovalRiskLevel::Critical,
+            authorized_approvers: vec!["@alice:example.org".to_string()],
+            expires_in_secs: 300,
+            on_timeout: crate::approval::ApprovalTimeoutBehavior::Notify,
+        }])
+    }
+
+    #[tokio::test]
+    async fn should_suspend_turn_when_tool_matches_human_approval_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory).with_config(
+            AgentConfig {
+                human_approval_rules: Some(human_approval_rules_for("alpha")),
+                ..AgentConfig::default()
+            },
+        );
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+        let pending = result
+            .pending_approval
+            .expect("turn should suspend with a pending approval draft");
+        assert_eq!(pending.request.tool_name, "alpha");
+        assert_eq!(
+            pending.request.authorized_approvers,
+            vec!["@alice:example.org".to_string()]
+        );
+        assert!(result.content.is_empty());
+        // The tool must NOT have executed.
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("alpha ok")),
+            "gated tool must not execute before approval"
+        );
+        // The placeholder tool result keeps the LLM history consistent.
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.role == MessageRole::Tool && m.content.contains("[APPROVAL REQUESTED]")),
+            "history should carry the approval placeholder: {:?}",
+            result.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn should_execute_normally_when_no_human_approval_rule_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory).with_config(
+            AgentConfig {
+                human_approval_rules: Some(human_approval_rules_for("beta")),
+                ..AgentConfig::default()
+            },
+        );
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+        assert!(result.pending_approval.is_none());
+        assert_eq!(result.content, "done");
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("alpha ok")),
+            "non-matching tool should run normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_run_tool_directly_when_executing_approved_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory);
+
+        let pending = human_approval_rules_for("alpha")
+            .draft_for_tool_call(
+                "alpha",
+                "call_alpha",
+                serde_json::json!({"value": "x"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let result = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "alpha ok");
+    }
+
+    #[tokio::test]
+    async fn should_not_re_deny_approved_shell_command_tripping_safepolicy_ask() {
+        // Codex/mempal review #1: an approved `shell` command that ALSO trips
+        // SafePolicy's Decision::Ask (sudo / rm -rf / git push --force) must
+        // not be re-denied by the in-tool approval gate. `execute_approved_tool`
+        // scopes an auto-approver so the already-human-approved call runs.
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-shell"), provider, tools, memory);
+
+        // `git push --force` trips SafePolicy::Ask; with no remote it fails
+        // fast and harmlessly — we only assert the approval gate was passed.
+        let pending = human_approval_rules_for("shell")
+            .draft_for_tool_call(
+                "shell",
+                "call_shell",
+                serde_json::json!({"command": "git push --force"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let result = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(
+            !result.output.contains("requires approval"),
+            "approved shell command must not be re-denied by the in-tool gate: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_revalidation_when_sender_not_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-test"), provider, tools, memory);
+
+        let pending = human_approval_rules_for("alpha")
+            .draft_for_tool_call(
+                "alpha",
+                "call_alpha",
+                serde_json::json!({"value": "x"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let err = agent
+            .revalidate_pending_approval(&pending, "@mallory:example.org")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not authorized"));
+
+        assert!(
+            agent
+                .revalidate_pending_approval(&pending, "@alice:example.org")
+                .await
+                .is_ok()
         );
     }
 }

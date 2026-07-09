@@ -19,6 +19,7 @@ use crate::harness_events::{
     OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
     OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context, write_event_to_sink,
 };
+use crate::policy::ApprovalPolicy;
 use crate::progress::ProgressEvent;
 use crate::subprocess_env::{
     EnvAllowlist, sanitize_command_env, sanitize_command_env_strict, should_forward_env_name,
@@ -118,6 +119,21 @@ pub struct PluginTool {
     /// `verified_exe_sha256` must be `Some`). When `false`, the gate is
     /// skipped on unverified plugins to keep the legacy path cheap.
     require_signed: bool,
+    /// yolo GAP #2: runtime approval behavior for the manifest risk gate.
+    /// Threaded from the session's `EffectivePermissions::approval_policy`
+    /// (same as `ShellTool`). Under [`ApprovalPolicy::Never`] a `high`/
+    /// `critical`-risk plugin is DENIED without prompting — parity with
+    /// shell.rs's fail-closed "approval_policy is never" — UNLESS
+    /// `auto_approve_high_risk` is set (a DangerFullAccess / AllowAll
+    /// context, which auto-allows the gate).
+    approval_policy: ApprovalPolicy,
+    /// yolo GAP #2: when `true`, the manifest risk gate auto-allows without
+    /// prompting. Set for a DangerFullAccess / AllowAll ("yolo") context,
+    /// mirroring how the same context swaps `SafePolicy` for `AllowAllPolicy`
+    /// on the shell tools. Takes precedence over `approval_policy` so a
+    /// dangerous session (whose `approval_policy` is `Never`) still runs
+    /// high-risk plugins rather than denying them.
+    auto_approve_high_risk: bool,
 }
 
 impl PluginTool {
@@ -138,7 +154,29 @@ impl PluginTool {
             manifest_sha256: None,
             manifest_path: None,
             require_signed: false,
+            approval_policy: ApprovalPolicy::Ask,
+            auto_approve_high_risk: false,
         }
+    }
+
+    /// yolo GAP #2: set the runtime approval behavior for the manifest risk
+    /// gate. Threaded from the session's
+    /// [`EffectivePermissions::approval_policy`](crate::policy::EffectivePermissions),
+    /// the same way `ShellTool::with_approval_policy` is wired. Under
+    /// [`ApprovalPolicy::Never`] a `high`/`critical`-risk plugin is denied
+    /// without prompting (unless [`Self::with_auto_approve_high_risk`] is set).
+    pub fn with_approval_policy(mut self, approval_policy: ApprovalPolicy) -> Self {
+        self.approval_policy = approval_policy;
+        self
+    }
+
+    /// yolo GAP #2: when `true`, the manifest risk gate auto-allows without
+    /// prompting. Set for a DangerFullAccess / AllowAll ("yolo") context —
+    /// this takes precedence over the `approval_policy` so a dangerous
+    /// session (whose policy is `Never`) still runs high-risk plugins.
+    pub fn with_auto_approve_high_risk(mut self, auto_approve: bool) -> Self {
+        self.auto_approve_high_risk = auto_approve;
+        self
     }
 
     /// Attach the load-time SHA-256 of the verified-exe bytes so the pre-spawn
@@ -187,6 +225,40 @@ impl PluginTool {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// The plugin's own execution timeout (seconds-resolution `Duration`).
+    /// Exposed for the loader tests to assert the manifest-timeout clamp.
+    #[cfg(test)]
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// yolo GAP #2 test accessor: the risk-gate approval policy this tool
+    /// carries. Used by the registry wiring test to prove
+    /// `apply_permissions_to_plugin_tools` threaded the session policy.
+    #[cfg(test)]
+    pub(crate) fn approval_policy(&self) -> ApprovalPolicy {
+        self.approval_policy
+    }
+
+    /// yolo GAP #2 test accessor: whether this tool auto-allows the risk gate
+    /// (a DangerFullAccess / AllowAll context).
+    #[cfg(test)]
+    pub(crate) fn auto_approve_high_risk(&self) -> bool {
+        self.auto_approve_high_risk
+    }
+
+    /// The construction-time working directory bound to this tool (`None`
+    /// when unbound). Mirrors the public [`Self::with_work_dir`] setter.
+    ///
+    /// Load-bearing for the chat/session cwd-rebind: a Host-scope ("yolo")
+    /// session omits `session_scope`, so `execute` derives the plugin's
+    /// `current_dir`/`OCTOS_WORK_DIR` from `work_dir` alone — it MUST be
+    /// bound to the resolved `--cwd`, not left `None` (else plugins run in
+    /// the process launch dir). Callers assert this to prove the binding.
+    pub fn work_dir(&self) -> Option<&Path> {
+        self.work_dir.as_deref()
     }
 
     /// S2 plumbing: set the synthesis LLM provider config injected into the
@@ -319,6 +391,37 @@ impl PluginTool {
             manifest_sha256: self.manifest_sha256.clone(),
             manifest_path: self.manifest_path.clone(),
             require_signed: self.require_signed,
+            approval_policy: self.approval_policy,
+            auto_approve_high_risk: self.auto_approve_high_risk,
+        }
+    }
+
+    /// yolo GAP #2: create a copy of this plugin tool carrying the session's
+    /// risk-gate approval context (everything else, including the current
+    /// `work_dir`, is preserved). The registry applies this per session in
+    /// [`ToolRegistry::apply_permissions_to_plugin_tools`] so a `never` /
+    /// DangerFullAccess session's plugin tools honor the same
+    /// `ApprovalPolicy` the shell/coding tools already do.
+    pub fn clone_with_permissions(
+        &self,
+        approval_policy: ApprovalPolicy,
+        auto_approve_high_risk: bool,
+    ) -> Self {
+        Self {
+            plugin_name: self.plugin_name.clone(),
+            tool_def: self.tool_def.clone(),
+            executable: self.executable.clone(),
+            blocked_env: self.blocked_env.clone(),
+            extra_env: self.extra_env.clone(),
+            work_dir: self.work_dir.clone(),
+            timeout: self.timeout,
+            synthesis_config: self.synthesis_config.clone(),
+            verified_exe_sha256: self.verified_exe_sha256.clone(),
+            manifest_sha256: self.manifest_sha256.clone(),
+            manifest_path: self.manifest_path.clone(),
+            require_signed: self.require_signed,
+            approval_policy,
+            auto_approve_high_risk,
         }
     }
 
@@ -1456,6 +1559,71 @@ fn rescue_workspace_input_existence(
     }
 }
 
+/// Lexically test whether `candidate` stays within `root` after
+/// collapsing `.`/`..` components, WITHOUT touching the filesystem.
+///
+/// Used by the plugin input-path subdir rescue to refuse a
+/// workspace-relative candidate that would climb out of the workspace
+/// root (defence in depth — the caller already rejected raw `..` input,
+/// but the `skill-output/`-stripped form is re-derived and re-checked
+/// here). A `..` that pops above `root` makes the running depth go
+/// negative → not within.
+fn lexically_within(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    let Ok(rel) = candidate.strip_prefix(root) else {
+        return false; // not even lexically prefixed by root
+    };
+    let mut depth: i32 = 0;
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            // CurDir / RootDir / Prefix: ignore (RootDir/Prefix can't
+            // appear in a relative strip result; CurDir is a no-op).
+            _ => {}
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod subdir_rescue_tests {
+    use super::lexically_within;
+    use std::path::Path;
+
+    #[test]
+    fn lexically_within_accepts_subdir_paths() {
+        let root = Path::new("/ws");
+        assert!(lexically_within(
+            root,
+            Path::new("/ws/slides/deck/script.js")
+        ));
+        assert!(lexically_within(root, Path::new("/ws/file.txt")));
+        assert!(lexically_within(root, Path::new("/ws"))); // root itself
+    }
+
+    #[test]
+    fn lexically_within_rejects_escapes_and_foreign_roots() {
+        let root = Path::new("/ws");
+        // climbs above root
+        assert!(!lexically_within(root, Path::new("/ws/../etc/passwd")));
+        assert!(!lexically_within(root, Path::new("/ws/a/../../etc")));
+        // not under root at all
+        assert!(!lexically_within(root, Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn lexically_within_allows_interior_parent_that_stays_within() {
+        let root = Path::new("/ws");
+        // dips into a subdir then back up — net still inside
+        assert!(lexically_within(root, Path::new("/ws/a/b/../c")));
+    }
+}
+
 /// Resolve a plugin tool's input path (`audio_path` / `file_path` /
 /// `input` / `script_path` / `video_path` / `text_path` / per-slide
 /// `source_image`) to an absolute on-disk string.
@@ -1591,6 +1759,72 @@ fn resolve_plugin_input_path(
     // doesn't fix the adversarial race.
     if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
         if let Some(parent) = work_dir.parent() {
+            // #1377 slides fix: BEFORE the basename-only rescue, try the
+            // FULL workspace-relative path under the workspace root. The
+            // basename rescue below only finds a file at `<workspace>/
+            // <basename>`, so a SUBDIR-prefixed input like
+            // `slides/<deck>/script.js` (the documented mofa-slides
+            // `input:` form, written by `write_file` against the workspace
+            // ROOT) never resolves — the work_dir is chrooted to
+            // `<workspace>/skill-output/`, so `work_dir.join(raw_path)`
+            // probes `<workspace>/skill-output/slides/...` and misses.
+            // Without this the agent's safe `input:` mode fails with
+            // `os error 2` and it falls back to partial inline `slides`
+            // arrays that overwrite earlier slides (position-based
+            // filenames). Probe `raw_path` and its `skill-output/`-
+            // stripped form against the workspace root, guarded by the
+            // same symlink/regular-file check as the basename rescue PLUS
+            // a lexical-containment check (raw `..` already returned Err
+            // at this fn's entry; this rejects any candidate that still
+            // escapes the workspace root after normalisation).
+            let workspace_root = parent;
+            for rel in [Some(raw_path), stripped.as_deref()].into_iter().flatten() {
+                let candidate = workspace_root.join(rel);
+                // Lexical containment: the normalised candidate must stay
+                // under the workspace root. `lexically_within` collapses
+                // `.`/`..` without touching disk; a candidate that climbs
+                // out (despite the entry `..` guard, e.g. via the stripped
+                // form) is refused.
+                if !lexically_within(workspace_root, &candidate) {
+                    continue;
+                }
+                // Guard 1 (final component): reject if the candidate's LEAF
+                // is a symlink or non-regular file. `symlink_metadata` does
+                // NOT follow the final component, so a `script.js -> …`
+                // symlink at the candidate path is refused regardless of its
+                // target — matching the basename rescue's target-agnostic,
+                // TOCTOU-resistant posture.
+                let leaf_is_regular_file = std::fs::symlink_metadata(&candidate)
+                    .map(|m| m.file_type().is_file())
+                    .unwrap_or(false);
+                if !leaf_is_regular_file {
+                    continue;
+                }
+                // Guard 2 (ancestors — codex round-1 P1): unlike the basename
+                // rescue (single component), this candidate carries SUBDIR
+                // components, so a symlinked ANCESTOR (`<workspace>/slides ->
+                // /etc`) could let `slides/passwd` escape — `symlink_metadata`
+                // above only checks the LEAF, and it traverses symlinked
+                // parents. Canonicalize the full candidate (resolves every
+                // ancestor symlink) and require it to stay under the canonical
+                // workspace root.
+                let (Ok(canon), Ok(canon_root)) = (
+                    std::fs::canonicalize(&candidate),
+                    std::fs::canonicalize(workspace_root),
+                ) else {
+                    continue;
+                };
+                if !canon.starts_with(&canon_root) {
+                    continue; // a symlinked ancestor escaped the workspace
+                }
+                // Both guards passed: return the LEXICAL candidate (not
+                // `canon`). Containment is proven, so the lexical path names
+                // the same in-workspace file, and the legacy resolver
+                // contract is to return the workspace-relative lexical form
+                // (callers/tests rely on it; canonicalize would also rewrite
+                // macOS `/var`->`/private/var`).
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
             if let Some(basename) = std::path::Path::new(raw_path).file_name() {
                 let candidate = parent.join(basename);
                 // Reject symlinks AND non-regular files (directories,
@@ -1980,6 +2214,61 @@ fn list_available_styles(dir: Option<&std::path::Path>) -> Vec<String> {
     names
 }
 
+/// RAII guard that SIGKILLs a spawned plugin's entire PROCESS GROUP on drop.
+///
+/// Cancellation-safety (codex re-review of af3597ab — Gap 3's "limits must
+/// degrade, never leak"): the registry's per-tool timeout wraps `execute()` in
+/// `tokio::time::timeout`, which DROPS the future on elapse. `kill_on_drop(true)`
+/// on the plugin `Command` reaps the DIRECT child on that drop, but NOT any
+/// grandchildren the plugin spawned. This guard — owned by the `execute` future
+/// alongside the `Child` — sends `kill -9 -<pid>` (negative pid = whole process
+/// group, which exists because the plugin was spawned with `process_group(0)`)
+/// when the future is dropped, reaping the entire tree.
+///
+/// On the normal-completion path the plugin has already exited and been reaped,
+/// so the guard is `disarm()`ed to avoid a redundant kill. Even if it were not
+/// disarmed, a group-kill after exit is a harmless no-op (the kernel returns
+/// ESRCH for a vanished group), so the guard is purely best-effort: its `Drop`
+/// never panics and ignores all errors.
+#[cfg(unix)]
+struct ProcessGroupKillGuard {
+    /// pgid == the plugin's pid (it was spawned into its own group). 0 = unset
+    /// / disarmed (no group to reap).
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl ProcessGroupKillGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid }
+    }
+
+    /// Disarm on the normal-completion path: the plugin already exited and was
+    /// reaped, so there is no group left to kill.
+    fn disarm(&mut self) {
+        self.pid = 0;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupKillGuard {
+    fn drop(&mut self) {
+        // Best-effort: never panic in Drop, ignore every error. A pid of 0
+        // means disarmed (or never armed); skip. The negative pid targets the
+        // whole process group established by `process_group(0)`, reaping any
+        // grandchildren the plugin spawned. A group-kill after the leader has
+        // already exited is a harmless ESRCH no-op.
+        if self.pid == 0 {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-9", "--", &format!("-{}", self.pid)])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[async_trait]
 impl Tool for PluginTool {
     fn name(&self) -> &str {
@@ -2111,7 +2400,42 @@ impl Tool for PluginTool {
         // so existing skills that don't declare `risk` keep working
         // unchanged.
         let risk_gate = ManifestRiskGate::classify(self.tool_def.risk.as_deref());
-        if risk_gate.requires_approval() {
+        // yolo GAP #2: the manifest risk gate must honor `ApprovalPolicy`,
+        // just like shell.rs's `Decision::Ask` path. Two overrides sit ahead
+        // of the interactive prompt:
+        //   1. A DangerFullAccess / AllowAll ("yolo") context auto-allows —
+        //      parity with the shell tools swapping `SafePolicy` for
+        //      `AllowAllPolicy` under danger. This takes precedence so a
+        //      dangerous session (whose `approval_policy` is `Never`) still
+        //      runs high-risk plugins instead of denying them.
+        //   2. Otherwise `ApprovalPolicy::Never` denies WITHOUT prompting —
+        //      fail-closed parity with shell.rs ("approval_policy is never").
+        // Only when neither override applies (`ApprovalPolicy::Ask`) do we
+        // fall through to the interactive approval round-trip below.
+        if risk_gate.requires_approval() && self.auto_approve_high_risk {
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                tool = %self.tool_def.name,
+                risk = ?self.tool_def.risk,
+                "manifest risk gate auto-allowed (danger full access context)"
+            );
+        } else if risk_gate.requires_approval() && !self.approval_policy.allows_prompt() {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                tool = %self.tool_def.name,
+                risk = ?self.tool_def.risk,
+                "plugin tool requires approval but approval_policy is never — denied"
+            );
+            return Ok(ToolResult {
+                output: format!(
+                    "Plugin tool '{}' requires approval (manifest risk={:?}) but approval_policy is never: denied without prompting.",
+                    self.tool_def.name,
+                    self.tool_def.risk.as_deref().unwrap_or("unspecified")
+                ),
+                success: false,
+                ..Default::default()
+            });
+        } else if risk_gate.requires_approval() {
             let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
             let Some(requester) = requester else {
                 tracing::warn!(
@@ -2198,7 +2522,40 @@ impl Tool for PluginTool {
         cmd.arg(&self.tool_def.name)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Cancellation-safety (codex review of 7c3e5eac): the registry's
+            // per-tool timeout (`ToolRegistry::execute_with_context`) wraps
+            // this future in `tokio::time::timeout`, which DROPS the future on
+            // elapse. The spawned `Child` below is owned by this future, so
+            // dropping the future drops the `Child`. With `kill_on_drop(true)`
+            // tokio sends SIGKILL to the DIRECT child (and the runtime's reaper
+            // collects it) on that drop. `kill_on_drop` alone, however, reaps
+            // ONLY the direct child — a plugin that spawns its own children
+            // (a worker, `sleep 600 &`, etc.) would leak those grandchildren on
+            // a registry-timeout drop. The `ProcessGroupKillGuard` installed
+            // after spawn closes that gap by SIGKILLing the whole PROCESS GROUP
+            // on drop (see below); it is paired with `process_group(0)` to make
+            // the group exist. The plugin's own kill branches below remain the
+            // graceful path (process-group kill -9 -PID) when the plugin's own
+            // `self.timeout` fires first.
+            .kill_on_drop(true);
+        // Cancellation-safety (codex re-review of af3597ab — Gap 3's "limits
+        // must degrade, never leak"): put the plugin in its OWN process group
+        // so its pgid == its pid. This is what makes a `kill -9 -<pid>`
+        // (negative PID = process group) actually target the whole plugin tree
+        // — the explicit kill branches below (and the drop guard) depend on it.
+        // Without this, the negative-PID kills hit whatever group the harness
+        // happens to be in (no dedicated group to reap), so grandchildren leak.
+        // Windows has no process groups: leave it on the existing
+        // `kill_on_drop` + `taskkill /T` behavior.
+        #[cfg(unix)]
+        {
+            // `tokio::process::Command` exposes `process_group` as an inherent
+            // method (mirroring `validators.rs`, which does the same on the same
+            // `tokio::process::Command` type), so no `CommandExt` import is
+            // needed here.
+            cmd.process_group(0);
+        }
 
         let env_allowlist = EnvAllowlist::from_strings(&self.tool_def.env);
 
@@ -2349,15 +2706,84 @@ impl Tool for PluginTool {
             "plugin process spawned"
         );
 
-        // Write args to stdin
+        // Arm the process-group kill guard (codex re-review of af3597ab). The
+        // plugin was spawned into its own group via `process_group(0)`, so its
+        // pgid == child_pid. This guard is owned by THIS future: if the registry
+        // timeout drops the future, the guard's Drop SIGKILLs the whole group
+        // (`kill -9 -<pid>`), reaping any grandchildren the plugin spawned —
+        // not just the direct child (`kill_on_drop` only covers the latter). On
+        // every normal-return path below we `disarm()` it, since the plugin has
+        // already exited/been reaped by then. A non-zero pid is required for the
+        // group to exist.
+        #[cfg(unix)]
+        let mut group_kill_guard = ProcessGroupKillGuard::new(child_pid);
+
+        // Write args to stdin.
+        //
+        // Cancellation-safety (codex review of 7c3e5eac): this write happens
+        // BEFORE the plugin's own timeout/kill branch below. A misbehaving
+        // plugin that never drains stdin (and fills the OS pipe buffer by
+        // streaming stdout before reading) could wedge `write_all` here
+        // indefinitely. `kill_on_drop(true)` on `cmd` already guarantees the
+        // child cannot be ORPHANED if the registry backstop drops this whole
+        // future, but we ALSO bound the write under the plugin's own
+        // `self.timeout` so the hang is caught by the plugin's graceful
+        // kill path (process-group kill -9 -PID) rather than only by the
+        // larger registry backstop. A timed-out write degrades to the same
+        // structured timeout error as a hung wait.
         if let Some(mut stdin) = child.stdin.take() {
             let data = serde_json::to_vec(&effective_args)?;
-            if let Err(err) = stdin.write_all(&data).await {
-                // Some plugins do not read stdin at all and exit after writing a
-                // best-effort stdout result. Treat an early pipe close as
-                // non-fatal so fallback stdout parsing can still succeed.
-                if err.kind() != ErrorKind::BrokenPipe {
-                    return Err(err.into());
+            match tokio::time::timeout(self.timeout, stdin.write_all(&data)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    // Some plugins do not read stdin at all and exit after
+                    // writing a best-effort stdout result. Treat an early pipe
+                    // close as non-fatal so fallback stdout parsing can still
+                    // succeed.
+                    if err.kind() != ErrorKind::BrokenPipe {
+                        return Err(err.into());
+                    }
+                }
+                Err(_elapsed) => {
+                    // stdin write wedged: kill the child via its process group
+                    // (matches the wait-timeout branch below) and surface a
+                    // structured timeout. The plugin was spawned with
+                    // `process_group(0)`, so `kill -9 -<pid>` now reaps the
+                    // whole tree (the leader AND any grandchildren), not just
+                    // the leader. Dropping the future would also reap the group
+                    // via the `ProcessGroupKillGuard`, but killing here keeps
+                    // the error path symmetric. We disarm the guard afterward
+                    // since the group is already reaped.
+                    let _ = child.kill().await;
+                    #[cfg(unix)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &format!("-{child_pid}")])
+                            .status();
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &child_pid.to_string()])
+                            .status();
+                    }
+                    #[cfg(unix)]
+                    group_kill_guard.disarm();
+                    #[cfg(windows)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &child_pid.to_string()])
+                            .status();
+                    }
+                    let timeout_secs = self.timeout.as_secs();
+                    let message = format!(
+                        "plugin '{}' tool '{}' timed out after {timeout_secs}s writing to stdin",
+                        self.plugin_name, self.tool_def.name
+                    );
+                    let classified = HarnessError::PluginTimeout {
+                        plugin_name: self.plugin_name.clone(),
+                        timeout_secs,
+                        message: message.clone(),
+                    };
+                    self.emit_plugin_error(ctx.as_ref(), &classified);
+                    return Err(eyre::eyre!(message));
                 }
             }
             // Drop stdin to signal EOF
@@ -2441,7 +2867,11 @@ impl Tool for PluginTool {
                     return Err(eyre::eyre!(message));
                 }
                 Err(_) => {
-                    // Timeout — kill the child process
+                    // Timeout — kill the child's whole process group. The plugin
+                    // was spawned with `process_group(0)`, so `kill -9 -<pid>`
+                    // reaps the leader AND any grandchildren it spawned, not just
+                    // the leader. We disarm the drop guard afterward since the
+                    // group is already reaped.
                     let _ = child.kill().await;
                     #[cfg(unix)]
                     if child_pid > 0 {
@@ -2452,6 +2882,8 @@ impl Tool for PluginTool {
                             .args(["-9", &child_pid.to_string()])
                             .status();
                     }
+                    #[cfg(unix)]
+                    group_kill_guard.disarm();
                     #[cfg(windows)]
                     if child_pid > 0 {
                         let _ = std::process::Command::new("taskkill")
@@ -2472,6 +2904,14 @@ impl Tool for PluginTool {
                     return Err(eyre::eyre!(message));
                 }
             };
+
+        // Normal-completion path: `child.wait()` above returned the exit status,
+        // so the plugin leader has already exited and been reaped. Disarm the
+        // process-group kill guard so a cleanly-finished plugin isn't redundantly
+        // group-killed when this future returns. (A group-kill after exit would
+        // be a harmless ESRCH no-op, but disarming is the clean approach.)
+        #[cfg(unix)]
+        group_kill_guard.disarm();
         let stdout = String::from_utf8_lossy(&stdout_bytes);
 
         tracing::info!(
@@ -3312,6 +3752,60 @@ mod tests {
         let _ = bait;
     }
 
+    #[test]
+    fn subdir_rescue_resolves_workspace_relative_script() {
+        // #1377 slides fix: a SUBDIR-prefixed input (`slides/<deck>/script.js`)
+        // written at the workspace ROOT must resolve when work_dir is
+        // chrooted to `<workspace>/skill-output/`. Before the fix only the
+        // basename was probed at the root, so this missed and the agent fell
+        // back to the overwrite-prone inline-array mode.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let deck_dir = workspace.path().join("slides").join("deck");
+        std::fs::create_dir_all(&deck_dir).unwrap();
+        let script = deck_dir.join("script.js");
+        std::fs::write(&script, "module.exports = []").unwrap();
+
+        let resolved = resolve_plugin_input_path("slides/deck/script.js", &skill_output)
+            .expect("subdir-prefixed workspace-relative input must resolve");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&script).unwrap(),
+            "must resolve to the real workspace-root script",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subdir_rescue_rejects_symlinked_ancestor_escape() {
+        // Codex round-1 P1: the full-path rescue carries SUBDIR components,
+        // so a symlinked ANCESTOR (`<workspace>/slides -> /etc`) could let
+        // `slides/passwd` escape — `symlink_metadata` only checks the final
+        // component. The canonical-containment guard must reject it.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // `<workspace>/slides` is a symlink to /etc (an ancestor of the input).
+        let bait_dir = workspace.path().join("slides");
+        std::os::unix::fs::symlink("/etc", &bait_dir).unwrap();
+
+        let resolved = resolve_plugin_input_path("slides/passwd", &skill_output)
+            .expect("resolver still returns a (contained) fallback path, not the escape");
+        let resolved_path = std::path::Path::new(&resolved);
+        assert!(
+            !resolved_path.starts_with("/etc"),
+            "rescue must not resolve through a symlinked ancestor into /etc: {resolved}",
+        );
+        // Falls through to a contained path (skill-output basename join, or
+        // the lexical fallback) — never the escaped /etc/passwd.
+        assert!(
+            resolved_path.starts_with(workspace.path()),
+            "resolved path must stay within the workspace: {resolved}",
+        );
+        let _ = bait_dir;
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_root_rescue_rejects_symlink_to_inside_workspace() {
@@ -4078,6 +4572,240 @@ mod tests {
         }
     }
 
+    /// A process is considered "alive" for the orphan check if `ps` reports a
+    /// non-zombie state for the pid. A reaped or zombie process is dead.
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let state = String::from_utf8_lossy(&o.stdout);
+                let state = state.trim();
+                // Empty output -> no such process (reaped). A leading 'Z' is a
+                // zombie -> the process is dead, awaiting reap.
+                !state.is_empty() && !state.starts_with('Z')
+            }
+            // Non-zero exit (or spawn error) -> no such pid.
+            _ => false,
+        }
+    }
+
+    /// Cancellation-safety regression (codex review of 7c3e5eac): the registry
+    /// timeout (`execute_with_context`) wraps the tool future in
+    /// `tokio::time::timeout`, which DROPS the future on elapse. A `PluginTool`
+    /// spawns a child subprocess that is owned by that future. If the dropped
+    /// future does not kill the child, the plugin subprocess is ORPHANED and
+    /// keeps mutating state — trading a hang for a runaway process.
+    ///
+    /// This simulates the registry path by racing `execute()` against a SHORT
+    /// timeout and dropping the future on elapse, then asserting the spawned
+    /// child PID is actually dead (not just that the future returned).
+    ///
+    /// RED on HEAD: without `kill_on_drop(true)` the `sleep` child survives the
+    /// drop and `pid_is_alive` stays true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn dropped_execute_future_kills_child_no_orphan() {
+        if std::path::Path::new("/.dockerenv").exists()
+            || std::fs::read_to_string("/proc/1/cgroup")
+                .map(|s| s.contains("docker") || s.contains("kubepods"))
+                .unwrap_or(false)
+        {
+            eprintln!("skipping dropped_execute_future_kills_child_no_orphan: container detected");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        let pidfile = dir.path().join("child.pid");
+        // `exec sleep` so the recorded pid IS the long-running process (no
+        // intermediate shell). Ignores stdin entirely, so a hang here also
+        // exercises the pre-kill stdin-write path. Sleeps far longer than the
+        // test timeout so it cannot exit on its own.
+        write_test_script(
+            &script_path,
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+                pidfile.display()
+            ),
+        );
+
+        let def = make_tool_def("hang_tool", "ignores stdin and sleeps");
+        // A long internal plugin timeout so it is NOT the plugin's own kill
+        // branch that saves us — only dropping the future can kill the child.
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
+
+        // Simulate the registry dispatch boundary: wrap the tool future in a
+        // short timeout. On elapse the future is dropped (its `Child` with it).
+        // Use a 3s window (generous even under heavy parallel test load) so the
+        // child reliably runs `echo $$ > pidfile` and reaches `sleep` BEFORE
+        // the timeout drops the future — otherwise we could not observe the
+        // pid to assert on. The cancellation-safety property is unaffected by
+        // the window length.
+        let args = json!({});
+        let fut = tool.execute(&args);
+        let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
+        assert!(
+            res.is_err(),
+            "expected the short registry-style timeout to elapse (future dropped)"
+        );
+        // `res` (the dropped future) is gone here — the `Child` was owned by it.
+
+        // The child should have written its pid before sleeping. It had the
+        // full 3s window above to do so.
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .expect("child should have recorded its pid before sleeping");
+
+        // Poll: the drop-kill + tokio reaper should make the child dead. Allow
+        // a brief window for SIGKILL delivery + reap.
+        let mut alive_after = true;
+        for _ in 0..100 {
+            if !pid_is_alive(pid) {
+                alive_after = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Best-effort cleanup so a RED run does not leak the orphan.
+        if alive_after {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+
+        assert!(
+            !alive_after,
+            "plugin child (pid {pid}) was ORPHANED after the execute future was dropped — \
+             not cancellation-safe"
+        );
+    }
+
+    /// Cancellation-safety regression, GRANDCHILD edition (codex re-review of
+    /// af3597ab — Gap 3's "limits must degrade, never leak"): `kill_on_drop(true)`
+    /// reaps only the DIRECT plugin child on future-drop. A plugin that spawns
+    /// its OWN children (a worker, `sleep 600 &`, etc.) leaves those
+    /// GRANDCHILDREN running after a registry-timeout cancellation unless the
+    /// plugin was placed in its own process group and the whole group is killed.
+    ///
+    /// This races `execute()` against a short timeout and drops the future, then
+    /// asserts BOTH the direct child pid AND the spawned grandchild pid are dead.
+    ///
+    /// RED on HEAD `af3597ab`: no `process_group(0)` before spawn + drop-time
+    /// group-kill, so the grandchild survives the drop and `pid_is_alive` stays
+    /// true for it. GREEN after the spawn is put in its own group and a Drop
+    /// guard SIGKILLs the group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn dropped_execute_future_kills_child_and_grandchild_no_orphan() {
+        if std::path::Path::new("/.dockerenv").exists()
+            || std::fs::read_to_string("/proc/1/cgroup")
+                .map(|s| s.contains("docker") || s.contains("kubepods"))
+                .unwrap_or(false)
+        {
+            eprintln!(
+                "skipping dropped_execute_future_kills_child_and_grandchild_no_orphan: container detected"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        let pidfile = dir.path().join("pids");
+        // The plugin spawns a background GRANDCHILD (`sleep 600 &`), records the
+        // grandchild's pid AND its own pid into the pidfile, then `exec sleep`s
+        // so the recorded `$$` is the long-running direct child (no intermediate
+        // shell). Both pids must be reaped on cancellation. Ignores stdin.
+        write_test_script(
+            &script_path,
+            &format!(
+                "#!/bin/sh\nsleep 600 &\necho $! >> '{0}'\necho $$ >> '{0}'\nexec sleep 600\n",
+                pidfile.display()
+            ),
+        );
+
+        let def = make_tool_def(
+            "hang_tool_with_grandchild",
+            "spawns a grandchild and sleeps",
+        );
+        // Long internal plugin timeout: only dropping the future (and the
+        // group-kill it triggers) can reap the tree, not the plugin's own
+        // kill branch.
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
+
+        // Simulate the registry dispatch boundary: a short timeout drops the
+        // future (and its `Child`) on elapse. 3s window so the script reliably
+        // records both pids before the drop.
+        let args = json!({});
+        let fut = tool.execute(&args);
+        let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
+        assert!(
+            res.is_err(),
+            "expected the short registry-style timeout to elapse (future dropped)"
+        );
+
+        // Read BOTH recorded pids (grandchild first, then direct child).
+        let contents = {
+            let mut last = String::new();
+            for _ in 0..100 {
+                last = std::fs::read_to_string(&pidfile).unwrap_or_default();
+                if last.lines().filter(|l| !l.trim().is_empty()).count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            last
+        };
+        let pids: Vec<u32> = contents
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect();
+        assert!(
+            pids.len() >= 2,
+            "expected the plugin to record both grandchild and child pids, got: {contents:?}"
+        );
+        let grandchild_pid = pids[0];
+        let child_pid = pids[1];
+
+        // Poll: the drop-time group-kill should reap BOTH the direct child and
+        // the grandchild. Allow a brief window for SIGKILL delivery + reap.
+        let mut child_alive = true;
+        let mut grandchild_alive = true;
+        for _ in 0..100 {
+            child_alive = pid_is_alive(child_pid);
+            grandchild_alive = pid_is_alive(grandchild_pid);
+            if !child_alive && !grandchild_alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Best-effort cleanup so a RED run does not leak orphans.
+        for pid in [grandchild_pid, child_pid] {
+            if pid_is_alive(pid) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+        }
+
+        assert!(
+            !child_alive,
+            "plugin DIRECT child (pid {child_pid}) was ORPHANED after the execute future was dropped"
+        );
+        assert!(
+            !grandchild_alive,
+            "plugin GRANDCHILD (pid {grandchild_pid}) was ORPHANED after the execute future was \
+             dropped — process tree leaked (kill_on_drop reaps only the direct child)"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Plugin protocol v2 stderr dispatch tests (W3.F2).
     // -------------------------------------------------------------------
@@ -4569,6 +5297,190 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output, "unprompted");
         assert!(last.lock().unwrap().is_none());
+    }
+
+    // ---- risk gate honors ApprovalPolicy (yolo GAP #2) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn should_deny_high_risk_plugin_without_prompt_when_approval_policy_never() {
+        // yolo GAP #2: the manifest risk gate previously ignored
+        // `ApprovalPolicy`, so a `never`/full-access session still got an
+        // approval prompt. Parity with shell.rs's fail-closed
+        // "approval_policy is never": under `Never` (and NOT a dangerous
+        // auto-allow context) a high-risk plugin must be DENIED without ever
+        // issuing an approval request.
+        use crate::policy::ApprovalPolicy;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"should_not_run\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_never", "danger");
+        def.risk = Some("high".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5))
+            .with_approval_policy(ApprovalPolicy::Never);
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute returns Ok with deny message");
+
+        assert!(!result.success, "never policy must fail the high-risk call");
+        assert!(
+            result.output.contains("approval_policy is never"),
+            "deny message should cite the never policy; got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("should_not_run"));
+        assert!(
+            last.lock().unwrap().is_none(),
+            "no approval request may be issued under approval_policy=never"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn should_auto_allow_high_risk_plugin_without_prompt_when_danger_full_access() {
+        // yolo GAP #2: a DangerFullAccess / AllowAll context auto-approves the
+        // risk gate (parity with shell's AllowAllPolicy under danger) — the
+        // plugin runs without a prompt even though its `approval_policy` is
+        // `Never` (which danger implies).
+        use crate::policy::ApprovalPolicy;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\necho '{\"output\":\"ran_under_yolo\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_yolo", "danger");
+        def.risk = Some("critical".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5))
+            .with_approval_policy(ApprovalPolicy::Never)
+            .with_auto_approve_high_risk(true);
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(
+            result.success,
+            "danger full access must auto-allow the risk gate"
+        );
+        assert_eq!(result.output, "ran_under_yolo");
+        assert!(
+            last.lock().unwrap().is_none(),
+            "no approval request may be issued under a danger auto-allow context"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn should_request_approval_for_high_risk_plugin_when_approval_policy_ask() {
+        // Regression pin: the default Ask policy still routes a high-risk
+        // plugin through the interactive approval bridge.
+        use crate::policy::ApprovalPolicy;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\necho '{\"output\":\"ran\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_ask", "danger");
+        def.risk = Some("high".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5))
+            .with_approval_policy(ApprovalPolicy::Ask);
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "ran");
+        assert!(
+            last.lock().unwrap().is_some(),
+            "Ask policy must still request approval for a high-risk plugin"
+        );
+    }
+
+    #[test]
+    fn should_thread_session_approval_context_into_plugin_tools_on_rebind() {
+        // yolo GAP #2 wiring: `apply_permissions_to_plugin_tools` (invoked by
+        // `rebind_cwd_with_permissions`) must replace each plugin tool with a
+        // copy carrying the session's approval context, so a plugin registered
+        // at profile-build time inherits the per-session `ApprovalPolicy`.
+        use crate::policy::{ApprovalPolicy, EffectivePermissions, PermissionProfile, RuntimeMode};
+        use crate::tools::ToolRegistry;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(&script_path, "#!/bin/sh\necho '{}'\n");
+        let mut def = make_tool_def("risky", "risky");
+        def.risk = Some("high".into());
+
+        // A plugin tool starts with the interactive default (Ask, no auto-allow).
+        let mut registry = ToolRegistry::new();
+        registry.register(PluginTool::new("p".into(), def, script_path));
+        {
+            let base = registry.get("risky").expect("plugin registered");
+            let pt = base
+                .as_any()
+                .downcast_ref::<PluginTool>()
+                .expect("is a PluginTool");
+            assert_eq!(pt.approval_policy(), ApprovalPolicy::Ask);
+            assert!(!pt.auto_approve_high_risk());
+        }
+
+        // A `never` workspace session: the risk gate must fail closed.
+        let never =
+            EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
+        registry.apply_permissions_to_plugin_tools(never);
+        {
+            let pt_arc = registry.get("risky").unwrap();
+            let pt = pt_arc.as_any().downcast_ref::<PluginTool>().unwrap();
+            assert_eq!(pt.approval_policy(), ApprovalPolicy::Never);
+            assert!(
+                !pt.auto_approve_high_risk(),
+                "workspace-write never is NOT an auto-allow context"
+            );
+        }
+
+        // A DangerFullAccess ("yolo") session: the risk gate auto-allows.
+        let danger = EffectivePermissions::for_runtime(
+            PermissionProfile::DangerFullAccess,
+            RuntimeMode::Solo,
+        )
+        .expect("solo danger");
+        registry.apply_permissions_to_plugin_tools(danger);
+        {
+            let pt_arc = registry.get("risky").unwrap();
+            let pt = pt_arc.as_any().downcast_ref::<PluginTool>().unwrap();
+            assert!(
+                pt.auto_approve_high_risk(),
+                "DangerFullAccess must set the auto-allow flag on plugin tools"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

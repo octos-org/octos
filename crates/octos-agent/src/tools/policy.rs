@@ -205,7 +205,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:memory",
         description: "Long-term memory: save and recall knowledge across sessions",
-        tools: &["recall_memory", "save_memory"],
+        tools: &["recall_memory", "save_memory", "memory_note"],
     },
     ToolGroupInfo {
         name: "group:research",
@@ -221,6 +221,15 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
         name: "group:media",
         description: "Media generation: comics, slides, infographics, cards, and text-to-speech",
         tools: &[
+            // RFC-1 fixup (codex round 3 P2): include the dispatcher
+            // pair so profile/policy allow-lists that grant only
+            // `group:media` still have a LLM-visible entry-point. Pre-
+            // fixup, an `allow: [group:media]` policy would retain
+            // only the (now internal-hidden) concrete targets and
+            // drop `mofa_make` / `mofa_describe_content_type`,
+            // leaving the LLM with no callable generation tool.
+            "mofa_make",
+            "mofa_describe_content_type",
             "mofa_comic",
             "mofa_slides",
             "mofa_infographic",
@@ -243,6 +252,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
             "send_message",
             "message",
             "save_memory",
+            "memory_note",
             "execute_code",
         ],
     },
@@ -274,10 +284,16 @@ fn expand_group(name: &str) -> Option<&'static [&'static str]> {
 /// Returns `true` if the tool should be kept, `false` if it should be
 /// evicted from the registry.
 pub fn keep_tool_in_slides_session(tool_name: &str) -> bool {
-    if tool_name == "mofa_slides" {
-        return true;
-    }
-    !tool_name.starts_with("mofa_")
+    // RFC-1 fixup (codex P1 round 2): retain the dispatcher pair too.
+    // After the RFC-1 switch from `defer` → `mark_internal_hidden`,
+    // `mofa_slides` is registered but invisible to `specs()` — the
+    // LLM only sees `mofa_make` + `mofa_describe_content_type`. If
+    // `retain` evicts those (they share the `mofa_` prefix), slides
+    // sessions end up with NO visible slides-generation tool.
+    matches!(
+        tool_name,
+        "mofa_slides" | "mofa_make" | "mofa_describe_content_type"
+    ) || !tool_name.starts_with("mofa_")
 }
 
 #[cfg(test)]
@@ -437,6 +453,61 @@ mod tests {
         // — that's the one tool the system prompt instructs the LLM to
         // call. Evicting it would break the slides workflow entirely.
         assert!(keep_tool_in_slides_session("mofa_slides"));
+    }
+
+    /// RFC-1 fixup (codex round 2 P1): when the make_type-based
+    /// `mofa-slides` skill is installed, `mofa_slides` is hidden via
+    /// `mark_internal_hidden` and the LLM only sees `mofa_make` +
+    /// `mofa_describe_content_type`. The slides-session retain MUST
+    /// preserve those two so the LLM still has a slides-generation
+    /// entry-point. Pre-fixup, retain evicted both (they share the
+    /// `mofa_` prefix) and slides sessions ended up with no visible
+    /// slides tool whatsoever.
+    #[test]
+    fn should_keep_mofa_make_dispatcher_pair_in_slides_session() {
+        assert!(
+            keep_tool_in_slides_session("mofa_make"),
+            "mofa_make dispatcher MUST survive slides-session retain — \
+             it is the only LLM-facing entry-point after RFC-1 hides \
+             the individual mofa_slides target tool"
+        );
+        assert!(
+            keep_tool_in_slides_session("mofa_describe_content_type"),
+            "mofa_describe_content_type must survive slides-session \
+             retain so the LLM can fetch the slides args schema"
+        );
+    }
+
+    /// RFC-1 fixup (codex round 3 P2): the `group:media` definition
+    /// must include the `mofa_make` dispatcher pair so any policy that
+    /// allow-lists `group:media` retains an LLM-callable generation
+    /// entry-point. Pre-fixup the group held only the concrete
+    /// targets (`mofa_slides`, `mofa_cards`, ...), so a profile with
+    /// `allow: [group:media]` would keep only internal-hidden tools
+    /// and drop the dispatcher, leaving no callable surface.
+    #[test]
+    fn group_media_includes_mofa_make_dispatcher_pair() {
+        let info = tool_group_info("group:media").expect("group:media defined");
+        assert!(
+            info.tools.contains(&"mofa_make"),
+            "group:media must include mofa_make so allow-list policies \
+             retain the dispatcher; got {:?}",
+            info.tools
+        );
+        assert!(
+            info.tools.contains(&"mofa_describe_content_type"),
+            "group:media must include mofa_describe_content_type so \
+             allow-list policies retain the catalog query tool"
+        );
+        // And a policy that allows only group:media must accept these
+        // names — guards against future regression that removes the
+        // dispatcher from the group while keeping the targets.
+        let policy = ToolPolicy {
+            allow: vec!["group:media".into()],
+            ..Default::default()
+        };
+        assert!(policy.is_allowed("mofa_make"));
+        assert!(policy.is_allowed("mofa_describe_content_type"));
     }
 
     #[test]

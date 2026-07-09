@@ -12,11 +12,16 @@ import type {
   SoloLoginResult,
   SoloCreateResult,
   User,
+  UserRole,
   AllowlistEntry,
   SharedMetrics,
   MonitorStatus,
+  MonitorProfileStatus,
   SystemMetrics,
   PurgeReport,
+  AdminAuditResponse,
+  UsageAnalytics,
+  UsageQueryParams,
 } from './types'
 
 const BASE = '/api/admin'
@@ -28,16 +33,48 @@ const BASE = '/api/admin'
 /// common "auth failed, hand back to the login flow" branch.
 export class ApiError extends Error {
   public readonly status: number
+  public readonly code?: string
+  public readonly details?: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string, details?: unknown) {
     super(message || `HTTP ${status}`)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
+    this.details = details
   }
 
   static isAuthError(err: unknown): boolean {
     return err instanceof ApiError && (err.status === 401 || err.status === 403)
   }
+}
+
+type ErrorBody = {
+  code?: unknown
+  message?: unknown
+  error?: unknown
+  details?: unknown
+}
+
+async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  const text = await res.text()
+  if (text.trim()) {
+    try {
+      const body = JSON.parse(text) as ErrorBody
+      if (body && typeof body === 'object') {
+        const message = typeof body.message === 'string'
+          ? body.message
+          : typeof body.error === 'string'
+            ? body.error
+            : text
+        const code = typeof body.code === 'string' ? body.code : undefined
+        return new ApiError(res.status, message, code, body.details)
+      }
+    } catch {
+      // Fall through to the raw response body for legacy text errors.
+    }
+  }
+  return new ApiError(res.status, text)
 }
 
 export interface SkillRegistryPackage {
@@ -69,8 +106,7 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
@@ -81,8 +117,7 @@ async function requestNoContent(path: string, opts?: RequestInit): Promise<void>
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
 }
 
@@ -92,8 +127,7 @@ async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
 }
@@ -104,16 +138,45 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
+}
+
+function queryPath(path: string, params: Record<string, string | number | undefined | null>): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && `${value}`.trim() !== '') {
+      query.set(key, `${value}`)
+    }
+  }
+  const suffix = query.toString()
+  return suffix ? `${path}?${suffix}` : path
+}
+
+function usageQuery(query?: UsageQueryParams): string {
+  const params = new URLSearchParams()
+  if (query?.session_id) params.set('session_id', query.session_id)
+  if (query?.from) params.set('from', query.from)
+  if (query?.to) params.set('to', query.to)
+  const encoded = params.toString()
+  return encoded ? `?${encoded}` : ''
 }
 
 // ── Admin API (existing) ────────────────────────────────────────────
 
 export const api = {
   overview: () => request<OverviewResponse>('/overview'),
+
+  listAudit: (params?: {
+    actor?: string
+    action?: string
+    target_id?: string
+    from?: string
+    to?: string
+    limit?: number
+    offset?: number
+  }) => request<AdminAuditResponse>(queryPath('/audit', params ?? {})),
 
   listProfiles: () => request<ProfileResponse[]>('/profiles'),
 
@@ -172,6 +235,17 @@ export const api = {
   providerMetrics: (id: string) =>
     request<SharedMetrics | null>(`/profiles/${id}/metrics`),
 
+  usage: (query?: UsageQueryParams) =>
+    request<UsageAnalytics>(`/usage${usageQuery(query)}`),
+
+  profileUsage: (id: string, query?: UsageQueryParams) =>
+    request<UsageAnalytics>(`/profiles/${id}/usage${usageQuery(query)}`),
+
+  profileSessionUsage: (id: string, sessionId: string, query?: Omit<UsageQueryParams, 'session_id'>) =>
+    request<UsageAnalytics>(
+      `/profiles/${id}/usage/sessions/${encodeURIComponent(sessionId)}${usageQuery(query)}`,
+    ),
+
   // Sub-account management
   listSubAccounts: (parentId: string) =>
     request<ProfileResponse[]>(`/profiles/${parentId}/accounts`),
@@ -184,6 +258,12 @@ export const api = {
 
   // User management (admin)
   listUsers: () => request<{ users: User[] }>('/users'),
+
+  updateUserRole: (id: string, role: UserRole) =>
+    request<User>(`/users/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    }),
 
   listAllowedEmails: () => request<{ entries: AllowlistEntry[] }>('/allowed-emails'),
 
@@ -214,6 +294,15 @@ export const api = {
     request<{ ok: boolean; alerts_enabled: boolean }>('/monitor/alerts', {
       method: 'POST',
       body: JSON.stringify({ enabled }),
+    }),
+
+  updateProfileMonitor: (
+    id: string,
+    data: { watchdog?: 'inherit' | 'enabled' | 'disabled'; alerts?: 'inherit' | 'enabled' | 'disabled' },
+  ) =>
+    request<MonitorProfileStatus>(`/monitor/profiles/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     }),
 
   gatewayStatus: (id: string) =>
@@ -445,6 +534,14 @@ export const myApi = {
 
   providerMetrics: () =>
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
+
+  usage: (query?: UsageQueryParams) =>
+    authedRequest<UsageAnalytics>(`/my/usage${usageQuery(query)}`),
+
+  sessionUsage: (sessionId: string, query?: Omit<UsageQueryParams, 'session_id'>) =>
+    authedRequest<UsageAnalytics>(
+      `/my/usage/sessions/${encodeURIComponent(sessionId)}${usageQuery(query)}`,
+    ),
 
   listProfileSkills: () =>
     authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(

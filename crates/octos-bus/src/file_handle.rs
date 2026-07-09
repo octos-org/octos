@@ -450,9 +450,428 @@ fn sanitize_display_name(name: &str) -> String {
     }
 }
 
+/// Materialize turn-attached upload references into `<workspace>/uploads/` so
+/// they become first-class, browsable session files (#1377). Returns the media
+/// list rewritten for the model and for persistence:
+///
+/// - A **non-image** upload handle / tmpdir reference is COPIED into
+///   `<workspace>/uploads/<name>` and rewritten to the workspace-relative
+///   string `uploads/<name>`, so `read_file`/`grep`/`list_dir`/`glob` all work
+///   by normal filesystem semantics — and global `up/` resolution can be
+///   refused for scoped sessions (tenant isolation) without losing access.
+/// - **Images** pass through UNCHANGED: they're consumed by the vision encoder
+///   via `std::fs::read` on their path (never via `read_file`), so the model
+///   never browses them and materializing would only risk the vision path.
+///   (Image materialization is a tracked follow-up.)
+/// - Anything that does NOT resolve to a staged upload — an already
+///   workspace-relative path (e.g. a re-referenced prior-turn `uploads/x`) or
+///   an unknown string — is passed through unchanged (idempotent across turns).
+///
+/// Copy is collision-safe (`uploads/<uuid>-<name>` on a name clash; never
+/// overwrites), symlink-safe (refuses a symlinked `uploads/` dir or an existing
+/// `uploads/<name>` entry), and atomic (temp file + rename). The source has
+/// already been canonicalized under the upload tmpdir by
+/// `resolve_upload_reference`, so symlink escapes on the source are excluded.
+/// The original (sanitized) display name from an `up/<base64>/<display>`
+/// handle, if present. `None` for the 2-segment `up/<base64>` form or a
+/// non-handle string. base64 uses URL-safe alphabet (no `/`), so the display is
+/// the segment after the second `/`.
+fn handle_display_name(entry: &str) -> Option<String> {
+    let display = entry.strip_prefix("up/")?.split_once('/')?.1;
+    if display.is_empty() {
+        return None;
+    }
+    Some(sanitize_display_name(display))
+}
+
+pub fn materialize_turn_uploads(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    media: &[String],
+) -> Vec<String> {
+    let uploads_dir = workspace_root.join("uploads");
+    media
+        .iter()
+        .filter_map(
+            |entry| match materialize_one(&uploads_dir, tenant_id, entry) {
+                MaterializeOutcome::Rewritten(path) => Some(path),
+                MaterializeOutcome::Passthrough => Some(entry.clone()),
+                // Foreign / cross-tenant: DROP the entry entirely. Passing the
+                // original handle through would let a no-`SessionScope` session
+                // (profile-qualified / cwd-hinted) read it via the legacy
+                // `resolve_path` fallback, bypassing the tenant gate (codex P1).
+                MaterializeOutcome::DropForeign => None,
+            },
+        )
+        .collect()
+}
+
+enum MaterializeOutcome {
+    /// Copied into the workspace; use this `uploads/<name>` path.
+    Rewritten(String),
+    /// Not a staged upload to rewrite (image / already-workspace / unknown /
+    /// I/O refusal) — keep the original media string unchanged.
+    Passthrough,
+    /// A staged upload owned by ANOTHER tenant — remove it from the media set.
+    DropForeign,
+}
+
+/// Copy one upload reference into `uploads_dir`. See [`MaterializeOutcome`].
+/// Whether a RESOLVED upload-tmpdir path is owned by `tenant_id`.
+///
+/// Uploads are stored as `octos-uploads/<tenant>/<uuid>_<name>`, so the FIRST
+/// path component of the resolved file (relative to the canonical upload root)
+/// is the owning tenant. This is the single tenant-ownership predicate shared by
+/// every upload-into-workspace path so the isolation rule cannot drift between
+/// them (the serve `materialize_one` and the gateway/actor
+/// `copy_media_to_workspace`):
+///
+/// - `tenant_id == Some(t)` → owned only if the resolved file's first component
+///   under the upload root equals `t`. A file owned by ANOTHER tenant — by `up/`
+///   handle, a raw absolute/relative tmpdir path, OR an image path — is NOT
+///   owned. A flat legacy file (no tenant component) is NOT owned either.
+/// - `tenant_id == None` (solo / CLI `octos chat`, single-tenant) → always owned.
+///
+/// Callers pass a path that is ALREADY resolved (e.g. via
+/// [`resolve_upload_reference`]); a path outside the upload root yields `false`
+/// for a multi-tenant caller, so non-upload paths must be screened separately.
+/// Whether a RESOLVED path lives under the process-global upload tmpdir
+/// root (`octos-uploads`). Callers use this to decide whether the tenant
+/// ownership rule ([`upload_owned_by_tenant`]) even applies: a workspace or
+/// profile file is NOT under the upload root and must not be subjected to
+/// the upload-ownership check (it would be falsely denied).
+pub fn is_under_upload_root(resolved: &Path) -> bool {
+    resolved.starts_with(canonical_root(&temp_upload_root()))
+}
+
+pub fn upload_owned_by_tenant(resolved: &Path, tenant_id: Option<&str>) -> bool {
+    let Some(tenant) = tenant_id else {
+        return true; // single-tenant: ownership check does not apply
+    };
+    let Ok(rel) = resolved.strip_prefix(canonical_root(&temp_upload_root())) else {
+        return false; // outside the upload root entirely
+    };
+    let mut comps = rel.components();
+    let first_is_tenant =
+        matches!(comps.next(), Some(Component::Normal(s)) if s.to_str() == Some(tenant));
+    // Require at least one MORE component after the tenant directory. A flat
+    // file resolved at `octos-uploads/<tenant>` (the legacy flat `/upload`
+    // path can create a file named exactly like the tenant) has the tenant as
+    // its ONLY component — that is NOT a `<tenant>/<file>` layout and must not
+    // be treated as owned (codex P2). `<tenant>/<file>` → owned.
+    first_is_tenant && comps.next().is_some()
+}
+
+fn materialize_one(uploads_dir: &Path, tenant_id: Option<&str>, entry: &str) -> MaterializeOutcome {
+    let Some(src) = resolve_upload_reference(entry) else {
+        return MaterializeOutcome::Passthrough; // not a staged upload (workspace path / external / unknown)
+    };
+
+    // #1377 tenant isolation: in a multi-tenant session only keep a file owned by
+    // THIS tenant; a file owned by another tenant — whether referenced by `up/`
+    // handle, a raw absolute/relative tmpdir path, OR an image path (which would
+    // otherwise reach the vision encoder via std::fs::read) — is DROPPED. Checking
+    // the RESOLVED path covers ALL of these (codex round-6 P1.3 + round-7 image
+    // P1). Solo sessions (`tenant_id == None`, CLI `octos chat`) skip the check.
+    if !upload_owned_by_tenant(&src, tenant_id) {
+        return MaterializeOutcome::DropForeign;
+    }
+
+    // Owned image: keep it on the vision path (the encoder reads it directly via
+    // std::fs::read) — don't copy into `uploads/`. Rewrite to the resolved
+    // ABSOLUTE path so the encoder can read it (a bare `up/` handle isn't a real
+    // file path). A non-tmpdir image (workspace/external) already returned
+    // Passthrough above via `resolve_upload_reference` == None.
+    if crate::media::is_image(entry) {
+        return match src.to_str() {
+            Some(abs) => MaterializeOutcome::Rewritten(abs.to_string()),
+            None => MaterializeOutcome::Passthrough,
+        };
+    }
+
+    // From here the file is OWNED by this tenant (or solo) — an I/O refusal
+    // returns Passthrough (keep the original handle; never re-expose a foreign
+    // file, which was already DropForeign'd above).
+    // Never write through a symlinked `uploads/` directory.
+    if let Ok(meta) = std::fs::symlink_metadata(uploads_dir) {
+        if meta.file_type().is_symlink() {
+            return MaterializeOutcome::Passthrough;
+        }
+    }
+    if std::fs::create_dir_all(uploads_dir).is_err() {
+        return MaterializeOutcome::Passthrough;
+    }
+
+    // Prefer the original display name carried in the `up/<base64>/<display>`
+    // handle — the upload endpoint stores the file on disk as `<uuid>_<name>`,
+    // so `src.file_name()` would leak the uuid into the workspace path the model
+    // sees. Fall back to the source basename for non-handle references.
+    let base = handle_display_name(entry).unwrap_or_else(|| {
+        sanitize_display_name(src.file_name().and_then(|n| n.to_str()).unwrap_or("file"))
+    });
+    // Stage the bytes in a private temp file, then publish via `hard_link`,
+    // which is atomic AND fails (rather than replacing, the way `rename` does)
+    // if the destination already exists. This makes concurrent turns
+    // materializing the same display name safe: at most one wins each name; the
+    // loser observes `AlreadyExists` and falls back to a uuid-prefixed name. A
+    // bare existence pre-check + `rename` would let two turns both pick
+    // `uploads/<name>` and clobber each other (codex #1377 P2).
+    let tmp = uploads_dir.join(format!(".{}.{base}.tmp", uuid::Uuid::now_v7()));
+    if std::fs::copy(&src, &tmp).is_err() {
+        return MaterializeOutcome::Passthrough;
+    }
+    let published = {
+        let first = uploads_dir.join(&base);
+        match std::fs::hard_link(&tmp, &first) {
+            Ok(()) => Some(base.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let unique = format!("{}-{base}", uuid::Uuid::now_v7());
+                std::fs::hard_link(&tmp, uploads_dir.join(&unique))
+                    .ok()
+                    .map(|()| unique)
+            }
+            Err(_) => None,
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    match published {
+        Some(name) => MaterializeOutcome::Rewritten(format!("uploads/{name}")),
+        None => MaterializeOutcome::Passthrough,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create a real file under the upload tmpdir (flat, legacy layout) and
+    /// return its `up/` handle.
+    fn stage_upload(name: &str, body: &[u8]) -> (PathBuf, String) {
+        let root = temp_upload_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("{}_{name}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, body).unwrap();
+        let handle = encode_tmp_upload_handle(&path, Some(name)).expect("encode handle");
+        (path, handle)
+    }
+
+    /// Create a real file under the per-tenant upload layout
+    /// (`octos-uploads/<tenant>/<uuid>_<name>`) and return its `up/` handle
+    /// (whose decoded relative path therefore begins with `<tenant>`).
+    fn stage_tenant_upload(tenant: &str, name: &str, body: &[u8]) -> (PathBuf, String) {
+        let dir = temp_upload_root().join(tenant);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}_{name}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, body).unwrap();
+        let handle = encode_tmp_upload_handle(&path, Some(name)).expect("encode handle");
+        (path, handle)
+    }
+
+    #[test]
+    fn materialize_matching_tenant_materializes_mismatch_and_flat_dropped() {
+        let ws = tempfile::tempdir().unwrap();
+        let (_a, h_a) = stage_tenant_upload("tenant-a", "owned.md", b"mine");
+        let (_b, h_b) = stage_tenant_upload("tenant-b", "foreign.md", b"theirs");
+        let (_f, h_flat) = stage_upload("legacy.md", b"flat");
+
+        // Session belongs to tenant-a.
+        let out = materialize_turn_uploads(ws.path(), Some("tenant-a"), &[h_a, h_b, h_flat]);
+
+        // tenant-a's own upload → materialized; the others (another tenant + a
+        // flat legacy handle) → DROPPED entirely (removed from the media set,
+        // not passed through — so a no-scope session can't reach them via the
+        // legacy resolver), and never copied into the workspace.
+        assert_eq!(out, vec!["uploads/owned.md".to_string()]);
+        assert!(ws.path().join("uploads/owned.md").is_file());
+        assert!(!ws.path().join("uploads/foreign.md").exists());
+        assert!(!ws.path().join("uploads/legacy.md").exists());
+    }
+
+    #[test]
+    fn materialize_rejects_raw_tmpdir_path_bypass() {
+        // codex round-5 P1.3: a client can submit a raw absolute path under
+        // another tenant's upload dir (NOT an up/ handle, so decode returns
+        // None). The check on the RESOLVED path must still drop it.
+        let ws = tempfile::tempdir().unwrap();
+        let (abs_src, _handle) = stage_tenant_upload("tenant-b", "secret.md", b"theirs");
+        let raw_abs = abs_src.to_string_lossy().into_owned();
+
+        let out =
+            materialize_turn_uploads(ws.path(), Some("tenant-a"), std::slice::from_ref(&raw_abs));
+        assert!(
+            out.is_empty(),
+            "raw cross-tenant tmpdir path must be DROPPED, got: {out:?}"
+        );
+        assert!(!ws.path().join("uploads/secret.md").exists());
+
+        // The owner (tenant-b) CAN materialize the same raw path. (A raw path
+        // carries no `up/` display name, so the workspace copy keeps the on-disk
+        // `<uuid>_secret.md` basename — that's fine; the point is it materializes.)
+        let ws_b = tempfile::tempdir().unwrap();
+        let out_b = materialize_turn_uploads(ws_b.path(), Some("tenant-b"), &[raw_abs]);
+        assert!(
+            out_b[0].starts_with("uploads/") && out_b[0].ends_with("secret.md"),
+            "owner's raw path should materialize, got: {}",
+            out_b[0]
+        );
+        assert!(ws_b.path().join(&out_b[0]).is_file());
+    }
+
+    #[test]
+    fn is_under_upload_root_distinguishes_upload_from_other_paths() {
+        let root = canonical_root(&temp_upload_root());
+        // Upload-root paths (any tenant / flat) are "under" the root — the
+        // download gate then applies the ownership check to these.
+        assert!(is_under_upload_root(&root.join("dspfac/uuid_doc.md")));
+        assert!(is_under_upload_root(&root.join("flat.md")));
+        // Workspace / profile / external paths are NOT under the upload root,
+        // so the download gate leaves them alone (no false denial).
+        assert!(!is_under_upload_root(std::path::Path::new(
+            "/some/profile/data/users/web-1/workspace/out.pptx"
+        )));
+        assert!(!is_under_upload_root(std::path::Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn upload_owned_by_tenant_keys_off_first_component_under_root() {
+        // The shared predicate used by BOTH the serve materializer and the
+        // gateway/actor `copy_media_to_workspace`. Ownership = the resolved
+        // file's first path component (under the canonical upload root)
+        // equals the tenant.
+        let root = canonical_root(&temp_upload_root());
+        let owned = root.join("dspfac").join("uuid_doc.md");
+        let foreign = root.join("acme").join("uuid_doc.md");
+        let flat = root.join("legacy_no_tenant.md");
+        // Flat file named EXACTLY like the tenant (legacy flat `/upload`): the
+        // tenant is its only component, so it must NOT be owned (codex P2).
+        let flat_named_as_tenant = root.join("dspfac");
+        let outside = PathBuf::from("/etc/passwd");
+
+        // Multi-tenant: only `<tenant>/<file>` is owned.
+        assert!(upload_owned_by_tenant(&owned, Some("dspfac")));
+        assert!(!upload_owned_by_tenant(&foreign, Some("dspfac")));
+        // Flat files (no tenant subdir) and paths outside the upload root are
+        // NOT owned — all dropped by the materializer / copy path.
+        assert!(!upload_owned_by_tenant(&flat, Some("dspfac")));
+        assert!(!upload_owned_by_tenant(
+            &flat_named_as_tenant,
+            Some("dspfac")
+        ));
+        assert!(!upload_owned_by_tenant(&outside, Some("dspfac")));
+
+        // Solo (tenant_id == None, CLI `octos chat`): ownership check skipped.
+        assert!(upload_owned_by_tenant(&foreign, None));
+        assert!(upload_owned_by_tenant(&outside, None));
+    }
+
+    #[test]
+    fn materialize_solo_session_ignores_tenant_check() {
+        // tenant_id == None (CLI `octos chat`): no tenant gate — a flat handle
+        // still materializes (back-compat).
+        let ws = tempfile::tempdir().unwrap();
+        let (_f, h_flat) = stage_upload("notes.md", b"solo");
+        let out = materialize_turn_uploads(ws.path(), None, std::slice::from_ref(&h_flat));
+        assert_eq!(out[0], "uploads/notes.md");
+        assert!(ws.path().join("uploads/notes.md").is_file());
+    }
+
+    #[test]
+    fn materialize_copies_non_image_upload_into_workspace_uploads() {
+        let ws = tempfile::tempdir().unwrap();
+        let (src, handle) = stage_upload("report.md", b"# strategy\n");
+
+        let out = materialize_turn_uploads(ws.path(), None, &[handle]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], "uploads/report.md", "rewritten to workspace path");
+        let dest = ws.path().join("uploads/report.md");
+        assert!(dest.is_file(), "file copied into <workspace>/uploads/");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"# strategy\n");
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn materialize_keeps_owned_image_on_vision_path_as_absolute() {
+        let ws = tempfile::tempdir().unwrap();
+        let (src, handle) = stage_upload("photo.png", b"\x89PNG\r\n");
+        // Solo (no tenant): image is NOT copied into uploads/, but is rewritten
+        // to its resolved ABSOLUTE path so the vision encoder can `std::fs::read`
+        // it (a bare `up/` handle isn't a real file path).
+        let out = materialize_turn_uploads(ws.path(), None, std::slice::from_ref(&handle));
+        assert_eq!(
+            out[0],
+            std::fs::canonicalize(&src).unwrap().to_string_lossy(),
+            "owned image → resolved absolute path"
+        );
+        assert!(
+            !ws.path().join("uploads").exists(),
+            "no uploads/ dir created for an image-only turn"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn materialize_drops_foreign_image() {
+        // codex round-7 P1: a raw image path under ANOTHER tenant's upload dir
+        // must be DROPPED, not passed through to the vision encoder.
+        let ws = tempfile::tempdir().unwrap();
+        let (src, _h) = stage_tenant_upload("tenant-b", "secret.png", b"\x89PNG\r\n");
+        let raw_abs = src.to_string_lossy().into_owned();
+        let out = materialize_turn_uploads(ws.path(), Some("tenant-a"), &[raw_abs]);
+        assert!(
+            out.is_empty(),
+            "foreign image must be dropped, got: {out:?}"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn materialize_passes_through_non_upload_paths() {
+        let ws = tempfile::tempdir().unwrap();
+        // Already a workspace-relative path (e.g. a re-referenced prior turn) —
+        // resolve_upload_reference returns None → passthrough (idempotent).
+        let out = materialize_turn_uploads(
+            ws.path(),
+            None,
+            &["uploads/report.md".to_string(), "notes.txt".to_string()],
+        );
+        assert_eq!(out, vec!["uploads/report.md", "notes.txt"]);
+    }
+
+    #[test]
+    fn materialize_never_overwrites_on_name_collision() {
+        let ws = tempfile::tempdir().unwrap();
+        let (s1, h1) = stage_upload("dup.md", b"first");
+        let (s2, h2) = stage_upload("dup.md", b"second");
+        let out = materialize_turn_uploads(ws.path(), None, &[h1, h2]);
+        assert_eq!(out[0], "uploads/dup.md");
+        assert_ne!(out[1], "uploads/dup.md", "collision gets a unique suffix");
+        assert!(out[1].starts_with("uploads/") && out[1].ends_with("-dup.md"));
+        // Both files exist with their own content (no clobber).
+        assert_eq!(std::fs::read(ws.path().join(&out[0])).unwrap(), b"first");
+        assert_eq!(std::fs::read(ws.path().join(&out[1])).unwrap(), b"second");
+        let _ = std::fs::remove_file(&s1);
+        let _ = std::fs::remove_file(&s2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_symlinked_uploads_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // `uploads` is a symlink pointing outside the workspace.
+        std::os::unix::fs::symlink(elsewhere.path(), ws.path().join("uploads")).unwrap();
+        let (src, handle) = stage_upload("x.md", b"data");
+        let out = materialize_turn_uploads(ws.path(), None, std::slice::from_ref(&handle));
+        assert_eq!(
+            out[0], handle,
+            "must NOT write through a symlinked uploads/ dir"
+        );
+        assert!(
+            !elsewhere.path().join("x.md").exists(),
+            "no file written through the symlink"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
 
     #[test]
     fn profile_handle_round_trips() {

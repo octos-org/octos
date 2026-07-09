@@ -48,7 +48,8 @@ use octos_agent::BackgroundResultPayload;
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     FileAttachedEvent, SessionEventBridgedEvent, TurnCompletedEvent, TurnId, TurnSessionResult,
-    TurnStartedEvent, UiNotification,
+    TurnStartedEvent, UiNotification, VisualFailedEvent, VisualGeneratingEvent,
+    VisualSucceededEvent, VoiceExitEvent,
 };
 use serde_json::Value;
 
@@ -149,6 +150,35 @@ pub(super) fn emit_turn_completed_full(
 /// runs inside a tool execution (rare; reserved for background-result
 /// futures). `mime` is also optional — clients fall back to extension
 /// sniffing when absent.
+/// Best-effort artefact size for a `file/attached` envelope (spec § 14.5
+/// mandates a value; clients fall back to extension/decode when it is 0).
+///
+/// The `path` here is the WORKSPACE-RELATIVE artefact name (e.g. a voice reply
+/// `reply-<id>.wav`); the SPA resolves it through `/api/files?session=…` at
+/// fetch time. Statting a relative path against the server's *process* CWD is
+/// therefore meaningless and was producing a steady stream of spurious
+/// "fs::metadata failed" warnings (#voice). So:
+/// - relative path  → report 0 silently (cannot resolve the workspace here);
+/// - absolute path  → stat it, and warn only on a genuine miss (file deleted
+///   between tool-end and emit, permissions, …) — that is a real signal.
+fn artifact_size_bytes(path: &str) -> u64 {
+    if !std::path::Path::new(path).is_absolute() {
+        return 0;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            tracing::warn!(
+                target: "octos::ui_protocol::envelope",
+                path = %path,
+                ?error,
+                "file/attached envelope: fs::metadata failed; emitting size_bytes=0",
+            );
+            0
+        }
+    }
+}
+
 pub(super) fn emit_file_attached(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -173,22 +203,8 @@ pub(super) fn emit_file_attached(
 
     // UPCR-2026-014 M9-γ dual-emit: parallel canonical
     // `file_attached` envelope. `mime` defaults to
-    // `application/octet-stream` (spec § 14.5 mandates a value); a
-    // warning is logged on metadata read failure so soak monitoring
-    // can surface broken artefact deliveries (file deleted between
-    // tool-end and emit, permissions, etc.).
-    let size_bytes = match std::fs::metadata(&path) {
-        Ok(meta) => meta.len(),
-        Err(error) => {
-            tracing::warn!(
-                target: "octos::ui_protocol::envelope",
-                path = %path,
-                ?error,
-                "file/attached envelope: fs::metadata failed; emitting size_bytes=0",
-            );
-            0
-        }
-    };
+    // `application/octet-stream` (spec § 14.5 mandates a value).
+    let size_bytes = artifact_size_bytes(&path);
     let envelope_mime = mime
         .as_deref()
         .filter(|m| !m.trim().is_empty())
@@ -287,6 +303,90 @@ pub(super) fn emit_files_attached_from_background(
             mime,
         );
     }
+}
+
+/// #1477 voice rich output: announce that a background visual artifact began
+/// generating, so the client can show a "generating" placeholder driven by this
+/// typed event instead of scraping an in-band marker out of the assistant text.
+/// Routed on the BASE session key (like [`emit_files_attached_from_background`])
+/// while still carrying the topic so topic-scoped subscribers accept it.
+pub(super) fn emit_visual_generating_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    kind: &str,
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualGenerating(VisualGeneratingEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        kind: kind.to_owned(),
+    }));
+}
+
+/// #1477 voice rich output: the background visual task produced its artifact(s).
+/// The structured success counterpart of
+/// [`emit_visual_generating_from_background`] — the client clears the
+/// "generating" placeholder off THIS, keeping the visual lifecycle decoupled
+/// from `file/attached` (emitted alongside it, NOT in place of it). `files` are
+/// the workspace-relative artifact names, same as the accompanying
+/// `file/attached`.
+pub(super) fn emit_visual_succeeded_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    kind: &str,
+    files: &[String],
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualSucceeded(VisualSucceededEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        kind: kind.to_owned(),
+        files: files.to_vec(),
+    }));
+}
+
+/// #1477 voice rich output: the background visual task failed / timed out, so
+/// the client should clear the "generating" placeholder.
+pub(super) fn emit_visual_failed_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    reason: Option<String>,
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VisualFailed(VisualFailedEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+        reason,
+    }));
+}
+
+/// UPCR-2026-025 voice exit intent: announce that the voice turn detected an
+/// end / goodbye / mute intent, so the client leaves the `/voice` screen and
+/// returns home. The marker `[[EXIT]]` was already stripped from every
+/// model-/client-facing surface; this typed event is the sole signal. Routed on
+/// the BASE session key (like the visual lifecycle) while still carrying the
+/// topic so topic-scoped subscribers accept it.
+pub(super) fn emit_voice_exit_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VoiceExit(VoiceExitEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
+    }));
 }
 
 /// Lightweight extension-based MIME sniffer used by
@@ -398,6 +498,27 @@ mod tests {
     use super::*;
     use octos_core::ui_protocol::methods;
     use serde_json::json;
+
+    #[test]
+    fn artifact_size_skips_metadata_for_workspace_relative_paths() {
+        // Voice reply WAVs (and other artefacts) are emitted as workspace-
+        // relative paths and resolved by `/api/files` at fetch time. Statting
+        // them against the process CWD is wrong, so report 0 without a spurious
+        // "fs::metadata failed" warning.
+        assert_eq!(artifact_size_bytes("reply-abc.wav"), 0);
+        assert_eq!(artifact_size_bytes("sub/dir/clip.wav"), 0);
+    }
+
+    #[test]
+    fn artifact_size_reads_metadata_for_absolute_paths() {
+        let f = std::env::temp_dir().join(format!("octos-a9-size-{}.bin", std::process::id()));
+        std::fs::write(&f, b"1234567").unwrap();
+        assert_eq!(artifact_size_bytes(f.to_str().unwrap()), 7);
+        let _ = std::fs::remove_file(&f);
+        // Absolute but missing → 0 (this is the genuine-problem path that warns).
+        let missing = std::env::temp_dir().join("octos-a9-size-does-not-exist.bin");
+        assert_eq!(artifact_size_bytes(missing.to_str().unwrap()), 0);
+    }
 
     /// α-9 acceptance gate (1) — `topic` lands on `turn/started`.
     #[test]
@@ -870,6 +991,7 @@ mod tests {
             task_id: Some("test-task".into()),
             originating_client_message_id: Some("test-cmid".into()),
             tool_call_id: Some(tool_call_id.to_string()),
+            terminal_status: None,
         }
     }
 
@@ -1554,5 +1676,58 @@ mod tests {
         } else {
             panic!("expected envelope variant");
         }
+    }
+
+    /// feat(envelope-wire-routing): an envelope emitted through the
+    /// ledger at a real (bare base) session key MUST carry that
+    /// `session_id` on the JSON-RPC WIRE form so a multi-session client
+    /// can route it. This pins the end-to-end serve path: emit →
+    /// `EnvelopeNotification` (with real session_id) →
+    /// `into_rpc_notification` (now flattens session_id onto the wire).
+    /// RED before the core wire change (wire stripped session_id).
+    #[test]
+    fn emitted_envelope_wire_form_carries_session_id_for_routing() {
+        use octos_core::ui_protocol::Payload;
+
+        let ledger = UiProtocolLedger::new(32);
+        let session = SessionKey::new("api", "wire-routing");
+
+        let ledgered = ledger
+            .emit_envelope(
+                &session,
+                "thread-route".into(),
+                Payload::AssistantDelta {
+                    text: "routed".into(),
+                },
+                None,
+            )
+            .expect("emit");
+
+        let crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(notif) =
+            ledgered.event
+        else {
+            panic!("expected notification event");
+        };
+
+        // Drive the real WIRE serialization the server uses on the WS.
+        let rpc = notif
+            .into_rpc_notification()
+            .expect("serialize envelope to wire");
+        assert_eq!(rpc.method, "projection/envelope");
+        assert_eq!(
+            rpc.params.get("session_id"),
+            Some(&serde_json::json!("api:wire-routing")),
+            "the emitted envelope's wire form must carry session_id so the \
+             client can route it to the right session",
+        );
+        // Bare envelope fields remain top-level (web-bridge compat).
+        assert_eq!(
+            rpc.params.get("thread_id"),
+            Some(&serde_json::json!("thread-route")),
+        );
+        assert!(
+            rpc.params.get("envelope").is_none(),
+            "wire is flattened, not nested under `envelope`",
+        );
     }
 }

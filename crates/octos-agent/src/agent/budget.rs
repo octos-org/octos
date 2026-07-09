@@ -414,6 +414,7 @@ mod tests {
             messages: vec![],
             tool_results: vec![],
             synthesized_from_spawn_only: false,
+            pending_approval: None,
         };
         let cloned = resp.clone();
         assert_eq!(cloned.content, "test");

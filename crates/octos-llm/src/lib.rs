@@ -24,6 +24,7 @@ pub mod router;
 pub mod sse;
 pub mod stream_accumulator;
 mod swappable;
+mod throttle;
 mod types;
 pub mod vision;
 
@@ -39,6 +40,7 @@ pub mod openai;
 pub mod openai_responses;
 pub mod openrouter;
 pub mod registry;
+pub mod vertex_auth;
 
 pub use adaptive::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, AutoEscalationCallback,
@@ -48,7 +50,7 @@ pub use adaptive::{
     with_router_context,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
-pub use config::{ChatConfig, ResponseFormat, ToolChoice};
+pub use config::{ChatConfig, ReasoningEffort, ResponseFormat, ToolChoice};
 pub use content_classifier::{
     ClassificationDecision, ContentClassifier, HarnessRoutingDecisionPayload, ModelTier,
     RoutingConfig,
@@ -81,6 +83,7 @@ pub use retry::{RetryConfig, RetryProvider};
 pub use router::{ProviderRouter, SubProviderMeta};
 pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
+pub use throttle::SemaphoreThrottledProvider;
 pub use types::{
     ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
     strip_think_tags,

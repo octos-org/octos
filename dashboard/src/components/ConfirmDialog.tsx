@@ -1,3 +1,5 @@
+import { useEffect } from 'react'
+
 interface Props {
   open: boolean
   title: string
@@ -17,12 +19,31 @@ export default function ConfirmDialog({
   onConfirm,
   onCancel,
 }: Props) {
+  useEffect(() => {
+    if (!open) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        onCancel()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onCancel, open])
+
   if (!open) return null
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="bg-surface rounded-xl border border-gray-700/50 shadow-2xl p-6 max-w-sm w-full mx-4">
-        <h3 className="text-lg font-semibold text-white mb-2">{title}</h3>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        className="bg-surface rounded-xl border border-gray-700/50 shadow-2xl p-6 max-w-sm w-full mx-4"
+      >
+        <h3 id="confirm-dialog-title" className="text-lg font-semibold text-white mb-2">{title}</h3>
         <p className="text-sm text-gray-400 mb-6">{message}</p>
         <div className="flex justify-end gap-3">
           <button

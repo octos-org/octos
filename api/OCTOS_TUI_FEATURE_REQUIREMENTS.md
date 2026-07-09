@@ -77,6 +77,7 @@ where a coding user can always answer four questions:
 | TUI-034 | Interrupt behavior | P0 | `Ctrl+C` interrupts active turn. `Esc` with queued messages interrupts active turn and sends queued work after the turn stops. Status text must distinguish interrupt requested vs no active turn. | event-loop tests |
 | TUI-035 | Secret hygiene | P0 | Captures and normal UI must not show auth tokens, provider keys, raw bearer headers, or secret environment values. | redaction/harness checks |
 | TUI-036 | Long-session stability | P0 | A 30+ minute real coding session remains responsive, does not truncate all history to only visible rows, and keeps enough transcript history for review. | live mini host parity test |
+| TUI-037 | Structured user-question picker | P0 | `user_question/requested` shows a blocking question picker (one card per question) with single-select or multi-select options and a free-text "Other" entry; the model/tool stream must not appear to continue until an answer is sent. Selecting and confirming sends `user_question/respond` with the correct `question_id` and per-question `answers` (selected labels + optional free text). Unknown structured fields fall back to the generic title/body and stay actionable; stale/expired questions render as decided/expired. | render snapshot and reducer tests |
 
 ## Major Interaction Flows
 

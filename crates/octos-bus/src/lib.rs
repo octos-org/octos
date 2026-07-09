@@ -16,6 +16,8 @@ pub mod session;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
+#[cfg(feature = "dingtalk")]
+pub mod dingtalk_channel;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
 #[cfg(feature = "email")]
@@ -26,6 +28,8 @@ pub mod feishu_channel;
 pub mod line_channel;
 #[cfg(feature = "matrix")]
 pub mod matrix_channel;
+#[cfg(feature = "matrix")]
+pub mod matrix_user_channel;
 #[cfg(feature = "qq-bot")]
 pub mod qq_bot_channel;
 #[cfg(feature = "slack")]
@@ -59,13 +63,15 @@ pub use resume_policy::{
     reconstruct_content_replacement_state,
 };
 pub use session::{
-    ActiveSessionStore, MessageCommitObserver, Session, SessionHandle, SessionListEntry,
-    SessionManager, persist_message_through_canonical_path, set_message_commit_observer,
-    validate_topic_name,
+    ActiveSessionStore, AnalysisFile, AnalysisSession, MessageCommitObserver, Session,
+    SessionHandle, SessionListEntry, SessionManager, persist_message_through_canonical_path,
+    set_message_commit_observer, validate_topic_name,
 };
 
 #[cfg(feature = "api")]
 pub use api_channel::{ApiChannel, TaskCancelOutcome, TaskRelaunchOutcome};
+#[cfg(feature = "dingtalk")]
+pub use dingtalk_channel::DingTalkChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]
@@ -79,6 +85,10 @@ pub use matrix_channel::{
     BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel, MatrixEventId, MatrixRoomId,
     MatrixUserId, SWARM_SUPERVISOR_EVENT_SCHEMA_V1, SteeringInput, SwarmHarnessEvent,
     SwarmSupervisorParams,
+};
+#[cfg(feature = "matrix")]
+pub use matrix_user_channel::{
+    MatrixAutoJoin, MatrixGroupPolicy, MatrixInviteStore, MatrixPendingInvite, MatrixUserChannel,
 };
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;

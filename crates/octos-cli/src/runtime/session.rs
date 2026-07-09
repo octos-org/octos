@@ -16,7 +16,9 @@ use octos_agent::{
     SubAgentOutputRouter, ToolRegistry,
 };
 use octos_bus::SessionManager;
-use octos_core::{AgentId, SessionKey, SessionScope, is_safe_session_id};
+use octos_core::{
+    AgentId, DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, SessionKey, SessionScope, is_safe_session_id,
+};
 
 use super::ProfileRuntime;
 
@@ -202,6 +204,26 @@ impl SessionRuntime {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_with_permissions_and_sandbox(
+            profile,
+            session_key,
+            workspace_hint,
+            permissions,
+            None,
+        )
+        .await
+    }
+
+    /// Construct a [`SessionRuntime`] with explicit effective permissions and
+    /// an optional, already-validated sandbox override. The override must be
+    /// derived from and no wider than the profile-level sandbox policy.
+    pub async fn bootstrap_with_permissions_and_sandbox(
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        permissions: EffectivePermissions,
+        sandbox_override: Option<SandboxConfig>,
+    ) -> Result<Arc<Self>> {
         // Step 1: resolve workspace_root.
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
@@ -244,7 +266,8 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = permissions.apply_to_sandbox(&profile.default_sandbox);
+        let sandbox = sandbox_override
+            .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
             create_sandbox(&sandbox),
@@ -299,92 +322,150 @@ impl SessionRuntime {
         ));
         let file_state_cache = Arc::new(FileStateCache::new());
 
-        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
-        // construct the multi-tenant filesystem contract for this
-        // session and stash it on the agent. The session id must
-        // satisfy [`is_safe_session_id`] (SPA `web-/slides-/site-`
-        // shapes pass; channel-prefixed `api:...` shapes do not). For
-        // unsafe shapes we leave the scope unset — Phase 1 is
-        // additive, no consumer reads the field yet. Phase 3 will
-        // migrate `api_session_workspace_dirs` and the related
-        // bespoke validators onto this contract; that's when the
-        // workspace shape mismatch between `SessionScope.workspace`
-        // (`<data>/users/<id>/workspace`) and the legacy encoded path
-        // (`<data>/users/<encoded id>/workspace` when the id has
-        // chars `is_safe_session_id` rejects) gets reconciled.
+        // SessionScope construction (#1377 Phase-3-B reconciliation).
+        //
+        // Bind a tenant-scoped filesystem contract to EVERY serve session
+        // and root it at the session's REAL `workspace_root` — not the
+        // canonical `<data>/users/<id>/workspace` derivation. This closes
+        // the round-9 cross-tenant gap: previously, channel-prefixed (`:`)
+        // and coding-agent `workspace_hint` sessions were left with
+        // `session_scope: None`, so their per-turn agent ran the unscoped
+        // legacy resolver, which decodes a process-global `up/` upload
+        // handle with NO tenant check (another tenant's pasted handle
+        // would resolve). A tenant-bound scope routes those sessions
+        // through the gated `resolve_for_scope` instead, where the
+        // upload-ownership gate fires.
+        //
+        // Why this is now safe (the Phase-3-A blockers are resolved): the
+        // earlier rounds left these sessions unscoped because the scoped
+        // resolver misclassified `up/...` handles and absolute upload-
+        // tmpdir paths as OutOfScope. Uploads are now MATERIALIZED into
+        // `<workspace>/uploads/` at turn start and read by their
+        // workspace-relative path, so the scoped resolver sees a real
+        // InWorkspace file — there are no raw `up/` handles left to
+        // misclassify. The legacy resolver already confined absolute
+        // paths to {workspace, upload-tmpdir, profile-root}, so the only
+        // behavioural delta for newly-scoped sessions is losing raw
+        // absolute upload-tmpdir reads (replaced by materialized uploads)
+        // and `pf/` profile-handle reads (tracked: #1367).
+        //
+        // Root selection respects the SessionScope WorkspaceEscapesRoot
+        // invariant: canonical/encoded sessions whose workspace lives
+        // under the profile data dir keep `root = data_dir` + the
+        // standard research/skills shared zones; coding-agent hint
+        // sessions whose repo is OUTSIDE the data dir root the scope AT
+        // the repo (`root == workspace`) with no shared zones.
         let session_id_raw = session_key.base_key().to_string();
-        let session_scope = if is_safe_session_id(&session_id_raw) {
-            match SessionScope::multi_tenant_with_default_zones(
-                profile.data_dir.clone(),
+        // The scope's session-id field is informational only
+        // (classification keys off `workspace`, never this id), but it
+        // must satisfy `is_safe_session_id`; collapse the `:` of
+        // channel-prefixed shapes (and any other out-of-alphabet byte).
+        let scope_session_id = sanitize_scope_session_id(&session_id_raw);
+        // #1377 (codex pre-merge P2): decide in-profile membership by comparing
+        // CANONICAL forms (firmlink-safe: macOS `/var` vs `/private/var`), but
+        // pick the `scope_root` that is an actual PREFIX of `workspace_root`.
+        // `workspace_root` is canonical for hint sessions (the `..`/symlink fix
+        // above) but RAW for the common no-hint case (it is built but not yet
+        // created on disk when `resolve_workspace_root` runs, so it can't be
+        // canonicalized there). Comparing a canonical workspace to a raw
+        // data_dir (or vice-versa) would misclassify; comparing canonical
+        // forms is correct, and rooting at whichever data_dir form prefixes
+        // the actual `workspace_root` keeps `scope.classify_*` containment
+        // intact for both shapes. `canonicalize` falls back to the raw path
+        // when the dir is absent.
+        let raw_data_dir = profile.data_dir.clone();
+        let canon_data_dir =
+            std::fs::canonicalize(&raw_data_dir).unwrap_or_else(|_| raw_data_dir.clone());
+        let canon_ws =
+            std::fs::canonicalize(&workspace_root).unwrap_or_else(|_| workspace_root.clone());
+        let workspace_under_data = canon_ws.starts_with(&canon_data_dir);
+        // Use the data_dir form that actually prefixes workspace_root so the
+        // scope's root is a true ancestor (raw-vs-raw for no-hint, else canon).
+        let scope_root = if workspace_under_data {
+            if workspace_root.starts_with(&raw_data_dir) {
+                raw_data_dir.clone()
+            } else {
+                canon_data_dir.clone()
+            }
+        } else {
+            workspace_root.clone()
+        };
+        let scope_zones: Vec<PathBuf> = if workspace_under_data {
+            DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
+                .iter()
+                .map(|name| scope_root.join(name))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Closure so the skill-zone-rejected fallback can rebuild the
+        // identical scope without re-deriving every input.
+        let build_scope = || {
+            SessionScope::multi_tenant_at_workspace(
+                scope_root.clone(),
+                workspace_root.clone(),
                 profile.profile_id.clone(),
-                session_id_raw.clone(),
-            ) {
+                scope_session_id.clone(),
+                scope_zones.clone(),
+            )
+        };
+        let session_scope = if permissions.filesystem_scope.is_host() {
+            // Codex round-10 P1: a `danger_full_access` session resolves
+            // to `FilesystemScope::Host` — file tools are deliberately
+            // allowed to target absolute host paths outside the workspace,
+            // and the sandbox is disabled. But the file tools PREFER an
+            // attached `ctx.session_scope` over their `filesystem_scope`,
+            // so attaching a scope here would silently re-fence a session
+            // the operator explicitly granted host access. Host access is
+            // a Solo-runtime single-user escape hatch, not a multi-tenant
+            // isolation context, so the cross-tenant upload gate does not
+            // apply. Leave the scope unset to honour the Host permission.
+            tracing::debug!(
+                profile_id = %profile.profile_id,
+                session = %session_key,
+                "skipping SessionScope: permissions grant Host filesystem access \
+                 (danger_full_access) — file tools must keep their host reach",
+            );
+            None
+        } else {
+            match build_scope() {
                 Ok(scope) => {
-                    // PR-A: thread the per-profile plugin install
-                    // directories through to the scope so file tools
-                    // (`read_file` today, glob/grep/list_dir in
-                    // PR-B) can reach the SKILL.md content the
-                    // agent's system prompt references.
-                    //
-                    // Codex round-2 BLOCKER 2 (PR #1327 review): SKIP
-                    // dirs that fail canonicalize (fail-closed). A
-                    // missing dir has no readable SKILL content yet,
-                    // so dropping it is the safe fallback. Keeping the
-                    // raw path was a fail-open vulnerability: if the
-                    // raw path is later created/replaced as a symlink
-                    // to `/etc`, `classify_canonical_path` would
-                    // canonicalize both candidate and zone root to
-                    // `/etc` and allow reads as `InSkillDir`. The
-                    // shared helper logs a warning per skip.
+                    // PR-A: thread the per-profile plugin install directories
+                    // through so file tools can reach the SKILL.md content the
+                    // system prompt references. Codex round-2 BLOCKER 2: SKIP
+                    // dirs that fail canonicalize (fail-closed) — a raw path
+                    // later replaced by a symlink to `/etc` would otherwise be
+                    // legitimised as `InSkillDir`.
                     let skill_dirs =
                         octos_core::canonicalize_skill_read_zones(&profile.plugin_dirs);
-                    let scope = scope
-                        .with_skill_read_zones(skill_dirs)
-                        .unwrap_or_else(|err| {
-                            tracing::warn!(
-                                profile_id = %profile.profile_id,
-                                session = %session_key,
-                                error = %err,
-                                "with_skill_read_zones rejected one or more plugin_dirs; \
-                                 continuing without skill_read_zones (read_file may not reach SKILL.md references)",
-                            );
-                            // Reconstruct the scope without skill
-                            // zones — non-fatal additive feature.
-                            SessionScope::multi_tenant_with_default_zones(
-                                profile.data_dir.clone(),
-                                profile.profile_id.clone(),
-                                session_id_raw.clone(),
-                            )
-                            .expect("scope was buildable above; rebuilding with the same inputs must succeed")
-                        });
+                    let scope = scope.with_skill_read_zones(skill_dirs).unwrap_or_else(|err| {
+                        tracing::warn!(
+                            profile_id = %profile.profile_id,
+                            session = %session_key,
+                            error = %err,
+                            "with_skill_read_zones rejected one or more plugin_dirs; \
+                             continuing without skill_read_zones (read_file may not reach SKILL.md references)",
+                        );
+                        build_scope().expect(
+                            "scope was buildable above; rebuilding with the same inputs must succeed",
+                        )
+                    });
                     Some(Arc::new(scope))
                 }
                 Err(err) => {
+                    // A scope that cannot be built (e.g. a non-absolute hint
+                    // workspace) falls back to the unscoped legacy resolver —
+                    // a no-regression degrade, not a hard failure.
                     tracing::warn!(
                         profile_id = %profile.profile_id,
                         session = %session_key,
+                        workspace_root = %workspace_root.display(),
                         error = %err,
-                        "SessionScope construction failed; bootstrap continues without scope (Phase 1 additive)",
+                        "SessionScope construction failed; bootstrap continues without scope (legacy resolver path)",
                     );
                     None
                 }
             }
-        } else {
-            // Codex review note (Phase-1 LOW): channel-prefixed legacy
-            // session ids (`api:web-1234`, `telegram:12345`, etc.) fail
-            // `is_safe_session_id` by design — the SessionScope on-disk
-            // layout uses the raw id, while gateway/legacy paths
-            // percent-encode the `:` before joining. Phase 3 will route
-            // every shape through the scope contract; until then, log
-            // the skip at `debug!` (not `warn!`) since this is the
-            // expected path for non-SPA channels and we don't want
-            // gateway sessions to spam warn lines.
-            tracing::debug!(
-                profile_id = %profile.profile_id,
-                session = %session_key,
-                "skipping SessionScope construction: session id outside is_safe_session_id alphabet (Phase 1 expected for channel-prefixed shapes)",
-            );
-            None
         };
 
         let mut agent = Agent::new_shared(
@@ -400,6 +481,8 @@ impl SessionRuntime {
             // background tasks that need more iterations.
             max_iterations: resolve_session_max_iterations(profile.max_iterations),
             save_episodes: true,
+            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
+            human_approval_rules: profile.human_approval_rules.clone(),
             ..Default::default()
         })
         // M11-F regression fix (#891): propagate the pre-assembled
@@ -412,7 +495,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.system_prompt.clone())
+        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -424,6 +507,38 @@ impl SessionRuntime {
         // behaviour byte-for-byte (no consumer reads the field yet).
         if let Some(scope) = session_scope {
             agent = agent.with_session_scope(scope);
+        }
+
+        // Memory rides the per-session agent as a NAMED prompt segment
+        // (chat.rs pattern) instead of being frozen into the profile's
+        // bootstrap prompt String: serve profiles bootstrapped before any
+        // consolidation carried an empty block forever (the model then
+        // fabricates a "memory bank" when asked). The provider re-renders
+        // the segment at each turn start when MEMORY.md / daily notes /
+        // bank change on disk (one fingerprint stat per turn otherwise).
+        let memory_ctx = profile
+            .memory_store
+            .get_injectable_context(profile.memory_inject_tokens)
+            .await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
+        );
+        // Contract parity with chat.rs: `memory.refresh.enabled = false`
+        // means NO per-turn memory re-read — the segment stays as seeded
+        // at session bootstrap. Default-on makes disabled an explicit
+        // opt-out.
+        if profile.memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                profile.memory_store.clone(),
+                profile.memory_inject_tokens,
+                true,
+            )));
+        }
+        // Post-memory half AFTER the named segment — the pre-refactor
+        // order (memory before skills/tool guidance).
+        if !profile.prompt_parts.post_memory.is_empty() {
+            agent.append_system_prompt(&profile.prompt_parts.post_memory);
         }
 
         // M11-F regression fix REG-3: propagate the profile-scope
@@ -447,6 +562,10 @@ impl SessionRuntime {
         // and the LLM cannot pull a deferred group back on demand.
         // Gateway does the equivalent at `session_actor.rs:2500`.
         agent.wire_activate_tools();
+        // RFC-1 (issue #1290): same pattern for the `mofa_make`
+        // dispatcher. The loader registered it but its `Weak<ToolRegistry>`
+        // back-reference needs the Arc-wrapped registry; we plant it here.
+        agent.wire_mofa_make_dispatcher();
 
         let agent = Arc::new(agent);
 
@@ -514,13 +633,52 @@ fn resolve_session_max_iterations(configured: Option<u32>) -> u32 {
 /// `api/handlers.rs::api_session_workspace_dirs` so an existing
 /// session can transparently pick up the new code path without
 /// losing its workspace.
+/// Map a raw session base-key into the [`is_safe_session_id`] alphabet
+/// for use as a [`SessionScope`]'s INFORMATIONAL session-id field.
+///
+/// Channel-prefixed ids (`api:web-1234`) carry a `:` that the scope's id
+/// field rejects. Scope path classification keys off the explicit
+/// workspace, never this id, so collapsing every out-of-alphabet byte to
+/// `-` is lossless for the field's only purpose (diagnostics/logging)
+/// while guaranteeing the constructor's `is_safe_session_id` check
+/// passes.
+pub(crate) fn sanitize_scope_session_id(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '#') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // `is_safe_session_id` also rejects empty / "." / "..". The map above
+    // already turns every `.` into `-`, so only the empty case remains.
+    if out.is_empty() {
+        out.push('-');
+    }
+    debug_assert!(
+        is_safe_session_id(&out),
+        "sanitize_scope_session_id must yield an is_safe_session_id-valid id: {out:?}",
+    );
+    out
+}
+
 fn resolve_workspace_root(
     profile: &ProfileRuntime,
     session_key: &SessionKey,
     workspace_hint: Option<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(hint) = workspace_hint {
-        return validate_workspace_hint(&hint).map(|_| hint);
+        // #1377 (codex pre-merge P1): return the CANONICAL hint, not the raw
+        // one. A raw hint carrying `..` (or symlinked ancestors) would flow
+        // into `workspace_root`, and `SessionScope::multi_tenant_at_workspace`
+        // rejects `..` — leaving the session UNSCOPED and back on the legacy
+        // resolver that decodes global `up/` handles with no tenant check.
+        // Canonicalizing collapses `..` and resolves symlinks so the scope is
+        // always built and the upload-ownership gate applies.
+        return validate_workspace_hint(&hint);
     }
 
     let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
@@ -545,7 +703,7 @@ fn resolve_workspace_root(
 /// `api/ui_protocol.rs::validate_session_workspace_allowed` and this
 /// function can call. Today the two paths must stay synchronized by
 /// inspection.
-fn validate_workspace_hint(hint: &Path) -> Result<()> {
+fn validate_workspace_hint(hint: &Path) -> Result<PathBuf> {
     // The hint must canonicalize (so we reject symlink traps and
     // nonexistent paths early). Callers that want to *create* a
     // workspace should pre-create the directory before passing the
@@ -581,7 +739,9 @@ fn validate_workspace_hint(hint: &Path) -> Result<()> {
         }
     }
 
-    Ok(())
+    // Return the CANONICAL path (collapses `..`, resolves symlinks) so the
+    // caller roots the session scope at a normalized workspace_root.
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -653,11 +813,19 @@ mod tests {
         data_dir: PathBuf,
         system_prompt: String,
     ) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt_and_sandbox(data_dir, system_prompt, SandboxConfig::default())
+            .await
+    }
+
+    async fn make_profile_with_prompt_and_sandbox(
+        data_dir: PathBuf,
+        system_prompt: String,
+        sandbox: SandboxConfig,
+    ) -> Arc<ProfileRuntime> {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
-        let sandbox = SandboxConfig::default();
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
         Arc::new(ProfileRuntime {
@@ -680,15 +848,114 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: system_prompt.clone(),
+                post_memory: String::new(),
+            },
             system_prompt,
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
+    }
+
+    async fn make_profile_with_sandbox(
+        data_dir: PathBuf,
+        sandbox: SandboxConfig,
+    ) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt_and_sandbox(data_dir, "test-system-prompt".to_string(), sandbox)
+            .await
+    }
+
+    #[tokio::test]
+    async fn session_agent_renders_fresh_memory_segment() {
+        // Serve sessions read MEMORY.md via the per-session agent's NAMED
+        // segment + turn-start refresh — NOT a value frozen into the
+        // profile bootstrap prompt (which fabricated-memory bugs came
+        // from). Consolidations landing AFTER the session was created
+        // must be visible on the next refresh.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Monday. (updated: 2026-07-08) ^mvzercg\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "mem"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Deploy day is Monday"),
+            "session agent must inject MEMORY.md: {prompt}"
+        );
+
+        // A consolidation AFTER session creation becomes visible on the
+        // next turn-start refresh (fingerprint change).
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Friday again. (updated: 2026-07-09) ^mvzercg\n",
+        )
+        .unwrap();
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Friday again"),
+            "read-refresh must pick up post-bootstrap consolidations: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_segment_keeps_pre_skills_slot() {
+        // codex round-3 P2: the memory block must keep its pre-refactor
+        // position — after bootstrap/soul, BEFORE the skills/tool-prefs
+        // half — or persisted user memory gains precedence over guidance
+        // that always followed it.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "A very durable fact. (updated: 2026-07-09) ^mvvvvvv\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "order"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        let memory_pos = prompt
+            .find("A very durable fact")
+            .expect("memory segment present");
+        if let Some(tool_prefs_pos) = prompt.find("## Tool Preferences") {
+            assert!(
+                memory_pos < tool_prefs_pos,
+                "memory must precede the tool-prefs half: mem={memory_pos} prefs={tool_prefs_pos}"
+            );
+        }
+        if let Some(skills_pos) = prompt.find("## Available Skills") {
+            assert!(
+                memory_pos < skills_pos,
+                "memory must precede the skills half: mem={memory_pos} skills={skills_pos}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -716,6 +983,96 @@ mod tests {
         assert!(rt_b.plugin_work_dir.starts_with(&rt_b.workspace_root));
         // Same parent profile Arc.
         assert!(Arc::ptr_eq(&rt_a.profile, &rt_b.profile));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_roots_scope_at_repo_for_workspace_hint_session() {
+        // #1377 Phase-3-B: a coding-agent `workspace_hint` session whose
+        // repo lives OUTSIDE the profile data dir gets a tenant scope
+        // rooted AT the repo (root == workspace, no shared zones). This
+        // (a) keeps the per-turn agent tenant-bound so the `up/` upload
+        // gate fires, and (b) makes scope.workspace() == workspace_root so
+        // the WS per-turn handler propagates it instead of skipping to the
+        // unscoped legacy resolver (the old Phase-3-A mismatch branch).
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        // Repo hint is a sibling of the data dir -> NOT under it.
+        let repo = tmp.path().join("some-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // #1377 (codex pre-merge P1): the hint is now CANONICALIZED before it
+        // becomes workspace_root (so a `..`/symlinked hint can't slip through
+        // unscoped). Compare against the canonical form (`/tmp`->`/private/tmp`
+        // on macOS).
+        let repo_canon = std::fs::canonicalize(&repo).unwrap();
+        let key = SessionKey::new("appui", "coding-1");
+        let rt = SessionRuntime::bootstrap(&profile, key, Some(repo.clone()))
+            .await
+            .expect("bootstrap with workspace hint");
+
+        assert_eq!(rt.workspace_root, repo_canon);
+        assert!(
+            !repo_canon.starts_with(&data_dir),
+            "test setup: repo must be outside data dir"
+        );
+
+        let scope = rt
+            .agent
+            .session_scope()
+            .expect("hint session now carries a tenant scope")
+            .clone();
+        assert_eq!(scope.tenant_id(), Some(profile.profile_id.as_str()));
+        // root == workspace == canonical repo; no shared zones (out-of-tree).
+        assert_eq!(scope.workspace(), repo_canon.as_path());
+        assert_eq!(scope.root(), repo_canon.as_path());
+        assert!(scope.shared_zones().is_empty());
+        // Critical for propagation: scope.workspace() == workspace_root.
+        assert_eq!(scope.workspace(), rt.workspace_root.as_path());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_explicit_sandbox_overrides_are_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile_with_sandbox(
+            data_dir,
+            SandboxConfig {
+                allow_network: true,
+                ..SandboxConfig::default()
+            },
+        )
+        .await;
+
+        let gamma_sandbox = SandboxConfig {
+            allow_network: false,
+            ..profile.default_sandbox.clone()
+        };
+
+        let gamma = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+            &profile,
+            SessionKey::new("api", "gamma"),
+            Some(tmp.path().join("gamma")),
+            EffectivePermissions::workspace_write(),
+            Some(gamma_sandbox),
+        )
+        .await
+        .expect("gamma bootstrap");
+        let delta = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+            &profile,
+            SessionKey::new("api", "delta"),
+            Some(tmp.path().join("delta")),
+            EffectivePermissions::workspace_write(),
+            None,
+        )
+        .await
+        .expect("delta bootstrap");
+
+        assert!(profile.default_sandbox.allow_network);
+        assert!(!gamma.sandbox.allow_network);
+        assert!(delta.sandbox.allow_network);
+        assert_ne!(gamma.workspace_root, delta.workspace_root);
+        assert!(!Arc::ptr_eq(&gamma.tools, &delta.tools));
     }
 
     #[tokio::test]
@@ -785,53 +1142,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_leaves_session_scope_unset_for_unsafe_session_id() {
-        // Phase 1 contract: when the session_id contains characters
-        // outside the `is_safe_session_id` alphabet (e.g. the legacy
-        // `channel:chat_id` shape with `:`), bootstrap MUST NOT panic
-        // — it leaves the scope unset and the agent keeps pre-Phase-1
-        // behaviour. Phase 3 reconciles the encoded-path-vs-bare-id
-        // mismatch by routing every legitimate id through the scope
-        // contract.
+    async fn bootstrap_attaches_tenant_scope_for_channel_prefixed_session_id() {
+        // #1377 Phase-3-B reconciliation: channel-prefixed (`:`) session
+        // ids previously left `session_scope` unset, dropping the per-turn
+        // agent onto the unscoped legacy resolver (which decodes a
+        // process-global `up/` upload handle with NO tenant check). The
+        // scope is now bound to the REAL (percent-encoded) workspace path
+        // — not a path re-derived from the raw id — so the upload-
+        // ownership gate in `resolve_for_scope` applies.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("profile-data");
         let profile = make_profile(data_dir.clone()).await;
 
-        // SessionKey with a `:` channel prefix — fails is_safe_session_id.
+        // SessionKey with a `:` channel prefix — outside is_safe_session_id.
         let key = SessionKey::new("api", "web-1234");
         let rt = SessionRuntime::bootstrap(&profile, key, None)
             .await
-            .expect("bootstrap must succeed even when scope can't be built");
+            .expect("bootstrap must succeed for channel-prefixed id");
 
-        assert!(
-            rt.agent.session_scope().is_none(),
-            "channel-prefixed session ids must not produce a scope in Phase 1",
-        );
+        let scope = rt
+            .agent
+            .session_scope()
+            .expect("channel-prefixed id now yields a tenant-bound scope")
+            .clone();
+        // Tenant binding present -> the resolver's `up/` ownership gate fires.
+        assert_eq!(scope.tenant_id(), Some(profile.profile_id.as_str()));
+        // No-hint session: workspace_root is the raw `<data>/users/<enc>/
+        // workspace` path, so scope.root() stays the raw data_dir (the form
+        // that prefixes workspace_root).
+        assert_eq!(scope.root(), data_dir.as_path());
+        // Workspace matches the runtime's workspace_root, so per-turn
+        // propagation attaches it.
+        assert_eq!(scope.workspace(), rt.workspace_root.as_path());
+        assert!(rt.workspace_root.starts_with(&data_dir));
     }
 
-    /// Phase 3-A design-pin (Phase 1 follow-up — gap #3 from codex
-    /// review of Phase 2-C): the `else` branch at
-    /// `SessionRuntime::bootstrap` (around `is_safe_session_id` check)
-    /// deliberately leaves `session_scope` unset for channel-prefixed
-    /// legacy session ids like `api:web-1234`, `telegram:12345`,
-    /// `discord:guild#chan`. This is INTENTIONAL: the SessionScope
-    /// on-disk layout uses the raw id while gateway/legacy paths
-    /// percent-encode the `:`, so the workspace shapes are not yet
-    /// reconciled until Phase 3 routes every shape through the scope
-    /// contract. This test exists explicitly to PIN that design
-    /// decision so a future "just construct a scope for every id"
-    /// refactor cannot silently flip it without re-reading the
-    /// rationale in the comment at the unsafe-id branch.
+    /// #1377 Phase-3-B reconciliation (formerly a Phase-3-A design-pin
+    /// asserting these stay unscoped). The old pin required "reconciling
+    /// the encoded-vs-raw workspace path mismatch first" before building
+    /// a scope for channel-prefixed ids — that reconciliation is now
+    /// done: [`SessionScope::multi_tenant_at_workspace`] binds the scope
+    /// to the REAL encoded `workspace_root` rather than re-deriving a
+    /// path from the raw id. So every channel-prefixed legacy session now
+    /// carries a tenant-bound scope and routes through the gated
+    /// resolver, closing the cross-tenant `up/` upload gap. This test
+    /// PINS the new contract.
     #[tokio::test]
-    async fn unsafe_session_id_session_intentionally_has_none_scope() {
+    async fn channel_prefixed_session_ids_get_tenant_scope() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("profile-data");
         let profile = make_profile(data_dir.clone()).await;
 
-        // Three flavours of channel-prefixed legacy ids that historically
-        // satisfied the gateway dispatcher but fail `is_safe_session_id`
-        // (the `:` character is rejected). Each must succeed at bootstrap
-        // and yield `agent.session_scope() == None`.
+        // Three flavours of channel-prefixed legacy ids that fail
+        // `is_safe_session_id` (the `:` is rejected). Each must succeed at
+        // bootstrap and now yield a tenant-bound scope.
         let cases = ["api:web-1234", "telegram:12345", "discord:guild#chan"];
         for raw in cases {
             // Split on `:` to round-trip through SessionKey::new's
@@ -843,10 +1207,21 @@ mod tests {
             let rt = SessionRuntime::bootstrap(&profile, key.clone(), None)
                 .await
                 .expect("bootstrap must succeed for legacy channel id");
-            assert!(
-                rt.agent.session_scope().is_none(),
-                "design pin: unsafe session id {raw:?} (key={key:?}) must leave session_scope unset; \
-                 changing this requires reconciling the encoded-vs-raw workspace path mismatch first",
+            let scope = rt.agent.session_scope().unwrap_or_else(|| {
+                panic!(
+                    "channel-prefixed id {raw:?} (key={key:?}) must now carry a tenant scope \
+                     (reconciliation done: scope bound to the real encoded workspace_root)"
+                )
+            });
+            assert_eq!(
+                scope.tenant_id(),
+                Some(profile.profile_id.as_str()),
+                "scope for {raw:?} must be tenant-bound so the upload-ownership gate fires",
+            );
+            assert_eq!(
+                scope.workspace(),
+                rt.workspace_root.as_path(),
+                "scope for {raw:?} must be rooted at the real workspace_root",
             );
         }
     }
@@ -933,49 +1308,34 @@ mod tests {
         assert_eq!(turn_scope.root(), data_dir.as_path());
     }
 
-    /// Phase 3-A codex round-4 regression-pin: when a coding-agent UI
-    /// opens a session with an explicit `cwd` hint, the cached
-    /// `SessionRuntime` honours the hint for `workspace_root` and the
-    /// rebound tool registry, but `bootstrap` still builds the
-    /// `SessionScope` from the canonical `<data>/users/<id>/workspace`
-    /// layout — so the cached scope's workspace does NOT match the
-    /// runtime's. The WS turn handler MUST skip propagation in this
-    /// case and leave the per-turn agent's `session_scope` as None
-    /// so hint sessions stay on their pre-Phase-3-A (legacy) behaviour.
+    /// #1377 Phase-3-B (formerly the Phase-3-A round-4 skip-pin): when a
+    /// coding-agent UI opens a session with an explicit `cwd` hint, the
+    /// cached `SessionRuntime` honours the hint for `workspace_root`, and
+    /// bootstrap NOW roots the `SessionScope` at that same
+    /// `workspace_root` (repo-rooted, root == workspace). So the cached
+    /// scope's workspace MATCHES the runtime's, and the WS turn handler
+    /// PROPAGATES it onto the per-turn agent — making the agent
+    /// tenant-bound so the `up/` upload-ownership gate fires.
     ///
-    /// Why skip rather than synthesize? Rounds 2 and 3 of this fix
-    /// tried synthesizing a workspace-rooted solo scope (round-2 with
-    /// empty grants, round-3 with `temp_upload_root` granted), but
-    /// each surfaced further regressions:
-    /// - The scope-aware resolver does not decode `up/...` handles
-    ///   (codex round-3 P2.a) — it treats them as workspace-relative
-    ///   `<workspace>/up/...`, so attachment resolution breaks.
-    /// - The plugin tool's classifier uses lexical (not canonical)
-    ///   classification (codex round-3 P2.b), so on macOS the
-    ///   `/var/folders/...` raw form and the `/private/var/folders/...`
-    ///   canonical form mismatch — granting one doesn't cover the
-    ///   other.
+    /// Earlier rounds skipped propagation here because bootstrap built
+    /// the scope from the canonical `<data>/users/<id>/workspace` layout
+    /// (a workspace mismatch) and the scoped resolver misclassified
+    /// `up/...` handles. Both are resolved: bootstrap reconciles the
+    /// workspace, and uploads are materialized into `<workspace>/uploads/`
+    /// so no raw `up/` handle reaches the scoped resolver.
     ///
-    /// Both of those are Phase-2 consumer changes the user explicitly
-    /// bounded out of this PR ("stay in plumbing — additive scope
-    /// propagation only"). The minimal-blast-radius landing is to
-    /// SKIP propagation for hint sessions and document the deferral
-    /// via a `TODO(phase3b)` at the call site.
-    ///
-    /// This test mirrors the round-4 rebuild and confirms hint
-    /// sessions keep their pre-Phase-3-A `session_scope: None`
-    /// behaviour byte-for-byte.
+    /// This test mirrors the WS turn rebuild and confirms hint sessions
+    /// now carry a propagated, workspace-matched scope.
     #[tokio::test]
-    async fn ui_protocol_ws_turn_agent_skips_session_scope_on_workspace_hint() {
+    async fn ui_protocol_ws_turn_agent_propagates_session_scope_on_workspace_hint() {
         use octos_agent::Agent;
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("profile-data");
         let profile = make_profile(data_dir.clone()).await;
 
-        // A safe SPA-shape session id (so bootstrap DOES build a
-        // scope under the default layout) PLUS a hint pointing at a
-        // different repo path — i.e. the coding-agent UI flow.
+        // A safe SPA-shape session id PLUS a hint pointing at a different
+        // repo path — i.e. the coding-agent UI flow.
         let session_id = "web-1779574360681-hintsx";
         let key = SessionKey(session_id.to_string());
         let hint_repo = tmp.path().join("coding-agent-repo");
@@ -984,14 +1344,13 @@ mod tests {
             .await
             .expect("bootstrap session runtime with workspace hint");
 
-        // Pre-condition: workspace_root tracks the HINT, but the cached
-        // scope was built from the default `<data>/users/<id>/workspace`
-        // layout (Phase-1 bootstrap behaviour we deliberately leave
-        // unchanged on this PR).
+        // Pre-condition: workspace_root honours the hint AND the cached
+        // scope is now rooted at that same workspace_root (the #1377
+        // reconciliation), so they match by construction.
         let runtime_scope = rt
             .agent
             .session_scope()
-            .expect("safe session id always yields a SessionScope")
+            .expect("hint session yields a tenant-bound SessionScope")
             .clone();
         let canonical_workspace = std::fs::canonicalize(&hint_repo).unwrap();
         let runtime_workspace_canonical = std::fs::canonicalize(&rt.workspace_root).unwrap();
@@ -999,16 +1358,19 @@ mod tests {
             runtime_workspace_canonical, canonical_workspace,
             "workspace_root must honour the hint"
         );
-        assert_ne!(
+        assert_eq!(
             runtime_scope.workspace(),
             rt.workspace_root.as_path(),
-            "Phase 1 design: scope still uses default <data>/users/<id>/workspace \
-             — this is the mismatch the round-4 skip at ui_protocol.rs guards against"
+            "#1377: bootstrap now roots the scope at the hint workspace_root",
+        );
+        assert_eq!(
+            runtime_scope.tenant_id(),
+            Some(profile.profile_id.as_str()),
+            "hint-session scope must be tenant-bound so the upload gate fires",
         );
 
-        // Mirror the WS turn handler's per-turn rebuild WITH the
-        // round-4 skip gate: when the cached scope's workspace doesn't
-        // match the runtime's workspace_root, skip propagation.
+        // Mirror the WS turn handler's per-turn rebuild + propagation
+        // gate: the workspaces match, so the scope IS propagated.
         let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
         let mut request_agent = Agent::new_shared(
             AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
@@ -1020,18 +1382,13 @@ mod tests {
             if scope.workspace() == rt.workspace_root.as_path() {
                 request_agent = request_agent.with_session_scope(scope.clone());
             }
-            // else: skip — see api/ui_protocol.rs round-4 comment for
-            // the full trade-off matrix; deferred to phase3b.
         }
 
-        assert!(
-            request_agent.session_scope().is_none(),
-            "per-turn agent must skip the mismatched scope when the session was \
-             opened with a workspace hint — hint sessions keep their pre-Phase-3-A \
-             `session_scope: None` behaviour byte-for-byte (Phase 3-B PR will revisit \
-             once the scope-aware resolver handles `up/...` decoding and canonical \
-             classification)",
+        let turn_scope = request_agent.session_scope().expect(
+            "per-turn agent must now carry the propagated, workspace-matched scope for \
+             a workspace-hint session (#1377 Phase-3-B reconciliation)",
         );
+        assert!(Arc::ptr_eq(turn_scope, &runtime_scope));
     }
 
     #[tokio::test]
@@ -1161,14 +1518,24 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: Some(executor),
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         })
     }
 
@@ -1214,14 +1581,24 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         });
         let key = SessionKey::new("api", "activate-tools-probe");
         let rt = SessionRuntime::bootstrap(&profile, key, None)
@@ -1295,14 +1672,24 @@ mod tests {
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
             review_config: None,
+            human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
+            voice: crate::config::VoiceConfig::default(),
         });
 
         let rt_a = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-a"), None)
@@ -1511,6 +1898,16 @@ mod tests {
         assert_eq!(
             rt.permissions.permission_profile,
             PermissionProfile::DangerFullAccess
+        );
+        // Codex round-10 P1: a Host (danger_full_access) session must NOT
+        // carry a SessionScope, or the file tools would prefer it over the
+        // Host filesystem_scope and silently re-fence the operator-granted
+        // host access. This session is `:`-keyed AND hinted — exactly the
+        // shapes #1377 newly scopes — so the assertion proves the Host gate
+        // wins over scope attachment.
+        assert!(
+            rt.agent.session_scope().is_none(),
+            "Host (danger_full_access) sessions must not carry a SessionScope",
         );
         assert!(!rt.sandbox.enabled);
         assert_eq!(rt.sandbox.mode, SandboxMode::None);
