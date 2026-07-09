@@ -1871,9 +1871,11 @@ mod tests {
     }
 
     /// Test transport: expose the octos ACP agent (backed by `factory`) as a
-    /// `ConnectTo<Client>` so an in-process client can drive it.
+    /// `ConnectTo<Client>` so an in-process client can drive it. The session
+    /// map is caller-supplied so tests can observe cancel flags directly.
     struct CancelTestTransport {
         factory: InjectedLlmFactory,
+        sessions: SessionMap,
     }
 
     impl agent_client_protocol::ConnectTo<Client> for CancelTestTransport {
@@ -1881,8 +1883,32 @@ mod tests {
             self,
             client: impl agent_client_protocol::ConnectTo<AcpAgentRole> + 'static,
         ) -> std::result::Result<(), AcpError> {
-            let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
-            spawn_acp_agent(Arc::new(self.factory), sessions, client).await
+            spawn_acp_agent(Arc::new(self.factory), self.sessions, client).await
+        }
+    }
+
+    /// Wait until `session/cancel` has been DISPATCHED for `sid` (its shutdown
+    /// flag is observably set). `send_notification` only queues the frame; on a
+    /// loaded runner the barrier release could otherwise win the race against
+    /// the dispatch loop, the turn would complete un-cancelled, and the test
+    /// would flake to `EndTurn` (seen repeatedly on CI under load).
+    async fn wait_for_cancel_dispatch(sessions: &SessionMap, sid: &SessionId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let flagged = sessions
+                .lock()
+                .await
+                .get(sid)
+                .map(|s| s.shutdown.load(Ordering::Acquire))
+                .unwrap_or(false);
+            if flagged {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session/cancel was not dispatched within 10s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 
@@ -1905,12 +1931,15 @@ mod tests {
             release: release.clone(),
             seen: Arc::new(Mutex::new(Vec::new())),
         });
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let sessions_for_canceller = sessions.clone();
         let transport = CancelTestTransport {
             factory: InjectedLlmFactory {
                 llm,
                 memory_dir,
                 default_cwd: cwd.clone(),
             },
+            sessions,
         };
 
         let stop_reason: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
@@ -1940,14 +1969,16 @@ mod tests {
                     let session_id = new_session.session_id;
 
                     // Concurrently: once the turn is executing, deliver a cancel,
+                    // wait until it has been dispatched (flag observably set),
                     // then release the barrier so the LLM call returns.
                     let cancel_conn = connection.clone();
                     let cancel_sid = session_id.clone();
                     let canceller = tokio::spawn(async move {
                         entered.notified().await;
                         cancel_conn
-                            .send_notification(CancelNotification::new(cancel_sid))
+                            .send_notification(CancelNotification::new(cancel_sid.clone()))
                             .expect("send cancel");
+                        wait_for_cancel_dispatch(&sessions_for_canceller, &cancel_sid).await;
                         release.notify_one();
                     });
 
@@ -1996,12 +2027,15 @@ mod tests {
             release: release.clone(),
             seen: seen.clone(),
         });
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let sessions_for_canceller = sessions.clone();
         let transport = CancelTestTransport {
             factory: InjectedLlmFactory {
                 llm,
                 memory_dir,
                 default_cwd: cwd.clone(),
             },
+            sessions,
         };
 
         let second_stop: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
@@ -2030,14 +2064,16 @@ mod tests {
                         .await?;
                     let session_id = new_session.session_id;
 
-                    // Turn 1: cancel it mid-flight (as in the test above).
+                    // Turn 1: cancel it mid-flight (as in the test above),
+                    // holding the barrier until the cancel is dispatched.
                     let cancel_conn = connection.clone();
                     let cancel_sid = session_id.clone();
                     let canceller = tokio::spawn(async move {
                         entered.notified().await;
                         cancel_conn
-                            .send_notification(CancelNotification::new(cancel_sid))
+                            .send_notification(CancelNotification::new(cancel_sid.clone()))
                             .expect("send cancel");
+                        wait_for_cancel_dispatch(&sessions_for_canceller, &cancel_sid).await;
                         release.notify_one();
                     });
                     let first = connection
