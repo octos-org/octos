@@ -109,6 +109,120 @@ impl WorkerWorktree {
     }
 }
 
+/// RAII wrapper around a freshly-allocated [`WorkerWorktree`] (PR #1250
+/// review, finding 1).
+///
+/// `allocate_worker_worktree` necessarily runs before the spawn tool's later
+/// refusal points — provider resolution (`resolve_sub_provider?`), the sync
+/// plugin/tool availability `?` returns, the background fanout-cap refusal —
+/// because both spawn branches need the child working dir up front. Each of
+/// those refusals returns without ever starting a worker; dropping an armed
+/// guard prunes the just-created worktree + branch so a refused spawn leaves
+/// `git worktree list` (and `.octos/work`) unchanged. Leaking instead would
+/// be permanent: the `octos clean` sweep deliberately skips directories that
+/// are still registered as live worktrees. Call [`Self::disarm`] at the real
+/// handoff — the point where the worker actually starts.
+struct WorkerWorktreeGuard {
+    repo_root: PathBuf,
+    worktree: Option<WorkerWorktree>,
+}
+
+impl WorkerWorktreeGuard {
+    fn new(repo_root: PathBuf, worktree: WorkerWorktree) -> Self {
+        Self {
+            repo_root,
+            worktree: Some(worktree),
+        }
+    }
+
+    fn worktree(&self) -> &WorkerWorktree {
+        self.worktree
+            .as_ref()
+            .expect("worker worktree guard is armed until disarmed")
+    }
+
+    /// Hand ownership of the worktree to the worker: after this the guard
+    /// no longer prunes on drop.
+    fn disarm(mut self) -> WorkerWorktree {
+        self.worktree
+            .take()
+            .expect("worker worktree guard disarmed twice")
+    }
+}
+
+impl Drop for WorkerWorktreeGuard {
+    fn drop(&mut self) {
+        if let Some(worktree) = self.worktree.take() {
+            prune_worker_worktree(&self.repo_root, &worktree);
+        }
+    }
+}
+
+/// Best-effort removal of a refused worker's worktree and branch. Failures
+/// are logged, not propagated — this runs on refusal paths (and in `Drop`)
+/// where the spawn refusal itself must surface to the caller.
+fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
+    // `--force` clears the untracked `.octos/worker-worktree.json` status
+    // marker; the checkout is otherwise fresh.
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree.path)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            warn!(
+                path = %worktree.path.display(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "spawn: git worktree remove failed for refused spawn; \
+                 falling back to manual prune"
+            );
+            if worktree.path.exists() {
+                if let Err(error) = std::fs::remove_dir_all(&worktree.path) {
+                    warn!(
+                        path = %worktree.path.display(),
+                        error = %error,
+                        "spawn: failed to remove refused worker worktree directory"
+                    );
+                }
+            }
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .args(["worktree", "prune"])
+                .output();
+        }
+        Err(error) => {
+            warn!(
+                path = %worktree.path.display(),
+                error = %error,
+                "spawn: failed to run git worktree remove for refused spawn"
+            );
+        }
+    }
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["branch", "-D"])
+        .arg(&worktree.branch)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => warn!(
+            branch = %worktree.branch,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "spawn: failed to delete refused worker branch"
+        ),
+        Err(error) => warn!(
+            branch = %worktree.branch,
+            error = %error,
+            "spawn: failed to run git branch -D for refused spawn"
+        ),
+    }
+}
+
 fn validate_worker_worktree_slug(slug: &str) -> Result<(), String> {
     if slug.is_empty() {
         return Err("worker worktree slug must not be empty".to_string());
@@ -166,22 +280,91 @@ fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
     }
 }
 
+/// Allocate a dedicated git worktree for a spawned worker.
+///
+/// Validation runs BEFORE `git worktree add` (PR #1250 review, finding 2):
+/// the `.octos` / `.octos/work` components must not be symlinks and the
+/// created work root must canonically resolve under the canonical repository
+/// root — this holds even when the caller carries no [`SessionScope`] at
+/// all. When a parent scope IS present, the planned worktree path must
+/// additionally pass [`SessionScope::with_workspace`] before creation, so a
+/// scope refusal never leaves a checkout behind (let alone one outside the
+/// session root).
+///
+/// Returns the allocation armed inside a [`WorkerWorktreeGuard`] (finding 1)
+/// plus the child scope precomputed from the validated path. The caller must
+/// [`WorkerWorktreeGuard::disarm`] at the real worker handoff; any earlier
+/// refusal drops the guard and prunes the worktree + branch.
 fn allocate_worker_worktree(
     parent_working_dir: &Path,
     worker_id: &AgentId,
-) -> Result<WorkerWorktree> {
+    parent_scope: Option<&Arc<SessionScope>>,
+) -> Result<(WorkerWorktreeGuard, Option<Arc<SessionScope>>)> {
     let repo_root = PathBuf::from(git_stdout(
         parent_working_dir,
         &["rev-parse", "--show-toplevel"],
     )?);
+    let canonical_repo_root = std::fs::canonicalize(&repo_root).wrap_err_with(|| {
+        format!(
+            "failed to canonicalize repository root {}",
+            repo_root.display()
+        )
+    })?;
     let base_slug = worker_id.to_string();
     let work_root = repo_root.join(".octos").join("work");
+    // Finding 2: refuse symlinked components BEFORE creating anything. A
+    // symlinked `.octos` or `.octos/work` would make `create_dir_all` (for a
+    // dangling link) and `git worktree add` write outside the repository —
+    // and thus outside the session root — before any validation ran.
+    for component in [repo_root.join(".octos"), work_root.clone()] {
+        let is_symlink = component
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_symlink {
+            return Err(eyre::eyre!(
+                "worker worktree root component {} is a symlink; refusing to \
+                 create worker worktrees through it",
+                component.display()
+            ));
+        }
+    }
+    // Finding 2: session-scope validation BEFORE any write — even the
+    // `.octos/work` root itself must sit inside the session root, or the
+    // spawn is refused with nothing created at all (not even the empty
+    // directory chain `create_dir_all` would otherwise leave behind). The
+    // per-attempt validation inside the loop below then binds the actual
+    // worker path.
+    scoped_child_session_scope(parent_scope, &work_root).map_err(|error| {
+        eyre::eyre!(
+            "worker worktree root {} rejected by session scope: {error}",
+            work_root.display()
+        )
+    })?;
     std::fs::create_dir_all(&work_root).wrap_err_with(|| {
         format!(
             "failed to create worker worktree root {}",
             work_root.display()
         )
     })?;
+    // Post-create re-verification: the canonical work root must stay under
+    // the canonical repository root. This closes the check/create race (a
+    // symlink swapped in between the check above and `create_dir_all`) and
+    // catches any resolution surprise a lexical join would hide.
+    let canonical_work_root = std::fs::canonicalize(&work_root).wrap_err_with(|| {
+        format!(
+            "failed to canonicalize worker worktree root {}",
+            work_root.display()
+        )
+    })?;
+    if !canonical_work_root.starts_with(&canonical_repo_root) {
+        return Err(eyre::eyre!(
+            "worker worktree root {} resolves to {}, outside the repository root {}; \
+             refusing symlink escape",
+            work_root.display(),
+            canonical_work_root.display(),
+            canonical_repo_root.display()
+        ));
+    }
 
     for attempt in 0..=32 {
         let slug = if attempt == 0 {
@@ -192,10 +375,25 @@ fn allocate_worker_worktree(
         validate_worker_worktree_slug(&slug).map_err(eyre::Report::msg)?;
         let branch = format!("octos/worker/{slug}");
         let refname = format!("refs/heads/{branch}");
-        let path = work_root.join(&slug);
+        // Plan against the canonical work root so the scope check below,
+        // `git worktree add`, and every later status write all target the
+        // same verified physical location.
+        let path = canonical_work_root.join(&slug);
         if path.exists() || git_ref_exists(&repo_root, &refname)? {
             continue;
         }
+        // Finding 2: session-scope validation BEFORE creation.
+        // `SessionScope::with_workspace` requires the planned path under the
+        // scope root by canonical form; a worktree that would land outside
+        // the session root is refused here, with nothing created. (The path
+        // only varies by slug suffix across attempts, so the first rejection
+        // is authoritative — no point retrying other slugs.)
+        let child_scope = scoped_child_session_scope(parent_scope, &path).map_err(|error| {
+            eyre::eyre!(
+                "worker worktree path {} rejected by session scope: {error}",
+                path.display()
+            )
+        })?;
         let output = Command::new("git")
             .arg("-C")
             .arg(&repo_root)
@@ -213,7 +411,7 @@ fn allocate_worker_worktree(
         }
         let allocation = WorkerWorktree { slug, branch, path };
         allocation.mark_status("spawned");
-        return Ok(allocation);
+        return Ok((WorkerWorktreeGuard::new(repo_root, allocation), child_scope));
     }
 
     Err(eyre::eyre!(
@@ -2729,11 +2927,30 @@ impl Tool for SpawnTool {
             });
         }
 
-        let worker_worktree = match input.isolation {
-            WorkerIsolation::Shared => None,
+        // PR #1250 review, findings 1+2: `allocate_worker_worktree` validates
+        // the planned path — canonical `.octos/work` containment under the
+        // repo root, plus `SessionScope::with_workspace` when a scope is
+        // present — BEFORE `git worktree add`, and returns the allocation
+        // armed inside an RAII guard. Any refusal or `?` return between here
+        // and the worker handoff drops the guard, which prunes the worktree
+        // and its branch; the guard is disarmed at the two handoff points
+        // (right before the sync task run / right before the background
+        // `tokio::spawn`).
+        //
+        // Only worktree isolation rebinds the session scope. A shared spawn
+        // runs in the parent's workspace, so rebasing the scope onto
+        // `self.working_dir` — which in gateway/session-actor wiring is the
+        // factory cwd, outside the per-profile scope root — would wrongly
+        // fail the default (shared) spawn. Shared keeps the parent scope.
+        let (mut worker_worktree_guard, child_session_scope) = match input.isolation {
+            WorkerIsolation::Shared => (None, ctx.session_scope.clone()),
             WorkerIsolation::Worktree => {
-                match allocate_worker_worktree(&self.working_dir, &worker_id) {
-                    Ok(worktree) => Some(worktree),
+                match allocate_worker_worktree(
+                    &self.working_dir,
+                    &worker_id,
+                    ctx.session_scope.as_ref(),
+                ) {
+                    Ok((guard, scope)) => (Some(guard), scope),
                     Err(error) => {
                         return Ok(ToolResult {
                             output: format!(
@@ -2746,32 +2963,10 @@ impl Tool for SpawnTool {
                 }
             }
         };
-        let child_working_dir = worker_worktree
+        let child_working_dir = worker_worktree_guard
             .as_ref()
-            .map(|worktree| worktree.path.clone())
+            .map(|guard| guard.worktree().path.clone())
             .unwrap_or_else(|| self.working_dir.clone());
-        // Only rebind the session scope when this spawn gets its OWN git
-        // worktree. A shared spawn runs in the parent's workspace, so rebasing
-        // the scope onto `self.working_dir` — which in gateway/session-actor
-        // wiring is the factory cwd, outside the per-profile scope root — would
-        // wrongly fail the default (shared) spawn. Shared keeps the parent scope.
-        let child_session_scope = match worker_worktree.as_ref() {
-            Some(worktree) => {
-                match scoped_child_session_scope(ctx.session_scope.as_ref(), &worktree.path) {
-                    Ok(scope) => scope,
-                    Err(error) => {
-                        return Ok(ToolResult {
-                            output: format!(
-                                "Status: FAILED\nfailed to inherit session scope for worker worktree: {error}"
-                            ),
-                            success: false,
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            None => ctx.session_scope.clone(),
-        };
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
 
@@ -2947,6 +3142,14 @@ impl Tool for SpawnTool {
                     ..Default::default()
                 },
             );
+
+            // PR #1250 finding 1: every refusal point is behind us — the
+            // worker starts now. Disarm the prune guard; from here the
+            // worktree's lifecycle is owned by its status marker
+            // (completed/failed) and the `octos clean` sweep.
+            let worker_worktree = worker_worktree_guard
+                .take()
+                .map(WorkerWorktreeGuard::disarm);
 
             // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
             // M8.9 recovery so the synchronous spawn path mirrors the
@@ -3128,7 +3331,13 @@ impl Tool for SpawnTool {
             let working_dir = child_working_dir.clone();
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
-            let detached_worker_worktree = worker_worktree.clone();
+            // PR #1250 finding 1: the fanout-cap refusal above was the last
+            // refusal point on the background path — the detached worker is
+            // definitely dispatched below. Disarm the prune guard and move
+            // the worktree handle into the background task.
+            let detached_worker_worktree = worker_worktree_guard
+                .take()
+                .map(WorkerWorktreeGuard::disarm);
             let provider_policy = self.provider_policy.clone();
             let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
@@ -6461,6 +6670,270 @@ PY
             .status()
             .expect("git command starts");
         assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    /// `git init` + one commit at `repo`, so worktree tests have a HEAD to
+    /// branch worker worktrees from.
+    fn init_worktree_test_repo(repo: &std::path::Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        run_git(repo, &["init"]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "shared.txt"]);
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Octos Test",
+                "-c",
+                "user.email=octos@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+    }
+
+    fn git_worktree_list(repo: &std::path::Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list runs");
+        assert!(output.status.success(), "git worktree list failed");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The `.octos/work` root may exist (it is created before the last
+    /// refusal points), but a refused spawn must not leave any worker
+    /// worktree directory inside it.
+    fn assert_no_worker_worktrees(repo: &std::path::Path) {
+        let work_root = repo.join(".octos/work");
+        if !work_root.exists() {
+            return;
+        }
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(&work_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "refused spawn left worker worktrees behind: {leftovers:?}"
+        );
+    }
+
+    /// PR #1250 finding 1: a sync spawn refused AFTER worktree allocation
+    /// (here: the subagent tool-availability preflight `?` return) must
+    /// prune the just-created worktree + branch. Leaking it as a live
+    /// registered worktree is permanent — the `octos clean` sweep only
+    /// removes directories absent from `git worktree list`.
+    #[tokio::test]
+    async fn worktree_isolation_prunes_allocation_when_sync_preflight_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_worktree_test_repo(&repo);
+        let baseline = git_worktree_list(&repo);
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            repo.clone(),
+            in_tx,
+        );
+        let scope =
+            octos_core::SessionScope::solo(repo.clone(), vec![]).expect("scope construction");
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "edit shared.txt",
+                    "mode": "sync",
+                    "isolation": "worktree",
+                    "allowed_tools": ["definitely_not_a_real_tool"]
+                }),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "an unavailable allowed tool must refuse the sync spawn"
+        );
+
+        assert_eq!(
+            git_worktree_list(&repo),
+            baseline,
+            "refused spawn must leave `git worktree list` unchanged"
+        );
+        assert_no_worker_worktrees(&repo);
+        assert!(
+            !git_ref_exists(&repo, "refs/heads/octos/worker/subagent-0").unwrap(),
+            "refused spawn must not leave its worker branch behind"
+        );
+    }
+
+    /// PR #1250 finding 1: the background fanout-cap refusal happens after
+    /// worktree allocation; the refused spawn must prune the worktree +
+    /// branch instead of leaking a live registered worktree.
+    #[tokio::test]
+    async fn worktree_isolation_prunes_allocation_when_fanout_cap_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_worktree_test_repo(&repo);
+        let baseline = git_worktree_list(&repo);
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let supervisor = Arc::new(TaskSupervisor::new());
+        // Unique per-test session key: shared keys are drained cross-test.
+        let session_key = "api:worktree-cap-session";
+        for i in 0..crate::task_supervisor::MAX_CHILDREN_PER_PARENT {
+            let id = supervisor.register("busy", &format!("call-{i}"), Some(session_key));
+            assert!(!id.is_empty(), "saturation register #{i} must succeed");
+        }
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            repo.clone(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), session_key, repo.join("tasks.jsonl"));
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Write a short answer",
+                "label": "over-cap worktree spawn",
+                "mode": "background",
+                "isolation": "worktree"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "cap-refused spawn must fail");
+        assert!(
+            result.output.contains("[TASK LIMIT]"),
+            "refusal must surface the cap; got: {}",
+            result.output
+        );
+        assert_eq!(
+            git_worktree_list(&repo),
+            baseline,
+            "refused spawn must leave `git worktree list` unchanged"
+        );
+        assert_no_worker_worktrees(&repo);
+        assert!(
+            !git_ref_exists(&repo, "refs/heads/octos/worker/subagent-0").unwrap(),
+            "refused spawn must not leave its worker branch behind"
+        );
+    }
+
+    /// PR #1250 finding 2: a symlinked `.octos/work` must be rejected
+    /// BEFORE anything is created — even when the context carries no
+    /// session scope at all (the scope-based validation alone would never
+    /// run here).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_isolation_refuses_symlinked_work_root_before_creating() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_worktree_test_repo(&repo);
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(repo.join(".octos")).unwrap();
+        // repo/.octos/work -> outside the repository root.
+        std::os::unix::fs::symlink(&outside, repo.join(".octos/work")).unwrap();
+        let baseline = git_worktree_list(&repo);
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            repo.clone(),
+            in_tx,
+        );
+
+        // Deliberately NO ctx.session_scope: the repo-root containment
+        // check must refuse on its own.
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "edit shared.txt",
+                "mode": "sync",
+                "isolation": "worktree"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "symlinked work root must refuse the spawn");
+        assert!(
+            result.output.contains("symlink"),
+            "refusal must name the symlink escape; got: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing may be created outside the repository root"
+        );
+        assert_eq!(git_worktree_list(&repo), baseline);
+    }
+
+    /// PR #1250 finding 2: session-scope validation must run BEFORE
+    /// `git worktree add`. With a scope rooted at a repo SUBDIR, the
+    /// planned worktree (`<repo-root>/.octos/work/...`) falls outside the
+    /// session root: the spawn must be refused with nothing created.
+    #[tokio::test]
+    async fn worktree_isolation_refuses_scope_escape_before_creating() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_worktree_test_repo(&repo);
+        let session_root = repo.join("session-root");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let baseline = git_worktree_list(&repo);
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            session_root.clone(),
+            in_tx,
+        );
+        let scope = octos_core::SessionScope::solo(session_root.clone(), vec![])
+            .expect("scope construction");
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "edit shared.txt",
+                    "mode": "sync",
+                    "isolation": "worktree"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a worktree outside the session root must refuse the spawn"
+        );
+        assert!(
+            result.output.contains("rejected by session scope"),
+            "refusal must name the scope rejection; got: {}",
+            result.output
+        );
+        assert_eq!(
+            git_worktree_list(&repo),
+            baseline,
+            "scope-refused spawn must not create a worktree"
+        );
+        assert_no_worker_worktrees(&repo);
+        assert!(
+            !repo.join(".octos/work").exists(),
+            "scope-refused spawn must not create the work root either"
+        );
     }
 
     #[test]
