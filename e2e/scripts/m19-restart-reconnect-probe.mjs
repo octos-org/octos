@@ -24,6 +24,7 @@ function positiveIntegerEnv(name, fallback) {
 const timeoutMs = positiveIntegerEnv('OCTOS_M19_RESTART_TIMEOUT_MS', 15_000);
 const appuiTranscript = path.join(artifactDir, 'appui-transcript.jsonl');
 const websocketTranscript = path.join(artifactDir, 'websocket-transcript.jsonl');
+const reconnectEvents = path.join(artifactDir, 'reconnect-events.jsonl');
 const snapshotPath = path.join(
   artifactDir,
   phase === 'post' ? 'post-reconnect-snapshot.json' : 'pre-restart-snapshot.json',
@@ -61,6 +62,7 @@ function resetTranscriptsForPrePhase() {
   if (phase !== 'pre') return;
   fs.rmSync(appuiTranscript, { force: true });
   fs.rmSync(websocketTranscript, { force: true });
+  fs.rmSync(reconnectEvents, { force: true });
 }
 
 class RpcFailure extends Error {
@@ -272,6 +274,7 @@ async function main() {
       include: ['messages', 'threads', 'turns', 'pending_approvals'],
     });
     assert(hydrate?.session_id === sessionId, 'session/hydrate returned wrong session_id');
+    const cursor = hydrate?.cursor || opened?.opened?.cursor || null;
     writeJson(snapshotPath, {
       schema: 'octos.ux.restart_reconnect.snapshot.v1',
       generated_at: new Date().toISOString(),
@@ -293,7 +296,20 @@ async function main() {
       tools,
       session_snapshot: sessionSnapshot,
       hydrate,
-      cursor: hydrate?.cursor || opened?.opened?.cursor || null,
+      cursor,
+    });
+    // Materialize the reconnect evidence that is otherwise spread across the
+    // websocket transcript (phase-tagged client_hello + session/hydrate frames)
+    // as one event per probe phase. The post-phase event records a successful
+    // reconnect + hydrate against the restarted backend.
+    appendJsonl(reconnectEvents, {
+      schema: 'octos.ux.restart_reconnect.reconnect_event.v1',
+      phase,
+      event: phase === 'post' ? 'reconnected' : 'connected',
+      endpoint,
+      session_id: sessionId,
+      profile_id: profileId,
+      cursor_seq: Number.isFinite(Number(cursor?.seq)) ? Number(cursor.seq) : null,
     });
   } finally {
     await client.close();
