@@ -58,6 +58,40 @@ fn request_host(headers: &HeaderMap) -> Option<String> {
     Some(strip_port_from_host(&raw).to_string())
 }
 
+/// The endpoint URL a scanning client should dial: original authority
+/// (host AND port — `request_host` strips the port, which would send
+/// scanners to :80/:443, codex P2) plus `X-Forwarded-Proto` when a
+/// reverse proxy supplies it, else https with a loopback http fallback.
+fn request_endpoint(headers: &HeaderMap) -> Option<String> {
+    let authority = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|p| p == "http" || p == "https");
+    let scheme = forwarded_proto.unwrap_or_else(|| {
+        let host_only = strip_port_from_host(&authority);
+        if host_only == "localhost" || host_only.starts_with("127.") || host_only == "::1" {
+            "http".to_string()
+        } else {
+            "https".to_string()
+        }
+    });
+    Some(format!("{scheme}://{authority}"))
+}
+
 fn strip_port_from_host(host: &str) -> &str {
     if let Some(stripped) = host.strip_prefix('[') {
         return stripped.split(']').next().unwrap_or(host);
@@ -781,12 +815,7 @@ pub async fn me(
                 let status = if let Some(ref pm) = state.process_manager {
                     pm.status(&p.id).await
                 } else {
-                    crate::process_manager::ProcessStatus {
-                        running: false,
-                        pid: None,
-                        started_at: None,
-                        uptime_secs: None,
-                    }
+                    crate::process_manager::ProcessStatus::stopped()
                 };
                 Some(ProfileResponse {
                     email: None,
@@ -862,12 +891,7 @@ pub async fn me(
             let status = if let Some(ref pm) = state.process_manager {
                 pm.status(&p.id).await
             } else {
-                crate::process_manager::ProcessStatus {
-                    running: false,
-                    pid: None,
-                    started_at: None,
-                    uptime_secs: None,
-                }
+                crate::process_manager::ProcessStatus::stopped()
             };
             Some(ProfileResponse {
                 email: None,
@@ -908,12 +932,7 @@ pub async fn my_profile(
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
     } else {
-        crate::process_manager::ProcessStatus {
-            running: false,
-            pid: None,
-            started_at: None,
-            uptime_secs: None,
-        }
+        crate::process_manager::ProcessStatus::stopped()
     };
 
     Ok(Json(ProfileResponse {
@@ -922,6 +941,163 @@ pub async fn my_profile(
         status,
     }))
 }
+
+#[derive(Deserialize, Default)]
+pub struct MyProfileQrQuery {
+    #[serde(default)]
+    pub include_secrets: bool,
+    /// Endpoint URL to embed; defaults to the request host.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// Whether an env-var value may be resolved into a QR export for
+/// `profile_id`: plain values always; `keychain:` markers ONLY when they
+/// point at the profile's own scoped account (`VAR::profile_id`). Bare
+/// (`keychain:VAR`) and foreign-scoped markers are refused — both can
+/// address keychain items the profile does not own.
+pub(crate) fn marker_allowed_for_export(raw: &str, var: &str, profile_id: &str) -> bool {
+    if !crate::auth::keychain::is_marker(raw) {
+        return true;
+    }
+    raw == crate::auth::keychain::marker_for(&crate::auth::keychain::scoped_account(
+        var, profile_id,
+    ))
+}
+
+/// Build the QR wire payload from a stored [`crate::profiles::UserProfile`].
+///
+/// Secrets are the profile's OWN `env_vars` entries referenced by its
+/// LLM routes (`api_key_env` on primary + fallbacks) — never the host
+/// process env or auth store, so a tenant export can only ever carry
+/// tenant-scoped credentials. Sub-account inheritance is NOT resolved
+/// here: the payload mirrors the profile as stored.
+pub(crate) fn payload_from_user_profile(
+    profile: &crate::profiles::UserProfile,
+    include_secrets: bool,
+) -> eyre::Result<crate::profile_qr::ProfileQrPayload> {
+    use eyre::WrapErr;
+
+    let mut payload = crate::profile_qr::ProfileQrPayload::new(&profile.id);
+    payload.name = Some(profile.name.clone());
+    if let Some(ref llm) = profile.config.llm {
+        payload.llm = Some(serde_json::to_value(llm).wrap_err("serialize llm config")?);
+    }
+    if let Some(ref memory) = profile.config.memory {
+        payload.memory = Some(serde_json::to_value(memory).wrap_err("serialize memory config")?);
+    }
+    payload.voice_default = profile.config.voice_default.clone();
+
+    if include_secrets {
+        if let Some(ref llm) = profile.config.llm {
+            let routes = llm
+                .primary
+                .iter()
+                .chain(llm.fallbacks.iter())
+                .filter_map(|selection| selection.route.as_ref());
+            for route in routes {
+                let Some(ref var) = route.api_key_env else {
+                    continue;
+                };
+                let Some(raw) = profile.config.env_vars.get(var) else {
+                    continue;
+                };
+                if !marker_allowed_for_export(raw, var, &profile.id) {
+                    // A profile may persist an ARBITRARY keychain marker
+                    // suffix ("keychain:VERTEX_SA_JSON::admin"); resolving
+                    // it here would exfiltrate another tenant's (or the
+                    // host's) keychain item through the QR (codex P1).
+                    continue;
+                }
+                let Some(value) = crate::auth::keychain::resolve_value(var, raw)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                payload.secrets.entry(var.clone()).or_insert(value);
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+/// GET /api/my/profile/qr
+///
+/// Export the caller's profile as an `OCTOS1:`/`OCTOS1E:` payload for
+/// client-side QR rendering. With `include_secrets=true` the payload is
+/// ALWAYS PIN-wrapped (`OCTOS1E`) — there is no plain-secrets override
+/// over the API — and the one-time PIN is returned beside the payload,
+/// so a screenshotted or logged QR image alone reveals nothing.
+pub async fn my_profile_qr(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Query(query): Query<MyProfileQrQuery>,
+) -> Result<
+    (
+        axum::response::AppendHeaders<[(axum::http::HeaderName, &'static str); 2]>,
+        Json<serde_json::Value>,
+    ),
+    (StatusCode, String),
+> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "profile store not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+
+    let mut payload = payload_from_user_profile(&profile, query.include_secrets)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    payload.endpoint = query.endpoint.or_else(|| request_endpoint(&headers));
+
+    let (encoded, pin) = if payload.has_secrets() {
+        // The Argon2id profile is deliberately heavy (64 MiB, t=3) — run
+        // it OFF the async workers, and bound concurrent secret exports
+        // so parallel requests can't pin N×64 MiB + all Tokio workers
+        // (codex round-2 P2).
+        let _permit = SECRET_EXPORT_LIMIT.try_acquire().map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent secret exports; retry shortly".to_string(),
+            )
+        })?;
+        let pin = crate::profile_qr::generate_pin();
+        let sealed_payload = payload.clone();
+        let sealed_pin = pin.clone();
+        let encoded = tokio::task::spawn_blocking(move || {
+            crate::profile_qr::encode_encrypted(&sealed_payload, &sealed_pin)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, Some(pin))
+    } else {
+        let encoded = crate::profile_qr::encode_plain(&payload, false)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, None)
+    };
+
+    // The response body carries everything needed to decrypt the exported
+    // keys (payload + transfer secret) — it must never land in a shared
+    // cache or be persisted by an intermediary (codex round-2 P2).
+    Ok((
+        axum::response::AppendHeaders([
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ]),
+        Json(serde_json::json!({
+            "payload": encoded,
+            "pin": pin,
+            "profile_id": profile.id,
+        })),
+    ))
+}
+
+/// Bounded concurrency for PIN-wrapped profile exports: each runs a
+/// 64 MiB Argon2id derivation on the blocking pool.
+static SECRET_EXPORT_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// GET /api/my/profile/skills
 pub async fn my_profile_skills(
@@ -1143,12 +1319,7 @@ pub async fn update_my_profile(
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
     } else {
-        crate::process_manager::ProcessStatus {
-            running: false,
-            pid: None,
-            started_at: None,
-            uptime_secs: None,
-        }
+        crate::process_manager::ProcessStatus::stopped()
     };
 
     Ok(Json(ProfileResponse {
@@ -1302,6 +1473,200 @@ pub async fn set_my_voice(
         ok: true,
         voice: canonical,
     }))
+}
+
+// ── Voice pipeline readiness ──────────────────────────────────────────
+
+/// Readiness of a single voice-pipeline leg.
+#[derive(Serialize)]
+pub struct VoiceLeg {
+    pub ready: bool,
+    /// Human-readable status for the UI to surface the failing leg precisely.
+    pub detail: String,
+}
+
+/// Readiness of the TTS leg, including which route the profile resolves to.
+#[derive(Serialize)]
+pub struct VoiceTtsLeg {
+    pub ready: bool,
+    /// Effective route for this profile: `"cloud"` or `"local"`.
+    pub mode: String,
+    pub detail: String,
+}
+
+/// Aggregated voice-assistant pre-flight readiness for one tenant.
+#[derive(Serialize)]
+pub struct VoiceReadiness {
+    /// All legs ready → a voice turn can complete end to end.
+    pub ready: bool,
+    pub asr: VoiceLeg,
+    pub llm: VoiceLeg,
+    pub tts: VoiceTtsLeg,
+}
+
+/// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
+///
+/// Confirms the whole pipeline can run under THIS profile's current config:
+/// - **ASR**: on-device model ready. Always required — there is no cloud ASR
+///   route (only TTS has a cloud option), so ASR is on-device in every mode.
+/// - **LLM**: the profile's provider chain is constructed (running runtime with
+///   a named provider).
+/// - **TTS**: the *chosen* route is actually usable — cloud credentials resolve
+///   for `cloud`/`volcano` (and `auto` when configured); otherwise the on-device
+///   GPT-SoVITS MODEL is ready AND the profile's *effective* reply voice (live
+///   override > per-profile default) is synthesizable. Mirrors
+///   `voice_turn::synthesize_reply`'s routing + voice resolution so the check
+///   matches what a real turn would do.
+pub async fn voice_readiness(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<VoiceReadiness>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
+    let profile_id = profile.id.clone();
+
+    // ── ASR leg (always on-device) ──
+    let runtime = crate::api::ominix_runtime::runtime_status(&state.http_client).await;
+    let health_healthy = runtime.health.healthy;
+    let asr_ok = crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
+    let asr = VoiceLeg {
+        ready: asr_ok,
+        detail: if asr_ok {
+            "On-device ASR ready".into()
+        } else if !health_healthy {
+            "Voice engine unavailable".into()
+        } else {
+            "On-device ASR model not ready".into()
+        },
+    };
+
+    // ── LLM leg ──
+    // The provider chain is built at bootstrap; a running runtime with a named
+    // provider means the LLM is wired for this tenant. Resolve via the same
+    // path session/turn handling uses — including dynamically bootstrapped
+    // runtimes (onboarding, `profile/llm/upsert`) that live outside
+    // `state.profiles` — so readiness can't report "not started" while voice
+    // turns actually work.
+    let rt = crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id));
+    let llm = VoiceLeg {
+        ready: rt
+            .as_ref()
+            .map(|r| !r.provider_name.is_empty())
+            .unwrap_or(false),
+        detail: match rt.as_ref() {
+            Some(r) if !r.provider_name.is_empty() => format!("LLM provider: {}", r.provider_name),
+            Some(_) => "LLM provider not configured".into(),
+            None => "Profile runtime not started".into(),
+        },
+    };
+
+    // ── TTS leg (route-aware) ──
+    let (provider, cloud) = rt
+        .as_ref()
+        .map(|r| (r.voice.tts_provider.clone(), r.voice.cloud.clone()))
+        .unwrap_or_else(|| ("auto".to_string(), None));
+    let cloud_configured = crate::api::voice_turn::cloud_tts_configured(cloud.as_ref());
+    let tts = match crate::api::voice_turn::classify_tts_route(&provider, cloud_configured) {
+        crate::api::voice_turn::TtsRoute::Cloud => VoiceTtsLeg {
+            ready: cloud_configured,
+            mode: "cloud".into(),
+            detail: if cloud_configured {
+                "Volcano cloud TTS configured".into()
+            } else {
+                "Cloud TTS selected but credentials missing (appid + VOLC_TTS_TOKEN)".into()
+            },
+        },
+        crate::api::voice_turn::TtsRoute::Local => {
+            // The on-device leg needs the TTS MODEL itself: a ready ASR plus
+            // a present voice with a missing GPT-SoVITS model would report
+            // ready here and then fail inside `synthesize_reply`.
+            let engine_ok =
+                crate::api::ominix_runtime::tts_engine_ready(health_healthy, &runtime.voice_models);
+            // The voice a real turn would synthesize with: live override
+            // (PUT /api/my/voice) wins, else the bootstrapped per-profile
+            // default (which already overlays the serve default). Mirrors the
+            // `resolve_reply_voice` call in the voice-turn path; when the
+            // runtime isn't started (LLM leg already not-ready) fall back to
+            // the persisted per-profile selection the bootstrap would apply.
+            let effective_voice = crate::api::voices::resolve_reply_voice(
+                &profile_id,
+                rt.as_ref()
+                    .map(|r| r.voice.default_voice.as_str())
+                    .unwrap_or_else(|| profile.config.voice_default.as_deref().unwrap_or_default()),
+            );
+            let voice_ok = local_tts_voice_available(&profile_id, &effective_voice);
+            let local_ok = engine_ok && voice_ok;
+            VoiceTtsLeg {
+                ready: local_ok,
+                mode: "local".into(),
+                detail: if local_ok {
+                    "On-device GPT-SoVITS ready".into()
+                } else if !health_healthy {
+                    "Voice engine unavailable".into()
+                } else if !engine_ok {
+                    "On-device TTS model not ready".into()
+                } else if !effective_voice.is_empty() {
+                    format!("Selected voice '{effective_voice}' not available on device")
+                } else {
+                    "No on-device voice available".into()
+                },
+            }
+        }
+    };
+
+    let ready = asr.ready && llm.ready && tts.ready;
+    Ok(Json(VoiceReadiness {
+        ready,
+        asr,
+        llm,
+        tts,
+    }))
+}
+
+/// Whether this tenant can synthesize on-device with its EFFECTIVE reply
+/// voice.
+///
+/// `effective_voice` is the voice a real turn would hand `synthesize_reply`
+/// (live override > bootstrapped per-profile default — see
+/// `resolve_reply_voice`). When it is non-empty, THAT specific voice must be
+/// synthesizable and visible to the tenant — some *other* voice existing is
+/// not enough, because the turn would still pass the missing selected voice
+/// to the engine and fail. Only when no selection resolves anywhere (empty
+/// effective voice) does this degrade to "any visible synthesizable voice",
+/// matching the engine-side default an empty voice name gets on a real turn.
+/// Visibility mirrors `GET /api/voices` scoping (shared presets + voices this
+/// profile owns).
+fn local_tts_voice_available(profile_id: &str, effective_voice: &str) -> bool {
+    let registry_path = crate::api::voices::registry_path();
+    match octos_llm::ominix::VoicesRegistry::load(&registry_path) {
+        Ok(reg) => voice_available_in_registry(&reg, profile_id, effective_voice),
+        Err(_) => false,
+    }
+}
+
+/// Pure core of [`local_tts_voice_available`] over a loaded registry, so the
+/// selected-voice semantics are unit-testable without touching
+/// `~/.OminiX/models/voices.json`.
+fn voice_available_in_registry(
+    reg: &octos_llm::ominix::VoicesRegistry,
+    profile_id: &str,
+    effective_voice: &str,
+) -> bool {
+    if effective_voice.is_empty() {
+        !reg.synthesizable_visible(|ref_audio| {
+            crate::api::voices::voice_visible_to(profile_id, ref_audio)
+        })
+        .is_empty()
+    } else {
+        reg.resolve_visible(effective_voice, |ref_audio| {
+            crate::api::voices::voice_visible_to(profile_id, ref_audio)
+        })
+        .is_some()
+    }
 }
 
 // ── Matrix invite review endpoints ────────────────────────────────────
@@ -3452,6 +3817,220 @@ mod tests {
     use crate::user_store::UserStore;
     use axum::http::HeaderMap;
     use axum::http::Request;
+
+    // --- voice_available_in_registry (voice readiness, local TTS leg) ---
+
+    /// Registry with: a shared preset `doubao` (ref exists, alias `vivian`),
+    /// a shared preset `ghost` whose ref audio is missing, and a per-profile
+    /// clone owned by tenant `other` (exists on disk, invisible to others).
+    fn readiness_registry(dir: &std::path::Path) -> octos_llm::ominix::VoicesRegistry {
+        std::fs::create_dir_all(dir.join("ref_audios")).unwrap();
+        std::fs::write(dir.join("ref_audios/doubao_ref.wav"), b"fake").unwrap();
+        let clone_dir = dir.join("profiles/other/data/voice_profiles");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let clone_path = clone_dir.join("mine.wav");
+        std::fs::write(&clone_path, b"fake").unwrap();
+        let json = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": "{base}",
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] }},
+                "other-clone": {{ "ref_audio": "{clone}", "ref_text": "z", "aliases": [] }}
+              }}
+            }}"#,
+            base = dir.to_string_lossy(),
+            clone = clone_path.to_string_lossy()
+        );
+        octos_llm::ominix::VoicesRegistry::parse(&json).unwrap()
+    }
+
+    #[test]
+    fn selected_voice_must_itself_be_synthesizable_not_just_any_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = readiness_registry(dir.path());
+        // The selected voice's ref audio is missing: NOT ready, even though
+        // another synthesizable voice (doubao) exists — the false-positive
+        // the readiness probe used to report.
+        assert!(!voice_available_in_registry(&reg, "me", "ghost"));
+        // The selected voice resolves (by id or alias) → ready.
+        assert!(voice_available_in_registry(&reg, "me", "doubao"));
+        assert!(voice_available_in_registry(&reg, "me", "vivian"));
+        // Unknown selection → not ready.
+        assert!(!voice_available_in_registry(&reg, "me", "nope"));
+    }
+
+    #[test]
+    fn selected_voice_owned_by_another_tenant_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = readiness_registry(dir.path());
+        // Exists on disk but is another profile's clone: invisible → not ready.
+        assert!(!voice_available_in_registry(&reg, "me", "other-clone"));
+        // The owning tenant itself CAN use it.
+        assert!(voice_available_in_registry(&reg, "other", "other-clone"));
+    }
+
+    #[test]
+    fn empty_selection_falls_back_to_any_visible_synthesizable_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = readiness_registry(dir.path());
+        // No selection resolves anywhere → any visible synthesizable voice is
+        // enough (mirrors the engine default an empty-voice turn gets).
+        assert!(voice_available_in_registry(&reg, "me", ""));
+        // ...but an empty/ref-less registry is still not ready.
+        let empty = octos_llm::ominix::VoicesRegistry::parse(
+            r#"{ "default_voice": "", "models_base_path": "", "voices": {} }"#,
+        )
+        .unwrap();
+        assert!(!voice_available_in_registry(&empty, "me", ""));
+    }
+
+    // --- payload_from_user_profile (profile QR export) ---
+
+    fn qr_profile_fixture() -> crate::profiles::UserProfile {
+        let mut profile = crate::profiles::UserProfile {
+            id: "ada".into(),
+            name: "Ada".into(),
+            public_subdomain: None,
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-pro".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    route_id: None,
+                    label: None,
+                    base_url: None,
+                    api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                    api_type: None,
+                }),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: vec![],
+        });
+        profile
+            .config
+            .env_vars
+            .insert("DEEPSEEK_API_KEY".into(), "sk-profile-key".into());
+        profile.config.env_vars.insert(
+            "TELEGRAM_BOT_TOKEN".into(),
+            "bot-token-must-not-leak".into(),
+        );
+        profile
+    }
+
+    #[test]
+    fn qr_payload_without_secrets_masks_nothing_because_nothing_is_included() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, false).unwrap();
+        assert_eq!(payload.id, "ada");
+        assert_eq!(payload.name.as_deref(), Some("Ada"));
+        assert!(payload.llm.is_some());
+        assert!(payload.secrets.is_empty());
+        assert!(!payload.has_secrets());
+    }
+
+    #[test]
+    fn qr_payload_with_secrets_includes_only_llm_route_referenced_vars() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        assert_eq!(payload.secrets["DEEPSEEK_API_KEY"], "sk-profile-key");
+        assert!(
+            !payload.secrets.contains_key("TELEGRAM_BOT_TOKEN"),
+            "env vars not referenced by an LLM route must not ride along"
+        );
+    }
+
+    #[test]
+    fn qr_export_refuses_foreign_and_bare_keychain_markers() {
+        // plain values export
+        assert!(marker_allowed_for_export(
+            "sk-plain",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // own scoped marker exports
+        assert!(marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // ANOTHER tenant's scoped account: refuse (exfiltration vector)
+        assert!(!marker_allowed_for_export(
+            "keychain:VERTEX_SA_JSON::admin",
+            "VERTEX_SA_JSON",
+            "ada"
+        ));
+        // bare marker addresses a host-level item: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // marker under a DIFFERENT var name than referenced: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:OTHER_VAR::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+    }
+
+    #[test]
+    fn qr_endpoint_keeps_port_and_honors_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://localhost:50080"),
+            "authority (incl. port) must survive; loopback defaults to http"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "ada.crew.example.com".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("https://ada.crew.example.com")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::1]:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://[::1]:50080"),
+            "bracketed IPv6 loopback is local, not https"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            "ada.crew.example.com:8443".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://ada.crew.example.com:8443"),
+            "reverse-proxy proto must win over the https default"
+        );
+    }
+
+    #[test]
+    fn qr_payload_secrets_round_trip_pin_wrapped() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        let encoded = crate::profile_qr::encode_encrypted(&payload, "246810").unwrap();
+        let decoded = crate::profile_qr::decode(&encoded, Some("246810")).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(crate::profile_qr::decode(&encoded, Some("000000")).is_err());
+    }
 
     // --- relocate_secret_to_keychain ---
 

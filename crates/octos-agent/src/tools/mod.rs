@@ -29,7 +29,7 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -575,7 +575,7 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
-    /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
+    /// Downcast support for concrete tool access (e.g. mofa-make dispatcher wiring).
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: no downcasting. Override in tools that need it.
         &()
@@ -638,85 +638,6 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// LRU-based tool lifecycle manager.
-///
-/// Tracks per-tool usage and auto-evicts idle tools when the active count
-/// exceeds a threshold. Base tools are pinned and never evicted.
-pub struct ToolLifecycle {
-    /// Per-tool last-used iteration counter.
-    pub(crate) last_used: HashMap<String, u32>,
-    /// Current iteration counter.
-    pub(crate) iteration: u32,
-    /// Tools that are never auto-evicted.
-    pub(crate) base_tools: HashSet<String>,
-    /// Maximum active tools before eviction kicks in.
-    pub(crate) max_active: usize,
-    /// Tools idle for this many iterations become eviction candidates.
-    pub(crate) idle_threshold: u32,
-}
-
-impl Default for ToolLifecycle {
-    fn default() -> Self {
-        Self {
-            last_used: HashMap::new(),
-            iteration: 0,
-            base_tools: HashSet::new(),
-            max_active: 15,
-            idle_threshold: 5,
-        }
-    }
-}
-
-impl ToolLifecycle {
-    /// Set base tools that are never auto-evicted.
-    pub fn set_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.base_tools = names.into_iter().map(|n| n.into()).collect();
-    }
-
-    /// Add more tools to the base set (extends, does not replace).
-    pub fn add_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.base_tools.extend(names.into_iter().map(|n| n.into()));
-    }
-
-    /// Record that a tool was used at the current iteration.
-    pub fn record_usage(&mut self, name: &str) {
-        self.last_used.insert(name.to_string(), self.iteration);
-    }
-
-    /// Advance the iteration counter.
-    pub fn tick(&mut self) {
-        self.iteration += 1;
-    }
-
-    /// Find idle non-base tools to evict from `active_tools`, sorted by
-    /// staleness (oldest first). Callers should have already excluded
-    /// deferred tools from `active_tools`.
-    pub fn find_evictable(&self, active_tools: &[&str]) -> Vec<String> {
-        let active_count = active_tools.len();
-        if active_count <= self.max_active {
-            return Vec::new();
-        }
-
-        let mut candidates: Vec<(&str, u32)> = active_tools
-            .iter()
-            .filter(|name| !self.base_tools.contains(**name))
-            .map(|name| {
-                let last = self.last_used.get(*name).copied().unwrap_or(0);
-                (*name, last)
-            })
-            .filter(|(_, last)| self.iteration.saturating_sub(*last) >= self.idle_threshold)
-            .collect();
-
-        candidates.sort_by_key(|(_, last)| *last);
-        let to_evict = active_count.saturating_sub(self.max_active);
-        candidates
-            .into_iter()
-            .take(to_evict)
-            .map(|(name, _)| name.to_string())
-            .collect()
-    }
-}
-
 // Tool registry (extracted to its own module)
 mod registry;
 pub use registry::ToolRegistry;
@@ -754,6 +675,7 @@ pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
+pub mod memory_note;
 pub mod message;
 pub mod read_file;
 pub mod read_task_output;
@@ -771,7 +693,6 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
-pub mod activate_tools;
 pub mod admin;
 pub mod browser;
 pub mod check_background_tasks;
@@ -812,6 +733,7 @@ pub use mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
+pub use memory_note::MemoryNoteTool;
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
@@ -826,7 +748,6 @@ pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
-pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
@@ -1213,7 +1134,7 @@ pub fn is_symlink_error(e: &std::io::Error) -> bool {
 pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
@@ -1232,40 +1153,36 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
         }
         let mut file = opts.open(&path)?;
 
-        // Peek the first 5 bytes to detect a PDF (`%PDF-`). The symlink-safe
-        // open above is already done; the bytes we read here can't have
-        // followed a symlink. PDF content is binary so `read_to_string`
-        // would fail with a UTF-8 error — for those we route through
-        // `pdf-extract` to recover plain text. Pinned by the mini5 invoice
-        // upload regression (2026-05-12): the LLM couldn't summarize a PDF
-        // because read_to_string aborted immediately.
+        // Peek the first 5 bytes to detect a PDF (`%PDF-`). PDF content is
+        // binary so `read_to_string` would fail with a UTF-8 error — for
+        // those we route through `pdf-extract` to recover plain text. Pinned
+        // by the mini5 invoice upload regression (2026-05-12).
+        //
+        // Both branches read the REST from the SAME O_NOFOLLOW file
+        // descriptor (seek back to 0), never by re-opening the path. The
+        // previous PDF branch did `std::fs::read(&path)`, which follows
+        // symlinks and does no symlink re-check — a leaf swapped between the
+        // O_NOFOLLOW open (time-of-check) and that read (time-of-use) was
+        // followed, so an attacker could redirect the read to `/etc/passwd`
+        // or any file and feed its contents to the LLM. Reading from the
+        // held fd binds every byte to the inode we already validated.
         let mut magic = [0u8; 5];
-        match file.read(&mut magic) {
-            Ok(n) if n >= 5 && &magic == b"%PDF-" => {
-                // PDF detected — close the partial read, load whole bytes,
-                // hand to pdf-extract. Errors from extraction get wrapped
-                // as io::Error so callers see a single error type.
-                drop(file);
-                let bytes = std::fs::read(&path)?;
-                match pdf_extract::extract_text_from_mem(&bytes) {
-                    Ok(text) => Ok(text),
-                    Err(err) => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("pdf extraction failed: {err}"),
-                    )),
-                }
+        let n = file.read(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if n >= 5 && &magic == b"%PDF-" {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) => Ok(text),
+                Err(err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {err}"),
+                )),
             }
-            Ok(n) => {
-                // Not a PDF. Re-open at the start and read as UTF-8 text.
-                // (Seeking back works on regular files but we re-open for
-                // simplicity — the path is already known-safe.)
-                drop(file);
-                let mut file = opts.open(&path)?;
-                let mut content = String::with_capacity(n);
-                file.read_to_string(&mut content)?;
-                Ok(content)
-            }
-            Err(err) => Err(err),
+        } else {
+            let mut content = String::with_capacity(n);
+            file.read_to_string(&mut content)?;
+            Ok(content)
         }
     })
     .await
@@ -1389,6 +1306,45 @@ mod nofollow_tests {
 
         let err = read_no_follow(&link).await.unwrap_err();
         assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_reads_full_content_from_held_fd() {
+        // P2 (tri-repo #1529): both branches now read the rest of the file
+        // from the ALREADY-OPEN O_NOFOLLOW fd (seek back to 0) instead of
+        // re-opening the path. This guards the seek: after the 5-byte magic
+        // peek, the full content — INCLUDING the first 5 bytes — must be
+        // returned. A missing `seek(0)` would drop the leading 5 bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("plain.txt");
+        let content = "HELLO, this plaintext must round-trip in full.";
+        std::fs::write(&file, content).unwrap();
+
+        let read = read_no_follow(&file).await.unwrap();
+        assert_eq!(read, content, "full content must be read from the held fd");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_pdf_reads_whole_file_from_fd_not_path() {
+        // The PDF branch previously did `std::fs::read(&path)` — a re-open by
+        // path that follows a symlink swapped in after the O_NOFOLLOW open
+        // (TOCTOU). It now reads the whole file (magic + body) from the held
+        // fd. A PDF whose body extends well past the 5-byte magic must reach
+        // the extractor in full: pdf-extract fails on this junk body with
+        // InvalidData (proving the whole buffer, not a 5-byte truncation, was
+        // handed over — an empty/short buffer would surface differently).
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf = dir.path().join("doc.pdf");
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'X', 4096));
+        std::fs::write(&pdf, &bytes).unwrap();
+
+        let err = read_no_follow(&pdf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("pdf extraction failed"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

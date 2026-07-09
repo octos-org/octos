@@ -488,6 +488,16 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   the placeholder lifecycle, so the split survives a future
   `projection.envelope.v1` cutover. See § 8.
 
+Voice exit intent (ungated; accepted `UPCR-2026-025`):
+
+- `voice/exit` — the voice turn detected an end / goodbye / mute intent
+  (the model appended an in-band `[[EXIT]]` control marker, which the
+  backend strips from every model-/client-facing surface). The client
+  leaves the `/voice` screen and returns home — after the turn's farewell
+  audio finishes playing (navigation is gated client-side on the reply
+  audio draining). Emitted on the same ledger-backed live path as
+  `file/attached`. See § 8.
+
 Router and queue (Wave4-A):
 
 - `router/status`, `router/failover`, `queue/state`
@@ -500,7 +510,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
-- `context/compaction_completed`, `context/normalization_reported`
+- `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
 
 ## 7. Command Semantics
 
@@ -1744,6 +1754,24 @@ these events, NOT off `file/attached`. Payload fields:
 - `visual/failed` — `session_id`, `turn_id` (required); optional `topic`
   and `reason` (failure/timeout/cancel detail).
 
+### `voice/exit`
+
+Typed voice-exit signal introduced by `UPCR-2026-025`. A voice turn may
+append an in-band `[[EXIT]]` control marker after a short spoken farewell
+when the user expresses an end / goodbye / mute intent; the backend strips
+it from every model-/client-facing surface (live `message/delta`, persisted
+`response.content`, assistant carriers) and instead emits this structured
+event, so the client never scrapes the marker out of the assistant text.
+Ungated and emitted on the same ledger-backed live path as `file/attached`
+(durable append → replayed on reconnect).
+
+The client uses it to leave the `/voice` screen and return home, but gates
+the actual navigation on its OWN reply-audio queue draining — so the spoken
+farewell is heard before the screen changes. The event is the trigger; the
+client owns the timing. Payload fields:
+
+- `voice/exit` — `session_id`, `turn_id` (required); optional `topic`.
+
 ### `session/event`
 
 Wrapper envelope introduced by `UPCR-2026-014` (M9-α-9) that bridges
@@ -1850,6 +1878,26 @@ Required fields: `session_id`, `context_state`, `compaction`. Full field
 set, `UiContextState` shape, and `UiContextCompactionRecord` shape
 documented by
 [UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `context/compaction_started`
+
+Notification that a server-owned context-manager compaction pass is about
+to run. Emitted immediately before the pass with the PRE-compaction
+`context_state` (its `token_estimate` is the "before" size), the `trigger`
+label that the eventual `context/compaction_completed` record repeats, and
+`threshold_tokens` (the context-window-derived limit that tripped the
+pass) so clients can render an honest fullness percentage and an
+in-progress state (spinner/progress bar).
+
+Always followed by `context/compaction_completed` for the same pass.
+Today's serve compaction is synchronous, so both notifications may arrive
+in one delivery batch; clients MUST tolerate a zero-duration window.
+
+Capability gate: `context.lifecycle.v1`.
+
+Required fields: `session_id`, `context_state`, `trigger`,
+`threshold_tokens`. Documented by
+[UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
 
 ### `context/normalization_reported`
 

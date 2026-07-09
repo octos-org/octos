@@ -275,19 +275,9 @@ impl SessionRuntime {
         );
         tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
         tools.rebind_plugin_work_dirs(&plugin_work_dir);
-        // M11-F regression fix REG-1 follow-up round 2 (codex review):
-        // re-register a fresh `ActivateToolsTool` instance on this
-        // session's registry. The profile-level template is shared via
-        // `Arc<dyn Tool>` clones across every session that snapshots
-        // from `profile.tool_specs`; if we let the same instance
-        // straddle sessions, the most recently bootstrapped session's
-        // `wire_activate_tools()` would rebind the shared tool's
-        // `Weak<ToolRegistry>` away from earlier sessions and break
-        // their `activate_tools` calls. Minting a fresh tool per
-        // session keeps the wiring per-registry.
-        if tools.get("activate_tools").is_some() {
-            tools.register(octos_agent::ActivateToolsTool::new());
-        }
+        // RFC-0 (#1289): the `activate_tools` meta-tool was removed — every
+        // enabled tool is emitted every turn, so there is no per-session
+        // meta-tool to re-register or wire.
         // Per-session policy filter is a no-op for M11; future work
         // may add session-level policy overrides on top of
         // `profile.tool_policy`. The profile-level policy itself is
@@ -495,7 +485,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.system_prompt.clone())
+        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -507,6 +497,38 @@ impl SessionRuntime {
         // behaviour byte-for-byte (no consumer reads the field yet).
         if let Some(scope) = session_scope {
             agent = agent.with_session_scope(scope);
+        }
+
+        // Memory rides the per-session agent as a NAMED prompt segment
+        // (chat.rs pattern) instead of being frozen into the profile's
+        // bootstrap prompt String: serve profiles bootstrapped before any
+        // consolidation carried an empty block forever (the model then
+        // fabricates a "memory bank" when asked). The provider re-renders
+        // the segment at each turn start when MEMORY.md / daily notes /
+        // bank change on disk (one fingerprint stat per turn otherwise).
+        let memory_ctx = profile
+            .memory_store
+            .get_injectable_context(profile.memory_inject_tokens)
+            .await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
+        );
+        // Contract parity with chat.rs: `memory.refresh.enabled = false`
+        // means NO per-turn memory re-read — the segment stays as seeded
+        // at session bootstrap. Default-on makes disabled an explicit
+        // opt-out.
+        if profile.memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                profile.memory_store.clone(),
+                profile.memory_inject_tokens,
+                true,
+            )));
+        }
+        // Post-memory half AFTER the named segment — the pre-refactor
+        // order (memory before skills/tool guidance).
+        if !profile.prompt_parts.post_memory.is_empty() {
+            agent.append_system_prompt(&profile.prompt_parts.post_memory);
         }
 
         // M11-F regression fix REG-3: propagate the profile-scope
@@ -521,15 +543,6 @@ impl SessionRuntime {
             agent = agent.with_hooks(hooks);
         }
 
-        // M11-F regression fix REG-1 follow-up (codex review): when
-        // `ProfileRuntime::bootstrap` deferred non-core tool groups and
-        // registered `activate_tools`, the agent must call
-        // `wire_activate_tools()` so the tool's `Weak<ToolRegistry>`
-        // back-reference is planted. Without this, `activate_tools`
-        // remains a no-op stub (its `set_registry` is never invoked)
-        // and the LLM cannot pull a deferred group back on demand.
-        // Gateway does the equivalent at `session_actor.rs:2500`.
-        agent.wire_activate_tools();
         // RFC-1 (issue #1290): same pattern for the `mofa_make`
         // dispatcher. The loader registered it but its `Weak<ToolRegistry>`
         // back-reference needs the Arc-wrapped registry; we plant it here.
@@ -817,9 +830,17 @@ mod tests {
             plugin_hooks: Vec::new(),
             review_config: None,
             human_approval_rules: None,
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: system_prompt.clone(),
+                post_memory: String::new(),
+            },
             system_prompt,
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
@@ -835,6 +856,87 @@ mod tests {
     ) -> Arc<ProfileRuntime> {
         make_profile_with_prompt_and_sandbox(data_dir, "test-system-prompt".to_string(), sandbox)
             .await
+    }
+
+    #[tokio::test]
+    async fn session_agent_renders_fresh_memory_segment() {
+        // Serve sessions read MEMORY.md via the per-session agent's NAMED
+        // segment + turn-start refresh — NOT a value frozen into the
+        // profile bootstrap prompt (which fabricated-memory bugs came
+        // from). Consolidations landing AFTER the session was created
+        // must be visible on the next refresh.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Monday. (updated: 2026-07-08) ^mvzercg\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "mem"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Deploy day is Monday"),
+            "session agent must inject MEMORY.md: {prompt}"
+        );
+
+        // A consolidation AFTER session creation becomes visible on the
+        // next turn-start refresh (fingerprint change).
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "Deploy day is Friday again. (updated: 2026-07-09) ^mvzercg\n",
+        )
+        .unwrap();
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            prompt.contains("Friday again"),
+            "read-refresh must pick up post-bootstrap consolidations: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_segment_keeps_pre_skills_slot() {
+        // codex round-3 P2: the memory block must keep its pre-refactor
+        // position — after bootstrap/soul, BEFORE the skills/tool-prefs
+        // half — or persisted user memory gains precedence over guidance
+        // that always followed it.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+        std::fs::write(
+            data_dir.join("memory/MEMORY.md"),
+            "A very durable fact. (updated: 2026-07-09) ^mvvvvvv\n",
+        )
+        .unwrap();
+        let profile = make_profile(data_dir.clone()).await;
+
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "order"), None)
+            .await
+            .expect("bootstrap");
+        rt.agent.refresh_prompt_segments().await;
+        let prompt = rt.agent.system_prompt_snapshot();
+        let memory_pos = prompt
+            .find("A very durable fact")
+            .expect("memory segment present");
+        if let Some(tool_prefs_pos) = prompt.find("## Tool Preferences") {
+            assert!(
+                memory_pos < tool_prefs_pos,
+                "memory must precede the tool-prefs half: mem={memory_pos} prefs={tool_prefs_pos}"
+            );
+        }
+        if let Some(skills_pos) = prompt.find("## Available Skills") {
+            assert!(
+                memory_pos < skills_pos,
+                "memory must precede the skills half: mem={memory_pos} skills={skills_pos}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1399,8 +1501,16 @@ mod tests {
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
@@ -1408,198 +1518,6 @@ mod tests {
             lane_routing: None,
             voice: crate::config::VoiceConfig::default(),
         })
-    }
-
-    /// M11-F regression fix REG-1 follow-up (codex review):
-    /// `SessionRuntime::bootstrap` must call `wire_activate_tools()`
-    /// on the per-session agent when `ProfileRuntime::bootstrap`
-    /// registered `activate_tools` (deferred-group scenario). Without
-    /// the wiring, `activate_tools.execute()` returns
-    /// `"tool registry not available"` and the LLM cannot pull
-    /// deferred groups back on demand.
-    #[tokio::test]
-    async fn session_runtime_agent_wires_activate_tools() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("profile-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
-        let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
-        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
-        let sandbox = SandboxConfig::default();
-        // Build a registry with activate_tools + a deferred entry so
-        // execute() has something to list.
-        let mut base_tools =
-            ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
-        base_tools.defer_group("group:web");
-        base_tools.register(octos_agent::ActivateToolsTool::new());
-        let profile = Arc::new(ProfileRuntime {
-            profile_id: "_main".to_string(),
-            data_dir: data_dir.clone(),
-            llm: Arc::new(StubLlm),
-            adaptive_router: None,
-            runtime_qos_catalog: None,
-            primary_model_id: "stub-model".to_string(),
-            provider_name: "stub".to_string(),
-            credentials: HashMap::new(),
-            skills_dir: None,
-            plugin_env_template: Vec::new(),
-            tool_policy: None,
-            default_sandbox: sandbox,
-            max_iterations: None,
-            tool_specs: Arc::new(base_tools),
-            plugin_tool_names: Vec::new(),
-            plugin_dirs: Vec::new(),
-            plugin_prompt_fragments: Vec::new(),
-            plugin_hooks: Vec::new(),
-            review_config: None,
-            human_approval_rules: None,
-            system_prompt: "test-system-prompt".to_string(),
-            memory,
-            memory_store,
-            tool_config,
-            cron_service: None,
-            pipeline_factory: None,
-            hook_executor: None,
-            lane_routing: None,
-            voice: crate::config::VoiceConfig::default(),
-        });
-        let key = SessionKey::new("api", "activate-tools-probe");
-        let rt = SessionRuntime::bootstrap(&profile, key, None)
-            .await
-            .expect("bootstrap");
-
-        let registry = rt.agent.tool_registry();
-        let tool = registry
-            .get("activate_tools")
-            .expect("activate_tools must be registered");
-        // Executing with empty args lists deferred groups. The path
-        // unwraps `registry.upgrade()`; if `wire_activate_tools` did
-        // not fire, the unwrap maps to an `Err("tool registry not
-        // available")` and the assertion below fails.
-        let result = tool
-            .execute(&serde_json::json!({}))
-            .await
-            .expect("activate_tools must be wired so its registry Weak upgrades");
-        assert!(
-            !result.output.contains("tool registry not available"),
-            "activate_tools.execute should not surface 'tool registry not available'; \
-             got: {}",
-            result.output,
-        );
-    }
-
-    /// M11-F regression fix REG-1 follow-up round 2 (codex review):
-    /// `ActivateToolsTool` is stored on the registry as `Arc<dyn Tool>`,
-    /// and `ToolRegistry::rebind_cwd` clones those Arcs verbatim into
-    /// the new per-session registry. If we DON'T re-register a fresh
-    /// `ActivateToolsTool` per session, both sessions end up sharing
-    /// the SAME tool instance — and the second session's
-    /// `wire_activate_tools()` rewires the shared `Weak<ToolRegistry>`
-    /// off session A's registry onto session B's, breaking session A's
-    /// `activate_tools` calls.
-    ///
-    /// This test bootstraps two sessions from the same profile (both
-    /// of which carry `activate_tools` on the base template) and
-    /// asserts that session A's activate_tools still resolves to
-    /// session A's registry after session B has been bootstrapped.
-    #[tokio::test]
-    async fn session_runtime_isolates_activate_tools_across_sessions() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("profile-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
-        let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
-        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
-        let sandbox = SandboxConfig::default();
-        let mut base_tools =
-            ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
-        base_tools.defer_group("group:web");
-        base_tools.register(octos_agent::ActivateToolsTool::new());
-        let profile = Arc::new(ProfileRuntime {
-            profile_id: "_main".to_string(),
-            data_dir: data_dir.clone(),
-            llm: Arc::new(StubLlm),
-            adaptive_router: None,
-            runtime_qos_catalog: None,
-            primary_model_id: "stub-model".to_string(),
-            provider_name: "stub".to_string(),
-            credentials: HashMap::new(),
-            skills_dir: None,
-            plugin_env_template: Vec::new(),
-            tool_policy: None,
-            default_sandbox: sandbox,
-            max_iterations: None,
-            tool_specs: Arc::new(base_tools),
-            plugin_tool_names: Vec::new(),
-            plugin_dirs: Vec::new(),
-            plugin_prompt_fragments: Vec::new(),
-            plugin_hooks: Vec::new(),
-            review_config: None,
-            human_approval_rules: None,
-            system_prompt: "test-system-prompt".to_string(),
-            memory,
-            memory_store,
-            tool_config,
-            cron_service: None,
-            pipeline_factory: None,
-            hook_executor: None,
-            lane_routing: None,
-            voice: crate::config::VoiceConfig::default(),
-        });
-
-        let rt_a = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-a"), None)
-            .await
-            .expect("bootstrap A");
-        let rt_b = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-b"), None)
-            .await
-            .expect("bootstrap B");
-
-        // Both sessions must have a usable `activate_tools`. The
-        // pre-fix regression: session A's tool's Weak would have been
-        // rewired by session B's bootstrap and now upgrades to
-        // session B's registry, mixing per-session state.
-        let tool_a = rt_a
-            .agent
-            .tool_registry()
-            .get("activate_tools")
-            .expect("session A activate_tools");
-        let tool_b = rt_b
-            .agent
-            .tool_registry()
-            .get("activate_tools")
-            .expect("session B activate_tools");
-
-        // The fresh-registration step in `SessionRuntime::bootstrap`
-        // means the two sessions must hold DISTINCT `Arc<dyn Tool>`
-        // instances; if they did not, the second bootstrap would have
-        // rewired the shared Weak away from the first.
-        assert!(
-            !Arc::ptr_eq(tool_a, tool_b),
-            "activate_tools must be a fresh instance per session, not a \
-             shared Arc cloned from the profile template",
-        );
-
-        // Both tools must execute successfully (i.e. their Weak
-        // upgrades to a live registry — not "tool registry not
-        // available").
-        let result_a = tool_a
-            .execute(&serde_json::json!({}))
-            .await
-            .expect("activate_tools A wired");
-        assert!(
-            !result_a.output.contains("tool registry not available"),
-            "session A activate_tools must remain wired after session B bootstrap; got: {}",
-            result_a.output,
-        );
-        let result_b = tool_b
-            .execute(&serde_json::json!({}))
-            .await
-            .expect("activate_tools B wired");
-        assert!(
-            !result_b.output.contains("tool registry not available"),
-            "session B activate_tools must also be wired; got: {}",
-            result_b.output,
-        );
     }
 
     /// M11-F regression fix REG-3: when the parent `ProfileRuntime`

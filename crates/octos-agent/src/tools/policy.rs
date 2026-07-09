@@ -141,8 +141,8 @@ fn entry_is_robot_group(entry: &str) -> bool {
     robot_groups::parse_group_name(entry).is_some()
 }
 
-/// Metadata about a tool group, used by the `activate_tools` tool to present
-/// available deferred groups to the LLM.
+/// Metadata about a named tool group (`group:web`, `group:runtime`, …) used
+/// by [`ToolPolicy`] matching and profile/role tool declarations.
 #[derive(Debug, Clone)]
 pub struct ToolGroupInfo {
     pub name: &'static str,
@@ -205,7 +205,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:memory",
         description: "Long-term memory: save and recall knowledge across sessions",
-        tools: &["recall_memory", "save_memory"],
+        tools: &["recall_memory", "save_memory", "memory_note"],
     },
     ToolGroupInfo {
         name: "group:research",
@@ -252,6 +252,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
             "send_message",
             "message",
             "save_memory",
+            "memory_note",
             "execute_code",
         ],
     },

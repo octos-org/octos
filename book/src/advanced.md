@@ -4,25 +4,16 @@ This chapter covers power-user features: tool management, queue modes, lifecycle
 
 ---
 
-## Tools & LRU Deferral
+## Tools
 
-Octos manages a large tool catalog by splitting tools into **active** and **deferred** sets. Active tools are sent to the LLM as callable tool specifications. Deferred tools are listed by name in the system prompt but not sent as full specs until needed.
+Octos sends the **full set of enabled tools** to the LLM as callable tool specifications on every turn. There is no recency-based deferral: which tools are available is controlled by [Tool Policies](#tool-policies) (allow/deny lists, named groups) and per-provider policy — not by how recently a tool was used.
 
-### How It Works
+Two categories are intentionally kept out of the per-turn tool list:
 
-- **Base tools** (never evicted): `read_file`, `write_file`, `shell`, `glob`, `grep`, `list_dir`, `run_pipeline`, `deep_search`, and others.
-- **Dynamic tools**: tools like `save_memory`, `web_search`, `recall_memory` that are activated on demand and evicted when idle.
-- **Deferred tools**: `browser`, `manage_skills`, `spawn`, `configure_tool`, `switch_model`, and others listed by name only.
+- **`spawn_only` tools** — background/fire-and-forget skills. They are auto-intercepted and run in a detached task rather than offered as normal callable specs in the main session (they surface to sub-agents).
+- **Internal-hidden tools** — dispatcher targets (e.g. `mofa_make`'s per-skill entry points) that a forwarding tool calls internally but that are hidden from the model to keep the surface clean.
 
-### Eviction Rules
-
-When the active tool count exceeds 15:
-- Tools idle for 5+ agent iterations that are not in the base set become candidates.
-- The stalest tool is moved to the deferred list first.
-
-### Re-activation
-
-When the LLM needs a deferred tool, it calls `activate_tools({"tools": [...]})`. This resolves the tool name to its group and activates the entire group.
+> **History:** earlier versions used an LRU-by-recency scheme (≈15 active, the rest deferred and re-promoted via an `activate_tools` meta-tool). This was removed in RFC-0 (#1289): modern LLMs handle the full ~40–50-tool set without quality degradation, and always sending the full list keeps the prompt cache stable and every tool discoverable.
 
 ### Tool Configuration
 
@@ -227,7 +218,22 @@ Hooks are shell commands that run at agent lifecycle events. Each hook receives 
 
 ### Events
 
-Four lifecycle events, each with a specific payload:
+Ten lifecycle events. Only the three **`before_*`** events can deny (exit 1); every other event is observe-only (a non-zero exit is logged but does not block).
+
+| Event | When it fires | Can deny |
+|-------|---------------|----------|
+| `before_tool_call` | Before each tool execution | ✅ |
+| `after_tool_call` | After each tool execution | — |
+| `before_llm_call` | Before each LLM API call | ✅ |
+| `after_llm_call` | After each successful LLM response | — |
+| `before_spawn_verify` | Before a spawned sub-agent's verify step | ✅ |
+| `on_spawn_verify` | At a spawned sub-agent's verify step | — |
+| `on_spawn_complete` | When a spawned (background) task completes | — |
+| `on_spawn_failure` | When a spawned task fails | — |
+| `on_turn_end` | When an agent turn finishes | — |
+| `on_resume` | When a session/turn resumes (e.g. after a client reconnect) | — |
+
+The four core events carry the richest payloads (shown below); the spawn/turn/resume events carry the relevant task/session identifiers plus `event`, `session_id`, and `profile_id`.
 
 #### `before_tool_call`
 
@@ -326,7 +332,7 @@ In `config.json` or per-profile JSON:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `event` | yes | -- | One of the 4 event types |
+| `event` | yes | -- | One of the 10 event types (see Events above) |
 | `command` | yes | -- | Argv array (no shell interpretation) |
 | `timeout_ms` | no | 5000 | Kill hook process after this timeout |
 | `tool_filter` | no | all | Only trigger for these tool names (tool events only) |
@@ -447,15 +453,15 @@ Configure in `config.json`:
 
 ## Session Management
 
-### Session Forking
+### New & Named Sessions
 
-Send `/new` to create a branched conversation:
+Send bare `/new` (equivalent to `/clear`) to wipe the current session's history and start fresh:
 
 ```
 /new
 ```
 
-This creates a new session that copies the last 10 messages from the current conversation. The child session has a `parent_key` reference to the original. Each fork gets a unique key namespaced by sender and timestamp.
+Use `/new <name>` to switch to — or create — a **named** session (e.g. `/new research`), and `/new slides <name>` / `/new site <preset>` to scaffold a project session. Sessions are keyed by sender/channel; the session store additionally carries a `parent_key` field used for internally-forked child sessions (e.g. background spawns).
 
 ### Session Persistence
 
@@ -463,7 +469,7 @@ Each channel:chat_id pair maintains its own session (conversation history).
 
 - **Storage**: JSONL files in `.octos/sessions/`
 - **Max history**: Configurable via `gateway.max_history` (default: 50 messages)
-- **Session forking**: `/new` creates a branched conversation with parent_key tracking
+- **Sessions**: bare `/new` clears the current session; named sessions are keyed by sender/channel, with a `parent_key` field for internally-forked child sessions
 
 ### Config Hot-Reload
 
@@ -488,6 +494,54 @@ Split preference: paragraph boundary > newline > sentence end > space > hard cut
 
 ---
 
+## Autonomy & Session Control
+
+Beyond one-shot chat, the graphical clients (octos-web, octos-tui) drive longer-running behaviors over the [UI Protocol](./architecture.md). The autonomy and task-artifact groups are gated by negotiated capability flags (see [Capability Negotiation](#capability-negotiation)); the core turn/session controls (`turn/start`, `turn/interrupt`, `session/rollback`, `task/output/read`) are always available.
+
+### Goals
+
+A **goal** is a persistent objective attached to a session. Once set, the agent keeps working toward it — re-firing turns as long as the goal's policy allows — instead of stopping after a single answer. Goals survive across turns and are cleared explicitly.
+
+- Protocol: `session/goal/set`, `session/goal/get`, `session/goal/clear` (notifications `session/goal/updated`, `session/goal/cleared`). Feature flags: **both** `coding.autonomy.v1` **and** `coding.goal_runtime.v1` must be negotiated (advertising only the group flag yields `method_not_supported`).
+- Use it for "keep going until X is done" work. Clearing the goal stops **future** re-fires, but does **not** abort a turn already in flight — call `turn/interrupt` to stop work that's currently running.
+
+### Loops
+
+A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (fire every N seconds), **self-paced** (the model sets its own next cadence by emitting a `<<loop-next-in: …>>` hint; default 15 minutes when it doesn't), or **maintenance** (runs an upkeep prompt resolved fresh on each fire — a `loop.md` override file if one is found, otherwise a built-in default). A loop keeps firing until paused, deleted, the 10,000-fire cap — **or its 7-day expiry**: every loop is stamped with `expires_at_ms = now + 7 days` and the due-scan skips it once expired, even below the fire cap.
+
+- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete`, `loop/fire_now` (**request** an immediate fire — it runs through the loop's fire policy and can be rejected if the loop is paused/exhausted or deduplicated, so inspect the returned `fire.queued`/error result rather than assuming a run happened). Notifications `loop/fired`, `loop/updated` (a `loop/completed` variant exists in the protocol but is not currently emitted on normal iterations — don't block on it). Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
+- Use it for polling, monitoring, and self-paced background agents.
+
+### Rewind
+
+`session/rollback` rewinds the **conversation** to an earlier point — it appends a rollback marker and rebuilds the chat/context history by dropping the last N user turns. It does **not** revert workspace files or task state. `session/snapshot` is a **read-only** aggregation of the current status, files, and tasks — a view, not a restorable checkpoint. Together they back the clients' "rewind" UI at the conversation level only.
+
+### Task & turn control
+
+- **Background tasks** (spawned work, deep-search, pipelines) can be listed and cancelled: `task/list`, `task/cancel`, with output/artifacts via `task/output/read` and `task/artifact/list`. Cancel is also reachable over REST at `POST /api/tasks/{id}/cancel`. `task/restart_from_node` is **accepted but not yet functional for re-execution** — the relaunch callback isn't wired into the production runtime, so it registers a successor task without re-running the work.
+- **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are aborted). Any messages already committed to the session survive (recoverable via replay/hydration); only the uncommitted streaming remainder of the interrupted turn is lost. `turn/start` and `turn/interrupt` are **not** capability-gated — they're always available. The separate **sub-agent** controls (`agent/list`, `agent/status/read`, `agent/interrupt`, `agent/close`) and task artifacts (`task/artifact/list|read`) require `coding.autonomy.v1` + `coding.agent_control.v1`.
+
+### Capability negotiation
+
+A client advertises which protocol features it supports when it connects: over WebSocket via the `ui_feature` / `ui_features` query params or the `X-Octos-Ui-Features` header; over `serve --stdio` via `client_hello`'s `supported_features`. The server gates most methods on the negotiated set, so older clients keep working as new capabilities ship. Two caveats worth knowing when implementing a client: some methods are *advertised* in the default capability list but still require their specific flag to actually be *called* (rely on the negotiated list and handle `method_not_supported` defensively); and notification delivery is best-effort — a connection can still observe autonomy events (`session/goal/updated`, `loop/*`, `agent/*`) triggered by another connection via live-forwarding or replay. Representative flags:
+
+| Flag | Unlocks |
+|------|---------|
+| `coding.autonomy.v1` | Autonomy root — required *together with* the goal/loop/agent-control flags below |
+| `coding.goal_runtime.v1` | Goals (`session/goal/*`) — needs `coding.autonomy.v1` too |
+| `coding.loop_runtime.v1` | Loops (`loop/*`) — needs `coding.autonomy.v1` too |
+| `coding.agent_control.v1` | Sub-agent controls (`agent/*`) and task artifacts (`task/artifact/*`) — needs `coding.autonomy.v1` too |
+| `harness.task_control.v1` | Task list/cancel/restart |
+| `harness.task_artifacts.v1` | Advertises `task/artifact/*`, but the dispatcher also requires `coding.autonomy.v1` + `coding.agent_control.v1` to actually call them |
+| `state.session_hydrate.v1` | `session/hydrate` resume |
+| `state.thread_graph.v1` | Thread/turn graph |
+| `context.lifecycle.v1` | Context-compaction events |
+| `approval.typed.v1` | Typed human-approval cards |
+| `user_question.v1` | Clarifying-question cards |
+| `auxiliary.rest_to_ws.v1` | The 13 auxiliary REST→WS methods (`session/list`, `content/list`, `session/snapshot`, …) |
+
+---
+
 ## Context Compaction
 
 When the conversation exceeds the LLM's context window, older messages are automatically compacted:
@@ -505,10 +559,23 @@ When the conversation exceeds the LLM's context window, older messages are autom
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Fork the conversation (creates a new session copying the last 10 messages) |
+| `/new [name]` | Bare `/new` clears the current session; `/new <name>` switches to (or creates) a named session; `/new slides <name>` / `/new site <preset>` scaffold a project |
+| `/clear` | Wipe the current session's history |
+| `/s`, `/switch <name>` | Switch to a named session |
+| `/sessions` | List sessions for this chat |
+| `/back`, `/b` | Switch to the previously active session |
+| `/delete`, `/d` | Delete the current session |
 | `/config` | View and modify tool configuration |
 | `/queue` | View or change queue mode |
+| `/thinking` | View or set the reasoning-effort level (transport-dependent) |
+| `/router`, `/adaptive` | View or change the routing/adaptive mode |
+| `/soul` | View or edit the profile's SOUL (personality) |
+| `/skills` | List / install / remove skills inline |
+| `/status` | Show session/runtime status |
+| `/help` | List the commands available on the current transport |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
+
+The exact set varies by transport (CLI, gateway channel, web, TUI). Matrix management rooms add scheduling (`/schedule`, `/schedules`, `/unschedule`) and multi-bot (`/createbot`, `/deletebot`, `/listbots`, `/allbots`, `/bothelp`) commands — see [Gateway & Channels](./channels.md).
 
 ### In-Chat Provider Switching
 
@@ -525,7 +592,7 @@ Bot: Current model: deepseek/deepseek-chat
        - anthropic (default: claude-sonnet-4-20250514) [ready]
        - openai (default: gpt-4o) [ready]
        - deepseek (default: deepseek-chat) [ready]
-       - gemini (default: gemini-2.0-flash) [ready]
+       - gemini (default: gemini-2.5-flash) [ready]
        ...
 ```
 

@@ -47,6 +47,7 @@ tracing-appender = { workspace = true }
 rustyline = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+fs2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 getrandom = "0.2"
 constant_time_eq = "0.3"
@@ -70,13 +71,25 @@ base64 = { workspace = true }
 # `octos_agent::workspace_policy::WorkspacePolicy` as the canonical schema
 # and only needs the `toml` deserializer entry point here.
 toml = { workspace = true }
+# `octos acp` speaks the Agent Client Protocol (Zed editor <-> agent standard)
+# over stdio. The official Rust SDK provides the JSON-RPC framing, the schema
+# types (initialize/session-new/prompt/cancel + session/update notifications),
+# and the connection runtime; `acp.rs` implements the agent side on top of the
+# existing octos agent loop. Pinned to the published 1.2.0 line.
+agent-client-protocol = "1.2.0"
 keyring = { workspace = true }
 flate2 = { workspace = true }
+qrcode = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
 tar = { workspace = true }
 # Optional deps gated by feature flags (api, admin-bot)
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 rust-embed = { workspace = true, optional = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
@@ -114,7 +127,7 @@ default = []
 # handlers and the admin dashboard's Matrix invite UI reference matrix-only
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
 # without it.
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-native-certs", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

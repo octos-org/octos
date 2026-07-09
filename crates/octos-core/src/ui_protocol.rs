@@ -240,6 +240,13 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_ar
 /// structured-metadata fallback, so the turn never hard-blocks.
 pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
 
+/// Feature flag for streamed voice-reply audio. When negotiated, the server
+/// pushes `voice/audio_chunk` notifications (base64 audio frames) as the
+/// cloud TTS synthesizes, so the client can play progressively (MSE) instead
+/// of waiting for a complete `file/attached` reply. Not negotiated → the voice
+/// turn keeps emitting whole-file `file/attached` audio.
+pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -268,6 +275,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -962,6 +970,10 @@ pub mod methods {
 
     /// UPCR-2026-009 `session/hydrate` — authoritative chat-state reload.
     pub const SESSION_HYDRATE: &str = "session/hydrate";
+    /// `session/rollback` — drop the last N user turns (conversation-only
+    /// rewind), persist an idempotent append-only marker, and return the
+    /// trimmed hydrated thread. MUTATING: changes persisted session state.
+    pub const SESSION_ROLLBACK: &str = "session/rollback";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
@@ -1060,6 +1072,18 @@ pub mod methods {
     /// #1477 voice rich output — the background visual task failed or timed
     /// out, so the client should clear the "generating" placeholder.
     pub const VISUAL_FAILED: &str = "visual/failed";
+    /// UPCR-2026-025 voice exit intent — the voice turn detected an end /
+    /// goodbye / mute intent (the model appended an in-band `[[EXIT]]` control
+    /// marker, which the backend strips from every model-/client-facing surface
+    /// and replaces with this typed event). The client uses it to leave the
+    /// `/voice` screen and return home AFTER the turn's farewell audio finishes
+    /// playing — it must NOT navigate before the reply audio drains. Ungated;
+    /// emitted on the same ledger-backed live path as `file/attached`.
+    pub const VOICE_EXIT: &str = "voice/exit";
+    /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
+    /// One per audio frame from cloud TTS; carries base64 audio plus a
+    /// `segment_id`/`seq`/`last` so the client groups and plays chunks in order.
+    pub const VOICE_AUDIO_CHUNK: &str = "voice/audio_chunk";
     /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
     /// envelope notification (spec § 14). γ-1 reserves the method name
     /// in the notification methods list as part of capability negotiation
@@ -1145,6 +1169,7 @@ pub mod methods {
     pub const LOOP_COMPLETED: &str = "loop/completed";
     /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
     pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+    pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
     /// Session-level whole-job orchestration status notification.
@@ -1175,6 +1200,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
+    methods::SESSION_ROLLBACK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1240,6 +1266,8 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::VISUAL_GENERATING,
     methods::VISUAL_SUCCEEDED,
     methods::VISUAL_FAILED,
+    methods::VOICE_EXIT,
+    methods::VOICE_AUDIO_CHUNK,
     methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
     methods::ROUTER_STATUS,
@@ -1254,6 +1282,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::LOOP_FIRED,
     methods::LOOP_COMPLETED,
     methods::CONTEXT_COMPACTION_COMPLETED,
+    methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
 ];
 
@@ -1273,6 +1302,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
+    methods::SESSION_ROLLBACK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1666,6 +1696,7 @@ pub enum UiResultKind {
     TaskArtifactList,
     TaskArtifactRead,
     SessionHydrate,
+    SessionRollback,
     ThreadGraphGet,
     TurnStateGet,
     UnsupportedCapability,
@@ -1689,6 +1720,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_ARTIFACT_LIST => Some(UiResultKind::TaskArtifactList),
         methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
+        methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         _ => None,
@@ -2694,6 +2726,38 @@ pub struct SessionHydrateResult {
     /// edge cases codex flagged on PR landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
+    /// Additive reload-recovery lane for tool-call UI state. These are
+    /// canonical M9-gamma projection envelopes filtered to tool_* payloads
+    /// from the hydrate replay window. They let clients that still render via
+    /// the legacy ThreadStore rebuild the same tool cards that live
+    /// `tool/started`, `tool/progress`, and `tool/completed` notifications
+    /// produced before the page refresh.
+    ///
+    /// This intentionally does not make `messages_page` equivalent to
+    /// `session/hydrate`: message rows remain the durable transcript, while
+    /// hydrate carries replayable UI projection facts. Omitted unless the
+    /// client requested `messages` and negotiated the same refresh-recovery
+    /// capability used by `replayed_envelopes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_tool_envelopes: Option<Vec<Envelope>>,
+}
+
+/// Params for `session/rollback` — conversation-only rewind. Drops the last
+/// `num_turns` user turns from the session (persisted + in-memory). `num_turns`
+/// must be `>= 1`; the server rejects `0` with `invalid_params`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRollbackParams {
+    pub session_id: SessionKey,
+    pub num_turns: u32,
+}
+
+/// Result for `session/rollback`. `dropped_turns` is the number of user turns
+/// actually removed (clamped to the session's turn count), and `thread` is the
+/// trimmed session projected via the same shape as `session/hydrate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRollbackResult {
+    pub dropped_turns: u32,
+    pub thread: SessionHydrateResult,
 }
 
 // ----- UPCR-2026-010 `thread/graph/get` -----
@@ -3574,6 +3638,7 @@ pub enum UiCommand {
     TaskArtifactList(TaskArtifactListParams),
     TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
+    SessionRollback(SessionRollbackParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
@@ -3615,6 +3680,7 @@ impl UiCommand {
             Self::TaskArtifactList(_) => methods::TASK_ARTIFACT_LIST,
             Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
+            Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
             Self::SessionList(_) => methods::SESSION_LIST,
@@ -3658,6 +3724,7 @@ impl UiCommand {
             Self::TaskArtifactList(params) => serde_json::to_value(params),
             Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
+            Self::SessionRollback(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
@@ -3727,6 +3794,7 @@ impl UiCommand {
                 Ok(Self::TaskArtifactRead(decode_params(method, params)?))
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
+            methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
@@ -4070,6 +4138,7 @@ pub enum UiRpcResult {
     TaskArtifactList(TaskArtifactListResult),
     TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
+    SessionRollback(SessionRollbackResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
@@ -4094,6 +4163,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(_) => UiResultKind::TaskArtifactList,
             Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
+            Self::SessionRollback(_) => UiResultKind::SessionRollback,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
@@ -4118,6 +4188,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(_) => Some(methods::TASK_ARTIFACT_LIST),
             Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
+            Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
@@ -4142,6 +4213,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(result) => serde_json::to_value(result),
             Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
+            Self::SessionRollback(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
@@ -4197,6 +4269,7 @@ impl UiRpcResult {
                 Ok(Self::TaskArtifactRead(decode_result(method, result)?))
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
+            methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
@@ -4605,6 +4678,21 @@ pub struct VisualFailedEvent {
     pub turn_id: TurnId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// UPCR-2026-025 voice exit intent: the voice turn detected an end / goodbye /
+/// mute intent. The model appended an in-band `[[EXIT]]` control marker; the
+/// backend strips it from every model-/client-facing surface (so it never
+/// reaches TTS, the `message/delta` wire, or the persisted session) and emits
+/// this typed event instead. The client leaves the `/voice` screen and returns
+/// home — but only AFTER the turn's farewell audio finishes playing, so the
+/// goodbye is heard before navigation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceExitEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5363,6 +5451,23 @@ pub struct ContextCompactionCompletedEvent {
     pub compaction: UiContextCompactionRecord,
 }
 
+/// UPCR-2026-026: emitted immediately BEFORE a context compaction pass so
+/// clients can show an in-progress state (spinner/bar). Always followed by
+/// `context/compaction_completed` for the same generation — today's serve
+/// compaction is synchronous, so both may arrive in one delivery batch;
+/// clients must tolerate a zero-duration window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionStartedEvent {
+    pub session_id: SessionKey,
+    /// Pre-compaction context state (token_estimate = the "before" size).
+    pub context_state: UiContextState,
+    /// Trigger label, mirrors the eventual completed record's trigger.
+    pub trigger: String,
+    /// The token threshold that tripped this compaction (context-window
+    /// derived) — lets clients render an honest fullness percentage.
+    pub threshold_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiContextNormalizationReport {
     pub generation: u64,
@@ -5472,6 +5577,28 @@ pub struct FileAttachedEvent {
     pub mime: Option<String>,
 }
 
+/// A streamed voice-reply audio chunk (`voice/audio_chunk`). Emitted per
+/// audio frame as cloud TTS synthesizes, gated by `event.voice_audio.v1`.
+/// Chunks sharing a `segment_id` form one playable utterance (one reply
+/// sentence); `seq` orders them and `last` marks the segment's final chunk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceAudioChunkEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    /// Groups chunks into one playable utterance (per reply sentence).
+    pub segment_id: String,
+    /// Chunk order within the segment (0-based).
+    pub seq: u32,
+    /// MIME type of the audio bytes, e.g. "audio/mpeg".
+    pub mime: String,
+    /// Base64-encoded raw audio bytes for this chunk.
+    pub audio_b64: String,
+    /// True on the final chunk of the segment.
+    pub last: bool,
+}
+
 /// UPCR-2026-014 (M9-α-9): wrapper for legacy
 /// `/api/sessions/:id/events/stream` SSE frames bridged onto the WS
 /// surface. `kind` is the legacy SSE `type` field; `payload` is the
@@ -5565,6 +5692,9 @@ pub enum UiNotification {
     VisualSucceeded(VisualSucceededEvent),
     /// #1477 voice rich output: a background visual task failed / timed out.
     VisualFailed(VisualFailedEvent),
+    /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
+    /// goodbye / mute intent; the client returns home after the farewell audio.
+    VoiceExit(VoiceExitEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
     ToolCompleted(ToolCompletedEvent),
@@ -5591,6 +5721,8 @@ pub enum UiNotification {
     TurnSpawnComplete(TurnSpawnCompleteEvent),
     /// UPCR-2026-014 (M9-α-9): per-turn file attachment event.
     FileAttached(FileAttachedEvent),
+    /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
+    VoiceAudioChunk(VoiceAudioChunkEvent),
     /// UPCR-2026-014 (M9-α-9): wrapper for legacy
     /// `/api/sessions/:id/events/stream` SSE frames bridged onto the
     /// unified v1 ledger.
@@ -5625,6 +5757,7 @@ pub enum UiNotification {
     LoopCompleted(LoopCompletedEvent),
     /// M16: compact-context lifecycle event.
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
+    ContextCompactionStarted(ContextCompactionStartedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
     /// Session-level whole-job orchestration status. Emitted when the session's
@@ -5663,6 +5796,7 @@ impl UiNotification {
             Self::VisualGenerating(_) => methods::VISUAL_GENERATING,
             Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
             Self::VisualFailed(_) => methods::VISUAL_FAILED,
+            Self::VoiceExit(_) => methods::VOICE_EXIT,
             Self::ToolStarted(_) => methods::TOOL_STARTED,
             Self::ToolProgress(_) => methods::TOOL_PROGRESS,
             Self::ToolCompleted(_) => methods::TOOL_COMPLETED,
@@ -5681,6 +5815,7 @@ impl UiNotification {
             Self::MessagePersisted(_) => methods::MESSAGE_PERSISTED,
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
+            Self::VoiceAudioChunk(_) => methods::VOICE_AUDIO_CHUNK,
             Self::SessionEventBridged(_) => methods::SESSION_EVENT,
             Self::RouterStatus(_) => methods::ROUTER_STATUS,
             Self::RouterFailover(_) => methods::ROUTER_FAILOVER,
@@ -5694,6 +5829,7 @@ impl UiNotification {
             Self::LoopFired(_) => methods::LOOP_FIRED,
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
+            Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
@@ -5709,6 +5845,7 @@ impl UiNotification {
             Self::VisualGenerating(event) => &event.session_id,
             Self::VisualSucceeded(event) => &event.session_id,
             Self::VisualFailed(event) => &event.session_id,
+            Self::VoiceExit(event) => &event.session_id,
             Self::ToolStarted(event) => &event.session_id,
             Self::ToolProgress(event) => &event.session_id,
             Self::ToolCompleted(event) => &event.session_id,
@@ -5727,6 +5864,7 @@ impl UiNotification {
             Self::MessagePersisted(event) => &event.session_id,
             Self::TurnSpawnComplete(event) => &event.session_id,
             Self::FileAttached(event) => &event.session_id,
+            Self::VoiceAudioChunk(event) => &event.session_id,
             Self::SessionEventBridged(event) => &event.session_id,
             Self::RouterStatus(event) => &event.session_id,
             Self::RouterFailover(event) => &event.session_id,
@@ -5740,6 +5878,7 @@ impl UiNotification {
             Self::LoopFired(event) => &event.session_id,
             Self::LoopCompleted(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
+            Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
@@ -5761,6 +5900,7 @@ impl UiNotification {
             Self::VisualSucceeded(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::VoiceExit(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::VisualFailed(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -5803,6 +5943,9 @@ impl UiNotification {
             Self::FileAttached(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::VoiceAudioChunk(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::SessionEventBridged(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -5822,6 +5965,7 @@ impl UiNotification {
             Self::VisualGenerating(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualSucceeded(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VisualFailed(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VoiceExit(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5837,6 +5981,7 @@ impl UiNotification {
             Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::Envelope(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
@@ -5854,6 +5999,7 @@ impl UiNotification {
             Self::VisualGenerating(params) => serde_json::to_value(params),
             Self::VisualSucceeded(params) => serde_json::to_value(params),
             Self::VisualFailed(params) => serde_json::to_value(params),
+            Self::VoiceExit(params) => serde_json::to_value(params),
             Self::ToolStarted(params) => serde_json::to_value(params),
             Self::ToolProgress(params) => serde_json::to_value(params),
             Self::ToolCompleted(params) => serde_json::to_value(params),
@@ -5872,6 +6018,7 @@ impl UiNotification {
             Self::MessagePersisted(params) => serde_json::to_value(params),
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
+            Self::VoiceAudioChunk(params) => serde_json::to_value(params),
             Self::SessionEventBridged(params) => serde_json::to_value(params),
             Self::RouterStatus(params) => serde_json::to_value(params),
             Self::RouterFailover(params) => serde_json::to_value(params),
@@ -5885,6 +6032,7 @@ impl UiNotification {
             Self::LoopFired(params) => serde_json::to_value(params),
             Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
+            Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
@@ -5957,6 +6105,7 @@ impl UiNotification {
             }
             methods::VISUAL_SUCCEEDED => Ok(Self::VisualSucceeded(decode_params(method, params)?)),
             methods::VISUAL_FAILED => Ok(Self::VisualFailed(decode_params(method, params)?)),
+            methods::VOICE_EXIT => Ok(Self::VoiceExit(decode_params(method, params)?)),
             methods::TOOL_STARTED => Ok(Self::ToolStarted(decode_params(method, params)?)),
             methods::TOOL_PROGRESS => Ok(Self::ToolProgress(decode_params(method, params)?)),
             methods::TOOL_COMPLETED => Ok(Self::ToolCompleted(decode_params(method, params)?)),
@@ -5987,6 +6136,7 @@ impl UiNotification {
                 Ok(Self::TurnSpawnComplete(decode_params(method, params)?))
             }
             methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
+            methods::VOICE_AUDIO_CHUNK => Ok(Self::VoiceAudioChunk(decode_params(method, params)?)),
             methods::SESSION_EVENT => Ok(Self::SessionEventBridged(decode_params(method, params)?)),
             methods::ROUTER_STATUS => Ok(Self::RouterStatus(decode_params(method, params)?)),
             methods::ROUTER_FAILOVER => Ok(Self::RouterFailover(decode_params(method, params)?)),
@@ -6007,6 +6157,9 @@ impl UiNotification {
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
             methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::CONTEXT_COMPACTION_STARTED => Ok(Self::ContextCompactionStarted(
+                decode_params(method, params)?,
+            )),
             methods::CONTEXT_COMPACTION_COMPLETED => Ok(Self::ContextCompactionCompleted(
                 decode_params(method, params)?,
             )),
@@ -6711,6 +6864,7 @@ mod tests {
                 "task/restart_from_node",
                 "task/output/read",
                 "session/hydrate",
+                "session/rollback",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6777,6 +6931,8 @@ mod tests {
                 "visual/generating",
                 "visual/succeeded",
                 "visual/failed",
+                "voice/exit",
+                "voice/audio_chunk",
                 "projection/envelope",
                 "session/event",
                 "router/status",
@@ -6791,6 +6947,7 @@ mod tests {
                 "loop/fired",
                 "loop/completed",
                 "context/compaction_completed",
+                "context/compaction_started",
                 "context/normalization_reported",
             ]
         );
@@ -6811,6 +6968,7 @@ mod tests {
                 "task/restart_from_node",
                 "task/output/read",
                 "session/hydrate",
+                "session/rollback",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6884,6 +7042,7 @@ mod tests {
                     "task/restart_from_node",
                     "task/output/read",
                     "session/hydrate",
+                    "session/rollback",
                     "thread/graph/get",
                     "turn/state/get",
                     "agent/list",
@@ -6947,6 +7106,8 @@ mod tests {
                     "visual/generating",
                     "visual/succeeded",
                     "visual/failed",
+                    "voice/exit",
+                    "voice/audio_chunk",
                     "projection/envelope",
                     "session/event",
                     "router/status",
@@ -6961,6 +7122,7 @@ mod tests {
                     "loop/fired",
                     "loop/completed",
                     "context/compaction_completed",
+                    "context/compaction_started",
                     "context/normalization_reported"
                 ],
                 "supported_features": [
@@ -6985,7 +7147,8 @@ mod tests {
                     "context.lifecycle.v1",
                     "harness.task_supervision_inspection.v1",
                     "harness.task_artifacts.v1",
-                    "user_question.v1"
+                    "user_question.v1",
+                    "event.voice_audio.v1"
                 ]
             })
         );
@@ -7594,6 +7757,31 @@ mod tests {
         assert_eq!(wire.params["reason"], json!("timed out"));
         let decoded = UiNotification::from_rpc_notification(wire).expect("decode visual/failed");
         assert_eq!(decoded, failed);
+    }
+
+    #[test]
+    fn voice_exit_wire_contract() {
+        // UPCR-2026-025: the typed exit notification carries session_id + turn_id
+        // (and an optional topic); it round-trips intact and the topic is stamped
+        // from a topic-scoped session key, mirroring the visual/* lifecycle.
+        let exit = UiNotification::VoiceExit(VoiceExitEvent {
+            session_id: SessionKey("local:voice#exit".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(42)),
+        });
+        assert_eq!(exit.method(), methods::VOICE_EXIT);
+        let wire = exit
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize voice/exit");
+        assert_eq!(wire.method, methods::VOICE_EXIT);
+        // Topic is stamped from the `#exit` suffix of the session key on the wire.
+        assert_eq!(wire.params["topic"], json!("exit"));
+        let decoded = UiNotification::from_rpc_notification(wire).expect("decode voice/exit");
+        // Equality holds after the topic was stamped from the session key.
+        assert_eq!(decoded.method(), methods::VOICE_EXIT);
+        assert_eq!(decoded.session_id().0, "local:voice#exit");
+        assert_eq!(decoded.topic(), Some("exit"));
     }
 
     #[test]
@@ -9719,6 +9907,7 @@ mod tests {
             pending_approvals: Some(vec![]),
             pending_questions: Some(vec![sample_user_question_requested_event()]),
             replayed_envelopes: Some(vec![]),
+            replayed_tool_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
         let parsed: SessionHydrateResult =
@@ -9737,6 +9926,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
         let object = value.as_object().expect("hydrate result is object");
@@ -9749,6 +9939,64 @@ mod tests {
         assert!(!object.contains_key("pending_questions"));
         // Bug C: a non-negotiated client never sees the new field.
         assert!(!object.contains_key("replayed_envelopes"));
+        assert!(!object.contains_key("replayed_tool_envelopes"));
+    }
+
+    #[test]
+    fn golden_session_rollback_params_serde() {
+        let params = SessionRollbackParams {
+            session_id: sample_session_id(),
+            num_turns: 2,
+        };
+        let value = serde_json::to_value(&params).expect("serialize rollback params");
+        assert_eq!(value, json!({ "session_id": "local:demo", "num_turns": 2 }));
+        let parsed: SessionRollbackParams =
+            serde_json::from_value(value).expect("deserialize rollback params");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn session_rollback_command_and_result_round_trip() {
+        // Command decodes from its wire method name.
+        let command = UiCommand::SessionRollback(SessionRollbackParams {
+            session_id: sample_session_id(),
+            num_turns: 1,
+        });
+        assert_eq!(command.method(), methods::SESSION_ROLLBACK);
+        let request = command.clone().into_rpc_request("r1").expect("encode");
+        assert_eq!(request.method, methods::SESSION_ROLLBACK);
+        let decoded = UiCommand::from_rpc_request(request).expect("decode command");
+        assert_eq!(decoded, command);
+
+        // Result carries the trimmed hydrate projection and round-trips through
+        // the method-keyed decode path.
+        let result = SessionRollbackResult {
+            dropped_turns: 1,
+            thread: SessionHydrateResult {
+                session_id: sample_session_id(),
+                cursor: sample_cursor(),
+                context: None,
+                context_state: None,
+                messages: Some(vec![]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+                replayed_tool_envelopes: None,
+            },
+        };
+        let wire = UiRpcResult::SessionRollback(result.clone());
+        assert_eq!(wire.method(), Some(methods::SESSION_ROLLBACK));
+        assert_eq!(wire.kind(), UiResultKind::SessionRollback);
+        let value = wire.into_result_value().expect("encode result");
+        let decoded =
+            UiRpcResult::from_method_and_result(methods::SESSION_ROLLBACK, value).expect("decode");
+        assert_eq!(decoded, UiRpcResult::SessionRollback(result));
+        assert_eq!(
+            first_server_result_kind_for_method(methods::SESSION_ROLLBACK),
+            Some(UiResultKind::SessionRollback)
+        );
     }
 
     #[test]
@@ -11767,6 +12015,28 @@ mod tests {
 
     fn bare_session() -> SessionKey {
         SessionKey("local:slides-soak".into())
+    }
+
+    #[test]
+    fn voice_audio_chunk_round_trips_through_rpc_notification() {
+        let event = VoiceAudioChunkEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            segment_id: "seg-1".into(),
+            seq: 0,
+            mime: "audio/mpeg".into(),
+            audio_b64: "QUJD".into(),
+            last: false,
+        };
+        let notif = UiNotification::VoiceAudioChunk(event.clone());
+        assert_eq!(notif.method(), methods::VOICE_AUDIO_CHUNK);
+
+        let rpc = notif.into_rpc_notification().expect("to rpc notification");
+        assert_eq!(rpc.method, "voice/audio_chunk");
+
+        let back = UiNotification::from_rpc_notification(rpc).expect("from rpc notification");
+        assert_eq!(back, UiNotification::VoiceAudioChunk(event));
     }
 
     #[test]

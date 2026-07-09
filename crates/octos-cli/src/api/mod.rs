@@ -54,6 +54,7 @@ pub mod usage;
 pub mod user_admin;
 pub(crate) mod voice_turn;
 pub mod voices;
+pub(crate) mod volcano_ws;
 pub mod webhook_proxy;
 pub mod ws_slash;
 
@@ -267,6 +268,10 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// Resolved HOST-level memory policy (top-level config). Threaded into
+    /// lazily-bootstrapped profile runtimes so a host opt-out of memory
+    /// refresh (DEFAULT-ON) also binds profiles created after startup.
+    pub host_memory: Option<crate::config::MemoryConfig>,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
@@ -386,6 +391,7 @@ impl AppState {
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
             solo_login_enabled: false,
+            host_memory: None,
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,

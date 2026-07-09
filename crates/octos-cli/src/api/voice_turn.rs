@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use octos_core::{Message, MessageRole};
 use octos_llm::ominix::OminixClient;
 
+use crate::config::CloudTtsConfig;
+
 /// 解析 OminiX 服务基址（平台级，env 优先）。与 `api/admin.rs` 的同名 helper 等价；
 /// 抽到此处避免跨模块可见性问题。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
@@ -58,54 +60,6 @@ pub(crate) async fn transcribe_audio_media(
         now_ms()
     );
     out
-}
-
-/// Tools kept active during a voice turn; everything else is deferred.
-///
-/// A spoken turn is almost always a single-iteration conversational reply that
-/// calls no tools, yet the full registry (50+ specs in a skill-rich profile)
-/// otherwise dominates the prompt's prefill — measured as the single largest
-/// contributor to voice-turn latency (≈half of a 34k-token input). Deferring
-/// keeps the tools *recoverable* via `activate_tools`, so a voice query that
-/// genuinely needs one pays a single extra round-trip instead of taxing every
-/// turn. We keep `activate_tools` itself so that recovery path stays reachable.
-const VOICE_TURN_KEEP_TOOLS: &[&str] = &["activate_tools"];
-
-/// Pure core of [`defer_tools_for_voice_turn`]: every registered name that is
-/// not on the keep-list. Split out so it is unit-testable without standing up
-/// a real `ToolRegistry`.
-fn voice_turn_deferred_names(all: &[String], keep: &[&str]) -> Vec<String> {
-    all.iter()
-        .filter(|name| !keep.contains(&name.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// Whether deferral is safe on this registry: at least one keep-list (recovery)
-/// tool is actually registered. Without it, deferring would hide every tool with
-/// no `activate_tools` path back, stranding a voice request that genuinely needs
-/// one of the remaining allowed tools. Split out for unit-testing.
-fn voice_turn_can_defer(all: &[String], keep: &[&str]) -> bool {
-    all.iter().any(|name| keep.contains(&name.as_str()))
-}
-
-/// Defer every tool except the voice-turn keep-list on a per-turn registry
-/// snapshot, so the spoken turn's first LLM call carries a lean tool set.
-/// Returns the number of tools deferred. Safe on any registry: `defer` only
-/// acts on names that are actually registered. Call on the mutable per-turn
-/// snapshot BEFORE it is wrapped in `Arc`.
-pub(crate) fn defer_tools_for_voice_turn(registry: &mut octos_agent::ToolRegistry) -> usize {
-    let all = registry.tool_names();
-    // If the recovery tool isn't registered (e.g. a tool surface small enough to
-    // skip auto-defer), deferring everything would leave the first LLM call with
-    // no tools AND no `activate_tools` to recover one. Skip deferral entirely.
-    if !voice_turn_can_defer(&all, VOICE_TURN_KEEP_TOOLS) {
-        return 0;
-    }
-    let to_defer = voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS);
-    let count = to_defer.len();
-    registry.defer(to_defer);
-    count
 }
 
 /// Whether a char is safe to hand to TTS: letters/digits (incl. CJK),
@@ -304,23 +258,53 @@ pub(crate) fn parse_visual_marker(reply: &str) -> Option<VisualDirective> {
     Some(VisualDirective { kind, brief })
 }
 
-/// The in-band marker opener. Streaming holds back only text that is — or could
-/// still grow into — this exact prefix, **not** any `[[`, so ordinary bracket
-/// notation (e.g. a `[[1]]` citation) never suppresses the rest of the TTS.
+/// The in-band visual marker opener. Streaming holds back only text that is —
+/// or could still grow into — this exact prefix, **not** any `[[`, so ordinary
+/// bracket notation (e.g. a `[[1]]` citation) never suppresses the rest of the
+/// TTS.
 const MARKER: &str = "[[VISUAL:";
 
+/// The in-band exit-intent marker (UPCR-2026-025). A fixed, self-contained
+/// trailing token the model appends after a farewell when the user wants to end
+/// / leave / mute. Held back from TTS and the `message/delta` wire exactly like
+/// [`MARKER`]; the actual exit decision is lifted off the final reply content
+/// via [`parse_exit_marker`] / [`strip_exit_directive`].
+const EXIT_MARKER: &str = "[[EXIT]]";
+
+/// Every in-band control marker held back from TTS / the delta wire. All share
+/// the `[[` opener; a trailing partial that could still grow into ANY of them is
+/// held back, and a full occurrence of any marks the start of the held region.
+/// Ordinary `[[…]]` notation (citations) matches none, so it is still spoken.
+const CONTROL_MARKERS: &[&str] = &[MARKER, EXIT_MARKER];
+
 /// Length in bytes of the longest suffix of `s` that is a non-empty prefix of
-/// [`MARKER`]. Those trailing chars are held back from TTS because the next
-/// streamed token might complete the marker. `MARKER` is ASCII, so any match is
-/// at a char boundary (safe to slice).
-fn marker_prefix_hold(s: &str) -> usize {
+/// `marker`. Both control markers are ASCII, so any match is at a char boundary
+/// (safe to slice).
+fn single_marker_prefix_hold(s: &str, marker: &str) -> usize {
     let sb = s.as_bytes();
-    let mb = MARKER.as_bytes();
+    let mb = marker.as_bytes();
     let max = mb.len().min(sb.len());
     (1..=max)
         .rev()
         .find(|&n| sb[sb.len() - n..] == mb[..n])
         .unwrap_or(0)
+}
+
+/// Length in bytes of the longest trailing partial that could still grow into
+/// ANY control marker — those chars are held back from TTS because the next
+/// streamed token might complete a marker.
+fn marker_prefix_hold(s: &str) -> usize {
+    CONTROL_MARKERS
+        .iter()
+        .map(|m| single_marker_prefix_hold(s, m))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Earliest byte index in `s` of a fully-present control-marker opener (visual
+/// or exit), or `None`. Everything from that index onward is held back.
+fn find_control_marker(s: &str) -> Option<usize> {
+    CONTROL_MARKERS.iter().filter_map(|m| s.find(m)).min()
 }
 
 /// Sentence chunking: strong boundaries (。！？!?…；;\n) always split; commas /
@@ -380,12 +364,12 @@ impl VoiceReplySplitter {
         self.full.push_str(token);
         self.pending.push_str(token);
 
-        if let Some(idx) = self.pending.find(MARKER) {
-            // A full `[[VISUAL:` appeared — treat everything from it onward as
-            // the (trailing) marker region and hold it back. Emit the speakable
-            // text before it; keep the unfinished pre-marker tail + the held
-            // region in `pending` (recovered in `finish` if it turns out not to
-            // be a real trailing marker).
+        if let Some(idx) = find_control_marker(&self.pending) {
+            // A full control marker (`[[VISUAL:` or `[[EXIT]]`) appeared — treat
+            // everything from it onward as the (trailing) marker region and hold
+            // it back. Emit the speakable text before it; keep the unfinished
+            // pre-marker tail + the held region in `pending` (recovered in
+            // `finish` if it turns out not to be a real trailing marker).
             let mut head = self.pending[..idx].to_string();
             let rest = self.pending[idx..].to_string();
             let out = drain_sentences(&mut head);
@@ -411,12 +395,26 @@ impl VoiceReplySplitter {
     /// speech so nothing is lost to a mid-reply `[[` or stray partial.
     pub(crate) fn finish(self) -> (Option<String>, Option<VisualDirective>) {
         let directive = parse_visual_marker(&self.full);
-        let speak = if directive.is_some() {
-            strip_visual_marker(&self.pending)
-        } else {
-            self.pending.as_str()
+        // Drop ALL real trailing control markers (visual and/or exit, in either
+        // order) from the spoken tail so neither reaches TTS — a stacked
+        // `…[[VISUAL:…]][[EXIT]]` must peel both. A held-back region that turned
+        // out NOT to be a real trailing marker (a rare mid-reply `[[`) is left
+        // intact and recovered as speech. The visual directive is returned for
+        // dispatch; the exit decision is lifted separately off the final content
+        // (`strip_control_directives`).
+        let mut speak: &str = self.pending.as_str();
+        loop {
+            if parse_visual_marker(speak).is_some() {
+                speak = strip_visual_marker(speak);
+                continue;
+            }
+            if parse_exit_marker(speak) {
+                speak = strip_exit_marker(speak);
+                continue;
+            }
+            break;
         }
-        .trim();
+        let speak = speak.trim();
         let tail = if speak.is_empty() {
             None
         } else {
@@ -433,6 +431,32 @@ impl VoiceReplySplitter {
 pub(crate) fn strip_visual_marker(reply: &str) -> &str {
     if parse_visual_marker(reply).is_some() {
         let i = reply.rfind("[[VISUAL:").expect("trailing marker present");
+        reply[..i].trim_end()
+    } else {
+        reply
+    }
+}
+
+/// Whether the model reply carries a TRAILING `[[EXIT]]` control marker
+/// (UPCR-2026-025). Trailing-only: the marker must end the right-trimmed reply,
+/// so a mid-reply mention / quote of the syntax never triggers an exit (mirrors
+/// [`parse_visual_marker`]).
+pub(crate) fn parse_exit_marker(reply: &str) -> bool {
+    let trimmed = reply.trim_end();
+    match trimmed.rfind(EXIT_MARKER) {
+        Some(start) => start + EXIT_MARKER.len() == trimmed.len(),
+        None => false,
+    }
+}
+
+/// Drop a trailing `[[EXIT]]` marker, returning the speakable prefix. Only a
+/// TRAILING marker is stripped (consistent with [`parse_exit_marker`]); a
+/// mid-reply mention is left intact.
+pub(crate) fn strip_exit_marker(reply: &str) -> &str {
+    if parse_exit_marker(reply) {
+        let i = reply
+            .rfind(EXIT_MARKER)
+            .expect("trailing exit marker present");
         reply[..i].trim_end()
     } else {
         reply
@@ -489,6 +513,63 @@ pub(crate) fn strip_visual_directive(
     Some(directive)
 }
 
+/// Lift the trailing `[[EXIT]]` control marker out of the turn's authoritative
+/// reply surfaces and strip it in place, so the internal control protocol never
+/// reaches the WIRE (`message/delta`, `message/persisted`) or STORAGE (session
+/// JSONL). Strips both `content` (the final `response.content`) and every
+/// Assistant carrier in `messages` whose trailing marker matches. Returns `true`
+/// when a real trailing marker was found and removed (the caller then emits the
+/// typed `voice/exit` event), or `false` (leaving everything intact) otherwise.
+/// Mirrors [`strip_visual_directive`]; the client learns to leave the voice
+/// screen from the typed `voice/exit` event, not from the marker text.
+pub(crate) fn strip_exit_directive(content: &mut String, messages: &mut [Message]) -> bool {
+    if !parse_exit_marker(content) {
+        return false;
+    }
+    *content = strip_exit_marker(content).to_string();
+    for message in messages.iter_mut() {
+        if message.role == MessageRole::Assistant {
+            let stripped = strip_exit_marker(&message.content);
+            if stripped.len() != message.content.len() {
+                message.content = stripped.to_string();
+            }
+        }
+    }
+    true
+}
+
+/// Strip STACKED trailing control markers ([[VISUAL:...]] and/or [[EXIT]]) from
+/// the turn's authoritative reply surfaces in EITHER order, returning the parsed
+/// visual directive (if any) and whether an exit was requested.
+///
+/// A reply may end with both markers (e.g. `…[[VISUAL:…]][[EXIT]]`): stripping
+/// only the outermost would leave the inner one trailing on the wire
+/// (`message/delta`, `message/persisted`) and in storage (session JSONL), and —
+/// for the visual case — never dispatch it. So this loops, peeling whichever
+/// marker is currently trailing, until neither is. Reuses (and supersedes on the
+/// turn path) the per-marker [`strip_visual_directive`] / [`strip_exit_directive`].
+pub(crate) fn strip_control_directives(
+    content: &mut String,
+    messages: &mut [Message],
+) -> (Option<VisualDirective>, bool) {
+    let mut directive = None;
+    let mut exit = false;
+    loop {
+        if let Some(d) = strip_visual_directive(content, messages) {
+            if directive.is_none() {
+                directive = Some(d);
+            }
+            continue;
+        }
+        if strip_exit_directive(content, messages) {
+            exit = true;
+            continue;
+        }
+        break;
+    }
+    (directive, exit)
+}
+
 /// Byte length of the marker-free visible prefix of `full`: everything up to a
 /// (possibly mid-reply) `[[VISUAL:` occurrence, else everything minus a trailing
 /// partial that could still grow into the marker. Trailing whitespace before
@@ -496,7 +577,7 @@ pub(crate) fn strip_visual_directive(
 /// so the preceding newline would otherwise leak as a blank line. Cut points
 /// fall on char boundaries (`MARKER` is ASCII; `trim_end` is boundary-safe).
 fn visible_prefix_len(full: &str) -> usize {
-    let cut = match full.find(MARKER) {
+    let cut = match find_control_marker(full) {
         Some(i) => i,
         None => full.len() - marker_prefix_hold(full),
     };
@@ -538,14 +619,26 @@ impl VisibleDeltaFilter {
     }
 
     /// End of stream: returns any held-back text that turned out NOT to be a
-    /// real trailing marker (a rare mid-reply `[[VISUAL:` quote), so nothing is
-    /// lost. A real trailing marker yields `""` (stays off the wire).
+    /// real trailing marker (a rare mid-reply `[[VISUAL:` / `[[EXIT]]` quote), so
+    /// nothing is lost. A real trailing control marker (visual or exit) yields
+    /// `""` for that span (stays off the wire).
     pub(crate) fn finish(self) -> String {
-        let visible = if parse_visual_marker(&self.full).is_some() {
-            strip_visual_marker(&self.full).len()
-        } else {
-            self.full.len()
-        };
+        // Peel ALL real trailing control markers (visual and/or exit, in either
+        // order) so a stacked `…[[VISUAL:…]][[EXIT]]` never leaks the inner one
+        // onto the `message/delta` wire.
+        let mut clean: &str = self.full.as_str();
+        loop {
+            if parse_visual_marker(clean).is_some() {
+                clean = strip_visual_marker(clean);
+                continue;
+            }
+            if parse_exit_marker(clean) {
+                clean = strip_exit_marker(clean);
+                continue;
+            }
+            break;
+        }
+        let visible = clean.len();
         if visible > self.emitted {
             self.full[self.emitted..visible].to_string()
         } else {
@@ -714,22 +807,156 @@ struct VolcanoTts {
     endpoint: String,
 }
 
-fn volcano_from_env() -> Option<VolcanoTts> {
-    let appid = std::env::var("VOLC_TTS_APPID")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let token = std::env::var("VOLC_TTS_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())?;
+/// Whether the route wants the cloud path. Legacy `volcano` aliases `cloud`.
+fn wants_cloud(provider: &str) -> bool {
+    matches!(provider, "auto" | "cloud" | "volcano")
+}
+
+/// The effective TTS route for pre-flight readiness reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtsRoute {
+    /// Cloud Volcano. For explicit `cloud`/`volcano` this is reported even when
+    /// the credentials are missing, so a pre-flight check can flag "cloud
+    /// chosen but not configured" instead of masking it behind the silent
+    /// on-device fallback that [`synthesize_reply`] applies at request time.
+    Cloud,
+    /// On-device GPT-SoVITS via ominix-api.
+    Local,
+}
+
+/// Classify the effective TTS route for readiness, mirroring
+/// [`synthesize_reply`]'s routing decision (minus the on-failure fallback):
+/// `auto` resolves to cloud only when the credentials are present; explicit
+/// `cloud`/`volcano` always reports cloud (so missing creds surface as a
+/// not-ready cloud leg, matching the user's chosen route); everything else
+/// (`local`, legacy `sovits`/`qwen3`, unknown) is on-device.
+pub(crate) fn classify_tts_route(provider: &str, cloud_configured: bool) -> TtsRoute {
+    match provider {
+        "cloud" | "volcano" => TtsRoute::Cloud,
+        "auto" => {
+            if cloud_configured {
+                TtsRoute::Cloud
+            } else {
+                TtsRoute::Local
+            }
+        }
+        _ => TtsRoute::Local,
+    }
+}
+
+/// Whether the cloud (Volcano) TTS path is fully configured for this profile —
+/// token + appid resolve and the endpoint is in the HTTPS allowlist. This is
+/// exactly what [`synthesize_reply`] needs to actually take the cloud path, so
+/// it is the authoritative "cloud TTS ready" signal for pre-flight checks.
+pub(crate) fn cloud_tts_configured(cloud: Option<&CloudTtsConfig>) -> bool {
+    resolve_volcano(cloud).is_some()
+}
+
+/// Pure core: merge typed (non-secret) cloud config over env fallbacks, applying
+/// engine defaults. Requires a non-empty token AND a resolvable appid.
+fn build_volcano(
+    token: Option<String>,
+    cloud: Option<&CloudTtsConfig>,
+    env_appid: Option<String>,
+    env_cluster: Option<String>,
+    env_voice: Option<String>,
+    env_encoding: Option<String>,
+    env_endpoint: Option<String>,
+) -> Option<VolcanoTts> {
+    let token = token.filter(|s| !s.is_empty())?;
+    let pick = |typed: Option<&String>, env: Option<String>| -> Option<String> {
+        typed
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .or_else(|| env.filter(|s| !s.is_empty()))
+    };
+    let appid = pick(cloud.and_then(|c| c.appid.as_ref()), env_appid)?;
+    let endpoint = pick(cloud.and_then(|c| c.endpoint.as_ref()), env_endpoint)
+        .unwrap_or_else(|| "https://openspeech.bytedance.com/api/v1/tts".to_string());
+    // The endpoint is partly tenant-controlled (per-profile `tts_cloud.endpoint`)
+    // and the token may be the host-global `VOLC_TTS_TOKEN`. Never send the token
+    // anywhere but an HTTPS Volcano host — otherwise a tenant could point the
+    // endpoint at an internal/attacker address and exfiltrate the token (SSRF).
+    if !is_allowed_volcano_endpoint(&endpoint) {
+        tracing::warn!(
+            endpoint = %endpoint,
+            "voice_turn: refusing cloud TTS — endpoint not in the HTTPS Volcano allowlist; token NOT sent"
+        );
+        return None;
+    }
     Some(VolcanoTts {
         appid,
         token,
-        cluster: std::env::var("VOLC_TTS_CLUSTER").unwrap_or_else(|_| "volcano_tts".to_string()),
-        voice: std::env::var("VOLC_TTS_VOICE").unwrap_or_else(|_| "BV001_streaming".to_string()),
-        encoding: std::env::var("VOLC_TTS_ENCODING").unwrap_or_else(|_| "mp3".to_string()),
-        endpoint: std::env::var("VOLC_TTS_ENDPOINT")
-            .unwrap_or_else(|_| "https://openspeech.bytedance.com/api/v1/tts".to_string()),
+        cluster: pick(cloud.and_then(|c| c.cluster.as_ref()), env_cluster)
+            .unwrap_or_else(|| "volcano_tts".to_string()),
+        voice: pick(cloud.and_then(|c| c.voice.as_ref()), env_voice)
+            .unwrap_or_else(|| "BV001_streaming".to_string()),
+        encoding: pick(cloud.and_then(|c| c.encoding.as_ref()), env_encoding)
+            .unwrap_or_else(|| "mp3".to_string()),
+        endpoint,
     })
+}
+
+/// HTTPS Volcano TTS hosts the token may be sent to. Keep this tight — it is the
+/// SSRF / token-exfiltration boundary for the partly tenant-controlled endpoint.
+/// Shared with the ws_binary streaming path ([`crate::api::volcano_ws`]) so both
+/// transports enforce the same boundary.
+pub(crate) const VOLCANO_ALLOWED_HOSTS: &[&str] = &["openspeech.bytedance.com"];
+
+/// True only for an `https://` URL whose host is in [`VOLCANO_ALLOWED_HOSTS`].
+fn is_allowed_volcano_endpoint(endpoint: &str) -> bool {
+    match reqwest::Url::parse(endpoint) {
+        Ok(u) => {
+            u.scheme() == "https"
+                && u.host_str()
+                    .is_some_and(|h| VOLCANO_ALLOWED_HOSTS.contains(&h))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve a Volcano config from typed per-profile cloud settings + env token.
+fn resolve_volcano(cloud: Option<&CloudTtsConfig>) -> Option<VolcanoTts> {
+    let env = |k: &str| std::env::var(k).ok();
+    // Token precedence: the runtime-resolved per-profile token (from `env_vars`,
+    // set by `ProfileRuntime::bootstrap`) wins; fall back to the process env for
+    // legacy pure-`export` setups.
+    let token = cloud
+        .and_then(|c| c.token.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| env("VOLC_TTS_TOKEN"));
+    build_volcano(
+        token,
+        cloud,
+        env("VOLC_TTS_APPID"),
+        env("VOLC_TTS_CLUSTER"),
+        env("VOLC_TTS_VOICE"),
+        env("VOLC_TTS_ENCODING"),
+        env("VOLC_TTS_ENDPOINT"),
+    )
+}
+
+/// Process-wide HTTP client for Volcano TTS, with redirects DISABLED. Even though the
+/// endpoint is allowlisted to an HTTPS Volcano host, that host could still
+/// respond with a 3xx to an off-allowlist address; `reqwest` would otherwise
+/// follow it and 307/308 preserve the POST body — replaying the token to the
+/// redirect target. `Policy::none()` makes a redirect a terminal response we
+/// never follow, closing that exfiltration path. The client is reused across
+/// per-sentence syntheses so each sentence does not pay a fresh TCP+TLS
+/// handshake to Volcano.
+fn volcano_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "voice_turn: volcano client build failed"),
+                )
+                .ok()
+        })
+        .as_ref()
 }
 
 /// Synthesize via Volcano Engine HTTP TTS (non-streaming `operation:"query"`,
@@ -746,7 +973,7 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
         "request": { "reqid": reqid, "text": text, "operation": "query", "text_type": "plain" },
     });
 
-    let client = reqwest::Client::new();
+    let client = volcano_http_client()?;
     let resp = client
         .post(&cfg.endpoint)
         // Volcano's quirky scheme: literal "Bearer;" + token (semicolon, no space).
@@ -788,18 +1015,61 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
 }
 
 /// Synthesize a reply to an audio file, picking the TTS route from `provider`:
-/// - `"auto"`: cloud Volcano when `VOLC_TTS_*` env is configured, else
-///   on-device GPT-SoVITS.
-/// - `"volcano"`: force cloud Volcano; fall back to on-device sovits when the
-///   env is missing or the request fails.
-/// - `"sovits"` / `"qwen3"`: force the named on-device engine (no cloud).
+/// - `"auto"`: cloud Volcano when a token resolves, else on-device.
+/// - `"cloud"` (alias `"volcano"`): force cloud Volcano; falls back to
+///   on-device when the token/appid is missing or the request fails.
+/// - `"local"` (or any other value, incl. legacy `"sovits"`/`"qwen3"`):
+///   on-device synthesis using the default engine.
 ///
 /// `voice` is the on-device voice preset (voices.json); the cloud route uses
 /// its own `VOLC_TTS_VOICE` env instead. Returns `None` on failure.
+/// Streaming cloud-TTS variant: synthesize `text` over the Volcano v1 ws
+/// `submit` protocol and invoke `on_chunk(bytes, is_last, mime)` for each audio
+/// frame as it arrives. Returns `Some(())` when the cloud stream completed (the
+/// caller delivered audio progressively and should NOT also write a file), or
+/// `None` when the request is not cloud-routed / env is missing / the stream
+/// failed — in which case the caller falls back to [`synthesize_reply`].
+///
+/// Only the cloud (`"auto"`/`"cloud"`/`"volcano"`) route streams; on-device
+/// engines keep the whole-file path. Voice/speed come from the same resolved
+/// cloud config as the non-streaming cloud path.
+pub(crate) async fn synthesize_reply_streaming(
+    text: &str,
+    provider: &str,
+    cloud: Option<&CloudTtsConfig>,
+    mut on_chunk: impl FnMut(&[u8], bool, &str),
+) -> Option<()> {
+    if !wants_cloud(provider) {
+        return None;
+    }
+    let speak = ensure_terminal_punctuation(&clean_for_tts(text));
+    if speak.trim().is_empty() {
+        return None;
+    }
+    let cfg = resolve_volcano(cloud)?;
+    let mime = match cfg.encoding.as_str() {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "ogg_opus" => "audio/ogg",
+        _ => "audio/mpeg",
+    };
+    crate::api::volcano_ws::synthesize_ws_stream(
+        &cfg.appid,
+        &cfg.token,
+        &cfg.cluster,
+        &cfg.voice,
+        &cfg.encoding,
+        &speak,
+        |bytes, last| on_chunk(bytes, last, mime),
+    )
+    .await
+}
+
 pub(crate) async fn synthesize_reply(
     text: &str,
     voice: &str,
     provider: &str,
+    cloud: Option<&CloudTtsConfig>,
     out_dir: &Path,
 ) -> Option<PathBuf> {
     let speak = clean_for_tts(text);
@@ -812,30 +1082,26 @@ pub(crate) async fn synthesize_reply(
     let tts_t = std::time::Instant::now();
     eprintln!("[TIMING] TTS_start epoch_ms={}", now_ms());
 
-    // Cloud route. "auto" uses cloud only when env is present; "volcano" forces
-    // it (still falls back to on-device on failure). Cloud is faster (no
+    // Cloud route. "auto" uses cloud only when env is present; "cloud"/"volcano"
+    // force it (still falls back to on-device on failure). Cloud is faster (no
     // on-device model reload) and higher quality when available.
-    let want_cloud = matches!(provider, "auto" | "volcano");
+    let want_cloud = wants_cloud(provider);
     if want_cloud {
-        if let Some(cfg) = volcano_from_env() {
+        if let Some(cfg) = resolve_volcano(cloud) {
             if let Some(path) = synthesize_volcano(&cfg, &speak, out_dir).await {
                 return Some(path);
             }
             tracing::warn!("voice_turn: volcano TTS failed; falling back to ominix");
-        } else if provider == "volcano" {
+        } else if provider == "cloud" || provider == "volcano" {
             tracing::warn!(
-                "voice_turn: tts_provider=volcano but VOLC_TTS_* env missing; \
-                 falling back to on-device sovits"
+                provider = %provider,
+                "voice_turn: tts cloud route but VOLC_TTS_TOKEN/appid missing; falling back to on-device"
             );
         }
     }
 
-    // On-device route. Forced engine for "sovits"/"qwen3"; sovits otherwise.
-    let engine = if provider == "qwen3" {
-        "qwen3"
-    } else {
-        "sovits"
-    };
+    // On-device route: always the default engine (no qwen3 UI split).
+    let engine = "sovits";
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
     match client
@@ -857,14 +1123,298 @@ pub(crate) async fn synthesize_reply(
     }
 }
 
+// Voice fail-fast spoken-error lines. Wording is示意 and tweakable; the
+// bucketing / precedence is what matters.
+const SPEAK_QUOTA: &str = "我这会儿有点忙不过来，稍后再跟我说一次好吗？";
+const SPEAK_RATE: &str = "请求有点多，等几秒再说一遍？";
+const SPEAK_NET: &str = "网络好像不太稳，再说一遍试试？";
+const SPEAK_CTX: &str = "我们聊得有点长了，新开一段再聊吧。";
+const SPEAK_FILTERED: &str = "这个我可能没法回答。";
+const SPEAK_GENERIC: &str = "抱歉，我这边出了点小问题，稍后再试。";
+const SPEAK_EMPTY: &str = "我好像没太听清，再说一遍？";
+
+/// Map a fail-fast [`octos_agent::TurnFailure`] to a short spoken line.
+///
+/// Strongly-typed [`octos_agent::HarnessError`] variants map directly;
+/// `Internal` / `ProviderUnavailable` (where a streaming 429 loses its
+/// quota/rate-limit signal through `classify_report`) fall back to a
+/// raw-detail substring scan so the most common 429 still hits the right
+/// line. `ContentFiltered` is never spoken as "didn't catch that". Returns a
+/// `&'static str` so the caller feeds it straight through the normal TTS path.
+pub(crate) fn voice_error_speech(f: &octos_agent::TurnFailure) -> &'static str {
+    use octos_agent::{HarnessError as H, TurnFailure};
+    let (error, raw) = match f {
+        TurnFailure::EmptyResponse => return SPEAK_EMPTY,
+        TurnFailure::LlmError { error, raw_detail } => (error, raw_detail.to_lowercase()),
+    };
+    match error {
+        H::Quota { .. } => SPEAK_QUOTA,
+        H::RateLimited { .. } => SPEAK_RATE,
+        H::Network { .. } | H::Timeout { .. } => SPEAK_NET,
+        H::ContextOverflow { .. } => SPEAK_CTX,
+        H::ContentFiltered { .. } => SPEAK_FILTERED,
+        H::Authentication { .. } | H::InvalidRequest { .. } => SPEAK_GENERIC,
+        H::Internal { .. } | H::ProviderUnavailable { .. } => {
+            if raw.contains("token_quota_exceeded") || raw.contains("quota") {
+                SPEAK_QUOTA
+            } else if raw.contains("429") || raw.contains("rate limit") {
+                SPEAK_RATE
+            } else if raw.contains("timeout") || raw.contains("network") {
+                SPEAK_NET
+            } else {
+                SPEAK_GENERIC
+            }
+        }
+        _ => SPEAK_GENERIC,
+    }
+}
+
+#[cfg(test)]
+mod voice_error_speech_tests {
+    use octos_agent::{HarnessError, TurnFailure};
+
+    use super::voice_error_speech;
+
+    fn llm(error: HarnessError, raw: &str) -> TurnFailure {
+        TurnFailure::LlmError {
+            error,
+            raw_detail: raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn typed_quota_speaks_busy() {
+        let f = llm(
+            HarnessError::Quota {
+                message: "..".into(),
+            },
+            "..",
+        );
+        assert!(voice_error_speech(&f).contains('忙'));
+    }
+
+    #[test]
+    fn streaming_429_internal_rescued_to_quota_via_raw_detail() {
+        let f = llm(
+            HarnessError::Internal {
+                message: "stream".into(),
+            },
+            r#"{"code":"token_quota_exceeded"} HTTP 429"#,
+        );
+        assert!(voice_error_speech(&f).contains('忙'));
+    }
+
+    #[test]
+    fn empty_response_speaks_didnt_catch() {
+        assert!(voice_error_speech(&TurnFailure::EmptyResponse).contains("没太听清"));
+    }
+
+    #[test]
+    fn content_filtered_is_not_didnt_catch() {
+        let f = llm(
+            HarnessError::ContentFiltered {
+                message: "..".into(),
+            },
+            "..",
+        );
+        assert!(voice_error_speech(&f).contains("没法回答"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CloudTtsConfig;
+
+    #[test]
+    fn should_want_cloud_for_auto_cloud_and_legacy_volcano() {
+        for p in ["auto", "cloud", "volcano"] {
+            assert!(wants_cloud(p), "{p} should want cloud");
+        }
+        for p in ["local", "sovits", "qwen3", ""] {
+            assert!(!wants_cloud(p), "{p} should NOT want cloud");
+        }
+    }
+
+    #[test]
+    fn should_classify_explicit_cloud_as_cloud_route_even_without_creds() {
+        // The caller explicitly chose cloud; readiness must report the cloud
+        // leg (and then flag it not-ready) rather than hide behind the local
+        // fallback.
+        assert_eq!(classify_tts_route("cloud", false), TtsRoute::Cloud);
+        assert_eq!(classify_tts_route("volcano", false), TtsRoute::Cloud);
+        assert_eq!(classify_tts_route("cloud", true), TtsRoute::Cloud);
+    }
+
+    #[test]
+    fn should_classify_auto_by_cloud_config_presence() {
+        assert_eq!(classify_tts_route("auto", true), TtsRoute::Cloud);
+        assert_eq!(classify_tts_route("auto", false), TtsRoute::Local);
+    }
+
+    #[test]
+    fn should_classify_local_and_unknown_as_local_route() {
+        for p in ["local", "sovits", "qwen3", "", "anything"] {
+            assert_eq!(
+                classify_tts_route(p, true),
+                TtsRoute::Local,
+                "{p} should route on-device regardless of cloud config"
+            );
+        }
+    }
+
+    #[test]
+    fn should_return_none_when_token_missing() {
+        let cloud = CloudTtsConfig {
+            appid: Some("1".into()),
+            ..Default::default()
+        };
+        assert!(build_volcano(None, Some(&cloud), None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn should_prefer_typed_cloud_over_env_and_apply_defaults() {
+        let cloud = CloudTtsConfig {
+            appid: Some("typed".into()),
+            voice: Some("BV700".into()),
+            ..Default::default()
+        };
+        let v = build_volcano(
+            Some("tok".into()),
+            Some(&cloud),
+            Some("envid".into()), // typed appid wins
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v.appid, "typed");
+        assert_eq!(v.voice, "BV700");
+        assert_eq!(v.cluster, "volcano_tts"); // default
+        assert_eq!(v.encoding, "mp3"); // default
+        assert_eq!(v.endpoint, "https://openspeech.bytedance.com/api/v1/tts");
+        assert_eq!(v.token, "tok");
+    }
+
+    #[test]
+    fn should_fall_back_to_env_when_cloud_none() {
+        let v = build_volcano(
+            Some("tok".into()),
+            None,
+            Some("envid".into()),
+            Some("clu".into()),
+            Some("envvoice".into()),
+            Some("wav".into()),
+            Some("https://openspeech.bytedance.com/api/v1/tts".into()),
+        )
+        .unwrap();
+        assert_eq!(v.token, "tok");
+        assert_eq!(v.appid, "envid");
+        assert_eq!(v.voice, "envvoice");
+        assert_eq!(v.cluster, "clu");
+        assert_eq!(v.encoding, "wav");
+        assert_eq!(v.endpoint, "https://openspeech.bytedance.com/api/v1/tts");
+    }
+
+    #[test]
+    fn should_return_none_when_no_appid_anywhere() {
+        assert!(build_volcano(Some("tok".into()), None, None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn should_reject_non_volcano_endpoint_to_prevent_ssrf() {
+        // A tenant-controlled endpoint pointing off the Volcano allowlist must
+        // never receive the token — build_volcano returns None.
+        let cloud = CloudTtsConfig {
+            appid: Some("1".into()),
+            endpoint: Some("https://attacker.example/tts".into()),
+            ..Default::default()
+        };
+        assert!(
+            build_volcano(
+                Some("tok".into()),
+                Some(&cloud),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn should_reject_http_volcano_endpoint() {
+        // Even the right host over plain http is rejected (must be https).
+        assert!(!is_allowed_volcano_endpoint(
+            "http://openspeech.bytedance.com/api/v1/tts"
+        ));
+        assert!(!is_allowed_volcano_endpoint(
+            "https://evil.openspeech.bytedance.com.attacker.com/"
+        ));
+        assert!(!is_allowed_volcano_endpoint("not a url"));
+    }
+
+    #[test]
+    fn should_allow_default_volcano_endpoint() {
+        assert!(is_allowed_volcano_endpoint(
+            "https://openspeech.bytedance.com/api/v1/tts"
+        ));
+    }
+
+    #[tokio::test]
+    async fn volcano_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A one-shot server that answers every connection with a 307 to another
+        // host. A client that followed redirects would replay the POST there;
+        // ours must instead surface the 307 as a terminal response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let resp = "HTTP/1.1 307 Temporary Redirect\r\n\
+                    Location: http://attacker.example/steal\r\n\
+                    Content-Length: 0\r\n\r\n";
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let client = volcano_http_client().expect("client builds");
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .body("token=secret")
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(
+            resp.status().as_u16(),
+            307,
+            "redirects must NOT be followed (token would leak to the target)"
+        );
+    }
+
+    #[test]
+    fn volcano_client_is_reused_across_calls() {
+        // Per-sentence synthesis must not rebuild the HTTP client each time —
+        // a fresh client per sentence pays a new TCP+TLS handshake to bytedance.
+        // A shared process-wide client returns the same instance every call.
+        let a = volcano_http_client().expect("client builds");
+        let b = volcano_http_client().expect("client builds");
+        assert!(
+            std::ptr::eq(a, b),
+            "volcano TTS client should be a shared instance, not rebuilt per call"
+        );
+    }
 
     #[tokio::test]
     async fn synthesize_reply_returns_none_for_blank_text() {
         let dir = std::env::temp_dir();
-        let got = synthesize_reply("   ", "vivian", "auto", &dir).await;
+        let got = synthesize_reply("   ", "vivian", "auto", None, &dir).await;
         assert!(got.is_none());
     }
 
@@ -933,56 +1483,6 @@ mod tests {
         assert!(got.contains("晚上好呀！"));
         assert!(got.contains("今天第 N 次"));
         assert!(got.contains("打招呼"));
-    }
-
-    #[test]
-    fn voice_turn_defers_everything_but_the_keep_list() {
-        // A spoken turn keeps only the recovery tool; every other registered
-        // tool is deferred so the first LLM call is not taxed by the full set.
-        let all = vec![
-            "read_file".to_string(),
-            "shell".to_string(),
-            "web_search".to_string(),
-            "activate_tools".to_string(),
-            "spawn".to_string(),
-        ];
-        let deferred = voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS);
-        assert_eq!(
-            deferred,
-            vec![
-                "read_file".to_string(),
-                "shell".to_string(),
-                "web_search".to_string(),
-                "spawn".to_string(),
-            ]
-        );
-        assert!(
-            !deferred.contains(&"activate_tools".to_string()),
-            "activate_tools must stay active so deferred tools remain recoverable"
-        );
-    }
-
-    #[test]
-    fn voice_turn_defer_is_noop_when_only_keep_tools_present() {
-        let all = vec!["activate_tools".to_string()];
-        assert!(voice_turn_deferred_names(&all, VOICE_TURN_KEEP_TOOLS).is_empty());
-    }
-
-    #[test]
-    fn voice_turn_skips_defer_when_no_recovery_tool_present() {
-        // Regression (#1464 P2): without `activate_tools` on the surface,
-        // deferring everything would strand the turn — no tools and no way to
-        // recover one. `defer_tools_for_voice_turn` must skip in that case.
-        let without = vec!["read_file".to_string(), "shell".to_string()];
-        assert!(
-            !voice_turn_can_defer(&without, VOICE_TURN_KEEP_TOOLS),
-            "no recovery tool ⇒ must not defer"
-        );
-        let with = vec!["read_file".to_string(), "activate_tools".to_string()];
-        assert!(
-            voice_turn_can_defer(&with, VOICE_TURN_KEEP_TOOLS),
-            "recovery tool present ⇒ deferral is safe"
-        );
     }
 
     #[test]
@@ -1407,5 +1907,212 @@ mod tests {
             remove_all_visual_markers("abc [[VISUAL:html|没闭合"),
             "abc "
         );
+    }
+
+    // ── voice exit intent (UPCR-2026-025) ─────────────────────────────────
+
+    #[test]
+    fn parse_exit_marker_requires_trailing_position() {
+        // Trailing marker (with trailing whitespace / newline) is accepted.
+        assert!(parse_exit_marker("好的，再见啦！\n[[EXIT]]"));
+        assert!(parse_exit_marker("拜拜。[[EXIT]]  \n"));
+        // A mid-reply mention / quote must NOT trigger an exit.
+        assert!(!parse_exit_marker("我说 [[EXIT]] 只是举个例子，然后继续。"));
+        // Absent.
+        assert!(!parse_exit_marker("普通口播回复，没有标记。"));
+    }
+
+    #[test]
+    fn strip_exit_marker_only_strips_trailing() {
+        assert_eq!(strip_exit_marker("再见啦。\n[[EXIT]]"), "再见啦。");
+        // Mid-reply mention is left intact (not truncated).
+        let mid = "用 [[EXIT]] 举例，然后继续。";
+        assert_eq!(strip_exit_marker(mid), mid);
+        // No marker → unchanged.
+        assert_eq!(strip_exit_marker("纯口播没有标记"), "纯口播没有标记");
+    }
+
+    #[test]
+    fn strip_exit_directive_strips_content_and_assistant_carriers() {
+        let mut content = "好的，再见！\n[[EXIT]]".to_string();
+        let mut messages = vec![
+            Message::user("再见".to_string()),
+            Message::assistant("好的，再见！\n[[EXIT]]".to_string()),
+        ];
+        assert!(strip_exit_directive(&mut content, &mut messages));
+        assert_eq!(content, "好的，再见！");
+        assert_eq!(messages[1].content, "好的，再见！");
+        assert_eq!(messages[0].content, "再见");
+    }
+
+    #[test]
+    fn strip_exit_directive_noop_without_trailing_marker() {
+        let mut content = "用 [[EXIT]] 举例。".to_string();
+        let mut messages = vec![Message::assistant(content.clone())];
+        assert!(!strip_exit_directive(&mut content, &mut messages));
+        assert!(content.contains("[[EXIT]]"));
+    }
+
+    #[test]
+    fn splitter_holds_back_exit_marker_from_tts_even_when_token_split() {
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        // The exit marker streams in as several chunks; none may leak to TTS.
+        for tok in ["好的，", "再见啦！\n", "[[EX", "IT]]"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+                spoken.push('\n');
+            }
+        }
+        let (tail, directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("再见啦"));
+        assert!(
+            !spoken.contains("EXIT"),
+            "marker must never reach TTS: {spoken:?}"
+        );
+        assert!(!spoken.contains("[["), "no bracket leak: {spoken:?}");
+        // The splitter returns no visual directive for an exit-only reply.
+        assert!(directive.is_none());
+    }
+
+    #[test]
+    fn visible_delta_filter_hides_trailing_exit_marker() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["再见", "啦。", "\n[[EX", "IT]]"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "再见啦。");
+    }
+
+    #[test]
+    fn visible_delta_filter_recovers_false_exit_marker_on_finish() {
+        // A mid-reply `[[EXIT]]` quote is NOT a trailing marker → recovered.
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["用 ", "[[EXIT]]", " 举例。"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "用 [[EXIT]] 举例。");
+    }
+
+    #[test]
+    fn ordinary_double_bracket_still_reaches_tts_with_exit_marker_added() {
+        // Regression: generalizing the hold-back to the control-marker SET must
+        // not suppress ordinary `[[1]]` citations — they are a prefix of neither
+        // `[[VISUAL:` nor `[[EXIT]]` past the shared `[[`.
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for tok in ["看这个 [[1]] 参考。", "后面还有内容。"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+            }
+        }
+        let (tail, _directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("看这个"));
+        assert!(
+            spoken.contains("[[1]]"),
+            "citation must still be spoken: {spoken:?}"
+        );
+        assert!(spoken.contains("后面还有内容"));
+    }
+
+    // ── stacked control markers (review fix: visual + exit, either order) ──
+
+    #[test]
+    fn strip_control_directives_handles_visual_then_exit() {
+        // `…[[VISUAL:…]][[EXIT]]` — peeling only the outer EXIT would leave the
+        // visual marker trailing in content/messages. The combined strip must
+        // return the visual directive AND exit=true, leaving the text clean.
+        let mut content = "好的，给你画一个，再见！\n[[VISUAL:html|电路]]\n[[EXIT]]".to_string();
+        let mut messages = vec![
+            Message::user("画个电路然后再见".to_string()),
+            Message::assistant(
+                "好的，给你画一个，再见！\n[[VISUAL:html|电路]]\n[[EXIT]]".to_string(),
+            ),
+        ];
+        let (directive, exit) = strip_control_directives(&mut content, &mut messages);
+        assert_eq!(directive.as_ref().map(|d| d.kind), Some(VisualKind::Html));
+        assert!(exit);
+        assert_eq!(content, "好的，给你画一个，再见！");
+        assert_eq!(messages[1].content, "好的，给你画一个，再见！");
+        assert!(!content.contains("[["), "no marker may leak: {content:?}");
+    }
+
+    #[test]
+    fn strip_control_directives_handles_exit_then_visual() {
+        // Reverse order: `…[[EXIT]][[VISUAL:…]]`. Order-independent.
+        let mut content = "再见！\n[[EXIT]]\n[[VISUAL:image|一只猫]]".to_string();
+        let mut messages = vec![Message::assistant(
+            "再见！\n[[EXIT]]\n[[VISUAL:image|一只猫]]".to_string(),
+        )];
+        let (directive, exit) = strip_control_directives(&mut content, &mut messages);
+        assert_eq!(directive.as_ref().map(|d| d.kind), Some(VisualKind::Image));
+        assert!(exit);
+        assert_eq!(content, "再见！");
+        assert!(!content.contains("[["));
+    }
+
+    #[test]
+    fn strip_control_directives_single_markers_and_none() {
+        // Exit only.
+        let mut c = "再见！\n[[EXIT]]".to_string();
+        let (d, e) = strip_control_directives(&mut c, &mut []);
+        assert!(d.is_none() && e);
+        assert_eq!(c, "再见！");
+        // Visual only.
+        let mut c = "看图。\n[[VISUAL:html|电路]]".to_string();
+        let (d, e) = strip_control_directives(&mut c, &mut []);
+        assert_eq!(d.map(|d| d.kind), Some(VisualKind::Html));
+        assert!(!e);
+        assert_eq!(c, "看图。");
+        // Neither.
+        let mut c = "普通回复。".to_string();
+        let (d, e) = strip_control_directives(&mut c, &mut []);
+        assert!(d.is_none() && !e);
+        assert_eq!(c, "普通回复。");
+    }
+
+    #[test]
+    fn splitter_holds_back_stacked_visual_and_exit_markers() {
+        // Neither marker may reach TTS when both trail the reply.
+        let mut sp = VoiceReplySplitter::new();
+        let mut spoken = String::new();
+        for tok in ["好的，再见！\n", "[[VISUAL:html|电路]]", "\n[[EXIT]]"] {
+            for s in sp.push(tok) {
+                spoken.push_str(&s);
+                spoken.push('\n');
+            }
+        }
+        let (tail, _directive) = sp.finish();
+        if let Some(t) = tail {
+            spoken.push_str(&t);
+        }
+        assert!(spoken.contains("再见"));
+        assert!(
+            !spoken.contains("VISUAL"),
+            "visual leaked to TTS: {spoken:?}"
+        );
+        assert!(!spoken.contains("EXIT"), "exit leaked to TTS: {spoken:?}");
+        assert!(!spoken.contains("[["), "no bracket leak: {spoken:?}");
+    }
+
+    #[test]
+    fn visible_delta_filter_hides_stacked_visual_and_exit_markers() {
+        let mut f = VisibleDeltaFilter::new();
+        let mut seen = String::new();
+        for tok in ["好的，再见！", "\n[[VISUAL:html|电路]]", "\n[[EXIT]]"] {
+            seen.push_str(&f.push(tok));
+        }
+        seen.push_str(&f.finish());
+        assert_eq!(seen, "好的，再见！");
     }
 }

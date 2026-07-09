@@ -44,22 +44,22 @@ const VIDEO_CALL_NOTE: &str =
 ///   prepends [`VIDEO_CALL_NOTE`] so a real-time camera frame isn't mistaken
 ///   for an uploaded file — applied whether or not the spoken turn was
 ///   transcribed into non-empty text.
-/// - With empty `user_content` and media present (but not a video call), the
-///   legacy `[User sent an image]` placeholder is kept.
+/// - With empty `user_content` and image media present (but not a video call),
+///   the legacy `[User sent an image]` placeholder is kept.
 /// - Any per-turn `prompt_summary` is appended, mirroring the previous
 ///   behaviour.
 ///
 /// Pure (no task-locals) so it is unit-testable in isolation.
 fn compose_turn_user_content(
     user_content: &str,
-    has_media: bool,
+    has_image: bool,
     is_video_call: bool,
     prompt_summary: Option<&str>,
 ) -> String {
     let base_content = if user_content.is_empty() {
         if is_video_call {
             VIDEO_CALL_NOTE.to_string()
-        } else if has_media {
+        } else if has_image {
             "[User sent an image]".to_string()
         } else {
             String::new()
@@ -531,6 +531,47 @@ impl Agent {
         }
     }
 
+    /// Task 8 — FailFast foreground-LLM-call failure handling.
+    ///
+    /// Called ONLY from the foreground LLM call sites (not from tool/verifier
+    /// dispatch). When the loop runs under
+    /// [`octos_llm::LlmCallPolicy::FailFast`] and a foreground LLM call fails,
+    /// this:
+    ///   1. Excludes hook-deny errors (`"LLM call denied by hook"`): returns
+    ///      `false` WITHOUT emitting a [`crate::TurnFailure`] so the caller
+    ///      falls through to the existing dispatch path and the permission
+    ///      behaviour is preserved byte-for-byte.
+    ///   2. Otherwise runs [`Self::classify_loop_error`] EXACTLY ONCE (records
+    ///      the metric + harness event; honours the "all escaping Reports go
+    ///      through the classifier" invariant), emits a single
+    ///      [`crate::TurnFailure::LlmError`] on the voice failure sink (if one
+    ///      is attached), and returns `true` so the caller bails with the
+    ///      ORIGINAL `report` (NOT through `handle_loop_error_with_dispatch`).
+    ///
+    /// Returns `false` under Normal policy so non-FailFast behaviour — and the
+    /// entire `handle_loop_error_with_dispatch` path — is unchanged.
+    fn failfast_llm_bail(&self, report: &eyre::Report) -> bool {
+        if octos_llm::current_llm_call_policy() != octos_llm::LlmCallPolicy::FailFast {
+            return false;
+        }
+        // Exclude hook-deny: preserve existing permission behaviour (no
+        // TurnFailure, fall through to the caller's dispatch path).
+        if report.to_string().starts_with("LLM call denied by hook") {
+            return false;
+        }
+        // Classify exactly once (keeps metric + harness-event side effects and
+        // the #488 invariant). The classified error is carried by the voice
+        // projection; the original `report` still bubbles out to the caller.
+        let classified = self.classify_loop_error(report, None);
+        if let Some(sink) = &self.voice_failure_sink {
+            let _ = sink.send(crate::TurnFailure::LlmError {
+                error: classified,
+                raw_detail: report.to_string(),
+            });
+        }
+        true
+    }
+
     /// Budget grace-call dispatch (M6.2). When the loop hits a hard iteration
     /// or token budget, this asks the retry state machine whether to grant
     /// one free iteration past budget. Only `MaxIterations` and `MaxTokens`
@@ -748,6 +789,12 @@ impl Agent {
                 self.tools.reset_spawn_only_invoked();
                 self.reset_loop_detected_recently();
 
+                // Refresh provider-backed prompt segments (e.g. the memory
+                // block when MEMORY.md changed on disk) before composing.
+                // No-op unless providers are registered; providers keep the
+                // unchanged path to a single stat.
+                self.refresh_prompt_segments().await;
+
                 // Build the system prompt via the shared helper in
                 // execution.rs so conversation + task loops compose the same
                 // prompt. This is where realtime sensor summary gets appended
@@ -791,7 +838,7 @@ impl Agent {
                     .flatten();
                 let content = compose_turn_user_content(
                     user_content,
-                    !media.is_empty(),
+                    has_image,
                     live_video && has_image,
                     summary.as_deref(),
                 );
@@ -854,7 +901,12 @@ impl Agent {
                 let mut loop_detector = LoopDetector::new(12);
                 let mut turn_ledger = self.new_turn_ledger();
 
-                loop {
+                // Labeled so the loop-detector recovery arms below can re-enter
+                // the AGENT loop (skip tool execution for this spiraling
+                // response), not merely the inner `for tc in &response.tool_calls`
+                // loop — an unlabeled `continue` there fell through to
+                // `handle_tool_use` and executed the spiraling tools anyway.
+                'agent_loop: loop {
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -889,17 +941,8 @@ impl Agent {
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
-                    // LRU tool management: tick iteration counter and auto-evict idle tools
-                    self.tools.tick();
-                    let evicted = self.tools.auto_evict();
-                    if !evicted.is_empty() {
-                        tracing::info!(
-                            evicted = %evicted.join(", "),
-                            count = evicted.len(),
-                            "auto-evicted idle tools"
-                        );
-                    }
-
+                    // RFC-0 (#1289): LRU tool deferral removed — every enabled
+                    // tool is emitted every turn (full schema).
                     let tools_spec = self.tools.specs();
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
@@ -963,6 +1006,18 @@ impl Agent {
                     {
                         Ok(r) => r,
                         Err(e) if e.to_string().contains("empty response after") => {
+                            // Task 8: under FailFast an empty response is
+                            // TERMINAL — do NOT make the adaptive 2nd call.
+                            // Emit the voice EmptyResponse projection once and
+                            // bail with the original error.
+                            if octos_llm::current_llm_call_policy()
+                                == octos_llm::LlmCallPolicy::FailFast
+                            {
+                                if let Some(sink) = &self.voice_failure_sink {
+                                    let _ = sink.send(crate::TurnFailure::EmptyResponse);
+                                }
+                                return Err(e);
+                            }
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
                             turn.record_retry(LoopRetryReason::ProviderFailover {
@@ -986,6 +1041,9 @@ impl Agent {
                             {
                                 Ok(r) => r,
                                 Err(e) => {
+                                    if self.failfast_llm_bail(&e) {
+                                        return Err(e);
+                                    }
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
                                         &mut retry_state,
@@ -999,6 +1057,9 @@ impl Agent {
                             }
                         }
                         Err(e) => {
+                            if self.failfast_llm_bail(&e) {
+                                return Err(e);
+                            }
                             match self.handle_loop_error_with_dispatch(
                                 &e,
                                 &mut retry_state,
@@ -1138,7 +1199,7 @@ impl Agent {
                                                 warn!(
                                                     "shell spiral fired pre-execution; injected recovery notice into latest shell Tool and continuing for LLM summary"
                                                 );
-                                                continue;
+                                                continue 'agent_loop;
                                             }
                                         }
                                         let terminal_content = if matches!(
@@ -1213,7 +1274,7 @@ impl Agent {
                                             warn!(
                                                 "loop detected — injected synthetic tool results with warning and continuing for ONE more iteration"
                                             );
-                                            continue;
+                                            continue 'agent_loop;
                                         }
                                         Err(_) => {
                                             warn!(
@@ -1716,16 +1777,8 @@ impl Agent {
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
-                // LRU tool management
-                self.tools.tick();
-                let evicted = self.tools.auto_evict();
-                if !evicted.is_empty() {
-                    tracing::info!(
-                        evicted = %evicted.join(", "),
-                        "auto-evicted idle tools in task"
-                    );
-                }
-
+                // RFC-0 (#1289): LRU tool deferral removed — every enabled
+                // tool is emitted every turn (full schema).
                 let tools_spec = self.tools.specs();
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.
@@ -1758,6 +1811,9 @@ impl Agent {
                 {
                     Ok(pair) => pair,
                     Err(e) => {
+                        if self.failfast_llm_bail(&e) {
+                            return Err(e);
+                        }
                         match self.handle_loop_error_with_dispatch(
                             &e,
                             &mut retry_state,
@@ -2693,9 +2749,22 @@ fn recover_shell_retry(
         .filter(|content| !is_successful_shell_output(content))
         .count();
 
-    shell_results
-        .iter()
-        .find(|content| is_diff_like_shell_output(content))
+    // Every recovery arm below is gated on `failed_shells` because this is a
+    // shell-SPIRAL detector: it only intervenes when the model is stuck
+    // retrying failing shell calls, not when it is deliberately running a
+    // streak of successful commands. DiffLikeSuccess must be gated too —
+    // otherwise a legitimate turn that runs `git diff`/`git show` >= threshold
+    // times (all exit 0) is short-circuited, surfacing the raw diff as the
+    // assistant answer and terminating the turn before the model can reply. A
+    // genuine stuck-on-identical-success loop is caught by the separate
+    // loop-detector, not here. `>= 1` mirrors the UsefulSuccess sibling.
+    (failed_shells >= 1)
+        .then(|| {
+            shell_results
+                .iter()
+                .find(|content| is_diff_like_shell_output(content))
+        })
+        .flatten()
         .map(|content| ShellRetryRecovery {
             kind: ShellRetryRecoveryKind::DiffLikeSuccess,
             content: strip_success_exit_suffix(content),
@@ -3123,6 +3192,12 @@ mod tests {
         // No image and not flagged → plain transcript passes through.
         let out = compose_turn_user_content("hello there", false, false, None);
         assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn should_not_call_empty_non_image_media_an_image() {
+        let out = compose_turn_user_content("", false, false, None);
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -4484,6 +4559,54 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
         assert!(recovered.content.contains("diff --git"));
         assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
+        // P2 (tri-repo #1529): DiffLikeSuccess used to fire whenever ANY recent
+        // shell result was diff-like, regardless of failures. A legitimate turn
+        // that runs `git diff` >= threshold times (all exit 0) is NOT a spiral
+        // and must NOT be short-circuited into surfacing the raw diff as the
+        // assistant answer. Build a 4-shell all-success diff streak and assert
+        // recovery does not fire.
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n\nExit code: 0";
+        let mut messages = vec![Message::user("show me every diff")];
+        for i in 0..4 {
+            let id = format!("call_diff_{i}");
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+            messages.push(Message {
+                role: MessageRole::Tool,
+                content: diff.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        assert!(
+            recover_shell_retry(&messages, 4).is_none(),
+            "an all-success diff streak must not trigger shell-spiral recovery"
+        );
     }
 
     #[test]
@@ -6503,6 +6626,103 @@ printf '{"output":"voice saved","success":true}\n'
         );
     }
 
+    /// LLM mock that always calls a named tool, so the loop detector fires
+    /// repeatedly on a tool whose EXECUTION count the test can observe.
+    struct CountingAlwaysNamedToolProvider {
+        calls: AtomicUsize,
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingAlwaysNamedToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loopy".to_string(),
+                    name: self.tool_name.to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
+        // Regression: the loop-detector `continue` after injecting synthetic
+        // results must re-enter the AGENT loop, not merely the inner
+        // `for tc in &response.tool_calls` loop. When it bound to the `for`,
+        // control fell through to `handle_tool_use` and the spiraling tool
+        // EXECUTED anyway (extra side effects + a duplicate tool_call_id row),
+        // defeating the detector's "inject a warning, do NOT call the tools"
+        // contract.
+        //
+        // With the same-tool provider the detector trips on the 4th call, so:
+        //   - iterations 1..=3 execute the tool  (3 executions)
+        //   - iteration 4 (FIRST fire) injects synthetic results and re-enters
+        //     the loop WITHOUT executing
+        //   - iteration 5 (SECOND fire) terminates before executing
+        // ⇒ executions == total_llm_calls - 2. The buggy fall-through executed
+        // on the first-fire iteration too (executions == total_llm_calls - 1).
+        let dir = tempfile::tempdir().unwrap();
+        let exec_count = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingAlwaysNamedToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_name: "loopy_tool",
+        });
+        let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "loopy_tool",
+            output: "looped",
+            calls: exec_count.clone(),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let result = agent
+            .process_message("please loop", &[], vec![])
+            .await
+            .expect("process_message should return Ok even when the loop terminates");
+        assert_eq!(result.content, loop_detected_terminal_message());
+
+        let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+        let executions = exec_count.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            executions,
+            total_calls - 2,
+            "the spiraling tool must NOT execute on the first-fire (synthetic-\
+             injection) iteration; got {executions} executions across \
+             {total_calls} LLM calls (buggy fall-through would be {})",
+            total_calls - 1
+        );
+    }
+
     // ----- Audit Gap-8: auto-fire check_workspace_contract on Completion -----
 
     /// LLM stub that always returns a single EndTurn — used by the
@@ -7880,6 +8100,208 @@ printf '{"output":"voice saved","success":true}\n'
                 .revalidate_pending_approval(&pending, "@alice:example.org")
                 .await
                 .is_ok()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task 8 — FailFast LLM bail: no empty-response 2nd call, classify-once
+    // TurnFailure projection, hook-deny exclusion.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Provider that always returns an empty (retriable) response and counts
+    /// how many times `chat` is invoked. The default `chat_stream` routes to
+    /// `chat`, so the counter equals the number of LLM call attempts.
+    struct AlwaysEmptyProvider {
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysEmptyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: Some(String::new()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-empty"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-empty"
+        }
+    }
+
+    /// Provider that always fails with a (typed) server-side error. A 5xx
+    /// ServerError classifies as a retriable LLM error without tripping the
+    /// agent's `1 << attempt` backoff under FailFast (retry_max = 0).
+    struct AlwaysErrorProvider {
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysErrorProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(LlmError::new(
+                LlmErrorKind::ServerError { status: 503 },
+                "provider unavailable",
+            )
+            .into())
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-error"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-error"
+        }
+    }
+
+    fn task_for(instruction: &str, dir: &std::path::Path) -> Task {
+        Task::new(
+            TaskKind::Code {
+                instruction: instruction.to_string(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.to_path_buf(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_empty_response_when_failfast() {
+        use octos_llm::{LlmCallPolicy, with_llm_call_policy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysEmptyProvider {
+            chat_calls: chat_calls.clone(),
+        });
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let mut agent = Agent::new(AgentId::new("ff-empty"), provider, tools, memory);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_voice_failure_sink(tx);
+
+        let _ = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent.process_message("hi", &[], vec![]).await
+        })
+        .await;
+
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "FailFast empty response must NOT make an adaptive 2nd call"
+        );
+        let failure = rx.try_recv().expect("one TurnFailure emitted");
+        assert!(
+            matches!(failure, crate::TurnFailure::EmptyResponse),
+            "expected EmptyResponse projection, got {failure:?}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one TurnFailure");
+    }
+
+    #[tokio::test]
+    async fn should_classify_once_and_emit_turn_failure_when_failfast_llm_error() {
+        use octos_llm::{LlmCallPolicy, with_llm_call_policy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysErrorProvider {
+            chat_calls: chat_calls.clone(),
+        });
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let mut agent = Agent::new(AgentId::new("ff-error"), provider, tools, memory);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_voice_failure_sink(tx);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent.run_task(&task_for("hi", dir.path())).await
+        })
+        .await;
+
+        // The ORIGINAL eyre::Report still bubbles out of the loop unchanged.
+        assert!(result.is_err(), "FailFast LLM error must bail with Err");
+        // Single foreground attempt — no adaptive/dispatch retry under FailFast.
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "FailFast LLM error must not retry"
+        );
+        // Exactly one TurnFailure::LlmError emitted (classify-once side effect
+        // produced the classified HarnessError carried by the projection).
+        let failure = rx.try_recv().expect("one TurnFailure emitted");
+        assert!(
+            matches!(failure, crate::TurnFailure::LlmError { .. }),
+            "expected LlmError projection, got {failure:?}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one TurnFailure");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_not_emit_turn_failure_when_hook_denies_llm_call_under_failfast() {
+        use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+        use octos_llm::{LlmCallPolicy, with_llm_call_policy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        // Provider would error if reached, but the before_llm hook denies first.
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysErrorProvider {
+            chat_calls: chat_calls.clone(),
+        });
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        // `false` exits with code 1 → hook Deny → llm_call.rs bails with
+        // "LLM call denied by hook: ..".
+        let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+            event: HookEvent::BeforeLlmCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }]));
+        let mut agent =
+            Agent::new(AgentId::new("ff-hookdeny"), provider, tools, memory).with_hooks(hooks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_voice_failure_sink(tx);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent.run_task(&task_for("hi", dir.path())).await
+        })
+        .await;
+
+        assert!(result.is_err(), "hook-deny must still bail with Err");
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "hook denied the call before the provider was reached"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "hook-deny must NOT emit a TurnFailure (preserve permission behaviour)"
         );
     }
 }

@@ -280,6 +280,22 @@ pub struct ServeCommand {
     pub swarm_backend_url: Option<String>,
 }
 
+/// Wire a `task_query_store` for `octos serve --stdio` (the in-process
+/// AppUI/TUI deployment); leave it `None` for HTTP/gateway serve.
+///
+/// `--stdio` runs session turns in *this* process with no gateway to proxy
+/// `task/cancel` to. The per-turn `tool_registry.supervisor()` self-registers
+/// into this store (see `ui_protocol.rs`, the `store.register(..)` guarded on
+/// `task_query_store.is_some()`, holding a `Weak<TaskSupervisor>` so it prunes
+/// at end of turn), which lets `handle_task_cancel` reach the live supervisor
+/// and actually cancel a running `spawn_only` background task. Without it the
+/// AppUI task commands fail `runtime_unavailable` ("task supervisor not wired
+/// for AppUI task commands"). HTTP/gateway serve must stay `None` so
+/// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
+fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
+    stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+}
+
 impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
@@ -316,6 +332,21 @@ impl ServeCommand {
                 %error,
                 "failed to configure durable agent supervisor store; continuing with in-process supervision only"
             );
+        } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+        {
+            // Solo-boot loop safety: restored loops must not silently resume
+            // firing model turns on a single-operator box. Park them paused;
+            // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
+            for (loop_id, session_id) in
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .pause_restored_loops_for_solo_boot()
+            {
+                tracing::info!(
+                    loop_id = %loop_id,
+                    session_id = %session_id.0,
+                    "solo boot: restored loop parked as paused (resume with /loop resume)"
+                );
+            }
         }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
@@ -459,6 +490,7 @@ impl ServeCommand {
                 crate::runtime::BootstrapRole::Serve,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -495,7 +527,13 @@ impl ServeCommand {
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
                 // gateway's effective `plugins.require_signed`.
-                .with_host_plugins_require_signed(config.plugins.require_signed),
+                .with_host_plugins_require_signed(config.plugins.require_signed)
+                .with_host_max_inject_tokens(
+                    config.memory.as_ref().and_then(|m| m.max_inject_tokens),
+                )
+                .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
+                    config.memory.as_ref(),
+                )),
         );
         process_manager.set_self_ref();
 
@@ -676,6 +714,7 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            host_memory: config.memory.clone(),
             solo_login_enabled: self.solo
                 || std::env::var("OCTOS_SOLO_LOGIN")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -698,12 +737,15 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
-            // The serve command is the API server proper — all session
-            // actors live in gateway processes, so `task_query_store`
-            // stays `None` and the cancel/restart handlers proxy via
-            // `resolve_api_port`. The gateway runtime sets its own
-            // store on the embedded api channel.
-            task_query_store: None,
+            // HTTP/gateway serve: session actors live in gateway
+            // processes, so `task_query_store` stays `None` and the
+            // cancel/restart handlers proxy via `resolve_api_port` (the
+            // gateway runtime sets its own store on the embedded api
+            // channel). `--stdio` runs actors in-process with no gateway,
+            // so it wires an empty store the per-turn supervisor
+            // self-registers into — letting AppUI `task/cancel` reach live
+            // `spawn_only` tasks. See `stdio_task_query_store`.
+            task_query_store: stdio_task_query_store(self.stdio),
             // Mirror the operator-configured Tier-2 default cwd so
             // `session_tool_registry` can distinguish "operator chose this
             // dir for sessions" from the boot fallback baked in by
@@ -1150,6 +1192,29 @@ impl ServeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdio_serve_wires_task_query_store_for_in_process_cancel() {
+        // `--stdio` runs session actors in-process with no gateway to
+        // proxy `task/cancel` to, so the store must be present for the
+        // per-turn supervisor to self-register into — otherwise AppUI
+        // task commands fail `runtime_unavailable` and octos-tui Esc/`x`
+        // cannot cancel a spawned background task (the reported bug).
+        assert!(
+            stdio_task_query_store(true).is_some(),
+            "stdio serve must wire a task_query_store"
+        );
+    }
+
+    #[test]
+    fn non_stdio_serve_leaves_task_query_store_none_for_gateway_proxy() {
+        // HTTP/gateway serve must leave it `None` so `handle_task_cancel`
+        // takes the gateway-proxy path; a non-`None` store would skip it.
+        assert!(
+            stdio_task_query_store(false).is_none(),
+            "gateway/http serve must leave task_query_store None"
+        );
+    }
 
     fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {
         use std::sync::{Mutex, OnceLock};

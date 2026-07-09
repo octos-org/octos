@@ -706,13 +706,14 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            // Merge in place when the frame leads with a System (e.g.
-            // compaction summary). `normalize_system_messages` runs
-            // BEFORE this bridge in the agent loop
-            // (`loop_compaction.rs:35`), so multi-System payloads
-            // produced here would reach the provider unmerged.
-            // Anthropic in particular rejects them outright. See the
-            // AppUI analogue in `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // Merge in place when the frame leads with a System (legacy
+            // guard — compaction summaries now render as protected User
+            // rows). `normalize_system_messages` runs BEFORE this bridge
+            // in the agent loop (`loop_compaction.rs:35`), so
+            // multi-System payloads produced here would reach the
+            // provider unmerged. Anthropic in particular rejects them
+            // outright. See the AppUI analogue in
+            // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
             // for the rationale.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
@@ -1451,10 +1452,25 @@ async fn persist_child_session_lifecycle(
                 error: None,
                 output_files: Vec::new(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path: a contract write is a whole-file
+            // read-modify-write, and every fanout child stamps the SHARED
+            // parent session — two children terminating together with their
+            // own stale handles silently erase each other's contract (the
+            // stuck-un-Joined race). The helper holds the per-key persist
+            // lock across open→mutate→rewrite.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
             Ok(parent_exists)
@@ -1514,10 +1530,23 @@ async fn persist_child_session_lifecycle(
                 error: payload.error.clone(),
                 output_files: payload.output_files.clone(),
             };
-            let _ = child.upsert_child_contract(contract.clone()).await?;
+            // Canonical locked path — see the Spawned arm. This terminal arm
+            // is the production-documented race: two children completing
+            // together each rewrote the parent from a stale snapshot, and the
+            // loser's terminal contract reverted to pre-terminal.
+            let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                data_dir,
+                &child_key,
+                contract.clone(),
+            )
+            .await?;
             if parent_exists {
-                let mut parent = SessionHandle::open(data_dir, &parent_key);
-                let _ = parent.upsert_child_contract(contract).await?;
+                let _ = octos_bus::session::upsert_child_contract_through_canonical_path(
+                    data_dir,
+                    &parent_key,
+                    contract,
+                )
+                .await?;
             }
             record_child_session_lifecycle(
                 payload.kind,
@@ -1579,7 +1608,16 @@ pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
 /// Shared lookup table for session-scoped background task supervisors.
 #[derive(Default, Clone)]
 pub struct SessionTaskQueryStore {
-    supervisors: Arc<StdMutex<HashMap<String, SessionTaskQueryEntry>>>,
+    /// Per-session list of registered supervisors, oldest-first. A session
+    /// accumulates more than one when a long-running `spawn_only` task spawned
+    /// in an earlier turn is still live (its worker holds that turn's
+    /// supervisor alive via `Arc<ToolRegistry>`) while a later turn registers a
+    /// fresh supervisor — `ToolRegistry::snapshot_excluding` builds a NEW
+    /// `TaskSupervisor` per turn. Keeping all live ones (rather than
+    /// overwriting) lets `cancel_task` reach the supervisor whose cancel token
+    /// the live worker actually polls; cancelling through a later turn's
+    /// supervisor would only fire a useless fresh token.
+    supervisors: Arc<StdMutex<HashMap<String, Vec<SessionTaskQueryEntry>>>>,
 }
 
 struct SessionTaskQueryEntry {
@@ -1732,31 +1770,49 @@ impl SessionTaskQueryStore {
         data_dir: &Path,
     ) {
         let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(
-            session_key.to_string(),
-            SessionTaskQueryEntry {
-                supervisor: Arc::downgrade(supervisor),
-                data_dir: data_dir.to_path_buf(),
-            },
-        );
-    }
-
-    /// Look up the live supervisor + data dir for `session_key`, pruning a
-    /// stale entry if the underlying `Arc<TaskSupervisor>` has been dropped.
-    fn lookup_live_supervisor(&self, session_key: &str) -> Option<(Arc<TaskSupervisor>, PathBuf)> {
-        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.get(session_key).and_then(|entry| {
-            entry
-                .supervisor
-                .upgrade()
-                .map(|supervisor| (supervisor, entry.data_dir.clone()))
-        }) {
-            Some(entry) => Some(entry),
-            None => {
-                guard.remove(session_key);
-                None
+        let entries = guard.entry(session_key.to_string()).or_default();
+        // Drop entries whose supervisor has been dropped (its turn ended with
+        // no live task holding it), then dedup: if this exact supervisor is
+        // already registered, just refresh its data_dir. Otherwise append at
+        // the end so the per-session order stays oldest-first — `cancel_task`
+        // scans oldest-first to prefer the supervisor the live worker polls.
+        entries.retain(|entry| entry.supervisor.strong_count() > 0);
+        for entry in entries.iter_mut() {
+            if let Some(existing) = entry.supervisor.upgrade() {
+                if Arc::ptr_eq(&existing, supervisor) {
+                    entry.data_dir = data_dir.to_path_buf();
+                    return;
+                }
             }
         }
+        entries.push(SessionTaskQueryEntry {
+            supervisor: Arc::downgrade(supervisor),
+            data_dir: data_dir.to_path_buf(),
+        });
+    }
+
+    /// Return every live supervisor + data dir registered for `session_key`,
+    /// oldest-first, pruning entries whose `Arc<TaskSupervisor>` has dropped
+    /// (and the session key entirely when none remain). A session has more
+    /// than one when an earlier turn's supervisor is still alive — a live
+    /// `spawn_only` worker holds it — alongside a later turn's fresh one.
+    fn live_entries_for_session(&self, session_key: &str) -> Vec<(Arc<TaskSupervisor>, PathBuf)> {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entries) = guard.get_mut(session_key) else {
+            return Vec::new();
+        };
+        let mut live = Vec::new();
+        entries.retain(|entry| match entry.supervisor.upgrade() {
+            Some(supervisor) => {
+                live.push((supervisor, entry.data_dir.clone()));
+                true
+            }
+            None => false,
+        });
+        if entries.is_empty() {
+            guard.remove(session_key);
+        }
+        live
     }
 
     /// Return the JSON task list for `session_key` and every reachable
@@ -1779,17 +1835,29 @@ impl SessionTaskQueryStore {
         queue.push_back(session_key.to_string());
         visited.insert(session_key.to_string());
 
+        let mut seen_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(current) = queue.pop_front() {
-            let Some((supervisor, data_dir)) = self.lookup_live_supervisor(&current) else {
-                continue;
-            };
-            for task in supervisor.get_tasks_for_session(&current) {
-                if let Some(child_key) = task.child_session_key.as_deref() {
-                    if visited.insert(child_key.to_string()) {
-                        queue.push_back(child_key.to_string());
+            // A session may have several live supervisors (an earlier-turn task
+            // still running while a later turn registered a fresh supervisor);
+            // walk them oldest-first and dedup by task id, since a restored
+            // copy of the same task can surface in more than one supervisor.
+            for (supervisor, data_dir) in self.live_entries_for_session(&current) {
+                // Freshen stale cross-turn copies from the ledger first (codex
+                // P2): a later supervisor's restored copy is frozen at restore
+                // time, so a finished task could otherwise surface as running
+                // once its owning supervisor drops.
+                let _ = supervisor.refresh_from_persistence();
+                for task in supervisor.get_tasks_for_session(&current) {
+                    if !seen_task_ids.insert(task.id.clone()) {
+                        continue;
                     }
+                    if let Some(child_key) = task.child_session_key.as_deref() {
+                        if visited.insert(child_key.to_string()) {
+                            queue.push_back(child_key.to_string());
+                        }
+                    }
+                    tasks.push(sanitize_task_for_response(&data_dir, &task));
                 }
-                tasks.push(sanitize_task_for_response(&data_dir, &task));
             }
         }
 
@@ -1816,17 +1884,25 @@ impl SessionTaskQueryStore {
         queue.push_back(session_key.to_string());
         visited.insert(session_key.to_string());
 
+        let mut seen_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(current) = queue.pop_front() {
-            let Some((supervisor, data_dir)) = self.lookup_live_supervisor(&current) else {
-                continue;
-            };
-            for task in supervisor.get_tasks_for_session(&current) {
-                if let Some(child_key) = task.child_session_key.as_deref() {
-                    if visited.insert(child_key.to_string()) {
-                        queue.push_back(child_key.to_string());
+            // See `query_json`: walk every live supervisor for the session
+            // oldest-first, dedup by task id across supervisors.
+            for (supervisor, data_dir) in self.live_entries_for_session(&current) {
+                // Freshen stale cross-turn copies from the ledger (codex P2),
+                // same as `query_json` — this feeds reconnect replay.
+                let _ = supervisor.refresh_from_persistence();
+                for task in supervisor.get_tasks_for_session(&current) {
+                    if !seen_task_ids.insert(task.id.clone()) {
+                        continue;
                     }
+                    if let Some(child_key) = task.child_session_key.as_deref() {
+                        if visited.insert(child_key.to_string()) {
+                            queue.push_back(child_key.to_string());
+                        }
+                    }
+                    tasks.push((task, data_dir.clone()));
                 }
-                tasks.push((task, data_dir.clone()));
             }
         }
 
@@ -1843,6 +1919,11 @@ impl SessionTaskQueryStore {
     /// `Err(TaskCancelError::NotFound)`.
     pub fn cancel_task(&self, task_id: &str) -> Result<(), octos_agent::TaskCancelError> {
         for supervisor in self.live_supervisors() {
+            // Freshen this task from the ledger first (codex P2): a stale
+            // restored `Running` copy in a later supervisor must not accept a
+            // cancel after the owning supervisor already drove it terminal —
+            // `cancel` then correctly returns `AlreadyTerminal`.
+            let _ = supervisor.refresh_task_from_persistence(task_id);
             if supervisor.get_task(task_id).is_some() {
                 return supervisor.cancel(task_id);
             }
@@ -1859,6 +1940,9 @@ impl SessionTaskQueryStore {
         opts: octos_agent::RelaunchOpts,
     ) -> Result<String, octos_agent::TaskRelaunchError> {
         for supervisor in self.live_supervisors() {
+            // Freshen from the ledger first (codex P2) so a stale cross-turn
+            // copy doesn't drive a relaunch off outdated state.
+            let _ = supervisor.refresh_task_from_persistence(task_id);
             if supervisor.get_task(task_id).is_some() {
                 return supervisor.relaunch(task_id, opts);
             }
@@ -1872,12 +1956,21 @@ impl SessionTaskQueryStore {
     fn live_supervisors(&self) -> Vec<Arc<TaskSupervisor>> {
         let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
         let mut alive = Vec::new();
-        guard.retain(|_, entry| match entry.supervisor.upgrade() {
-            Some(supervisor) => {
-                alive.push(supervisor);
-                true
-            }
-            None => false,
+        // Flatten every session's supervisor list, oldest-first within each
+        // session, pruning dropped entries (and now-empty sessions).
+        // Oldest-first matters for `cancel_task`: when a task spawned in an
+        // earlier turn has a restored copy in a later turn's supervisor, the
+        // earlier (live) supervisor must be tried first so cancel fires the
+        // token the worker is actually polling.
+        guard.retain(|_, entries| {
+            entries.retain(|entry| match entry.supervisor.upgrade() {
+                Some(supervisor) => {
+                    alive.push(supervisor);
+                    true
+                }
+                None => false,
+            });
+            !entries.is_empty()
         });
         alive
     }
@@ -2641,7 +2734,7 @@ pub struct ActorFactory {
     /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
     pub llm_strong: Arc<dyn LlmProvider>,
     pub memory: Arc<EpisodeStore>,
-    pub system_prompt: Arc<std::sync::RwLock<String>>,
+    pub system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     pub hooks: Option<Arc<HookExecutor>>,
     pub hook_context_template: Option<HookContext>,
     /// Data directory for creating per-actor SessionHandle instances.
@@ -2697,6 +2790,11 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    /// Paired with `memory_store`; `memory_refresh_enabled` gates the
+    /// capture-policy text and the per-turn refresh provider.
+    pub memory_inject_tokens: usize,
+    pub memory_refresh_enabled: bool,
     /// Profile id (= tenant id in [`SessionScope::multi_tenant`]). Used
     /// to construct a per-session [`SessionScope`] when spawning gateway
     /// session actors. `None` for the top-level admin factory (the
@@ -3213,13 +3311,9 @@ impl ActorFactory {
             Some(self.subagent_output_router.clone()),
             user_workspace.clone(),
         ));
-        // Codex round 3 P2: pin `read_task_output` against the
-        // `ToolLifecycle` LRU evictor. Without this, in long-running
-        // gateway sessions the reader can be auto-deferred after the
-        // idle threshold and disappear from `specs()`, making the
-        // `task_handle` envelope point at a tool the LLM is no longer
-        // offered. The base-tool list is the LRU pin point.
-        tools.add_base_tools(["read_task_output"]);
+        // RFC-0 (#1289): LRU tool deferral was removed — `read_task_output`
+        // (like every enabled tool) is emitted every turn, so no base-tool
+        // pin is needed.
         tools.register(message_tool);
         tools.register(send_file_tool);
         tools.register(octos_agent::SendAppCardTool::with_context(
@@ -3255,6 +3349,11 @@ impl ActorFactory {
             session_key.to_string(),
             task_state_path.clone(),
         )
+        // Embed-on-save + recall parity: without the profile's embedder
+        // spawn workers store their episodes vectorless and their
+        // episodic recall silently skips (same contract as the
+        // `agent.with_embedder` wiring below).
+        .with_optional_embedder(self.embedder.clone())
         // M8 Runtime Parity W2.B1: parent → child cache inheritance.
         // Without these the spawned child Agent observes
         // `file_state_cache: None` and `subagent_output_router: None`
@@ -3393,6 +3492,7 @@ impl ActorFactory {
             octos_agent::DelegateTool::new(self.llm.clone(), self.memory.clone(), self.cwd.clone())
                 .with_provider_policy(self.provider_policy.clone())
                 .with_agent_config(self.agent_config.clone())
+                .with_optional_embedder(self.embedder.clone())
                 .with_task_supervisor(supervisor.clone(), session_key.to_string())
                 .with_child_prompt_context_manager_factory(delegate_factory);
         if let Some(ref prompt) = self.worker_prompt {
@@ -3450,20 +3550,16 @@ impl ActorFactory {
             tools.apply_policy(policy);
         }
 
-        // Defer rarely-used per-session tools to keep active tool count low
-        // for providers that choke on many tools (e.g. Dashscope).
-        // Keep cron active so reminder flows don't require activate_tools.
-        tools.defer(["spawn".to_string()]);
+        // RFC-0 (#1289): LRU tool deferral was removed — every enabled tool
+        // is emitted every turn (full schema).
 
-        // For slides sessions, auto-activate media tools and use primary model
-        // (bypasses adaptive router which may pick a weak model).
+        // For slides sessions use the primary model (bypasses adaptive
+        // router which may pick a weak model).
         let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
         let is_site = session_key
             .topic()
             .is_some_and(|t| t == "site" || t.starts_with("site "));
         if is_slides {
-            tools.activate("group:media");
-
             // Structural guardrail (fix/slides-session-tool-allowlist):
             // hide every `mofa_*` plugin tool except `mofa_slides` so a
             // weaker fallback model (e.g. kimi-k2.6 on mini1 dspfac,
@@ -3550,35 +3646,43 @@ impl ActorFactory {
             self.llm.clone()
         };
         let agent_id = AgentId::new(format!("session-{}", session_key));
-        let has_deferred = tools.has_deferred();
-        let mut system_prompt = system_prompt_override.unwrap_or_else(|| {
-            self.system_prompt
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
+        // Pre/post-memory split: the memory segment must keep its
+        // pre-refactor slot (after bootstrap/soul, BEFORE skills/tool
+        // guidance) — see GatewayPromptParts. Per-session tails (slides
+        // availability) belong to the post half.
+        let (mut system_prompt, mut post_memory_tail) = match system_prompt_override {
+            // An override replaces the whole base prompt; memory still
+            // takes the slot right after it.
+            Some(override_prompt) => (override_prompt, String::new()),
+            None => {
+                let parts = self
+                    .system_prompt
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                (parts.pre_memory, parts.post_memory)
+            }
+        };
+        // Per-chat soul override (set via /soul in this chat) — appended to
+        // the pre-memory half so it lands in the base prompt's soul slot,
+        // after any profile-wide soul and before the memory segment.
+        if let Some(user_soul) =
+            crate::soul_service::read_soul_for_session(&self.data_dir, &session_key)
+        {
+            system_prompt.push_str("\n\n## Soul\n\n");
+            system_prompt.push_str(&user_soul);
+        }
         if is_slides && !slides_generation_available {
-            system_prompt.push_str(
+            post_memory_tail.push_str(
                 "\n\n## Slides Generation Availability\n\n\
                  `mofa_slides` is not available on this host. You may still design and edit slide projects, \
                  but you must tell the user that PPTX/image generation is unavailable here. \
                  Do NOT retry generation via shell, run_pipeline, or alternative binaries.",
             );
         }
-        if has_deferred {
-            let groups = tools.deferred_groups();
-            let mut tool_names = Vec::new();
-            for (name, _desc, _count) in &groups {
-                if let Some(info) = octos_agent::tools::policy::TOOL_GROUPS
-                    .iter()
-                    .find(|g| g.name == name)
-                {
-                    tool_names.extend(info.tools.iter().copied());
-                }
-            }
-            let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
-            system_prompt.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
-        }
+        // RFC-0 (#1289): tool deferral + the `activate_tools` meta-tool were
+        // removed, so there is no deferred-tools teaching block to append.
+        let _ = &mut system_prompt;
 
         // M8 fix-first item 8 (gap 2): build a per-actor
         // AgentSummaryGenerator now that the supervisor handle and the
@@ -3642,6 +3746,44 @@ impl ActorFactory {
             agent = agent.with_session_scope(scope);
         }
 
+        // Memory as a NAMED per-agent prompt segment (chat.rs pattern):
+        // the factory's base prompt String no longer inlines it, so both
+        // gateway channel actors and serve WS/stdio actors read a fresh
+        // block each turn instead of whatever was on disk at
+        // build_system_prompt time (gateway persona tick = 6h; serve
+        // profile bootstrap = forever). This builder is synchronous, so
+        // the segment is not pre-seeded: the provider composes it during
+        // the turn-start refresh, which runs BEFORE the first model call.
+        // The provider is ALWAYS registered — this synchronous builder
+        // cannot pre-seed the segment, so the provider's first turn-start
+        // refresh is what injects memory at all. The refresh-disabled
+        // contract ("no per-turn memory re-read") is honored via snapshot
+        // mode: one render, then silence — parity with the old
+        // inlined-at-build behavior, minus the staleness.
+        if let Some(ref memory_store) = self.memory_store {
+            // RESERVE the named slot before the post tail lands: set_named
+            // on a missing segment APPENDS, so without this the provider's
+            // first refresh would place memory AFTER the tail
+            // (pre → post → memory). Empty segments render as nothing.
+            agent.set_prompt_segment(octos_agent::MEMORY_SEGMENT_NAME, String::new());
+            let provider = octos_agent::MemorySegmentProvider::new(
+                memory_store.clone(),
+                self.memory_inject_tokens,
+                self.memory_refresh_enabled,
+            );
+            let provider = if self.memory_refresh_enabled {
+                provider
+            } else {
+                provider.static_snapshot()
+            };
+            agent.add_prompt_segment_provider(Arc::new(provider));
+        }
+        // Post-memory half (skills, tool prefs, per-session tails) lands
+        // AFTER the named memory segment — the pre-refactor order.
+        if !post_memory_tail.is_empty() {
+            agent.append_system_prompt(&post_memory_tail);
+        }
+
         if let Some(ref embedder) = self.embedder {
             agent = agent.with_embedder(embedder.clone());
         }
@@ -3692,10 +3834,8 @@ impl ActorFactory {
             );
         }
 
-        // Wire the activate_tools back-reference now that tools are in Arc
-        agent.wire_activate_tools();
         // RFC-1 (issue #1290): wire the mofa_make dispatcher's
-        // back-reference at the same site.
+        // back-reference now that tools are in Arc.
         agent.wire_mofa_make_dispatcher();
 
         // Load per-user status configuration
@@ -3750,6 +3890,7 @@ impl ActorFactory {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -4295,6 +4436,14 @@ struct SessionActor {
     /// cleared at the end. `None` outside command handling — `send_reply`
     /// then falls back to legacy behavior (stamping no thread_id).
     current_command_cmid: Option<String>,
+
+    /// Total tokens (input + output) attributed to the MOST RECENT turn run
+    /// by `process_inbound`. Set on every LLM turn; read by
+    /// `maybe_advance_goal_runtime_after_turn` so a goal continuation's token
+    /// budget is charged the turn's real usage instead of a hardcoded 0
+    /// (which let a goal recur past its token budget). Reset to 0 at the top
+    /// of each turn so a failed/no-response turn charges nothing.
+    last_turn_total_tokens: u64,
 }
 
 impl SessionActor {
@@ -4708,12 +4857,25 @@ impl SessionActor {
             .profile_id()
             .unwrap_or(MAIN_PROFILE_ID)
             .to_owned();
-        let continuations = default_agent_orchestrator().drain_ready_continuations_for_session(
-            &self.session_key,
-            &profile_id,
-            runtime_state,
-            1,
-        );
+        // Cross-subsystem occupancy (#1529): drain AND claim the in-flight
+        // marker under a SINGLE state lock (see
+        // `drain_and_claim_ready_continuation_for_session`). This is the only
+        // race-free ordering — setting the marker before the drain
+        // self-suppresses the actor's own due-goal enqueue; setting it after
+        // the drain opens a window for a concurrent AppUI tick to re-enqueue
+        // and spawn a duplicate turn (both caught by codex re-review). A
+        // session already in-flight (an AppUI goal turn running) drains
+        // nothing and yields no guard, so the actor defers. The guard is held
+        // across the whole turn and clears the marker on ANY exit at the end
+        // of the loop iteration, suppressing the AppUI due-scan/drain until
+        // the turn completes.
+        let (continuations, _in_flight_guard) = default_agent_orchestrator()
+            .drain_and_claim_ready_continuation_for_session(
+                &self.session_key,
+                &profile_id,
+                runtime_state,
+                1,
+            );
         let drained = !continuations.is_empty();
         for continuation in continuations {
             info!(
@@ -4789,19 +4951,35 @@ impl SessionActor {
                         .last()
                         .map(|(_, message)| message.content.clone())
                 };
-                if let Some(reply) = assistant_reply {
-                    if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
-                        &loop_id,
-                        &profile_id,
-                        &reply,
-                    ) {
-                        info!(
-                            session = %self.session_key,
-                            loop_id = %loop_id,
-                            error = %err.message,
-                            "apply_self_paced_response skipped"
-                        );
-                    }
+                // A reply-less fire (interrupt / agent error / empty content)
+                // still reschedules: the empty reply carries no
+                // `<<loop-next-in: …>>` sentinel, so the orchestrator applies
+                // the DEFAULT self-paced delay. Skipping here parked the loop
+                // at `next_run_at_ms: None`, which the due-scan never visits
+                // again — one failed turn silently killed the loop.
+                //
+                // Deliberate divergence from the AppUI path (codex round-1):
+                // AppUI captures the EndTurn payload and can distinguish a
+                // DELIBERATE blank reply (skip, #1134 contract) from a true
+                // no-reply (reschedule). This path has no capture —
+                // `process_inbound` doesn't persist empty assistant content
+                // and the history scan filters empties — so blank and error
+                // are indistinguishable here, and liveness wins: a blank
+                // loop turn retries at the default delay instead of dying.
+                // An explicit model stop should be a sentinel (follow-up),
+                // not an unpersistable blank.
+                let reply = assistant_reply.unwrap_or_default();
+                if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                    &loop_id,
+                    &profile_id,
+                    &reply,
+                ) {
+                    info!(
+                        session = %self.session_key,
+                        loop_id = %loop_id,
+                        error = %err.message,
+                        "apply_self_paced_response skipped"
+                    );
                 }
             }
             default_agent_orchestrator().mark_continuation_completed(
@@ -4824,13 +5002,11 @@ impl SessionActor {
     /// continuation only when the runtime stays idle AND the per-goal
     /// policy still allows another fire.
     ///
-    /// Token tracking is wired through the goal record's `tokens_used`
-    /// only when the orchestrator-level `record_goal_turn` is called
-    /// with a non-zero `tokens_consumed`. The per-turn LLM token usage
-    /// is currently still attributed via existing audit paths; surfacing
-    /// it into this hook is a deliberate follow-up so the first
-    /// production cut closes the recurrence + budget-state-machine
-    /// bullets cleanly without restructuring `process_inbound`.
+    /// The goal record's `tokens_used` is charged this turn's real token
+    /// usage (`last_turn_total_tokens`, set by `process_inbound` from the LLM
+    /// response's input+output tokens — the same per-turn total the AppUI
+    /// dispatch path attributes). Passing 0 here previously let the token
+    /// budget gate never trip, so a goal recurred past its token budget.
     #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
@@ -4838,8 +5014,14 @@ impl SessionActor {
         goal_turn_start: Instant,
     ) {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
+        let tokens_consumed = self.last_turn_total_tokens;
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(&self.session_key, profile_id, 0, elapsed_seconds);
+        orchestrator.record_goal_turn(
+            &self.session_key,
+            profile_id,
+            tokens_consumed,
+            elapsed_seconds,
+        );
         // Capture the most recent assistant turn's text content to feed
         // the completion-sentinel detector. Reading from the durable
         // session handle keeps the wiring narrow — `process_inbound`
@@ -8661,6 +8843,10 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // Reset per-turn token accounting so a turn that fails / produces no
+        // response charges 0 to the goal budget (set to the real usage below
+        // once the LLM response is in hand).
+        self.last_turn_total_tokens = 0;
         // Consecutive-recovery cap reset
         // (feat/spawn-only-failure-feedback-loop): user-initiated turns
         // break the "recovery chain" — once the user re-engages we no
@@ -9003,6 +9189,11 @@ impl SessionActor {
         if let Ok(Ok(ref cr)) = result {
             self.record_usage_event(cr, client_message_id.as_deref(), None)
                 .await;
+            // Attribute this turn's real token usage so a goal continuation
+            // charges its budget correctly (read by
+            // `maybe_advance_goal_runtime_after_turn`).
+            self.last_turn_total_tokens = u64::from(cr.token_usage.input_tokens)
+                .saturating_add(u64::from(cr.token_usage.output_tokens));
         }
 
         match result {
@@ -9760,6 +9951,106 @@ mod tests {
         );
     }
 
+    /// Post-compaction coverage regression: the agent loop runs
+    /// `normalize_system_messages` BEFORE the bridge, converting any
+    /// non-leading `[Conversation summary]` System row into a
+    /// `[System note] ` User row. When the frame emitted that summary as a
+    /// System row, the bridge's contiguous coverage window never matched
+    /// again after the first compaction, and every TurnStart re-recorded the
+    /// entire retained conversation as source-less duplicates. The frame now
+    /// emits the summary as a User row, which the loop leaves untouched, so
+    /// TurnStart must record exactly ONE new item (the current user turn).
+    #[test]
+    fn session_actor_prompt_context_bridge_covers_frame_after_compaction() {
+        let session_key = SessionKey::new("cli", "context-post-compaction-coverage");
+        let history: Vec<Message> = (0..6)
+            .flat_map(|index| {
+                vec![
+                    test_message(MessageRole::User, format!("user turn {index}")),
+                    test_message(MessageRole::Assistant, format!("assistant turn {index}")),
+                ]
+            })
+            .collect();
+        let mut manager =
+            ContextManager::from_session_history(session_key.to_string(), None, &history);
+        manager.install_compaction_summary("older turns summarized", 4);
+        let item_count_before = manager.items().len();
+        let manager = Arc::new(StdMutex::new(manager));
+        let dir = tempfile::TempDir::new().unwrap();
+        let bridge = SessionActorPromptContextBridge::new(
+            session_key.clone(),
+            dir.path().to_path_buf(),
+            manager.clone(),
+        );
+
+        let request = PromptContextRequest {
+            phase: PromptContextPhase::TurnStart,
+            iteration: 1,
+            provider_name: "test".to_string(),
+            model_id: "large-context".to_string(),
+            context_window: 16_000,
+        };
+        // Build the turn-start vector the way the agent loop does: runtime
+        // System + the manager's own frame + the new user turn...
+        let frame_messages = {
+            let guard = manager.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .for_prompt(&SessionActorPromptContextBridge::prompt_policy(&request))
+                .messages
+        };
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(frame_messages);
+        prompt.push(test_message(MessageRole::User, "current request"));
+        // ...then apply the `normalize_system_messages` conversion rule that
+        // runs before the bridge (message_repair.rs): non-leading context
+        // System rows become `[System note] ` User rows. A User-role summary
+        // frame row makes this a no-op; a System-role regression would be
+        // rewritten here and blow the coverage window below.
+        for message in prompt.iter_mut().skip(1) {
+            if message.role == MessageRole::System
+                && (message.content.starts_with("[Conversation summary]")
+                    || message.content.starts_with("[Background task"))
+            {
+                message.role = MessageRole::User;
+                message.content = format!("[System note] {}", message.content);
+            }
+        }
+
+        let report = bridge
+            .prepare_prompt(request, &mut prompt)
+            .expect("context manager bridge should prepare prompt");
+
+        assert!(
+            !report.compaction_performed,
+            "small post-compaction transcript must not re-compact"
+        );
+        let item_count_after = manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items()
+            .len();
+        assert_eq!(
+            item_count_after,
+            item_count_before + 1,
+            "TurnStart must record exactly the current user turn; anything more \
+             means the frame failed coverage and was re-recorded as duplicates"
+        );
+        assert!(
+            prompt
+                .iter()
+                .any(|message| message.content.contains("[Conversation summary]")),
+            "summary must still reach the model prompt"
+        );
+        assert_eq!(
+            prompt
+                .iter()
+                .filter(|message| message.content == "user turn 4")
+                .count(),
+            1,
+            "retained history must not be duplicated in the outgoing prompt"
+        );
+    }
+
     /// Regression for issue #1019. Ensures gateway/session_actor-spawned
     /// children inherit the parent session's [`ContextManager`] via the
     /// shared fork sanitiser instead of starting from an ad-hoc empty
@@ -10362,6 +10653,240 @@ mod tests {
             store
                 .raw_tasks_for_session(&SessionKey::new("api", "other").to_string())
                 .is_empty()
+        );
+    }
+
+    /// Cross-turn cancel regression (codex P2): a `spawn_only` task spawned in
+    /// turn 1 polls turn-1's cancel token. When turn 2 registers a fresh
+    /// supervisor for the SAME session, the store must keep turn-1's supervisor
+    /// (still alive — the live worker holds it via `Arc<ToolRegistry>`)
+    /// reachable, so cancel fires the token the worker actually polls rather
+    /// than a later supervisor's useless fresh one. The old `HashMap::insert`
+    /// evicted turn-1's supervisor, leaving the task uncancellable.
+    #[test]
+    fn cancel_task_reaches_earlier_turn_supervisor_after_a_later_turn_registers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        let task_id = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&task_id);
+        let live_token = sup1.cancel_token(&task_id);
+        assert!(!live_token.is_cancelled());
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+
+        // Turn 2's fresh supervisor for the same session (used to evict sup1).
+        let sup2 = Arc::new(TaskSupervisor::new());
+        store.register(&session_key, &sup2, &data_dir);
+
+        store
+            .cancel_task(&task_id)
+            .expect("task spawned under the earlier supervisor must still cancel");
+        assert!(
+            live_token.is_cancelled(),
+            "cancel must fire the live (turn-1) supervisor's token"
+        );
+    }
+
+    /// `query_json` walks EVERY live supervisor for a session (not just the
+    /// last-registered one) and dedups by task id: the task whose live copy is
+    /// in the earlier supervisor appears exactly once, and a later-supervisor's
+    /// own task still surfaces.
+    #[test]
+    fn query_json_walks_all_live_supervisors_and_dedups_by_task_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        // A later turn's supervisor restores T1 (same id) from the shared
+        // ledger and also owns its own T2.
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        assert!(sup2.get_task(&t1).is_some(), "T1 restored into sup2");
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        let json = store.query_json(&session_key.to_string());
+        let ids: Vec<String> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            ids.iter().filter(|id| **id == t1).count(),
+            1,
+            "T1 must appear exactly once across the two supervisors"
+        );
+        assert!(
+            ids.contains(&t2),
+            "the later supervisor's own task must still surface"
+        );
+    }
+
+    /// `raw_tasks_for_session` mirrors `query_json`'s multi-supervisor walk +
+    /// task-id dedup (it feeds reconnect/session-open task replay).
+    #[test]
+    fn raw_tasks_for_session_walks_all_live_supervisors_and_dedups() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        let tasks = store.raw_tasks_for_session(&session_key.to_string());
+        assert_eq!(
+            tasks.iter().filter(|(task, _)| task.id == t1).count(),
+            1,
+            "T1 must appear exactly once"
+        );
+        assert!(
+            tasks.iter().any(|(task, _)| task.id == t2),
+            "the later supervisor's own task must surface"
+        );
+    }
+
+    /// codex P2 follow-up: a later turn's supervisor (sup2) holds a restored
+    /// copy of an earlier turn's task (t1) and never receives its later status
+    /// updates. After sup1 completes t1 and drops while sup2 stays alive for its
+    /// own task, the store must reconcile t1 from the ledger — never surfacing
+    /// sup2's stale `Running` copy, nor accepting a cancel against the
+    /// already-finished task.
+    #[test]
+    fn store_reconciles_stale_cross_turn_copy_from_ledger() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        // sup1 finishes t1 (persists Completed to the shared ledger) then drops
+        // — its turn ended and the worker released the per-turn registry.
+        sup1.mark_completed(&t1, vec![]);
+        drop(sup1);
+
+        // sup2's stale `Running` copy of t1 must never surface.
+        let raw = store.raw_tasks_for_session(&session_key.to_string());
+        assert!(
+            !raw.iter()
+                .any(|(task, _)| task.id == t1 && task.status == octos_agent::TaskStatus::Running),
+            "t1's stale running copy must not surface after its owner completed it"
+        );
+        assert!(
+            raw.iter().any(|(task, _)| task.id == t2),
+            "sup2's own task must still surface"
+        );
+        // query_json shows t1 at most once (deduped) and t2 present.
+        let ids: Vec<String> = store
+            .query_json(&session_key.to_string())
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(ids.iter().filter(|id| **id == t1).count() <= 1);
+        assert!(
+            ids.contains(&t2),
+            "sup2's own task must surface in query_json"
+        );
+
+        // A cancel against the finished task reports AlreadyTerminal — proving
+        // the store reconciled t1's terminal status from the ledger rather than
+        // acting on sup2's stale running copy.
+        assert!(matches!(
+            store.cancel_task(&t1),
+            Err(octos_agent::TaskCancelError::AlreadyTerminal)
+        ));
+    }
+
+    /// codex P1 follow-up: ledger refresh must never import a task into a
+    /// supervisor that doesn't own it. Two live turns share a ledger but poll
+    /// different cancel tokens; if an older supervisor imported a later
+    /// supervisor's task, cancel/relaunch (oldest-first) would fire the wrong
+    /// token while the real worker ran on. Refresh updates only already-owned
+    /// rows, so cancel routes to the owning supervisor's live token.
+    #[test]
+    fn refresh_does_not_import_a_later_supervisors_task_into_an_older_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ledger = data_dir.join("tasks.jsonl");
+        let session_key = SessionKey::new("api", "session");
+
+        // sup1 (turn N) owns t1; sup2 (turn N+1, registered later) owns t2.
+        // Both live, both persist to the shared ledger.
+        let sup1 = Arc::new(TaskSupervisor::new());
+        sup1.enable_persistence(&ledger).unwrap();
+        let t1 = sup1.register("run_pipeline", "call-1", Some("api:session"));
+        sup1.mark_running(&t1);
+
+        let sup2 = Arc::new(TaskSupervisor::new());
+        sup2.enable_persistence(&ledger).unwrap();
+        let t2 = sup2.register("deep_search", "call-2", Some("api:session"));
+        sup2.mark_running(&t2);
+        let t2_token = sup2.cancel_token(&t2);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&session_key, &sup1, &data_dir);
+        store.register(&session_key, &sup2, &data_dir);
+
+        // A projection refreshes every supervisor from the ledger.
+        let _ = store.query_json(&session_key.to_string());
+
+        // sup1 (registered before t2 existed) must NOT have imported t2.
+        assert!(
+            sup1.get_task(&t2).is_none(),
+            "t2 must not be imported into the older supervisor"
+        );
+
+        // Cancelling t2 must fire sup2's live token (the worker's), not sup1's.
+        store.cancel_task(&t2).expect("t2 is cancellable");
+        assert!(
+            t2_token.is_cancelled(),
+            "cancel must reach t2's owning supervisor (sup2) live token"
         );
     }
 
@@ -11252,6 +11777,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11332,6 +11858,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11409,6 +11936,110 @@ mod tests {
             "internal master-continuation prompt must not leak into chat history: {:?}",
             session.messages
         );
+        drop(tx);
+        handle.abort();
+    }
+
+    /// #1529 P2 — a goal continuation drained by the SESSION ACTOR must
+    /// charge the goal's `tokens_used` the turn's REAL token usage.
+    ///
+    /// End-to-end: an active goal enqueues a `GoalContinue` continuation;
+    /// the actor's periodic tick drains it into `process_inbound`, which
+    /// stamps `last_turn_total_tokens` from the LLM response's
+    /// input+output tokens; the post-turn hook
+    /// (`maybe_advance_goal_runtime_after_turn`) then passes that value to
+    /// `record_goal_turn`. Before the fix the hook passed a hardcoded 0,
+    /// so `tokens_used` never advanced on the CLI/session-actor path and
+    /// the token-budget gate never tripped.
+    ///
+    /// The goal is registered under `MAIN_PROFILE_ID` because the actor's
+    /// drain loop resolves its goal profile as
+    /// `session_key.profile_id().unwrap_or(MAIN_PROFILE_ID)` and the bare
+    /// `cli:{tag}` test key has no profile segment — `record_goal_turn`
+    /// silently no-ops on a profile mismatch.
+    #[cfg(feature = "api")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // `make_response` carries TokenUsage { input: 50, output: 10 } —
+        // the turn's real total is 60 tokens.
+        let provider = Arc::new(DelayedMockProvider::new(
+            "goal-token-test",
+            vec![(Duration::ZERO, make_response("advancing the goal"))],
+        ));
+        let (tx, _out_rx, handle, _session_mgr) =
+            setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
+        let session_id = test_session_key(dir.path());
+
+        let orchestrator = default_agent_orchestrator();
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: MAIN_PROFILE_ID.into(),
+                objective: "keep the build green".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Pre-condition: nothing accounted before the actor runs the turn.
+        let (tokens_before, continuations_before, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_before, 0);
+        assert_eq!(continuations_before, 0);
+
+        // Cross the actor's continuation tick so it drains the queued
+        // GoalContinue into process_inbound (which calls the provider).
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            if provider.call_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert!(
+            provider.call_count.load(Ordering::Relaxed) > 0,
+            "periodic actor tick must drain the queued goal continuation into process_inbound"
+        );
+
+        // The post-turn accountant runs after process_inbound returns, and
+        // the tail of process_inbound does REAL blocking I/O (the session
+        // JSONL append runs on the spawn_blocking pool) that the paused
+        // virtual clock cannot fast-forward. Wait for it in small bounded
+        // REAL-time slices: each slice parks the runtime on the blocking
+        // pool, so the actor's I/O completion (a real wakeup) gets CPU
+        // time. Bounded at 500 x 2ms = 1s real time; typically a couple of
+        // slices suffice.
+        let mut counters = None;
+        for _ in 0..500 {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(2));
+            })
+            .await
+            .unwrap();
+            let current = orchestrator
+                .goal_counters_for_test(&session_id)
+                .expect("goal still exists");
+            if current.1 >= 1 {
+                counters = Some(current);
+                break;
+            }
+        }
+        let (tokens_used, continuations_used, _window) =
+            counters.expect("goal turn must be recorded within the polling window");
+        assert_eq!(
+            continuations_used, 1,
+            "exactly one goal turn should be accounted"
+        );
+        assert_eq!(
+            tokens_used, 60,
+            "goal budget must be charged the turn's real usage \
+             (50 input + 10 output tokens), not a hardcoded 0"
+        );
+
         drop(tx);
         handle.abort();
     }
@@ -11493,6 +12124,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11626,6 +12258,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11755,6 +12388,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11856,6 +12490,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -11956,6 +12591,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -14434,7 +15070,14 @@ mod tests {
             llm_for_compaction: provider.clone(),
             llm_strong: provider.clone(),
             memory,
-            system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: true,
+            system_prompt: Arc::new(std::sync::RwLock::new(
+                crate::commands::gateway::prompt::GatewayPromptParts {
+                    pre_memory: "default prompt".to_string(),
+                    post_memory: String::new(),
+                },
+            )),
             hooks: None,
             hook_context_template: None,
             data_dir: dir.path().to_path_buf(),
@@ -17380,6 +18023,7 @@ mod tests {
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
+            last_turn_total_tokens: 0,
             usage_ledger: None,
             usage_profile_id: "test-profile".to_string(),
         };

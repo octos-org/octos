@@ -17,6 +17,11 @@ pub struct LinuxContainerSandbox {
     pub read_allow_paths: Vec<String>,
     /// Optional profile label, currently accepted for parity with other helpers.
     pub profile_name: Option<String>,
+    /// When `false`, the workspace cwd is granted READ-ONLY (the helper is
+    /// invoked with `--readonly-cwd`) so shell commands cannot mutate the
+    /// workspace under a read-only permission profile (codex P1). Default
+    /// constructions use `true` (read-write cwd) for backward compatibility.
+    pub workspace_write: bool,
 }
 
 impl Sandbox for LinuxContainerSandbox {
@@ -38,6 +43,12 @@ impl Sandbox for LinuxContainerSandbox {
             .arg(self.profile_name.as_deref().unwrap_or("octos.linux"))
             .arg("--cwd")
             .arg(cwd);
+
+        // Read-only permission profile: grant the workspace read-only so the
+        // helper's Landlock policy denies workspace writes (`touch newfile`).
+        if !self.workspace_write {
+            cmd.arg("--readonly-cwd");
+        }
 
         for path in &self.read_allow_paths {
             if Path::new(path).exists() {
@@ -70,6 +81,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec!["/usr".to_string()],
             profile_name: Some("octos.test".to_string()),
+            workspace_write: true,
         };
         let cmd = sandbox.wrap_command("echo hello", Path::new("/tmp"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -81,11 +93,64 @@ mod tests {
     }
 
     #[test]
+    fn should_pass_readonly_cwd_to_helper_when_workspace_write_disabled() {
+        // P1 (codex): a read-only permission profile must invoke the
+        // octos-sandbox helper with `--readonly-cwd` so its Landlock policy
+        // grants the cwd read-only (no write_access) — otherwise
+        // `--sandbox read-only` still lets `touch newfile` succeed.
+        let sandbox = LinuxContainerSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            profile_name: None,
+            workspace_write: false,
+        };
+        let cmd = sandbox.wrap_command("touch newfile", Path::new("/tmp/ws"));
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        // If the helper is present it must be invoked with --readonly-cwd. If
+        // the helper is absent the sandbox fails closed (prog == "sh"); in that
+        // case there is no unsandboxed write path either.
+        if prog.contains("octos-sandbox") {
+            assert!(
+                args.iter().any(|a| a == "--readonly-cwd"),
+                "read-only profile must pass --readonly-cwd, args: {args:?}"
+            );
+        } else {
+            assert_eq!(prog, "sh", "must fail closed when helper is absent");
+        }
+    }
+
+    #[test]
+    fn should_not_pass_readonly_cwd_to_helper_when_workspace_write_enabled() {
+        let sandbox = LinuxContainerSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            profile_name: None,
+            workspace_write: true,
+        };
+        let cmd = sandbox.wrap_command("touch newfile", Path::new("/tmp/ws"));
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a == "--readonly-cwd"),
+            "writable profile must NOT pass --readonly-cwd, args: {args:?}"
+        );
+    }
+
+    #[test]
     fn linux_container_sandbox_removes_injection_env() {
         let sandbox = LinuxContainerSandbox {
             allow_network: true,
             read_allow_paths: vec![],
             profile_name: None,
+            workspace_write: true,
         };
         let cmd = sandbox.wrap_command("echo hello", Path::new("/tmp"));
         let removed: Vec<String> = cmd

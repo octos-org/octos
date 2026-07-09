@@ -860,7 +860,14 @@ impl HttpMcpAgent {
 
         let mut builder = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
-            .read_timeout(self.read_timeout);
+            .read_timeout(self.read_timeout)
+            // SSRF: never auto-follow redirects. reqwest's default policy
+            // resolves + connects to redirect targets WITHOUT re-running the
+            // SSRF check, and the `.resolve()` pin below only covers the
+            // ORIGINAL host — so a 30x to 169.254.169.254 / 10.x would be
+            // followed unchecked. An MCP endpoint is a fixed JSON-RPC URL, so
+            // we fail closed on any redirect (see `send_request`).
+            .redirect(reqwest::redirect::Policy::none());
         for addr in &resolved_addrs {
             builder = builder.resolve(&host, *addr);
         }
@@ -930,6 +937,22 @@ impl HttpMcpAgent {
                 );
             }
         };
+
+        // Auto-redirects are disabled (see `dispatch_inner`): a 3xx here means
+        // the endpoint tried to redirect us to a target that would bypass the
+        // SSRF check. MCP endpoints are a stable URL, so fail closed rather
+        // than follow an unvalidated hop.
+        if resp.status().is_redirection() {
+            return DispatchResponse::failure(
+                DispatchOutcome::SsrfBlocked,
+                format!(
+                    "MCP remote endpoint '{}' returned redirect {}; refusing to \
+                     follow (redirect targets bypass SSRF validation)",
+                    self.url,
+                    resp.status(),
+                ),
+            );
+        }
 
         let status = resp.status();
         let text = match resp.text().await {

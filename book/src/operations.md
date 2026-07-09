@@ -17,12 +17,12 @@ git pull origin main
 If running as a service, restart it after the upgrade:
 
 ```bash
-# macOS (launchd):
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+# macOS (launchd system daemon):
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 
 # Linux (systemd):
-systemctl --user restart octos-serve
+sudo systemctl restart octos-serve
 ```
 
 ---
@@ -127,7 +127,7 @@ security set-keychain-settings ~/Library/Keychains/login.keychain-db
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | "User interaction is not allowed" | Keychain locked (SSH session) | `octos auth unlock --password <pw>` |
-| Keychain lookup timed out (3s) | Keychain locked (LaunchAgent) | Enable auto-login, reboot |
+| Keychain lookup timed out (3s) | Keychain locked (LaunchDaemon) | Enable auto-login, reboot |
 | "keychain marker found but no secret" | Key never stored or wrong keychain | Re-run `octos auth set-key` after unlock |
 | Gateway hangs at startup | Keychain lookup blocking | Update to latest octos binary |
 
@@ -155,10 +155,10 @@ The macOS Keychain was designed for interactive desktop use. On headless servers
 **Why Keychain is unreliable on headless servers:**
 
 1. **Requires the macOS login password** -- To unlock the keychain via SSH, you need the user's login password stored somewhere, reducing the security benefit.
-2. **Re-locks on reboot/sleep** -- The LaunchAgent that starts `octos serve` runs before GUI login, so the keychain is locked at that point.
+2. **Re-locks on reboot/sleep** -- The LaunchDaemon that starts `octos serve` runs before GUI login, so the keychain is locked at that point.
 3. **Re-locks after idle timeout** -- Even after unlock, macOS may re-lock. The `set-keychain-settings` workaround can be reset by macOS updates.
 4. **ACL prompts block headless access** -- If the binary was not the one that originally stored the secret, macOS may pop an unanswerable GUI dialog.
-5. **Session isolation** -- Unlocking from SSH does not unlock for the LaunchAgent session, and vice versa.
+5. **Session isolation** -- Unlocking from SSH does not unlock for the LaunchDaemon session, and vice versa.
 
 **Plain text setup for servers:**
 
@@ -179,7 +179,7 @@ Protect the files with filesystem permissions:
 
 ```bash
 chmod 600 ~/.octos/profiles/*.json
-chmod 600 ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo chmod 600 /Library/LaunchDaemons/io.octos.serve.plist
 ```
 
 ---
@@ -188,17 +188,17 @@ chmod 600 ~/Library/LaunchAgents/io.octos.octos-serve.plist
 
 ### macOS (launchd)
 
-Create a LaunchAgent plist to run octos as a persistent service:
+The deploy script installs octos as a **system LaunchDaemon** at `/Library/LaunchDaemons/io.octos.serve.plist` (so it survives logout and starts before GUI login). Manage it with `sudo`:
 
 ```bash
 # Load the service
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 
 # Unload the service
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
 
 # Check status
-launchctl list | grep octos
+sudo launchctl print system/io.octos.serve
 ```
 
 If the service needs environment variables (e.g., SMTP credentials), add them to the plist:
@@ -215,18 +215,18 @@ Check logs at `~/.octos/serve.log`.
 
 ### Linux (systemd)
 
-Manage the service with systemd user units:
+The deploy script installs a **system unit** at `/etc/systemd/system/octos-serve.service`. Manage it with `sudo`:
 
 ```bash
 # Start / stop / restart
-systemctl --user start octos-serve
-systemctl --user stop octos-serve
-systemctl --user restart octos-serve
+sudo systemctl start octos-serve
+sudo systemctl stop octos-serve
+sudo systemctl restart octos-serve
 
 # Enable on boot
-systemctl --user enable octos-serve
+sudo systemctl enable octos-serve
 
 # Check status and logs
-systemctl --user status octos-serve
-journalctl --user -u octos-serve
+sudo systemctl status octos-serve
+sudo journalctl -u octos-serve -f
 ```

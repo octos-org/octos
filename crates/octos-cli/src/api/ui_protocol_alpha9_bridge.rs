@@ -49,7 +49,7 @@ use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     FileAttachedEvent, SessionEventBridgedEvent, TurnCompletedEvent, TurnId, TurnSessionResult,
     TurnStartedEvent, UiNotification, VisualFailedEvent, VisualGeneratingEvent,
-    VisualSucceededEvent,
+    VisualSucceededEvent, VoiceExitEvent,
 };
 use serde_json::Value;
 
@@ -366,6 +366,26 @@ pub(super) fn emit_visual_failed_from_background(
         topic,
         turn_id: turn_id.clone(),
         reason,
+    }));
+}
+
+/// UPCR-2026-025 voice exit intent: announce that the voice turn detected an
+/// end / goodbye / mute intent, so the client leaves the `/voice` screen and
+/// returns home. The marker `[[EXIT]]` was already stripped from every
+/// model-/client-facing surface; this typed event is the sole signal. Routed on
+/// the BASE session key (like the visual lifecycle) while still carrying the
+/// topic so topic-scoped subscribers accept it.
+pub(super) fn emit_voice_exit_from_background(
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) {
+    let topic = session_id.topic().map(ToOwned::to_owned);
+    let base_session = SessionKey(session_id.base_key().to_owned());
+    let _ = ledger.append_notification(UiNotification::VoiceExit(VoiceExitEvent {
+        session_id: base_session,
+        topic,
+        turn_id: turn_id.clone(),
     }));
 }
 
