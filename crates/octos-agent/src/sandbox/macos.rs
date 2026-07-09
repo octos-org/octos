@@ -6,12 +6,104 @@ use tokio::process::Command;
 
 use super::{BLOCKED_ENV_VARS, DEFAULT_READ_ALLOW_PATHS, Sandbox};
 
+/// Pick a scratch temp dir for a READ-ONLY workspace that is provably OUTSIDE
+/// the (already-canonicalized) `real_cwd`.
+///
+/// `candidate` is the natural choice derived from `std::env::temp_dir()` (which
+/// honours `$TMPDIR`). A hostile parent can set `$TMPDIR` to a path UNDER the
+/// workspace — either an ABSOLUTE path inside it, or a RELATIVE path like "tmp"
+/// that the sandboxed process resolves against its cwd to `<cwd>/tmp`. If we
+/// used it we would (a) mutate the read-only workspace when creating the dir and
+/// (b) grant SBPL write inside it — both defeat read-only (codex P2, rounds
+/// 3+5). So we first ABSOLUTIZE the candidate against `real_cwd` (a relative
+/// candidate is joined onto cwd, an absolute one is left as-is), then
+/// canonicalize its location; if it falls inside `real_cwd` we fall back to a
+/// base rooted at `/private/tmp` (the real path of `/tmp` on macOS, independent
+/// of `$TMPDIR`) which is guaranteed outside any normal workspace. The returned
+/// path is always ABSOLUTE. This function performs NO filesystem mutation — the
+/// caller creates the dir only after the path is validated safe.
+fn read_only_scratch_dir(candidate: &Path, real_cwd: &Path) -> std::path::PathBuf {
+    // Absolutize the candidate FIRST. A hostile `$TMPDIR` can be RELATIVE (e.g.
+    // "tmp" or "./sub/tmp"); the sandboxed process resolves it relative to its
+    // cwd — i.e. it lands at `<cwd>/tmp`, inside the read-only workspace. If we
+    // canonicalized it while still relative, the absolute `real_cwd`-contains
+    // check below would MISS it (absolute vs relative never match) and we would
+    // accept it, then `create_dir_all` would mutate the read-only workspace
+    // (codex P2, round 5). Joining a relative candidate onto `real_cwd` models
+    // where it truly resolves so the containment check rejects it. An absolute
+    // candidate is unchanged by the join.
+    let candidate_abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        real_cwd.join(candidate)
+    };
+
+    // Resolve the candidate to a real path. It usually does not exist yet, so
+    // canonicalize the nearest existing ancestor and re-attach the tail.
+    let candidate_real = canonicalize_lexical(&candidate_abs);
+
+    if !candidate_real.starts_with(real_cwd) {
+        // Return the ABSOLUTIZED candidate (never the raw relative one) so the
+        // caller creates the dir at the location we actually validated.
+        return candidate_abs;
+    }
+
+    // Candidate is inside the read-only workspace: fall back to a location that
+    // does not depend on $TMPDIR. `/private/tmp` is the canonical macOS temp
+    // root; guard against the pathological case where the workspace itself is
+    // under it by only using it when it is outside cwd.
+    let unique = format!("octos-sandbox-ro.{}", std::process::id());
+    for base in ["/private/tmp", "/private/var/tmp"] {
+        let fallback = Path::new(base).join(&unique);
+        if !canonicalize_lexical(&fallback).starts_with(real_cwd) {
+            return fallback;
+        }
+    }
+    // Extremely unlikely: even the system temp roots are inside cwd. Return the
+    // first fallback anyway — the SBPL grant is scoped to it, and the caller's
+    // "outside cwd" invariant is enforced by the write-rule guard below.
+    Path::new("/private/tmp").join(unique)
+}
+
+/// Canonicalize `path` as far as it exists, re-attaching any non-existent tail.
+/// Used to decide containment for a scratch dir that has not been created yet
+/// (`canonicalize` fails on non-existent paths, so we resolve the longest
+/// existing ancestor and re-append the remaining components).
+fn canonicalize_lexical(path: &Path) -> std::path::PathBuf {
+    let mut ancestor = path;
+    // Names peeled off while walking up, in leaf-to-root order.
+    let mut peeled: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(ancestor) {
+            for name in peeled.iter().rev() {
+                real.push(name);
+            }
+            return real;
+        }
+        match ancestor.parent() {
+            Some(parent) if parent != ancestor => {
+                if let Some(name) = ancestor.file_name() {
+                    peeled.push(name);
+                }
+                ancestor = parent;
+            }
+            // Reached the root without finding an existing ancestor.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// macOS sandbox using sandbox-exec.
 pub struct MacosSandbox {
     pub(crate) allow_network: bool,
     /// When non-empty, restrict file-read* to these paths + cwd.
     /// Empty = allow all reads (backward compatible).
     pub(crate) read_allow_paths: Vec<String>,
+    /// When `false`, the workspace cwd is NOT granted `file-write*`
+    /// (read-only workspace for shell). `/dev/null` stays writable so
+    /// shell redirections and git still work. Default constructions use
+    /// `true` to preserve the historical writable-workspace behaviour.
+    pub(crate) workspace_write: bool,
 }
 
 impl Sandbox for MacosSandbox {
@@ -98,6 +190,77 @@ impl Sandbox for MacosSandbox {
             rules.join("\n")
         };
 
+        // Workspace write rule. When `workspace_write` is false (read-only
+        // permission profile), OMIT the cwd `file-write*` grant so shell
+        // commands cannot mutate the workspace — `(deny default)` then denies
+        // the write. `/dev/null` stays writable regardless so shell
+        // redirections and git internals still function.
+        let workspace_write_rule = if self.workspace_write {
+            format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd)
+        } else {
+            String::new()
+        };
+
+        // Choose a scratch temp dir for TMPDIR/TEMP/TMP.
+        //
+        // - Writable workspace: keep the historical `<cwd>/tmp` (covered by the
+        //   cwd file-write* grant above).
+        // - Read-only workspace (P2, codex): NEVER create or point TMPDIR under
+        //   the workspace — that would mutate it BEFORE sandbox-exec even runs.
+        //   Use a private dir OUTSIDE the workspace and grant SBPL write to
+        //   THAT instead, so read-only truly means no workspace mutation while
+        //   tools that need scratch space (Python tempfile, compilers) still
+        //   work.
+        let user_tmp = if self.workspace_write {
+            cwd.join("tmp")
+        } else {
+            // `std::env::temp_dir()` honours `$TMPDIR`, which a hostile parent
+            // could point UNDER the workspace. Route the candidate through
+            // `read_only_scratch_dir`, which guarantees a path OUTSIDE the
+            // (canonicalized) workspace so we never mutate it (codex P2).
+            let candidate =
+                std::env::temp_dir().join(format!("octos-sandbox-ro.{}", std::process::id()));
+            let real_cwd_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            read_only_scratch_dir(&candidate, &real_cwd_path)
+        };
+        // Create the scratch dir. For the writable case this lives inside the
+        // (writable) workspace; for the read-only case it is outside it.
+        let _ = std::fs::create_dir_all(&user_tmp);
+
+        // For the read-only case, grant SBPL file-write* to the external temp
+        // dir's real path so scratch writes succeed there (not in the
+        // workspace). The path is validated for SBPL metacharacters; if it is
+        // unexpectedly unsafe we simply omit the grant (fail-closed: scratch
+        // writes fail rather than the profile being injectable).
+        let external_tmp_write_rule = if self.workspace_write {
+            String::new()
+        } else {
+            let real_tmp_path =
+                std::fs::canonicalize(&user_tmp).unwrap_or_else(|_| user_tmp.clone());
+            let real_tmp = real_tmp_path.to_string_lossy().to_string();
+            // Defence in depth: NEVER grant write to a temp path that resolved
+            // inside the workspace — that would re-open the read-only hole even
+            // though `read_only_scratch_dir` already steers outside cwd
+            // (codex P2, fail-closed).
+            let real_cwd_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            if real_tmp_path.starts_with(&real_cwd_path) {
+                tracing::error!(
+                    "external temp dir resolved inside the read-only workspace, omitting write grant"
+                );
+                String::new()
+            } else if real_tmp
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+            {
+                tracing::error!(
+                    "external temp dir contains SBPL metacharacters, omitting write grant"
+                );
+                String::new()
+            } else {
+                format!("(allow file-write* (subpath \"{real_tmp}\"))\n")
+            }
+        };
+
         let profile = format!(
             r#"(version 1)
 (deny default)
@@ -112,21 +275,17 @@ impl Sandbox for MacosSandbox {
 (allow file-ioctl)
 {read_rules}
 (allow file-write* (literal "/dev/null"))
-(allow file-write* (subpath "{cwd}"))
-{network_rule}
+{workspace_write_rule}{external_tmp_write_rule}{network_rule}
 "#,
             read_rules = read_rules,
-            cwd = real_cwd,
+            workspace_write_rule = workspace_write_rule,
+            external_tmp_write_rule = external_tmp_write_rule,
             network_rule = network_rule,
         );
 
-        // Create a per-user tmp dir inside the workspace so programs that
-        // need temp files (Python tempfile, compilers, etc.) still work.
-        let user_tmp = cwd.join("tmp");
-        let _ = std::fs::create_dir_all(&user_tmp);
-
         let mut cmd = Command::new("sandbox-exec");
-        // Redirect TMPDIR/TEMP/TMP to the per-user tmp inside the workspace
+        // Redirect TMPDIR/TEMP/TMP to the chosen scratch dir (inside cwd when
+        // writable, outside the workspace when read-only).
         cmd.env("TMPDIR", &user_tmp);
         cmd.env("TEMP", &user_tmp);
         cmd.env("TMP", &user_tmp);
@@ -154,6 +313,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: true,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -190,6 +350,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/\x01bad"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -210,6 +371,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         // Parentheses, backslash, and quote should all be rejected
         for path in &[
@@ -238,6 +400,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -257,6 +420,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo ok", Path::new("/Users/test/project"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -269,6 +433,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/evil\x7Fpath"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -283,6 +448,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: Vec::new(),
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -310,6 +476,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/custom/path".to_string()],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
@@ -349,6 +516,7 @@ mod tests {
                 "/evil\")\n(allow file-write* (subpath \"/\"))".to_string(),
                 "/another/safe".to_string(),
             ],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -384,6 +552,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/path/with(parens)".to_string()],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -411,6 +580,7 @@ mod tests {
                 "/path/with\x7Fdel".to_string(),
                 "/valid/path".to_string(),
             ],
+            workspace_write: true,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -447,6 +617,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec![],
+            workspace_write: true,
         };
         let mut cmd = sb.wrap_command(
             "touch /tmp/sandbox_escape_test_file 2>&1; echo exit=$?",
@@ -471,6 +642,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec![],
+            workspace_write: true,
         };
         let mut cmd = sb.wrap_command("touch test_file && echo ok", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -483,6 +655,386 @@ mod tests {
         assert!(
             cwd.join("test_file").exists(),
             "file should be created inside cwd"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_omit_workspace_write_rule_when_workspace_write_disabled() {
+        // P1 (codex): under a read-only profile the SBPL profile must NOT
+        // grant file-write* to the workspace cwd (so shell cannot write),
+        // while still permitting /dev/null writes.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("touch newfile", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains(&format!(r#"(allow file-write* (subpath "{real_cwd}"))"#)),
+            "read-only profile must NOT grant file-write* to the workspace, profile:\n{profile}"
+        );
+        // /dev/null stays writable for shell redirections / git internals.
+        assert!(
+            profile.contains(r#"(allow file-write* (literal "/dev/null"))"#),
+            "/dev/null must stay writable even when workspace is read-only"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_grant_workspace_write_rule_when_workspace_write_enabled() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+        };
+        let cmd = sb.wrap_command("touch newfile", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            profile.contains(&format!(r#"(allow file-write* (subpath "{real_cwd}"))"#)),
+            "writable profile must grant file-write* to the workspace, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_not_create_tmp_under_cwd_when_workspace_write_disabled() {
+        // P2 (codex): with workspace_write=false, wrap_command must NOT create
+        // `<cwd>/tmp` (a workspace mutation that happens BEFORE sandbox-exec
+        // even starts) nor point TMPDIR/TEMP/TMP under the workspace. The temp
+        // dir must live OUTSIDE the read-only workspace.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+
+        // The wrapper must not have created a tmp dir inside the workspace.
+        assert!(
+            !cwd.join("tmp").exists(),
+            "read-only wrapper must NOT create <cwd>/tmp before sandbox-exec"
+        );
+
+        // TMPDIR/TEMP/TMP must point OUTSIDE the workspace cwd.
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            if let Some(Some(val)) = envs.get(key) {
+                assert!(
+                    !std::path::Path::new(val).starts_with(cwd),
+                    "{key} must not point inside the read-only workspace, got {val}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_grant_sbpl_write_to_external_tmp_when_workspace_write_disabled() {
+        // P2 (codex): the out-of-workspace temp dir that TMPDIR points at must
+        // itself be granted file-write* in the SBPL profile, otherwise tools
+        // that need scratch space break under a read-only workspace.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        let tmpdir = envs
+            .get("TMPDIR")
+            .and_then(|v| v.clone())
+            .expect("TMPDIR must be set");
+        // Canonicalize because SBPL subpath rules use real paths.
+        let real_tmp = std::fs::canonicalize(&tmpdir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(tmpdir);
+        assert!(
+            profile.contains(&format!(r#"(allow file-write* (subpath "{real_tmp}"))"#)),
+            "external temp dir must be granted file-write* in SBPL, profile:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_reject_scratch_candidate_inside_workspace_when_read_only() {
+        // P2 (codex, round 3): `std::env::temp_dir()` honours `$TMPDIR`, which a
+        // parent could point UNDER the read-only workspace. `read_only_scratch_dir`
+        // must detect a candidate inside the (canonicalized) cwd and fall back to
+        // a location provably OUTSIDE the workspace — WITHOUT creating anything
+        // under cwd.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        // Adversarial candidate: a subdir of the workspace cwd (what $TMPDIR
+        // pointing under cwd would yield).
+        let evil_candidate = cwd.join("evil-tmp");
+        let scratch = read_only_scratch_dir(&evil_candidate, &real_cwd);
+
+        // The chosen scratch dir must be OUTSIDE the workspace...
+        let scratch_real = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        assert!(
+            !scratch_real.starts_with(&real_cwd),
+            "read-only scratch must be OUTSIDE the workspace, got {} (cwd {})",
+            scratch_real.display(),
+            real_cwd.display()
+        );
+        // ...and choosing it must NOT have created anything inside cwd.
+        assert!(
+            !evil_candidate.exists(),
+            "must NOT create the in-workspace candidate dir"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_keep_scratch_candidate_outside_workspace_when_read_only() {
+        // When $TMPDIR is already OUTSIDE the workspace, the candidate is kept.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let outside = tempfile::tempdir().expect("create outside temp dir");
+        let good_candidate = outside.path().join("octos-sandbox-ro.123");
+        let scratch = read_only_scratch_dir(&good_candidate, &real_cwd);
+        assert_eq!(
+            scratch, good_candidate,
+            "an outside candidate must be used as-is"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_reject_relative_scratch_candidate_when_read_only() {
+        // P2 (codex, round 5): a NON-EXISTENT RELATIVE `$TMPDIR` like "tmp" is
+        // resolved by the sandboxed process relative to its cwd — i.e. it lands
+        // at `<cwd>/tmp`, inside the read-only workspace. A prior lexical
+        // canonicalization left it relative, so the absolute `real_cwd`-contains
+        // check missed it and it was accepted → `create_dir_all` would mutate the
+        // read-only workspace. The relative candidate must be absolutized against
+        // cwd BEFORE the containment check and thereby rejected; the chosen
+        // scratch must be ABSOLUTE and OUTSIDE cwd.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let relative_candidate = Path::new("tmp");
+        let scratch = read_only_scratch_dir(relative_candidate, &real_cwd);
+
+        assert!(
+            scratch.is_absolute(),
+            "chosen scratch must be absolute, got {}",
+            scratch.display()
+        );
+        // Absolutize a still-relative result against cwd the way the process
+        // would, then confirm it is NOT inside the workspace.
+        let scratch_abs = if scratch.is_absolute() {
+            scratch.clone()
+        } else {
+            real_cwd.join(&scratch)
+        };
+        let scratch_real =
+            std::fs::canonicalize(&scratch_abs).unwrap_or_else(|_| scratch_abs.clone());
+        assert!(
+            !scratch_real.starts_with(&real_cwd),
+            "a relative $TMPDIR candidate must not resolve inside cwd; got {} (cwd {})",
+            scratch_real.display(),
+            real_cwd.display()
+        );
+        // Purity: selecting the scratch must NOT create `<cwd>/tmp`.
+        assert!(
+            !cwd.join("tmp").exists(),
+            "must NOT create <cwd>/tmp when rejecting a relative candidate"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_reject_nested_relative_scratch_candidate_when_read_only() {
+        // Same hazard with a deeper relative path "./sub/tmp".
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let relative_candidate = Path::new("./sub/tmp");
+        let scratch = read_only_scratch_dir(relative_candidate, &real_cwd);
+
+        assert!(
+            scratch.is_absolute(),
+            "chosen scratch must be absolute, got {}",
+            scratch.display()
+        );
+        let scratch_real = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        assert!(
+            !scratch_real.starts_with(&real_cwd),
+            "nested relative candidate must not resolve inside cwd; got {} (cwd {})",
+            scratch_real.display(),
+            real_cwd.display()
+        );
+        assert!(
+            !cwd.join("sub").exists(),
+            "must NOT create <cwd>/sub when rejecting a nested relative candidate"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_not_use_tmpdir_inside_workspace_end_to_end_when_read_only() {
+        // End-to-end through wrap_command: even though we can't safely mutate
+        // $TMPDIR in a #[deny(unsafe_code)] test, assert the wired TMPDIR points
+        // OUTSIDE the workspace and no scratch dir was created under cwd.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: false,
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+
+        assert!(
+            !cwd.join("tmp").exists(),
+            "read-only wrapper must NOT create <cwd>/tmp"
+        );
+
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            let val = envs
+                .get(key)
+                .and_then(|v| v.clone())
+                .unwrap_or_else(|| panic!("{key} must be set"));
+            let real_val =
+                std::fs::canonicalize(&val).unwrap_or_else(|_| std::path::PathBuf::from(&val));
+            assert!(
+                !real_val.starts_with(&real_cwd),
+                "{key} must point OUTSIDE the read-only workspace, got {val} (real {})",
+                real_val.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn should_not_leave_tmp_dir_in_workspace_after_read_only_run() {
+        // P2 (codex) end-to-end: running a command under a read-only workspace
+        // must leave NO `<cwd>/tmp` behind (the workspace stays untouched).
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            workspace_write: false,
+        };
+        let mut cmd = sb.wrap_command("echo hello; :", cwd);
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !cwd.join("tmp").exists(),
+            "read-only run must not create <cwd>/tmp, stdout={stdout}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn should_block_write_inside_cwd_when_workspace_write_disabled() {
+        // End-to-end proof: a read-only sandbox denies `touch newfile` even
+        // inside the workspace cwd (the P1 footgun: shell writing under
+        // `--sandbox read-only`).
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            workspace_write: false,
+        };
+        let mut cmd = sb.wrap_command("touch newfile 2>&1; echo exit=$?", cwd);
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !cwd.join("newfile").exists(),
+            "read-only sandbox must block workspace writes, stdout={stdout}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -501,6 +1053,7 @@ mod tests {
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/nonexistent/path".to_string()],
+            workspace_write: true,
         };
         let real_secret =
             std::fs::canonicalize(&secret_file).unwrap_or_else(|_| secret_file.clone());

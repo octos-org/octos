@@ -157,6 +157,44 @@ async fn dangerous_host_scope_file_tools_can_touch_outside_cwd() {
     assert!(read.output.contains("host"));
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn should_block_shell_workspace_write_when_read_only_profile() {
+    // P1 (codex): `octos chat --sandbox read-only` must stop shell writes.
+    // With a ReadOnly-profile-derived sandbox, a `shell` `touch newfile`
+    // inside the workspace must NOT create the file — the sandbox (not just
+    // the native file tools) enforces read-only. Gated to macos/linux where
+    // a real sandbox backend is active (NoSandbox on other platforms cannot
+    // enforce this).
+    let workspace = tempfile::tempdir().unwrap();
+
+    let permissions = EffectivePermissions::read_only().with_approval_policy(ApprovalPolicy::Never);
+    let effective = permissions.apply_to_sandbox(&SandboxConfig::default());
+    // The resolved sandbox config denies workspace writes.
+    assert!(
+        !effective.workspace_write,
+        "ReadOnly profile must resolve to a non-writable sandbox config"
+    );
+
+    let sandbox = create_sandbox(&effective);
+    let registry =
+        ToolRegistry::with_builtins_and_permissions(workspace.path(), sandbox, permissions);
+
+    let result = registry
+        .execute(
+            "shell",
+            &serde_json::json!({ "command": "touch newfile 2>&1; echo done" }),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !workspace.path().join("newfile").exists(),
+        "read-only sandbox must block shell writes to the workspace, output: {}",
+        result.output
+    );
+}
+
 #[tokio::test]
 async fn approval_never_returns_direct_tool_failure_for_ask_commands() {
     let workspace = tempfile::tempdir().unwrap();
