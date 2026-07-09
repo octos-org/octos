@@ -1166,7 +1166,7 @@ JSON 持久化位于 `.octos/cron.json`。
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1——**唯一**的聊天传输通道与控制平面（旧的 `POST /api/chat` 处理器已下线；见下） |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1——唯一的 **HTTP** 聊天入口 + 控制平面（旧的 `POST /api/chat` 已下线）。同一协议也通过 `octos serve --stdio` 提供。见下。 |
 | `/health` | GET | 存活探针（原 `/api/status`；结构化状态已迁移到 WS `system/status.get`） |
 | `/metrics` | GET | Prometheus 文本指标（无需认证） |
 | `/*`（回退） | GET | 内嵌 Web UI（通过 rust-embed 提供静态文件） |
@@ -1182,7 +1182,7 @@ JSON 持久化位于 `.octos/cron.json`。
 - **配置/profile**：`profile/llm/*`、`profile/skills/*`、`permission/profile/*`、`content/list`、`config/capabilities/list`。
 - **通知**（服务器→客户端）：`message/delta`、`message/persisted`、`tool/*`、`turn/spawn_complete`、`session/goal/updated`、`loop/fired`、`context/compaction_started` 等。
 
-许多方法/通知由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控；客户端在连接时通过 `ui_feature`/`X-Octos-Ui-Features` 声明。**不**发送任何特性头的连接会获得旧版首个服务器能力切片，因此*旧版门控*的分组（任务控制、自主运行）为向后兼容仍可调用。有两组是**严格按需（strict opt-in）**、从不进入无头切片、始终需要各自标志：13 个 `auxiliary.rest_to_ws.v1` 方法（`session/list`、`content/list`、`session/snapshot` 等）与 `user_question/respond`。当客户端声明了某个特性集但省略了必需标志时，被省略的方法返回 `method_not_supported`。核心的聊天/轮次方法始终可用。
+许多方法由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控，客户端在连接时声明——WebSocket 通过 `ui_feature`/`X-Octos-Ui-Features`，`serve --stdio` 通过 `client_hello` 的 `supported_features`。核心的聊天/轮次/会话方法始终可用；自主运行、任务产物与辅助方法组位于标志之后。**「声明」与「可调用」**的确切规则较为微妙：某个方法可能出现在默认能力列表中，却仍需其标志才能被*调用*（如 `auxiliary.rest_to_ws.v1` 方法与 `user_question/respond`），因此客户端应以协商后的能力列表为准，并稳妥处理 `method_not_supported`，而非仅凭「已声明」就假定可调用。
 
 **认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost 开发源加已配置的 base domain。**最大消息**：1MB。
 

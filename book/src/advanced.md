@@ -496,7 +496,7 @@ Split preference: paragraph boundary > newline > sentence end > space > hard cut
 
 ## Autonomy & Session Control
 
-Beyond one-shot chat, the graphical clients (octos-web, octos-tui) drive longer-running behaviors over the [UI Protocol](./architecture.md). Each of these is gated by a negotiated capability flag (see [Capability Negotiation](#capability-negotiation)); when the client doesn't advertise the flag, the method is simply not offered.
+Beyond one-shot chat, the graphical clients (octos-web, octos-tui) drive longer-running behaviors over the [UI Protocol](./architecture.md). The autonomy and task-artifact groups are gated by negotiated capability flags (see [Capability Negotiation](#capability-negotiation)); the core turn/session controls (`turn/start`, `turn/interrupt`, `session/rollback`, `task/output/read`) are always available.
 
 ### Goals
 
@@ -507,7 +507,7 @@ A **goal** is a persistent objective attached to a session. Once set, the agent 
 
 ### Loops
 
-A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (fire every N seconds), **self-paced** (the model sets its own next cadence by emitting a `<<loop-next-in: …>>` hint; default 15 minutes when it doesn't), or **maintenance** (a built-in upkeep prompt). A loop keeps firing until paused, deleted, the 10,000-fire cap — **or its 7-day expiry**: every loop is stamped with `expires_at_ms = now + 7 days` and the due-scan skips it once expired, even below the fire cap.
+A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (fire every N seconds), **self-paced** (the model sets its own next cadence by emitting a `<<loop-next-in: …>>` hint; default 15 minutes when it doesn't), or **maintenance** (runs an upkeep prompt resolved fresh on each fire — `.octos/loop.md` in the project, else `~/.octos/loop.md`, else a built-in default). A loop keeps firing until paused, deleted, the 10,000-fire cap — **or its 7-day expiry**: every loop is stamped with `expires_at_ms = now + 7 days` and the due-scan skips it once expired, even below the fire cap.
 
 - Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete`, `loop/fire_now` (**request** an immediate fire — it runs through the loop's fire policy and can be rejected if the loop is paused/exhausted or deduplicated, so inspect the returned `fire.queued`/error result rather than assuming a run happened). Notifications `loop/fired`, `loop/completed`, `loop/updated`. Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
 - Use it for polling, monitoring, and self-paced background agents.
@@ -523,7 +523,7 @@ A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (
 
 ### Capability negotiation
 
-A client advertises which protocol features it supports when it connects (the `ui_feature` / `ui_features` query params or the `X-Octos-Ui-Features` header). The server only exposes methods and emits notifications for the features the client negotiated — so older clients keep working and new capabilities roll out without breaking them. Representative flags:
+A client advertises which protocol features it supports when it connects: over WebSocket via the `ui_feature` / `ui_features` query params or the `X-Octos-Ui-Features` header; over `serve --stdio` via `client_hello`'s `supported_features`. The server gates most methods on the negotiated set, so older clients keep working as new capabilities ship. Two caveats worth knowing when implementing a client: some methods are *advertised* in the default capability list but still require their specific flag to actually be *called* (rely on the negotiated list and handle `method_not_supported` defensively); and notification delivery is best-effort — a connection can still observe autonomy events (`session/goal/updated`, `loop/*`, `agent/*`) triggered by another connection via live-forwarding or replay. Representative flags:
 
 | Flag | Unlocks |
 |------|---------|

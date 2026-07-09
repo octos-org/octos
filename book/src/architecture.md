@@ -1167,7 +1167,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 | Route | Method | Description |
 |---|---|---|
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the **sole** chat transport and control plane (the legacy `POST /api/chat` handler has been retired; see below) |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the sole **HTTP** chat ingress + control plane (legacy `POST /api/chat` retired). The same protocol is also served over `octos serve --stdio`. See below. |
 | `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
@@ -1181,7 +1181,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 - **Config/profile**: `profile/llm/*`, `profile/skills/*`, `permission/profile/*`, `content/list`, `config/capabilities/list`.
 - **Notifications** (server→client): `message/delta`, `message/persisted`, `tool/*`, `turn/spawn_complete`, `session/goal/updated`, `loop/fired`, `context/compaction_started`, etc.
 
-Many methods/notifications are gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) that the client advertises at connect time via `ui_feature`/`X-Octos-Ui-Features`. A connection that sends **no** feature header gets the legacy first-server capability slice, so the *legacy-gated* groups (task control, autonomy) stay callable for backward compatibility. Two groups are **strict opt-in** and are never in the no-header slice — they always require their flag: the 13 `auxiliary.rest_to_ws.v1` methods (`session/list`, `content/list`, `session/snapshot`, …) and `user_question/respond`. When a client advertises a feature set but omits a required flag, the omitted method returns `method_not_supported`. Core chat/turn methods are always available.
+Many methods are gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) advertised at connect time — over WebSocket via `ui_feature`/`X-Octos-Ui-Features`, or over `serve --stdio` via `client_hello`'s `supported_features`. Core chat/turn/session methods are always available; the autonomy, task-artifact, and auxiliary groups sit behind flags. The exact **advertised-versus-callable** rules are intricate: a method can appear in the default capability list yet still require its flag to actually be *called* (e.g. the `auxiliary.rest_to_ws.v1` methods and `user_question/respond`), so a client should rely on the negotiated capability list and handle `method_not_supported` defensively rather than assume callability from advertisement alone.
 
 **Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 
