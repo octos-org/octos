@@ -1,11 +1,20 @@
-//! Auth credential storage at ~/.octos/auth.json (mode 0600).
+//! Auth credential storage (mode 0600).
+//!
+//! The store path is `auth_home/auth.json`, where `auth_home` comes from the
+//! canonical [`ConfigContext`](crate::config_context::ConfigContext) — GLOBAL
+//! (XDG) unless `OCTOS_CONFIG_DIR` is set. The store NEVER recomputes its path
+//! from the environment on its own; callers pass the resolved location via
+//! [`AuthStore::open`] or [`AuthStore::at`]. There is intentionally no no-arg
+//! `load()` so no site can diverge from the resolver.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
+
+use crate::config_context::ConfigContext;
 
 /// A stored authentication credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,10 +48,30 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
-    /// Load the auth store from disk (or create empty).
-    pub fn load() -> Result<Self> {
-        let path = Self::store_path()?;
+    /// Open the auth store at the context's `auth_home` (i.e.
+    /// `auth_home/auth.json`). This is the canonical entrypoint.
+    pub fn open(ctx: &ConfigContext) -> Result<Self> {
+        Self::at(&ctx.auth_home)
+    }
+
+    /// Open the auth store at `auth_home/auth.json` (or create empty in memory).
+    pub fn at(auth_home: &Path) -> Result<Self> {
+        let path = auth_home.join("auth.json");
         let data = if path.exists() {
+            // Harden an existing store on open: a credential file created by an
+            // older octos (or copied in by hand) may be 0644. `save()` always
+            // writes 0600, but a file we only ever READ would stay world/group
+            // readable forever — tighten it best-effort whenever we open it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
             let content = std::fs::read_to_string(&path).wrap_err("failed to read auth store")?;
             serde_json::from_str(&content).wrap_err("failed to parse auth store")?
         } else {
@@ -106,13 +135,6 @@ impl AuthStore {
         }
 
         Ok(())
-    }
-
-    /// Path: ~/.octos/auth.json
-    fn store_path() -> Result<PathBuf> {
-        let home =
-            dirs::home_dir().ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
-        Ok(home.join(".octos").join("auth.json"))
     }
 }
 
@@ -197,6 +219,60 @@ mod tests {
             auth_method: "paste_token".to_string(),
         };
         assert!(!no_expiry.is_expired());
+    }
+
+    #[test]
+    fn at_resolves_auth_json_under_auth_home() {
+        let tmp = TempDir::new().unwrap();
+        let auth_home = tmp.path().join("xdg").join("octos");
+        let store = AuthStore::at(&auth_home).unwrap();
+        assert_eq!(store.path, auth_home.join("auth.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let auth_home = tmp.path().join("octos");
+        let mut store = AuthStore::at(&auth_home).unwrap();
+        store
+            .set(
+                "anthropic",
+                AuthCredential {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    provider: "anthropic".into(),
+                    auth_method: "paste_token".into(),
+                },
+            )
+            .unwrap();
+        let mode = std::fs::metadata(auth_home.join("auth.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn at_tightens_loose_permissions_on_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let auth_home = tmp.path().join("octos");
+        std::fs::create_dir_all(&auth_home).unwrap();
+        let path = auth_home.join("auth.json");
+        // Simulate a legacy / hand-copied store that is world-readable.
+        std::fs::write(&path, "{\"credentials\":{}}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Opening it must tighten the perms to 0600 (no plain-read leaving creds
+        // world/group readable).
+        let _store = AuthStore::at(&auth_home).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "at() must tighten a loose auth.json to 0600");
     }
 
     #[test]

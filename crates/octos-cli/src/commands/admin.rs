@@ -15,6 +15,8 @@ use crate::admin_token_store::AdminTokenStore;
 use crate::smtp_secret_store::SmtpSecretStore;
 use crate::tenant::{TenantConfig, TenantStatus, TenantStore, render_frpc_config};
 
+const DEFAULT_ADMIN_BASE_URL: &str = "http://127.0.0.1:50080";
+
 /// Admin commands for tenant and tunnel management.
 #[derive(Debug, Args)]
 pub struct AdminCommand {
@@ -341,7 +343,7 @@ fn resolve_base_url(cli_value: Option<String>) -> String {
     cli_value
         .or_else(|| std::env::var("OCTOS_BASE_URL").ok())
         .or_else(|| std::env::var("OCTOS_TEST_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+        .unwrap_or_else(|| DEFAULT_ADMIN_BASE_URL.to_string())
 }
 
 fn resolve_auth_token(cli_value: Option<String>) -> Option<String> {
@@ -442,6 +444,10 @@ fn render_collection_section(output: &mut String, summary: &serde_json::Value) {
     writeln!(output, "{}", "─".repeat(60).dimmed()).unwrap();
     for (label, key) in [
         ("running-gateways", "running_gateways"),
+        (
+            "configuration-error-gateways",
+            "configuration_error_gateways",
+        ),
         ("gateways-with-api-port", "gateways_with_api_port"),
         ("gateways-missing-api-port", "gateways_missing_api_port"),
         ("scrape-failures", "scrape_failures"),
@@ -632,7 +638,7 @@ mod tests {
             resolve_base_url(Some("https://example.com".into())),
             "https://example.com"
         );
-        assert_eq!(resolve_base_url(None), "http://127.0.0.1:3000");
+        assert_eq!(resolve_base_url(None), DEFAULT_ADMIN_BASE_URL);
     }
 
     #[test]
@@ -723,7 +729,7 @@ mod tests {
             }
         });
 
-        let rendered = render_operator_summary("http://127.0.0.1:3000", &summary);
+        let rendered = render_operator_summary(DEFAULT_ADMIN_BASE_URL, &summary);
 
         assert!(rendered.contains("Coverage"));
         assert!(rendered.contains("Runtime Sources"));

@@ -2,7 +2,7 @@
   "updated_at": "2026-04-16T22:00:15Z",
   "models": [
     {
-      "provider": "minimax/MiniMax-M2.7",
+      "provider": "minimax/MiniMax-M3",
       "type": "strong",
       "stability": 1.0,
       "tool_avg_ms": 1807,
@@ -11,7 +11,7 @@
       "cost_in": 0.15,
       "cost_out": 1.50,
       "ds_output": 7848,
-      "context_window": 200000,
+      "context_window": 1048576,
       "max_output": 131072
     },
     {
@@ -67,17 +67,17 @@
       "max_output": 65535
     },
     {
-      "provider": "deepseek/deepseek-chat",
+      "provider": "deepseek/deepseek-v4-pro",
       "type": "strong",
       "stability": 1.0,
       "tool_avg_ms": 3422,
       "p95_ms": 3549,
       "score": 0.0,
-      "cost_in": 0.14,
-      "cost_out": 0.28,
+      "cost_in": 0.28,
+      "cost_out": 0.42,
       "ds_output": 4266,
-      "context_window": 128000,
-      "max_output": 8000
+      "context_window": 1048576,
+      "max_output": 384000
     },
     {
       "provider": "dashscope/qwen3.5-plus",

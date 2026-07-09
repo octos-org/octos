@@ -569,11 +569,16 @@ impl CompactionRunner {
             summarizer_kind: self.summarizer.kind(),
         };
 
-        if tokens_before <= budget {
+        // Budget decision uses the POST-prune estimate: when placeholder
+        // pruning alone brought the conversation under budget, summarizing
+        // old messages would discard context for no budget reason.
+        // `tokens_before` (pre-prune) is preserved on the outcome for
+        // reporting.
+        let tokens_after_prune: u32 = messages.iter().map(estimate_message_tokens).sum();
+        if tokens_after_prune <= budget {
             // Nothing to summarise — only the pruning step ran.
-            let tokens_after: u32 = messages.iter().map(estimate_message_tokens).sum();
-            outcome.tokens_after = tokens_after;
-            self.emit_phase_event(phase, "complete", tokens_after);
+            outcome.tokens_after = tokens_after_prune;
+            self.emit_phase_event(phase, "complete", tokens_after_prune);
             return outcome;
         }
 
@@ -1254,6 +1259,61 @@ mod tests {
         let mut messages = vec![user_msg("hi")];
         let outcome = runner.run(&mut messages, CompactionPhase::OnDemand);
         assert!(!outcome.performed);
+    }
+
+    /// When the tool-result pruning pass alone brings the conversation under
+    /// the token budget, the runner must not go on to summarize/drop old
+    /// messages based on the stale pre-prune estimate — that discards
+    /// conversational context for no budget reason.
+    #[test]
+    fn runner_skips_summary_when_prune_brings_under_budget() {
+        let policy = CompactionPolicy {
+            token_budget: 1_000,
+            prune_tool_results_after_turns: Some(1),
+            ..Default::default()
+        };
+        let runner = CompactionRunner::new(policy);
+        let mut messages = vec![system_msg("sys prompt")];
+        // Turn 1 carries a huge, stale tool result (pruned to a placeholder).
+        messages.push(user_msg("old question"));
+        messages.push(assistant_tool_call("shell", "tc_old"));
+        messages.push(tool_result("tc_old", &"x".repeat(8_000)));
+        // 6 more modest turns so the post-prune total sits between
+        // budget/2 and budget (the recent-boundary walk engages, so a
+        // stale over-budget decision WOULD summarize old turns).
+        for index in 0..6 {
+            messages.push(user_msg(&format!(
+                "question {index} {}",
+                "detail ".repeat(30)
+            )));
+            messages.push(assistant_msg(&format!(
+                "answer {index} {}",
+                "reply ".repeat(30)
+            )));
+        }
+        let message_count_before = messages.len();
+
+        let outcome = runner.run(&mut messages, CompactionPhase::OnDemand);
+
+        assert!(
+            outcome.tool_results_replaced >= 1,
+            "the stale tool result should be pruned"
+        );
+        assert_eq!(
+            outcome.messages_dropped, 0,
+            "pruning already satisfied the budget; no messages may be summarized away"
+        );
+        assert_eq!(
+            messages.len(),
+            message_count_before,
+            "no summary row should be inserted and no messages drained"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("Conversation Summary")),
+            "no extractive summary should be generated"
+        );
     }
 
     #[test]

@@ -8,17 +8,37 @@ use chrono::Utc;
 use eyre::Result;
 use octos_core::{InboundMessage, OutboundMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::channel::Channel;
 
 pub struct CliChannel {
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 }
 
 impl CliChannel {
     pub fn new(shutdown: Arc<AtomicBool>) -> Self {
-        Self { shutdown }
+        Self::with_shutdown_notify(shutdown, Arc::new(Notify::new()))
+    }
+
+    pub fn with_shutdown_notify(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> Self {
+        Self {
+            shutdown,
+            shutdown_notify,
+        }
+    }
+
+    pub fn is_exit_command(input: &str) -> bool {
+        matches!(
+            input.trim().to_ascii_lowercase().as_str(),
+            "quit" | "exit" | "/quit" | "/exit" | ":q"
+        )
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
     }
 }
 
@@ -36,7 +56,22 @@ impl Channel for CliChannel {
         stdout.write_all(b"octos gateway> ").await?;
         stdout.flush().await?;
 
-        while let Ok(Some(line)) = reader.next_line().await {
+        loop {
+            let shutdown_notified = self.shutdown_notify.notified();
+            tokio::pin!(shutdown_notified);
+
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let line = tokio::select! {
+                biased;
+                _ = &mut shutdown_notified => break,
+                line = reader.next_line() => line,
+            };
+            let Some(line) = line? else {
+                break;
+            };
             let trimmed = line.trim().to_string();
 
             if trimmed.is_empty() {
@@ -45,8 +80,8 @@ impl Channel for CliChannel {
                 continue;
             }
 
-            if trimmed == "/quit" || trimmed == "/exit" {
-                self.shutdown.store(true, Ordering::SeqCst);
+            if Self::is_exit_command(&trimmed) {
+                self.request_shutdown();
                 break;
             }
 
@@ -59,6 +94,7 @@ impl Channel for CliChannel {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             };
 
             if inbound_tx.send(msg).await.is_err() {
@@ -79,7 +115,23 @@ impl Channel for CliChannel {
     }
 
     async fn stop(&self) -> Result<()> {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.request_shutdown();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_gateway_exit_commands() {
+        for cmd in ["quit", "exit", "/quit", "/exit", ":q", " QUIT "] {
+            assert!(CliChannel::is_exit_command(cmd), "{cmd} should exit");
+        }
+
+        for cmd in ["", "quit now", "/sessions", "please exit"] {
+            assert!(!CliChannel::is_exit_command(cmd), "{cmd} should not exit");
+        }
     }
 }

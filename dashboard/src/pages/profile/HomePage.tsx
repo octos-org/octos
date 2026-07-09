@@ -6,7 +6,7 @@ import GatewayControls from '../../components/GatewayControls'
 import ConfirmDialog from '../../components/ConfirmDialog'
 import StatusBadge from '../../components/StatusBadge'
 import { CHANNEL_COLORS, CHANNEL_LABELS } from '../../types'
-import type { ProfileResponse } from '../../types'
+import type { ProfileResponse, UsageAnalytics, UsageRollup } from '../../types'
 import { api, myApi, systemApi } from '../../api'
 import { useToast } from '../../components/Toast'
 
@@ -40,6 +40,9 @@ export default function HomePage() {
   const [newSubdomain, setNewSubdomain] = useState('')
   const [newSubEmail, setNewSubEmail] = useState('')
   const [createSubLoading, setCreateSubLoading] = useState(false)
+  const [usage, setUsage] = useState<UsageAnalytics | null>(null)
+  const [usageLoading, setUsageLoading] = useState(false)
+  const [usageError, setUsageError] = useState<string | null>(null)
   // Public base domain advertised by the server — drives the preview
   // URL so mini2/3/5 render `*.bot./*.octos./*.ocean.ominix.io` instead
   // of mini1's `*.crew.ominix.io`. Falls back to `DEFAULT_BASE_DOMAIN`
@@ -64,6 +67,40 @@ export default function HomePage() {
   useEffect(() => {
     loadSubAccounts()
   }, [loadSubAccounts])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!profileId || (!isOwn && !isAdmin)) {
+      setUsage(null)
+      setUsageError(null)
+      setUsageLoading(false)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    setUsageLoading(true)
+    setUsageError(null)
+    const request = isOwn ? myApi.usage() : api.profileUsage(profileId)
+    request
+      .then((nextUsage) => {
+        if (cancelled) return
+        setUsage(nextUsage)
+      })
+      .catch((error: any) => {
+        if (cancelled) return
+        setUsage(null)
+        setUsageError(error?.message || 'Failed to load usage')
+      })
+      .finally(() => {
+        if (cancelled) return
+        setUsageLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [profileId, isOwn, isAdmin])
 
   useEffect(() => {
     let cancelled = false
@@ -202,7 +239,7 @@ export default function HomePage() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
         {/* Gateway Controls */}
         <GatewayControls
           status={status || { running: false, pid: null, started_at: null, uptime_secs: null }}
@@ -256,6 +293,12 @@ export default function HomePage() {
             </div>
           )}
         </div>
+
+        <UsagePanel
+          usage={usage}
+          loading={usageLoading}
+          error={usageError}
+        />
       </div>
 
       {/* Profile Settings */}
@@ -441,7 +484,12 @@ export default function HomePage() {
                     key={sub.id}
                     className="flex items-center gap-3 py-2.5 px-3 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors"
                   >
-                    <StatusBadge running={sub.status.running} className="shrink-0" />
+                    <StatusBadge
+                      running={sub.status.running}
+                      status={sub.status.status}
+                      error={sub.status.error}
+                      className="shrink-0"
+                    />
 
                     <Link
                       to={`/profile/${sub.id}`}
@@ -569,6 +617,83 @@ function InfoRow({ label, value }: { label: string; value: string }) {
       <dd className="text-gray-300">{value}</dd>
     </div>
   )
+}
+
+function UsagePanel({
+  usage,
+  loading,
+  error,
+}: {
+  usage: UsageAnalytics | null
+  loading: boolean
+  error: string | null
+}) {
+  const totals = usage?.totals
+  const totalTokens = (totals?.input_tokens || 0) + (totals?.output_tokens || 0)
+  const topProvider = topRollup(usage?.by_provider)
+  const topModel = topRollup(usage?.by_model)
+  const topChannel = topRollup(usage?.by_channel)
+
+  return (
+    <div className="bg-surface rounded-xl border border-gray-700/50 p-5 min-h-[220px]">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-semibold text-white">Usage</h3>
+        {loading && (
+          <div className="animate-spin w-4 h-4 border-2 border-accent border-t-transparent rounded-full" />
+        )}
+      </div>
+
+      {error ? (
+        <p className="text-sm text-red-300">{error}</p>
+      ) : (
+        <div className="space-y-4">
+          <div className="grid grid-cols-3 gap-2">
+            <UsageMetric label="Runs" value={String(totals?.run_count || 0)} />
+            <UsageMetric label="Tokens" value={formatTokens(totalTokens)} />
+            <UsageMetric label="Cost" value={formatCost(totals?.estimated_cost_usd || 0)} />
+          </div>
+
+          <dl className="space-y-3 text-xs">
+            <InfoRow label="Input" value={formatTokens(totals?.input_tokens || 0)} />
+            <InfoRow label="Output" value={formatTokens(totals?.output_tokens || 0)} />
+            <InfoRow label="Provider" value={topProvider} />
+            <InfoRow label="Model" value={topModel} />
+            <InfoRow label="Channel" value={topChannel} />
+          </dl>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function UsageMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-white/[0.03] border border-gray-700/40 px-3 py-2 min-w-0">
+      <div className="text-[10px] uppercase text-gray-500 truncate">{label}</div>
+      <div className="text-sm font-semibold text-gray-100 truncate" title={value}>
+        {value}
+      </div>
+    </div>
+  )
+}
+
+function topRollup(rollups: UsageRollup[] | undefined): string {
+  if (!rollups || rollups.length === 0) return 'None'
+  return [...rollups]
+    .sort((a, b) => b.totals.run_count - a.totals.run_count || a.key.localeCompare(b.key))[0]
+    .key
+}
+
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return String(value)
+}
+
+function formatCost(value: number): string {
+  if (value === 0) return '$0.00'
+  if (value < 0.01) return `$${value.toFixed(4)}`
+  return `$${value.toFixed(2)}`
 }
 
 function formatUptime(secs: number | null): string {

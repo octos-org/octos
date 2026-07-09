@@ -61,12 +61,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     Envelope, EnvelopeNotification, Payload, RpcError, RpcNotification, SessionOpened,
-    TurnCompletedEvent, UiCursor, UiNotification, UiProgressEvent, methods,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
+    UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Per-session broadcast buffer size. Bounded so a slow subscriber cannot
 /// pin unbounded memory; on overflow the receiver sees `Lagged(n)` and
@@ -123,12 +124,22 @@ impl LedgerConfig {
 
 /// Anything that can sit in the ledger ring.
 ///
-/// Serialized with an outer `record_kind` tag. The earlier name `"envelope"`
-/// collided with `EnvelopeNotification.envelope` once internally-tagged
-/// `UiNotification` flattened its variant data alongside the outer tag —
-/// serde produced two `"envelope"` keys in the same object and rejected
-/// the record on replay (`duplicate field 'envelope'`). `record_kind` is
-/// disjoint from every flattened inner field name on both branches.
+/// Serialized AND deserialized with an outer `record_kind` tag (the
+/// derived impls). The earlier name `"envelope"` collided with
+/// `EnvelopeNotification.envelope` once internally-tagged `UiNotification`
+/// flattened its variant data alongside the outer tag — serde produced two
+/// `"envelope"` keys in the same object and rejected the record on replay
+/// (`duplicate field 'envelope'`, #1358). `record_kind` is disjoint from
+/// every flattened inner field name on both branches, so it is the
+/// canonical on-disk tag going forward.
+///
+/// Back-compat for the *pre-#1358* `envelope` tag is handled NOT here but
+/// at the read site (see [`LegacyLedgerDiskRecord`] and
+/// `read_session_disk_snapshot`). Both the canonical and legacy parses are
+/// DERIVED (`#[serde(tag = …)]`), so both stay STRICT: genuine duplicate
+/// keys (`record_kind` / `kind` / `session_id` / payload fields) still
+/// produce serde's `duplicate field …` error rather than being silently
+/// collapsed last-wins by a `serde_json::Value` round-trip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_kind", rename_all = "snake_case")]
 pub(crate) enum UiProtocolLedgerEvent {
@@ -243,6 +254,110 @@ struct LedgerDiskRecord {
 
 const LEDGER_DISK_VERSION: u32 = 1;
 
+/// Back-compat read shim for records written by the *pre-#1358* binary,
+/// whose `event` carried the outer discriminator under the legacy tag key
+/// `envelope` (renamed to `record_kind` in #1358 with no alias). Mirrors
+/// [`LedgerDiskRecord`] exactly except the inner event enum is tagged
+/// `envelope` instead of `record_kind`.
+///
+/// This is a DERIVED `Deserialize`, so it is just as STRICT as the
+/// canonical parse — duplicate `envelope` / `kind` / `session_id` /
+/// payload keys still error with serde's `duplicate field …`. There is no
+/// `serde_json::Value` round-trip anywhere on the read path, so duplicate
+/// keys are never silently collapsed last-wins.
+///
+/// LIMITATION (Step 0 finding, #1358): this shim CANNOT represent the
+/// legacy `UiNotification::Envelope` variant. Pre-#1358, the outer tag was
+/// `envelope` AND `EnvelopeNotification` carries a nested `envelope`
+/// OBJECT field, so internally-tagged flattening emitted TWO `envelope`
+/// keys in the same object — `duplicate field 'envelope'`. Those records
+/// were duplicate-key garbage on disk and were NEVER cleanly readable
+/// (that is precisely the bug #1358 fixed by renaming the outer tag).
+/// Recovering them is inherently impossible; the legacy shim's derived
+/// parse rejects them on the duplicate `envelope` key, so they fail
+/// gracefully and are counted in the per-file skip aggregate. This is NOT
+/// a regression — they had no clean prior representation.
+#[derive(Debug, Deserialize)]
+struct LegacyLedgerDiskRecord {
+    v: u32,
+    seq: u64,
+    event: LegacyUiProtocolLedgerEvent,
+}
+
+/// Legacy `envelope`-tagged twin of [`UiProtocolLedgerEvent`]. Derived
+/// (strict) — see [`LegacyLedgerDiskRecord`].
+#[derive(Debug, Deserialize)]
+// Mirrors `UiProtocolLedgerEvent`'s own variant sizing; this internal
+// shim is immediately converted into the canonical enum, so boxing would
+// only churn an allocation. The public enum carries the same (pre-existing)
+// profile.
+#[allow(clippy::large_enum_variant)]
+#[serde(tag = "envelope", rename_all = "snake_case")]
+enum LegacyUiProtocolLedgerEvent {
+    Notification(UiNotification),
+    Progress(UiProgressEvent),
+}
+
+impl From<LegacyUiProtocolLedgerEvent> for UiProtocolLedgerEvent {
+    fn from(legacy: LegacyUiProtocolLedgerEvent) -> Self {
+        match legacy {
+            LegacyUiProtocolLedgerEvent::Notification(n) => Self::Notification(n),
+            LegacyUiProtocolLedgerEvent::Progress(p) => Self::Progress(p),
+        }
+    }
+}
+
+impl From<LegacyLedgerDiskRecord> for LedgerDiskRecord {
+    fn from(legacy: LegacyLedgerDiskRecord) -> Self {
+        Self {
+            v: legacy.v,
+            seq: legacy.seq,
+            event: legacy.event.into(),
+        }
+    }
+}
+
+/// Parse one on-disk ledger line, dual-reading the outer event tag.
+///
+/// Tries the canonical [`LedgerDiskRecord`] parse (tag `record_kind`)
+/// first. If — and ONLY if — that fails because the event object is
+/// missing its `record_kind` discriminator (i.e. a *pre-#1358* legacy
+/// record tagged `envelope`), it retries via the strict
+/// [`LegacyLedgerDiskRecord`] shim. Both parses are derived and strict, so
+/// duplicate-key corruption is rejected on either path; the legacy retry
+/// only widens the *tag-key* alias, never the duplicate-key tolerance.
+///
+/// On genuine corruption the *canonical* error is returned (it reflects
+/// the format the writer actually emits) so debug logs stay meaningful.
+fn parse_ledger_disk_record(line: &str) -> Result<LedgerDiskRecord, serde_json::Error> {
+    match serde_json::from_str::<LedgerDiskRecord>(line) {
+        Ok(record) => Ok(record),
+        Err(canonical_err) => {
+            // Only attempt the legacy `envelope`-tagged shim when the
+            // canonical parse failed specifically because the event is
+            // missing its `record_kind` discriminator — i.e. a legacy
+            // record. Any other failure (duplicate field, malformed JSON,
+            // missing payload field, unknown version handled by caller) is
+            // genuine and must surface the canonical error unchanged so
+            // strictness is preserved.
+            if is_missing_record_kind_tag(&canonical_err) {
+                if let Ok(legacy) = serde_json::from_str::<LegacyLedgerDiskRecord>(line) {
+                    return Ok(legacy.into());
+                }
+            }
+            Err(canonical_err)
+        }
+    }
+}
+
+/// Whether a canonical-parse error is the "the event object lacks its
+/// `record_kind` discriminator" case — the signal that the record may be a
+/// legacy `envelope`-tagged one worth retrying. serde's internally-tagged
+/// enum reports this as `missing field \`record_kind\``.
+fn is_missing_record_kind_tag(err: &serde_json::Error) -> bool {
+    err.to_string().contains("missing field `record_kind`")
+}
+
 // ---------- Per-session state ----------
 
 #[derive(Debug)]
@@ -262,6 +377,12 @@ struct DiskSessionSnapshot {
     head_seq: u64,
     retained_entries: VecDeque<LedgerEntry>,
     replay_entries: Vec<LedgeredUiProtocolEvent>,
+    /// Total records skipped across all scanned log files (unknown
+    /// version + genuinely-malformed). Surfaced so callers/tests can
+    /// assert the aggregation deterministically without depending on the
+    /// process-global tracing subscriber's level filter.
+    #[cfg_attr(not(test), allow(dead_code))]
+    skipped_records: u64,
 }
 
 /// Per-session state held under the global lock. Disk writers live inside
@@ -462,6 +583,17 @@ impl UiProtocolLedger {
                     if count > 0 {
                         sessions += 1;
                         events += count;
+                        // The process that wrote these events is gone; rows it
+                        // left non-terminal will never terminate on their own.
+                        let swept = ledger.reconcile_orphaned_rows(&session_key);
+                        if swept > 0 {
+                            info!(
+                                target = "octos::ledger",
+                                session_id = %session_key.0,
+                                swept,
+                                "recovery: synthesized terminal events for rows orphaned by restart"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -485,6 +617,104 @@ impl UiProtocolLedger {
             sessions_recovered: sessions,
             events_recovered: events,
         }
+    }
+
+    /// Boot-time reconciliation for one recovered session: any task, turn,
+    /// or agent row whose LAST replayed lifecycle event is non-terminal was
+    /// orphaned — the server process that owned it died before emitting the
+    /// terminal event, and no future event will ever close it. Replaying
+    /// such rows verbatim makes every client render phantom running work
+    /// forever (spinners for dead tasks, "Orchestrating…" for dead agents,
+    /// Esc mis-targeting ghost tasks). Append synthesized terminal events so
+    /// hydrate/replay converges to reality.
+    ///
+    /// Safe because recovery runs before this process serves any connection
+    /// (nothing genuinely live exists yet) and idempotent because swept rows
+    /// replay as terminal on the next boot.
+    fn reconcile_orphaned_rows(&self, session_id: &SessionKey) -> usize {
+        let Ok((events, _)) = self.snapshot_with_cursor(session_id, None) else {
+            return 0;
+        };
+        let mut tasks: std::collections::HashMap<
+            String,
+            octos_core::ui_protocol::TaskUpdatedEvent,
+        > = std::collections::HashMap::new();
+        let mut started_turns: std::collections::HashMap<
+            String,
+            (octos_core::TurnId, Option<String>),
+        > = std::collections::HashMap::new();
+        let mut terminal_turns: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut agents: std::collections::HashMap<
+            String,
+            octos_core::ui_protocol::AgentUpdatedEvent,
+        > = std::collections::HashMap::new();
+        for event in &events {
+            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+                continue;
+            };
+            match notification {
+                UiNotification::TaskUpdated(task) => {
+                    tasks.insert(task.task_id.to_string(), task.clone());
+                }
+                UiNotification::TurnStarted(turn) => {
+                    started_turns.insert(
+                        turn.turn_id.0.to_string(),
+                        (turn.turn_id.clone(), turn.topic.clone()),
+                    );
+                }
+                UiNotification::TurnCompleted(turn) => {
+                    terminal_turns.insert(turn.turn_id.0.to_string());
+                }
+                UiNotification::TurnError(turn) => {
+                    terminal_turns.insert(turn.turn_id.0.to_string());
+                }
+                UiNotification::AgentUpdated(agent) => {
+                    agents.insert(agent.agent.agent_id.clone(), agent.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut swept = 0usize;
+        for (_, mut task) in tasks {
+            if matches!(
+                task.state,
+                TaskRuntimeState::Pending | TaskRuntimeState::Running
+            ) {
+                task.state = TaskRuntimeState::Cancelled;
+                task.runtime_detail = Some("orphaned_by_restart".to_owned());
+                self.append_notification(UiNotification::TaskUpdated(task));
+                swept += 1;
+            }
+        }
+        for (key, (turn_id, topic)) in started_turns {
+            if terminal_turns.contains(&key) {
+                continue;
+            }
+            // Preserve the topic so topic-scoped replay filters still see the
+            // synthesized terminal for a topic-suffixed turn.
+            self.append_notification(UiNotification::TurnError(TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic,
+                turn_id,
+                code: "orphaned_by_restart".to_owned(),
+                message: "server restarted before this turn finished".to_owned(),
+            }));
+            swept += 1;
+        }
+        for (_, mut agent) in agents {
+            if matches!(
+                agent.agent.status.as_str(),
+                "completed" | "failed" | "cancelled" | "closed" | "interrupted"
+            ) {
+                continue;
+            }
+            agent.agent.status = "failed".to_owned();
+            agent.agent.summary = Some("orphaned by server restart".to_owned());
+            self.append_notification(UiNotification::AgentUpdated(agent));
+            swept += 1;
+        }
+        swept
     }
 
     fn recover_one_session(
@@ -543,11 +773,21 @@ impl UiProtocolLedger {
         let mut head_seq = 0u64;
         let mut retained_entries = VecDeque::new();
         let mut replay_entries = Vec::new();
+        let mut skipped_records = 0u64;
         let cap = self.config.retained_per_session;
 
         for path in log_files {
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
+            // Aggregate skip counts per file: emit ONE summary `warn!`
+            // after the inner loop instead of one line per record per
+            // rescan. `read_session_disk_snapshot` re-reads every log
+            // from byte 0 on every recovery / re-hydration / replay, so
+            // per-record warnings multiply into log spam (~30k lines per
+            // scan on pre-#1358 ledgers). Per-record detail stays at
+            // `debug!` for when it is needed.
+            let mut skipped_unknown_version = 0u64;
+            let mut skipped_malformed = 0u64;
             for line_result in reader.lines() {
                 let line = match line_result {
                     Ok(line) => line,
@@ -565,10 +805,17 @@ impl UiProtocolLedger {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record = match serde_json::from_str::<LedgerDiskRecord>(&line) {
+                // Dual-read the outer event tag: canonical `record_kind`
+                // first, then the strict legacy `envelope`-tagged shim for
+                // pre-#1358 records (see `parse_ledger_disk_record`). Both
+                // parses are derived + strict — no `serde_json::Value`
+                // round-trip — so duplicate-key corruption is still
+                // rejected on either path.
+                let record = match parse_ledger_disk_record(&line) {
                     Ok(record) if record.v == LEDGER_DISK_VERSION => record,
                     Ok(record) => {
-                        warn!(
+                        skipped_unknown_version += 1;
+                        debug!(
                             target = "octos::ledger",
                             version = record.v,
                             path = %path.display(),
@@ -577,7 +824,17 @@ impl UiProtocolLedger {
                         continue;
                     }
                     Err(error) => {
-                        warn!(
+                        // Valid-JSON-but-unknown-discriminator records that
+                        // are legacy `envelope`-tagged are recovered by the
+                        // legacy shim above, so reaching this arm means
+                        // genuine corruption — OR a legacy
+                        // `UiNotification::Envelope` record, which is
+                        // inherently duplicate-key garbage (#1358 collision)
+                        // and was never cleanly readable. Either way it is
+                        // skipped, not panicked. Kept at `debug!` per-record,
+                        // aggregated into one `warn!` below.
+                        skipped_malformed += 1;
+                        debug!(
                             target = "octos::ledger",
                             ?error,
                             session_id = %session_id.0,
@@ -612,6 +869,19 @@ impl UiProtocolLedger {
                     retained_entries.pop_front();
                 }
             }
+            let skipped_total = skipped_unknown_version + skipped_malformed;
+            if skipped_total > 0 {
+                skipped_records = skipped_records.saturating_add(skipped_total);
+                warn!(
+                    target = "octos::ledger",
+                    session_id = %session_id.0,
+                    path = %path.display(),
+                    skipped = skipped_total,
+                    skipped_unknown_version,
+                    skipped_malformed,
+                    "skipped ledger records during scan (aggregated)"
+                );
+            }
         }
 
         Ok(Some(DiskSessionSnapshot {
@@ -622,6 +892,7 @@ impl UiProtocolLedger {
             head_seq,
             retained_entries,
             replay_entries,
+            skipped_records,
         }))
     }
 
@@ -1529,6 +1800,12 @@ impl UiProtocolLedger {
         inner.subscribers.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_session_in_memory_for_test(&self, session_id: &SessionKey) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.sessions.contains_key(session_id)
+    }
+
     /// Snapshot of the observability counters. Useful for tests and the
     /// `/metrics` endpoint integration.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1630,7 +1907,18 @@ impl UiProtocolLedger {
                 .sessions
                 .entry(session_id.clone())
                 .or_insert_with(SessionLedger::new);
-            hydrate_session_from_snapshot(session, snapshot);
+            // codex P1: never hydrate a STALE disk snapshot over a newer live
+            // session. `hydrate_session_from_snapshot` overwrites `next_seq` and
+            // clears the in-memory ring, so if the live session is already newer
+            // than the snapshot's head — a concurrent append that landed between
+            // the pre-lock disk read and acquiring this lock — hydrating would
+            // roll `next_seq` back and drop/duplicate live events. A
+            // freshly-inserted session has `next_seq == 0`, so new/trimmed rings
+            // still hydrate normally. (Mirrors the stale-live guard on the
+            // append/disk-replay paths.)
+            if session.next_seq <= snapshot.head_seq {
+                hydrate_session_from_snapshot(session, snapshot);
+            }
         }
 
         let session = match inner.sessions.get(session_id) {
@@ -1666,7 +1954,17 @@ impl UiProtocolLedger {
         // Range validation echoes the existing replay_after error.
         if let Some(oldest_seq) = session.entries.front().map(|entry| entry.seq) {
             let min_after_seq = oldest_seq.saturating_sub(1);
-            if after.seq < min_after_seq || after.seq > head_seq {
+            // A from-beginning request (`after: None` -> seq 0) means "everything
+            // you still retain" and is always valid — even for a long/trimmed
+            // ledger whose oldest retained seq is > 1. Without this exemption a
+            // `session/hydrate { after: None }` against a large session
+            // (oldest_seq > 1, e.g. ledger head ~5.5k) was rejected with
+            // `cursor_out_of_range`, breaking reconnect-rehydration; the client
+            // can't supply a valid cursor for "from the beginning" of a trimmed
+            // ring. We still reject a genuine stale non-zero cursor and any
+            // future cursor.
+            let from_beginning = after.seq == 0;
+            if (!from_beginning && after.seq < min_after_seq) || after.seq > head_seq {
                 let head_cursor = UiCursor {
                     stream: session_id.0.clone(),
                     seq: head_seq,
@@ -2023,6 +2321,11 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::SessionOpened(event) => &event.session_id,
         UiNotification::TurnStarted(event) => &event.session_id,
         UiNotification::MessageDelta(event) => &event.session_id,
+        UiNotification::ReasoningDelta(event) => &event.session_id,
+        UiNotification::VisualGenerating(event) => &event.session_id,
+        UiNotification::VisualSucceeded(event) => &event.session_id,
+        UiNotification::VisualFailed(event) => &event.session_id,
+        UiNotification::VoiceExit(event) => &event.session_id,
         UiNotification::ToolStarted(event) => &event.session_id,
         UiNotification::ToolProgress(event) => &event.session_id,
         UiNotification::ToolCompleted(event) => &event.session_id,
@@ -2040,6 +2343,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::MessagePersisted(event) => &event.session_id,
         UiNotification::TurnSpawnComplete(event) => &event.session_id,
         UiNotification::FileAttached(event) => &event.session_id,
+        UiNotification::VoiceAudioChunk(event) => &event.session_id,
         UiNotification::SessionEventBridged(event) => &event.session_id,
         UiNotification::RouterStatus(event) => &event.session_id,
         UiNotification::RouterFailover(event) => &event.session_id,
@@ -2053,7 +2357,10 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::LoopFired(event) => &event.session_id,
         UiNotification::LoopCompleted(event) => &event.session_id,
         UiNotification::ContextCompactionCompleted(event) => &event.session_id,
+        UiNotification::ContextCompactionStarted(event) => &event.session_id,
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
+        UiNotification::SessionOrchestration(event) => &event.session_id,
+        UiNotification::UserQuestionRequested(event) => &event.session_id,
         UiNotification::Envelope(event) => &event.session_id,
     }
 }
@@ -2177,6 +2484,23 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn session_log_payload(data_dir: &Path, session_id: &SessionKey) -> String {
+        let session_dir = data_dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id));
+        let mut log_files = list_log_files(&session_dir).expect("list session log files");
+        log_files.sort();
+        assert!(
+            !log_files.is_empty(),
+            "expected persisted JSONL log files for {}",
+            session_id.0
+        );
+        log_files
+            .iter()
+            .map(|path| std::fs::read_to_string(path).expect("read session log file"))
+            .collect::<String>()
     }
 
     #[test]
@@ -2381,6 +2705,45 @@ mod tests {
     }
 
     #[test]
+    fn ledger_post_eviction_validation_path_replays_from_persisted_jsonl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.retained_per_session = 4;
+        config.active_session_cap = 1;
+        let ledger = UiProtocolLedger::with_config(config);
+        let target = SessionKey("local:post-eviction-target".into());
+        let filler = SessionKey("local:post-eviction-filler".into());
+
+        ledger.append_notification(delta(&target, "target-one"));
+        ledger.append_notification(delta(&target, "target-two"));
+        assert!(ledger.has_session_in_memory_for_test(&target));
+        assert!(session_log_payload(temp.path(), &target).contains("target-two"));
+
+        ledger.append_notification(delta(&filler, "filler-evicts-target"));
+        let post_eviction_metrics = ledger.metrics();
+        assert_eq!(post_eviction_metrics.sessions_evicted, 1);
+        assert_eq!(post_eviction_metrics.sessions_active, 1);
+        assert!(!ledger.has_session_in_memory_for_test(&target));
+        assert!(ledger.has_session_in_memory_for_test(&filler));
+
+        let (replayed, cursor) = ledger
+            .snapshot_with_cursor(
+                &target,
+                Some(&UiCursor {
+                    stream: target.0.clone(),
+                    seq: 1,
+                }),
+            )
+            .expect("hydrate evicted target session from JSONL");
+
+        assert_eq!(replay_texts(&replayed), vec!["target-two"]);
+        assert_eq!(cursor.seq, 2);
+        assert!(ledger.has_session_in_memory_for_test(&target));
+        assert!(!ledger.has_session_in_memory_for_test(&filler));
+        assert_eq!(ledger.metrics().sessions_evicted, 2);
+    }
+
+    #[test]
     fn ledger_replays_from_disk_after_idle_ttl_eviction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut config = LedgerConfig::durable(temp.path().into());
@@ -2555,6 +2918,180 @@ mod tests {
                 .as_ref()
                 .and_then(|data| data.get("oldest_retained_seq")),
             Some(&json!(6))
+        );
+    }
+
+    #[test]
+    fn snapshot_from_beginning_succeeds_on_trimmed_ring() {
+        // Regression: `session/hydrate { after: None }` (from-beginning) against a
+        // large/trimmed session (oldest retained seq > 1) must NOT be rejected as
+        // cursor_out_of_range — "from the beginning" means "everything you still
+        // retain". This previously broke reconnect-rehydration on long sessions
+        // (mini5 soak: ledger head ~5.5k, hydrate errored + the transcript went
+        // empty). A genuine stale non-zero cursor is still rejected elsewhere.
+        let ledger = UiProtocolLedger::new(3);
+        let session_id = SessionKey("local:trimmed".into());
+        for i in 1..=6 {
+            ledger.append_notification(delta(&session_id, &format!("msg-{i}")));
+        }
+        // Ring retains only the last 3 (seq 4,5,6); oldest_seq = 4 > 1.
+        let (events, _head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("from-beginning hydrate must succeed on a trimmed ring");
+        assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
+    }
+
+    /// Boot recovery must synthesize terminal events for task/turn/agent
+    /// rows the dead server generation left non-terminal — otherwise every
+    /// hydrate replays phantom running work forever.
+    #[test]
+    fn recovery_sweeps_rows_orphaned_by_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:orphan-sweep".into());
+        let turn_id = octos_core::TurnId::new();
+        let ghost_task = octos_core::TaskId::new();
+        {
+            let config = LedgerConfig::durable(temp.path().into());
+            let ledger = UiProtocolLedger::with_config(config);
+            let task: octos_core::ui_protocol::TaskUpdatedEvent = serde_json::from_value(json!({
+                "session_id": session_id.0,
+                "task_id": ghost_task.to_string(),
+                "title": "astro dev server",
+                "state": "running",
+            }))
+            .expect("task event");
+            ledger.append_notification(UiNotification::TaskUpdated(task));
+            let started: octos_core::ui_protocol::TurnStartedEvent =
+                serde_json::from_value(json!({
+                    "session_id": session_id.0,
+                    "turn_id": turn_id.0,
+                    "timestamp": chrono::Utc::now(),
+                }))
+                .expect("turn started");
+            ledger.append_notification(UiNotification::TurnStarted(started));
+            let agent: octos_core::ui_protocol::AgentUpdatedEvent = serde_json::from_value(json!({
+                "session_id": session_id.0,
+                "agent": {
+                    "agent_id": "agent-ghost",
+                    "session_id": session_id.0,
+                    "path": "root/agent-ghost",
+                    "role": "worker",
+                    "nickname": "ghost",
+                    "backend_kind": "native",
+                    "status": "running",
+                    "profile_id": "dev",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                }
+            }))
+            .expect("agent event");
+            ledger.append_notification(UiNotification::AgentUpdated(agent));
+        } // process "dies" — no terminal events were emitted
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot");
+
+        let mut task_terminal = false;
+        let mut turn_terminal = false;
+        let mut agent_terminal = false;
+        for event in &events {
+            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+                continue;
+            };
+            match notification {
+                UiNotification::TaskUpdated(task)
+                    if task.state == octos_core::ui_protocol::TaskRuntimeState::Cancelled
+                        && task.runtime_detail.as_deref() == Some("orphaned_by_restart") =>
+                {
+                    task_terminal = true;
+                }
+                UiNotification::TurnError(error)
+                    if error.turn_id == turn_id && error.code == "orphaned_by_restart" =>
+                {
+                    turn_terminal = true;
+                }
+                UiNotification::AgentUpdated(agent)
+                    if agent.agent.agent_id == "agent-ghost" && agent.agent.status == "failed" =>
+                {
+                    agent_terminal = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            task_terminal,
+            "orphaned running task must be swept terminal"
+        );
+        assert!(turn_terminal, "orphaned started turn must error terminal");
+        assert!(
+            agent_terminal,
+            "orphaned running agent must be swept terminal"
+        );
+
+        // Idempotence: a second recovery must not append more sweep events.
+        let count_after_first = events.len();
+        drop(recovered);
+        let recovered_again = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events_again, _) = recovered_again
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot again");
+        assert_eq!(
+            events_again.len(),
+            count_after_first,
+            "second recovery must sweep nothing (rows already terminal)"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_cursor_does_not_hydrate_stale_disk_over_newer_live() {
+        // codex P1: `snapshot_with_cursor` must not let a STALE disk snapshot
+        // roll back a newer live session — `hydrate_session_from_snapshot` resets
+        // `next_seq` and clears the ring, which would drop/duplicate live events.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.retained_per_session = 1;
+        config.retained_log_files = 4;
+        config.rotate_bytes = 1024 * 1024;
+        let ledger = UiProtocolLedger::with_config(config);
+        let session_id = SessionKey("local:stale-live-snap".into());
+
+        ledger.append_notification(delta(&session_id, "one"));
+        ledger.append_notification(delta(&session_id, "two"));
+        ledger.append_notification(delta(&session_id, "three")); // live next_seq=4, ring=[seq3]
+
+        // Truncate the disk log to a STALE snapshot (only seq 1,2 → head_seq=2).
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        let mut log_files = list_log_files(&session_dir).expect("list logs");
+        log_files.sort();
+        let active_log = log_files.last().expect("active log");
+        let contents = std::fs::read_to_string(active_log).expect("read log");
+        let stale = contents
+            .lines()
+            .take(2)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(active_log, stale).expect("truncate to stale snapshot");
+
+        // From-beginning snapshot: with the guard it must keep the LIVE tail and
+        // the live head, not roll back to the stale disk.
+        let (events, head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("from-beginning must succeed without rolling back");
+        assert_eq!(
+            head.seq, 3,
+            "live head (3) must be preserved, not rolled back to the stale disk head (2)"
+        );
+        assert_eq!(
+            replay_texts(&events),
+            vec!["three"],
+            "the live tail survives; the stale disk must not replace it"
         );
     }
 
@@ -3458,5 +3995,452 @@ mod tests {
         let parsed: UiProtocolLedgerEvent = serde_json::from_str(&serialized)
             .unwrap_or_else(|e| panic!("ledger replay MUST succeed: {e}; payload={serialized}"));
         assert_eq!(parsed, event, "round-trip must be field-equal");
+    }
+
+    // ---------- #1358 back-compat: legacy `envelope` outer tag ----------
+
+    /// Construct a legacy on-disk `event` JSON as the PRE-#1358 binary
+    /// wrote it: the outer ledger discriminator was named `envelope`
+    /// (renamed to `record_kind` in #1358). We synthesize it by serializing
+    /// with the current `record_kind` tag and renaming JUST the outer tag
+    /// KEY back to `envelope` via STRING manipulation.
+    ///
+    /// The string-level rename is load-bearing: for the `Envelope` notification
+    /// variant the canonical JSON already contains a nested `envelope` OBJECT
+    /// field, so renaming the outer tag to `envelope` re-creates the genuine
+    /// TWO-`envelope`-keys-in-one-object collision the pre-#1358 binary wrote.
+    /// A `serde_json::Map` could not represent that (it would collapse the two
+    /// keys to last-wins) — which is exactly why the collision was duplicate-key
+    /// garbage on disk (Step 0). For non-`Envelope` notifications and `Progress`
+    /// records there is no inner `envelope` field, so the rename is a clean
+    /// single-key swap.
+    fn legacy_envelope_tagged_json(event: &UiProtocolLedgerEvent) -> String {
+        // serde emits the internally-tagged discriminator FIRST, so the
+        // canonical JSON always begins `{"record_kind":"…",`. Rename only
+        // that leading outer tag key, leaving every other key (including any
+        // nested `envelope` object) byte-for-byte intact.
+        let canonical = serde_json::to_string(event).expect("serialize event");
+        assert!(
+            canonical.starts_with("{\"record_kind\":"),
+            "expected canonical record_kind-tagged JSON, got {canonical}"
+        );
+        canonical.replacen("{\"record_kind\":", "{\"envelope\":", 1)
+    }
+
+    /// Wrap a legacy `envelope`-tagged event JSON into a full on-disk
+    /// `{v, seq, event}` record line — the shape the pre-#1358 binary
+    /// actually wrote. Back-compat lives at the disk-record READ SITE
+    /// (`parse_ledger_disk_record`), not on the bare `UiProtocolLedgerEvent`
+    /// type (whose derived `Deserialize` is now strictly `record_kind`),
+    /// so legacy recovery is exercised through that helper.
+    fn legacy_envelope_tagged_record_line(event: &UiProtocolLedgerEvent, seq: u64) -> String {
+        let event_json: Value =
+            serde_json::from_str(&legacy_envelope_tagged_json(event)).expect("legacy event json");
+        let record = json!({ "v": LEDGER_DISK_VERSION, "seq": seq, "event": event_json });
+        serde_json::to_string(&record).expect("serialize legacy record line")
+    }
+
+    #[test]
+    fn legacy_envelope_tagged_notification_deserializes() {
+        // RED before back-compat: serde's `tag = "record_kind"` cannot find
+        // its discriminator in a record whose `event` carries the legacy
+        // `envelope` tag key, so the canonical parse fails with
+        // `missing field record_kind` and `parse_ledger_disk_record` retries
+        // the strict legacy `envelope`-tagged shim.
+        let session = SessionKey("local:legacy-notif".into());
+        let event = UiProtocolLedgerEvent::Notification(delta(&session, "legacy delta"));
+        let event_json = legacy_envelope_tagged_json(&event);
+        assert!(
+            event_json.contains("\"envelope\":\"notification\""),
+            "fixture must carry the legacy `envelope` outer tag — got {event_json}"
+        );
+        let line = legacy_envelope_tagged_record_line(&event, 1);
+        let record = parse_ledger_disk_record(&line)
+            .unwrap_or_else(|e| panic!("legacy envelope-tagged record MUST deserialize: {e}"));
+        assert_eq!(
+            record.event, event,
+            "legacy record must decode to the same variant"
+        );
+    }
+
+    #[test]
+    fn legacy_envelope_tagged_progress_deserializes() {
+        use octos_core::ui_protocol::UiProgressMetadata;
+        let session = SessionKey("local:legacy-progress".into());
+        let event = UiProtocolLedgerEvent::Progress(UiProgressEvent {
+            session_id: session,
+            turn_id: None,
+            metadata: UiProgressMetadata {
+                kind: "thinking".into(),
+                label: None,
+                message: None,
+                detail: None,
+                iteration: None,
+                progress_pct: None,
+                retry: None,
+                file_mutation: None,
+                token_cost: None,
+                extra: Default::default(),
+            },
+        });
+        let event_json = legacy_envelope_tagged_json(&event);
+        assert!(
+            event_json.contains("\"envelope\":\"progress\""),
+            "fixture must carry the legacy `envelope` outer tag — got {event_json}"
+        );
+        let line = legacy_envelope_tagged_record_line(&event, 1);
+        let record = parse_ledger_disk_record(&line)
+            .unwrap_or_else(|e| panic!("legacy envelope-tagged progress MUST deserialize: {e}"));
+        assert_eq!(record.event, event);
+    }
+
+    #[test]
+    fn new_record_kind_tagged_notification_still_deserializes() {
+        // The write side MUST keep emitting `record_kind` (no #1358
+        // regression) and the reader must still accept it.
+        let session = SessionKey("local:new-notif".into());
+        let event = UiProtocolLedgerEvent::Notification(delta(&session, "new delta"));
+        let serialized = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            serialized.contains("\"record_kind\":\"notification\""),
+            "write side must still emit `record_kind` — got {serialized}"
+        );
+        assert!(
+            !serialized.contains("\"envelope\":\"notification\""),
+            "write side must NOT regress to the legacy `envelope` tag — got {serialized}"
+        );
+        let parsed: UiProtocolLedgerEvent =
+            serde_json::from_str(&serialized).expect("record_kind record deserializes");
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn genuinely_malformed_record_still_errors() {
+        // A record with neither discriminator (and not even valid for the
+        // inner variant) must still be rejected so real corruption is not
+        // silently accepted — both as a bare event and through the actual
+        // disk-record read path.
+        let bad = r#"{"kind":"message_delta","text":"orphan, no outer tag"}"#;
+        let result: Result<UiProtocolLedgerEvent, _> = serde_json::from_str(bad);
+        assert!(
+            result.is_err(),
+            "record lacking any outer discriminator must still error, got {result:?}"
+        );
+        let not_json = "this is not json at all";
+        assert!(
+            serde_json::from_str::<UiProtocolLedgerEvent>(not_json).is_err(),
+            "non-JSON must still error"
+        );
+
+        // Disk-record read path: neither the canonical nor the legacy shim
+        // can decode these, and non-object JSON must not panic.
+        let bad_record = format!("{{\"v\":{LEDGER_DISK_VERSION},\"seq\":1,\"event\":{bad}}}");
+        assert!(
+            parse_ledger_disk_record(&bad_record).is_err(),
+            "malformed event in a disk record must still error via the read path"
+        );
+        assert!(
+            parse_ledger_disk_record("{not valid json}").is_err(),
+            "non-JSON disk line must error, not panic"
+        );
+        assert!(
+            parse_ledger_disk_record("[1,2,3]").is_err(),
+            "non-object JSON disk line must error, not panic"
+        );
+    }
+
+    /// Inject a duplicate key into a JSON object STRING by inserting
+    /// `"key":<value>,` immediately after the opening brace. The result is
+    /// valid JSON syntax with a genuine duplicate top-level key — which a
+    /// `serde_json::Map` cannot represent (it collapses to last-wins), so
+    /// the corruption can only be expressed at the string level. Used to
+    /// prove the deserializer stays STRICT and does not round-trip through
+    /// a duplicate-collapsing `Value`.
+    fn inject_duplicate_key(json: &str, key: &str, value: &str) -> String {
+        let brace = json.find('{').expect("object json");
+        let (head, tail) = json.split_at(brace + 1);
+        format!("{head}\"{key}\":{value},{tail}")
+    }
+
+    #[test]
+    fn duplicate_key_corruption_is_rejected() {
+        // STRICTNESS: the derived `Deserialize` rejects duplicate fields
+        // (`duplicate field …`). The dual-tag rework must NOT regress that
+        // into a duplicate-collapsing `serde_json::Value` round-trip, which
+        // silently keeps the LAST value and accepts corrupted JSON.
+        //
+        // Fixtures are built by serializing a fully-valid event (so every
+        // field — including the UUID `turn_id` — is genuinely valid) and
+        // then injecting ONE duplicate key into the JSON STRING. A
+        // `serde_json::Map` cannot hold duplicate keys, which is exactly why
+        // a Value round-trip loses the strictness the derived path
+        // guaranteed; the ONLY reason any fixture below can error is the
+        // duplicate key.
+        //
+        // RED on 39794cd1: the inner-field cases (`session_id`, `kind`,
+        // `text`) were SILENTLY ACCEPTED (last-wins) because the
+        // `Value::deserialize` step collapsed the duplicate before the
+        // derived shim ever saw it.
+        let session = SessionKey("local:dup".into());
+        let event = UiProtocolLedgerEvent::Notification(delta(&session, "corrupt"));
+        let valid = serde_json::to_string(&event).expect("serialize valid event");
+        // Sanity: the clean record must deserialize (so a failure below is
+        // attributable to the injected duplicate, not a broken fixture).
+        serde_json::from_str::<UiProtocolLedgerEvent>(&valid)
+            .expect("clean fixture must deserialize");
+
+        // Duplicate INNER payload field `session_id` — headline regression.
+        let dup_session = inject_duplicate_key(&valid, "session_id", "\"local:other\"");
+        assert!(
+            serde_json::from_str::<UiProtocolLedgerEvent>(&dup_session).is_err(),
+            "duplicate inner `session_id` must error, not last-wins — got {dup_session}"
+        );
+
+        // Duplicate INNER scalar `text`.
+        let dup_text = inject_duplicate_key(&valid, "text", "\"first\"");
+        assert!(
+            serde_json::from_str::<UiProtocolLedgerEvent>(&dup_text).is_err(),
+            "duplicate inner `text` must error, not last-wins — got {dup_text}"
+        );
+
+        // Duplicate INNER discriminator `kind`.
+        let dup_kind = inject_duplicate_key(&valid, "kind", "\"tool_started\"");
+        assert!(
+            serde_json::from_str::<UiProtocolLedgerEvent>(&dup_kind).is_err(),
+            "duplicate inner `kind` must error, not last-wins — got {dup_kind}"
+        );
+
+        // Duplicate OUTER discriminator `record_kind`.
+        let dup_record_kind = inject_duplicate_key(&valid, "record_kind", "\"progress\"");
+        assert!(
+            serde_json::from_str::<UiProtocolLedgerEvent>(&dup_record_kind).is_err(),
+            "duplicate outer `record_kind` must error, not last-wins — got {dup_record_kind}"
+        );
+
+        // The legacy `envelope`-tagged path runs only at the disk-record
+        // READ SITE (`parse_ledger_disk_record`), so legacy duplicate-key
+        // fixtures are exercised there — proving the STRICT legacy shim
+        // (not a Value collapse) is what recovers them. Wrap each corrupt
+        // legacy event in a `{v, seq, event}` line and assert it is
+        // rejected. (Sanity: the clean legacy line recovers, so failures
+        // below are attributable to the injected duplicate.)
+        let legacy_event = legacy_envelope_tagged_json(&event);
+        let clean_legacy_line = legacy_envelope_tagged_record_line(&event, 1);
+        parse_ledger_disk_record(&clean_legacy_line).expect("clean legacy line must recover");
+
+        // Duplicate legacy OUTER discriminator `envelope` (string tag).
+        let dup_envelope_event = inject_duplicate_key(&legacy_event, "envelope", "\"progress\"");
+        let dup_envelope_line =
+            format!("{{\"v\":{LEDGER_DISK_VERSION},\"seq\":1,\"event\":{dup_envelope_event}}}");
+        assert!(
+            parse_ledger_disk_record(&dup_envelope_line).is_err(),
+            "duplicate legacy outer `envelope` tag must error, not last-wins — got {dup_envelope_line}"
+        );
+
+        // Duplicate INNER `session_id` on a legacy-tagged record.
+        let dup_session_event =
+            inject_duplicate_key(&legacy_event, "session_id", "\"local:other\"");
+        let dup_session_line =
+            format!("{{\"v\":{LEDGER_DISK_VERSION},\"seq\":1,\"event\":{dup_session_event}}}");
+        assert!(
+            parse_ledger_disk_record(&dup_session_line).is_err(),
+            "duplicate inner `session_id` (legacy record) must error — got {dup_session_line}"
+        );
+    }
+
+    #[test]
+    fn legacy_envelope_variant_record_errors_gracefully_not_recovered() {
+        // STEP 0 finding: pre-#1358 `UiNotification::Envelope` records were
+        // NEVER cleanly (de)serializable. The outer ledger tag was named
+        // `envelope` AND `EnvelopeNotification` carries a nested `envelope`
+        // OBJECT field, so internally-tagged flattening emitted TWO
+        // `envelope` keys in the same object — exactly the
+        // `duplicate field 'envelope'` that #1358 fixed by renaming the
+        // outer tag to `record_kind`. Such records are duplicate-key
+        // garbage on disk; recovering them is inherently impossible.
+        //
+        // The contract here is therefore NOT "recover" but "fail
+        // gracefully": the record must ERROR (so the read loop counts it as
+        // a skip) and MUST NOT panic. This is NOT a regression — these
+        // records were always unreadable.
+        //
+        // Build the fixture authentically: serialize a real
+        // `UiNotification::Envelope` event (with the canonical `record_kind`
+        // tag) then rename the outer key back to the legacy `envelope` — the
+        // exact byte shape the pre-#1358 binary wrote. This produces the
+        // genuine two-`envelope`-keys-in-one-object collision.
+        let session = SessionKey("local:env".into());
+        let event =
+            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(EnvelopeNotification {
+                session_id: session,
+                topic: Some("planning".into()),
+                envelope: Envelope {
+                    thread_id: "t".into(),
+                    seq: 1,
+                    client_message_id: None,
+                    payload: Payload::AssistantDelta { text: "x".into() },
+                },
+            }));
+        let legacy_event = legacy_envelope_tagged_json(&event);
+        // The collision: the outer string tag AND the nested object field
+        // both serialize to the key `envelope`.
+        assert!(
+            legacy_event.matches("\"envelope\":").count() >= 2,
+            "legacy Envelope record must carry the duplicate `envelope` key \
+             collision — got {legacy_event}"
+        );
+
+        // The bare strict event parse rejects it (no `record_kind`).
+        assert!(
+            serde_json::from_str::<UiProtocolLedgerEvent>(&legacy_event).is_err(),
+            "bare legacy Envelope event must error under the strict canonical parse"
+        );
+
+        // The actual READ PATH must also reject it gracefully: the legacy
+        // shim hits `duplicate field 'envelope'` and errors — counted as a
+        // skip, never recovered, never a panic.
+        let line = legacy_envelope_tagged_record_line(&event, 1);
+        let result = parse_ledger_disk_record(&line);
+        assert!(
+            result.is_err(),
+            "legacy Envelope-variant records are inherently duplicate-key \
+             garbage (#1358 collision) and must error gracefully, got {result:?}"
+        );
+
+        // Whole-chain: a log file containing ONLY such records recovers
+        // zero events and counts each as a skip (no panic).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:env-disk".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let log_path = session_dir.join(new_log_file_name());
+        fs::write(&log_path, format!("{line}\n")).expect("write envelope log");
+
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        let snapshot = ledger
+            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .expect("scan ok");
+        // An empty snapshot (`None`) is also acceptable (nothing
+        // recovered); when present it must show zero recovered + one skip.
+        if let Some(snap) = snapshot {
+            assert_eq!(
+                snap.retained_entries.len(),
+                0,
+                "legacy Envelope-variant records must not be recovered"
+            );
+            assert_eq!(
+                snap.skipped_records, 1,
+                "the single unreadable Envelope-variant record must be counted as a skip"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_recovers_legacy_envelope_tagged_records_from_disk() {
+        // Whole-chain: write a log file by hand using the legacy
+        // `envelope` outer tag (as the pre-#1358 binary did) and confirm
+        // recovery hydrates them rather than dropping them as malformed.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:legacy-disk".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let log_path = session_dir.join(new_log_file_name());
+        let mut lines = String::new();
+        for (seq, text) in [(1u64, "legacy-one"), (2, "legacy-two"), (3, "legacy-three")] {
+            let event = UiProtocolLedgerEvent::Notification(delta(&session_id, text));
+            let event_json: Value =
+                serde_json::from_str(&legacy_envelope_tagged_json(&event)).unwrap();
+            let record = json!({ "v": LEDGER_DISK_VERSION, "seq": seq, "event": event_json });
+            lines.push_str(&serde_json::to_string(&record).unwrap());
+            lines.push('\n');
+        }
+        fs::write(&log_path, lines).expect("write legacy log");
+
+        let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        assert_eq!(
+            outcome.events_recovered, 3,
+            "all 3 legacy `envelope`-tagged records must be recovered, not skipped"
+        );
+        let replay = outcome
+            .ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                }),
+            )
+            .expect("replay recovered legacy session");
+        assert_eq!(replay_texts(&replay), vec!["legacy-two", "legacy-three"]);
+    }
+
+    #[test]
+    fn scanning_legacy_and_bad_records_aggregates_skips_per_file() {
+        // N legacy + M truly-bad records in ONE file: the N legacy
+        // records are recovered (0 skips, via part 1) and only the M bad
+        // records are counted. `skipped_records` is the per-file
+        // aggregate — proving the read loop emits a single summary `warn!`
+        // per file (the warn is guarded by `skipped_total > 0`, once per
+        // file) rather than one line per record per rescan. We assert on
+        // the returned count rather than captured logs because the
+        // process-global tracing max-level filter (set by the test
+        // harness / other tests) is not deterministically observable.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:agg-skip".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let log_path = session_dir.join(new_log_file_name());
+
+        let mut lines = String::new();
+        // 2 legacy `envelope`-tagged records → recovered by part 1.
+        for (seq, text) in [(1u64, "legacy-a"), (2, "legacy-b")] {
+            let event = UiProtocolLedgerEvent::Notification(delta(&session_id, text));
+            let event_json: Value =
+                serde_json::from_str(&legacy_envelope_tagged_json(&event)).unwrap();
+            let record = json!({ "v": LEDGER_DISK_VERSION, "seq": seq, "event": event_json });
+            lines.push_str(&serde_json::to_string(&record).unwrap());
+            lines.push('\n');
+        }
+        // 3 truly-bad records → skipped (aggregated into one summary).
+        lines.push_str("{not valid json}\n");
+        lines.push_str("{\"v\":1,\"seq\":99}\n"); // missing `event`
+        lines.push_str("garbage line\n");
+        fs::write(&log_path, lines).expect("write mixed log");
+
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        let snapshot = ledger
+            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .expect("scan ok")
+            .expect("non-empty snapshot");
+
+        assert_eq!(
+            snapshot.skipped_records, 3,
+            "only the 3 truly-bad records are skipped; the 2 legacy records are recovered"
+        );
+        assert_eq!(
+            snapshot.retained_entries.len(),
+            2,
+            "the 2 legacy `envelope`-tagged records must be recovered, not skipped"
+        );
+        let recovered_texts: Vec<String> = snapshot
+            .retained_entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(d)) => {
+                    Some(d.text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recovered_texts, vec!["legacy-a", "legacy-b"]);
     }
 }

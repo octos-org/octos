@@ -65,4 +65,4 @@ octos gateway
 octos serve
 ```
 
-然后在浏览器中打开 `http://localhost:8080`。
+然后在浏览器中打开 `http://localhost:50080`。

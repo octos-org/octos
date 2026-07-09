@@ -9,13 +9,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use octos_bus::{ChannelManager, SessionManager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::config::ChannelEntry;
 
 #[cfg(feature = "api")]
 mod api;
 mod cli;
+#[cfg(feature = "dingtalk")]
+mod dingtalk;
 #[cfg(feature = "discord")]
 mod discord;
 #[cfg(feature = "email")]
@@ -48,6 +50,7 @@ mod whatsapp;
 #[cfg(any(
     feature = "telegram",
     feature = "discord",
+    feature = "dingtalk",
     feature = "slack",
     feature = "whatsapp",
     feature = "email",
@@ -76,6 +79,7 @@ pub type TaskRelaunchCb =
 #[allow(dead_code)]
 pub struct ChannelRegistrationCtx<'a> {
     pub shutdown: &'a Arc<AtomicBool>,
+    pub shutdown_notify: &'a Arc<Notify>,
     pub media_dir: &'a Path,
     pub data_dir: &'a Path,
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
@@ -105,13 +109,21 @@ pub fn register_all(
     entries: &[ChannelEntry],
     ctx: &mut ChannelRegistrationCtx<'_>,
 ) -> eyre::Result<()> {
-    for entry in entries {
+    #[cfg(feature = "matrix")]
+    ensure_single_matrix_channel(entries)?;
+
+    for (channel_index, entry) in entries.iter().enumerate() {
+        // `channel_index` is only consumed by the matrix arm below.
+        #[cfg(not(feature = "matrix"))]
+        let _ = channel_index;
         match entry.channel_type.as_str() {
-            "cli" => cli::register(channel_mgr, entry, ctx.shutdown)?,
+            "cli" => cli::register(channel_mgr, entry, ctx.shutdown, ctx.shutdown_notify)?,
             #[cfg(feature = "telegram")]
             "telegram" => telegram::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "discord")]
             "discord" => discord::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
+            #[cfg(feature = "dingtalk")]
+            "dingtalk" => dingtalk::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "slack")]
             "slack" => slack::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "whatsapp")]
@@ -147,6 +159,7 @@ pub fn register_all(
                 channel_mgr,
                 ctx.matrix_channel,
                 entry,
+                channel_index,
                 ctx.shutdown,
                 ctx.data_dir,
             )?,
@@ -160,4 +173,51 @@ pub fn register_all(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "matrix")]
+fn ensure_single_matrix_channel(entries: &[ChannelEntry]) -> eyre::Result<()> {
+    let mut first_index: Option<usize> = None;
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.channel_type != "matrix" {
+            continue;
+        }
+        if let Some(first) = first_index {
+            eyre::bail!(
+                "multiple Matrix channels are not supported yet; channel indexes {first} and {idx} share the same routing key"
+            );
+        }
+        first_index = Some(idx);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "matrix"))]
+mod tests {
+    use super::*;
+
+    fn entry(channel_type: &str) -> ChannelEntry {
+        ChannelEntry {
+            channel_type: channel_type.to_string(),
+            allowed_senders: Vec::new(),
+            settings: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_matrix_channels_before_registration() {
+        let entries = vec![entry("cli"), entry("matrix"), entry("matrix")];
+
+        let err = ensure_single_matrix_channel(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("multiple Matrix channels"));
+        assert!(err.to_string().contains("1 and 2"));
+    }
+
+    #[test]
+    fn allows_single_matrix_channel() {
+        let entries = vec![entry("cli"), entry("matrix")];
+
+        ensure_single_matrix_channel(&entries).unwrap();
+    }
 }

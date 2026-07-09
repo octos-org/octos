@@ -163,7 +163,7 @@ async fn tier1_shrinks_50kb_tool_result_to_placeholder_on_next_iteration() {
             .content
             .starts_with(octos_agent::compaction::TOOL_RESULT_PLACEHOLDER_PREFIX),
         "tier 1 did not shrink the 50KB tool result: {:?}",
-        &tool_msg.content.chars().take(80).collect::<String>()
+        tool_msg.content.chars().take(80).collect::<String>()
     );
     assert!(
         tool_msg.content.len() < 1_000,

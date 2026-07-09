@@ -357,6 +357,11 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn shell_fixture_config(script: &std::path::Path) -> CliAgentCommandConfig {
+        CliAgentCommandConfig::new("/bin/sh").arg(script.to_string_lossy())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn captures_stdout_stderr_and_declared_artifacts() {
         let dir = tempfile::tempdir().unwrap();
@@ -372,7 +377,7 @@ printf '# report\n' > "$1"
         );
 
         let result = run_cli_agent_command(
-            CliAgentCommandConfig::new(script)
+            shell_fixture_config(&script)
                 .arg(artifact.to_string_lossy())
                 .declared_artifact(&artifact),
         )
@@ -407,7 +412,7 @@ printf '# report\n' > report.md
         );
 
         let result = run_cli_agent_command(
-            CliAgentCommandConfig::new(script)
+            shell_fixture_config(&script)
                 .cwd(dir.path())
                 .declared_artifact("report.md"),
         )
@@ -435,7 +440,7 @@ perl -e 'print "x" x (1024 * 1024 + 64)'
 "#,
         );
 
-        let result = run_cli_agent_command(CliAgentCommandConfig::new(script))
+        let result = run_cli_agent_command(shell_fixture_config(&script))
             .await
             .unwrap();
 
@@ -462,7 +467,7 @@ printf done > "$1"
         );
 
         let result = run_cli_agent_command(
-            CliAgentCommandConfig::new(script)
+            shell_fixture_config(&script)
                 .arg(marker.to_string_lossy())
                 .timeout(Duration::from_millis(100)),
         )
@@ -489,7 +494,7 @@ printf done > "$1"
         );
 
         let mut process = CliAgentProcess::spawn(
-            CliAgentCommandConfig::new(script)
+            shell_fixture_config(&script)
                 .arg(marker.to_string_lossy())
                 .timeout(Duration::from_secs(5)),
         )
@@ -516,7 +521,7 @@ printf done > "$1"
         );
 
         let mut process = CliAgentProcess::spawn(
-            CliAgentCommandConfig::new(script)
+            shell_fixture_config(&script)
                 .arg(marker.to_string_lossy())
                 .timeout(Duration::from_secs(5)),
         )
@@ -542,7 +547,7 @@ printf '%s\n' "$1"
         );
 
         let payload = format!("literal; touch {}", injected.display());
-        let result = run_cli_agent_command(CliAgentCommandConfig::new(script).arg(payload.clone()))
+        let result = run_cli_agent_command(shell_fixture_config(&script).arg(payload.clone()))
             .await
             .unwrap();
 

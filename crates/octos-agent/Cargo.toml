@@ -31,6 +31,29 @@ regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+# MCP client over the official rmcp SDK: stdio + streamable-HTTP + OAuth 2.1.
+rmcp = { version = "1.8", default-features = false, features = [
+    "client",
+    "auth",
+    "macros",
+    "base64",
+    "transport-async-rw",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+oauth2 = "5"
+# rmcp's `AuthClient` wraps a reqwest 0.13 client (rmcp's own reqwest major).
+# Aliased so it coexists with octos's reqwest 0.12; cargo unifies both 0.13
+# users to the same crate instance, so the type matches rmcp's expectations.
+reqwest_rmcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+# Interactive OAuth login (`octos mcp login`): open the consent URL + catch the
+# loopback redirect.
+tiny_http = "0.12"
+webbrowser = "1"
+# Keyring for MCP OAuth token storage. The persistent platform backend is
+# selected per-OS below (`[target.*]`); without one the crate falls back to a
+# non-persistent in-memory mock, so login would silently lose tokens.
+keyring = { workspace = true }
 url = { workspace = true }
 htmd = { workspace = true }
 dirs = { workspace = true }
@@ -54,7 +77,30 @@ redb = { workspace = true }
 hound = { workspace = true }
 symphonia = { workspace = true, optional = true }
 
+# Persistent keyring backend per OS for MCP OAuth token storage. Feature-unioned
+# with the base `keyring` dep above; each is compiled only for its target.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+# Kernel keyutils (pure-Rust, no system libdbus) so it builds on stock CI/Linux.
+# Session-scoped: tokens persist across octos invocations within a login session
+# but not across reboot/logout (a Secret-Service backend would need system
+# libdbus). Documented in the migration ADR.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
 [features]
+# `browser` is ON by default: it gates the headless-Chrome (CDP) search
+# provider that `web_search` uses as a last-resort fallback (after every HTTP
+# provider yields nothing). The underlying `chromiumoxide` dependency and the
+# `browser` tool itself are always compiled; this feature only toggles the new
+# CDP-backed `web_search` fallback so `--no-default-features` builds keep the
+# pre-existing HTTP-only `web_search` behaviour byte-for-byte.
+default = ["browser"]
+browser = []
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
 # Enable MP3 decoding for the `AudioNonSilent` workspace-policy validator.

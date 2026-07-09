@@ -37,6 +37,7 @@ pub struct GatewayDispatcher {
     pub(crate) active_sessions: Arc<RwLock<ActiveSessionStore>>,
     pub(crate) pending_messages: PendingMessages,
     pub(crate) out_tx: mpsc::Sender<OutboundMessage>,
+    pub(crate) session_delete_tx: Option<mpsc::UnboundedSender<String>>,
     /// Profile ID used for building profiled session keys (None = main profile).
     pub(crate) dispatch_profile_id: Option<String>,
     /// Profile data directory for per-user files (soul.md, etc.).
@@ -55,6 +56,7 @@ impl GatewayDispatcher {
             active_sessions,
             pending_messages,
             out_tx,
+            session_delete_tx: None,
             dispatch_profile_id: None,
             data_dir: None,
         }
@@ -72,9 +74,21 @@ impl GatewayDispatcher {
         self
     }
 
+    /// Set the actor-removal event channel used when a session is deleted.
+    pub fn with_session_delete_tx(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
+        self.session_delete_tx = Some(tx);
+        self
+    }
+
     /// Build a profiled session key for the given channel/chat/topic.
     fn profiled_key(&self, channel: &str, chat_id: &str, topic: &str) -> SessionKey {
         build_profiled_session_key(self.dispatch_profile_id.as_deref(), channel, chat_id, topic)
+    }
+
+    fn notify_session_deleted(&self, session_key: &SessionKey) {
+        if let Some(tx) = &self.session_delete_tx {
+            let _ = tx.send(session_key.to_string());
+        }
     }
 
     /// Flush pending (buffered) messages for a session key, delivering them
@@ -219,7 +233,7 @@ impl GatewayDispatcher {
                     match crate::project_templates::scaffold_site_project(
                         &workspace_root,
                         &profile_id,
-                        session_key.chat_id(),
+                        crate::project_templates::preview_session_id(session_key),
                         name,
                         data_dir,
                     ) {
@@ -462,6 +476,7 @@ impl GatewayDispatcher {
                 let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, &current_topic);
                 match self.session_mgr.lock().await.clear(&del_key).await {
                     Ok(()) => {
+                        self.notify_session_deleted(&del_key);
                         self.active_sessions
                             .write()
                             .await
@@ -485,6 +500,7 @@ impl GatewayDispatcher {
             let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             match self.session_mgr.lock().await.clear(&del_key).await {
                 Ok(()) => {
+                    self.notify_session_deleted(&del_key);
                     self.active_sessions
                         .write()
                         .await
@@ -566,6 +582,7 @@ impl GatewayDispatcher {
     pub async fn handle_soul_command(
         &self,
         cmd: &str,
+        inbound: &InboundMessage,
         reply_channel: &str,
         reply_chat_id: &str,
     ) -> Option<DispatchResult> {
@@ -588,26 +605,39 @@ impl GatewayDispatcher {
         };
 
         let arg = cmd.strip_prefix("/soul").unwrap_or("").trim();
+        let soul_key = self.profiled_key(&inbound.channel, &inbound.chat_id, "");
 
         if arg.is_empty() || arg.eq_ignore_ascii_case("show") {
-            let reply = match crate::soul_service::read_soul(data_dir) {
-                Some(content) => format!("🪶 Current soul:\n\n{content}"),
-                None => "No custom soul set. Using default.".to_string(),
+            // Report the EFFECTIVE soul with its source: a per-chat override
+            // wins, otherwise the profile-wide soul (dashboard `/api/my/soul`)
+            // still reaches actors and must not be masked as "No custom soul".
+            let reply = match crate::soul_service::read_soul_for_session(data_dir, &soul_key) {
+                Some(content) => format!("🪶 Current soul (this chat):\n\n{content}"),
+                None => match crate::soul_service::read_soul(data_dir) {
+                    Some(content) => {
+                        format!("🪶 Current soul (profile-wide, no chat override):\n\n{content}")
+                    }
+                    None => "No custom soul set. Using default.".to_string(),
+                },
             };
             let _ = self
                 .out_tx
                 .send(make_reply(reply_channel, reply_chat_id, reply))
                 .await;
         } else if arg.eq_ignore_ascii_case("reset") {
-            match crate::soul_service::remove_soul(data_dir) {
+            match crate::soul_service::remove_soul_for_session(data_dir, &soul_key) {
                 Ok(()) => {
+                    // Only the per-chat override is removed; if a profile-wide
+                    // soul exists it remains effective — say so.
+                    let msg = if crate::soul_service::read_soul(data_dir).is_some() {
+                        "Chat soul override removed; the profile-wide soul still applies. \
+                         Takes effect in new sessions."
+                    } else {
+                        "Soul reset to default. Takes effect in new sessions."
+                    };
                     let _ = self
                         .out_tx
-                        .send(make_reply(
-                            reply_channel,
-                            reply_chat_id,
-                            "Soul reset to default. Takes effect in new sessions.",
-                        ))
+                        .send(make_reply(reply_channel, reply_chat_id, msg))
                         .await;
                 }
                 Err(e) => {
@@ -623,9 +653,9 @@ impl GatewayDispatcher {
                 }
             }
         } else {
-            match crate::soul_service::write_soul(data_dir, arg) {
+            match crate::soul_service::write_soul_for_session(data_dir, &soul_key, arg) {
                 Ok(()) => {
-                    info!(soul_len = arg.len(), "user soul updated");
+                    info!(session = %soul_key, soul_len = arg.len(), "user soul updated");
                     let _ = self
                         .out_tx
                         .send(make_reply(
@@ -694,7 +724,7 @@ impl GatewayDispatcher {
             return r;
         }
         if let Some(r) = self
-            .handle_soul_command(cmd, reply_channel, reply_chat_id)
+            .handle_soul_command(cmd, inbound, reply_channel, reply_chat_id)
             .await
         {
             return r;
@@ -754,6 +784,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         }
     }
 
@@ -1046,6 +1077,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_signal_actor_stop_when_deleting_named_session() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let disp = disp.with_session_delete_tx(delete_tx);
+        let inbound = make_test_inbound("telegram", "123", "/delete old");
+
+        let result = disp
+            .handle_delete_command("/delete old", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Deleted session: old");
+        assert_eq!(
+            delete_rx.try_recv().unwrap(),
+            build_profiled_session_key(None, "telegram", "123", "old").to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn should_delete_named_session_with_short_alias() {
         let (tx, mut rx) = mpsc::channel(16);
         let (disp, _, _tmp) = setup_dispatcher(tx);
@@ -1078,6 +1130,32 @@ mod tests {
         assert!(matches!(result, Some(DispatchResult::Handled)));
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.content, "Deleted session: research");
+    }
+
+    #[tokio::test]
+    async fn should_signal_actor_stop_when_deleting_current_named_session() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let disp = disp.with_session_delete_tx(delete_tx);
+        let inbound = make_test_inbound("telegram", "123", "/delete");
+        disp.active_sessions
+            .write()
+            .await
+            .switch_to("telegram:123", "research")
+            .unwrap();
+
+        let result = disp
+            .handle_delete_command("/delete", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Deleted session: research");
+        assert_eq!(
+            delete_rx.try_recv().unwrap(),
+            build_profiled_session_key(None, "telegram", "123", "research").to_string()
+        );
     }
 
     #[tokio::test]
@@ -1195,6 +1273,128 @@ mod tests {
             .await;
 
         assert!(result.is_none());
+    }
+
+    // ── /soul tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_isolate_soul_by_chat_id() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let inbound_a = make_test_inbound("telegram", "100", "/soul coding helper");
+        let inbound_b = make_test_inbound("telegram", "200", "/soul writing tutor");
+
+        disp.handle_soul_command("/soul coding helper", &inbound_a, "telegram", "100")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "Soul updated. Takes effect in new sessions."
+        );
+
+        disp.handle_soul_command("/soul writing tutor", &inbound_b, "telegram", "200")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "Soul updated. Takes effect in new sessions."
+        );
+
+        disp.handle_soul_command("/soul", &inbound_a, "telegram", "100")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("coding helper"));
+
+        disp.handle_soul_command("/soul", &inbound_b, "telegram", "200")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("writing tutor"));
+
+        disp.handle_soul_command("/soul reset", &inbound_a, "telegram", "100")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "Soul reset to default. Takes effect in new sessions."
+        );
+
+        disp.handle_soul_command("/soul", &inbound_a, "telegram", "100")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "No custom soul set. Using default."
+        );
+
+        disp.handle_soul_command("/soul", &inbound_b, "telegram", "200")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("writing tutor"));
+    }
+
+    #[tokio::test]
+    async fn should_report_profile_wide_soul_when_no_chat_override() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let inbound = make_test_inbound("telegram", "100", "/soul");
+
+        // Profile-wide soul (set via the dashboard) lives at data_dir/soul.md
+        // and reaches actors even without a per-chat override.
+        crate::soul_service::write_soul(tmp.path(), "dashboard persona").unwrap();
+
+        // /soul show without a per-chat override must report the effective
+        // profile-wide soul with its source, not "No custom soul set".
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("dashboard persona"), "reply: {reply}");
+        assert!(reply.contains("profile-wide"), "reply: {reply}");
+
+        // A per-chat override takes precedence in the report.
+        disp.handle_soul_command("/soul chat persona", &inbound, "telegram", "100")
+            .await;
+        let _ = rx.try_recv().unwrap();
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("chat persona"), "reply: {reply}");
+        assert!(!reply.contains("profile-wide"), "reply: {reply}");
+
+        // /soul reset removes only the per-chat override; the message must
+        // say the profile-wide soul still applies.
+        disp.handle_soul_command("/soul reset", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("profile-wide"), "reply: {reply}");
+
+        // After reset the profile-wide soul is the effective one again.
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("dashboard persona"), "reply: {reply}");
+    }
+
+    #[tokio::test]
+    async fn should_isolate_soul_by_profile_id() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let mut disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let inbound = make_test_inbound("telegram", "100", "/soul");
+
+        disp.dispatch_profile_id = Some("profile-a".to_string());
+        disp.handle_soul_command("/soul profile a", &inbound, "telegram", "100")
+            .await;
+        let _ = rx.try_recv().unwrap();
+
+        disp.dispatch_profile_id = Some("profile-b".to_string());
+        disp.handle_soul_command("/soul profile b", &inbound, "telegram", "100")
+            .await;
+        let _ = rx.try_recv().unwrap();
+
+        disp.dispatch_profile_id = Some("profile-a".to_string());
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("profile a"));
+
+        disp.dispatch_profile_id = Some("profile-b".to_string());
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("profile b"));
     }
 
     // ── try_dispatch_session_command tests ───────────────────────────────

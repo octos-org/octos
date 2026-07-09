@@ -5,6 +5,7 @@
 
 pub mod artifact;
 pub mod checkpoint;
+pub mod compose;
 pub mod condition;
 pub mod context;
 pub mod discovery;
@@ -12,12 +13,15 @@ pub mod events;
 pub mod executor;
 pub mod fidelity;
 pub mod graph;
+pub mod guard;
 pub mod handler;
 pub mod host_context;
 pub mod human_gate;
+pub mod ir;
 pub mod manager;
 pub mod model_assignment;
 pub mod parser;
+pub mod profile;
 pub mod recovery;
 pub mod run_dir;
 pub mod server;
@@ -37,11 +41,12 @@ pub use executor::{
     PIPELINE_DEADLINE_EXCEEDED_TOTAL, PipelineExecutor, PipelineResult, PipelineStatusBridge,
     deadline_exceeded_count,
 };
-pub use fidelity::FidelityMode;
+pub use fidelity::{DEFAULT_RESULT_CEILING_BYTES, FidelityMode, apply_result_ceiling};
 pub use graph::{
     DeadlineAction, HandlerKind, MissionCheckpoint, NodeOutcome, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode, Subgraph, validate_pipeline_id,
 };
+pub use guard::{GuardContext, GuardDecision, PipelineGuard, TimeoutGuard, TokenBudgetGuard};
 pub use handler::{
     CodergenHandler, GateHandler, Handler, HandlerRegistry, NoopHandler, ShellHandler,
 };

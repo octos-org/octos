@@ -5,7 +5,7 @@
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -36,9 +36,60 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "GEMINI_BASE_URL",
     "GOOGLE_API_KEY",
     "GOOGLE_BASE_URL",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "VERTEX_BASE_URL",
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
 ];
+
+/// Google / Vertex credential material: the raw service-account JSON, the
+/// application-default-credentials path, and OAuth access tokens. Unlike
+/// [`FIRST_PARTY_SKILL_ENV_VARS`], these are forwarded to skill processes
+/// ONLY when the profile's own provider chain (primary or a fallback)
+/// resolves to a Google-family provider — a profile that merely has Vertex
+/// credentials configured but routes through a different provider must not
+/// hand its SA JSON to every skill subprocess.
+///
+/// The names are also force-registered via
+/// [`octos_agent::register_secret_env_names`]: `VERTEX_SA_JSON` in
+/// particular does not look secret to the `is_secret_env_name` heuristic,
+/// and the provider-build-time registration in `Config::resolve_api_key`
+/// only fires when Vertex is the ACTIVE provider.
+const GOOGLE_VERTEX_CREDENTIAL_ENV_VARS: &[&str] = &[
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "VERTEX_SA_JSON",
+    "VERTEX_ACCESS_TOKEN",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+];
+
+/// Provider families that authenticate against Google Cloud credentials.
+/// Mirrors the provider-name spellings `build_plugin_env` special-cases.
+fn is_google_family_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "gemini" | "google" | "vertex" | "vertex-ai" | "vertexai"
+    )
+}
+
+/// True when the profile's provider chain (primary or any fallback)
+/// resolves to a Google-family provider. Mirrors the runtime provider
+/// resolution: explicit `family_id` first, else `detect_provider` on the
+/// selection's model id.
+fn profile_uses_google_family_provider(profile: &crate::profiles::UserProfile) -> bool {
+    profile.config.llm.as_ref().is_some_and(|llm| {
+        llm.primary
+            .iter()
+            .chain(llm.fallbacks.iter())
+            .any(|selection| {
+                selection
+                    .family_id
+                    .as_deref()
+                    .or_else(|| selection.model_id.as_deref().and_then(detect_provider))
+                    .is_some_and(is_google_family_provider)
+            })
+    })
+}
 
 pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
     match provider_id {
@@ -106,6 +157,26 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
         }
     }
 
+    // Google / Vertex credentials: ALWAYS secret-register the names (their
+    // values may sit in the process env regardless of the active provider,
+    // and `VERTEX_SA_JSON` doesn't trip the secret-name heuristic), but
+    // forward them ONLY to skills of a profile whose provider chain actually
+    // uses a Google-family provider. This keeps the sanctioned path working —
+    // a Vertex-routed profile's skills still receive the SA JSON — without
+    // leaking it into every skill subprocess of unrelated profiles.
+    octos_agent::register_secret_env_names(GOOGLE_VERTEX_CREDENTIAL_ENV_VARS.iter().copied());
+    if profile_uses_google_family_provider(profile) {
+        for key in GOOGLE_VERTEX_CREDENTIAL_ENV_VARS {
+            if let Some(value) = resolved_env_vars
+                .get(*key)
+                .cloned()
+                .or_else(|| std::env::var(key).ok())
+            {
+                push_env_once(&mut env, *key, value);
+            }
+        }
+    }
+
     if let Some(slides) = profile
         .config
         .apps
@@ -124,14 +195,24 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
 }
 
 fn discover_ominix_url() -> Option<String> {
-    std::env::var("OMINIX_API_URL").ok().or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-        std::fs::read_to_string(discovery)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+    std::env::var("OMINIX_API_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            for dir in [".ominix", ".OminiX"] {
+                let discovery = std::path::Path::new(&home).join(dir).join("api_url");
+                if let Some(url) = std::fs::read_to_string(discovery)
+                    .ok()
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(url);
+                }
+            }
+            None
+        })
 }
 
 fn push_runtime_plugin_env(
@@ -332,11 +413,18 @@ pub(crate) fn build_plugin_env(
             env.push(("OPENAI_API_KEY".to_string(), api_key));
         } else {
             let key_var = match provider_name {
-                "gemini" | "google" => "GEMINI_API_KEY",
-                "dashscope" | "qwen" => "DASHSCOPE_API_KEY",
-                _ => "OPENAI_API_KEY",
+                "gemini" | "google" => Some("GEMINI_API_KEY"),
+                "dashscope" | "qwen" => Some("DASHSCOPE_API_KEY"),
+                // Vertex authenticates with a service-account JSON, not an API
+                // key. It is not a usable credential for any plugin, and must
+                // never be forwarded under the wrong `OPENAI_API_KEY` name —
+                // so inject nothing for it.
+                "vertex" | "vertex-ai" | "vertexai" => None,
+                _ => Some("OPENAI_API_KEY"),
             };
-            env.push((key_var.to_string(), api_key));
+            if let Some(key_var) = key_var {
+                env.push((key_var.to_string(), api_key));
+            }
         }
     }
 
@@ -478,6 +566,18 @@ pub(crate) fn build_synthesis_config(
 pub(super) struct ProfileActorFactoryBuilder {
     pub(super) profile_store: Arc<crate::profiles::ProfileStore>,
     pub(super) project_dir: PathBuf,
+    /// Gap 4.1 BLOCKER 1: the effective octos root the gateway bootstraps
+    /// bundled pipelines into (`--octos-home` > `data_dir`). The child-profile
+    /// `run_pipeline` tool is built `with_octos_home(effective_octos_home)` so
+    /// its discovery searches the EXACT dir bootstrap wrote into
+    /// (bootstrap-dir == search-dir). Previously the child factory reused
+    /// `project_dir` (= `cwd/.octos` on the standalone path where
+    /// `--octos-home` is absent), so discovery searched a dir bootstrap never
+    /// wrote — letting the embedded fallback beat an installed global
+    /// pipeline. In production `--octos-home` is always passed so
+    /// `effective_octos_home == project_dir`, but the standalone/default path
+    /// must also be correct.
+    pub(super) effective_octos_home: PathBuf,
     pub(super) tool_config: Arc<octos_agent::ToolConfigStore>,
     pub(super) memory: Arc<EpisodeStore>,
     pub(super) memory_store: Arc<MemoryStore>,
@@ -511,9 +611,25 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// can mandate strict signing even when individual profile JSONs omit
     /// the flag. Mirrors `ProfileRuntime::bootstrap_with_host_plugins`.
     pub(super) host_plugins: crate::config::PluginsConfig,
+    /// Host-level memory settings from the gateway's resolved config (which
+    /// already applied the config-beats-env precedence in
+    /// `Config::from_file`). Routed child profiles that omit `memory` fall
+    /// back to this, NOT to a re-read of the ambient env var, so they follow
+    /// the exact precedence of the main actor.
+    pub(super) host_memory: Option<crate::config::MemoryConfig>,
 }
 
 impl ProfileActorFactoryBuilder {
+    /// Gap 4.1 BLOCKER 1: the octos root a child-profile `run_pipeline` tool
+    /// must search. It is the effective octos home (`--octos-home` > data_dir)
+    /// the gateway bootstrapped the bundled pipelines into — NOT `project_dir`
+    /// (= `cwd/.octos` on the standalone path), which bootstrap never wrote.
+    /// Keeping these identical preserves bootstrap-dir == search-dir, so an
+    /// installed global pipeline always wins over the bundled fallback.
+    pub(super) fn child_pipeline_octos_home(&self) -> &Path {
+        &self.effective_octos_home
+    }
+
     pub(super) async fn build(&self, profile_id: &str) -> Result<ActorFactory> {
         let profile = self
             .profile_store
@@ -530,6 +646,12 @@ impl ProfileActorFactoryBuilder {
         if self.host_plugins.require_signed {
             profile_config.plugins.require_signed = true;
         }
+        // Host memory settings apply field-by-field when the child profile
+        // doesn't override them (same pattern as bootstrap_with_host_plugins).
+        crate::config::merge_host_memory_into_profile(
+            &mut profile_config.memory,
+            self.host_memory.as_ref(),
+        );
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -541,18 +663,22 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
+        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
+            profile_config.memory.as_ref(),
+        );
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(profile_config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
             &self.project_dir,
-            &self.memory_store,
             &skills_loader,
             &self.tool_config,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            system_prompt.post_memory.push_str("\n\n");
+            system_prompt.post_memory.push_str(fragment);
         }
         let mut pipeline_factory = self.pipeline_factory.clone();
         let mut provider_policy = self.provider_policy.clone();
@@ -561,6 +687,13 @@ impl ProfileActorFactoryBuilder {
         // Collected for SpawnTool subagents (set inside the else branch below).
         let mut actor_plugin_dirs: Vec<PathBuf> = Vec::new();
         let mut actor_plugin_env: Vec<(String, String)> = Vec::new();
+
+        // Resolve the profile's embedding provider ONCE; the child
+        // pipeline factory and the ActorFactory below share this handle
+        // (codex P3: duplicate resolves broke the single-handle
+        // invariant and doubled keychain lookups).
+        let profile_embedder =
+            create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
@@ -681,6 +814,9 @@ impl ProfileActorFactoryBuilder {
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
+            if memory_refresh_enabled {
+                tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
+            }
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);
             }
@@ -761,47 +897,15 @@ impl ProfileActorFactoryBuilder {
             };
             provider_router = child_router.clone();
 
-            tools.set_base_tools([
-                "run_pipeline",
-                "search",
-                "deep_crawl",
-                "web_search",
-                "web_fetch",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "shell",
-                "list_dir",
-                "glob",
-                "grep",
-                "message",
-                "send_file",
-                "spawn",
-                "activate_tools",
-            ]);
-            let visible = tools.specs().len();
-            if visible > 15 {
-                for group in &[
-                    "group:memory",
-                    "group:admin",
-                    "group:sessions",
-                    "group:web",
-                    "group:runtime",
-                    "group:media",
-                ] {
-                    tools.defer_group(group);
-                }
-            }
-            if tools.has_deferred() {
-                tools.register(octos_agent::ActivateToolsTool::new());
-            }
+            // RFC-0 (#1289): LRU tool deferral + the `activate_tools`
+            // meta-tool were removed. Every enabled tool is emitted every
+            // turn (full schema) — no base-tool pin list or auto-defer pass.
 
             // PR #688 follow-up — codex finding: re-apply tool_policy
             // AFTER all base-registry tools have been registered. The
-            // first pass at line ~648 ran before `ActivateToolsTool`
-            // (and any other late-registered base tools) existed, so a
-            // `tool_policy.deny` entry targeting them was bypassed at
-            // the base level. Per-session re-apply in
+            // first pass at line ~648 ran before some late-registered base
+            // tools existed, so a `tool_policy.deny` entry targeting them
+            // was bypassed at the base level. Per-session re-apply in
             // `ActorFactory::spawn` still covers `run_pipeline`.
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);
@@ -846,11 +950,10 @@ impl ProfileActorFactoryBuilder {
             }
 
             // NEW-06 fix: the parent ActorFactory's session agent gets
-            // its embedder from `create_embedder(profile_config)`; mirror
-            // that here so child-profile pipeline workers run on the
-            // same contamination-safe hybrid memory path.
-            let child_pipeline_embedder = create_embedder(&profile_config)
-                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            // its embedder from the shared single resolve below; hand the
+            // same handle here so child-profile pipeline workers run on
+            // the same contamination-safe hybrid memory path.
+            let child_pipeline_embedder = profile_embedder.clone();
 
             pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
                 llm: llm.clone(),
@@ -859,7 +962,13 @@ impl ProfileActorFactoryBuilder {
                 policy: provider_policy.clone(),
                 plugin_dirs: plugin_dirs.clone(),
                 router: provider_router.clone(),
-                octos_home: self.project_dir.clone(),
+                // Gap 4.1 BLOCKER 1: the child-profile pipeline root MUST be
+                // the same `effective_octos_home` the gateway bootstrapped the
+                // bundled pipelines into — NOT `project_dir` (= `cwd/.octos`
+                // on the standalone path). bootstrap-dir == search-dir, so an
+                // installed global pipeline wins over the bundled fallback on
+                // every path, including standalone `octos gateway`.
+                octos_home: self.child_pipeline_octos_home().to_path_buf(),
                 // Section B (codex review follow-up): propagate the
                 // profile's strict-signing policy.
                 plugin_require_signed: profile_config.plugins.require_signed,
@@ -872,8 +981,8 @@ impl ProfileActorFactoryBuilder {
 
         if !child_plugin_prompt_fragments.is_empty() {
             for fragment in &child_plugin_prompt_fragments {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(fragment);
+                system_prompt.post_memory.push_str("\n\n");
+                system_prompt.post_memory.push_str(fragment);
             }
         }
 
@@ -884,12 +993,18 @@ impl ProfileActorFactoryBuilder {
         } else {
             Some(Arc::new(HookExecutor::new(all_hooks)))
         };
+        let usage_ledger = Arc::new(
+            crate::usage_ledger::PersistentUsageLedger::open_sync(&profile_data_dir)
+                .wrap_err("failed to open profile usage ledger")?,
+        );
 
         Ok(ActorFactory {
             agent_config: self.agent_config.clone(),
             llm: llm.clone(),
             llm_for_compaction,
             memory: self.memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: Arc::new(std::sync::RwLock::new(system_prompt)),
             hooks,
             hook_context_template: Some(HookContext {
@@ -897,6 +1012,7 @@ impl ProfileActorFactoryBuilder {
                 profile_id: Some(profile_id.to_string()),
             }),
             data_dir: profile_data_dir,
+            usage_ledger: Some(usage_ledger),
             session_mgr: self.session_mgr.clone(),
             out_tx: self.out_tx.clone(),
             spawn_inbound_tx: self.spawn_inbound_tx.clone(),
@@ -919,8 +1035,7 @@ impl ProfileActorFactoryBuilder {
             tool_policy: profile_config.tool_policy.clone(),
             worker_prompt,
             provider_router,
-            embedder: create_embedder(&profile_config)
-                .map(|embedder| embedder as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: profile_embedder,
             active_sessions: self.active_sessions.clone(),
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
@@ -953,7 +1068,8 @@ impl ProfileActorFactoryBuilder {
 mod tests {
     use super::*;
     use crate::profiles::{
-        AppsConfig, ProfileConfig, SearchConfig, SearchProviderConfig, SlidesAppConfig, UserProfile,
+        AppsConfig, LlmModelSelectionConfig, LlmProfileConfig, ProfileConfig, SearchConfig,
+        SearchProviderConfig, SlidesAppConfig, UserProfile,
     };
     use chrono::Utc;
 
@@ -1012,6 +1128,177 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn profile_plugin_env_forwards_vertex_service_account_to_vertex_profile_by_its_own_name() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let prev_google_credentials = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+        // SAFETY: serialized by `synthesis_env_lock`; this test verifies profile
+        // env forwarding without inheriting the developer/CI host's Google SDK env.
+        unsafe { std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS") };
+
+        let service_account = "{\"type\":\"service_account\",\"project_id\":\"mofa-test\"}";
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                // Vertex is the profile's PRIMARY provider — the condition
+                // under which its skills are entitled to the SA JSON.
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("vertex".to_string()),
+                        model_id: Some("gemini-2.5-pro".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![],
+                }),
+                env_vars: [
+                    ("VERTEX_SA_JSON".to_string(), service_account.to_string()),
+                    (
+                        "GOOGLE_CLOUD_LOCATION".to_string(),
+                        "us-central1".to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&("VERTEX_SA_JSON".to_string(), service_account.to_string())));
+        assert!(env.contains(&(
+            "GOOGLE_CLOUD_LOCATION".to_string(),
+            "us-central1".to_string()
+        )));
+        assert!(
+            !env.iter()
+                .any(|(key, _)| key == "GOOGLE_APPLICATION_CREDENTIALS")
+        );
+
+        // SAFETY: serialized by `synthesis_env_lock`.
+        if let Some(value) = prev_google_credentials {
+            unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", value) };
+        }
+    }
+
+    /// A profile with Vertex/Google credentials in `env_vars` but a
+    /// NON-Google provider chain must not leak them to its skill
+    /// subprocesses: the SA JSON is a private key, and nothing in a
+    /// deepseek-routed profile's skills is entitled to it.
+    #[test]
+    fn profile_plugin_env_does_not_leak_google_vertex_credentials_to_non_google_profiles() {
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("deepseek".to_string()),
+                        model_id: Some("deepseek-chat".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        ..Default::default()
+                    }],
+                }),
+                env_vars: [
+                    (
+                        "VERTEX_SA_JSON".to_string(),
+                        "{\"type\":\"service_account\",\"private_key\":\"x\"}".to_string(),
+                    ),
+                    (
+                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                        "/secrets/sa.json".to_string(),
+                    ),
+                    ("VERTEX_ACCESS_TOKEN".to_string(), "ya29.t".to_string()),
+                    (
+                        "GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                        "ya29.o".to_string(),
+                    ),
+                    (
+                        "GOOGLE_CLOUD_LOCATION".to_string(),
+                        "us-central1".to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        for credential in GOOGLE_VERTEX_CREDENTIAL_ENV_VARS {
+            assert!(
+                !env.iter().any(|(key, _)| key == credential),
+                "{credential} must not be forwarded to a non-Google profile's skills: {env:?}"
+            );
+        }
+        // Non-credential Google config still forwards (it is harmless and
+        // some skills use it for display/diagnostics).
+        assert!(env.contains(&(
+            "GOOGLE_CLOUD_LOCATION".to_string(),
+            "us-central1".to_string()
+        )));
+    }
+
+    /// A Google-family provider anywhere in the chain (here: a gemini
+    /// FALLBACK behind a non-Google primary) still entitles the profile's
+    /// skills to the Google credentials.
+    #[test]
+    fn profile_plugin_env_forwards_google_credentials_when_google_family_fallback_in_chain() {
+        let service_account = "{\"type\":\"service_account\",\"project_id\":\"mofa-test\"}";
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("deepseek".to_string()),
+                        model_id: Some("deepseek-chat".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![LlmModelSelectionConfig {
+                        // No explicit family_id: resolution falls back to
+                        // detect_provider on the model id, mirroring the
+                        // runtime provider resolution.
+                        model_id: Some("gemini-2.5-flash".to_string()),
+                        ..Default::default()
+                    }],
+                }),
+                env_vars: [("VERTEX_SA_JSON".to_string(), service_account.to_string())].into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(
+            env.contains(&("VERTEX_SA_JSON".to_string(), service_account.to_string())),
+            "gemini fallback in the chain must keep the sanctioned forwarding path working: {env:?}"
+        );
     }
 
     /// Mutex serializing build_synthesis_config env tests in this module.
@@ -1074,5 +1361,130 @@ mod tests {
         if let Some(v) = prev_key {
             unsafe { std::env::set_var("OPENAI_API_KEY", v) };
         }
+    }
+
+    #[test]
+    fn build_plugin_env_does_not_forward_vertex_sa_json_as_api_key() {
+        // A Vertex service-account JSON is not an API key. It must never be
+        // injected into plugin env under any `*_API_KEY` name (the catch-all
+        // arm would otherwise hand it to plugins as a bogus OPENAI_API_KEY).
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert(
+            "VERTEX_SA_JSON".to_string(),
+            "{\"type\":\"service_account\",\"project_id\":\"p\"}".to_string(),
+        );
+        let config = crate::config::Config {
+            provider: Some("vertex".to_string()),
+            env_vars,
+            ..Default::default()
+        };
+
+        let env = build_plugin_env(&config, "vertex");
+
+        assert!(
+            !env.iter().any(|(k, _)| k.ends_with("_API_KEY")),
+            "Vertex SA JSON must not be forwarded to plugins as an API key: {env:?}"
+        );
+    }
+
+    /// Gap 4.1 BLOCKER 1 (standalone gateway child-profile uses the wrong
+    /// pipeline root) — on the standalone path `project_dir` (= `cwd/.octos`)
+    /// and `effective_octos_home` (= `data_dir`) DIFFER, and the gateway
+    /// bootstraps bundled pipelines into `effective_octos_home`. The
+    /// child-profile `run_pipeline` factory MUST be rooted at
+    /// `effective_octos_home` (bootstrap-dir == search-dir), NOT `project_dir`.
+    ///
+    /// RED on 344d0df1: the builder had no `effective_octos_home` field and the
+    /// child factory was rooted at `self.project_dir` — so this test could not
+    /// even be written (the field/helper did not exist), and a global pipeline
+    /// installed under `effective_octos_home` was invisible to child sessions.
+    #[tokio::test]
+    async fn child_pipeline_root_is_effective_octos_home_not_project_dir() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Standalone layout: these two dirs are DISTINCT.
+        let project_dir = tmp.path().join("cwd").join(".octos");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let effective_octos_home = tmp.path().join("data");
+        std::fs::create_dir_all(&effective_octos_home).unwrap();
+        assert_ne!(
+            project_dir, effective_octos_home,
+            "test precondition: standalone roots must differ"
+        );
+
+        let store = Arc::new(crate::profiles::ProfileStore::open(tmp.path()).unwrap());
+        let tool_config = Arc::new(
+            octos_agent::ToolConfigStore::open(&effective_octos_home)
+                .await
+                .unwrap(),
+        );
+        let memory = Arc::new(EpisodeStore::open(&effective_octos_home).await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(&effective_octos_home).await.unwrap());
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&effective_octos_home).unwrap(),
+        ));
+        let active_sessions = Arc::new(RwLock::new(
+            ActiveSessionStore::open(&effective_octos_home).unwrap(),
+        ));
+        let pending_messages: crate::session_actor::PendingMessages =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel(4);
+        let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);
+        let cron_service = Arc::new(CronService::new(
+            effective_octos_home.join("cron"),
+            cron_in_tx,
+        ));
+
+        let builder = ProfileActorFactoryBuilder {
+            profile_store: store,
+            project_dir: project_dir.clone(),
+            effective_octos_home: effective_octos_home.clone(),
+            tool_config,
+            memory,
+            memory_store,
+            agent_config: AgentConfig::default(),
+            session_mgr,
+            out_tx,
+            spawn_inbound_tx,
+            cron_service,
+            tool_registry_factory: Arc::new(SnapshotToolRegistryFactory::new(ToolRegistry::new())),
+            pipeline_factory: None,
+            max_history: Arc::new(AtomicUsize::new(50)),
+            session_timeout_secs: octos_agent::DEFAULT_SESSION_TIMEOUT_SECS,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cwd: project_dir.clone(),
+            provider_policy: None,
+            worker_prompt: None,
+            provider_router: None,
+            active_sessions,
+            pending_messages,
+            queue_mode: crate::config::QueueMode::Followup,
+            plugin_prompt_fragments: vec![],
+            no_retry: false,
+            sandbox_config: octos_agent::SandboxConfig::default(),
+            task_query_store: crate::session_actor::SessionTaskQueryStore::default(),
+            subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
+                effective_octos_home.join("subagent-out"),
+            )),
+            host_plugins: Default::default(),
+            host_memory: None,
+        };
+
+        // The child-profile pipeline root MUST be effective_octos_home — the
+        // dir the gateway bootstraps bundled pipelines into — so bootstrap-dir
+        // == search-dir and an installed global pipeline wins over the bundle.
+        assert_eq!(
+            builder.child_pipeline_octos_home(),
+            effective_octos_home.as_path(),
+            "child-profile pipeline root must be effective_octos_home (bootstrap dir)"
+        );
+        assert_ne!(
+            builder.child_pipeline_octos_home(),
+            project_dir.as_path(),
+            "child-profile pipeline root must NOT be project_dir (cwd/.octos), which \
+             bootstrap never wrote — the 344d0df1 defect"
+        );
     }
 }

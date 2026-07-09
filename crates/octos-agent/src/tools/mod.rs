@@ -29,7 +29,7 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -353,12 +353,66 @@ tokio::task_local! {
     pub static TOOL_APPROVAL_CTX: Arc<dyn ToolApprovalRequester>;
 }
 
+/// Request emitted by the `ask_user_question` tool when it asks the user a
+/// structured multiple-choice question mid-turn (UPCR-2026-023).
+///
+/// Mirrors [`ToolApprovalRequest`]: a typed payload the
+/// [`UserQuestionRequester`] surfaces to the attached client, blocking the
+/// tool on a oneshot until the client answers. `questions` is already
+/// validated (1..=4 questions, 2..=4 options each); `title`/`body` are the
+/// mandatory generic fallback text a non-structured client renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionRequest {
+    pub questions: Vec<octos_core::ui_protocol::UserQuestion>,
+    pub title: String,
+    pub body: String,
+}
+
+/// Outcome returned to the blocked `ask_user_question` tool after client
+/// handling (UPCR-2026-023). Mirrors [`ToolApprovalDecision`] but carries the
+/// structured per-question answers and distinguishes a cancelled turn from an
+/// unsupported client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserQuestionOutcome {
+    /// The client answered; one entry per question, in question order.
+    Answered(Vec<octos_core::ui_protocol::UserQuestionAnswer>),
+    /// The turn was interrupted / the pending question drained before an
+    /// answer arrived. The tool returns a cancelled result.
+    Cancelled,
+    /// No capable client was attached for this turn; the tool degrades to the
+    /// structured-metadata fallback (§4.4).
+    Unsupported,
+}
+
+/// Async user-question bridge provided by clients that negotiated
+/// `user_question.v1` (UPCR-2026-023). Mirrors [`ToolApprovalRequester`]:
+/// scoped per-turn via [`USER_QUESTION_CTX`] so the `ask_user_question` tool
+/// can block on a oneshot until `user_question/respond` resolves it.
+#[async_trait]
+pub trait UserQuestionRequester: Send + Sync {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome;
+}
+
+tokio::task_local! {
+    /// Optional task-local user-question bridge scoped around a turn by
+    /// interactive clients that negotiated `user_question.v1`. When unset the
+    /// `ask_user_question` tool degrades gracefully (no hard block).
+    pub static USER_QUESTION_CTX: Arc<dyn UserQuestionRequester>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnAttachmentContext {
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
     pub prompt_summary: Option<String>,
+    /// Explicit live-video signal for this turn, set by the ingress from the
+    /// client (`InboundMessage.metadata.live_video`) — NOT inferred from
+    /// attachment types. True only when the turn is a real-time video call
+    /// whose attached image is the user's current camera frame; drives the
+    /// agent loop's video-call note. Defaults false (no auto-detection): a
+    /// voice note plus an uploaded image is not a camera frame.
+    pub live_video: bool,
 }
 
 tokio::task_local! {
@@ -521,7 +575,7 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
-    /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
+    /// Downcast support for concrete tool access (e.g. mofa-make dispatcher wiring).
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: no downcasting. Override in tools that need it.
         &()
@@ -537,84 +591,50 @@ pub trait Tool: Send + Sync {
     fn concurrency_class(&self) -> ConcurrencyClass {
         ConcurrencyClass::Safe
     }
-}
 
-/// LRU-based tool lifecycle manager.
-///
-/// Tracks per-tool usage and auto-evicts idle tools when the active count
-/// exceeds a threshold. Base tools are pinned and never evicted.
-pub struct ToolLifecycle {
-    /// Per-tool last-used iteration counter.
-    pub(crate) last_used: HashMap<String, u32>,
-    /// Current iteration counter.
-    pub(crate) iteration: u32,
-    /// Tools that are never auto-evicted.
-    pub(crate) base_tools: HashSet<String>,
-    /// Maximum active tools before eviction kicks in.
-    pub(crate) max_active: usize,
-    /// Tools idle for this many iterations become eviction candidates.
-    pub(crate) idle_threshold: u32,
-}
-
-impl Default for ToolLifecycle {
-    fn default() -> Self {
-        Self {
-            last_used: HashMap::new(),
-            iteration: 0,
-            base_tools: HashSet::new(),
-            max_active: 15,
-            idle_threshold: 5,
-        }
-    }
-}
-
-impl ToolLifecycle {
-    /// Set base tools that are never auto-evicted.
-    pub fn set_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.base_tools = names.into_iter().map(|n| n.into()).collect();
+    /// Per-tool execution timeout (seconds) enforced at the registry dispatch
+    /// boundary (Gap 3.3). `None` (the default) means "use the registry's
+    /// global backstop" (`ToolRegistry::set_tool_timeout_secs`, default
+    /// 1800s). A tool that returns `Some(n)` caps its own foreground
+    /// execution at `n` seconds regardless of the registry default.
+    ///
+    /// This is the LAST line of defence against a hung foreground tool
+    /// wedging the session-actor turn forever: even direct registry callers
+    /// (e.g. the serve/API tool path, workspace-contract auto-send) that do
+    /// not run inside the agent loop's per-batch timeout get bounded here.
+    /// It composes with — and is independent of — the agent loop's
+    /// fast/long batch timeout in `agent::execution`, which fires first on
+    /// that path; this guard catches the unprotected direct-caller paths.
+    ///
+    /// `spawn_only` tools are intercepted and backgrounded BEFORE the
+    /// foreground dispatch path, so they never hit this timeout. Genuinely
+    /// long-running foreground tools (`web_fetch`, `web_search`, `browser`,
+    /// deep research/crawl) inherit the generous 1800s backstop by leaving
+    /// this `None`; the `shell` tool already clamps its own internal timeout
+    /// to [1, 600]s, well under the backstop, so it is not double-killed.
+    ///
+    /// Default: `None` (inherit the registry backstop). Keep any override
+    /// generous — this is a safety net, not a tuning knob for normal work.
+    fn execution_timeout_secs(&self) -> Option<u64> {
+        None
     }
 
-    /// Add more tools to the base set (extends, does not replace).
-    pub fn add_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.base_tools.extend(names.into_iter().map(|n| n.into()));
-    }
-
-    /// Record that a tool was used at the current iteration.
-    pub fn record_usage(&mut self, name: &str) {
-        self.last_used.insert(name.to_string(), self.iteration);
-    }
-
-    /// Advance the iteration counter.
-    pub fn tick(&mut self) {
-        self.iteration += 1;
-    }
-
-    /// Find idle non-base tools to evict from `active_tools`, sorted by
-    /// staleness (oldest first). Callers should have already excluded
-    /// deferred tools from `active_tools`.
-    pub fn find_evictable(&self, active_tools: &[&str]) -> Vec<String> {
-        let active_count = active_tools.len();
-        if active_count <= self.max_active {
-            return Vec::new();
-        }
-
-        let mut candidates: Vec<(&str, u32)> = active_tools
-            .iter()
-            .filter(|name| !self.base_tools.contains(**name))
-            .map(|name| {
-                let last = self.last_used.get(*name).copied().unwrap_or(0);
-                (*name, last)
-            })
-            .filter(|(_, last)| self.iteration.saturating_sub(*last) >= self.idle_threshold)
-            .collect();
-
-        candidates.sort_by_key(|(_, last)| *last);
-        let to_evict = active_count.saturating_sub(self.max_active);
-        candidates
-            .into_iter()
-            .take(to_evict)
-            .map(|(name, _)| name.to_string())
-            .collect()
+    /// Whether this tool BLOCKS on human input (e.g. `ask_user_question`
+    /// awaits the [`USER_QUESTION_CTX`] requester until the client answers,
+    /// exactly as the approval gate blocks on [`TOOL_APPROVAL_CTX`]). Such a
+    /// tool must be EXEMPT from the dispatch-boundary timeout in
+    /// [`ToolRegistry::execute_with_context`]: a human may legitimately take
+    /// longer than any finite tool timeout, and firing the timeout would drop
+    /// the requester's receiver and leak the pending question/approval store
+    /// entry forever (Gap-3.3 interaction). The waiting future is instead
+    /// cancelled the right way — when the turn is interrupted the pending
+    /// store drains the entry and resolves the waiter as `Cancelled`.
+    ///
+    /// Returning `true` here makes the registry skip wrapping the call in the
+    /// dispatch timeout entirely (it still composes with the agent loop's
+    /// per-turn lifecycle and the turn-interrupt drain). Default: `false`.
+    fn blocks_on_human_input(&self) -> bool {
+        false
     }
 }
 
@@ -642,6 +662,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod ask_user_question;
 pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
@@ -654,12 +675,14 @@ pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
+pub mod memory_note;
 pub mod message;
 pub mod read_file;
 pub mod read_task_output;
 pub mod recall_memory;
 pub mod research_utils;
 pub mod save_memory;
+pub mod send_app_card;
 pub mod send_file;
 pub mod shell;
 #[allow(dead_code)]
@@ -670,11 +693,11 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
-pub mod activate_tools;
 pub mod admin;
 pub mod browser;
 pub mod check_background_tasks;
 pub mod check_workspace_contract;
+pub mod mofa_make;
 pub mod tool_config;
 pub mod workspace_history;
 
@@ -684,6 +707,7 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use ask_user_question::AskUserQuestionTool;
 pub use coding_tools::{
     ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
     ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
@@ -709,11 +733,13 @@ pub use mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
+pub use memory_note::MemoryNoteTool;
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
+pub use send_app_card::SendAppCardTool;
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
 pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
@@ -722,10 +748,12 @@ pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
-pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
+pub use mofa_make::{
+    MakeTypeEntry, MofaDescribeContentTypeTool, MofaMakeTool, make_dispatcher_with_entries,
+};
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 pub use workspace_history::{WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool};
 
@@ -1106,7 +1134,7 @@ pub fn is_symlink_error(e: &std::io::Error) -> bool {
 pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
@@ -1125,40 +1153,36 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
         }
         let mut file = opts.open(&path)?;
 
-        // Peek the first 5 bytes to detect a PDF (`%PDF-`). The symlink-safe
-        // open above is already done; the bytes we read here can't have
-        // followed a symlink. PDF content is binary so `read_to_string`
-        // would fail with a UTF-8 error — for those we route through
-        // `pdf-extract` to recover plain text. Pinned by the mini5 invoice
-        // upload regression (2026-05-12): the LLM couldn't summarize a PDF
-        // because read_to_string aborted immediately.
+        // Peek the first 5 bytes to detect a PDF (`%PDF-`). PDF content is
+        // binary so `read_to_string` would fail with a UTF-8 error — for
+        // those we route through `pdf-extract` to recover plain text. Pinned
+        // by the mini5 invoice upload regression (2026-05-12).
+        //
+        // Both branches read the REST from the SAME O_NOFOLLOW file
+        // descriptor (seek back to 0), never by re-opening the path. The
+        // previous PDF branch did `std::fs::read(&path)`, which follows
+        // symlinks and does no symlink re-check — a leaf swapped between the
+        // O_NOFOLLOW open (time-of-check) and that read (time-of-use) was
+        // followed, so an attacker could redirect the read to `/etc/passwd`
+        // or any file and feed its contents to the LLM. Reading from the
+        // held fd binds every byte to the inode we already validated.
         let mut magic = [0u8; 5];
-        match file.read(&mut magic) {
-            Ok(n) if n >= 5 && &magic == b"%PDF-" => {
-                // PDF detected — close the partial read, load whole bytes,
-                // hand to pdf-extract. Errors from extraction get wrapped
-                // as io::Error so callers see a single error type.
-                drop(file);
-                let bytes = std::fs::read(&path)?;
-                match pdf_extract::extract_text_from_mem(&bytes) {
-                    Ok(text) => Ok(text),
-                    Err(err) => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("pdf extraction failed: {err}"),
-                    )),
-                }
+        let n = file.read(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if n >= 5 && &magic == b"%PDF-" {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) => Ok(text),
+                Err(err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {err}"),
+                )),
             }
-            Ok(n) => {
-                // Not a PDF. Re-open at the start and read as UTF-8 text.
-                // (Seeking back works on regular files but we re-open for
-                // simplicity — the path is already known-safe.)
-                drop(file);
-                let mut file = opts.open(&path)?;
-                let mut content = String::with_capacity(n);
-                file.read_to_string(&mut content)?;
-                Ok(content)
-            }
-            Err(err) => Err(err),
+        } else {
+            let mut content = String::with_capacity(n);
+            file.read_to_string(&mut content)?;
+            Ok(content)
         }
     })
     .await
@@ -1282,6 +1306,45 @@ mod nofollow_tests {
 
         let err = read_no_follow(&link).await.unwrap_err();
         assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_reads_full_content_from_held_fd() {
+        // P2 (tri-repo #1529): both branches now read the rest of the file
+        // from the ALREADY-OPEN O_NOFOLLOW fd (seek back to 0) instead of
+        // re-opening the path. This guards the seek: after the 5-byte magic
+        // peek, the full content — INCLUDING the first 5 bytes — must be
+        // returned. A missing `seek(0)` would drop the leading 5 bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("plain.txt");
+        let content = "HELLO, this plaintext must round-trip in full.";
+        std::fs::write(&file, content).unwrap();
+
+        let read = read_no_follow(&file).await.unwrap();
+        assert_eq!(read, content, "full content must be read from the held fd");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_pdf_reads_whole_file_from_fd_not_path() {
+        // The PDF branch previously did `std::fs::read(&path)` — a re-open by
+        // path that follows a symlink swapped in after the O_NOFOLLOW open
+        // (TOCTOU). It now reads the whole file (magic + body) from the held
+        // fd. A PDF whose body extends well past the 5-byte magic must reach
+        // the extractor in full: pdf-extract fails on this junk body with
+        // InvalidData (proving the whole buffer, not a 5-byte truncation, was
+        // handed over — an empty/short buffer would surface differently).
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf = dir.path().join("doc.pdf");
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'X', 4096));
+        std::fs::write(&pdf, &bytes).unwrap();
+
+        let err = read_no_follow(&pdf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("pdf extraction failed"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
-use crate::sandbox::{SandboxConfig, SandboxMode};
+use crate::sandbox::{MountMode, SandboxConfig, SandboxMode};
 
 /// Decision for a command execution request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +223,13 @@ impl EffectivePermissions {
     }
 
     /// Apply this permission profile to an inherited sandbox configuration.
+    ///
+    /// The sandbox is the layer that gates *what commands can write*
+    /// (`CommandPolicy` only gates *which commands run*). A read-only
+    /// profile must therefore make the shell/exec sandbox deny workspace
+    /// writes, not just deny the native write/edit file tools — otherwise
+    /// `octos chat --sandbox read-only` still lets `touch newfile` succeed
+    /// via the shell (codex P1).
     pub fn apply_to_sandbox(self, inherited: &SandboxConfig) -> SandboxConfig {
         let mut sandbox = inherited.clone();
         if self.is_dangerous() {
@@ -233,6 +240,20 @@ impl EffectivePermissions {
         }
         if matches!(self.network, NetworkPolicy::Allowed) {
             sandbox.allow_network = true;
+        }
+        // Mirror the file-tool write policy onto the shell sandbox: a
+        // read-only profile mounts/binds the workspace read-only so
+        // shell/bash/exec_command cannot write to it either. WorkspaceWrite
+        // leaves the inherited (writable) sandbox untouched.
+        if !self.file_access.allows_write() {
+            sandbox.workspace_write = false;
+            // Docker: NARROW a read-write mount to read-only, but never WIDEN
+            // a fully-isolated `None` mount (no project access at all) up to
+            // `ReadOnly` — that would grant read access the operator withheld
+            // (codex P1 regression). Only ReadWrite -> ReadOnly is a narrowing.
+            if sandbox.docker.mount_mode == MountMode::ReadWrite {
+                sandbox.docker.mount_mode = MountMode::ReadOnly;
+            }
         }
         sandbox
     }
@@ -493,5 +514,90 @@ mod tests {
         assert!(!sandbox.enabled);
         assert_eq!(sandbox.mode, SandboxMode::None);
         assert!(sandbox.allow_network);
+    }
+
+    #[test]
+    fn should_make_shell_sandbox_read_only_when_read_only_profile() {
+        // P1 (codex): `--sandbox read-only` must stop shell writes too, not
+        // just the native file tools. The resolved sandbox config must be
+        // non-writable for the workspace so shell/exec cannot `touch newfile`.
+        let base = SandboxConfig {
+            enabled: true,
+            mode: SandboxMode::Docker,
+            allow_network: false,
+            ..SandboxConfig::default()
+        };
+        let sandbox = EffectivePermissions::read_only().apply_to_sandbox(&base);
+
+        // Sandbox stays enabled (it is what enforces the read-only boundary).
+        assert!(sandbox.enabled);
+        // Workspace writes are denied at the sandbox level.
+        assert!(
+            !sandbox.workspace_write,
+            "ReadOnly profile must make the shell sandbox deny workspace writes"
+        );
+        // Docker mounts the workspace read-only.
+        assert_eq!(
+            sandbox.docker.mount_mode,
+            crate::sandbox::MountMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn should_not_widen_docker_none_mount_to_read_only_when_read_only_profile() {
+        // P1 (codex) regression guard: an inherited Docker config with
+        // `MountMode::None` means the container has NO project access at all
+        // (fully isolated). Downgrading it to `ReadOnly` for a read-only
+        // profile would WIDEN access (none -> read), a security regression.
+        // Only `ReadWrite` may be narrowed to `ReadOnly`; `None` stays `None`.
+        let base = SandboxConfig {
+            enabled: true,
+            mode: SandboxMode::Docker,
+            allow_network: false,
+            docker: crate::sandbox::DockerConfig {
+                mount_mode: crate::sandbox::MountMode::None,
+                ..Default::default()
+            },
+            ..SandboxConfig::default()
+        };
+        let sandbox = EffectivePermissions::read_only().apply_to_sandbox(&base);
+
+        // workspace_write is still forced false (read-only intent preserved).
+        assert!(!sandbox.workspace_write);
+        // But the mount mode must NOT be widened from None to ReadOnly.
+        assert_eq!(
+            sandbox.docker.mount_mode,
+            crate::sandbox::MountMode::None,
+            "None (fully isolated) must not be widened to ReadOnly by a read-only profile"
+        );
+    }
+
+    #[test]
+    fn should_keep_shell_sandbox_writable_when_workspace_write_profile() {
+        // WorkspaceWrite must leave the workspace writable at the sandbox
+        // level (default behaviour — the shell can create files in cwd).
+        let base = SandboxConfig::default();
+        let sandbox = EffectivePermissions::workspace_write().apply_to_sandbox(&base);
+
+        assert!(sandbox.enabled);
+        assert!(
+            sandbox.workspace_write,
+            "WorkspaceWrite must keep the sandbox workspace writable"
+        );
+        assert_eq!(
+            sandbox.docker.mount_mode,
+            crate::sandbox::MountMode::ReadWrite
+        );
+    }
+
+    #[test]
+    fn should_leave_sandbox_off_when_danger_full_access_profile() {
+        // DangerFullAccess disables the sandbox entirely (unchanged): the
+        // workspace_write flag is irrelevant because there is no sandbox.
+        let base = SandboxConfig::default();
+        let sandbox = EffectivePermissions::danger_full_access().apply_to_sandbox(&base);
+
+        assert!(!sandbox.enabled);
+        assert_eq!(sandbox.mode, SandboxMode::None);
     }
 }

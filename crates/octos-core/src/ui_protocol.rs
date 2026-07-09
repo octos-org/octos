@@ -106,6 +106,9 @@ pub const UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1: &str = "pane.snapshots.v1";
 /// Feature flag for UPCR-2026-003 per-session workspace cwd requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
 
+/// Feature flag for UPCR-2026-022 per-session sandbox narrowing requests.
+pub const UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1: &str = "session.sandbox.v1";
+
 /// Feature flag for harness task registry/control commands.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1: &str = "harness.task_control.v1";
 
@@ -227,6 +230,23 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1: &str =
 /// `agent/artifact/*` aliases remain gated on agent control.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
 
+/// Feature flag for UPCR-2026-023 structured `AskUserQuestion` mid-turn
+/// user questions. Gates the `user_question/respond` command, the
+/// `user_question/requested` notification, and the structured `questions`
+/// field on the request event. Advertised through optional
+/// `supported_features` in [`UiProtocolCapabilities`]; clients request it
+/// through `X-Octos-Ui-Features`. When it is NOT negotiated the agent's
+/// `ask_user_question` tool degrades to the `request_user_input`
+/// structured-metadata fallback, so the turn never hard-blocks.
+pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
+
+/// Feature flag for streamed voice-reply audio. When negotiated, the server
+/// pushes `voice/audio_chunk` notifications (base64 audio frames) as the
+/// cloud TTS synthesizes, so the client can play progressively (MSE) instead
+/// of waiting for a complete `file/attached` reply. Not negotiated → the voice
+/// turn keeps emitting whole-file `file/attached` audio.
+pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -236,6 +256,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
     UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
@@ -253,6 +274,8 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -306,6 +329,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::LOOP_RESUME
         | methods::LOOP_FIRE_NOW => Some(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
         methods::REVIEW_START => Some(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
+        methods::USER_QUESTION_RESPOND => Some(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
         _ => None,
     }
 }
@@ -426,6 +450,26 @@ pub mod rpc_error_codes {
     /// Spec §10 `approval_cancelled`: `respond` against an administratively cancelled approval.
     pub const APPROVAL_CANCELLED: i64 = -32105;
 
+    /// UPCR-2026-023 `user_question_unknown`: `user_question/respond` against a
+    /// `question_id` not pending for the caller's session. Mirrors
+    /// [`UNKNOWN_APPROVAL_ID`] for the structured-question surface.
+    pub const USER_QUESTION_UNKNOWN: i64 = -32106;
+    /// UPCR-2026-023 `user_question_stale`: `user_question/respond` against a
+    /// question that was already answered or cancelled. Mirrors
+    /// [`APPROVAL_NOT_PENDING`] / [`APPROVAL_CANCELLED`] for the
+    /// structured-question surface.
+    pub const USER_QUESTION_STALE: i64 = -32107;
+    /// UPCR-2026-023 `user_question_invalid`: `user_question/respond` carried
+    /// answers that do not match the STORED request (wrong answer count, a
+    /// `selected_labels` value not in that question's options, more than one
+    /// label on a non-`multi_select` question, or free text where the question
+    /// disallows it). The server rejects the call and does NOT resolve the
+    /// blocked tool with bad data. Distinct from `user_question_unknown`
+    /// (target not found) and `user_question_stale` (target no longer
+    /// pending) so the client can tell "fix your answer and retry" from "this
+    /// question is gone".
+    pub const USER_QUESTION_INVALID: i64 = -32108;
+
     /// Spec §10 `cursor_out_of_range`: stale or future cursor relative to ledger.
     pub const CURSOR_OUT_OF_RANGE: i64 = -32110;
     /// Spec §10 cursor variant: cursor malformed or wrong-session. Distinct from
@@ -513,6 +557,27 @@ impl ApprovalId {
 }
 
 impl Default for ApprovalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stable identity for a structured user-question request (UPCR-2026-023).
+///
+/// Mirrors [`ApprovalId`]: a `Uuid` newtype minted server-side per
+/// `ask_user_question` tool call. The client cannot forge it — a
+/// `user_question/respond` is accepted only for a pending `question_id`
+/// on the caller's session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QuestionId(pub Uuid);
+
+impl QuestionId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for QuestionId {
     fn default() -> Self {
         Self::new()
     }
@@ -892,6 +957,9 @@ pub mod methods {
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const APPROVAL_RESPOND: &str = "approval/respond";
     pub const APPROVAL_SCOPES_LIST: &str = "approval/scopes/list";
+    /// UPCR-2026-023 `user_question/respond` — answer a structured
+    /// `user_question/requested` event. Gated by `user_question.v1`.
+    pub const USER_QUESTION_RESPOND: &str = "user_question/respond";
     pub const PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
     pub const PERMISSION_PROFILE_SET: &str = "permission/profile/set";
     pub const DIFF_PREVIEW_GET: &str = "diff/preview/get";
@@ -902,6 +970,10 @@ pub mod methods {
 
     /// UPCR-2026-009 `session/hydrate` — authoritative chat-state reload.
     pub const SESSION_HYDRATE: &str = "session/hydrate";
+    /// `session/rollback` — drop the last N user turns (conversation-only
+    /// rewind), persist an idempotent append-only marker, and return the
+    /// trimmed hydrated thread. MUTATING: changes persisted session state.
+    pub const SESSION_ROLLBACK: &str = "session/rollback";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
@@ -945,6 +1017,7 @@ pub mod methods {
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_ERROR: &str = "turn/error";
     pub const MESSAGE_DELTA: &str = "message/delta";
+    pub const MESSAGE_REASONING_DELTA: &str = "message/reasoning_delta";
     pub const TOOL_STARTED: &str = "tool/started";
     pub const TOOL_PROGRESS: &str = "tool/progress";
     pub const TOOL_COMPLETED: &str = "tool/completed";
@@ -952,6 +1025,11 @@ pub mod methods {
     pub const APPROVAL_AUTO_RESOLVED: &str = "approval/auto_resolved";
     pub const APPROVAL_DECIDED: &str = "approval/decided";
     pub const APPROVAL_CANCELLED: &str = "approval/cancelled";
+    /// UPCR-2026-023 `user_question/requested` — structured multiple-choice
+    /// question the agent is asking the user mid-turn. While unresolved the
+    /// turn stays paused at the blocking-tool boundary (same boundary as
+    /// `approval/requested`). Gated by `user_question.v1`.
+    pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
     pub const TASK_UPDATED: &str = "task/updated";
     pub const TASK_OUTPUT_DELTA: &str = "task/output/delta";
     pub const PROGRESS_UPDATED: &str = "progress/updated";
@@ -976,6 +1054,36 @@ pub mod methods {
     /// event mirroring the SSE `file:` frame from `files_to_send` tool
     /// surfaces.
     pub const FILE_ATTACHED: &str = "file/attached";
+    /// #1477 voice rich output — a background visual artifact (illustrated
+    /// HTML / image / infographic) began generating for the turn. Lets the
+    /// client show a "generating" placeholder WITHOUT scraping an in-band
+    /// marker out of the assistant text. Ungated; emitted on the same
+    /// ledger-backed live path as `file/attached` (durable append, so a
+    /// reconnecting client replays it). The lifecycle is terminated by a typed
+    /// `visual/succeeded` or `visual/failed` — NOT by `file/attached` (which is
+    /// purely an artifact-delivery signal).
+    pub const VISUAL_GENERATING: &str = "visual/generating";
+    /// #1477 voice rich output — the background visual task produced its
+    /// artifact(s). The structured success counterpart of `visual/generating`:
+    /// the client clears the "generating" placeholder off THIS event, keeping
+    /// the visual lifecycle decoupled from `file/attached`. Emitted alongside
+    /// `file/attached` on the success branch.
+    pub const VISUAL_SUCCEEDED: &str = "visual/succeeded";
+    /// #1477 voice rich output — the background visual task failed or timed
+    /// out, so the client should clear the "generating" placeholder.
+    pub const VISUAL_FAILED: &str = "visual/failed";
+    /// UPCR-2026-025 voice exit intent — the voice turn detected an end /
+    /// goodbye / mute intent (the model appended an in-band `[[EXIT]]` control
+    /// marker, which the backend strips from every model-/client-facing surface
+    /// and replaces with this typed event). The client uses it to leave the
+    /// `/voice` screen and return home AFTER the turn's farewell audio finishes
+    /// playing — it must NOT navigate before the reply audio drains. Ungated;
+    /// emitted on the same ledger-backed live path as `file/attached`.
+    pub const VOICE_EXIT: &str = "voice/exit";
+    /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
+    /// One per audio frame from cloud TTS; carries base64 audio plus a
+    /// `segment_id`/`seq`/`last` so the client groups and plays chunks in order.
+    pub const VOICE_AUDIO_CHUNK: &str = "voice/audio_chunk";
     /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
     /// envelope notification (spec § 14). γ-1 reserves the method name
     /// in the notification methods list as part of capability negotiation
@@ -1061,8 +1169,11 @@ pub mod methods {
     pub const LOOP_COMPLETED: &str = "loop/completed";
     /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
     pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+    pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
+    /// Session-level whole-job orchestration status notification.
+    pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -1080,6 +1191,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
     methods::DIFF_PREVIEW_GET,
@@ -1088,6 +1200,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
+    methods::SESSION_ROLLBACK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1133,6 +1246,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::TURN_COMPLETED,
     methods::TURN_ERROR,
     methods::MESSAGE_DELTA,
+    methods::MESSAGE_REASONING_DELTA,
     methods::TOOL_STARTED,
     methods::TOOL_PROGRESS,
     methods::TOOL_COMPLETED,
@@ -1140,6 +1254,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_AUTO_RESOLVED,
     methods::APPROVAL_DECIDED,
     methods::APPROVAL_CANCELLED,
+    methods::USER_QUESTION_REQUESTED,
     methods::TASK_UPDATED,
     methods::TASK_OUTPUT_DELTA,
     methods::PROGRESS_UPDATED,
@@ -1148,6 +1263,11 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::MESSAGE_PERSISTED,
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
+    methods::VISUAL_GENERATING,
+    methods::VISUAL_SUCCEEDED,
+    methods::VISUAL_FAILED,
+    methods::VOICE_EXIT,
+    methods::VOICE_AUDIO_CHUNK,
     methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
     methods::ROUTER_STATUS,
@@ -1162,6 +1282,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::LOOP_FIRED,
     methods::LOOP_COMPLETED,
     methods::CONTEXT_COMPACTION_COMPLETED,
+    methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
 ];
 
@@ -1172,6 +1293,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
     methods::DIFF_PREVIEW_GET,
@@ -1180,6 +1302,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
+    methods::SESSION_ROLLBACK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1279,6 +1402,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+            UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
@@ -1293,6 +1417,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
         ])
     }
 
@@ -1422,6 +1547,80 @@ fn is_autonomy_optional_feature(feature: &str) -> bool {
     )
 }
 
+/// Result of comparing a server's advertised [`UiProtocolCapabilities`] against
+/// a caller-supplied required-feature set. This is the **pure** protocol
+/// semantics primitive: it has no dependency on any network/transport crate and
+/// reasons only over the protocol family string, the schema version, and the
+/// advertised `supported_features`.
+///
+/// `octos-diagnostics` wraps the result of [`compare_protocol`] into a
+/// `Check`/report line (the product-facing adapter); both the TUI and the
+/// server reuse this same comparator so the skew logic never forks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolCompat {
+    /// The server speaks the same protocol family, its schema version is at
+    /// least the client's, and every required feature is advertised.
+    Compatible,
+    /// The protocol family + schema are compatible, but the server does not
+    /// advertise one or more features the client requires. Carries the missing
+    /// feature names (in the order they were requested).
+    MissingFeatures(Vec<String>),
+    /// The server is on a different protocol family, or its schema version is
+    /// *older* than the client's compiled-in [`UI_PROTOCOL_SCHEMA_VERSION`] —
+    /// the two cannot interoperate regardless of features.
+    SchemaIncompatible { server: u32, client: u32 },
+}
+
+impl ProtocolCompat {
+    /// Whether the comparison found no problems at all.
+    pub fn is_compatible(&self) -> bool {
+        matches!(self, ProtocolCompat::Compatible)
+    }
+}
+
+/// Pure protocol-compatibility comparator (no new deps; reasons only over the
+/// existing protocol consts + the advertised capability payload).
+///
+/// Decision order (first wins), mirroring the client/server handshake contract:
+///
+/// 1. **Family mismatch** → [`ProtocolCompat::SchemaIncompatible`] with the
+///    server's schema vs the client's compiled-in [`UI_PROTOCOL_SCHEMA_VERSION`]
+///    (a different `protocol` string means the wire dialects differ — we report
+///    it as schema-incompatible because no feature negotiation can bridge it).
+/// 2. **Older server schema** (`server.version.schema_version <
+///    UI_PROTOCOL_SCHEMA_VERSION`) → [`ProtocolCompat::SchemaIncompatible`]. A
+///    server *newer* than the client is allowed (forward-compatible additive
+///    schema), so only an older server is rejected.
+/// 3. **Missing required features** → [`ProtocolCompat::MissingFeatures`],
+///    preserving the order in `required`.
+/// 4. Otherwise → [`ProtocolCompat::Compatible`].
+pub fn compare_protocol<I, S>(server: &UiProtocolCapabilities, required: I) -> ProtocolCompat
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if server.version.protocol != UI_PROTOCOL_V1
+        || server.version.schema_version < UI_PROTOCOL_SCHEMA_VERSION
+    {
+        return ProtocolCompat::SchemaIncompatible {
+            server: server.version.schema_version,
+            client: UI_PROTOCOL_SCHEMA_VERSION,
+        };
+    }
+
+    let missing: Vec<String> = required
+        .into_iter()
+        .filter(|feature| !server.supports_feature(feature.as_ref()))
+        .map(|feature| feature.as_ref().to_owned())
+        .collect();
+
+    if missing.is_empty() {
+        ProtocolCompat::Compatible
+    } else {
+        ProtocolCompat::MissingFeatures(missing)
+    }
+}
+
 fn string_list(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -1497,6 +1696,7 @@ pub enum UiResultKind {
     TaskArtifactList,
     TaskArtifactRead,
     SessionHydrate,
+    SessionRollback,
     ThreadGraphGet,
     TurnStateGet,
     UnsupportedCapability,
@@ -1520,6 +1720,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_ARTIFACT_LIST => Some(UiResultKind::TaskArtifactList),
         methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
+        methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         _ => None,
@@ -1552,8 +1753,25 @@ pub struct SessionOpenParams {
     pub profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SessionSandboxParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<UiCursor>,
+}
+
+/// Optional session-scoped sandbox narrowing requested by `session/open`.
+///
+/// The server validates this object against the profile-derived sandbox before
+/// constructing the session runtime. Requests may keep or narrow the inherited
+/// policy; they must not widen network, filesystem, or sandbox isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSandboxParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_allow_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1577,7 +1795,6 @@ pub struct TurnStartParams {
     /// UPCR-2026-015 (M9-β-1): optional sub-topic suffix that scopes
     /// this send to a per-topic session bucket (`<session>#<topic>`
     /// shape). Mirrors the legacy SSE `topic` query/body field. The
-    /// server folds this into the resolved `SessionKey` before
     /// validating scope and looking up history. Empty / absent for
     /// the default-topic case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1591,6 +1808,33 @@ pub struct TurnStartParams {
     /// Absent on regular sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite_for: Option<String>,
+    /// Per-turn reasoning/thinking effort override for thinking-capable models
+    /// (DeepSeek V4, OpenAI reasoning models, Grok-4). Set by the TUI `/thinking`
+    /// command and attached to every turn for the rest of the session. `None`
+    /// (absent) falls back to the gateway/profile default; otherwise the server
+    /// overrides the turn's effort. No-op for models without a reasoning style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortLevel>,
+    /// Explicit "this turn is a live video call" signal — the attached image
+    /// (if any) is the user's current camera frame, not an uploaded file. Set
+    /// by video-call surfaces (the voice screen with the camera on). The server
+    /// folds it into `inbound.metadata["live_video"]`; consumers read it from
+    /// `TurnAttachmentContext.live_video` and NEVER infer it from attachment
+    /// types. Defaults false; omitted on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_video: bool,
+}
+
+/// Reasoning/thinking effort level carried on the wire (octos-core cannot depend
+/// on octos-llm's `ReasoningEffort`, so the serve maps between them). Snake-case
+/// on the wire: `"low" | "medium" | "high" | "max"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1713,6 +1957,75 @@ impl ApprovalRespondResult {
             approval_id,
             accepted: true,
             status: ApprovalRespondStatus::Accepted,
+            runtime_resumed,
+        }
+    }
+}
+
+/// One per-question answer carried by `user_question/respond` (UPCR-2026-023).
+///
+/// Forward-compat: serde defaults mean a client that omits `selected_labels`
+/// (free-text only) or `free_text` still decodes; unknown sibling fields are
+/// ignored. `selected_labels` holds 0..1 entries for a single-select question
+/// and 0..N for a `multi_select` question; the labels must match the option
+/// labels from the originating request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionAnswer {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text: Option<String>,
+}
+
+/// Params for `user_question/respond` — the client's answer to a
+/// `user_question/requested` event (UPCR-2026-023). Mirrors
+/// [`ApprovalRespondParams`]: correlated by `question_id`, scoped to the
+/// caller's `session_id`, with an optional audit/display `client_note` the
+/// server must not require.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionRespondParams {
+    pub session_id: SessionKey,
+    pub question_id: QuestionId,
+    /// One entry per question, in question order.
+    pub answers: Vec<UserQuestionAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_note: Option<String>,
+}
+
+impl UserQuestionRespondParams {
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        answers: Vec<UserQuestionAnswer>,
+    ) -> Self {
+        Self {
+            session_id,
+            question_id,
+            answers,
+            client_note: None,
+        }
+    }
+}
+
+/// Ack result for `user_question/respond` (UPCR-2026-023). Mirrors
+/// [`ApprovalRespondResult`]: confirms the answer was accepted and whether the
+/// waiting runtime turn was resumed by it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionRespondResult {
+    pub question_id: QuestionId,
+    pub accepted: bool,
+    pub runtime_resumed: bool,
+}
+
+impl UserQuestionRespondResult {
+    pub fn accepted(question_id: QuestionId) -> Self {
+        Self::accepted_with_runtime_resumed(question_id, false)
+    }
+
+    pub fn accepted_with_runtime_resumed(question_id: QuestionId, runtime_resumed: bool) -> Self {
+        Self {
+            question_id,
+            accepted: true,
             runtime_resumed,
         }
     }
@@ -2372,6 +2685,14 @@ pub struct SessionHydrateResult {
     pub turns: Option<Vec<HydratedTurn>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<ApprovalRequestedEvent>>,
+    /// UPCR-2026-023: still-pending structured user-questions for this
+    /// session, mirroring [`pending_approvals`](Self::pending_approvals). A
+    /// reconnecting client that negotiated `user_question.v1` re-renders these
+    /// and can still answer them; omitted (not `null`) when the request did
+    /// not ask for the `pending_approvals` section or the connection lacks the
+    /// capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questions: Option<Vec<UserQuestionRequestedEvent>>,
     /// M10 Phase 6.2 (Bug C). Retained `turn/spawn_complete` envelopes
     /// from the ledger replay window for clients that negotiated
     /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]. Populated only when
@@ -2405,6 +2726,38 @@ pub struct SessionHydrateResult {
     /// edge cases codex flagged on PR landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
+    /// Additive reload-recovery lane for tool-call UI state. These are
+    /// canonical M9-gamma projection envelopes filtered to tool_* payloads
+    /// from the hydrate replay window. They let clients that still render via
+    /// the legacy ThreadStore rebuild the same tool cards that live
+    /// `tool/started`, `tool/progress`, and `tool/completed` notifications
+    /// produced before the page refresh.
+    ///
+    /// This intentionally does not make `messages_page` equivalent to
+    /// `session/hydrate`: message rows remain the durable transcript, while
+    /// hydrate carries replayable UI projection facts. Omitted unless the
+    /// client requested `messages` and negotiated the same refresh-recovery
+    /// capability used by `replayed_envelopes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_tool_envelopes: Option<Vec<Envelope>>,
+}
+
+/// Params for `session/rollback` — conversation-only rewind. Drops the last
+/// `num_turns` user turns from the session (persisted + in-memory). `num_turns`
+/// must be `>= 1`; the server rejects `0` with `invalid_params`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRollbackParams {
+    pub session_id: SessionKey,
+    pub num_turns: u32,
+}
+
+/// Result for `session/rollback`. `dropped_turns` is the number of user turns
+/// actually removed (clamped to the session's turn count), and `thread` is the
+/// trimmed session projected via the same shape as `session/hydrate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRollbackResult {
+    pub dropped_turns: u32,
+    pub thread: SessionHydrateResult,
 }
 
 // ----- UPCR-2026-010 `thread/graph/get` -----
@@ -3089,6 +3442,9 @@ pub enum Payload {
     /// `assistant_persisted` for the same thread REPLACES the
     /// accumulated text.
     AssistantDelta { text: String },
+    /// One streamed assistant reasoning fragment. Clients render this on a
+    /// separate reasoning surface from assistant answer text.
+    ReasoningDelta { text: String },
     /// Final assistant text persisted to the ledger after streaming
     /// completes. Carries the durable [`MessageMeta`] so the projection
     /// can finalize the bubble's identity and surface attachments. Its
@@ -3169,31 +3525,38 @@ pub struct Envelope {
 /// Ledger / wire wrapper around [`Envelope`] for the
 /// `projection/envelope` notification (UPCR-2026-014 M9-γ).
 ///
-/// The wire JSON-RPC `params` field MUST match the spec § 14.1 wire
-/// shape exactly — `{ thread_id, seq, client_message_id?, payload }` —
-/// with **no `session_id`** key. But the in-memory ledger needs the
-/// `SessionKey` to route the event to the right per-session ring and
-/// broadcast channel, and it needs the optional `topic` so the
-/// topic-scope live filter (`ledger_event_matches_topic_scope`) keeps
-/// envelopes flowing to the right subscriber pane.
+/// The in-memory ledger needs the `SessionKey` to route the event to
+/// the right per-session ring and broadcast channel, and it needs the
+/// optional `topic` so the topic-scope live filter
+/// (`ledger_event_matches_topic_scope`) keeps envelopes flowing to the
+/// right subscriber pane. This wrapper carries those routing fields
+/// **outside** of the `envelope` body so the durable ledger can persist
+/// them and recovery can rebuild the routing context after restart.
 ///
-/// This wrapper carries those routing fields **outside** of the
-/// `envelope` body so the durable ledger can persist them and recovery
-/// can rebuild the routing context after restart.
+/// **Wire shape (spec § 14.1, feat(envelope-wire-routing)):** the
+/// JSON-RPC `params` field is the bare `Envelope` fields FLATTENED with
+/// the routing keys — `{ thread_id, seq, client_message_id?, payload,
+/// session_id, topic? }`. `session_id` is the bare base key so a
+/// multi-session client can route the envelope to the correct session;
+/// `topic` is omitted when `None`. This replaces the original
+/// bare-`Envelope`-only wire (no routing keys), which left a
+/// multi-session consumer with an unroutable empty `session_id`. The
+/// flatten keeps the bare keys at the top level, so a tolerant client
+/// that reads `thread_id`/`seq`/`payload` top-level and ignores unknown
+/// keys (the octos-web bridge) decodes it unchanged; the decoder also
+/// accepts an OLD frame lacking `session_id` (defaults to empty / None).
+/// The wire DTO is [`EnvelopeWire`]; serialization happens only at the
+/// JSON-RPC boundary in [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`].
 ///
-/// **Serialization split (codex #1336 round-2 BLOCKER 4):** the global
-/// `Serialize` / `Deserialize` derive includes ALL fields (envelope +
-/// session_id + topic) so the DURABLE LEDGER round-trips routing
-/// state across daemon restart. The wire shape — bare `Envelope` per
-/// spec § 14.1 — is opted into only at the JSON-RPC boundary in
-/// [`UiNotification::into_rpc_notification`] /
-/// [`UiNotification::from_method_and_params`], where the bare
-/// envelope is extracted/re-wrapped. This is the "structurally honest"
-/// answer: a single global Serialize that strips routing fields means
-/// the ledger's disk records also strip them, and recovery walks the
-/// disk back into an `EnvelopeNotification` with empty `session_id` /
-/// `None` topic — topic-scoped envelope replay after restart silently
-/// loses routing.
+/// **Disk shape (codex #1336 round-2 BLOCKER 4 — UNCHANGED):** the
+/// global `Serialize` / `Deserialize` derive on this struct includes ALL
+/// fields (envelope + session_id + topic) as a NESTED `{ session_id,
+/// topic, envelope }` object so the DURABLE LEDGER round-trips routing
+/// state across daemon restart. BLOCKER 4's invariant — disk records
+/// must not lose routing, else topic-scoped replay after restart
+/// mis-routes — holds: the wire DTO above does not touch this derive,
+/// so the disk path is byte-for-byte identical to before this change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopeNotification {
     /// Session this envelope belongs to. Used for ledger routing and
@@ -3213,6 +3576,47 @@ pub struct EnvelopeNotification {
     pub envelope: Envelope,
 }
 
+/// Wire DTO for the `projection/envelope` JSON-RPC notification
+/// (feat(envelope-wire-routing)).
+///
+/// This is the shape on the WIRE — distinct from the on-disk derive of
+/// [`EnvelopeNotification`]. The bare [`Envelope`] fields are
+/// `#[serde(flatten)]`-ed to the top level (`thread_id`, `seq`,
+/// `client_message_id?`, `payload`) so an older/tolerant client decodes
+/// them unchanged, and the routing keys `session_id` + `topic` sit
+/// alongside them. Used ONLY at the JSON-RPC boundary in
+/// [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`]; the durable ledger never
+/// serializes through this type.
+///
+/// Backward-compatible on decode: `session_id` defaults to the empty
+/// [`SessionKey`] and `topic` to `None` when an OLD bare-envelope frame
+/// (no routing keys) is received.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EnvelopeWire {
+    /// Bare base session key for client-side routing. Normalized to the
+    /// base key at the `into_rpc_notification` boundary (any `#topic`
+    /// suffix folded in by `turn/start` is stripped here and surfaced on
+    /// `topic` below). Defaults to the empty key for legacy frames that
+    /// predate this wire field.
+    #[serde(default = "empty_session_key")]
+    session_id: SessionKey,
+    /// Optional topic for topic-scoped routing. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    /// Bare envelope fields, flattened to the top level so the wire is
+    /// `{ thread_id, seq, client_message_id?, payload, session_id,
+    /// topic? }`.
+    #[serde(flatten)]
+    envelope: Envelope,
+}
+
+/// Serde default for the wire `session_id`: the empty session key, used
+/// when an OLD bare-envelope frame (no routing keys) is decoded.
+fn empty_session_key() -> SessionKey {
+    SessionKey(String::new())
+}
+
 /// Draft command payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -3223,6 +3627,7 @@ pub enum UiCommand {
     TurnInterrupt(TurnInterruptParams),
     ApprovalRespond(ApprovalRespondParams),
     ApprovalScopesList(ApprovalScopesListParams),
+    UserQuestionRespond(UserQuestionRespondParams),
     PermissionProfileList(PermissionProfileListParams),
     PermissionProfileSet(PermissionProfileSetParams),
     DiffPreviewGet(DiffPreviewGetParams),
@@ -3233,6 +3638,7 @@ pub enum UiCommand {
     TaskArtifactList(TaskArtifactListParams),
     TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
+    SessionRollback(SessionRollbackParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
@@ -3263,6 +3669,7 @@ impl UiCommand {
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
             Self::ApprovalScopesList(_) => methods::APPROVAL_SCOPES_LIST,
+            Self::UserQuestionRespond(_) => methods::USER_QUESTION_RESPOND,
             Self::PermissionProfileList(_) => methods::PERMISSION_PROFILE_LIST,
             Self::PermissionProfileSet(_) => methods::PERMISSION_PROFILE_SET,
             Self::DiffPreviewGet(_) => methods::DIFF_PREVIEW_GET,
@@ -3273,6 +3680,7 @@ impl UiCommand {
             Self::TaskArtifactList(_) => methods::TASK_ARTIFACT_LIST,
             Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
+            Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
             Self::SessionList(_) => methods::SESSION_LIST,
@@ -3305,6 +3713,7 @@ impl UiCommand {
             Self::TurnInterrupt(params) => serde_json::to_value(params),
             Self::ApprovalRespond(params) => serde_json::to_value(params),
             Self::ApprovalScopesList(params) => serde_json::to_value(params),
+            Self::UserQuestionRespond(params) => serde_json::to_value(params),
             Self::PermissionProfileList(params) => serde_json::to_value(params),
             Self::PermissionProfileSet(params) => serde_json::to_value(params),
             Self::DiffPreviewGet(params) => serde_json::to_value(params),
@@ -3315,6 +3724,7 @@ impl UiCommand {
             Self::TaskArtifactList(params) => serde_json::to_value(params),
             Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
+            Self::SessionRollback(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
@@ -3361,6 +3771,9 @@ impl UiCommand {
             methods::APPROVAL_SCOPES_LIST => {
                 Ok(Self::ApprovalScopesList(decode_params(method, params)?))
             }
+            methods::USER_QUESTION_RESPOND => {
+                Ok(Self::UserQuestionRespond(decode_params(method, params)?))
+            }
             methods::PERMISSION_PROFILE_LIST => {
                 Ok(Self::PermissionProfileList(decode_params(method, params)?))
             }
@@ -3381,6 +3794,7 @@ impl UiCommand {
                 Ok(Self::TaskArtifactRead(decode_params(method, params)?))
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
+            methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
@@ -3570,6 +3984,20 @@ pub struct SessionOpened {
     /// `serde(default)` for forward compatibility.
     #[serde(default = "UiProtocolCapabilities::first_server_slice")]
     pub capabilities: UiProtocolCapabilities,
+    /// Server-persisted per-session reasoning/thinking effort, surfaced on
+    /// session open/reconnect so a restarting TUI can restore its local
+    /// `/thinking` state and mark its menu without re-deriving it. `None`
+    /// (omitted on the wire) means no effort has ever been persisted for this
+    /// session — the client should treat that as "default" (no override).
+    ///
+    /// This is the authoritative value across a full serve/TUI restart: in
+    /// `--stdio` mode the serve is a child of the TUI, so a TUI restart
+    /// respawns the serve and only this disk-backed value survives. The server
+    /// persists it whenever a `turn/start` carries `reasoning_effort` and reads
+    /// it back here. Additive + backward-compatible: older clients ignore the
+    /// field, and older serialized payloads decode it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3710,6 +4138,7 @@ pub enum UiRpcResult {
     TaskArtifactList(TaskArtifactListResult),
     TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
+    SessionRollback(SessionRollbackResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
@@ -3734,6 +4163,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(_) => UiResultKind::TaskArtifactList,
             Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
+            Self::SessionRollback(_) => UiResultKind::SessionRollback,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
@@ -3758,6 +4188,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(_) => Some(methods::TASK_ARTIFACT_LIST),
             Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
+            Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
@@ -3782,6 +4213,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(result) => serde_json::to_value(result),
             Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
+            Self::SessionRollback(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
@@ -3837,6 +4269,7 @@ impl UiRpcResult {
                 Ok(Self::TaskArtifactRead(decode_result(method, result)?))
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
+            methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
@@ -3986,6 +4419,11 @@ pub struct UiTokenCostUpdate {
     /// scraping the legacy `metadata.label` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Model context window in tokens, when the provider exposes it. Lets
+    /// clients render an honest context-fill gauge against the real window
+    /// instead of a hardcoded default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl UiTokenCostUpdate {
@@ -4001,6 +4439,7 @@ impl UiTokenCostUpdate {
             session_cost: None,
             currency: None,
             model: None,
+            context_window: None,
         }
     }
 }
@@ -4138,6 +4577,29 @@ impl UiProgressEvent {
     }
 }
 
+/// Session-level "whole job" orchestration status (`session/orchestration`
+/// notification). Lets a client render a single job-status indicator that stays
+/// active across the gap between a sub-agent's "task completed" and the master's
+/// re-entry turn — a gap the client cannot infer on its own because the
+/// master-continuation queue is server-side.
+///
+/// `active` is true when the session has any of: an in-flight turn, a running
+/// sub-agent, or a queued/in-flight master continuation. `phase` is a coarse
+/// human label ("working" / "orchestrating" / "re-entering"); `running_agents`
+/// is the count of non-terminal sub-agents. When `active` is false the client
+/// hides the indicator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOrchestrationEvent {
+    pub session_id: SessionKey,
+    pub active: bool,
+    #[serde(default)]
+    pub running_agents: u32,
+    #[serde(default)]
+    pub pending_continuations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnStartedEvent {
     pub session_id: SessionKey,
@@ -4160,6 +4622,77 @@ pub struct MessageDeltaEvent {
     pub topic: Option<String>,
     pub turn_id: TurnId,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningDeltaEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    pub text: String,
+}
+
+/// #1477 voice rich output: a background visual artifact began generating for
+/// the turn. The client renders a "generating" placeholder keyed off this
+/// typed event instead of scraping an in-band `[[VISUAL:...]]` marker out of the
+/// assistant text (which the backend now keeps out of the wire/persisted
+/// surfaces entirely). The lifecycle terminates on `visual/succeeded` or
+/// `visual/failed`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisualGeneratingEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    /// `html` | `illustrated` | `image` | `infographic`.
+    pub kind: String,
+}
+
+/// #1477 voice rich output: the background visual task produced its artifact(s).
+/// The structured success counterpart of [`VisualGeneratingEvent`] — the client
+/// clears the "generating" placeholder off this, NOT off `file/attached` (which
+/// stays a pure artifact-delivery signal). Emitted alongside `file/attached` on
+/// the success branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisualSucceededEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    /// `html` | `illustrated` | `image` | `infographic`.
+    pub kind: String,
+    /// Workspace-relative filenames of the delivered artifact(s) — the same
+    /// paths carried on the accompanying `file/attached` event(s).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+/// #1477 voice rich output: the background visual task failed or timed out, so
+/// the client should clear the "generating" placeholder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisualFailedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// UPCR-2026-025 voice exit intent: the voice turn detected an end / goodbye /
+/// mute intent. The model appended an in-band `[[EXIT]]` control marker; the
+/// backend strips it from every model-/client-facing surface (so it never
+/// reaches TTS, the `message/delta` wire, or the persisted session) and emits
+/// this typed event instead. The client leaves the `/voice` screen and returns
+/// home — but only AFTER the turn's farewell audio finishes playing, so the
+/// goodbye is heard before navigation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceExitEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4490,6 +5023,73 @@ impl ApprovalCancelledEvent {
     }
 }
 
+/// One selectable option on a [`UserQuestion`] (UPCR-2026-023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One structured multiple-choice question carried by a
+/// [`UserQuestionRequestedEvent`] (UPCR-2026-023). 2–4 `options`, an optional
+/// `multi_select`, and a server-forced `allow_free_text` ("Other" escape
+/// hatch). `header` is a short label (≤ 12 chars).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserQuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    /// Server forces this `true` so a free-text "Other" is always offered.
+    #[serde(default)]
+    pub allow_free_text: bool,
+}
+
+/// Notification emitted when the agent's `ask_user_question` tool asks the user
+/// a structured multiple-choice question mid-turn (UPCR-2026-023). Mirrors
+/// [`ApprovalRequestedEvent`]: while unresolved the turn stays paused at the
+/// blocking-tool boundary, and the mandatory generic `title`/`body` keep a
+/// client that does not understand the structured `questions` field
+/// actionable. The structured `questions` field is gated by `user_question.v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionRequestedEvent {
+    pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question_id: QuestionId,
+    pub turn_id: TurnId,
+    /// Mandatory generic fallback text.
+    pub title: String,
+    /// Mandatory generic fallback text.
+    pub body: String,
+    /// 1–4 structured questions. A client that does not understand this field
+    /// falls back to rendering `title`/`body` and answering via free text.
+    pub questions: Vec<UserQuestion>,
+}
+
+impl UserQuestionRequestedEvent {
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        questions: Vec<UserQuestion>,
+    ) -> Self {
+        Self {
+            session_id,
+            topic: None,
+            question_id,
+            turn_id,
+            title: title.into(),
+            body: body.into(),
+            questions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRuntimeState {
@@ -4558,6 +5158,14 @@ pub struct TaskUpdatedEvent {
     /// `BackgroundTask::runtime_policy_stamp`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
+    /// C1 step 4: the turn that originated this task. Lets the client
+    /// reconcile its per-turn "N running" task count when a sub-agent
+    /// fails/recovers/errors/is-orphaned — without it the count stayed
+    /// stuck and the chip stuck "Orchestrating". Optional so legacy daemons
+    /// and synthetic / fallback emission paths that cannot resolve the
+    /// originating turn still parse; omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4843,6 +5451,23 @@ pub struct ContextCompactionCompletedEvent {
     pub compaction: UiContextCompactionRecord,
 }
 
+/// UPCR-2026-026: emitted immediately BEFORE a context compaction pass so
+/// clients can show an in-progress state (spinner/bar). Always followed by
+/// `context/compaction_completed` for the same generation — today's serve
+/// compaction is synchronous, so both may arrive in one delivery batch;
+/// clients must tolerate a zero-duration window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionStartedEvent {
+    pub session_id: SessionKey,
+    /// Pre-compaction context state (token_estimate = the "before" size).
+    pub context_state: UiContextState,
+    /// Trigger label, mirrors the eventual completed record's trigger.
+    pub trigger: String,
+    /// The token threshold that tripped this compaction (context-window
+    /// derived) — lets clients render an honest fullness percentage.
+    pub threshold_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiContextNormalizationReport {
     pub generation: u64,
@@ -4952,6 +5577,28 @@ pub struct FileAttachedEvent {
     pub mime: Option<String>,
 }
 
+/// A streamed voice-reply audio chunk (`voice/audio_chunk`). Emitted per
+/// audio frame as cloud TTS synthesizes, gated by `event.voice_audio.v1`.
+/// Chunks sharing a `segment_id` form one playable utterance (one reply
+/// sentence); `seq` orders them and `last` marks the segment's final chunk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceAudioChunkEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    /// Groups chunks into one playable utterance (per reply sentence).
+    pub segment_id: String,
+    /// Chunk order within the segment (0-based).
+    pub seq: u32,
+    /// MIME type of the audio bytes, e.g. "audio/mpeg".
+    pub mime: String,
+    /// Base64-encoded raw audio bytes for this chunk.
+    pub audio_b64: String,
+    /// True on the final chunk of the segment.
+    pub last: bool,
+}
+
 /// UPCR-2026-014 (M9-α-9): wrapper for legacy
 /// `/api/sessions/:id/events/stream` SSE frames bridged onto the WS
 /// surface. `kind` is the legacy SSE `type` field; `payload` is the
@@ -5038,6 +5685,16 @@ pub enum UiNotification {
     SessionOpened(SessionOpened),
     TurnStarted(TurnStartedEvent),
     MessageDelta(MessageDeltaEvent),
+    ReasoningDelta(ReasoningDeltaEvent),
+    /// #1477 voice rich output: a background visual artifact started generating.
+    VisualGenerating(VisualGeneratingEvent),
+    /// #1477 voice rich output: a background visual artifact was produced.
+    VisualSucceeded(VisualSucceededEvent),
+    /// #1477 voice rich output: a background visual task failed / timed out.
+    VisualFailed(VisualFailedEvent),
+    /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
+    /// goodbye / mute intent; the client returns home after the farewell audio.
+    VoiceExit(VoiceExitEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
     ToolCompleted(ToolCompletedEvent),
@@ -5045,6 +5702,9 @@ pub enum UiNotification {
     ApprovalAutoResolved(ApprovalAutoResolvedEvent),
     ApprovalDecided(ApprovalDecidedEvent),
     ApprovalCancelled(ApprovalCancelledEvent),
+    /// UPCR-2026-023: structured mid-turn user question. Mirrors
+    /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
+    UserQuestionRequested(UserQuestionRequestedEvent),
     TaskUpdated(TaskUpdatedEvent),
     TaskOutputDelta(TaskOutputDeltaEvent),
     ProgressUpdated(ProgressUpdatedEvent),
@@ -5061,6 +5721,8 @@ pub enum UiNotification {
     TurnSpawnComplete(TurnSpawnCompleteEvent),
     /// UPCR-2026-014 (M9-α-9): per-turn file attachment event.
     FileAttached(FileAttachedEvent),
+    /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
+    VoiceAudioChunk(VoiceAudioChunkEvent),
     /// UPCR-2026-014 (M9-α-9): wrapper for legacy
     /// `/api/sessions/:id/events/stream` SSE frames bridged onto the
     /// unified v1 ledger.
@@ -5095,8 +5757,14 @@ pub enum UiNotification {
     LoopCompleted(LoopCompletedEvent),
     /// M16: compact-context lifecycle event.
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
+    ContextCompactionStarted(ContextCompactionStartedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
+    /// Session-level whole-job orchestration status. Emitted when the session's
+    /// orchestration state changes (turn active / sub-agents running / master
+    /// continuation pending), so a client can render a job indicator that stays
+    /// live across the sub-agent-complete → master-re-entry gap.
+    SessionOrchestration(SessionOrchestrationEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -5124,6 +5792,11 @@ impl UiNotification {
             Self::SessionOpened(_) => methods::SESSION_OPEN,
             Self::TurnStarted(_) => methods::TURN_STARTED,
             Self::MessageDelta(_) => methods::MESSAGE_DELTA,
+            Self::ReasoningDelta(_) => methods::MESSAGE_REASONING_DELTA,
+            Self::VisualGenerating(_) => methods::VISUAL_GENERATING,
+            Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
+            Self::VisualFailed(_) => methods::VISUAL_FAILED,
+            Self::VoiceExit(_) => methods::VOICE_EXIT,
             Self::ToolStarted(_) => methods::TOOL_STARTED,
             Self::ToolProgress(_) => methods::TOOL_PROGRESS,
             Self::ToolCompleted(_) => methods::TOOL_COMPLETED,
@@ -5131,6 +5804,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(_) => methods::APPROVAL_AUTO_RESOLVED,
             Self::ApprovalDecided(_) => methods::APPROVAL_DECIDED,
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
+            Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
             Self::TaskOutputDelta(_) => methods::TASK_OUTPUT_DELTA,
             Self::ProgressUpdated(_) => methods::PROGRESS_UPDATED,
@@ -5141,6 +5815,7 @@ impl UiNotification {
             Self::MessagePersisted(_) => methods::MESSAGE_PERSISTED,
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
+            Self::VoiceAudioChunk(_) => methods::VOICE_AUDIO_CHUNK,
             Self::SessionEventBridged(_) => methods::SESSION_EVENT,
             Self::RouterStatus(_) => methods::ROUTER_STATUS,
             Self::RouterFailover(_) => methods::ROUTER_FAILOVER,
@@ -5154,7 +5829,9 @@ impl UiNotification {
             Self::LoopFired(_) => methods::LOOP_FIRED,
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
+            Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
+            Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
         }
     }
@@ -5164,6 +5841,11 @@ impl UiNotification {
             Self::SessionOpened(event) => &event.session_id,
             Self::TurnStarted(event) => &event.session_id,
             Self::MessageDelta(event) => &event.session_id,
+            Self::ReasoningDelta(event) => &event.session_id,
+            Self::VisualGenerating(event) => &event.session_id,
+            Self::VisualSucceeded(event) => &event.session_id,
+            Self::VisualFailed(event) => &event.session_id,
+            Self::VoiceExit(event) => &event.session_id,
             Self::ToolStarted(event) => &event.session_id,
             Self::ToolProgress(event) => &event.session_id,
             Self::ToolCompleted(event) => &event.session_id,
@@ -5171,6 +5853,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => &event.session_id,
             Self::ApprovalDecided(event) => &event.session_id,
             Self::ApprovalCancelled(event) => &event.session_id,
+            Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
             Self::TaskOutputDelta(event) => &event.session_id,
             Self::ProgressUpdated(event) => &event.session_id,
@@ -5181,6 +5864,7 @@ impl UiNotification {
             Self::MessagePersisted(event) => &event.session_id,
             Self::TurnSpawnComplete(event) => &event.session_id,
             Self::FileAttached(event) => &event.session_id,
+            Self::VoiceAudioChunk(event) => &event.session_id,
             Self::SessionEventBridged(event) => &event.session_id,
             Self::RouterStatus(event) => &event.session_id,
             Self::RouterFailover(event) => &event.session_id,
@@ -5194,7 +5878,9 @@ impl UiNotification {
             Self::LoopFired(event) => &event.session_id,
             Self::LoopCompleted(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
+            Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
+            Self::SessionOrchestration(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
         }
     }
@@ -5203,6 +5889,19 @@ impl UiNotification {
         match self {
             Self::TurnStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::MessageDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ReasoningDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::VisualGenerating(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::VisualSucceeded(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::VoiceExit(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::VisualFailed(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::ToolStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
@@ -5224,6 +5923,9 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::UserQuestionRequested(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::TaskOutputDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
@@ -5241,6 +5943,9 @@ impl UiNotification {
             Self::FileAttached(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::VoiceAudioChunk(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::SessionEventBridged(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -5256,6 +5961,11 @@ impl UiNotification {
         match self {
             Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ReasoningDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VisualGenerating(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VisualSucceeded(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VisualFailed(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VoiceExit(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ToolCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5263,6 +5973,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -5270,6 +5981,7 @@ impl UiNotification {
             Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::Envelope(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
@@ -5283,6 +5995,11 @@ impl UiNotification {
             Self::SessionOpened(params) => serde_json::to_value(params),
             Self::TurnStarted(params) => serde_json::to_value(params),
             Self::MessageDelta(params) => serde_json::to_value(params),
+            Self::ReasoningDelta(params) => serde_json::to_value(params),
+            Self::VisualGenerating(params) => serde_json::to_value(params),
+            Self::VisualSucceeded(params) => serde_json::to_value(params),
+            Self::VisualFailed(params) => serde_json::to_value(params),
+            Self::VoiceExit(params) => serde_json::to_value(params),
             Self::ToolStarted(params) => serde_json::to_value(params),
             Self::ToolProgress(params) => serde_json::to_value(params),
             Self::ToolCompleted(params) => serde_json::to_value(params),
@@ -5290,6 +6007,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(params) => serde_json::to_value(params),
             Self::ApprovalDecided(params) => serde_json::to_value(params),
             Self::ApprovalCancelled(params) => serde_json::to_value(params),
+            Self::UserQuestionRequested(params) => serde_json::to_value(params),
             Self::TaskUpdated(params) => serde_json::to_value(params),
             Self::TaskOutputDelta(params) => serde_json::to_value(params),
             Self::ProgressUpdated(params) => serde_json::to_value(params),
@@ -5300,6 +6018,7 @@ impl UiNotification {
             Self::MessagePersisted(params) => serde_json::to_value(params),
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
+            Self::VoiceAudioChunk(params) => serde_json::to_value(params),
             Self::SessionEventBridged(params) => serde_json::to_value(params),
             Self::RouterStatus(params) => serde_json::to_value(params),
             Self::RouterFailover(params) => serde_json::to_value(params),
@@ -5313,15 +6032,50 @@ impl UiNotification {
             Self::LoopFired(params) => serde_json::to_value(params),
             Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
+            Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
-            // UPCR-2026-014 (M9-γ): the wire shape per spec § 14.1 is the
-            // bare `Envelope` — `session_id` and `topic` are server-internal
-            // routing fields stripped here at the JSON-RPC boundary. The
-            // `EnvelopeNotification` struct itself uses a derive-based
-            // `Serialize` so the durable ledger persists routing fields
-            // on disk; recovery rebuilds them before rebroadcasting (codex
-            // #1336 round-2 BLOCKER 4).
-            Self::Envelope(params) => serde_json::to_value(&params.envelope),
+            Self::SessionOrchestration(params) => serde_json::to_value(params),
+            // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
+            // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
+            // with the routing keys `session_id` (the bare base key) +
+            // optional `topic`, i.e. `{ thread_id, seq, client_message_id?,
+            // payload, session_id, topic? }`. A multi-session client routes
+            // on `session_id`; a topic-scoped pane routes on `topic`.
+            //
+            // The flatten keeps the bare Envelope keys at the TOP level so
+            // an older/tolerant client (e.g. the octos-web bridge) that
+            // reads `thread_id`/`seq`/`payload` top-level and ignores
+            // unknown keys decodes it unchanged. The matching decoder in
+            // `from_method_and_params` accepts an OLD frame lacking
+            // `session_id` (defaults to empty / `None`).
+            //
+            // Codex #1336 round-2 BLOCKER 4 required that the DURABLE
+            // LEDGER preserve routing on disk: that invariant is unchanged
+            // — the disk path uses the derive-based `Serialize` on
+            // `EnvelopeNotification` (nested `{ session_id, topic,
+            // envelope }`), which this wire DTO does NOT touch. Only the
+            // WIRE is un-stripped here.
+            //
+            // codex BLOCKER (feat(envelope-wire-routing)): on a TOPIC
+            // turn, `turn/start` folds the topic into `session_id` as
+            // `"base#topic"` and that composite key is carried forward
+            // into the emitted `EnvelopeNotification.session_id`. A client
+            // only knows the bare base key, so a `"base#topic"` wire key
+            // misroutes the message and defeats orphan-chip self-heal —
+            // and it contradicts the spec text above (wire = bare base key
+            // + separate topic). Normalize the wire `session_id` to the
+            // base key here (wire boundary ONLY; the disk derive keeps
+            // `"base#topic"`), and keep the topic — recovering it from the
+            // suffix when the explicit `topic` field is empty so it is
+            // never lost.
+            Self::Envelope(params) => serde_json::to_value(&EnvelopeWire {
+                session_id: SessionKey(params.session_id.base_key().to_owned()),
+                topic: params
+                    .topic
+                    .clone()
+                    .or_else(|| params.session_id.topic().map(str::to_owned)),
+                envelope: params.envelope,
+            }),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -5343,6 +6097,15 @@ impl UiNotification {
             methods::SESSION_OPEN => Ok(Self::SessionOpened(decode_params(method, params)?)),
             methods::TURN_STARTED => Ok(Self::TurnStarted(decode_params(method, params)?)),
             methods::MESSAGE_DELTA => Ok(Self::MessageDelta(decode_params(method, params)?)),
+            methods::MESSAGE_REASONING_DELTA => {
+                Ok(Self::ReasoningDelta(decode_params(method, params)?))
+            }
+            methods::VISUAL_GENERATING => {
+                Ok(Self::VisualGenerating(decode_params(method, params)?))
+            }
+            methods::VISUAL_SUCCEEDED => Ok(Self::VisualSucceeded(decode_params(method, params)?)),
+            methods::VISUAL_FAILED => Ok(Self::VisualFailed(decode_params(method, params)?)),
+            methods::VOICE_EXIT => Ok(Self::VoiceExit(decode_params(method, params)?)),
             methods::TOOL_STARTED => Ok(Self::ToolStarted(decode_params(method, params)?)),
             methods::TOOL_PROGRESS => Ok(Self::ToolProgress(decode_params(method, params)?)),
             methods::TOOL_COMPLETED => Ok(Self::ToolCompleted(decode_params(method, params)?)),
@@ -5355,6 +6118,9 @@ impl UiNotification {
             methods::APPROVAL_DECIDED => Ok(Self::ApprovalDecided(decode_params(method, params)?)),
             methods::APPROVAL_CANCELLED => {
                 Ok(Self::ApprovalCancelled(decode_params(method, params)?))
+            }
+            methods::USER_QUESTION_REQUESTED => {
+                Ok(Self::UserQuestionRequested(decode_params(method, params)?))
             }
             methods::TASK_UPDATED => Ok(Self::TaskUpdated(decode_params(method, params)?)),
             methods::TASK_OUTPUT_DELTA => Ok(Self::TaskOutputDelta(decode_params(method, params)?)),
@@ -5370,6 +6136,7 @@ impl UiNotification {
                 Ok(Self::TurnSpawnComplete(decode_params(method, params)?))
             }
             methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
+            methods::VOICE_AUDIO_CHUNK => Ok(Self::VoiceAudioChunk(decode_params(method, params)?)),
             methods::SESSION_EVENT => Ok(Self::SessionEventBridged(decode_params(method, params)?)),
             methods::ROUTER_STATUS => Ok(Self::RouterStatus(decode_params(method, params)?)),
             methods::ROUTER_FAILOVER => Ok(Self::RouterFailover(decode_params(method, params)?)),
@@ -5390,30 +6157,34 @@ impl UiNotification {
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
             methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::CONTEXT_COMPACTION_STARTED => Ok(Self::ContextCompactionStarted(
+                decode_params(method, params)?,
+            )),
             methods::CONTEXT_COMPACTION_COMPLETED => Ok(Self::ContextCompactionCompleted(
                 decode_params(method, params)?,
             )),
             methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
                 decode_params(method, params)?,
             )),
-            // UPCR-2026-014 (M9-γ): decode the bare wire envelope into the
-            // wrapper; `session_id` and `topic` default to empty/None and
-            // are reconstituted from the ambient ledger context by the
-            // server-side decode path (the ledger never round-trips a
-            // wire-only envelope back into routing).
-            //
-            // Codex #1336 round-2 BLOCKER 4: the JSON-RPC params carry
-            // ONLY the bare `Envelope` (the wire shape per spec § 14.1) —
-            // decode it into `Envelope` directly and wrap with empty
-            // routing fields. The full-struct `EnvelopeNotification`
-            // serialization is used by the ledger ONLY on disk, never
-            // on the wire.
+            methods::SESSION_ORCHESTRATION => {
+                Ok(Self::SessionOrchestration(decode_params(method, params)?))
+            }
+            // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
+            // the FLATTENED wire frame — bare Envelope keys plus the
+            // routing keys `session_id` + `topic`. Backward-compatible:
+            // an OLD bare-envelope frame that omits `session_id` /
+            // `topic` decodes with `session_id` defaulting to the empty
+            // `SessionKey` and `topic` to `None` (the `#[serde(default)]`
+            // on `EnvelopeWire`), so a legacy producer never errors here.
+            // A multi-session consumer routes on the recovered
+            // `session_id`; for a legacy empty key it falls back to its
+            // ambient connection context.
             methods::PROJECTION_ENVELOPE => {
-                let envelope: Envelope = decode_params(method, params)?;
+                let wire: EnvelopeWire = decode_params(method, params)?;
                 Ok(Self::Envelope(EnvelopeNotification {
-                    session_id: SessionKey(String::new()),
-                    topic: None,
-                    envelope,
+                    session_id: wire.session_id,
+                    topic: wire.topic,
+                    envelope: wire.envelope,
                 }))
             }
             _ => Err(RpcError::method_not_found(method)),
@@ -5425,6 +6196,200 @@ impl UiNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compare_protocol_compatible_for_full_protocol_with_known_features() {
+        // The full-protocol capabilities advertise every known feature, so any
+        // subset (here: the whole known registry) is satisfied.
+        let server = UiProtocolCapabilities::full_protocol();
+        let required: Vec<&str> = vec![
+            UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+        ];
+        assert_eq!(
+            compare_protocol(&server, required),
+            ProtocolCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn compare_protocol_empty_required_is_always_compatible() {
+        let server = UiProtocolCapabilities::full_protocol();
+        let required: Vec<&str> = Vec::new();
+        assert_eq!(
+            compare_protocol(&server, required),
+            ProtocolCompat::Compatible
+        );
+        assert!(compare_protocol(&server, Vec::<&str>::new()).is_compatible());
+    }
+
+    #[test]
+    fn compare_protocol_reports_missing_features_in_request_order() {
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server
+            .supported_features
+            .retain(|f| f != UI_PROTOCOL_FEATURE_USER_QUESTION_V1);
+        let required = vec![
+            UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, // present
+            UI_PROTOCOL_FEATURE_USER_QUESTION_V1,  // removed → missing
+        ];
+        assert_eq!(
+            compare_protocol(&server, required),
+            ProtocolCompat::MissingFeatures(vec![UI_PROTOCOL_FEATURE_USER_QUESTION_V1.to_owned()])
+        );
+    }
+
+    #[test]
+    fn compare_protocol_schema_incompatible_when_server_older() {
+        if UI_PROTOCOL_SCHEMA_VERSION == 0 {
+            return; // can't model an older schema below zero
+        }
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server.version.schema_version = UI_PROTOCOL_SCHEMA_VERSION - 1;
+        assert_eq!(
+            compare_protocol(&server, [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]),
+            ProtocolCompat::SchemaIncompatible {
+                server: UI_PROTOCOL_SCHEMA_VERSION - 1,
+                client: UI_PROTOCOL_SCHEMA_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn compare_protocol_allows_newer_server_schema() {
+        // A server ahead of the client (additive forward-compat) is fine.
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server.version.schema_version = UI_PROTOCOL_SCHEMA_VERSION + 5;
+        assert_eq!(
+            compare_protocol(&server, [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]),
+            ProtocolCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn compare_protocol_schema_incompatible_on_wrong_protocol_family() {
+        let mut server = UiProtocolCapabilities::full_protocol();
+        server.version.protocol = "octos-ui/v2alpha".into();
+        // Even with a same/newer schema number, a different family can't bridge.
+        match compare_protocol(&server, [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]) {
+            ProtocolCompat::SchemaIncompatible { client, .. } => {
+                assert_eq!(client, UI_PROTOCOL_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaIncompatible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_level_wire_shape() {
+        // Snake-case wire strings, incl. the DeepSeek "max" tier.
+        assert_eq!(
+            serde_json::to_value(ReasoningEffortLevel::Max).unwrap(),
+            json!("max")
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningEffortLevel::High).unwrap(),
+            json!("high")
+        );
+        assert_eq!(
+            serde_json::from_value::<ReasoningEffortLevel>(json!("low")).unwrap(),
+            ReasoningEffortLevel::Low
+        );
+        // Absent on turn/start is the common case; present round-trips.
+        let params = TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId::new(),
+            input: vec![],
+            media: vec![],
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: Some(ReasoningEffortLevel::Max),
+            live_video: false,
+        };
+        let wire = serde_json::to_value(&params).unwrap();
+        assert_eq!(wire["reasoning_effort"], json!("max"));
+        let back: TurnStartParams = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffortLevel::Max));
+        // Omitted optional fields deserialize to their defaults (backward
+        // compatible): no reasoning_effort, and `live_video` false.
+        let legacy = json!({
+            "session_id": "local:demo",
+            "turn_id": "00000000-0000-0000-0000-000000000001",
+            "input": []
+        });
+        let parsed: TurnStartParams = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.reasoning_effort, None);
+        assert!(!parsed.live_video);
+    }
+
+    #[test]
+    fn turn_start_live_video_roundtrips_and_is_omitted_when_false() {
+        // Explicit true is carried on the wire and read back.
+        let on = json!({
+            "session_id": "local:demo",
+            "turn_id": "00000000-0000-0000-0000-000000000001",
+            "input": [],
+            "live_video": true
+        });
+        let parsed: TurnStartParams = serde_json::from_value(on).unwrap();
+        assert!(parsed.live_video);
+        // Default false is omitted from the serialized form (no wire bloat).
+        let params = TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId(Uuid::from_u128(1)),
+            input: vec![],
+            media: vec![],
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
+        };
+        let wire = serde_json::to_value(&params).unwrap();
+        assert!(wire.get("live_video").is_none());
+    }
+
+    #[test]
+    fn should_surface_persisted_reasoning_effort_on_session_open() {
+        // The persisted per-session effort is surfaced back to a
+        // reconnecting/restarting TUI via `SessionOpened.reasoning_effort` so
+        // the client can restore its local `/thinking` state and mark its menu.
+        let opened = SessionOpened {
+            session_id: SessionKey("local:demo".into()),
+            active_profile_id: None,
+            workspace_root: None,
+            context: None,
+            context_state: None,
+            cursor: None,
+            panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: Some(ReasoningEffortLevel::High),
+        };
+        let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+        assert_eq!(wire["reasoning_effort"], json!("high"));
+        let back: SessionOpened = serde_json::from_value(wire).expect("round-trip");
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffortLevel::High));
+
+        // Omitted on the wire when None, and older payloads (no field) decode
+        // to None — additive + backward-compatible.
+        let none_opened = SessionOpened {
+            reasoning_effort: None,
+            ..opened.clone()
+        };
+        let none_wire = serde_json::to_value(&none_opened).expect("serialize None");
+        assert!(
+            none_wire.get("reasoning_effort").is_none(),
+            "reasoning_effort must be omitted from the wire when None"
+        );
+        let legacy = json!({
+            "session_id": "local:demo",
+            "capabilities": serde_json::to_value(
+                UiProtocolCapabilities::first_server_slice()
+            )
+            .unwrap()
+        });
+        let parsed: SessionOpened =
+            serde_json::from_value(legacy).expect("legacy payload without field decodes");
+        assert_eq!(parsed.reasoning_effort, None);
+    }
 
     #[test]
     fn ui_command_method_matches_expected_transport_name() {
@@ -5454,6 +6419,7 @@ mod tests {
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(capabilities.supports_method(methods::TASK_LIST));
@@ -5473,6 +6439,23 @@ mod tests {
                 .supported_notifications
                 .contains(&methods::SESSION_OPEN.to_owned())
         );
+        // #1477: the typed visual lifecycle events are advertised as supported
+        // notifications, so a negotiating client knows to expect them.
+        assert!(
+            decoded
+                .supported_notifications
+                .contains(&methods::VISUAL_GENERATING.to_owned())
+        );
+        assert!(
+            decoded
+                .supported_notifications
+                .contains(&methods::VISUAL_SUCCEEDED.to_owned())
+        );
+        assert!(
+            decoded
+                .supported_notifications
+                .contains(&methods::VISUAL_FAILED.to_owned())
+        );
     }
 
     #[test]
@@ -5491,6 +6474,7 @@ mod tests {
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
     }
@@ -5511,18 +6495,26 @@ mod tests {
     }
 
     #[test]
-    fn session_open_params_topic_and_cwd_are_additive_and_round_trip() {
+    fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
         let params = SessionOpenParams {
             session_id: SessionKey("local:demo".into()),
             topic: Some("research".into()),
             profile_id: Some("coding".into()),
             cwd: Some("/repo".into()),
+            sandbox: Some(SessionSandboxParams {
+                enabled: Some(true),
+                network_access: Some(false),
+                read_allow_paths: vec!["/repo/docs".into()],
+            }),
             after: None,
         };
 
         let wire = serde_json::to_value(&params).expect("serialize session/open params");
         assert_eq!(wire["topic"], json!("research"));
         assert_eq!(wire["cwd"], json!("/repo"));
+        assert_eq!(wire["sandbox"]["enabled"], json!(true));
+        assert_eq!(wire["sandbox"]["network_access"], json!(false));
+        assert_eq!(wire["sandbox"]["read_allow_paths"], json!(["/repo/docs"]));
 
         let decoded: SessionOpenParams =
             serde_json::from_value(wire).expect("deserialize session/open params");
@@ -5536,6 +6528,7 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy session/open params");
         assert!(decoded_legacy.topic.is_none());
         assert!(decoded_legacy.cwd.is_none());
+        assert!(decoded_legacy.sandbox.is_none());
     }
 
     #[test]
@@ -5599,6 +6592,7 @@ mod tests {
                 limitations: Vec::new(),
             }),
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         };
 
         let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -5632,6 +6626,7 @@ mod tests {
             cursor: None,
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         };
         let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
         let capabilities = wire
@@ -5860,6 +6855,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
                 "diff/preview/get",
@@ -5868,6 +6864,7 @@ mod tests {
                 "task/restart_from_node",
                 "task/output/read",
                 "session/hydrate",
+                "session/rollback",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -5914,6 +6911,7 @@ mod tests {
                 "turn/completed",
                 "turn/error",
                 "message/delta",
+                "message/reasoning_delta",
                 "tool/started",
                 "tool/progress",
                 "tool/completed",
@@ -5921,6 +6919,7 @@ mod tests {
                 "approval/auto_resolved",
                 "approval/decided",
                 "approval/cancelled",
+                "user_question/requested",
                 "task/updated",
                 "task/output/delta",
                 "progress/updated",
@@ -5929,6 +6928,11 @@ mod tests {
                 "message/persisted",
                 "turn/spawn_complete",
                 "file/attached",
+                "visual/generating",
+                "visual/succeeded",
+                "visual/failed",
+                "voice/exit",
+                "voice/audio_chunk",
                 "projection/envelope",
                 "session/event",
                 "router/status",
@@ -5943,6 +6947,7 @@ mod tests {
                 "loop/fired",
                 "loop/completed",
                 "context/compaction_completed",
+                "context/compaction_started",
                 "context/normalization_reported",
             ]
         );
@@ -5954,6 +6959,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
                 "diff/preview/get",
@@ -5962,6 +6968,7 @@ mod tests {
                 "task/restart_from_node",
                 "task/output/read",
                 "session/hydrate",
+                "session/rollback",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6000,7 +7007,7 @@ mod tests {
                 "router/get_metrics",
             ]
         );
-        assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
+        assert_eq!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.len(), 0);
     }
 
     #[test]
@@ -6026,6 +7033,7 @@ mod tests {
                     "turn/interrupt",
                     "approval/respond",
                     "approval/scopes/list",
+                    "user_question/respond",
                     "permission/profile/list",
                     "permission/profile/set",
                     "diff/preview/get",
@@ -6034,6 +7042,7 @@ mod tests {
                     "task/restart_from_node",
                     "task/output/read",
                     "session/hydrate",
+                    "session/rollback",
                     "thread/graph/get",
                     "turn/state/get",
                     "agent/list",
@@ -6077,6 +7086,7 @@ mod tests {
                     "turn/completed",
                     "turn/error",
                     "message/delta",
+                    "message/reasoning_delta",
                     "tool/started",
                     "tool/progress",
                     "tool/completed",
@@ -6084,6 +7094,7 @@ mod tests {
                     "approval/auto_resolved",
                     "approval/decided",
                     "approval/cancelled",
+                    "user_question/requested",
                     "task/updated",
                     "task/output/delta",
                     "progress/updated",
@@ -6092,6 +7103,11 @@ mod tests {
                     "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
+                    "visual/generating",
+                    "visual/succeeded",
+                    "visual/failed",
+                    "voice/exit",
+                    "voice/audio_chunk",
                     "projection/envelope",
                     "session/event",
                     "router/status",
@@ -6106,12 +7122,14 @@ mod tests {
                     "loop/fired",
                     "loop/completed",
                     "context/compaction_completed",
+                    "context/compaction_started",
                     "context/normalization_reported"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
                     "pane.snapshots.v1",
                     "session.workspace_cwd.v1",
+                    "session.sandbox.v1",
                     "harness.task_control.v1",
                     "state.session_hydrate.v1",
                     "state.thread_graph.v1",
@@ -6128,7 +7146,9 @@ mod tests {
                     "review.start.v1",
                     "context.lifecycle.v1",
                     "harness.task_supervision_inspection.v1",
-                    "harness.task_artifacts.v1"
+                    "harness.task_artifacts.v1",
+                    "user_question.v1",
+                    "event.voice_audio.v1"
                 ]
             })
         );
@@ -6142,6 +7162,8 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
         })
         .into_rpc_request("req-turn-start")
         .expect("serialize turn/start");
@@ -6334,6 +7356,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         })
         .into_rpc_notification()
         .expect("serialize task/updated cancelled");
@@ -6575,6 +7598,286 @@ mod tests {
         assert_eq!(decoded.body, "Fallback body remains actionable");
     }
 
+    // ---- UPCR-2026-023 AskUserQuestion protocol round-trips ----
+
+    #[test]
+    fn user_question_methods_and_feature_are_registered() {
+        assert_eq!(methods::USER_QUESTION_RESPOND, "user_question/respond");
+        assert_eq!(methods::USER_QUESTION_REQUESTED, "user_question/requested");
+        assert_eq!(UI_PROTOCOL_FEATURE_USER_QUESTION_V1, "user_question.v1");
+        assert!(UI_PROTOCOL_COMMAND_METHODS.contains(&methods::USER_QUESTION_RESPOND));
+        assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::USER_QUESTION_REQUESTED));
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_USER_QUESTION_V1));
+        assert_eq!(
+            method_capability_gate(methods::USER_QUESTION_RESPOND),
+            Some(UI_PROTOCOL_FEATURE_USER_QUESTION_V1)
+        );
+    }
+
+    #[test]
+    fn full_protocol_advertises_user_question_feature() {
+        // `full_protocol()` must agree with the known/first-server feature
+        // lists, both of which already include `user_question.v1`. A client
+        // that handshakes against `full_protocol()` must see the question
+        // capability or it will never negotiate `user_question.v1` and the
+        // tool silently degrades to its fallback.
+        let caps = UiProtocolCapabilities::full_protocol();
+        assert!(
+            caps.supported_features
+                .iter()
+                .any(|f| f == UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            "full_protocol() must advertise user_question.v1; got {:?}",
+            caps.supported_features
+        );
+    }
+
+    #[test]
+    fn user_question_requested_event_round_trips_with_structured_questions() {
+        let event = UserQuestionRequestedEvent::new(
+            SessionKey("local:demo".into()),
+            QuestionId(Uuid::from_u128(7)),
+            TurnId(Uuid::from_u128(1)),
+            "Pick a framework",
+            "The agent needs you to choose a target framework and runtimes.",
+            vec![
+                UserQuestion {
+                    header: "Framework".into(),
+                    question: "Which web framework should I scaffold?".into(),
+                    options: vec![
+                        UserQuestionOption {
+                            label: "axum".into(),
+                            description: "tower-based async framework".into(),
+                        },
+                        UserQuestionOption {
+                            label: "actix".into(),
+                            description: "actor-based framework".into(),
+                        },
+                    ],
+                    multi_select: false,
+                    allow_free_text: true,
+                },
+                UserQuestion {
+                    header: "Runtimes".into(),
+                    question: "Which runtimes should CI cover?".into(),
+                    options: vec![
+                        UserQuestionOption {
+                            label: "stable".into(),
+                            description: "latest stable toolchain".into(),
+                        },
+                        UserQuestionOption {
+                            label: "nightly".into(),
+                            description: "nightly toolchain".into(),
+                        },
+                        UserQuestionOption {
+                            label: "msrv".into(),
+                            description: "minimum supported rust version".into(),
+                        },
+                    ],
+                    multi_select: true,
+                    allow_free_text: true,
+                },
+            ],
+        );
+
+        let notification = UiNotification::UserQuestionRequested(event.clone());
+        assert_eq!(notification.method(), methods::USER_QUESTION_REQUESTED);
+        let wire = notification
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize user_question/requested");
+        assert_eq!(wire.method, methods::USER_QUESTION_REQUESTED);
+        // snake_case wire field names + mandatory title/body fallback.
+        assert_eq!(wire.params["title"], json!("Pick a framework"));
+        assert_eq!(wire.params["questions"][0]["header"], json!("Framework"));
+        assert_eq!(wire.params["questions"][0]["multi_select"], json!(false));
+        assert_eq!(wire.params["questions"][1]["multi_select"], json!(true));
+        assert_eq!(wire.params["questions"][1]["allow_free_text"], json!(true));
+        assert_eq!(
+            wire.params["questions"][0]["options"][0]["label"],
+            json!("axum")
+        );
+
+        let decoded =
+            UiNotification::from_rpc_notification(wire).expect("decode user_question/requested");
+        assert_eq!(decoded, notification);
+    }
+
+    // #1477 voice rich output: the typed visual lifecycle events carry the
+    // right method + snake_case wire fields (server→client only).
+    #[test]
+    fn visual_generating_and_failed_wire_contract() {
+        let generating = UiNotification::VisualGenerating(VisualGeneratingEvent {
+            session_id: SessionKey("local:voice".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(1)),
+            kind: "illustrated".into(),
+        });
+        assert_eq!(generating.method(), methods::VISUAL_GENERATING);
+        let wire = generating
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize visual/generating");
+        assert_eq!(wire.method, methods::VISUAL_GENERATING);
+        assert_eq!(wire.params["kind"], json!("illustrated"));
+        // Round-trip: decode must reconstruct the same notification.
+        let decoded =
+            UiNotification::from_rpc_notification(wire).expect("decode visual/generating");
+        assert_eq!(decoded, generating);
+
+        let succeeded = UiNotification::VisualSucceeded(VisualSucceededEvent {
+            session_id: SessionKey("local:voice".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(1)),
+            kind: "html".into(),
+            files: vec!["visual-abc.html".into()],
+        });
+        assert_eq!(succeeded.method(), methods::VISUAL_SUCCEEDED);
+        let wire = succeeded
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize visual/succeeded");
+        assert_eq!(wire.method, methods::VISUAL_SUCCEEDED);
+        assert_eq!(wire.params["kind"], json!("html"));
+        assert_eq!(wire.params["files"], json!(["visual-abc.html"]));
+        let decoded = UiNotification::from_rpc_notification(wire).expect("decode visual/succeeded");
+        assert_eq!(decoded, succeeded);
+
+        let failed = UiNotification::VisualFailed(VisualFailedEvent {
+            session_id: SessionKey("local:voice".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(1)),
+            reason: Some("timed out".into()),
+        });
+        assert_eq!(failed.method(), methods::VISUAL_FAILED);
+        let wire = failed
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize visual/failed");
+        assert_eq!(wire.method, methods::VISUAL_FAILED);
+        assert_eq!(wire.params["reason"], json!("timed out"));
+        let decoded = UiNotification::from_rpc_notification(wire).expect("decode visual/failed");
+        assert_eq!(decoded, failed);
+    }
+
+    #[test]
+    fn voice_exit_wire_contract() {
+        // UPCR-2026-025: the typed exit notification carries session_id + turn_id
+        // (and an optional topic); it round-trips intact and the topic is stamped
+        // from a topic-scoped session key, mirroring the visual/* lifecycle.
+        let exit = UiNotification::VoiceExit(VoiceExitEvent {
+            session_id: SessionKey("local:voice#exit".into()),
+            topic: None,
+            turn_id: TurnId(Uuid::from_u128(42)),
+        });
+        assert_eq!(exit.method(), methods::VOICE_EXIT);
+        let wire = exit
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize voice/exit");
+        assert_eq!(wire.method, methods::VOICE_EXIT);
+        // Topic is stamped from the `#exit` suffix of the session key on the wire.
+        assert_eq!(wire.params["topic"], json!("exit"));
+        let decoded = UiNotification::from_rpc_notification(wire).expect("decode voice/exit");
+        // Equality holds after the topic was stamped from the session key.
+        assert_eq!(decoded.method(), methods::VOICE_EXIT);
+        assert_eq!(decoded.session_id().0, "local:voice#exit");
+        assert_eq!(decoded.topic(), Some("exit"));
+    }
+
+    #[test]
+    fn user_question_respond_params_round_trip_multi_question_and_free_text() {
+        let params = UserQuestionRespondParams {
+            session_id: SessionKey("local:demo".into()),
+            question_id: QuestionId(Uuid::from_u128(7)),
+            answers: vec![
+                // single-select: one label
+                UserQuestionAnswer {
+                    selected_labels: vec!["axum".into()],
+                    free_text: None,
+                },
+                // multi-select: several labels
+                UserQuestionAnswer {
+                    selected_labels: vec!["stable".into(), "msrv".into()],
+                    free_text: None,
+                },
+                // free-text-only: empty labels + free_text
+                UserQuestionAnswer {
+                    selected_labels: Vec::new(),
+                    free_text: Some("rocket, please".into()),
+                },
+            ],
+            client_note: Some("answered from TUI".into()),
+        };
+
+        let command = UiCommand::UserQuestionRespond(params.clone());
+        assert_eq!(command.method(), methods::USER_QUESTION_RESPOND);
+        let request = command
+            .clone()
+            .into_rpc_request("req-uq-1")
+            .expect("serialize user_question/respond");
+        assert_eq!(request.method, methods::USER_QUESTION_RESPOND);
+        // free-text-only answer omits the empty selected_labels but keeps free_text.
+        assert_eq!(
+            request.params["answers"][2]["free_text"],
+            json!("rocket, please")
+        );
+        assert!(
+            request.params["answers"][2]
+                .get("selected_labels")
+                .is_none()
+        );
+
+        let decoded = UiCommand::from_rpc_request(request).expect("decode user_question/respond");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn user_question_respond_decodes_minimal_and_unknown_fields() {
+        // Minimal params: client_note omitted, free-text-only answer with no
+        // selected_labels, plus an unknown forward-compat sibling field.
+        let value = json!({
+            "session_id": "local:demo",
+            "question_id": QuestionId(Uuid::from_u128(7)),
+            "answers": [
+                { "free_text": "something else" }
+            ],
+            "future_field": { "anything": true }
+        });
+        let decoded: UserQuestionRespondParams =
+            serde_json::from_value(value).expect("minimal user_question/respond decodes");
+        assert_eq!(decoded.client_note, None);
+        assert_eq!(decoded.answers.len(), 1);
+        assert!(decoded.answers[0].selected_labels.is_empty());
+        assert_eq!(
+            decoded.answers[0].free_text.as_deref(),
+            Some("something else")
+        );
+    }
+
+    #[test]
+    fn user_question_requested_keeps_generic_fallback_on_unknown_fields() {
+        // A client that does not understand `questions` must still get the
+        // mandatory generic title/body, and an unknown extra field must not
+        // break decoding (forward-compat).
+        let value = json!({
+            "session_id": "local:demo",
+            "question_id": QuestionId(Uuid::from_u128(7)),
+            "turn_id": TurnId(Uuid::from_u128(1)),
+            "title": "Generic fallback title",
+            "body": "Generic fallback body the user can still answer via free text.",
+            "questions": [],
+            "future_render_hint": "wizard"
+        });
+        let decoded: UserQuestionRequestedEvent =
+            serde_json::from_value(value).expect("unknown-field event decodes");
+        assert_eq!(decoded.title, "Generic fallback title");
+        assert_eq!(
+            decoded.body,
+            "Generic fallback body the user can still answer via free text."
+        );
+        assert!(decoded.questions.is_empty());
+    }
+
     #[test]
     fn approval_respond_accepts_legacy_and_typed_metadata() {
         let legacy = json!({
@@ -6617,6 +7920,8 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
         });
 
         let request = command
@@ -6682,6 +7987,8 @@ mod tests {
             ],
             topic: None,
             rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -6721,6 +8028,8 @@ mod tests {
             media: Vec::new(),
             topic: Some("slides".into()),
             rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -6760,6 +8069,8 @@ mod tests {
             media: Vec::new(),
             topic: None,
             rewrite_for: Some("cmid-queued-original".into()),
+            reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -6804,6 +8115,8 @@ mod tests {
             }],
             topic: Some("research".into()),
             rewrite_for: Some("cmid-original".into()),
+            reasoning_effort: None,
+            live_video: false,
         });
 
         let wire = serde_json::to_value(
@@ -6934,6 +8247,7 @@ mod tests {
             }),
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         };
 
         let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -7776,6 +9090,7 @@ mod tests {
             cursor: Some(opened_cursor.clone()),
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
         });
 
         let opened_wire = opened
@@ -8377,6 +9692,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         });
         let rpc = event
             .clone()
@@ -8410,6 +9726,8 @@ mod tests {
             summary: Some("found 1 issue".into()),
             artifact_count: Some(2),
             runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+            // C1 step 4: turn_id round-trips alongside the projection fields.
+            turn_id: Some(TurnId(Uuid::from_u128(0xCAFE))),
         };
         let value = serde_json::to_value(&event).expect("serialize task/updated");
         assert_eq!(value.get("source"), Some(&json!("model")));
@@ -8419,6 +9737,11 @@ mod tests {
         assert_eq!(
             value.get("runtime_policy_stamp"),
             Some(&json!({ "approval_policy": "on-request" })),
+        );
+        assert_eq!(
+            value.get("turn_id"),
+            Some(&json!(Uuid::from_u128(0xCAFE).to_string())),
+            "turn_id must appear on the wire when set",
         );
         let parsed: TaskUpdatedEvent =
             serde_json::from_value(value).expect("deserialize task/updated");
@@ -8440,6 +9763,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         };
         let bare_value = serde_json::to_value(&bare).expect("serialize bare task/updated");
         assert!(bare_value.get("source").is_none(), "absent source omits");
@@ -8452,6 +9776,10 @@ mod tests {
         assert!(
             bare_value.get("runtime_policy_stamp").is_none(),
             "absent runtime_policy_stamp omits",
+        );
+        assert!(
+            bare_value.get("turn_id").is_none(),
+            "absent turn_id omits (C1 step 4)",
         );
         let legacy_json = json!({
             "session_id": "local:demo",
@@ -8466,6 +9794,7 @@ mod tests {
         assert_eq!(parsed_legacy.summary, None);
         assert_eq!(parsed_legacy.artifact_count, None);
         assert_eq!(parsed_legacy.runtime_policy_stamp, None);
+        assert_eq!(parsed_legacy.turn_id, None);
     }
 
     // ===== UPCR-2026-009 / -010 / -011 / -012 golden tests (PR G) =====
@@ -8489,6 +9818,32 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-04-30T12:00:00Z")
             .expect("rfc3339 parse")
             .with_timezone(&Utc)
+    }
+
+    fn sample_user_question_requested_event() -> UserQuestionRequestedEvent {
+        UserQuestionRequestedEvent::new(
+            sample_session_id(),
+            QuestionId(Uuid::from_u128(0x77)),
+            sample_turn_id(),
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            vec![UserQuestion {
+                header: "Framework".into(),
+                question: "Which framework?".into(),
+                options: vec![
+                    UserQuestionOption {
+                        label: "axum".into(),
+                        description: "tower-based".into(),
+                    },
+                    UserQuestionOption {
+                        label: "actix".into(),
+                        description: "actor-based".into(),
+                    },
+                ],
+                multi_select: false,
+                allow_free_text: true,
+            }],
+        )
     }
 
     #[test]
@@ -8550,7 +9905,9 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: Some(vec![]),
+            pending_questions: Some(vec![sample_user_question_requested_event()]),
             replayed_envelopes: Some(vec![]),
+            replayed_tool_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
         let parsed: SessionHydrateResult =
@@ -8567,7 +9924,9 @@ mod tests {
             threads: None,
             turns: None,
             pending_approvals: None,
+            pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
         let object = value.as_object().expect("hydrate result is object");
@@ -8575,8 +9934,69 @@ mod tests {
         assert!(!object.contains_key("threads"));
         assert!(!object.contains_key("turns"));
         assert!(!object.contains_key("pending_approvals"));
+        // UPCR-2026-023: a client that did not request pending questions never
+        // sees the new field — it is omitted, never serialized as `null`.
+        assert!(!object.contains_key("pending_questions"));
         // Bug C: a non-negotiated client never sees the new field.
         assert!(!object.contains_key("replayed_envelopes"));
+        assert!(!object.contains_key("replayed_tool_envelopes"));
+    }
+
+    #[test]
+    fn golden_session_rollback_params_serde() {
+        let params = SessionRollbackParams {
+            session_id: sample_session_id(),
+            num_turns: 2,
+        };
+        let value = serde_json::to_value(&params).expect("serialize rollback params");
+        assert_eq!(value, json!({ "session_id": "local:demo", "num_turns": 2 }));
+        let parsed: SessionRollbackParams =
+            serde_json::from_value(value).expect("deserialize rollback params");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn session_rollback_command_and_result_round_trip() {
+        // Command decodes from its wire method name.
+        let command = UiCommand::SessionRollback(SessionRollbackParams {
+            session_id: sample_session_id(),
+            num_turns: 1,
+        });
+        assert_eq!(command.method(), methods::SESSION_ROLLBACK);
+        let request = command.clone().into_rpc_request("r1").expect("encode");
+        assert_eq!(request.method, methods::SESSION_ROLLBACK);
+        let decoded = UiCommand::from_rpc_request(request).expect("decode command");
+        assert_eq!(decoded, command);
+
+        // Result carries the trimmed hydrate projection and round-trips through
+        // the method-keyed decode path.
+        let result = SessionRollbackResult {
+            dropped_turns: 1,
+            thread: SessionHydrateResult {
+                session_id: sample_session_id(),
+                cursor: sample_cursor(),
+                context: None,
+                context_state: None,
+                messages: Some(vec![]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+                replayed_tool_envelopes: None,
+            },
+        };
+        let wire = UiRpcResult::SessionRollback(result.clone());
+        assert_eq!(wire.method(), Some(methods::SESSION_ROLLBACK));
+        assert_eq!(wire.kind(), UiResultKind::SessionRollback);
+        let value = wire.into_result_value().expect("encode result");
+        let decoded =
+            UiRpcResult::from_method_and_result(methods::SESSION_ROLLBACK, value).expect("decode");
+        assert_eq!(decoded, UiRpcResult::SessionRollback(result));
+        assert_eq!(
+            first_server_result_kind_for_method(methods::SESSION_ROLLBACK),
+            Some(UiResultKind::SessionRollback)
+        );
     }
 
     #[test]
@@ -8866,6 +10286,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         };
         let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
         assert_eq!(
@@ -8892,6 +10313,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: None,
         };
         let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");
         assert!(
@@ -10014,10 +11436,14 @@ mod tests {
     }
 
     #[test]
-    fn envelope_notification_round_trips_through_rpc_envelope_with_bare_wire_shape() {
-        // The wire shape MUST be the bare `Envelope` per spec § 14.1 —
-        // `session_id` and `topic` are server-internal routing fields
-        // and MUST NOT leak onto the JSON-RPC `params`.
+    fn envelope_notification_round_trips_through_rpc_envelope_with_routing() {
+        // feat(envelope-wire-routing): the wire now carries `session_id`
+        // (the bare base key) + optional `topic` FLATTENED alongside the
+        // bare Envelope fields so a multi-session client can route the
+        // envelope to the right session. The envelope fields stay at the
+        // top level (no `envelope` nesting) so the existing tolerant web
+        // SPA bridge — which reads `thread_id`/`seq`/`payload` top-level
+        // and ignores unknown keys — keeps decoding it unchanged.
         let envelope = Envelope {
             thread_id: "thread-7".into(),
             seq: 42,
@@ -10038,31 +11464,72 @@ mod tests {
         });
         let rpc = notif.into_rpc_notification().expect("serialize");
         assert_eq!(rpc.method, "projection/envelope");
-        // Wire shape: bare Envelope JSON, no session_id/topic keys.
+        // Wire shape: flattened — bare Envelope keys PLUS routing keys.
         let params = &rpc.params;
-        assert!(
-            params.get("session_id").is_none(),
-            "session_id must not leak onto the wire"
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:demo")),
+            "session_id must reach the wire so the client can route",
         );
-        assert!(
-            params.get("topic").is_none(),
-            "topic must not leak onto the wire"
+        assert_eq!(
+            params.get("topic"),
+            Some(&json!("planning")),
+            "topic must reach the wire for topic-scoped routing",
         );
+        // Bare Envelope keys stay at the top level (web-bridge compat).
         assert_eq!(params.get("thread_id"), Some(&json!("thread-7")));
         assert_eq!(params.get("seq"), Some(&json!(42)));
         assert_eq!(params.get("client_message_id"), Some(&json!("cmid-x")));
+        // No `envelope` nesting on the wire — the flatten keeps the bare
+        // shape the web bridge already reads.
+        assert!(
+            params.get("envelope").is_none(),
+            "wire is flattened, not nested under `envelope`",
+        );
 
-        // Round-trip decode: session_id defaults to empty (the AppUI
-        // decode path rebuilds it from ambient context); envelope must
-        // be byte-equal.
+        // Round-trip decode: session_id + topic survive byte-for-byte and
+        // the envelope is byte-equal.
         let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
         match parsed {
             UiNotification::Envelope(ev) => {
                 assert_eq!(ev.envelope, envelope);
-                // Routing fields default on the decode path; consumer
-                // reconstructs them from ambient context.
-                assert_eq!(ev.session_id, SessionKey(String::new()));
-                assert_eq!(ev.topic, None);
+                assert_eq!(
+                    ev.session_id,
+                    SessionKey("local:demo".into()),
+                    "decode must recover the routing session_id from the wire",
+                );
+                assert_eq!(ev.topic, Some("planning".into()));
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+    }
+
+    /// feat(envelope-wire-routing) backward-compat: an OLD bare-envelope
+    /// wire frame (no `session_id` / `topic` keys — emitted by a server
+    /// before this change) must still decode without error. The routing
+    /// fields default to empty/None; the consumer is expected to fall
+    /// back to ambient connection context for those legacy frames.
+    #[test]
+    fn envelope_notification_decodes_legacy_bare_wire_frame_without_routing() {
+        // OLD wire shape: bare Envelope, no session_id/topic.
+        let legacy_params = json!({
+            "thread_id": "thread-legacy",
+            "seq": 3,
+            "payload": { "type": "assistant_delta", "data": { "text": "hi" } }
+        });
+        let decoded =
+            UiNotification::from_method_and_params(methods::PROJECTION_ENVELOPE, legacy_params)
+                .expect("legacy bare-envelope frame must still decode");
+        match decoded {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(
+                    ev.session_id,
+                    SessionKey(String::new()),
+                    "absent session_id defaults to empty for legacy frames",
+                );
+                assert_eq!(ev.topic, None, "absent topic defaults to None");
+                assert_eq!(ev.envelope.thread_id, "thread-legacy");
+                assert_eq!(ev.envelope.seq, 3);
             }
             other => panic!("expected Envelope variant, got {other:?}"),
         }
@@ -10143,16 +11610,18 @@ mod tests {
         assert_eq!(parsed, no_topic);
     }
 
-    /// Codex #1336 round-2 BLOCKER 4 — wire shape regression guard.
-    /// `into_rpc_notification` is the ONLY place the wire shape is
-    /// produced; routing fields are stripped here and ONLY here. The
-    /// disk-persistence test above pins that the routing fields DO
-    /// survive when the envelope is serialized directly (not through
-    /// into_rpc_notification).
+    /// feat(envelope-wire-routing) — wire shape guard. The wire is the
+    /// FLATTENED form: bare Envelope keys (`thread_id`, `seq`, `payload`,
+    /// no `envelope` nesting) PLUS the routing keys `session_id` +
+    /// `topic` so a multi-session client can route. Codex #1336
+    /// BLOCKER-4's actual invariant — that the DISK derive preserves
+    /// routing — is pinned by
+    /// `envelope_notification_serde_preserves_routing_fields_for_disk_persistence`
+    /// above; that disk path is untouched by un-stripping the wire.
     #[test]
-    fn envelope_notification_into_rpc_notification_strips_routing_fields() {
+    fn envelope_notification_into_rpc_notification_flattens_routing_onto_wire() {
         let notif = UiNotification::Envelope(EnvelopeNotification {
-            session_id: SessionKey("local:wire-strip".into()),
+            session_id: SessionKey("local:wire-route".into()),
             topic: Some("planning".into()),
             envelope: Envelope {
                 thread_id: "thread-wire".into(),
@@ -10164,18 +11633,131 @@ mod tests {
         let rpc = notif.into_rpc_notification().expect("serialize");
         assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
         let params = &rpc.params;
-        assert!(
-            params.get("session_id").is_none(),
-            "wire MUST strip session_id (spec § 14.1)",
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:wire-route")),
+            "wire carries session_id for routing",
         );
-        assert!(
-            params.get("topic").is_none(),
-            "wire MUST strip topic (spec § 14.1)",
+        assert_eq!(
+            params.get("topic"),
+            Some(&json!("planning")),
+            "wire carries topic for topic-scoped routing",
         );
-        // Bare envelope on the wire — `thread_id`, `seq`, `payload`
-        // are top-level keys (no `envelope` nesting).
+        // Bare envelope fields stay top-level (no `envelope` nesting) so
+        // the existing web-bridge top-level reader is unaffected.
         assert_eq!(params.get("thread_id"), Some(&json!("thread-wire")));
         assert_eq!(params.get("seq"), Some(&json!(5)));
+        assert!(
+            params.get("envelope").is_none(),
+            "wire is flattened, not nested under `envelope`",
+        );
+    }
+
+    /// feat(envelope-wire-routing): a `topic: None` envelope omits the
+    /// `topic` key on the wire (compact shape) but still carries
+    /// `session_id`. Decode recovers session_id and defaults topic.
+    #[test]
+    fn envelope_notification_wire_omits_absent_topic_but_keeps_session_id() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:no-topic".into()),
+            topic: None,
+            envelope: Envelope {
+                thread_id: "thread-nt".into(),
+                seq: 9,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "y".into() },
+            },
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        let params = &rpc.params;
+        assert_eq!(params.get("session_id"), Some(&json!("local:no-topic")));
+        assert!(
+            params.get("topic").is_none(),
+            "absent topic omitted on the wire",
+        );
+        let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
+        match parsed {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(ev.session_id, SessionKey("local:no-topic".into()));
+                assert_eq!(ev.topic, None);
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+    }
+
+    /// feat(envelope-wire-routing) — codex BLOCKER: on a TOPIC turn the
+    /// `turn/start` flow folds the topic into `session_id` as
+    /// `"base#topic"`, which is carried forward into the emitted
+    /// `EnvelopeNotification.session_id`. The WIRE `session_id` MUST be
+    /// normalized to the bare base key (`"base"`) — a client only knows
+    /// the base key, so a `"base#topic"` wire key misroutes the message
+    /// and defeats the orphan-chip self-heal. The topic MUST NOT be lost:
+    /// it is preserved on the wire's separate `topic` field (recovered
+    /// from the suffix when the explicit `topic` field is empty). The
+    /// DISK derive on `EnvelopeNotification` keeps `"base#topic"`
+    /// untouched (pinned by the disk-persistence test above).
+    #[test]
+    fn envelope_wire_session_id_is_normalized_to_base_key_with_topic_preserved() {
+        let envelope = Envelope {
+            thread_id: "thread-topic".into(),
+            seq: 11,
+            client_message_id: None,
+            payload: Payload::AssistantDelta {
+                text: "topic delta".into(),
+            },
+        };
+
+        // Case 1: topic folded into session_id ("base#topic"), explicit
+        // `topic` field is None — the suffix must be recovered onto the
+        // wire's separate `topic` field while session_id is stripped.
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo#research".into()),
+            topic: None,
+            envelope: envelope.clone(),
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        let params = &rpc.params;
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:demo")),
+            "wire session_id must be the bare base key, not base#topic",
+        );
+        assert_eq!(
+            params.get("topic"),
+            Some(&json!("research")),
+            "topic must be preserved on the wire (recovered from suffix)",
+        );
+        // Decode must round-trip to the bare base key + separate topic.
+        let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
+        match parsed {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(
+                    ev.session_id,
+                    SessionKey("local:demo".into()),
+                    "decode recovers the bare base key from the wire",
+                );
+                assert_eq!(ev.topic, Some("research".into()));
+                assert_eq!(ev.envelope, envelope);
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+
+        // Case 2: topic folded into session_id AND an explicit `topic`
+        // field also set — the explicit topic wins, session_id still
+        // strips to the base key.
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo#research".into()),
+            topic: Some("research".into()),
+            envelope: envelope.clone(),
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        let params = &rpc.params;
+        assert_eq!(
+            params.get("session_id"),
+            Some(&json!("local:demo")),
+            "wire session_id must be the bare base key even with explicit topic",
+        );
+        assert_eq!(params.get("topic"), Some(&json!("research")));
     }
 
     // ------------------------------------------------------------------
@@ -10433,6 +12015,28 @@ mod tests {
 
     fn bare_session() -> SessionKey {
         SessionKey("local:slides-soak".into())
+    }
+
+    #[test]
+    fn voice_audio_chunk_round_trips_through_rpc_notification() {
+        let event = VoiceAudioChunkEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            segment_id: "seg-1".into(),
+            seq: 0,
+            mime: "audio/mpeg".into(),
+            audio_b64: "QUJD".into(),
+            last: false,
+        };
+        let notif = UiNotification::VoiceAudioChunk(event.clone());
+        assert_eq!(notif.method(), methods::VOICE_AUDIO_CHUNK);
+
+        let rpc = notif.into_rpc_notification().expect("to rpc notification");
+        assert_eq!(rpc.method, "voice/audio_chunk");
+
+        let back = UiNotification::from_rpc_notification(rpc).expect("from rpc notification");
+        assert_eq!(back, UiNotification::VoiceAudioChunk(event));
     }
 
     #[test]

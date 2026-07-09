@@ -13,6 +13,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::vision;
 
 use crate::config::ChatConfig;
+use crate::config::ReasoningEffort;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::{
     ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
@@ -77,25 +78,11 @@ impl AnthropicProvider {
         tools: &'a [ToolSpec],
         config: &'a ChatConfig,
     ) -> AnthropicRequest<'a> {
+        let max_tokens = config.max_tokens.unwrap_or(4096);
         AnthropicRequest {
             model: &self.model,
-            max_tokens: config.max_tokens.unwrap_or(4096),
-            messages: messages
-                .iter()
-                .filter(|m| m.role != octos_core::MessageRole::System)
-                .map(|m| {
-                    let role = match m.role {
-                        octos_core::MessageRole::User => "user",
-                        octos_core::MessageRole::Assistant => "assistant",
-                        octos_core::MessageRole::Tool => "user",
-                        octos_core::MessageRole::System => "user",
-                    };
-                    AnthropicMessage {
-                        role,
-                        content: build_anthropic_content(m),
-                    }
-                })
-                .collect(),
+            max_tokens,
+            messages: build_anthropic_messages(messages),
             system: {
                 let system_parts: Vec<&str> = messages
                     .iter()
@@ -109,6 +96,9 @@ impl AnthropicProvider {
                 }
             },
             tools: if tools.is_empty() { None } else { Some(tools) },
+            thinking: config
+                .reasoning_effort
+                .and_then(|effort| build_anthropic_thinking(effort, max_tokens)),
             context_management: config.context_management.as_ref(),
         }
     }
@@ -155,45 +145,7 @@ impl LlmProvider for AnthropicProvider {
             .await
             .wrap_err("failed to parse Anthropic response")?;
 
-        // Convert response to our types
-        let mut content = None;
-        let mut tool_calls = Vec::new();
-
-        for block in api_response.content {
-            match block {
-                ContentBlock::Text { text } => {
-                    content = Some(text);
-                }
-                ContentBlock::ToolUse { id, name, input } => {
-                    tool_calls.push(octos_core::ToolCall {
-                        id,
-                        name,
-                        arguments: input,
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        let stop_reason = match api_response.stop_reason.as_str() {
-            "end_turn" => StopReason::EndTurn,
-            "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::MaxTokens,
-            _ => StopReason::EndTurn,
-        };
-
-        Ok(ChatResponse {
-            content,
-            reasoning_content: None,
-            tool_calls,
-            stop_reason,
-            usage: TokenUsage {
-                input_tokens: api_response.usage.input_tokens,
-                output_tokens: api_response.usage.output_tokens,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        Ok(anthropic_response_to_chat_response(api_response))
     }
 
     async fn chat_stream(
@@ -272,6 +224,8 @@ struct AnthropicRequest<'a> {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolSpec]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
     /// M8.5 tier 2: forwarded from `ChatConfig.context_management`. Opaque
     /// payload (typically `{ "edits": [ { "type":
     /// "clear_tool_uses_20250919", ... } ] }`) that tells Anthropic's server
@@ -279,6 +233,40 @@ struct AnthropicRequest<'a> {
     /// non-null and the caller opted in via the builder.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_management: Option<&'a serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AnthropicThinking {
+    r#type: &'static str,
+    budget_tokens: u32,
+}
+
+/// Anthropic requires `1024 <= budget_tokens < max_tokens`, and the reply still
+/// needs output room. Clamp the per-effort budget to leave a reserve below
+/// `max_tokens`; if `max_tokens` is too small to fit a valid (>=1024) budget,
+/// return `None` so we omit the thinking param entirely instead of emitting a
+/// request Claude rejects before the turn starts.
+fn build_anthropic_thinking(effort: ReasoningEffort, max_tokens: u32) -> Option<AnthropicThinking> {
+    const MIN_BUDGET: u32 = 1_024;
+    const OUTPUT_RESERVE: u32 = 1_024;
+    let budget =
+        anthropic_thinking_budget_tokens(effort).min(max_tokens.saturating_sub(OUTPUT_RESERVE));
+    if budget < MIN_BUDGET {
+        return None;
+    }
+    Some(AnthropicThinking {
+        r#type: "enabled",
+        budget_tokens: budget,
+    })
+}
+
+fn anthropic_thinking_budget_tokens(effort: ReasoningEffort) -> u32 {
+    match effort {
+        ReasoningEffort::Low => 1_024,
+        ReasoningEffort::Medium => 4_096,
+        ReasoningEffort::High => 8_192,
+        ReasoningEffort::Max => 16_000,
+    }
 }
 
 #[derive(Serialize)]
@@ -302,6 +290,23 @@ enum AnthropicContentBlock {
     Text { text: String },
     #[serde(rename = "image")]
     Image { source: AnthropicImageSource },
+    /// Prior assistant tool invocation, round-tripped from
+    /// [`octos_core::Message::tool_calls`]. Anthropic requires the original
+    /// `tool_use` block in the assistant turn for the following
+    /// `tool_result` to pair with — without it the request 400s.
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool output for a prior `tool_use`, carried in a USER-role message
+    /// (Anthropic's convention for tool results).
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -309,6 +314,167 @@ struct AnthropicImageSource {
     r#type: String,
     media_type: String,
     data: String,
+}
+
+/// Convert the transcript into Anthropic wire messages.
+///
+/// Role handling:
+/// - System rows are extracted by the caller into the top-level `system`
+///   field and skipped here.
+/// - Assistant rows round-trip `tool_calls` as `tool_use` blocks; rows with
+///   neither non-blank text nor tool calls are DROPPED (Anthropic rejects
+///   empty content — mirrors the openai.rs filter).
+/// - Tool rows become `tool_result` blocks in USER-role messages, and
+///   CONSECUTIVE Tool rows merge into ONE user message: Anthropic requires
+///   every `tool_use` id from the assistant turn to be answered in the
+///   immediately-following message, so parallel tool results split across
+///   two user messages would 400.
+fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'static>> {
+    let mut out: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
+    // True while `out.last()` is the user-role message accumulating the
+    // current run of consecutive tool_result blocks.
+    let mut merging_tool_results = false;
+    // tool_use ids answerable by the NEXT emitted message (codex P2): a
+    // `tool_result` is only valid immediately after the assistant message
+    // that carries its `tool_use`. A Tool row whose id is not pending — the
+    // assistant row was trimmed/compacted away, the window starts mid-loop,
+    // or another message closed the window — must fall back to plain user
+    // text; Anthropic rejects orphan tool_result blocks outright.
+    let mut pending_tool_use_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for m in messages
+        .iter()
+        .filter(|m| m.role != octos_core::MessageRole::System)
+    {
+        match m.role {
+            octos_core::MessageRole::Assistant => {
+                merging_tool_results = false;
+                if let Some(content) = build_assistant_anthropic_content(m) {
+                    pending_tool_use_ids = m
+                        .tool_calls
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|tc| !tc.id.is_empty())
+                        .map(|tc| tc.id.clone())
+                        .collect();
+                    out.push(AnthropicMessage {
+                        role: "assistant",
+                        content,
+                    });
+                }
+                // A DROPPED (fully-empty) assistant row emits nothing, so the
+                // previously-emitted message is unchanged — leave the pending
+                // window as-is.
+            }
+            octos_core::MessageRole::Tool => {
+                let block = m
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| pending_tool_use_ids.contains(*id))
+                    .and_then(|_| anthropic_tool_result_block(m));
+                match block {
+                    Some(block) => {
+                        // Consume the id: a duplicate result for the same
+                        // tool_use would also be rejected.
+                        if let Some(id) = m.tool_call_id.as_deref() {
+                            pending_tool_use_ids.remove(id);
+                        }
+                        if merging_tool_results
+                            && let Some(AnthropicMessage {
+                                content: AnthropicContent::Parts(parts),
+                                ..
+                            }) = out.last_mut()
+                        {
+                            parts.push(block);
+                        } else {
+                            out.push(AnthropicMessage {
+                                role: "user",
+                                content: AnthropicContent::Parts(vec![block]),
+                            });
+                            merging_tool_results = true;
+                        }
+                    }
+                    None => {
+                        // ID-less or orphan tool output: no pending tool_use
+                        // to pair with — plain user text for this row. This
+                        // also closes the pending window (the inserted text
+                        // message breaks the immediately-after adjacency).
+                        merging_tool_results = false;
+                        pending_tool_use_ids.clear();
+                        out.push(AnthropicMessage {
+                            role: "user",
+                            content: build_anthropic_content(m),
+                        });
+                    }
+                }
+            }
+            _ => {
+                merging_tool_results = false;
+                pending_tool_use_ids.clear();
+                out.push(AnthropicMessage {
+                    role: "user",
+                    content: build_anthropic_content(m),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Build an ASSISTANT message's content, round-tripping `tool_calls` as
+/// `tool_use` blocks. Returns `None` when the row has neither non-blank text
+/// nor tool calls — Anthropic rejects empty/whitespace-only content, so such
+/// rows are dropped entirely (mirrors the openai.rs empty-assistant filter).
+///
+/// Known limitation: streamed `thinking` blocks are NOT round-tripped (their
+/// signatures are not captured in [`ChatResponse`]), so a tool loop with
+/// extended thinking enabled may still be rejected by the API's
+/// thinking-precedes-tool_use requirement. Tool loops with thinking off (the
+/// default) are fully supported.
+fn build_assistant_anthropic_content(msg: &Message) -> Option<AnthropicContent> {
+    let tool_calls = msg
+        .tool_calls
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|tc| !tc.id.is_empty())
+        .collect::<Vec<_>>();
+    let has_text = !msg.content.trim().is_empty();
+
+    if tool_calls.is_empty() {
+        if !has_text {
+            return None;
+        }
+        return Some(AnthropicContent::Text(msg.content.clone()));
+    }
+
+    let mut parts = Vec::with_capacity(tool_calls.len() + 1);
+    if has_text {
+        parts.push(AnthropicContentBlock::Text {
+            text: msg.content.clone(),
+        });
+    }
+    for tc in tool_calls {
+        parts.push(AnthropicContentBlock::ToolUse {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            input: tc.arguments.clone(),
+        });
+    }
+    Some(AnthropicContent::Parts(parts))
+}
+
+/// Build the `tool_result` block for a Tool-role message. Returns `None`
+/// when `tool_call_id` is missing/empty (ID-less providers) — an empty
+/// `tool_use_id` would 400, so the caller falls back to plain user text.
+fn anthropic_tool_result_block(msg: &Message) -> Option<AnthropicContentBlock> {
+    let tool_use_id = msg.tool_call_id.as_deref().filter(|id| !id.is_empty())?;
+    Some(AnthropicContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content: msg.content.clone(),
+    })
 }
 
 fn build_anthropic_content(msg: &Message) -> AnthropicContent {
@@ -385,17 +551,80 @@ enum ContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+    },
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
     },
+    /// Any other block type — notably `redacted_thinking` (opaque, returned when
+    /// extended thinking is enabled), but also forward-compat for future block
+    /// types. Without this the internally-tagged enum fails to deserialize an
+    /// unknown `type` and the whole response (answer + tool calls) is lost.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+fn append_nonempty(target: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match target {
+        Some(existing) => existing.push_str(&text),
+        None => *target = Some(text),
+    }
+}
+
+fn anthropic_response_to_chat_response(api_response: AnthropicResponse) -> ChatResponse {
+    let mut content = None;
+    let mut reasoning_content = None;
+    let mut tool_calls = Vec::new();
+
+    for block in api_response.content {
+        match block {
+            ContentBlock::Text { text } => append_nonempty(&mut content, text),
+            ContentBlock::Thinking { thinking } => {
+                append_nonempty(&mut reasoning_content, thinking);
+            }
+            ContentBlock::Unknown => {}
+            ContentBlock::ToolUse { id, name, input } => {
+                tool_calls.push(octos_core::ToolCall {
+                    id,
+                    name,
+                    arguments: input,
+                    metadata: None,
+                });
+            }
+        }
+    }
+
+    let stop_reason = match api_response.stop_reason.as_str() {
+        "end_turn" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        _ => StopReason::EndTurn,
+    };
+
+    ChatResponse {
+        content,
+        reasoning_content,
+        tool_calls,
+        stop_reason,
+        usage: TokenUsage {
+            input_tokens: api_response.usage.input_tokens,
+            output_tokens: api_response.usage.output_tokens,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
 }
 
 // --- Streaming SSE helpers ---
@@ -468,6 +697,14 @@ fn map_anthropic_sse(
                     vec![StreamEvent::TextDelta(
                         data["delta"]["text"].as_str().unwrap_or("").to_string(),
                     )]
+                }
+                "thinking_delta" => {
+                    let thinking = data["delta"]["thinking"].as_str().unwrap_or("");
+                    if thinking.is_empty() {
+                        vec![]
+                    } else {
+                        vec![StreamEvent::ReasoningDelta(thinking.to_string())]
+                    }
                 }
                 "input_json_delta" => {
                     if let Some(&tool_idx) = state.block_to_tool.get(&idx) {
@@ -572,6 +809,191 @@ mod tests {
         }
     }
 
+    // --- tool_use / tool_result round-trip tests ---
+
+    fn tool_call(id: &str, name: &str, args: serde_json::Value) -> octos_core::ToolCall {
+        octos_core::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn tool_loop_history_round_trips_tool_use_and_tool_result() {
+        // Regression: the request builder never serialized `tool_calls` /
+        // `tool_call_id`, so an assistant turn that returned only tool_use
+        // round-tripped as `{"role":"assistant","content":""}` (Anthropic
+        // 400s on empty content) and the Tool-role result went back as plain
+        // user text (Anthropic 400s on a dangling tool_use without a
+        // matching tool_result in the next message). Iteration 2 of every
+        // native-Anthropic tool loop died on it.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![tool_call(
+            "toolu_01",
+            "shell",
+            serde_json::json!({"command": "ls"}),
+        )]);
+        let mut tool_result = msg(MessageRole::Tool, "file-a\nfile-b");
+        tool_result.tool_call_id = Some("toolu_01".into());
+        let messages = vec![msg(MessageRole::User, "list files"), assistant, tool_result];
+
+        let config = ChatConfig::default();
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 3, "user + assistant + tool_result: {body}");
+
+        let assistant_content = out[1]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("assistant content must be blocks, got {}", out[1]));
+        assert_eq!(assistant_content[0]["type"], "tool_use");
+        assert_eq!(assistant_content[0]["id"], "toolu_01");
+        assert_eq!(assistant_content[0]["name"], "shell");
+        assert_eq!(assistant_content[0]["input"]["command"], "ls");
+
+        assert_eq!(out[2]["role"], "user");
+        let result_content = out[2]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool result content must be blocks, got {}", out[2]));
+        assert_eq!(result_content[0]["type"], "tool_result");
+        assert_eq!(result_content[0]["tool_use_id"], "toolu_01");
+        assert_eq!(result_content[0]["content"], "file-a\nfile-b");
+    }
+
+    #[test]
+    fn parallel_tool_results_merge_into_one_user_message() {
+        // Anthropic requires EVERY tool_use id from the assistant turn to have
+        // a tool_result in the IMMEDIATELY following message. Two consecutive
+        // Tool-role rows (parallel calls) must therefore merge into one user
+        // message with two tool_result blocks — separate user messages 400.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let mut assistant = msg(MessageRole::Assistant, "Running both.");
+        assistant.tool_calls = Some(vec![
+            tool_call("toolu_a", "shell", serde_json::json!({"command": "ls"})),
+            tool_call("toolu_b", "read_file", serde_json::json!({"path": "x"})),
+        ]);
+        let mut result_a = msg(MessageRole::Tool, "out-a");
+        result_a.tool_call_id = Some("toolu_a".into());
+        let mut result_b = msg(MessageRole::Tool, "out-b");
+        result_b.tool_call_id = Some("toolu_b".into());
+        let messages = vec![
+            msg(MessageRole::User, "go"),
+            assistant,
+            result_a,
+            result_b,
+            msg(MessageRole::User, "thanks"),
+        ];
+
+        let config = ChatConfig::default();
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(
+            out.len(),
+            4,
+            "user + assistant + merged tool_results + user: {body}"
+        );
+
+        // Assistant keeps its text AND carries both tool_use blocks.
+        let assistant_content = out[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_content[0]["type"], "text");
+        assert_eq!(assistant_content[0]["text"], "Running both.");
+        assert_eq!(assistant_content[1]["type"], "tool_use");
+        assert_eq!(assistant_content[2]["type"], "tool_use");
+
+        let results = out[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "both tool_results in ONE user message");
+        assert_eq!(results[0]["tool_use_id"], "toolu_a");
+        assert_eq!(results[1]["tool_use_id"], "toolu_b");
+
+        assert_eq!(out[3]["role"], "user");
+        assert_eq!(out[3]["content"], "thanks");
+    }
+
+    #[test]
+    fn empty_assistant_message_is_dropped_from_request() {
+        // Mirrors the openai.rs empty-assistant filter: a fully-empty
+        // assistant row (no text, no tool calls) must be dropped, not sent as
+        // `content: ""` which Anthropic rejects.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![
+            msg(MessageRole::User, "hi"),
+            msg(MessageRole::Assistant, ""),
+            msg(MessageRole::User, "still there?"),
+        ];
+        let config = ChatConfig::default();
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 2, "empty assistant row dropped: {body}");
+        assert_eq!(out[0]["content"], "hi");
+        assert_eq!(out[1]["content"], "still there?");
+    }
+
+    #[test]
+    fn orphan_tool_result_falls_back_to_plain_text() {
+        // codex P2: a Tool row whose matching assistant tool_use is NOT the
+        // immediately-preceding emitted message (compaction trimmed the
+        // assistant row, or the window starts mid-loop) must NOT serialize as
+        // a tool_result — Anthropic rejects orphan tool_result blocks. Fall
+        // back to plain user text, the pre-fix behaviour for these rows.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+
+        // Case 1: transcript starts with a Tool row (assistant trimmed away).
+        let mut orphan = msg(MessageRole::Tool, "stale output");
+        orphan.tool_call_id = Some("toolu_gone".into());
+        let messages = vec![orphan.clone(), msg(MessageRole::User, "continue")];
+        let config = ChatConfig::default();
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(
+            out[0]["content"], "stale output",
+            "orphan tool row must be plain text, not tool_result: {body}"
+        );
+
+        // Case 2: a user row between the assistant's tool_use and the Tool row
+        // closes the immediately-following window — the late result must fall
+        // back to text (a tool_result there would be orphaned).
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![tool_call(
+            "toolu_late",
+            "shell",
+            serde_json::json!({"command": "ls"}),
+        )]);
+        let mut late = msg(MessageRole::Tool, "late output");
+        late.tool_call_id = Some("toolu_late".into());
+        let messages = vec![
+            msg(MessageRole::User, "go"),
+            assistant,
+            msg(MessageRole::User, "interposed"),
+            late,
+        ];
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[3]["role"], "user");
+        assert_eq!(
+            out[3]["content"], "late output",
+            "a result outside the immediately-following window must be plain text: {body}"
+        );
+    }
+
+    #[test]
+    fn tool_result_without_id_falls_back_to_plain_text() {
+        // ID-less providers can leave tool_call_id empty; a tool_result block
+        // with an empty tool_use_id would 400, so fall back to plain user
+        // text (pre-fix behaviour) for that row only.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let mut orphan = msg(MessageRole::Tool, "orphan output");
+        orphan.tool_call_id = None;
+        let messages = vec![msg(MessageRole::User, "go"), orphan];
+        let config = ChatConfig::default();
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "orphan output");
+    }
+
     // --- build_request tests ---
 
     #[test]
@@ -664,6 +1086,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn should_emit_thinking_only_when_reasoning_effort_is_set() {
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+
+        let default_config = ChatConfig::default();
+        let default_request = provider.build_request(&messages, &[], &default_config);
+        let default_body = serde_json::to_value(&default_request).unwrap();
+        assert!(default_body.get("thinking").is_none());
+
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            // Large enough output budget to fit the full High ladder (8192) with
+            // the output reserve, so it is not clamped here.
+            max_tokens: Some(32_000),
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &[], &config);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8_192);
+    }
+
+    #[test]
+    fn should_clamp_thinking_budget_below_max_tokens() {
+        // P2: budget must stay strictly below max_tokens (with output room).
+        // High ladder is 8192; with max_tokens=6000 it clamps to 6000-1024=4976.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            max_tokens: Some(6_000),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert_eq!(budget, 4_976, "clamped to max_tokens - reserve");
+        assert!(budget < 6_000, "budget strictly below max_tokens");
+        assert!(budget >= 1_024, "budget meets Anthropic minimum");
+    }
+
+    #[test]
+    fn should_omit_thinking_when_max_tokens_too_small() {
+        // P2: when max_tokens can't fit a valid (>=1024) budget, omit thinking
+        // entirely rather than emit a request Claude rejects.
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            max_tokens: Some(1_500), // 1500 - 1024 = 476 < 1024 → omit
+            ..Default::default()
+        };
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking omitted when max_tokens too small: {body}"
+        );
+    }
+
+    #[test]
+    fn should_parse_redacted_thinking_block() {
+        // P2: a redacted_thinking block must not break deserialization; the
+        // answer/tool calls still come through and it contributes no reasoning.
+        let api_response: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "content": [
+                { "type": "redacted_thinking", "data": "Er0BCkY..." },
+                { "type": "text", "text": "The answer is 42." }
+            ],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 5, "output_tokens": 7 }
+        }))
+        .unwrap();
+
+        let response = anthropic_response_to_chat_response(api_response);
+        assert_eq!(response.content.as_deref(), Some("The answer is 42."));
+        assert_eq!(response.reasoning_content, None);
+    }
+
+    #[test]
+    fn test_response_captures_thinking_content_block() {
+        let api_response: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Compare the constraints first.",
+                    "signature": "opaque"
+                },
+                {
+                    "type": "text",
+                    "text": "Use the narrower option."
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34
+            }
+        }))
+        .unwrap();
+
+        let response = anthropic_response_to_chat_response(api_response);
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("Compare the constraints first.")
+        );
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Use the narrower option.")
+        );
+    }
+
     // --- SSE mapping tests ---
 
     #[test]
@@ -688,6 +1221,18 @@ mod tests {
         let events = map_anthropic_sse(&mut state, &event);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "Hello"));
+    }
+
+    #[test]
+    fn test_sse_thinking_delta() {
+        let mut state = AnthropicStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Check edge cases."}}"#.into(),
+        };
+        let events = map_anthropic_sse(&mut state, &event);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "Check edge cases."));
     }
 
     #[test]
