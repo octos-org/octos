@@ -22,10 +22,13 @@ pub const MEMORY_SEGMENT_NAME: &str = "memory";
 /// independent of the capture policy, because stale-memory discipline
 /// matters even on read-only surfaces (#1589, codex read-path pattern).
 pub const MEMORY_USE_GUIDANCE: &str = "## Memory Use\n\
-Treat Long-term Memory as leads, not verified current state:\n\
+Treat ALL remembered content above (long-term memory, notes, memory bank, \
+past experiences) as leads, not verified current state:\n\
 - Facts that drift (versions, paths, running processes, dates, ownership): \
 verify live before acting on them when verification is cheap; otherwise say \
 the claim is memory-derived and may be stale, and offer to re-check.\n\
+- Verifying means re-checking live state yourself (files, commands, tools) — \
+do NOT re-ask the user for facts memory already answers.\n\
 - Prefer fresh evidence from THIS conversation over memory when they \
 conflict.\n\
 - Never present an unverified memory-derived fact as confirmed-current.";
@@ -282,8 +285,10 @@ user lives in Vancouver
     #[test]
     fn use_guidance_teaches_verify_and_staleness_flagging() {
         for needle in [
+            "ALL remembered content",
             "verify live",
             "memory-derived",
+            "do NOT re-ask the user",
             "fresh evidence from THIS conversation",
             "confirmed-current",
         ] {
