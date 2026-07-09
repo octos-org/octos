@@ -245,7 +245,7 @@ octos office comment <unpacked-dir> <id> <text> # Add a comment to an unpacked D
 # LibreOffice-backed (require `soffice` on PATH)
 octos office accept-changes <input> <output>    # Accept tracked changes (DOCX) → clean copy
 octos office recalc <file>                      # Recalculate XLSX formulas
-octos office thumbnail <file> [OPTIONS]         # Render slide/page thumbnails
+octos office thumbnail <file> [OPTIONS]         # Render slide/page thumbnails (also needs Poppler's pdftoppm)
 octos office soffice <args...>                  # Passthrough to a sandboxed soffice
 ```
 
@@ -309,7 +309,7 @@ Options:
       --data-dir <P>  Data dir override (defaults to ~/.octos)
 ```
 
-Checks binaries on `PATH`, feature flags, data-dir layout, provider/auth configuration, and version/skew. Exit code is non-zero when a check fails (or, with `--strict`, when any check warns). Use `--json` to attach the bundle to a bug report.
+Checks the installed binary's location (and PATH shadowing), the terminal (terminfo), config/data-dir writability, the UI-protocol version skew, and `api.github.com` reachability for update checks. (It does **not** validate provider API keys — use `octos status` for those.) Exit code is non-zero when a check fails (or, with `--strict`, when any check warns). Use `--json` to attach the bundle to a bug report.
 
 ---
 

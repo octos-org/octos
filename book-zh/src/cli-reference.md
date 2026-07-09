@@ -234,7 +234,7 @@ octos office comment <unpacked-dir> <id> <text> # 向解包后的 DOCX 添加批
 # 依赖 LibreOffice（需 PATH 中有 `soffice`）
 octos office accept-changes <input> <output>    # 接受修订（DOCX）→ 干净副本
 octos office recalc <file>                      # 重新计算 XLSX 公式
-octos office thumbnail <file> [OPTIONS]         # 渲染幻灯片/页面缩略图
+octos office thumbnail <file> [OPTIONS]         # 渲染幻灯片/页面缩略图（还需 Poppler 的 pdftoppm）
 octos office soffice <args...>                  # 透传到沙箱化的 soffice
 ```
 
@@ -298,7 +298,7 @@ octos doctor [OPTIONS]
       --data-dir <P>  数据目录覆盖（默认 ~/.octos）
 ```
 
-检查 `PATH` 上的二进制、特性标志、数据目录布局、供应商/认证配置以及版本/时钟偏移。任一检查失败时退出码非零（加 `--strict` 时任一警告也会致失败）。用 `--json` 将支持包附到缺陷报告。
+检查已安装二进制的位置（及 PATH 遮蔽）、终端（terminfo）、config/数据目录的可写性、UI 协议版本偏移，以及 `api.github.com` 的可达性（用于更新检查）。（它**不**校验供应商 API 密钥——请用 `octos status` 检查那些。）任一检查失败时退出码非零（加 `--strict` 时任一警告也会致失败）。用 `--json` 将支持包附到缺陷报告。
 
 ---
 

@@ -2,12 +2,12 @@
 
 ## Overview
 
-octos is a 14-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 26-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
-**Workspace members**:
-- **Layered core**: `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API).
-- **Alongside octos-agent**: `octos-bus` (14 channels, sessions, coalescing, cron), `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-diagnostics` (powers `octos doctor`), `octos-dora-mcp`.
-- **Bundled skills**: `app-skills` (news, deep-search, deep-crawl, send-email, account-manager, skill-evolve, harness starters) and `platform-skills` (voice ASR/TTS).
+**Workspace members** (from `Cargo.toml`):
+- **Layered core** (7): `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API), plus `octos-bus` (14 channels, sessions, coalescing, cron) and `octos-diagnostics` (powers `octos doctor`).
+- **Agent-adjacent** (5): `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
+- **Bundled skill crates** (14): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
 
 (The web SPA and terminal client live in the separate `octos-web` and `octos-tui` repositories and talk to `octos serve` over the UI Protocol.)
 
