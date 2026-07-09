@@ -1532,9 +1532,11 @@ pub struct VoiceReadiness {
 /// - **LLM**: the profile's provider chain is constructed (running runtime with
 ///   a named provider).
 /// - **TTS**: the *chosen* route is actually usable — cloud credentials resolve
-///   for `cloud`/`volcano` (and `auto` when configured), otherwise the on-device
-///   GPT-SoVITS engine is available. Mirrors `voice_turn::synthesize_reply`'s
-///   routing so the check matches what a real turn would do.
+///   for `cloud`/`volcano` (and `auto` when configured); otherwise the on-device
+///   GPT-SoVITS MODEL is ready AND the profile's *effective* reply voice (live
+///   override > per-profile default) is synthesizable. Mirrors
+///   `voice_turn::synthesize_reply`'s routing + voice resolution so the check
+///   matches what a real turn would do.
 pub async fn voice_readiness(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1599,7 +1601,25 @@ pub async fn voice_readiness(
             },
         },
         crate::api::voice_turn::TtsRoute::Local => {
-            let local_ok = health_healthy && local_tts_voice_available(&profile_id);
+            // The on-device leg needs the TTS MODEL itself: a ready ASR plus
+            // a present voice with a missing GPT-SoVITS model would report
+            // ready here and then fail inside `synthesize_reply`.
+            let engine_ok =
+                crate::api::ominix_runtime::tts_engine_ready(health_healthy, &runtime.voice_models);
+            // The voice a real turn would synthesize with: live override
+            // (PUT /api/my/voice) wins, else the bootstrapped per-profile
+            // default (which already overlays the serve default). Mirrors the
+            // `resolve_reply_voice` call in the voice-turn path; when the
+            // runtime isn't started (LLM leg already not-ready) fall back to
+            // the persisted per-profile selection the bootstrap would apply.
+            let effective_voice = crate::api::voices::resolve_reply_voice(
+                &profile_id,
+                rt.as_ref()
+                    .map(|r| r.voice.default_voice.as_str())
+                    .unwrap_or_else(|| profile.config.voice_default.as_deref().unwrap_or_default()),
+            );
+            let voice_ok = local_tts_voice_available(&profile_id, &effective_voice);
+            let local_ok = engine_ok && voice_ok;
             VoiceTtsLeg {
                 ready: local_ok,
                 mode: "local".into(),
@@ -1607,6 +1627,10 @@ pub async fn voice_readiness(
                     "On-device GPT-SoVITS ready".into()
                 } else if !health_healthy {
                     "Voice engine unavailable".into()
+                } else if !engine_ok {
+                    "On-device TTS model not ready".into()
+                } else if !effective_voice.is_empty() {
+                    format!("Selected voice '{effective_voice}' not available on device")
                 } else {
                     "No on-device voice available".into()
                 },
@@ -1623,18 +1647,45 @@ pub async fn voice_readiness(
     }))
 }
 
-/// Whether this tenant has at least one synthesizable on-device voice in the
-/// registry (shared presets + voices it owns). Mirrors `GET /api/voices`
-/// scoping, so it reflects exactly what the on-device engine could speak.
-fn local_tts_voice_available(profile_id: &str) -> bool {
+/// Whether this tenant can synthesize on-device with its EFFECTIVE reply
+/// voice.
+///
+/// `effective_voice` is the voice a real turn would hand `synthesize_reply`
+/// (live override > bootstrapped per-profile default — see
+/// `resolve_reply_voice`). When it is non-empty, THAT specific voice must be
+/// synthesizable and visible to the tenant — some *other* voice existing is
+/// not enough, because the turn would still pass the missing selected voice
+/// to the engine and fail. Only when no selection resolves anywhere (empty
+/// effective voice) does this degrade to "any visible synthesizable voice",
+/// matching the engine-side default an empty voice name gets on a real turn.
+/// Visibility mirrors `GET /api/voices` scoping (shared presets + voices this
+/// profile owns).
+fn local_tts_voice_available(profile_id: &str, effective_voice: &str) -> bool {
     let registry_path = crate::api::voices::registry_path();
     match octos_llm::ominix::VoicesRegistry::load(&registry_path) {
-        Ok(reg) => !reg
-            .synthesizable_visible(|ref_audio| {
-                crate::api::voices::voice_visible_to(profile_id, ref_audio)
-            })
-            .is_empty(),
+        Ok(reg) => voice_available_in_registry(&reg, profile_id, effective_voice),
         Err(_) => false,
+    }
+}
+
+/// Pure core of [`local_tts_voice_available`] over a loaded registry, so the
+/// selected-voice semantics are unit-testable without touching
+/// `~/.OminiX/models/voices.json`.
+fn voice_available_in_registry(
+    reg: &octos_llm::ominix::VoicesRegistry,
+    profile_id: &str,
+    effective_voice: &str,
+) -> bool {
+    if effective_voice.is_empty() {
+        !reg.synthesizable_visible(|ref_audio| {
+            crate::api::voices::voice_visible_to(profile_id, ref_audio)
+        })
+        .is_empty()
+    } else {
+        reg.resolve_visible(effective_voice, |ref_audio| {
+            crate::api::voices::voice_visible_to(profile_id, ref_audio)
+        })
+        .is_some()
     }
 }
 
@@ -3786,6 +3837,74 @@ mod tests {
     use crate::user_store::UserStore;
     use axum::http::HeaderMap;
     use axum::http::Request;
+
+    // --- voice_available_in_registry (voice readiness, local TTS leg) ---
+
+    /// Registry with: a shared preset `doubao` (ref exists, alias `vivian`),
+    /// a shared preset `ghost` whose ref audio is missing, and a per-profile
+    /// clone owned by tenant `other` (exists on disk, invisible to others).
+    fn readiness_registry(dir: &std::path::Path) -> octos_llm::ominix::VoicesRegistry {
+        std::fs::create_dir_all(dir.join("ref_audios")).unwrap();
+        std::fs::write(dir.join("ref_audios/doubao_ref.wav"), b"fake").unwrap();
+        let clone_dir = dir.join("profiles/other/data/voice_profiles");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let clone_path = clone_dir.join("mine.wav");
+        std::fs::write(&clone_path, b"fake").unwrap();
+        let json = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": "{base}",
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] }},
+                "other-clone": {{ "ref_audio": "{clone}", "ref_text": "z", "aliases": [] }}
+              }}
+            }}"#,
+            base = dir.to_string_lossy(),
+            clone = clone_path.to_string_lossy()
+        );
+        octos_llm::ominix::VoicesRegistry::parse(&json).unwrap()
+    }
+
+    #[test]
+    fn selected_voice_must_itself_be_synthesizable_not_just_any_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = readiness_registry(dir.path());
+        // The selected voice's ref audio is missing: NOT ready, even though
+        // another synthesizable voice (doubao) exists — the false-positive
+        // the readiness probe used to report.
+        assert!(!voice_available_in_registry(&reg, "me", "ghost"));
+        // The selected voice resolves (by id or alias) → ready.
+        assert!(voice_available_in_registry(&reg, "me", "doubao"));
+        assert!(voice_available_in_registry(&reg, "me", "vivian"));
+        // Unknown selection → not ready.
+        assert!(!voice_available_in_registry(&reg, "me", "nope"));
+    }
+
+    #[test]
+    fn selected_voice_owned_by_another_tenant_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = readiness_registry(dir.path());
+        // Exists on disk but is another profile's clone: invisible → not ready.
+        assert!(!voice_available_in_registry(&reg, "me", "other-clone"));
+        // The owning tenant itself CAN use it.
+        assert!(voice_available_in_registry(&reg, "other", "other-clone"));
+    }
+
+    #[test]
+    fn empty_selection_falls_back_to_any_visible_synthesizable_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = readiness_registry(dir.path());
+        // No selection resolves anywhere → any visible synthesizable voice is
+        // enough (mirrors the engine default an empty-voice turn gets).
+        assert!(voice_available_in_registry(&reg, "me", ""));
+        // ...but an empty/ref-less registry is still not ready.
+        let empty = octos_llm::ominix::VoicesRegistry::parse(
+            r#"{ "default_voice": "", "models_base_path": "", "voices": {} }"#,
+        )
+        .unwrap();
+        assert!(!voice_available_in_registry(&empty, "me", ""));
+    }
 
     // --- payload_from_user_profile (profile QR export) ---
 
