@@ -692,37 +692,8 @@ impl ProfileRuntime {
             tools.set_context_filter(config.context_filter.clone());
         }
 
-        // Step 16: pin core builtins + plugin tools as base so the
-        // LRU evictor never drops them. Mirrors gateway's pin list
-        // (with the gateway-only session tools elided — those are
-        // session-scope via the per-session ActorFactory).
-        let mut base_tools: Vec<&str> = vec![
-            "shell",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "diff_edit",
-            "glob",
-            "grep",
-            "list_dir",
-            "web_search",
-            "web_fetch",
-            "browser",
-            "check_workspace_contract",
-            "workspace_log",
-            "workspace_show",
-            "workspace_diff",
-        ];
-        if cfg!(feature = "git") {
-            base_tools.push("git");
-        }
-        if cfg!(feature = "ast") {
-            base_tools.push("code_structure");
-        }
-        tools.set_base_tools(base_tools);
-        if !plugin_result.tool_names.is_empty() {
-            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
-        }
+        // RFC-0 (#1289): LRU tool deferral was removed — the base-tool pin
+        // list is no longer needed; every enabled tool is emitted every turn.
 
         // Memory bank tools — registered profile-side so every
         // session inherits the same memory_store.
@@ -892,41 +863,9 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
 
-        // M11-F regression fix REG-1: auto-defer non-core tool groups
-        // when the visible tool count is high so weaker LLMs (notably
-        // GLM, kimi-k2 cold-start) don't return empty responses under
-        // the weight of 30+ tool definitions.
-        //
-        // Mirrors `gateway_runtime.rs:1048-1070` byte-for-byte: defer
-        // `group:admin` / `group:sessions` / `group:web` /
-        // `group:runtime` / `group:media`, then register the
-        // `ActivateToolsTool` when anything ended up deferred so the
-        // LLM can pull a group back on demand mid-loop. Keeps research
-        // (deep_search, deep_crawl) active by leaving `group:search`
-        // alone — users call those directly often enough that hiding
-        // them behind an extra round-trip would regress latency.
-        let visible = tools.specs().len();
-        if visible > 15 {
-            for group in &[
-                "group:admin",
-                "group:sessions",
-                "group:web",
-                "group:runtime",
-                "group:media",
-            ] {
-                tools.defer_group(group);
-            }
-            let after = tools.specs().len();
-            info!(
-                profile_id = %profile.id,
-                before = visible,
-                after,
-                "auto-deferred non-core tool groups to reduce LLM tool-count load"
-            );
-        }
-        if tools.has_deferred() {
-            tools.register(octos_agent::ActivateToolsTool::new());
-        }
+        // RFC-0 (#1289): LRU tool deferral + the `activate_tools` meta-tool
+        // were removed. Every enabled tool is now emitted every turn (full
+        // schema), so the former auto-defer-non-core-groups pass is gone.
 
         // Step 18: pre-assemble the profile-scope system prompt.
         //
@@ -1613,40 +1552,6 @@ mod tests {
         );
     }
 
-    /// M11-F regression fix REG-1: when the visible tool count exceeds
-    /// 15 (the gateway threshold), bootstrap must defer the five
-    /// non-core groups and register `activate_tools`. This mirrors
-    /// `gateway_runtime.rs:1048-1070` and is essential for weaker LLMs
-    /// (kimi-k2, GLM) that return empty responses under tool-spec
-    /// overload.
-    #[tokio::test]
-    async fn profile_runtime_bootstrap_defers_groups_and_registers_activate_tools() {
-        let _key = ScopedEnvKey::set("OCTOS_M11F_REG1_KEY");
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("profile-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let profile = fixture_profile("reg1", "OCTOS_M11F_REG1_KEY");
-        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
-            .await
-            .expect("bootstrap should succeed");
-
-        // The base builtin set + memory tools + cron exceeds 15 visible
-        // tools, so the defer pass MUST fire and the activate_tools tool
-        // MUST be registered.
-        assert!(
-            rt.tool_specs.has_deferred(),
-            "bootstrap should auto-defer non-core groups when visible > 15",
-        );
-        assert!(
-            rt.tool_specs
-                .specs()
-                .iter()
-                .any(|s| s.name == "activate_tools"),
-            "activate_tools must be registered when any tool is deferred",
-        );
-    }
-
     /// M11-F regression fix REG-5: bootstrap's plugin_dirs must include
     /// the *global* `~/.octos/plugins` and `~/.octos/skills` (via
     /// `Config::plugin_dirs_from_project`) so admin-installed skills
@@ -1685,12 +1590,11 @@ mod tests {
     }
 
     /// Issue #87: sub-account profile skill loading must not strand the
-    /// runtime without `shell` or a usable `activate_tools` back-reference.
-    /// The original report showed a sub-account bot that had loaded skills
-    /// but could not call any tool, including `activate_tools`.
+    /// runtime without `shell`. The original report showed a sub-account bot
+    /// that had loaded skills but could not call any tool.
     #[cfg(unix)]
     #[tokio::test]
-    async fn subaccount_skill_loading_preserves_shell_and_activate_tools() {
+    async fn subaccount_skill_loading_preserves_shell() {
         use std::os::unix::fs::PermissionsExt;
 
         let _key = ScopedEnvKey::set("OCTOS_ISSUE_87_SUBACCOUNT_KEY");
@@ -1747,9 +1651,11 @@ mod tests {
             rt.tool_specs.get("shell").is_some(),
             "sub-account skill loading must not drop the shell tool"
         );
+        // RFC-0 (#1289): `shell` is emitted every turn — no activate_tools
+        // round-trip needed. Verify it stays visible after workspace rebind.
         assert!(
-            rt.tool_specs.get("activate_tools").is_some(),
-            "sub-account skill loading must leave activate_tools available"
+            rt.tool_specs.specs().iter().any(|s| s.name == "shell"),
+            "shell must be visible in specs"
         );
 
         let profile_runtime = Arc::new(rt);
@@ -1768,24 +1674,10 @@ mod tests {
                 "session {} must retain shell after workspace rebind",
                 session.session_key
             );
-            let activate_tools = session
-                .tools
-                .get("activate_tools")
-                .expect("session activate_tools");
-            let result = activate_tools
-                .execute(&serde_json::json!({"tools": ["shell"]}))
-                .await
-                .expect("activate_tools must be wired to the session registry");
             assert!(
-                result.success,
-                "activate_tools should be able to resolve shell for {}; got: {}",
-                session.session_key, result.output
-            );
-            assert!(
-                result.output.contains("shell"),
-                "activate_tools output should name shell for {}; got: {}",
-                session.session_key,
-                result.output
+                session.tools.specs().iter().any(|s| s.name == "shell"),
+                "session {} must expose shell in specs",
+                session.session_key
             );
         }
     }

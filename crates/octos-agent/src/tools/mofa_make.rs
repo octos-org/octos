@@ -983,8 +983,8 @@ mod tests {
         registry.register(cards_tool);
 
         // Simulate what the loader does for every make_type entry.
-        registry.defer(std::iter::once("mofa_slides".to_string()));
-        registry.defer(std::iter::once("mofa_cards".to_string()));
+        registry.mark_internal_hidden("mofa_slides");
+        registry.mark_internal_hidden("mofa_cards");
 
         // LLM-visible specs MUST NOT include the target tools.
         let visible: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();

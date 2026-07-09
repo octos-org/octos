@@ -897,47 +897,15 @@ impl ProfileActorFactoryBuilder {
             };
             provider_router = child_router.clone();
 
-            tools.set_base_tools([
-                "run_pipeline",
-                "search",
-                "deep_crawl",
-                "web_search",
-                "web_fetch",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "shell",
-                "list_dir",
-                "glob",
-                "grep",
-                "message",
-                "send_file",
-                "spawn",
-                "activate_tools",
-            ]);
-            let visible = tools.specs().len();
-            if visible > 15 {
-                for group in &[
-                    "group:memory",
-                    "group:admin",
-                    "group:sessions",
-                    "group:web",
-                    "group:runtime",
-                    "group:media",
-                ] {
-                    tools.defer_group(group);
-                }
-            }
-            if tools.has_deferred() {
-                tools.register(octos_agent::ActivateToolsTool::new());
-            }
+            // RFC-0 (#1289): LRU tool deferral + the `activate_tools`
+            // meta-tool were removed. Every enabled tool is emitted every
+            // turn (full schema) — no base-tool pin list or auto-defer pass.
 
             // PR #688 follow-up — codex finding: re-apply tool_policy
             // AFTER all base-registry tools have been registered. The
-            // first pass at line ~648 ran before `ActivateToolsTool`
-            // (and any other late-registered base tools) existed, so a
-            // `tool_policy.deny` entry targeting them was bypassed at
-            // the base level. Per-session re-apply in
+            // first pass at line ~648 ran before some late-registered base
+            // tools existed, so a `tool_policy.deny` entry targeting them
+            // was bypassed at the base level. Per-session re-apply in
             // `ActorFactory::spawn` still covers `run_pipeline`.
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);

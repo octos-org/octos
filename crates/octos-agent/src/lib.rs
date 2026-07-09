@@ -176,7 +176,7 @@ pub use task_supervisor::{
     TaskSupervisor, TerminalEvent, TerminalOutcome, parse_alternatives,
 };
 pub use tools::{
-    ActivateToolsTool, AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload,
+    AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload,
     BrowserTool, CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass,
     ConfigureToolTool, DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,

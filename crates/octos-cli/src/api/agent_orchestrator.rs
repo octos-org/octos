@@ -924,7 +924,6 @@ impl InProcessAgentOrchestrator {
         if let Some(system_prompt) = system_prompt {
             worker = worker.with_system_prompt(system_prompt);
         }
-        worker.wire_activate_tools();
         // RFC-1: wire mofa_make for spawned workers too — child
         // registries inherit a shared catalog so the dispatcher must
         // resolve through the right registry handle.

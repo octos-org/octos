@@ -1555,10 +1555,8 @@ fn ensure_subagent_tools_available(
     tools: &ToolRegistry,
     allowed_tools: &[String],
 ) -> std::result::Result<(), String> {
-    for tool_name in allowed_tools {
-        tools.activate(tool_name);
-    }
-
+    // RFC-0 (#1289): tool deferral was removed — every registered tool is
+    // available. Just verify the allowed tools are actually present.
     let missing = allowed_tools
         .iter()
         .filter(|tool_name| tools.get(tool_name).is_none())
@@ -4549,14 +4547,12 @@ mod tests {
     }
 
     #[test]
-    fn subagent_tool_preflight_activates_deferred_allowed_tool() {
-        let mut tools = ToolRegistry::with_builtins("/tmp");
-        tools.defer(["shell".to_string()]);
-        assert!(tools.specs().iter().all(|spec| spec.name != "shell"));
-
-        ensure_subagent_tools_available(&tools, &[String::from("shell")]).unwrap();
-
+    fn subagent_tool_preflight_passes_when_allowed_tool_present() {
+        let tools = ToolRegistry::with_builtins("/tmp");
+        // RFC-0 (#1289): `shell` is always registered and visible — no
+        // deferral to un-hide.
         assert!(tools.specs().iter().any(|spec| spec.name == "shell"));
+        ensure_subagent_tools_available(&tools, &[String::from("shell")]).unwrap();
     }
 
     #[test]

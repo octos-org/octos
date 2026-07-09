@@ -5281,24 +5281,8 @@ mod tests {
             .get_tool("tool_search")
             .expect("tool_search registered by with_builtins");
 
-        registry.defer(["bash".to_string()]);
-        let result = search_tool
-            .execute(&serde_json::json!({ "query": "bash" }))
-            .await
-            .expect("tool_search ok");
-        let payload: Value = serde_json::from_str(&result.output).expect("payload");
-        let names: Vec<_> = payload["matches"]
-            .as_array()
-            .expect("matches")
-            .iter()
-            .filter_map(|m| m["name"].as_str())
-            .collect();
-        assert!(
-            !names.contains(&"bash"),
-            "deferred tools must stay out of tool_search: {names:?}"
-        );
-
-        registry.activate("bash");
+        // RFC-0 (#1289): tool deferral removed; visibility filtering is now
+        // driven purely by provider_policy and context_filter.
         registry.set_provider_policy(crate::tools::ToolPolicy {
             deny: vec!["bash".to_string()],
             ..Default::default()
