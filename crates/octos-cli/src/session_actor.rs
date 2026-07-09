@@ -3767,6 +3767,11 @@ impl ActorFactory {
         // mode: one render, then silence — parity with the old
         // inlined-at-build behavior, minus the staleness.
         if let Some(ref memory_store) = self.memory_store {
+            // RESERVE the named slot before the post tail lands: set_named
+            // on a missing segment APPENDS, so without this the provider's
+            // first refresh would place memory AFTER the tail
+            // (pre → post → memory). Empty segments render as nothing.
+            agent.set_prompt_segment(octos_agent::MEMORY_SEGMENT_NAME, String::new());
             let provider = octos_agent::MemorySegmentProvider::new(
                 memory_store.clone(),
                 self.memory_inject_tokens,
