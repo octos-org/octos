@@ -92,19 +92,93 @@ const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 /// approval against a question (codex review).
 static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-struct CliApprovalRequester;
+/// What the user answered at the CLI approval prompt. `ApproveSession`
+/// mirrors the TUI's `s` action / the serve `approval_scope: "session"`
+/// (`ApprovalScopeKind::ApproveForSession`): every later approval-gated
+/// request in this chat process auto-resolves without prompting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliApprovalAnswer {
+    ApproveOnce,
+    ApproveSession,
+    Deny,
+}
+
+/// Parse the `[y/s/N]` answer line. Empty / unrecognized input denies —
+/// same fail-closed default as the old `[y/N]` prompt.
+fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => CliApprovalAnswer::ApproveOnce,
+        "s" | "session" => CliApprovalAnswer::ApproveSession,
+        _ => CliApprovalAnswer::Deny,
+    }
+}
+
+#[derive(Default)]
+struct CliApprovalRequester {
+    /// Set once the user answers `s` — the CLI-chat equivalent of the serve
+    /// scope table's `(ApproveForSession, MatchKey::Session)` entry, which
+    /// auto-resolves every subsequent approval in the session. Scope lifetime
+    /// is this chat process (serve evicts its entry on session close).
+    session_approved: std::sync::atomic::AtomicBool,
+}
+
+impl CliApprovalRequester {
+    fn session_approved(&self) -> bool {
+        self.session_approved
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
 
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // Fast path: a prior `s` answer auto-resolves without prompting
+        // (mirrors serve's `approval_auto_resolved`). Print a note so the
+        // grant stays visible instead of commands silently running.
+        if self.session_approved() {
+            eprintln!(
+                "{} {}",
+                "Auto-approved (session scope):".dimmed(),
+                request
+                    .command
+                    .as_deref()
+                    .unwrap_or(&request.title)
+                    .dimmed()
+            );
+            return ToolApprovalDecision::Approve;
+        }
         let _guard = CHAT_PROMPT_LOCK.lock().await;
-        tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
+        // Re-check after acquiring the lock: a parallel tool batch can queue
+        // two prompts; if the first answer was `s`, the second must
+        // auto-resolve instead of prompting again.
+        if self.session_approved() {
+            eprintln!(
+                "{} {}",
+                "Auto-approved (session scope):".dimmed(),
+                request
+                    .command
+                    .as_deref()
+                    .unwrap_or(&request.title)
+                    .dimmed()
+            );
+            return ToolApprovalDecision::Approve;
+        }
+        let answer = tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
             .await
-            .unwrap_or(ToolApprovalDecision::Deny)
+            .unwrap_or(CliApprovalAnswer::Deny);
+        match answer {
+            CliApprovalAnswer::ApproveOnce => ToolApprovalDecision::Approve,
+            CliApprovalAnswer::ApproveSession => {
+                self.session_approved
+                    .store(true, std::sync::atomic::Ordering::Release);
+                ToolApprovalDecision::Approve
+            }
+            CliApprovalAnswer::Deny => ToolApprovalDecision::Deny,
+        }
     }
 }
 
-fn prompt_for_cli_approval(request: ToolApprovalRequest) -> ToolApprovalDecision {
+fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
     eprintln!();
     eprintln!("{}", "Approval required".yellow().bold());
     eprintln!("{}", request.title.bold());
@@ -115,17 +189,15 @@ fn prompt_for_cli_approval(request: ToolApprovalRequest) -> ToolApprovalDecision
 
     if !io::stdin().is_terminal() {
         eprintln!("No interactive terminal available; denying request.");
-        return ToolApprovalDecision::Deny;
+        return CliApprovalAnswer::Deny;
     }
 
-    eprint!("Approve once? [y/N] ");
+    eprint!("Approve? [y]es once / [s]ession / [N]o ");
     let _ = io::stderr().flush();
     let mut answer = String::new();
     match io::stdin().read_line(&mut answer) {
-        Ok(_) if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") => {
-            ToolApprovalDecision::Approve
-        }
-        _ => ToolApprovalDecision::Deny,
+        Ok(_) => parse_cli_approval_answer(&answer),
+        Err(_) => CliApprovalAnswer::Deny,
     }
 }
 
@@ -824,7 +896,8 @@ impl ChatCommand {
             }
         }
 
-        let approval_requester: Arc<dyn ToolApprovalRequester> = Arc::new(CliApprovalRequester);
+        let approval_requester: Arc<dyn ToolApprovalRequester> =
+            Arc::new(CliApprovalRequester::default());
 
         // Single-message mode: send one message and exit
         if let Some(msg) = self.message {
@@ -1184,6 +1257,51 @@ mod tests {
             multi_select: multi,
             allow_free_text,
         }
+    }
+
+    #[test]
+    fn parse_approval_answer_maps_y_s_and_default_deny() {
+        assert_eq!(
+            parse_cli_approval_answer("y\n"),
+            CliApprovalAnswer::ApproveOnce
+        );
+        assert_eq!(
+            parse_cli_approval_answer("  YES "),
+            CliApprovalAnswer::ApproveOnce
+        );
+        assert_eq!(
+            parse_cli_approval_answer("s"),
+            CliApprovalAnswer::ApproveSession
+        );
+        assert_eq!(
+            parse_cli_approval_answer("Session\n"),
+            CliApprovalAnswer::ApproveSession
+        );
+        // Fail-closed: empty and anything unrecognized deny.
+        assert_eq!(parse_cli_approval_answer(""), CliApprovalAnswer::Deny);
+        assert_eq!(parse_cli_approval_answer("n"), CliApprovalAnswer::Deny);
+        assert_eq!(parse_cli_approval_answer("wat"), CliApprovalAnswer::Deny);
+    }
+
+    #[tokio::test]
+    async fn session_scope_auto_resolves_later_requests_without_prompting() {
+        // With the session flag set, request_approval must return Approve on
+        // the fast path — before spawn_blocking would ever touch stdin (this
+        // test has no TTY; a prompt would deny, failing the assert).
+        let requester = CliApprovalRequester::default();
+        requester
+            .session_approved
+            .store(true, std::sync::atomic::Ordering::Release);
+        let request = ToolApprovalRequest {
+            tool_id: "t1".into(),
+            tool_name: "shell".into(),
+            title: "Approve command".into(),
+            body: "Run command: sudo echo hi".into(),
+            command: Some("sudo echo hi".into()),
+            cwd: None,
+        };
+        let decision = requester.request_approval(request).await;
+        assert_eq!(decision, ToolApprovalDecision::Approve);
     }
 
     #[test]

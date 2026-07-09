@@ -2998,8 +2998,10 @@ mod tests {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
 
-        let mut config = Config::default();
-        config.api_key_env = Some("ANTHROPIC_API_KEY".to_string());
+        let mut config = Config {
+            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            ..Default::default()
+        };
         config
             .env_vars
             .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
