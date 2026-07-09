@@ -91,6 +91,33 @@ client construction, not octos's reqwest type.)
    codex's `compute_expires_at_millis`/`token_needs_refresh`/`parse_oauth_callback`
    helpers.
 
+## Known follow-ups (from codex review, deferred — OAuth path, pre-merge)
+
+The stdio + static-HTTP paths are hardened and live-validated. Two OAuth-path
+items are documented rather than fixed in this branch (OAuth is not yet
+e2e-validated — needs a real OAuth MCP server — and these are larger changes to
+land deliberately before enabling `oauth = true` in production):
+
+1. **SSRF on OAuth-*discovered* literal-IP endpoints.** Config URLs are checked
+   by `reject_private_url_host`, hostnames by `SsrfDnsResolver`, and OAuth now
+   requires `https://`. But endpoints rmcp learns from server metadata
+   (`authorization_servers` / registration / token) that are *literal private
+   IPs* still bypass the resolver (reqwest skips it for literal IPs). Full fix:
+   implement `rmcp::transport::auth::OAuthHttpClient` that SSRF-validates each
+   request URI, and pass it via `OAuthState::new_with_oauth_http_client`
+   (mirrors codex's `OAuthHttpClientAdapter`). Narrowed today by the HTTPS
+   requirement + config-URL/hostname coverage.
+2. **Guaranteed stdio child reap on shutdown.** Children are killed via
+   `kill_on_drop(true)`, but dropping the shared `Arc<RunningService>` at
+   `block_on` teardown doesn't *await* `cancel()`/`close()`, so a child can
+   outlive a fast runtime shutdown. Full fix: give `McpClient` an owned
+   shutdown handle and `await` cancel before runtime teardown across the 5 call
+   sites (chat/serve/gateway/profile ×2).
+
+Also documented in-code: rmcp's child-process transport reads frames with an
+unbounded `read_until` (no `MAX_LINE_BYTES` cap) — accepted for
+operator-configured local stdio servers; a bounded codec needs a custom transport.
+
 ## Non-goals / notes
 
 - No third-party aggregator services (per direction). rmcp is a crate, self-hosted.

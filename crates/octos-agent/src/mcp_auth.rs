@@ -114,8 +114,9 @@ pub async fn connect_oauth(
     let token: OAuthTokenResponse = serde_json::from_value(stored.token_response.clone())
         .map_err(|e| eyre::eyre!("parse stored oauth token: {e}"))?;
 
-    // Refuse a literal private/loopback host up front (the DNS resolver is
-    // skipped for literal IPs).
+    // OAuth sends bearer tokens; require TLS and refuse a literal
+    // private/loopback host up front (the DNS resolver is skipped for literals).
+    require_https(url)?;
     crate::mcp::reject_private_url_host(url)?;
 
     // Two SSRF-filtered, no-redirect clients. The OAuth operations
@@ -178,12 +179,14 @@ pub async fn connect_oauth(
 pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
+    require_https(url)?;
     crate::mcp::reject_private_url_host(url)?;
     // SSRF-filtered client so metadata discovery / dynamic registration / token
     // exchange during login can't be pointed at private/metadata endpoints.
     let client = crate::mcp::build_ssrf_http_client(&std::collections::HashMap::new())?;
-    let mut oauth_state = OAuthState::new(url.to_string(), Some(client))
+    let mut oauth_state = timeout(HANDSHAKE_TIMEOUT, OAuthState::new(url.to_string(), Some(client)))
         .await
+        .map_err(|_| eyre::eyre!("oauth metadata discovery for '{url}' timed out"))?
         .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
 
     // Loopback catcher on an ephemeral localhost port.
@@ -196,10 +199,13 @@ pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    oauth_state
-        .start_authorization(&scope_refs, &redirect_uri, Some("octos"))
-        .await
-        .map_err(|e| eyre::eyre!("start authorization (metadata discovery / client registration): {e}"))?;
+    timeout(
+        HANDSHAKE_TIMEOUT,
+        oauth_state.start_authorization(&scope_refs, &redirect_uri, Some("octos")),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("oauth authorization/registration for '{url}' timed out"))?
+    .map_err(|e| eyre::eyre!("start authorization (metadata discovery / client registration): {e}"))?;
     let auth_url = oauth_state
         .get_authorization_url()
         .await
@@ -251,6 +257,16 @@ fn expires_at_ms(creds: &OAuthTokenResponse) -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     Some((now + dur).as_millis() as u64)
+}
+
+/// Require `https://` for OAuth URLs — bearer tokens must not travel over
+/// cleartext. (Loopback, where `http` is common for dev, is already refused by
+/// `reject_private_url_host`, so this doesn't block a legitimate local case.)
+fn require_https(url: &str) -> Result<()> {
+    if !url.trim_start().to_ascii_lowercase().starts_with("https://") {
+        eyre::bail!("OAuth MCP server '{url}' must use https:// (refusing to send bearer tokens over cleartext)");
+    }
+    Ok(())
 }
 
 /// Whether a stored token is at/near its persisted wall-clock expiry (30s skew).
