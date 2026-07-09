@@ -53,6 +53,16 @@ use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 
+// `large_enum_variant`: the `Inbound` variant carries an
+// `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
+// workspace crate enables serde_json's `preserve_order` feature (the `octos acp`
+// bridge's `agent-client-protocol` dependency requires it, and Cargo unifies
+// features workspace-wide), `Value::Object` switches from `BTreeMap` to
+// `IndexMap` and this enum grows past the lint threshold. This event is
+// constructed once per inbound message on a channel-bounded path where the size
+// delta is immaterial; boxing would churn every construction/match site for no
+// real benefit, so we allow it.
+#[allow(clippy::large_enum_variant)]
 enum GatewayLoopEvent {
     Wake,
     Shutdown,

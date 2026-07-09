@@ -41,8 +41,12 @@ fn main() -> Result<()> {
         log_dir = Some(dir);
     }
 
-    // Initialize tracing (with optional rolling file output for serve)
-    let _log_guard = init_tracing(log_dir.as_deref())?;
+    // Initialize tracing (with optional rolling file output for serve).
+    // `octos acp` speaks ACP JSON-RPC on STDOUT, so its logs MUST NOT touch
+    // stdout — one stray log line corrupts the protocol stream and strict
+    // clients (Zed) reject it all with a -32700 parse error. Route to stderr.
+    let reserve_stdout = matches!(args.command, commands::Command::Acp(_));
+    let _log_guard = init_tracing(log_dir.as_deref(), reserve_stdout)?;
 
     args.command.execute()
 }
@@ -54,6 +58,7 @@ fn main() -> Result<()> {
 /// the last 7 days.  The returned guard must be held for the program lifetime.
 fn init_tracing(
     log_dir: Option<&std::path::Path>,
+    reserve_stdout: bool,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     use std::io::IsTerminal as _;
     use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
@@ -122,6 +127,13 @@ fn init_tracing(
 
         Ok(Some(guard))
     } else {
+        // `octos acp` reserves stdout for the JSON-RPC protocol → its logs go to
+        // stderr. Every other no-log-dir command keeps the historical stdout.
+        let writer: BoxMakeWriter = if reserve_stdout {
+            BoxMakeWriter::new(std::io::stderr)
+        } else {
+            BoxMakeWriter::new(std::io::stdout)
+        };
         if json_logs {
             tracing_subscriber::registry()
                 .with(
@@ -129,7 +141,8 @@ fn init_tracing(
                         .json()
                         .with_target(true)
                         .with_span_list(true)
-                        .with_current_span(true),
+                        .with_current_span(true)
+                        .with_writer(writer),
                 )
                 .with(filter)
                 .init();
@@ -139,7 +152,8 @@ fn init_tracing(
                     fmt::layer()
                         .with_target(false)
                         .with_thread_ids(false)
-                        .compact(),
+                        .compact()
+                        .with_writer(writer),
                 )
                 .with(filter)
                 .init();
