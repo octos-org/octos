@@ -494,6 +494,18 @@ impl ServeCommand {
             .await
             {
                 Ok(rt) => {
+                    if let Err(error) =
+                        crate::api::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
+                            &profile.id,
+                            &profile_data_dir,
+                        )
+                    {
+                        tracing::warn!(
+                            profile_id = %profile.id,
+                            %error,
+                            "failed to recover active skill action jobs after profile bootstrap",
+                        );
+                    }
                     tracing::info!(
                         profile_id = %profile.id,
                         provider = %rt.provider_name,

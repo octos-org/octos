@@ -10651,6 +10651,16 @@ async fn ensure_session_profile_runtime(
             "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error}"
         ))
     })?;
+    if let Err(error) = super::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
+        profile_id,
+        &profile_data_dir,
+    ) {
+        warn!(
+            profile_id,
+            %error,
+            "failed to recover active skill action jobs after dynamic profile bootstrap"
+        );
+    }
 
     let mut runtimes = dynamic_profile_runtimes().write().await;
     let runtime = runtimes

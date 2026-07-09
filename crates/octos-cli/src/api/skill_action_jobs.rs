@@ -203,6 +203,22 @@ fn latest_by_job_id(snapshots: Vec<SkillActionJobRecord>) -> Vec<SkillActionJobR
     latest.into_values().collect()
 }
 
+pub(crate) fn recover_skill_action_jobs_for_profile_start(
+    profile_id: &str,
+    profile_data_dir: impl AsRef<Path>,
+) -> Result<usize> {
+    let store = SkillActionJobStore::open(profile_data_dir);
+    let abandoned = store.mark_active_jobs_abandoned()?;
+    if abandoned > 0 {
+        tracing::info!(
+            profile_id,
+            abandoned_jobs = abandoned,
+            "recovered active skill action jobs after profile start"
+        );
+    }
+    Ok(abandoned)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
@@ -368,5 +384,51 @@ mod tests {
             store.read(&session_b, "failed").unwrap().unwrap().status,
             SkillActionJobStatus::Failed
         );
+    }
+
+    #[test]
+    fn should_recover_active_jobs_when_profile_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillActionJobStore::open(dir.path());
+        let session_id = SessionKey("local:profile-start".to_string());
+
+        store
+            .append(&record(
+                &session_id,
+                "job-queued",
+                SkillActionJobStatus::Queued,
+                1,
+            ))
+            .unwrap();
+        store
+            .append(&record(
+                &session_id,
+                "job-running",
+                SkillActionJobStatus::Running,
+                2,
+            ))
+            .unwrap();
+        store
+            .append(&record(
+                &session_id,
+                "job-finished",
+                SkillActionJobStatus::Succeeded,
+                3,
+            ))
+            .unwrap();
+
+        let recovered = recover_skill_action_jobs_for_profile_start("alan0x", dir.path()).unwrap();
+
+        assert_eq!(recovered, 2);
+        let jobs = store.list(&session_id).unwrap();
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.status == SkillActionJobStatus::Abandoned)
+                .count(),
+            2
+        );
+        assert!(jobs.iter().any(|job| {
+            job.job_id == "job-finished" && job.status == SkillActionJobStatus::Succeeded
+        }));
     }
 }
