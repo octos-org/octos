@@ -375,6 +375,27 @@ async fn delete_user_profiles(
 
     for sub in sub_accounts {
         delete_profile_record(state, profile_store, &sub).await?;
+        // Sub-accounts can have their own login users (created with
+        // `id == sub.id` in admin.rs / auth_handlers.rs). Delete those rows
+        // too — a stale user row survives the parent otherwise, and with
+        // self-registration enabled `verify` would auto-create a fresh
+        // TOP-LEVEL profile for it, resurrecting the deleted sub-account
+        // with broken parentage.
+        if let Some(ref us) = state.user_store {
+            match us.delete(&sub.id) {
+                Ok(true) => {
+                    tracing::info!(user_id = %sub.id, "delete_user: cascaded sub-account login user");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %sub.id,
+                        error = %e,
+                        "delete_user: failed to delete sub-account login user"
+                    );
+                }
+            }
+        }
     }
 
     if let Some(parent) = parent {
@@ -510,6 +531,13 @@ mod tests {
         user_store
             .save(&test_user("alice", UserRole::User))
             .unwrap();
+        // Sub-accounts can carry their own login user (id == profile id,
+        // as created by the admin/my-account endpoints) — the cascade must
+        // remove it too, or self-registration `verify` can resurrect the
+        // deleted sub-account as a top-level profile.
+        user_store
+            .save(&test_user("alice--bot", UserRole::User))
+            .unwrap();
         profile_store.save(&parent).unwrap();
         profile_store.save(&sub_account).unwrap();
         assert!(parent_data_dir.exists());
@@ -528,6 +556,10 @@ mod tests {
 
         assert!(response.ok);
         assert!(user_store.get("alice").unwrap().is_none());
+        assert!(
+            user_store.get("alice--bot").unwrap().is_none(),
+            "sub-account login user must be cascaded with the parent"
+        );
         assert!(profile_store.get("alice").unwrap().is_none());
         assert!(profile_store.get("alice--bot").unwrap().is_none());
         assert!(!parent_data_dir.exists());
