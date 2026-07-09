@@ -85,6 +85,7 @@ pub const APPROVAL_NEVER: &str = "never";
 /// from inside a detached subagent.
 pub(crate) const SPAWN_BUILTIN_TOOLS: &[&str] = &[
     "apply_patch",
+    "ask_user_question",
     "bash",
     "browser",
     "check_workspace_contract",
@@ -214,7 +215,7 @@ pub struct RoleTemplate {
     pub allowed_tools: &'static [&'static str],
     /// Default sandbox mode the role suggests. One of `SANDBOX_AUTO`
     /// or `SANDBOX_NONE`. Templates intentionally do not advertise
-    /// "bwrap" / "docker" — backend selection is environment-driven.
+    /// specific backends — backend selection is environment-driven.
     pub default_sandbox_mode: &'static str,
     /// Default approval policy the role suggests. One of
     /// `APPROVAL_ASK` or `APPROVAL_NEVER`.

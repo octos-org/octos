@@ -21,7 +21,7 @@ This guide covers the full lifecycle of an Octos skill — from development to p
 | **App Store** | Apple App Store | [octos-hub](https://github.com/octos-org/octos-hub) registry |
 | **Distribution** | App Store binary delivery | Pre-built binaries in GitHub Releases |
 | **Install** | Tap "Get" | `octos skills install user/repo` |
-| **Sideload** | Ad-hoc / TestFlight | Copy to `~/.octos/skills/` directly |
+| **Sideload** | Ad-hoc / TestFlight | `octos skills --profile <profile> install ./my-skill` |
 
 ---
 
@@ -148,7 +148,7 @@ A skill is a **standalone executable** that communicates via **stdin/stdout JSON
 ```
 User message → LLM → tool_use("get_weather", {"city": "Paris"})
                         ↓
-             Gateway spawns: ~/.octos/skills/weather/main get_weather
+             Gateway spawns: ~/.octos/profiles/<profile>/data/skills/weather/main get_weather
                         ↓
              Stdin:  {"city": "Paris"}
              Stdout: {"output": "25°C, sunny", "success": true}
@@ -441,12 +441,15 @@ echo '{"param1": "hello"}' | ./my-skill/main my_tool
 # Build everything
 cargo build --release --workspace
 
-# Start the gateway
-octos gateway
+# Install into the profile you want to test
+octos skills --profile alice install ./my-skill
 
 # Verify skill loaded
-ls ~/.octos/skills/my-skill/
+ls ~/.octos/profiles/alice/data/skills/my-skill/
 # main  manifest.json  SKILL.md
+
+# Start the gateway
+octos gateway
 
 # Ask the agent to use your skill in conversation
 ```
@@ -688,21 +691,26 @@ DELETE /api/admin/profiles/alice/skills/my-skill
 
 ### Sideloading (Manual Install)
 
-Copy a skill directory directly — like sideloading an app:
+Install a local skill directory into the profile that should be allowed to use
+it:
 
 ```bash
-# Copy to global skills directory
-cp -r my-skill/ ~/.octos/skills/my-skill/
-chmod +x ~/.octos/skills/my-skill/main
+octos skills --profile alice install ./my-skill --force
+```
 
-# Or to a profile-specific directory
+For one-off debugging you can copy the directory yourself, but keep the target
+profile-scoped:
+
+```bash
+# Canonical: per-profile install
 cp -r my-skill/ ~/.octos/profiles/alice/data/skills/my-skill/
+chmod +x ~/.octos/profiles/alice/data/skills/my-skill/main
 ```
 
 ### Installed Skill Layout
 
 ```
-~/.octos/skills/my-skill/
+~/.octos/profiles/alice/data/skills/my-skill/
 ├── main                # Executable binary
 ├── manifest.json       # Tool definitions
 ├── SKILL.md            # Documentation
@@ -729,8 +737,8 @@ When multiple directories contain a skill with the same name, first match wins:
 |----------|----------|--------|
 | 1 (highest) | `<profile-data>/skills/` | Per-profile install |
 | 2 | `<project-dir>/skills/` | Project-local |
-| 3 | `<project-dir>/bundled-skills/` | Bundled app-skills |
-| 4 (lowest) | `~/.octos/skills/` | Global install |
+| 3 | `<project-dir>/bundled-app-skills/` | Bundled app-skills |
+| 4 (lowest, deprecated) | `~/.octos/skills/` | Legacy global install, migration only |
 
 ---
 
@@ -758,7 +766,7 @@ Skill binaries can be updated without restarting the gateway:
 cargo build --release -p my-skill
 
 # Replace the binary
-cp target/release/my_skill ~/.octos/skills/my-skill/main
+cp target/release/my_skill ~/.octos/profiles/alice/data/skills/my-skill/main
 
 # Next tool call automatically uses the new binary
 ```

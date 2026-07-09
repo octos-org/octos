@@ -413,6 +413,7 @@ impl Channel for TwilioChannel {
                     }
                 }),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             };
 
             let _ = state.inbound_tx.send(inbound).await;

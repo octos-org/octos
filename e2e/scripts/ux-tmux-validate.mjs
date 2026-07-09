@@ -144,6 +144,36 @@ function isAcceptableJsonRpcError(frame) {
   return [...ACCEPTABLE_IDEMPOTENT_ERROR_CODES].some((known) => message.includes(known));
 }
 
+function reportProvesForcedTerminalDrop(report) {
+  if (!report.ok) return false;
+  const coverage = report.value.coverage;
+  const hasTrueTerminalDropCoverage =
+    coverage === 'true-dropped-turn-completed'
+    || coverage === 'forced-turn-completed-drop'
+    || (
+      isPlainObject(coverage)
+      && (
+        coverage.true_dropped_turn_completed === true
+        || coverage.terminal_drop_forced === true
+        || coverage.writer_channel_turn_completed_drop === true
+      )
+    );
+  return hasTrueTerminalDropCoverage
+    && report.value.forced_terminal_drop?.server_log_detected === true;
+}
+
+function reportTerminalProvesCompletion(value) {
+  const terminal = value?.terminal;
+  if (!isPlainObject(terminal)) return false;
+  if (terminal.method === 'turn/completed') return true;
+  return terminal.method === 'projection/envelope'
+    && terminal.legacy_equivalent === 'turn/completed'
+    && (
+      terminal.payload_type === 'turn_completed'
+      || terminal.params?.payload?.type === 'turn_completed'
+    );
+}
+
 function artifactPath(artifactDir, name) {
   return path.join(artifactDir, name);
 }
@@ -173,6 +203,10 @@ function codepointLength(text) {
   return [...text].length;
 }
 
+function firstInteger(...values) {
+  return values.find((value) => Number.isInteger(value)) ?? null;
+}
+
 function sortedStrings(values) {
   return [...new Set(values)].sort();
 }
@@ -183,6 +217,13 @@ function makeCheck(id, passed, detail, evidence) {
     status: passed ? 'passed' : 'failed',
     detail,
     evidence,
+  };
+}
+
+function makeCheckWithData(id, passed, detail, evidence, data) {
+  return {
+    ...makeCheck(id, passed, detail, evidence),
+    ...data,
   };
 }
 
@@ -420,13 +461,84 @@ function normalizeTranscriptFrame(value) {
   return null;
 }
 
-function checkAppuiTranscriptParseable(artifactDir) {
+function transcriptFrameRows(artifactDir) {
   const parsed = parseJsonl(artifactPath(artifactDir, 'appui-transcript.jsonl'));
+  return {
+    parsed,
+    frameRows: parsed.rows
+      .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
+      .filter((entry) => isPlainObject(entry.frame)),
+  };
+}
+
+function isRequestFrame(frame) {
+  return isPlainObject(frame)
+    && typeof frame.method === 'string'
+    && Object.prototype.hasOwnProperty.call(frame, 'id');
+}
+
+function isResponseFrame(frame) {
+  return isPlainObject(frame)
+    && (Object.prototype.hasOwnProperty.call(frame, 'result')
+      || Object.prototype.hasOwnProperty.call(frame, 'error'));
+}
+
+function extractAdvertisedMethodSet(result) {
+  const methods = new Set(['client_hello', 'config/capabilities/list']);
+  const visit = (value, key = '') => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key);
+      return;
+    }
+    if (!isPlainObject(value)) {
+      if (
+        typeof value === 'string'
+        && value.includes('/')
+        && /methods?|commands?|routes?|capabilities/i.test(key)
+      ) {
+        methods.add(value);
+      }
+      return;
+    }
+    for (const [childKey, childValue] of Object.entries(value)) {
+      visit(childValue, childKey);
+    }
+  };
+  visit(result);
+  return methods;
+}
+
+function findCapabilityAdvertisement(frameRows) {
+  const requestsById = new Map();
+  for (const entry of frameRows) {
+    if (isRequestFrame(entry.frame)) {
+      requestsById.set(String(entry.frame.id), entry.frame.method);
+    }
+    if (!isResponseFrame(entry.frame) || !isPlainObject(entry.frame.result)) continue;
+    const responseTo = requestsById.get(String(entry.frame.id));
+    const result = entry.frame.result;
+    if (
+      responseTo === 'client_hello'
+      || responseTo === 'config/capabilities/list'
+      || Array.isArray(result.capabilities)
+      || Array.isArray(result.methods)
+      || Array.isArray(result.supported_methods)
+      || Array.isArray(result.commands)
+    ) {
+      return {
+        row: entry.row,
+        result,
+        methods: extractAdvertisedMethodSet(result),
+      };
+    }
+  }
+  return null;
+}
+
+function checkAppuiTranscriptParseable(artifactDir) {
+  const { parsed, frameRows } = transcriptFrameRows(artifactDir);
   const shapeErrors = parsed.rows.flatMap((row) => validateFrameShape(row));
   const jsonErrors = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
-  const frameRows = parsed.rows
-    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
-    .filter((entry) => isPlainObject(entry.frame));
   const methodNames = sortedStrings(
     frameRows
       .map((entry) => entry.frame.method)
@@ -455,6 +567,63 @@ function checkAppuiTranscriptParseable(artifactDir) {
     problems.length === 0
       ? `parsed ${parsed.rows.length} JSONL entries; methods=${methodNames.join(', ')}; responses=${responseCount}`
       : `transcript parse problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
+function checkCapabilitiesBeforeFollowups(artifactDir) {
+  const { parsed, frameRows } = transcriptFrameRows(artifactDir);
+  const problems = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
+  const advertisement = findCapabilityAdvertisement(frameRows);
+  if (!advertisement) {
+    problems.push('no client_hello or config/capabilities/list capability advertisement response found');
+  }
+  for (const entry of frameRows) {
+    if (!isRequestFrame(entry.frame)) continue;
+    const method = entry.frame.method;
+    if (method === 'client_hello' || method === 'config/capabilities/list') continue;
+    if (!advertisement || entry.row.line < advertisement.row.line) {
+      problems.push(`line ${entry.row.line}: ${method} was sent before capability advertisement`);
+      break;
+    }
+  }
+  return makeCheck(
+    'capabilities_before_followups',
+    problems.length === 0,
+    problems.length === 0
+      ? `capability advertisement precedes follow-up requests at line ${advertisement.row.line}`
+      : `capability ordering problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
+function checkNoUnadvertisedMethodsCalled(artifactDir) {
+  const { parsed, frameRows } = transcriptFrameRows(artifactDir);
+  const problems = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
+  const advertisement = findCapabilityAdvertisement(frameRows);
+  if (!advertisement) {
+    return makeCheck(
+      'no_unadvertised_methods_called',
+      false,
+      'no method advertisement found before checking AppUI request methods',
+      ['appui-transcript.jsonl'],
+    );
+  }
+  const advertised = advertisement.methods;
+  for (const entry of frameRows) {
+    if (!isRequestFrame(entry.frame)) continue;
+    const method = entry.frame.method;
+    if (entry.row.line <= advertisement.row.line) continue;
+    if (!advertised.has(method)) {
+      problems.push(`line ${entry.row.line}: ${method} was not advertised`);
+    }
+  }
+  return makeCheck(
+    'no_unadvertised_methods_called',
+    problems.length === 0,
+    problems.length === 0
+      ? `all ${advertised.size} advertised method gate(s) respected`
+      : `unadvertised AppUI method problems: ${problems.join('; ')}`,
     ['appui-transcript.jsonl'],
   );
 }
@@ -498,6 +667,249 @@ function checkRealTmuxEvidence(artifactDir) {
       ? 'summary confirms this artifact set came from a completed real tmux run'
       : `real tmux evidence problems: ${problems.join('; ')}`,
     ['summary.json'],
+  );
+}
+
+function checkFinalAnswerVisible(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const transcript = readText(artifactPath(artifactDir, 'appui-transcript.jsonl'));
+  const problems = [];
+  const marker = scenario.ok && typeof scenario.value.final_marker === 'string'
+    ? scenario.value.final_marker
+    : null;
+  if (!summary.ok) {
+    problems.push(`summary.json is not parseable JSON: ${summary.error}`);
+  }
+  if (!capture.ok) {
+    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  }
+  if (!transcript.ok) {
+    problems.push(`appui-transcript.jsonl could not be read: ${transcript.error}`);
+  }
+  if (problems.length === 0) {
+    const combined = `${capture.text}\n${transcript.text}`;
+    if (marker) {
+      const compactMarker = marker.replace(/_/g, '');
+      const compactCombined = combined.replace(/[_\s]/g, '');
+      if (!combined.includes(marker) && !compactCombined.includes(compactMarker)) {
+        problems.push(`final marker ${marker} is missing from capture/transcript`);
+      }
+    } else if (
+      summary.value.status === 'passed'
+      && !/(Assistant:|turn\/completed|final answer|completed)/i.test(combined)
+    ) {
+      problems.push('passed scenario has no visible assistant/final-completion evidence');
+    }
+  }
+  return makeCheck(
+    'final_answer_visible',
+    problems.length === 0,
+    problems.length === 0
+      ? (marker ? `final marker ${marker} is visible` : 'final answer/completion evidence is visible')
+      : `final answer visibility problems: ${problems.join('; ')}`,
+    ['scenario.json', 'summary.json', 'tui-capture.txt', 'appui-transcript.jsonl'],
+  );
+}
+
+function checkComposerUsable(artifactDir) {
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const terminal = readJson(artifactPath(artifactDir, 'terminal-size.json'));
+  const problems = [];
+  if (!capture.ok) {
+    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  }
+  if (!terminal.ok) {
+    problems.push(`terminal-size.json is not parseable JSON: ${terminal.error}`);
+  }
+  if (problems.length === 0) {
+    if (!/\bComposer\b/i.test(capture.text)) {
+      problems.push('capture is missing Composer label');
+    }
+    if (!/(^|\n)\s*(>|›|Input:|Prompt:)/.test(capture.text)) {
+      problems.push('capture is missing an input prompt/cursor row');
+    }
+    const lines = captureLines(capture.text);
+    const composerIndex = lines.findIndex((line) => /\bComposer\b/i.test(line));
+    if (composerIndex === -1) {
+      problems.push('composer row could not be located');
+    } else if (terminal.ok && composerIndex >= terminal.value.rows) {
+      problems.push(`composer row ${composerIndex + 1} is outside declared terminal height ${terminal.value.rows}`);
+    }
+  }
+  return makeCheck(
+    'composer_usable',
+    problems.length === 0,
+    problems.length === 0
+      ? 'composer label and input row are visible inside the declared terminal'
+      : `composer usability problems: ${problems.join('; ')}`,
+    ['terminal-size.json', 'tui-capture.txt'],
+  );
+}
+
+const SECRET_PATTERNS = [
+  /\b(?:OPENAI|ANTHROPIC|GOOGLE|OPENROUTER|DEEPSEEK|KIMI|AUTODL)_API_KEY\s*=\s*sk-[A-Za-z0-9_-]{8,}/,
+  /\bBearer\s+sk-[A-Za-z0-9_-]{8,}/,
+  /"api[_-]?key"\s*:\s*"sk-[A-Za-z0-9_-]{8,}"/i,
+  /OCTOS_UX_SECRET_SHOULD_BE_REDACTED/,
+];
+
+function shouldScanForSecrets(name) {
+  return /\.(json|jsonl|txt|log|md|env)$/.test(name) && name !== 'validation.json';
+}
+
+function checkSecretRedaction(artifactDir) {
+  const problems = [];
+  const evidence = [];
+  const visit = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      const relative = path.relative(artifactDir, file);
+      if (entry.isDirectory()) {
+        visit(file);
+      } else if (entry.isFile() && shouldScanForSecrets(relative)) {
+        evidence.push(relative);
+        const text = readText(file);
+        if (!text.ok) {
+          problems.push(`${relative} could not be read: ${text.error}`);
+          continue;
+        }
+        for (const pattern of SECRET_PATTERNS) {
+          const match = lineMatches(text.text, pattern);
+          if (match) {
+            problems.push(`${relative}:${match.line} contains unredacted secret-like text`);
+            break;
+          }
+        }
+      }
+    }
+  };
+  visit(artifactDir);
+  return makeCheck(
+    'secret_redaction',
+    problems.length === 0,
+    problems.length === 0
+      ? `scanned ${evidence.length} retained text artifact(s) for secret leaks`
+      : `secret redaction problems: ${problems.join('; ')}`,
+    evidence,
+  );
+}
+
+function readCursorSamples(artifactDir) {
+  const name = 'tmux-cursor-samples.jsonl';
+  const file = artifactPath(artifactDir, name);
+  if (!fs.existsSync(file)) {
+    return {
+      present: false,
+      samples: [],
+      errors: [],
+      evidence: [],
+    };
+  }
+
+  const parsed = parseJsonl(file);
+  const samples = parsed.rows.map((row) => {
+    const value = row.value;
+    const source = isPlainObject(value.cursor)
+      ? value.cursor
+      : isPlainObject(value.position)
+        ? value.position
+        : value;
+    return {
+      line: row.line,
+      row: firstInteger(
+        source.row,
+        source.y,
+        source.cursor_row,
+        source.cursor_y,
+        value.row,
+        value.y,
+        value.cursor_row,
+        value.cursor_y,
+      ),
+      col: firstInteger(
+        source.col,
+        source.column,
+        source.x,
+        source.cursor_col,
+        source.cursor_x,
+        value.col,
+        value.column,
+        value.x,
+        value.cursor_col,
+        value.cursor_x,
+      ),
+    };
+  });
+  const errors = [
+    ...parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`),
+    ...samples
+      .filter((sample) => sample.row === null || sample.col === null)
+      .map((sample) => `line ${sample.line}: cursor sample must include row/col coordinates`),
+  ];
+  return {
+    present: true,
+    samples,
+    errors,
+    evidence: [name],
+  };
+}
+
+function checkTerminalLayoutSnapshot(artifactDir) {
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const terminal = readJson(artifactPath(artifactDir, 'terminal-size.json'));
+  const cursorSamples = readCursorSamples(artifactDir);
+  const problems = [];
+  if (!capture.ok) problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  if (!terminal.ok) problems.push(`terminal-size.json is not parseable JSON: ${terminal.error}`);
+  problems.push(...cursorSamples.errors);
+  const snapshot = {
+    schema: 'octos.ux.terminal_layout_snapshot.v1',
+    terminal: terminal.ok
+      ? { cols: terminal.value.cols, rows: terminal.value.rows }
+      : null,
+    cursor_samples: {
+      present: cursorSamples.present,
+      count: cursorSamples.samples.length,
+      samples: cursorSamples.samples.slice(0, 20),
+    },
+    regions: [],
+  };
+  if (problems.length === 0) {
+    const lines = captureLines(capture.text);
+    const regionPatterns = [
+      ['history', /Messages|Assistant:|User:/i],
+      ['composer', /\bComposer\b|(^|\n)\s*(>|›|Input:|Prompt:)/i],
+      ['status', /^ state |Status:/i],
+      ['menu', /\bMenu\b|Permissions|Model/i],
+      ['approval_prompt', /Approve|Deny|approval/i],
+      ['task_output', /Task|Subagent|Progress/i],
+    ];
+    for (const [name, regex] of regionPatterns) {
+      const line = lines.findIndex((value) => regex.test(value));
+      if (line !== -1) {
+        snapshot.regions.push({
+          name,
+          start_row: line + 1,
+          end_row: line + 1,
+          detected: true,
+        });
+      }
+    }
+    if (snapshot.regions.length === 0) {
+      problems.push('no terminal layout regions detected in capture');
+    }
+  }
+  return makeCheckWithData(
+    'terminal_layout_snapshot',
+    problems.length === 0,
+    problems.length === 0
+      ? `embedded layout snapshot with ${snapshot.regions.length} detected region(s) and ${cursorSamples.samples.length} cursor sample(s)`
+      : `terminal layout snapshot problems: ${problems.join('; ')}`,
+    ['terminal-size.json', 'tui-capture.txt', ...cursorSamples.evidence],
+    { layout_snapshot: snapshot },
   );
 }
 
@@ -598,6 +1010,10 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     : ['tui-capture.txt'];
   if (!captureNames.includes('tui-capture.txt')) captureNames.unshift('tui-capture.txt');
   const serverLog = readText(artifactPath(artifactDir, 'server.log'));
+  const report = readJson(artifactPath(artifactDir, 'backpressure-report.json'));
+  const expectedForcedTerminalDrop =
+    scenarioId === 'dropped-completion-backpressure'
+    && reportProvesForcedTerminalDrop(report);
   const problems = [];
   let mainCaptureText = '';
   for (const captureName of captureNames) {
@@ -629,7 +1045,7 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     problems.push(`server.log could not be read: ${serverLog.error}`);
   } else {
     const serverDrop = lineMatches(serverLog.text, SERVER_DROPPED_TURN_PATTERN);
-    if (serverDrop) {
+    if (serverDrop && !expectedForcedTerminalDrop) {
       problems.push(`server_dropped_turn_completed at line ${serverDrop.line}: server log contains dropped turn/completed lifecycle evidence`);
     }
     if (mainCaptureText && CAPTURE_STUCK_RUNNING_PATTERN.test(mainCaptureText) && serverDrop) {
@@ -1159,6 +1575,7 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
 
   const replayCapture = readText(artifactPath(artifactDir, 'tui-capture-replay-lossy.txt'));
   const finalCapture = readText(artifactPath(artifactDir, 'tui-capture-backpressure-final.txt'));
+  const postRecoveryCapture = readText(artifactPath(artifactDir, 'tui-capture-backpressure-post-recovery.txt'));
   const report = readJson(artifactPath(artifactDir, 'backpressure-report.json'));
   const parsedNotifications = parseJsonl(artifactPath(artifactDir, 'notification-log.jsonl'));
   const parsedWs = parseJsonl(artifactPath(artifactDir, 'websocket-transcript.jsonl'));
@@ -1185,15 +1602,43 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
   } else if (CAPTURE_STUCK_RUNNING_PATTERN.test(finalCapture.text)) {
     problems.push('final backpressure capture still shows a running task state');
   }
+  if (!postRecoveryCapture.ok) {
+    problems.push(`tui-capture-backpressure-post-recovery.txt could not be read: ${postRecoveryCapture.error}`);
+  } else {
+    if (CAPTURE_STUCK_RUNNING_PATTERN.test(postRecoveryCapture.text)) {
+      problems.push('post-recovery backpressure capture still shows a running task state');
+    }
+    if (!/\bOK\b/.test(postRecoveryCapture.text) && !/\bDone\b/.test(postRecoveryCapture.text)) {
+      problems.push('post-recovery backpressure capture does not show the next prompt settling successfully');
+    }
+  }
   if (!report.ok) {
     problems.push(`backpressure-report.json is not parseable JSON: ${report.error}`);
   } else {
+    const coverage = report.value.coverage;
+    const hasTrueTerminalDropCoverage =
+      coverage === 'true-dropped-turn-completed'
+      || coverage === 'forced-turn-completed-drop'
+      || (
+        isPlainObject(coverage)
+        && (
+          coverage.true_dropped_turn_completed === true
+          || coverage.terminal_drop_forced === true
+          || coverage.writer_channel_turn_completed_drop === true
+        )
+      );
+    if (!hasTrueTerminalDropCoverage) {
+      problems.push('backpressure report must prove true dropped turn/completed writer-channel coverage; fixture-only protocol/replay_lossy recovery is not sufficient');
+    }
+    if (report.value.forced_terminal_drop?.server_log_detected !== true) {
+      problems.push('backpressure report is missing server-log evidence for the forced turn/completed writer-channel drop');
+    }
     const droppedCount = Number(report.value.replay_lossy?.dropped_count);
     if (!Number.isFinite(droppedCount) || droppedCount <= 0) {
       problems.push(`backpressure report replay_lossy.dropped_count must be > 0, got ${report.value.replay_lossy?.dropped_count ?? '<missing>'}`);
     }
-    if (report.value.terminal?.method !== 'turn/completed') {
-      problems.push(`backpressure report terminal method must be turn/completed, got ${report.value.terminal?.method ?? '<missing>'}`);
+    if (!reportTerminalProvesCompletion(report.value)) {
+      problems.push(`backpressure report terminal must prove turn/completed, got ${report.value.terminal?.method ?? '<missing>'}`);
     }
     if (report.value.session_id !== scenario.value.session_id) {
       problems.push('backpressure report session_id does not match scenario session_id');
@@ -1230,14 +1675,16 @@ function checkDroppedCompletionBackpressureScenario(artifactDir) {
     'dropped_completion_backpressure_contract',
     problems.length === 0,
     problems.length === 0
-      ? 'fixture-backed protocol/replay_lossy recovery is visible, terminal, and snapshot-backed'
+      ? 'true dropped turn/completed backpressure coverage is visible, terminal, and snapshot-backed'
       : `dropped-completion/backpressure contract problems: ${problems.join('; ')}`,
     [
       'tui-capture-replay-lossy.txt',
       'tui-capture-backpressure-final.txt',
+      'tui-capture-backpressure-post-recovery.txt',
       'notification-log.jsonl',
       'backpressure-report.json',
       'websocket-transcript.jsonl',
+      'server.log',
     ],
   );
 }
@@ -1280,14 +1727,65 @@ function checkLowerSoakSummary(artifactDir) {
   );
 }
 
+function checkStdioHappyPathFinalMarker(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'stdio_happy_path_final_marker_visible',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (scenario.value.id !== 'stdio-happy-path' && scenario.value.scenario_id !== 'stdio-happy-path') {
+    return makeCheck(
+      'stdio_happy_path_final_marker_visible',
+      true,
+      'stdio happy-path final-marker contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const marker = typeof scenario.value.final_marker === 'string' && scenario.value.final_marker.length > 0
+    ? scenario.value.final_marker
+    : 'M19_STDIO_HAPPY_PATH_FINAL_LINE';
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  if (!capture.ok) {
+    return makeCheck(
+      'stdio_happy_path_final_marker_visible',
+      false,
+      `tui-capture.txt could not be read: ${capture.error}`,
+      ['tui-capture.txt'],
+    );
+  }
+
+  const answerLines = captureLines(capture.text)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(marker) && !line.startsWith('›'));
+  return makeCheck(
+    'stdio_happy_path_final_marker_visible',
+    answerLines.length > 0,
+    answerLines.length > 0
+      ? 'stdio happy-path final marker is visible in captured assistant output'
+      : `stdio happy-path final marker ${marker} is not visible outside the user/composer line`,
+    ['scenario.json', 'tui-capture.txt'],
+  );
+}
+
 function buildValidation(artifactDir) {
   const checks = [
     checkArtifactAbi(artifactDir),
     checkAppuiTranscriptParseable(artifactDir),
+    checkCapabilitiesBeforeFollowups(artifactDir),
+    checkNoUnadvertisedMethodsCalled(artifactDir),
     checkRealTmuxEvidence(artifactDir),
     checkAppuiTranscriptSemantic(artifactDir),
     checkRenderedScreenNoKnownBugPatterns(artifactDir),
     checkScreenGeometryConsistent(artifactDir),
+    checkFinalAnswerVisible(artifactDir),
+    checkComposerUsable(artifactDir),
+    checkSecretRedaction(artifactDir),
+    checkTerminalLayoutSnapshot(artifactDir),
     checkPermissionSelectionScenario(artifactDir),
     checkProviderMissingScenario(artifactDir),
     checkApprovalDenialScenario(artifactDir),
@@ -1295,6 +1793,7 @@ function buildValidation(artifactDir) {
     checkRestartReconnectScenario(artifactDir),
     checkDroppedCompletionBackpressureScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
+    checkStdioHappyPathFinalMarker(artifactDir),
   ];
   const failures = checks
     .filter((check) => check.status === 'failed')
@@ -1303,9 +1802,12 @@ function buildValidation(artifactDir) {
       detail: check.detail,
       evidence: check.evidence,
     }));
+  const layoutCheck = checks.find((check) => check.id === 'terminal_layout_snapshot');
   return {
     schema: VALIDATION_SCHEMA,
     status: failures.length === 0 ? 'passed' : 'failed',
+    validators: checks.map((check) => check.id),
+    layout_snapshot: layoutCheck?.layout_snapshot ?? null,
     checks,
     failures,
   };

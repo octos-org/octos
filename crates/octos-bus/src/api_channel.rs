@@ -1622,6 +1622,7 @@ async fn handle_chat(
                 serde_json::Value::Object(metadata)
             },
             message_id: Some(request_thread_id.clone()),
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if let Err(e) = state.inbound_tx.send(inbound).await {
@@ -1712,6 +1713,16 @@ struct SessionInfo {
     /// first user message, or set manually). None for legacy sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    /// RFC3339 last-updated timestamp, for the resume picker's recency
+    /// column. None for legacy files lacking the meta field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    /// The session's most recent user prompt (content-part text unwrapped,
+    /// truncated) — the resume picker's preview. codex P2: the gateway path
+    /// previously emitted only id/count/title, so gateway-only sessions had
+    /// no preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2268,9 +2279,9 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
-        .list_top_level_sessions_with_title()
+        .list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt)| {
             let chat_id = api_chat_id_from_session_key(&id)?.to_string();
             if !seen.insert(chat_id.clone()) {
                 return None;
@@ -2279,6 +2290,8 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
                 id: chat_id,
                 message_count: count,
                 title,
+                updated_at: updated_at.map(|ts| ts.to_rfc3339()),
+                last_prompt,
             })
         })
         .collect();

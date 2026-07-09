@@ -212,9 +212,19 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         plugin_prompt_fragments: Vec::new(),
         plugin_hooks: Vec::new(),
         review_config: None,
+        human_approval_rules: None,
         system_prompt: "test-system-prompt".to_string(),
+        prompt_parts: octos_cli::commands::gateway::prompt::GatewayPromptParts {
+            pre_memory: "test-system-prompt".to_string(),
+            post_memory: String::new(),
+        },
+        voice: octos_cli::config::VoiceConfig::default(),
         memory,
         memory_store,
+        embedder: None,
+        memory_inject_tokens: 2500,
+        memory_refresh_enabled: false,
+        memory_refresh: None,
         tool_config,
         cron_service: None,
         pipeline_factory: None,
@@ -310,6 +320,8 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
     std::fs::create_dir_all(&repo_b).expect("create repo-B");
     std::fs::write(repo_a.join("a.txt"), "hello-A\n").expect("seed a.txt");
     std::fs::write(repo_b.join("b.txt"), "hello-B\n").expect("seed b.txt");
+    let repo_a_canon = std::fs::canonicalize(&repo_a).expect("canonicalize repo-A");
+    let repo_b_canon = std::fs::canonicalize(&repo_b).expect("canonicalize repo-B");
 
     // 3. The session keys we drive turns against. We pre-warm the
     //    cache with the desired `workspace_hint` per session — the
@@ -347,12 +359,12 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
         "per-session workspace roots must differ when distinct hints are supplied",
     );
     assert_eq!(
-        rt_a.workspace_root, repo_a,
+        rt_a.workspace_root, repo_a_canon,
         "session A's workspace must be the supplied workspace_hint (repo-A); \
          if this fails, `SessionRuntime::bootstrap` is dropping `workspace_hint`",
     );
     assert_eq!(
-        rt_b.workspace_root, repo_b,
+        rt_b.workspace_root, repo_b_canon,
         "session B's workspace must be the supplied workspace_hint (repo-B); \
          if this fails, `SessionRuntime::bootstrap` is dropping `workspace_hint`",
     );

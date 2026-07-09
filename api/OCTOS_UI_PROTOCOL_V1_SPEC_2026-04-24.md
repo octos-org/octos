@@ -287,6 +287,20 @@ Current M9 sandbox-parity decision:
   It lets AppUI clients inspect the server-owned prompt context generation,
   transcript hash, checkpoint, compaction, and recovery state without
   reconstructing it from chat rows.
+- The additive structured mid-turn user-question surface (the
+  `user_question/respond` command, the `user_question/requested` notification,
+  the `questions[]` / `answers[]` payloads, and the new `question_id`
+  correlation id) is governed by proposed
+  [UPCR-2026-023](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_023_ASK_USER_QUESTION.md),
+  gated behind the `user_question.v1` feature flag. It is the codex/Claude
+  `AskUserQuestion` shape implemented as "approval + choices + free-text": the
+  agent tool blocks the turn at a deterministic tool boundary (mirroring
+  `approval/requested`), the server emits `user_question/requested`, the client
+  renders a single/multi-select picker plus a free-text "Other", and
+  `user_question/respond` resumes the waiting tool. A turn interrupt cancels
+  pending questions; a client lacking the capability receives the agent tool's
+  structured-metadata/generic-text fallback instead of a blocking question. See
+  [docs/design/ask-user-question-2026-06-03.md](../docs/design/ask-user-question-2026-06-03.md).
 
 ## 5. Identity Model
 
@@ -340,15 +354,18 @@ Client commands are JSON-RPC requests.
 
 Server notifications are JSON-RPC notifications.
 
-The logical command/event names are listed below. The machine-readable
-source of truth for this catalog is `UI_PROTOCOL_COMMAND_METHODS` and
-`UI_PROTOCOL_NOTIFICATION_METHODS` in
-[crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1075)
-(plus the server-handled `APPUI_EXTRA_METHODS` slice in
-[crates/octos-cli/src/api/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-cli/src/api/ui_protocol.rs:1)).
-Per `SRV-036`/M18-E, this list MUST stay in sync with those constants — a
-method that is dispatched and advertised in `supported_methods` but not
-named here is a spec defect.
+The logical command/event names below mirror the current wire inventory:
+
+- command source of truth:
+  `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_COMMAND_METHODS`,
+  `UI_PROTOCOL_FIRST_SERVER_METHODS`, and
+  `crates/octos-cli/src/api/ui_protocol.rs::APPUI_EXTRA_METHODS`
+- notification source of truth:
+  `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_NOTIFICATION_METHODS`
+- executable route inventory:
+  `e2e/fixtures/appui-conformance/m18-route-inventory.json`
+- human-readable wire inventory:
+  `api/OCTOS_UI_PROTOCOL_WIRE_INVENTORY_2026-05-24.md`
 
 Commands:
 
@@ -362,6 +379,7 @@ Session, turn, and approval core:
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
 - `approval/scopes/list` (approval-scope discovery; first-server slice)
+- `user_question/respond` (gate `user_question.v1`, proposed `UPCR-2026-023`)
 - `permission/profile/list`, `permission/profile/set`
   (accepted `UPCR-2026-018`)
 - `diff/preview/get`
@@ -437,6 +455,11 @@ Approval lifecycle:
 - `approval/requested`, `approval/auto_resolved`, `approval/decided`,
   `approval/cancelled`
 
+Structured user-question lifecycle (gate `user_question.v1`, proposed
+`UPCR-2026-023`):
+
+- `user_question/requested`
+
 Task and progress:
 
 - `task/updated`
@@ -447,9 +470,33 @@ Task and progress:
 
 Projection and session bridging (accepted `UPCR-2026-014`):
 
-- `projection/envelope`
+- `projection/envelope` — wire `params` carries the bare `Envelope`
+  fields FLATTENED with the routing keys `session_id` (bare base key) +
+  optional `topic`, so a multi-session client can route each envelope
+  (`feat(envelope-wire-routing)`); see § 14.1.
 - `file/attached`
 - `session/event`
+
+Voice rich-output visual lifecycle (#1477, ungated; accepted
+`UPCR-2026-024`):
+
+- `visual/generating`, `visual/succeeded`, `visual/failed` — typed
+  lifecycle for a background visual artifact (illustrated HTML / image /
+  infographic) produced by a voice turn. Emitted on the same
+  ledger-backed live path as `file/attached`, but kept distinct from it:
+  `file/attached` stays a pure artifact-delivery signal while these carry
+  the placeholder lifecycle, so the split survives a future
+  `projection.envelope.v1` cutover. See § 8.
+
+Voice exit intent (ungated; accepted `UPCR-2026-025`):
+
+- `voice/exit` — the voice turn detected an end / goodbye / mute intent
+  (the model appended an in-band `[[EXIT]]` control marker, which the
+  backend strips from every model-/client-facing surface). The client
+  leaves the `/voice` screen and returns home — after the turn's farewell
+  audio finishes playing (navigation is gated client-side on the reply
+  audio draining). Emitted on the same ledger-backed live path as
+  `file/attached`. See § 8.
 
 Router and queue (Wave4-A):
 
@@ -463,7 +510,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
-- `context/compaction_completed`, `context/normalization_reported`
+- `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
 
 ## 7. Command Semantics
 
@@ -732,6 +779,30 @@ Optional params from accepted `UPCR-2026-001`:
   String registry with initial values `request`, `turn`, and `session`.
   Scope is advisory in v1alpha1 and must not silently create persistent allow
   rules.
+- `client_note`
+  Human-readable client note for audit/display. Servers must not require it.
+
+### `user_question/respond`
+
+Purpose:
+
+- answer a `user_question/requested` event
+
+Minimum params:
+
+- `session_id`
+- `question_id`
+- `answers`
+  Per-question answer list, one entry per question in the originating
+  `user_question/requested` event, in question order. Each entry carries:
+  - `selected_labels` — selected option label(s). Empty when the user supplied
+    only free text. For a single-select question this is 0 or 1 entries; for a
+    `multi_select` question it is 0..N. Labels must match the option labels from
+    the request.
+  - `free_text` — optional string from the free-text "Other" escape hatch.
+
+Optional params (governed by accepted `UPCR-2026-023`):
+
 - `client_note`
   Human-readable client note for audit/display. Servers must not require it.
 
@@ -1558,6 +1629,56 @@ Capability feature:
   Advertised through optional `supported_features` in `UiProtocolCapabilities`.
   The capability payload schema version is `2`.
 
+### `user_question/requested`
+
+Carries a structured multiple-choice question the agent is asking the user
+mid-turn. While this is unresolved, the turn remains paused at a deterministic
+boundary (the same blocking-tool boundary as `approval/requested`).
+
+Required fallback fields:
+
+- `session_id`
+- `question_id`
+- `turn_id`
+- `title`
+  Mandatory generic fallback text.
+- `body`
+  Mandatory generic fallback text.
+
+Structured field (governed by accepted `UPCR-2026-023`):
+
+- `questions`
+  An array of 1–4 questions. Each question carries:
+  - `header` — short label, ≤ 12 characters. An over-long header is
+    **truncated** to the limit (char-boundary safe, ellipsis-marked) server-side
+    rather than rejected, so a model that sends a descriptive header
+    ("Favorite Color") still gets a rendered picker (live-soak hardening
+    2026-06-04).
+  - `question` — the question text.
+  - `options` — an array of 2–4 options, each with `label` and `description`.
+  - `multi_select` — `bool`; when `true` the user may select more than one
+    option.
+  - `allow_free_text` — `bool`; the server forces this `true` so a free-text
+    "Other" escape hatch is always offered alongside the options.
+
+Compatibility rules:
+
+- Generic `title` and `body` remain mandatory fallback text for v1alpha1.
+- Unknown fields must fall back to generic rendering and remain actionable: a
+  client that does not understand `questions` renders `title`/`body` and the
+  user can still answer (for example via free text).
+- Clients that do not advertise the `user_question.v1` capability receive the
+  agent tool's structured-metadata / generic-text fallback instead of a blocking
+  question, so the turn never hard-blocks on a non-supporting client (the agent
+  tool degrades exactly like the existing `request_user_input` codex tool).
+
+Capability feature:
+
+- `user_question.v1`
+  Advertised through optional `supported_features` in `UiProtocolCapabilities`.
+  Clients request it through `X-Octos-Ui-Features` using comma or
+  space-separated feature tokens.
+
 ### `task/updated`
 
 Carries task lifecycle and summary updates that are useful to clients even before the full unified ledger exists.
@@ -1608,6 +1729,48 @@ declare `files_to_send`. Payload fields:
   background-result paths that don't run inside a tool execution).
 - `mime` — MIME-type hint (optional; clients fall back to extension
   sniffing when absent).
+
+### `visual/generating`, `visual/succeeded`, `visual/failed`
+
+Typed visual-artifact lifecycle introduced by `UPCR-2026-024` (#1477,
+voice rich output). A voice turn may append an in-band `[[VISUAL:...]]`
+control marker; the backend strips it from every model-/client-facing
+surface and instead drives the client off these three structured events,
+so the client never scrapes the marker out of the assistant text. Ungated
+and emitted on the same ledger-backed live path as `file/attached` (durable
+append → replayed on reconnect).
+
+The lifecycle is `generating → (succeeded | failed)` and is deliberately
+decoupled from `file/attached`, which stays a pure artifact-delivery
+signal: the client raises and clears the "generating" placeholder off
+these events, NOT off `file/attached`. Payload fields:
+
+- `visual/generating` — `session_id`, `turn_id` (required); `kind`
+  (`html` | `illustrated` | `image` | `infographic`); optional `topic`.
+- `visual/succeeded` — same fields as `generating`, plus `files`: the
+  workspace-relative filenames of the delivered artifact(s) (the same paths
+  carried on the accompanying `file/attached` event(s); omitted when empty).
+  Emitted alongside `file/attached` on the success branch.
+- `visual/failed` — `session_id`, `turn_id` (required); optional `topic`
+  and `reason` (failure/timeout/cancel detail).
+
+### `voice/exit`
+
+Typed voice-exit signal introduced by `UPCR-2026-025`. A voice turn may
+append an in-band `[[EXIT]]` control marker after a short spoken farewell
+when the user expresses an end / goodbye / mute intent; the backend strips
+it from every model-/client-facing surface (live `message/delta`, persisted
+`response.content`, assistant carriers) and instead emits this structured
+event, so the client never scrapes the marker out of the assistant text.
+Ungated and emitted on the same ledger-backed live path as `file/attached`
+(durable append → replayed on reconnect).
+
+The client uses it to leave the `/voice` screen and return home, but gates
+the actual navigation on its OWN reply-audio queue draining — so the spoken
+farewell is heard before the screen changes. The event is the trigger; the
+client owns the timing. Payload fields:
+
+- `voice/exit` — `session_id`, `turn_id` (required); optional `topic`.
 
 ### `session/event`
 
@@ -1715,6 +1878,26 @@ Required fields: `session_id`, `context_state`, `compaction`. Full field
 set, `UiContextState` shape, and `UiContextCompactionRecord` shape
 documented by
 [UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `context/compaction_started`
+
+Notification that a server-owned context-manager compaction pass is about
+to run. Emitted immediately before the pass with the PRE-compaction
+`context_state` (its `token_estimate` is the "before" size), the `trigger`
+label that the eventual `context/compaction_completed` record repeats, and
+`threshold_tokens` (the context-window-derived limit that tripped the
+pass) so clients can render an honest fullness percentage and an
+in-progress state (spinner/progress bar).
+
+Always followed by `context/compaction_completed` for the same pass.
+Today's serve compaction is synchronous, so both notifications may arrive
+in one delivery batch; clients MUST tolerate a zero-duration window.
+
+Capability gate: `context.lifecycle.v1`.
+
+Required fields: `session_id`, `context_state`, `trigger`,
+`threshold_tokens`. Documented by
+[UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
 
 ### `context/normalization_reported`
 
@@ -1916,9 +2099,33 @@ Wire shape (JSON):
   "thread_id": "thread-1",
   "seq": 18,
   "client_message_id": "01900000-0000-7000-8000-000000000001",
-  "payload": { "type": "...", "data": { ... } }
+  "payload": { "type": "...", "data": { ... } },
+  "session_id": "local:demo",
+  "topic": "planning"
 }
 ```
+
+The `projection/envelope` notification's JSON-RPC `params` is the bare
+`Envelope` fields (`thread_id`, `seq`, `client_message_id?`, `payload`)
+FLATTENED with the routing keys `session_id` and optional `topic`. The
+routing keys let a multi-session client (e.g. the TUI, which holds
+several sessions on one connection) route each envelope to the correct
+session and topic-scoped pane. The bare `Envelope` keys remain at the
+top level, so a client that reads `thread_id`/`seq`/`payload` top-level
+and ignores unknown keys decodes the frame unchanged — the routing
+addition is backward-compatible. A decoder that receives an OLD frame
+lacking `session_id`/`topic` defaults `session_id` to the empty key and
+`topic` to absent, and falls back to its ambient connection context for
+routing.
+
+> History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
+> BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
+> only on the durable ledger's on-disk record. That left a multi-session
+> consumer with an unroutable empty `session_id`. The wire is now
+> un-stripped (`feat(envelope-wire-routing)`); the **disk** record shape
+> — a NESTED `{ session_id, topic, envelope }` object via the
+> `EnvelopeNotification` derive — is UNCHANGED, so post-restart
+> topic-scoped replay still routes (BLOCKER 4's actual invariant holds).
 
 Field contract:
 
@@ -1935,6 +2142,12 @@ Field contract:
   server emitting `client_message_id` on a non-`user_message` envelope
   is a wire contract violation.
 - `payload` (object, required) — Sealed tagged union; see § 14.2.
+- `session_id` (`string`, optional on the wire for backward-compat,
+  always emitted by current servers) — The bare base session key for
+  client-side routing. A multi-session client routes the envelope to
+  this session; the projection itself does not consult it.
+- `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
+  Omitted when the envelope is not topic-scoped.
 
 Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
 in `octos-core::ui_protocol`. TS source: `Envelope` in

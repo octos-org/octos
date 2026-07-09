@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-FEATURES="${FEATURES:-api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3}"
+FEATURES="${FEATURES:-api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3}"
 SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p skill-evolve}"
 
 usage() {
@@ -65,6 +65,10 @@ run_hosted_fast() {
   cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
   cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
   cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+  # #1477: the `api` module (incl. voice_turn rich-output marker/splitter/delta
+  # helpers) is feature-gated, so `cargo test --workspace` above never compiles
+  # it. Run the api-gated unit tests explicitly so this coverage is real.
+  cargo test -p octos-cli --features api voice_turn -- --nocapture
   cargo test -p octos-agent --test activate_tools_regression -- --nocapture
   cargo test -p octos-bus --test file_handle_resolve_tool_path -- --nocapture
 }
@@ -78,6 +82,7 @@ run_workspace_all_features() {
 
 run_release_bundle() {
   cargo build --release -p octos-cli --features "$FEATURES"
+  cargo build --release -p octos-sandbox
   # shellcheck disable=SC2086
   cargo build --release ${SKILL_CRATES}
 }

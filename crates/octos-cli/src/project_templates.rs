@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use octos_agent::{WorkspaceProjectKind, initialize_and_commit, write_workspace_policy};
+use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -427,6 +428,22 @@ fn site_pages_for_preset(preset_key: &str) -> Vec<SitePlanPage> {
             },
         ],
     }
+}
+
+/// Session identifier used for the preview route AND the workspace
+/// namespacing (`users/{id}/workspace`). This MUST be `base_key()`, not
+/// `chat_id()`.
+///
+/// Regression (preview blank / `/api/preview/{profile}//{slug}`):
+/// `SessionKey::chat_id()` returns `""` for a bare, colon-less key like
+/// `"site-1780906218033-vyftae"` (the web/API flow uses such keys),
+/// because `chat_id()` reads the 3rd `:`-segment which doesn't exist.
+/// The site scaffolders fed that empty string into the preview base,
+/// producing the double-slash URL, while the workspace dir is laid out
+/// from `encode_path_component(base_key())`. The two MUST agree, so the
+/// preview id is derived from the same `base_key()`.
+pub(crate) fn preview_session_id(session_key: &SessionKey) -> &str {
+    session_key.base_key()
 }
 
 fn site_preview_base_path(profile_id: &str, session_id: &str, site_slug: &str) -> String {
@@ -912,7 +929,7 @@ fn run_site_bootstrap(
             .arg("--locale")
             .arg("en")
             .arg("--base-path")
-            .arg(&metadata.preview_base_path)
+            .arg(site_bootstrap_base_path(metadata))
             .status()
             .map_err(|e| format!("spawn site bootstrap failed: {e}"))?
     };
@@ -925,6 +942,13 @@ fn run_site_bootstrap(
     }
 
     Ok(())
+}
+
+fn site_bootstrap_base_path(metadata: &SiteProjectMetadata) -> &str {
+    match metadata.template.as_str() {
+        "react-vite" => "./",
+        _ => &metadata.preview_base_path,
+    }
 }
 
 pub fn scaffold_site_project(
@@ -1157,6 +1181,101 @@ mod tests {
             "/api/preview/dspfac/site-session-123/signal-atlas/index.html"
         );
         assert_eq!(metadata.build_output_dir, "dist");
+    }
+
+    #[test]
+    fn should_use_relative_asset_base_when_bootstrapping_react_vite_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-site");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(
+            scripts_dir.join("bootstrap_template.sh"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+OUT_DIR=""
+BASE_PATH=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out-dir)
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    --base-path)
+      BASE_PATH="$2"
+      shift 2
+      ;;
+    *)
+      shift 2
+      ;;
+  esac
+done
+
+mkdir -p "$OUT_DIR"
+printf '%s' "$BASE_PATH" >"$OUT_DIR/base_path.txt"
+"#,
+        )
+        .unwrap();
+
+        let project_dir = tmp.path().join("workspace").join("sites").join("react-lab");
+        let metadata = build_site_project_metadata(
+            "alan0x",
+            "site-1780910158184-af9jo2",
+            "site react",
+            tmp.path(),
+        )
+        .expect("react metadata");
+
+        assert_eq!(
+            metadata.preview_base_path,
+            "/api/preview/alan0x/site-1780910158184-af9jo2/react-lab"
+        );
+
+        run_site_bootstrap(&skill_dir, &project_dir, &metadata).expect("bootstrap runs");
+
+        assert_eq!(
+            std::fs::read_to_string(project_dir.join("base_path.txt")).unwrap(),
+            "./",
+            "React/Vite build assets must be relative so signed preview URLs load JS/CSS through /api/preview-signed/<token>/..."
+        );
+    }
+
+    #[test]
+    fn preview_session_id_is_non_empty_for_bare_web_session_key() {
+        // Regression: the web/API flow scaffolds sites under a bare,
+        // colon-less SessionKey (e.g. "site-1780906218033-vyftae").
+        // `chat_id()` reads the 3rd `:`-segment, which is absent, so it
+        // returns "" — the scaffolders used to feed that into the preview
+        // base, yielding "/api/preview/{profile}//{slug}" (empty session
+        // segment) and a preview that 404/401-loops. `preview_session_id`
+        // must use `base_key()` so it stays non-empty AND matches the
+        // workspace dir (`users/{base_key}/workspace`).
+        let bare = SessionKey("site-1780906218033-vyftae".into());
+        assert_eq!(
+            bare.chat_id(),
+            "",
+            "chat_id() is the trap: empty for a bare key — do not use it for the preview id"
+        );
+        assert_eq!(preview_session_id(&bare), "site-1780906218033-vyftae");
+
+        // And the resulting preview base has no empty `//` session segment.
+        let meta = build_site_project_metadata(
+            "alan0x",
+            preview_session_id(&bare),
+            "site react",
+            Path::new("."),
+        )
+        .expect("react metadata");
+        assert!(
+            !meta.preview_base_path.contains("//"),
+            "preview base must not contain an empty session segment: {}",
+            meta.preview_base_path
+        );
+        assert_eq!(
+            meta.preview_base_path,
+            "/api/preview/alan0x/site-1780906218033-vyftae/react-lab"
+        );
     }
 
     #[test]

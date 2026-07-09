@@ -52,6 +52,27 @@ pub const MIN_EPISODE_SIMILARITY: f32 = 0.55;
 /// also re-checks the floor as defense in depth.
 const RELEVANT_EXPERIENCES_INJECT_LIMIT: usize = 6;
 
+/// Neutral, non-misattributing log line emitted when this agent runs
+/// without an embedder configured and therefore skips episodic recall.
+///
+/// **Why this exists (the misdiagnostic-WARN fix).** The previous
+/// no-embedder branch logged at `warn!` and told the operator to
+/// "investigate the `RunPipelineTool::with_embedder` wiring (NEW-06)".
+/// That advice is wrong for the common case: on a host with no embedder
+/// configured at all (the soak hosts), `create_embedder()` returns
+/// `None` and `self.embedder` is legitimately `None` — the wiring is
+/// fine, there is simply nothing to propagate. The only state knowable
+/// at this call site is "this agent has no embedder" (`self.embedder`
+/// is `None`); we cannot distinguish "never had one" from "had a parent
+/// embedder but lost it in the worker" here, because a worker that lost
+/// its embedder also just presents as `embedder == None`. Since we
+/// cannot tell them apart, we must NOT assert the wiring is broken —
+/// that misdirected an operator into chasing a non-bug. So the message
+/// is downgraded to a neutral `debug!`, with no NEW-06 / wiring
+/// attribution.
+const NO_EMBEDDER_RECALL_SKIPPED_MSG: &str =
+    "memory recall: no embedder configured; skipping episodic recall (no cross-task injection)";
+
 impl Agent {
     pub(super) async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
@@ -78,11 +99,13 @@ impl Agent {
             octos_core::TaskKind::Custom { name, .. } => name.clone(),
         };
 
-        // Hybrid (embedding-aware) path returns scored matches so we can
-        // filter out below-threshold noise that would otherwise contaminate
-        // unrelated sessions. The cwd-scoped `find_relevant` fallback is
-        // already filtered by working directory and keyword overlap, so it
-        // doesn't need the score gate.
+        // Episodic recall requires an embedder. The hybrid (embedding-aware)
+        // path returns scored matches so we can filter out below-threshold
+        // noise that would otherwise contaminate unrelated sessions. WITHOUT
+        // an embedder we SKIP recall entirely (the `else` below): BM25-only
+        // keyword overlap within a single shared workspace can't discriminate
+        // on-task from cross-task episodes, so injecting it leaks stale,
+        // unrelated memory into the prompt.
         if let Some(ref embedder) = self.embedder {
             // Push the modality-aware similarity floor down into the
             // index via `_filtered`. The floor is applied to every
@@ -159,64 +182,38 @@ impl Agent {
                     });
                 }
             }
-        } else if let Ok(episodes) = self
-            .memory
-            .find_relevant_filtered(
-                &task.context.working_dir,
-                &query,
-                3,
-                // NEW-06 defense-in-depth: apply the modality-aware
-                // similarity gate to the no-embedder fallback path too.
-                // The primary fix is propagating the parent embedder
-                // to pipeline workers via `RunPipelineTool::with_embedder`
-                // (crates/octos-pipeline/src/tool.rs); this is the
-                // belt-and-suspenders rail for the case where a worker
-                // still ends up here (embedder construction failed, an
-                // older call site not yet updated, etc.).
-                Some(MIN_EPISODE_SIMILARITY),
-            )
-            .await
-        {
-            // CWD-scoped fallback path. No scoring infrastructure here;
-            // the cwd filter + keyword match already constrain results.
-            // Inject only when there's something to inject (no empty header).
+        } else {
+            // No-embedder path. Contamination guard (NEW-06 follow-up,
+            // option (a)): when there is NO embedder we skip episodic
+            // recall ENTIRELY rather than injecting BM25-only,
+            // same-workspace matches.
             //
-            // NEW-06 diagnostic: ALSO log on the no-embedder path so we
-            // can detect contamination here too. The round-3 root
-            // cause was that pipeline workers fell through to THIS
-            // branch because their parent agent's embedder wasn't
-            // propagated. The wiring fix lives in
-            // crates/octos-pipeline (RunPipelineTool::with_embedder ->
-            // CodergenHandler -> worker Agent::with_embedder); this
-            // log gives us evidence when a worker still ends up here
-            // despite the fix (e.g. embedder failed to construct).
-            if !episodes.is_empty() {
-                let ids: Vec<String> = episodes.iter().map(|e| e.id.clone()).collect();
-                warn!(
-                    caller = "agent_memory_cwd_fallback",
-                    agent = %self.id,
-                    cwd = %task.context.working_dir.display(),
-                    query_len = query.len(),
-                    injected = episodes.len(),
-                    episodes = ?ids,
-                    "memory recall: no-embedder CWD fallback (no similarity gate). \
-                     If this agent is a pipeline worker, the parent embedder did NOT \
-                     propagate — investigate the RunPipelineTool::with_embedder wiring \
-                     (NEW-06)."
-                );
-                let content = render_relevant_experiences(&episodes);
-                messages.push(Message {
-                    role: MessageRole::System,
-                    content,
-                    media: vec![],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    client_message_id: None,
-                    thread_id: None,
-                    timestamp: chrono::Utc::now(),
-                });
-            }
+            // Rationale for option (a) over raising the floor (option b):
+            // without an embedder the only signal is BM25 keyword overlap
+            // scoped to the working directory. On the soak hosts every
+            // task shares ONE workspace, so a prior *unrelated* episode
+            // that merely shares vocabulary (the "Jingkang Incident"
+            // research doc recalled into a code-review run) can clear any
+            // BM25 floor and get injected into a fresh, unrelated context.
+            // BM25-only same-workspace recall has no reliable way to
+            // distinguish on-task from cross-task here, so there is no
+            // safe value in injecting it at all — skipping is the
+            // least-invasive correct fix. Embedder-backed recall (the
+            // `if let Some(embedder)` arm above) keeps the modality-aware
+            // similarity gate and is unaffected.
+            //
+            // The log is deliberately neutral (`debug!`, no NEW-06 /
+            // `with_embedder` wiring attribution): the only knowable state
+            // here is "this agent has no embedder", which is the expected
+            // condition on an unconfigured host, not evidence of a wiring
+            // bug. See `NO_EMBEDDER_RECALL_SKIPPED_MSG`.
+            tracing::debug!(
+                caller = "agent_memory_no_embedder",
+                agent = %self.id,
+                cwd = %task.context.working_dir.display(),
+                query_len = query.len(),
+                "{NO_EMBEDDER_RECALL_SKIPPED_MSG}"
+            );
         }
 
         // Add the task as user message
@@ -283,13 +280,6 @@ fn format_relevant_experiences(scored: &[(Episode, HybridScore)]) -> Option<Stri
         return None;
     }
     Some(render_relevant_experiences_iter(filtered.into_iter()))
-}
-
-/// Render a slice of episodes (no scores) into the "Relevant Past
-/// Experiences" system message body. Used by the cwd-scoped fallback path
-/// where scores aren't available; the cwd filter constrains noise instead.
-fn render_relevant_experiences(episodes: &[Episode]) -> String {
-    render_relevant_experiences_iter(episodes.iter())
 }
 
 fn render_relevant_experiences_iter<'a, I>(iter: I) -> String
@@ -598,6 +588,151 @@ mod tests {
             assert!(
                 !rendered.contains(&needle),
                 "expected rank '{needle}' to be truncated past the inject limit ({RELEVANT_EXPERIENCES_INJECT_LIMIT})"
+            );
+        }
+    }
+
+    // ---- Fix #1: the no-embedder log must not misattribute to wiring ----
+
+    /// The neutral no-embedder log line must NOT tell the operator to
+    /// investigate the `RunPipelineTool::with_embedder` wiring (the prior
+    /// misdiagnostic WARN). The only state knowable on that path is
+    /// "this agent has no embedder", which is the expected condition on
+    /// an unconfigured host — not evidence of a wiring bug — so the
+    /// message must carry no NEW-06 / `with_embedder` blame.
+    #[test]
+    fn no_embedder_log_message_does_not_misattribute_to_wiring() {
+        let msg = NO_EMBEDDER_RECALL_SKIPPED_MSG.to_ascii_lowercase();
+        assert!(
+            !msg.contains("with_embedder"),
+            "no-embedder log must not blame RunPipelineTool::with_embedder wiring: {NO_EMBEDDER_RECALL_SKIPPED_MSG}"
+        );
+        assert!(
+            !msg.contains("new-06"),
+            "no-embedder log must not reference the NEW-06 wiring investigation: {NO_EMBEDDER_RECALL_SKIPPED_MSG}"
+        );
+        assert!(
+            !msg.contains("propagate") && !msg.contains("investigate"),
+            "no-embedder log must not direct the operator to investigate embedder propagation: {NO_EMBEDDER_RECALL_SKIPPED_MSG}"
+        );
+        // And it should still say *something* useful about why recall was skipped.
+        assert!(
+            msg.contains("embedder") && msg.contains("skip"),
+            "no-embedder log should still explain that recall was skipped because no embedder is configured: {NO_EMBEDDER_RECALL_SKIPPED_MSG}"
+        );
+    }
+
+    // ---- Fix #3 (option a): no-embedder recall injects nothing ----
+
+    /// A stub provider that immediately ends the turn — enough to let us
+    /// drive `build_initial_messages` through `Agent`.
+    struct EndTurnProvider;
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EndTurnProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some(String::new()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// Contamination guard (the "Jingkang artifact" bug). On a host with
+    /// NO embedder configured, a prior *unrelated* episode that merely
+    /// shares vocabulary with the current task — and lives in the SAME
+    /// workspace (so the old cwd filter would have admitted it) — must
+    /// NOT be injected into the fresh task's prompt.
+    ///
+    /// Pre-fix: `build_initial_messages` fell into the no-embedder branch,
+    /// ran a BM25-only same-cwd recall, and injected the shared-vocab
+    /// episode as a "Relevant Past Experience" — exactly how a stale
+    /// "Jingkang Incident" research doc leaked into a code-review run.
+    /// Post-fix (option a): the no-embedder branch skips recall entirely,
+    /// so no "Relevant Past Experiences" message is produced.
+    #[tokio::test]
+    async fn no_embedder_path_does_not_inject_shared_vocab_episode() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_core::{TaskContext, TaskKind};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+
+        // A prior, unrelated episode that shares vocabulary ("history",
+        // "incident", "report") with a code-review-style query, stored in
+        // the SAME workspace so a cwd-scoped BM25 recall WOULD have matched
+        // it. This stands in for the stale "Jingkang Incident" history doc.
+        let contaminating = Episode::new(
+            TaskId::new(),
+            AgentId::new("prior-task"),
+            workspace.clone(),
+            "Researched the Jingkang Incident history report and synthesized a timeline"
+                .to_string(),
+            EpisodeOutcome::Success,
+        );
+        memory.store(contaminating).await.unwrap();
+
+        // Sanity: the store CAN find it by shared vocabulary in this cwd
+        // (proving the contamination vector is real and the guard, not a
+        // cwd/keyword miss, is what closes it).
+        let hits = memory
+            .find_relevant(&workspace, "review the incident history report", 5)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|e| e.summary.contains("Jingkang")),
+            "precondition: the shared-vocab episode is recallable by BM25 in this cwd"
+        );
+
+        // Agent::new defaults embedder=None — the no-embedder path.
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        let agent = Agent::new(AgentId::new("reviewer"), provider, tools, memory);
+
+        let task = octos_core::Task::new(
+            TaskKind::Custom {
+                name: "review the incident history report".to_string(),
+                params: serde_json::Value::Null,
+            },
+            TaskContext {
+                working_dir: workspace.clone(),
+                ..Default::default()
+            },
+        );
+
+        let messages = agent.build_initial_messages(&task).await;
+
+        // No message may carry the stale episode or a "Relevant Past
+        // Experiences" header — recall is skipped entirely on this path.
+        for m in &messages {
+            assert!(
+                !m.content.contains("Jingkang"),
+                "no-embedder path injected the stale cross-task episode: {:?}",
+                m.content
+            );
+            assert!(
+                !m.content.contains("Relevant Past Experiences"),
+                "no-embedder path must not inject any past-experience block: {:?}",
+                m.content
             );
         }
     }
