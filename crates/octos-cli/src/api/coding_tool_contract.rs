@@ -172,10 +172,9 @@ pub(crate) struct ToolStatusListContext<'a> {
     pub policy: ToolPolicyView<'a>,
     pub available_model_tools: &'a [&'a str],
     pub disabled_model_tools: &'a [&'a str],
-    /// #970 — names of tools currently in the LRU deferred set. Empty by
-    /// default; populated from `ToolRegistry::deferred_tool_names()` so
-    /// the contract resolver can distinguish "registered but inactive"
-    /// from "not registered at all".
+    /// Names of tools registered but not visible yet recoverable. RFC-0
+    /// (#1289) removed LRU tool deferral, so this is now always empty in
+    /// practice; the field is retained for wire-contract compatibility.
     pub deferred_model_tools: &'a [&'a str],
     pub include_coding_tool_contract: bool,
 }
