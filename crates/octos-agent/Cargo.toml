@@ -31,14 +31,17 @@ regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
-# MCP client over the official rmcp SDK: stdio + streamable-HTTP + OAuth 2.1.
+# MCP over the official rmcp SDK. Client: stdio + streamable-HTTP + OAuth 2.1.
+# Server (`octos mcp-serve`): `server` + `transport-io` for the stdio handler.
 rmcp = { version = "1.8", default-features = false, features = [
     "client",
+    "server",
     "auth",
     "macros",
     "base64",
     "transport-async-rw",
     "transport-child-process",
+    "transport-io",
     "transport-streamable-http-client-reqwest",
 ] }
 oauth2 = "5"

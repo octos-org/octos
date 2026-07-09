@@ -40,11 +40,18 @@ use metrics::counter;
 use octos_core::{TASK_RESULT_SCHEMA_VERSION, TaskId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, serve_server};
 
 use crate::harness_events::HarnessEvent;
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
@@ -129,7 +136,9 @@ type EventSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
 pub struct McpServer {
     dispatch: Arc<dyn McpSessionDispatch>,
     supervisor: Arc<TaskSupervisor>,
-    event_sink: RwLock<Option<EventSink>>,
+    // `Arc` so the rmcp `OctosMcpHandler` (which must be `Clone` for the
+    // per-session HTTP service factory) can share the same installed sink.
+    event_sink: Arc<RwLock<Option<EventSink>>>,
 }
 
 impl McpServer {
@@ -137,7 +146,7 @@ impl McpServer {
         Self {
             dispatch,
             supervisor,
-            event_sink: RwLock::new(None),
+            event_sink: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -188,60 +197,13 @@ impl McpServer {
             return render_mcp_error(id, McpServerError::UnknownTool(tool_name.to_string()));
         }
 
-        match dispatch_run_octos_session(&*self.dispatch, &self.supervisor, params).await {
-            Ok(result) => {
-                // Extract the outcome so we can emit the matching harness event.
-                let (outcome_label, contract_label, error_message) =
-                    extract_outcome_from_result(&result);
-                self.emit_mcp_event(
-                    transport,
-                    &outcome_label,
-                    contract_label.as_deref(),
-                    error_message.as_deref(),
-                );
-                counter!(
-                    "octos_mcp_server_call_total",
-                    "tool" => RUN_OCTOS_SESSION_TOOL.to_string(),
-                    "outcome" => outcome_label,
-                )
-                .increment(1);
-                json_rpc_result(id, result)
-            }
-            Err(err) => {
-                self.emit_mcp_event(transport, "error", None, Some(&err.to_string()));
-                counter!(
-                    "octos_mcp_server_call_total",
-                    "tool" => RUN_OCTOS_SESSION_TOOL.to_string(),
-                    "outcome" => "error".to_string(),
-                )
-                .increment(1);
-                render_mcp_error(id, err)
-            }
+        let result = dispatch_run_octos_session(&*self.dispatch, &self.supervisor, params).await;
+        let sink = self.event_sink.read().await.clone();
+        emit_call_outcome(&sink, transport, &result);
+        match result {
+            Ok(value) => json_rpc_result(id, value),
+            Err(err) => render_mcp_error(id, err),
         }
-    }
-
-    fn emit_mcp_event(
-        &self,
-        transport: &str,
-        outcome: &str,
-        contract: Option<&str>,
-        error: Option<&str>,
-    ) {
-        let Some(sink) = self.event_sink.try_read().ok().and_then(|g| g.clone()) else {
-            return;
-        };
-        let caller_id = caller_id_for_transport(transport);
-        let event = HarnessEvent::mcp_server_call(
-            format!("mcp:{transport}"),
-            TaskId::new().to_string(),
-            RUN_OCTOS_SESSION_TOOL,
-            caller_id,
-            transport,
-            outcome,
-            contract.map(|s| s.to_string()),
-            error.map(|s| s.to_string()),
-        );
-        (sink)(event);
     }
 
     /// Bind an HTTP listener on localhost (ephemeral port) for tests.
@@ -292,15 +254,214 @@ impl McpServer {
         })
     }
 
-    /// Production entry point for the stdio transport — loops on stdin, writes
-    /// JSON-RPC responses to stdout. Returns when stdin closes or the process
-    /// is signalled to shut down.
-    pub async fn serve_stdio(self) -> Result<()> {
-        let server = Arc::new(self);
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        serve_stdio_generic(server, stdin, stdout).await
+    /// Serve the single `run_octos_session` tool over the rmcp SDK on an
+    /// arbitrary byte transport (`read`/`write` pair). [`serve_stdio`] is the
+    /// production wrapper over the process's stdin/stdout; tests drive it over
+    /// an in-memory duplex. Returns when the peer closes the stream or the
+    /// service is cancelled.
+    pub async fn serve_io<R, W>(self, read: R, write: W) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let handler = OctosMcpHandler {
+            dispatch: self.dispatch,
+            supervisor: self.supervisor,
+            event_sink: self.event_sink,
+            transport_label: "stdio",
+        };
+        let running = serve_server(handler, (read, write))
+            .await
+            .map_err(|err| eyre::eyre!("mcp-serve stdio handshake failed: {err}"))?;
+        running
+            .waiting()
+            .await
+            .map_err(|err| eyre::eyre!("mcp-serve stdio service failed: {err}"))?;
+        Ok(())
     }
+
+    /// Production entry point for the stdio transport (parent-trust auth — the
+    /// parent process spawned us). Serves the single `run_octos_session` tool
+    /// over the rmcp SDK on the process's stdin/stdout.
+    pub async fn serve_stdio(self) -> Result<()> {
+        let (stdin, stdout) = rmcp::transport::stdio();
+        self.serve_io(stdin, stdout).await
+    }
+}
+
+/// rmcp [`ServerHandler`] exposing octos as a single-tool MCP server.
+///
+/// Every transport (`serve_stdio` today, the streamable-HTTP service next)
+/// routes through this handler, which reuses the same
+/// [`dispatch_run_octos_session`] business logic, harness-event emission, and
+/// `octos_mcp_server_call_total` metric as the legacy JSON-RPC path.
+#[derive(Clone)]
+pub(crate) struct OctosMcpHandler {
+    dispatch: Arc<dyn McpSessionDispatch>,
+    supervisor: Arc<TaskSupervisor>,
+    event_sink: Arc<RwLock<Option<EventSink>>>,
+    transport_label: &'static str,
+}
+
+impl ServerHandler for OctosMcpHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new("octos", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Exposes a single tool, `run_octos_session`, that runs a complete octos \
+                 session (workspace contract + input to artifact) to completion, including \
+                 workspace-contract enforcement. Internal tool calls and progress events \
+                 are not streamed to the caller.",
+            )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: vec![run_octos_session_tool()],
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if request.name.as_ref() != RUN_OCTOS_SESSION_TOOL {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "unknown tool '{}'; this server exposes only '{RUN_OCTOS_SESSION_TOOL}'",
+                    request.name
+                ),
+                None,
+            ));
+        }
+
+        // Adapt the typed rmcp request into the `{name, arguments}` shape the
+        // shared dispatch helper expects, so all transports run identical
+        // supervisor / contract / artifact logic.
+        let arguments = request
+            .arguments
+            .map(Value::Object)
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let params = json!({ "name": RUN_OCTOS_SESSION_TOOL, "arguments": arguments });
+        let result = dispatch_run_octos_session(&*self.dispatch, &self.supervisor, &params).await;
+
+        let sink = self.event_sink.read().await.clone();
+        emit_call_outcome(&sink, self.transport_label, &result);
+
+        match result {
+            Ok(value) => Ok(value_to_call_tool_result(value)),
+            Err(err) => Err(mcp_error_to_error_data(err)),
+        }
+    }
+}
+
+/// The single MCP tool advertised by the server, as a typed rmcp [`Tool`].
+fn run_octos_session_tool() -> Tool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "contract": {
+                "type": "string",
+                "description": "Workspace contract name (e.g. 'slides_delivery', 'site_delivery', 'coding')."
+            },
+            "input": {
+                "type": "object",
+                "description": "Opaque input payload forwarded to the session. Shape is contract-specific."
+            }
+        },
+        "required": ["contract", "input"]
+    });
+    let input_schema = schema.as_object().cloned().unwrap_or_default();
+    Tool::new(
+        RUN_OCTOS_SESSION_TOOL,
+        "Run a complete octos session. The caller supplies a workspace contract name and an \
+         input payload; octos runs its normal loop to completion (including workspace-contract \
+         enforcement) and returns the resulting artifact. Internal tool calls and progress \
+         events are not streamed to the caller.",
+        input_schema,
+    )
+}
+
+/// Convert the shared dispatch result (`{content:[{text}], isError}`) into a
+/// typed rmcp [`CallToolResult`], preserving the tool-level error flag so the
+/// caller's MCP client renders failures with their recovery hints.
+fn value_to_call_tool_result(value: Value) -> CallToolResult {
+    let text = value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let is_error = value
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content = vec![Content::text(text)];
+    if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
+
+/// Map a typed [`McpServerError`] onto an rmcp JSON-RPC [`ErrorData`]. Used
+/// only for protocol-level failures (bad params, unroutable tool, server
+/// fault); session-level failures travel as `CallToolResult::error` so the
+/// caller sees the message.
+fn mcp_error_to_error_data(err: McpServerError) -> ErrorData {
+    match err {
+        McpServerError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
+        McpServerError::UnknownTool(name) => {
+            ErrorData::invalid_params(format!("unknown tool: {name}"), None)
+        }
+        McpServerError::ProtocolError(msg) => ErrorData::invalid_request(msg, None),
+        McpServerError::SessionFailed(msg) => ErrorData::internal_error(msg, None),
+        McpServerError::Unauthorized => ErrorData::invalid_request("authentication required", None),
+    }
+}
+
+/// Emit the `McpServerCall` harness event and increment
+/// `octos_mcp_server_call_total{tool,outcome}` for a completed
+/// `run_octos_session` dispatch. Shared by the rmcp `call_tool` handler and
+/// the legacy JSON-RPC `handle_tools_call` path so both transports observe the
+/// same audit trail.
+fn emit_call_outcome(
+    sink: &Option<EventSink>,
+    transport: &str,
+    result: &Result<Value, McpServerError>,
+) {
+    let (outcome_label, contract_label, error_message) = match result {
+        Ok(value) => extract_outcome_from_result(value),
+        Err(err) => ("error".to_string(), None, Some(err.to_string())),
+    };
+    if let Some(sink) = sink {
+        let event = HarnessEvent::mcp_server_call(
+            format!("mcp:{transport}"),
+            TaskId::new().to_string(),
+            RUN_OCTOS_SESSION_TOOL,
+            caller_id_for_transport(transport),
+            transport,
+            &outcome_label,
+            contract_label,
+            error_message,
+        );
+        (sink)(event);
+    }
+    counter!(
+        "octos_mcp_server_call_total",
+        "tool" => RUN_OCTOS_SESSION_TOOL.to_string(),
+        "outcome" => outcome_label,
+    )
+    .increment(1);
 }
 
 /// Handle returned by [`McpServer::spawn_http_on_local_port`] so callers can
@@ -630,60 +791,6 @@ impl SessionLifecycleObserver for SupervisorObserver<'_> {
     }
 }
 
-// ---- stdio transport ----
-
-async fn serve_stdio_generic<R, W>(server: Arc<McpServer>, stdin: R, mut stdout: W) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            info!("mcp-serve stdio: peer closed");
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.len() > MAX_REQUEST_BYTES {
-            let err = render_mcp_error(
-                Value::Null,
-                McpServerError::ProtocolError("request exceeds 1MB limit".into()),
-            );
-            let mut buf = serde_json::to_string(&err)?;
-            buf.push('\n');
-            stdout.write_all(buf.as_bytes()).await?;
-            stdout.flush().await?;
-            continue;
-        }
-        let request: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(err) => {
-                let response = render_mcp_error(
-                    Value::Null,
-                    McpServerError::ProtocolError(format!("invalid JSON-RPC: {err}")),
-                );
-                let mut buf = serde_json::to_string(&response)?;
-                buf.push('\n');
-                stdout.write_all(buf.as_bytes()).await?;
-                stdout.flush().await?;
-                continue;
-            }
-        };
-
-        let response = server.handle_request(&request, "stdio").await;
-        let mut buf = serde_json::to_string(&response)?;
-        buf.push('\n');
-        stdout.write_all(buf.as_bytes()).await?;
-        stdout.flush().await?;
-    }
-}
-
 // ---- http transport (minimal HTTP/1.1, one request per connection) ----
 
 async fn handle_http_connection(
@@ -874,6 +981,71 @@ impl SessionLifecycleObserver for RecordingObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dispatch that always returns a Ready outcome so the rmcp round-trip
+    /// test can assert protocol behavior without running the agent loop.
+    struct ReadyDispatch;
+
+    #[async_trait]
+    impl McpSessionDispatch for ReadyDispatch {
+        async fn run_session(
+            &self,
+            _contract: &str,
+            _input: &Value,
+            observer: &dyn SessionLifecycleObserver,
+        ) -> Result<McpSessionOutcome, McpServerError> {
+            observer.mark_state(TaskLifecycleState::Running);
+            observer.mark_state(TaskLifecycleState::Verifying);
+            observer.mark_state(TaskLifecycleState::Ready);
+            Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Ready,
+                artifact_path: Some("out/deck.pptx".to_string()),
+                artifact_content: Some("BYTES".to_string()),
+                validator_results: vec![],
+                cost: json!({"input_tokens": 1, "output_tokens": 1}),
+                error: None,
+            })
+        }
+    }
+
+    /// End-to-end proof that the rmcp [`OctosMcpHandler`] speaks the real MCP
+    /// protocol: an rmcp client connected over an in-memory duplex completes
+    /// the initialize handshake, sees exactly `run_octos_session` via
+    /// `tools/list`, and receives a non-error `tools/call` result.
+    #[tokio::test]
+    async fn serves_run_octos_session_over_real_rmcp_transport() {
+        use rmcp::model::{CallToolRequestParams, ClientInfo};
+        use rmcp::service::serve_client;
+
+        let server = McpServer::new(Arc::new(ReadyDispatch), Arc::new(TaskSupervisor::new()));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, server_write) = tokio::io::split(server_io);
+
+        let server_task =
+            tokio::spawn(async move { server.serve_io(server_read, server_write).await });
+
+        let client = serve_client(ClientInfo::default(), (client_read, client_write))
+            .await
+            .expect("client handshake should complete");
+
+        // tools/list advertises exactly the one session-level tool.
+        let tools = client.list_all_tools().await.expect("tools/list");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_ref(), RUN_OCTOS_SESSION_TOOL);
+
+        // tools/call routes through the dispatch and returns a non-error bundle.
+        let mut param = CallToolRequestParams::new(RUN_OCTOS_SESSION_TOOL);
+        param.arguments = json!({ "contract": "coding", "input": {} })
+            .as_object()
+            .cloned();
+        let result = client.call_tool(param).await.expect("tools/call");
+        assert_ne!(result.is_error, Some(true));
+        assert!(!result.content.is_empty());
+
+        client.cancel().await.ok();
+        let _ = server_task.await;
+    }
 
     #[test]
     fn parse_bearer_token_accepts_mixed_case_scheme() {
