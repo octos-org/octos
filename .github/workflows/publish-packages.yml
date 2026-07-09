@@ -3,11 +3,17 @@ name: Publish Packages
 # archives produced by release.yml (which this workflow does NOT modify) and
 # publishes a Homebrew formula + an npm wrapper.
 #
+# The Homebrew formula now lives IN THIS REPO at Formula/octos.rb (this repo is
+# its own Homebrew tap — `brew tap octos-org/octos https://github.com/octos-org/octos`).
+# On a stable release the homebrew job re-renders Formula/octos.rb from the
+# built bundles and opens a PR to update it (main is branch-protected, so it
+# cannot push directly). npm publishing is unchanged.
+#
 # Gated behind the repo variable PUBLISH_PACKAGES so it no-ops until the
 # maintainer opts in (avoids failing on missing tokens). To go live, set:
 #   - repo variable PUBLISH_PACKAGES = true
-#   - secret HOMEBREW_TAP_TOKEN  (PAT with push to octos-org/homebrew-tap)
 #   - secret NPM_TOKEN           (npm automation token for @octos-org)
+# (No tap PAT needed anymore — the formula update uses the built-in GITHUB_TOKEN.)
 
 on:
   release:
@@ -26,11 +32,18 @@ jobs:
   homebrew:
     if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push the formula-update branch
+      pull-requests: write   # open the PR that bumps Formula/octos.rb
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Base the formula-bump branch on main (a release event otherwise checks
+      # out the tag commit, which would make the PR diff/auto-merge messy).
       - uses: actions/checkout@v6
+        with:
+          ref: main
 
       - name: Download unix bundles for the tag
         run: |
@@ -66,43 +79,51 @@ jobs:
           sha_linux_x64=$(sha256sum bundles/octos-bundle-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
           sha_linux_arm=$(sha256sum bundles/octos-bundle-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
 
-          cp packaging/homebrew/octos.rb octos.rb
-          sed -i "s|__VERSION__|${version}|g" octos.rb
-          sed -i "s|__TAG__|${TAG}|g" octos.rb
-          sed -i "s|__SHA_DARWIN_ARM__|${sha_darwin_arm}|g" octos.rb
-          sed -i "s|__SHA_LINUX_X64__|${sha_linux_x64}|g" octos.rb
-          sed -i "s|__SHA_LINUX_ARM__|${sha_linux_arm}|g" octos.rb
+          mkdir -p Formula
+          cp packaging/homebrew/octos.rb Formula/octos.rb
+          sed -i "s|__VERSION__|${version}|g" Formula/octos.rb
+          sed -i "s|__TAG__|${TAG}|g" Formula/octos.rb
+          sed -i "s|__SHA_DARWIN_ARM__|${sha_darwin_arm}|g" Formula/octos.rb
+          sed -i "s|__SHA_LINUX_X64__|${sha_linux_x64}|g" Formula/octos.rb
+          sed -i "s|__SHA_LINUX_ARM__|${sha_linux_arm}|g" Formula/octos.rb
 
           echo "----- rendered Formula/octos.rb -----"
-          cat octos.rb
+          cat Formula/octos.rb
 
-      - name: Skip tap push for prereleases
+      - name: Skip formula update for prereleases
         if: ${{ contains(env.TAG, '-') }}
-        run: echo "::notice::${TAG} is a prerelease — formula rendered + validated above, but NOT pushed to the public tap (octos.rb tracks stable only)."
+        run: echo "::notice::${TAG} is a prerelease — formula rendered + validated above, but NOT committed (Formula/octos.rb tracks stable only)."
 
-      - name: Push formula to homebrew-tap
+      - name: Open PR to update in-repo formula
         if: ${{ !contains(env.TAG, '-') }}
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/octos-org/homebrew-tap.git" tap
-          mkdir -p tap/Formula
-          cp octos.rb tap/Formula/octos.rb
-          cd tap
-          git config user.name "octos-release-bot"
-          git config user.email "151983+ymote@users.noreply.github.com"
-          # `git add` FIRST, then check the STAGED diff: a brand-new untracked
-          # Formula/octos.rb is invisible to a plain `git diff --quiet` (that only
-          # inspects tracked files), so the first publish would silently skip the
-          # push. `git diff --cached --quiet` correctly sees the new staged file.
-          git add Formula/octos.rb
-          if git diff --cached --quiet; then
-            echo "Formula/octos.rb unchanged; nothing to push."
+          # Formula/octos.rb lives in this repo (this repo is its own tap). main
+          # is branch-protected, so we open a PR rather than pushing to it.
+          if git diff --quiet -- Formula/octos.rb; then
+            echo "Formula/octos.rb unchanged; nothing to open a PR for."
             exit 0
           fi
-          git commit -m "octos ${TAG}"
-          git push origin HEAD
+          branch="homebrew/octos-${TAG}"
+          git config user.name "octos-release-bot"
+          git config user.email "151983+ymote@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Formula/octos.rb
+          git commit -m "octos ${TAG}: update Homebrew formula"
+          git push -f origin "$branch"
+          # Create the PR if one isn't already open for this branch, then enable
+          # auto-merge so a green formula-only change lands without babysitting.
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create --base main --head "$branch" \
+              --title "octos ${TAG}: update Homebrew formula" \
+              --body "Automated Homebrew formula bump for ${TAG}. Renders \`Formula/octos.rb\` from the published bundle checksums." \
+              --label "release" 2>/dev/null \
+            || gh pr create --base main --head "$branch" \
+              --title "octos ${TAG}: update Homebrew formula" \
+              --body "Automated Homebrew formula bump for ${TAG}."
+          fi
+          gh pr merge "$branch" --squash --auto 2>/dev/null \
+            || echo "::notice::auto-merge unavailable; merge the formula PR manually."
 
   npm:
     if: ${{ vars.PUBLISH_PACKAGES == 'true' }}

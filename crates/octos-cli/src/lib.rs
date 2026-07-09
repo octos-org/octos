@@ -26,6 +26,8 @@ pub mod cron_tool;
 pub mod gateway_dispatcher;
 #[cfg(feature = "api")]
 pub mod login_allowlist;
+pub mod memory_consolidate;
+pub mod memory_refresh;
 #[cfg(feature = "api")]
 pub mod monitor;
 #[cfg(feature = "api")]
@@ -33,6 +35,7 @@ pub mod otp;
 pub mod persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;
+pub mod profile_qr;
 pub mod profiles;
 pub mod project_templates;
 mod qos_catalog;

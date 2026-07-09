@@ -13,6 +13,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
