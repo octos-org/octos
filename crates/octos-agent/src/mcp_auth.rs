@@ -108,7 +108,9 @@ pub async fn connect_oauth(
     client_info: ClientInfo,
 ) -> Result<McpService> {
     let stored = load_tokens(url)?.ok_or_else(|| {
-        eyre::eyre!("no stored OAuth tokens for MCP server '{url}'; run `octos mcp login {url}` first")
+        eyre::eyre!(
+            "no stored OAuth tokens for MCP server '{url}'; run `octos mcp login {url}` first"
+        )
     })?;
 
     let token: OAuthTokenResponse = serde_json::from_value(stored.token_response.clone())
@@ -215,7 +217,9 @@ pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
     )
     .await
     .map_err(|_| eyre::eyre!("oauth authorization/registration for '{url}' timed out"))?
-    .map_err(|e| eyre::eyre!("start authorization (metadata discovery / client registration): {e}"))?;
+    .map_err(|e| {
+        eyre::eyre!("start authorization (metadata discovery / client registration): {e}")
+    })?;
     let auth_url = oauth_state
         .get_authorization_url()
         .await
@@ -245,7 +249,8 @@ pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
         .get_credentials()
         .await
         .map_err(|e| eyre::eyre!("read credentials after callback: {e}"))?;
-    let creds = creds.ok_or_else(|| eyre::eyre!("authorization succeeded but no credentials returned"))?;
+    let creds =
+        creds.ok_or_else(|| eyre::eyre!("authorization succeeded but no credentials returned"))?;
 
     let stored = StoredTokens {
         url: url.to_string(),
@@ -273,8 +278,14 @@ fn expires_at_ms(creds: &OAuthTokenResponse) -> Option<u64> {
 /// cleartext. (Loopback, where `http` is common for dev, is already refused by
 /// `reject_private_url_host`, so this doesn't block a legitimate local case.)
 fn require_https(url: &str) -> Result<()> {
-    if !url.trim_start().to_ascii_lowercase().starts_with("https://") {
-        eyre::bail!("OAuth MCP server '{url}' must use https:// (refusing to send bearer tokens over cleartext)");
+    if !url
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://")
+    {
+        eyre::bail!(
+            "OAuth MCP server '{url}' must use https:// (refusing to send bearer tokens over cleartext)"
+        );
     }
     Ok(())
 }
@@ -282,7 +293,9 @@ fn require_https(url: &str) -> Result<()> {
 /// Whether a stored token is at/near its persisted wall-clock expiry (30s skew).
 /// `None` (server sent no `expires_in`) → treat as non-expiring; rmcp handles it.
 fn token_expired(expires_at_ms: Option<u64>) -> bool {
-    let Some(exp) = expires_at_ms else { return false };
+    let Some(exp) = expires_at_ms else {
+        return false;
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -325,8 +338,7 @@ fn wait_for_callback(server: &tiny_http::Server, deadline: Instant) -> Result<St
         };
         // `req.url()` is just the path+query; wrap it so `url` can parse it.
         let full = format!("http://127.0.0.1{}", req.url());
-        let parsed =
-            url::Url::parse(&full).map_err(|e| eyre::eyre!("parse callback url: {e}"))?;
+        let parsed = url::Url::parse(&full).map_err(|e| eyre::eyre!("parse callback url: {e}"))?;
 
         let (mut has_code, mut has_state, mut err) = (false, false, None);
         for (k, v) in parsed.query_pairs() {

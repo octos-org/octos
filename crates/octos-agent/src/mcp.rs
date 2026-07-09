@@ -143,7 +143,10 @@ impl reqwest_rmcp::dns::Resolve for SsrfDnsResolver {
             if addrs.is_empty() {
                 return Err(format!("no addresses resolved for '{host}'").into());
             }
-            if let Some(bad) = addrs.iter().find(|a| crate::tools::ssrf::is_private_ip(&a.ip())) {
+            if let Some(bad) = addrs
+                .iter()
+                .find(|a| crate::tools::ssrf::is_private_ip(&a.ip()))
+            {
                 return Err(format!(
                     "SSRF blocked: '{host}' resolves to private/blocked address {}",
                     bad.ip()
@@ -184,7 +187,9 @@ pub(crate) fn build_ssrf_http_client(
 ) -> Result<reqwest_rmcp::Client> {
     let mut builder = reqwest_rmcp::Client::builder()
         .redirect(reqwest_rmcp::redirect::Policy::none())
-        .dns_resolver(std::sync::Arc::new(SsrfDnsResolver) as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>);
+        .dns_resolver(
+            std::sync::Arc::new(SsrfDnsResolver) as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>
+        );
     if !headers.is_empty() {
         let mut hmap = reqwest_rmcp::header::HeaderMap::new();
         for (k, v) in headers {
@@ -224,7 +229,9 @@ fn validate_oauth_uri(uri: &oauth2::http::Uri) -> std::result::Result<(), String
         None => return Err(format!("OAuth endpoint '{s}' has no host")),
     };
     if private {
-        return Err(format!("SSRF blocked: OAuth endpoint '{s}' is private/loopback"));
+        return Err(format!(
+            "SSRF blocked: OAuth endpoint '{s}' is private/loopback"
+        ));
     }
     Ok(())
 }
@@ -370,7 +377,8 @@ impl McpClient {
                     // Bound tool discovery: a server that completes `initialize`
                     // but never answers `tools/list` must not wedge startup (and
                     // block later servers) — fail-soft on timeout.
-                    let discovered = match timeout(HANDSHAKE_TIMEOUT, service.list_all_tools()).await
+                    let discovered = match timeout(HANDSHAKE_TIMEOUT, service.list_all_tools())
+                        .await
                     {
                         Ok(Ok(t)) => t,
                         Ok(Err(e)) => {
@@ -378,7 +386,10 @@ impl McpClient {
                             continue;
                         }
                         Err(_) => {
-                            warn!(server = server_name, "MCP tools/list timed out, skipping server");
+                            warn!(
+                                server = server_name,
+                                "MCP tools/list timed out, skipping server"
+                            );
                             continue;
                         }
                     };
@@ -467,10 +478,13 @@ impl McpClient {
             .spawn()
             .wrap_err_with(|| format!("failed to spawn MCP server '{command}'"))?;
 
-        let service = timeout(HANDSHAKE_TIMEOUT, serve_client(octos_client_info(), transport))
-            .await
-            .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
-            .map_err(|e| eyre::eyre!("MCP initialize failed: {e}"))?;
+        let service = timeout(
+            HANDSHAKE_TIMEOUT,
+            serve_client(octos_client_info(), transport),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
+        .map_err(|e| eyre::eyre!("MCP initialize failed: {e}"))?;
         Ok(Arc::new(service))
     }
 
@@ -496,10 +510,13 @@ impl McpClient {
             StreamableHttpClientTransportConfig::with_uri(url.to_string()),
         );
 
-        let service = timeout(HANDSHAKE_TIMEOUT, serve_client(octos_client_info(), transport))
-            .await
-            .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
-            .map_err(|e| eyre::eyre!("MCP initialize failed: {e}"))?;
+        let service = timeout(
+            HANDSHAKE_TIMEOUT,
+            serve_client(octos_client_info(), transport),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
+        .map_err(|e| eyre::eyre!("MCP initialize failed: {e}"))?;
         Ok(Arc::new(service))
     }
 
@@ -509,7 +526,10 @@ impl McpClient {
     pub fn register_tools(self, registry: &mut ToolRegistry) {
         for spec in self.tools {
             if Self::PROTECTED_NAMES.contains(&spec.name.as_str()) {
-                warn!(tool = spec.name, "MCP tool name collides with built-in tool, skipping");
+                warn!(
+                    tool = spec.name,
+                    "MCP tool name collides with built-in tool, skipping"
+                );
                 continue;
             }
             registry.register(McpTool {
@@ -556,7 +576,12 @@ impl Tool for McpTool {
 
         let result = timeout(TOOL_CALL_TIMEOUT, self.service.call_tool(param))
             .await
-            .map_err(|_| eyre::eyre!("MCP tool '{}' call timed out after {TOOL_CALL_TIMEOUT:?}", self.name))?
+            .map_err(|_| {
+                eyre::eyre!(
+                    "MCP tool '{}' call timed out after {TOOL_CALL_TIMEOUT:?}",
+                    self.name
+                )
+            })?
             .map_err(|e| eyre::eyre!("MCP tool '{}' call failed: {e}", self.name))?;
 
         // Flatten text content parts; non-text parts (images/resources) are
@@ -633,7 +658,14 @@ mod tests {
 
     #[test]
     fn protected_names_cover_core_builtins() {
-        for name in ["shell", "read_file", "write_file", "edit_file", "send_file", "spawn"] {
+        for name in [
+            "shell",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "send_file",
+            "spawn",
+        ] {
             assert!(
                 McpClient::PROTECTED_NAMES.contains(&name),
                 "{name} must be protected"

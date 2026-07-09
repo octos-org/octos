@@ -82,8 +82,12 @@ symphonia = { workspace = true, optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
+# Kernel keyutils (pure-Rust, no system libdbus) so it builds on stock CI/Linux.
+# Session-scoped: tokens persist across octos invocations within a login session
+# but not across reboot/logout (a Secret-Service backend would need system
+# libdbus). Documented in the migration ADR.
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["sync-secret-service"] }
+keyring = { workspace = true, features = ["linux-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }

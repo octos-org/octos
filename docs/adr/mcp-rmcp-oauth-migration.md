@@ -125,6 +125,12 @@ the OAuth path is SSRF-guarded end to end.
   token on every use will leave the keyring with a stale refresh token, so a
   later octos run must `octos mcp login` again. Most providers don't rotate on
   every refresh; a full fix is codex's `OAuthPersistor` (persist after each op).
+- **Linux keyring is session-scoped.** The Linux backend is `linux-native`
+  (kernel keyutils) — chosen because a Secret-Service backend pulls
+  `libdbus-sys`, which needs system `libdbus-1-dev` (absent on stock CI). Tokens
+  persist across octos invocations within a login session but not across
+  reboot/logout; a Linux user re-runs `octos mcp login` after a reboot. macOS
+  (`apple-native`) and Windows (`windows-native`) are fully persistent.
 - **Unbounded stdio frame read.** rmcp's child-process transport uses
   `read_until` with no `MAX_LINE_BYTES` cap — accepted for operator-configured
   local stdio servers; a bounded codec would need a custom transport.
