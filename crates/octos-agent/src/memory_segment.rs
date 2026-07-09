@@ -18,14 +18,24 @@ use crate::agent::PromptSegmentProvider;
 /// Name of the named prompt segment carrying the memory block.
 pub const MEMORY_SEGMENT_NAME: &str = "memory";
 
+/// Read-path etiquette appended whenever memory content is injected —
+/// independent of the capture policy, because stale-memory discipline
+/// matters even on read-only surfaces (#1589, codex read-path pattern).
+pub const MEMORY_USE_GUIDANCE: &str = "## Memory Use\n\
+Treat Long-term Memory as leads, not verified current state:\n\
+- Facts that drift (versions, paths, running processes, dates, ownership): \
+verify live before acting on them when verification is cheap; otherwise say \
+the claim is memory-derived and may be stale, and offer to re-check.\n\
+- Prefer fresh evidence from THIS conversation over memory when they \
+conflict.\n\
+- Never present an unverified memory-derived fact as confirmed-current.";
+
 /// Capture-policy block appended to the memory segment when the
 /// memory-refresh feature is enabled. Shared by the chat path (via
 /// [`MemorySegmentProvider`]) and the gateway prompt builder so both
 /// surfaces teach the same rules.
 pub const MEMORY_CAPTURE_POLICY: &str = "## Memory Capture\n\
-Your Long-term Memory above may be stale — prefer fresh evidence from this \
-conversation when they conflict, and say so when a consequential answer relies \
-on possibly-stale memory. Capture durable observations with the `memory_note` \
+Capture durable observations with the `memory_note` \
 tool (notes are consolidated later; MOST TURNS NEED NO NOTE):\n\
 - The user explicitly asks to remember/forget/update something -> \
 memory_note(kind=\"user_request\") quoting their request.\n\
@@ -120,11 +130,15 @@ impl MemorySegmentProvider {
 /// policy. Shared with the gateway prompt builder so both paths emit the
 /// same bytes.
 pub fn compose_memory_segment(memory_ctx: &str, include_capture_policy: bool) -> String {
+    // Use-guidance rides with CONTENT (stale-memory etiquette is moot when
+    // nothing was injected); the capture policy rides with the FEATURE.
     match (memory_ctx.is_empty(), include_capture_policy) {
         (true, false) => String::new(),
         (true, true) => MEMORY_CAPTURE_POLICY.to_string(),
-        (false, false) => memory_ctx.to_string(),
-        (false, true) => format!("{memory_ctx}\n\n{MEMORY_CAPTURE_POLICY}"),
+        (false, false) => format!("{memory_ctx}\n\n{MEMORY_USE_GUIDANCE}"),
+        (false, true) => {
+            format!("{memory_ctx}\n\n{MEMORY_USE_GUIDANCE}\n\n{MEMORY_CAPTURE_POLICY}")
+        }
     }
 }
 
@@ -248,10 +262,35 @@ user lives in Vancouver
 
     #[test]
     fn should_compose_segment_in_all_four_shapes() {
+        // Empty memory: no use-guidance (nothing to be stale about).
         assert_eq!(compose_memory_segment("", false), "");
         assert_eq!(compose_memory_segment("", true), MEMORY_CAPTURE_POLICY);
-        assert_eq!(compose_memory_segment("mem", false), "mem");
+        // Non-empty memory carries the read etiquette even WITHOUT the
+        // capture feature (#1589) …
+        let read_only = compose_memory_segment("mem", false);
+        assert!(read_only.starts_with("mem\n\n## Memory Use"));
+        assert!(!read_only.contains("## Memory Capture"));
+        // … and both blocks, guidance first, when capture is enabled.
         let both = compose_memory_segment("mem", true);
-        assert!(both.starts_with("mem\n\n## Memory Capture"));
+        assert!(both.starts_with("mem\n\n## Memory Use"));
+        assert!(both.contains("\n\n## Memory Capture"));
+        let use_idx = both.find("## Memory Use").unwrap();
+        let cap_idx = both.find("## Memory Capture").unwrap();
+        assert!(use_idx < cap_idx, "guidance precedes capture policy");
+    }
+
+    #[test]
+    fn use_guidance_teaches_verify_and_staleness_flagging() {
+        for needle in [
+            "verify live",
+            "memory-derived",
+            "fresh evidence from THIS conversation",
+            "confirmed-current",
+        ] {
+            assert!(
+                MEMORY_USE_GUIDANCE.contains(needle),
+                "guidance lost its '{needle}' clause"
+            );
+        }
     }
 }
