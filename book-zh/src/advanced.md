@@ -509,7 +509,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 **循环**是周期性的 agent 运行，有三种模式：**固定间隔**（每 N 秒触发）、**自定步调**（模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏；未指定时默认 15 分钟）或**维护**（每次触发时重新解析并运行一段维护提示——若找到 `loop.md` 覆盖文件则用之，否则用内置默认）。循环持续触发，直到被暂停、删除、达到 10,000 次触发上限——**或到期**：每个循环都会被打上 `expires_at_ms = now + 7 天`，一旦过期，即使未达触发上限，到期扫描也会跳过它。
 
-- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`、`loop/fire_now`（**请求**立即触发——它会经过循环的触发策略，若循环已暂停/耗尽可能被拒绝或去重，因此应检查返回的 `fire.queued`/错误结果，而非假定一定触发了一次）——通知 `loop/fired`、`loop/completed`、`loop/updated`。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
+- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`、`loop/fire_now`（**请求**立即触发——它会经过循环的触发策略，若循环已暂停/耗尽可能被拒绝或去重，因此应检查返回的 `fire.queued`/错误结果，而非假定一定触发了一次）——通知 `loop/fired`、`loop/updated`（协议中存在 `loop/completed` 变体，但正常迭代时当前并不发送——不要等待它）。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
 - 适用于轮询、监控和自定步调的后台 agent。
 
 ### 回退（Rewind）
