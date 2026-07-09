@@ -521,6 +521,18 @@ pub struct EmbeddingConfig {
     /// Custom base URL for the embedding API.
     #[serde(default)]
     pub base_url: Option<String>,
+
+    /// Embedding model id (default: text-embedding-3-small). Set for
+    /// OpenAI-compatible providers with their own catalogs (e.g.
+    /// DashScope `text-embedding-v4`).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// OpenAI-standard `dimensions` request field. The episodic HNSW
+    /// index is fixed at 1536 dims — set this when the model's native
+    /// output differs or its vectors are dropped to BM25-only.
+    #[serde(default)]
+    pub dimensions: Option<u32>,
 }
 
 fn default_embedding_provider() -> String {
@@ -1687,6 +1699,55 @@ impl Config {
     }
 
     /// Get the API key: auth store first, then environment variable.
+    /// [`Self::get_api_key`] with an explicit env-var override (e.g. the
+    /// embedding block's `api_key_env`): resolves through the SAME chain —
+    /// secret registration, auth store, `env_vars` (keychain-resolved),
+    /// process env — instead of a bare `std::env::var` read.
+    pub fn get_api_key_with_env(&self, provider: &str, env_var: Option<&str>) -> Result<String> {
+        match env_var {
+            // A CUSTOM var means "use this variable": the provider-scoped
+            // auth store must not win, or a stored `octos auth login -p
+            // openai` token would be sent to the custom OpenAI-compatible
+            // endpoint the override targets. But when the override IS the
+            // provider's default var name (a redundant-but-legal config),
+            // the full provider chain — auth store included — still
+            // applies, preserving pre-existing login-based setups.
+            Some(var) if Some(var) != Self::provider_default_env_var(provider).as_deref() => {
+                self.resolve_env_var_only(var)
+            }
+            // Default-name override: the FULL chain (auth store included)
+            // but with THE GIVEN var — get_api_key would re-apply the
+            // top-level Config.api_key_env, which in mixed-provider
+            // configs points at the PRIMARY provider's key (codex R4).
+            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            None => self.get_api_key(provider),
+        }
+    }
+
+    /// The env-var name the provider chain would use by default.
+    fn provider_default_env_var(provider: &str) -> Option<String> {
+        Some(
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase())),
+        )
+    }
+
+    /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
+    /// auth-store lookup: secret registration → `env_vars` map (keychain-
+    /// resolved) → process env.
+    fn resolve_env_var_only(&self, env_var: &str) -> Result<String> {
+        octos_agent::register_secret_env_names([env_var]);
+        if let Some(value) = self.env_vars.get(env_var).and_then(|value| {
+            crate::auth::keychain::resolve_value(env_var, value).filter(|value| !value.is_empty())
+        }) {
+            return Ok(value);
+        }
+        std::env::var(env_var)
+            .wrap_err_with(|| format!("{env_var} not set (explicit embedding api_key_env)"))
+    }
+
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Resolve the env var name we expect to hold this provider's key, and
         // mark it as a secret FIRST — before any early return — so the
@@ -1704,6 +1765,12 @@ impl Config {
                 .map(String::from)
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
+        self.resolve_api_key(provider, env_var)
+    }
+
+    /// Shared resolution body: auth store → env_vars (keychain) → process
+    /// env, with the var name secret-registered first.
+    fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
         octos_agent::register_secret_env_names([env_var.as_str()]);
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
@@ -2880,6 +2947,124 @@ mod tests {
             MemoryConfig::effective_max_inject_tokens(Some(&on)),
             octos_memory::DEFAULT_MAX_INJECT_TOKENS
         );
+    }
+
+    #[test]
+    fn explicit_env_var_skips_provider_auth_store() {
+        // Even with provider-default resolution available, the explicit
+        // override must come from ITS variable only — never the
+        // provider-scoped auth store (codex R2: an OpenAI OAuth token
+        // must not be sent to a custom-endpoint embedder).
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("DASH_EMBED_KEY".to_string(), "dash-key".to_string());
+        // Provider-default path would resolve something else entirely;
+        // the explicit var wins regardless.
+        let key = config
+            .get_api_key_with_env("openai", Some("DASH_EMBED_KEY"))
+            .expect("explicit var resolves");
+        assert_eq!(key, "dash-key");
+        // And a MISSING explicit var is an error — no silent fallback to
+        // the provider chain.
+        assert!(
+            config
+                .get_api_key_with_env("openai", Some("NOPE_MISSING_VAR"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn default_name_override_ignores_top_level_api_key_env() {
+        // Mixed-provider config: primary provider pins the top-level
+        // api_key_env to ITS key; the embedding override naming the
+        // embedding provider's default var must still read THAT var.
+        // Auth-home isolated (codex R5): the default-name path consults
+        // the GLOBAL auth store first, so an ambient `octos auth login
+        // -p openai` on a dev/CI machine would shadow the env_vars
+        // assertion nondeterministically.
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_octos_home = std::env::var_os("OCTOS_HOME");
+        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        let mut config = Config::default();
+        config.api_key_env = Some("ANTHROPIC_API_KEY".to_string());
+        config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
+        let key = config.get_api_key_with_env("openai", Some("OPENAI_API_KEY"));
+
+        // SAFETY: still inside HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_octos_home {
+                Some(v) => std::env::set_var("OCTOS_HOME", v),
+                None => std::env::remove_var("OCTOS_HOME"),
+            }
+            match original_octos_config {
+                Some(v) => std::env::set_var("OCTOS_CONFIG_DIR", v),
+                None => std::env::remove_var("OCTOS_CONFIG_DIR"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(
+            key.expect("resolves"),
+            "openai-key",
+            "must not read the primary provider's var"
+        );
+    }
+
+    #[test]
+    fn provider_default_env_var_name_keeps_full_chain() {
+        // api_key_env set to the provider's OWN default name is redundant
+        // but legal — it must keep the full provider chain (auth store
+        // included), not the custom-var-only path. Here the chain falls
+        // through to env_vars, same as get_api_key would.
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "from-chain".to_string());
+        let via_override = config
+            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
+            .expect("resolves");
+        let via_default = config.get_api_key("openai").expect("resolves");
+        assert_eq!(via_override, via_default);
+    }
+
+    #[test]
+    fn get_api_key_with_env_resolves_through_config_env_vars() {
+        // The override var must resolve through the same chain as normal
+        // keys — here via the config's env_vars map, NOT the process env.
+        let mut config = Config::default();
+        config.env_vars.insert(
+            "CUSTOM_EMBED_KEY".to_string(),
+            "from-config-map".to_string(),
+        );
+        let key = config
+            .get_api_key_with_env("openai", Some("CUSTOM_EMBED_KEY"))
+            .expect("resolves via env_vars map");
+        assert_eq!(key, "from-config-map");
     }
 
     #[test]

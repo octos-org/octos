@@ -19,8 +19,10 @@ const CWD_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("cwd_i
 /// Table for episode embeddings: key = episode_id, value = bincode-serialized Vec<f32>
 const EMBEDDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
 
-/// Default embedding dimension (OpenAI text-embedding-3-small).
-const DEFAULT_DIMENSION: usize = 1536;
+/// Default embedding dimension (OpenAI text-embedding-3-small). Public:
+/// embedder configuration pins non-1536 models to this value so their
+/// vectors are not dropped by the fixed-dimension episodic index.
+pub const DEFAULT_DIMENSION: usize = 1536;
 
 /// Parse a cwd-index JSON array of episode IDs. On corrupt JSON, salvage any
 /// quoted strings that look like episode IDs instead of silently replacing

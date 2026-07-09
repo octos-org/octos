@@ -1048,10 +1048,70 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
-    let key = config.get_api_key(&cfg.provider).ok()?;
+    // `api_key_env` was declared on EmbeddingConfig but never honored —
+    // it wins over the provider-default var name, resolving through the
+    // SAME credential chain as every other key (auth store, env_vars +
+    // keychain, process env), so `octos auth login` / config-stored keys
+    // keep working (codex P2).
+    let key = config
+        .get_api_key_with_env(&cfg.provider, cfg.api_key_env.as_deref())
+        .ok()?;
     let mut e = OpenAIEmbedder::new(key);
     if let Some(ref url) = cfg.base_url {
         e = e.with_base_url(url);
+    } else if !cfg.provider.eq_ignore_ascii_case("openai") {
+        // A non-openai provider without an explicit base_url falls back to
+        // the registry's default endpoint — otherwise the request goes to
+        // api.openai.com with the other provider's key/model (codex R8).
+        if let Some(url) =
+            octos_llm::registry::lookup(&cfg.provider).and_then(|e| e.default_base_url)
+        {
+            e = e.with_base_url(url);
+        }
+    }
+    if let Some(ref model) = cfg.model {
+        e = e.with_model(model);
+    }
+    if let Some(dimensions) = cfg.dimensions {
+        if dimensions as usize != octos_memory::EPISODIC_INDEX_DIMENSION {
+            tracing::warn!(
+                dimensions,
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "embedding.dimensions differs from the episodic index dimension — \
+                 vectors will be dropped to BM25-only"
+            );
+        }
+        e = e.with_dimensions(dimensions);
+    } else if let Some(model) = cfg.model.as_deref() {
+        // Auto-pin to the index dimension ONLY for families known to
+        // accept the OpenAI-standard `dimensions` field (OpenAI 3-series;
+        // DashScope text-embedding-v3/v4, natively 1024-d). Models that
+        // reject the field (ada-002) keep the legacy request shape; for
+        // families we can't classify, warn loudly instead of degrading
+        // silently — the native size is unknown and non-1536 vectors are
+        // dropped to BM25-only.
+        // Exactly the families verified to accept `dimensions: 1536`:
+        // OpenAI 3-series (native 1536/3072, truncation supported) and
+        // DashScope text-embedding-v4 (64–2048, verified live). v3 caps
+        // below 1536 and would error — it falls to the warn path.
+        let supports_dimensions =
+            model.starts_with("text-embedding-3") || model == "text-embedding-v4";
+        if supports_dimensions {
+            tracing::info!(
+                model = %e.model(),
+                pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "pinning custom embedding model to the episodic index dimension"
+            );
+            e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
+        } else {
+            tracing::warn!(
+                model = %e.model(),
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "custom embedding model without `dimensions`: native size unknown — \
+                 vectors that are not index-sized will be dropped to BM25-only; set \
+                 embedding.dimensions if the provider supports it"
+            );
+        }
     }
     Some(Arc::new(e))
 }
