@@ -117,11 +117,21 @@ the OAuth path is SSRF-guarded end to end.
   through all 8 call sites (chat/acp/serve/gateway/profile) and is not needed for
   safety.
 
-### Known limitation (in-code)
+### Known limitations
 
-rmcp's child-process transport reads frames with an unbounded `read_until` (no
-`MAX_LINE_BYTES` cap) — accepted for operator-configured local stdio servers; a
-bounded codec would need a custom transport.
+- **Refresh-token rotation across restarts.** octos persists tokens after the
+  connect-time refresh, but rmcp's `AuthClient` may auto-refresh *mid-session*
+  and that new token stays only in memory. A provider that rotates the refresh
+  token on every use will leave the keyring with a stale refresh token, so a
+  later octos run must `octos mcp login` again. Most providers don't rotate on
+  every refresh; a full fix is codex's `OAuthPersistor` (persist after each op).
+- **Unbounded stdio frame read.** rmcp's child-process transport uses
+  `read_until` with no `MAX_LINE_BYTES` cap — accepted for operator-configured
+  local stdio servers; a bounded codec would need a custom transport.
+- **OAuth backend redirects are refused.** The OAuth HTTP client uses
+  `redirect: none` (a followed hop would bypass the per-request SSRF/TLS check);
+  a server whose `.well-known`/token endpoint 3xx-redirects would fail. None of
+  the common providers require this.
 
 ## Non-goals / notes
 

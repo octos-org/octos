@@ -182,23 +182,8 @@ pub(crate) fn reject_private_url_host(url: &str) -> Result<()> {
 pub(crate) fn build_ssrf_http_client(
     headers: &HashMap<String, String>,
 ) -> Result<reqwest_rmcp::Client> {
-    build_ssrf_client_inner(headers, false)
-}
-
-fn build_ssrf_client_inner(
-    headers: &HashMap<String, String>,
-    follow_redirects: bool,
-) -> Result<reqwest_rmcp::Client> {
-    let redirect = if follow_redirects {
-        // Even followed hops re-resolve through SsrfDnsResolver (hostname hosts
-        // are re-checked); the initial URL's literal-IP host is checked by the
-        // caller. Bound the hop count.
-        reqwest_rmcp::redirect::Policy::limited(5)
-    } else {
-        reqwest_rmcp::redirect::Policy::none()
-    };
     let mut builder = reqwest_rmcp::Client::builder()
-        .redirect(redirect)
+        .redirect(reqwest_rmcp::redirect::Policy::none())
         .dns_resolver(std::sync::Arc::new(SsrfDnsResolver) as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>);
     if !headers.is_empty() {
         let mut hmap = reqwest_rmcp::header::HeaderMap::new();
@@ -216,24 +201,53 @@ fn build_ssrf_client_inner(
         .map_err(|e| eyre::eyre!("build MCP http client: {e}"))
 }
 
-/// An rmcp `OAuthHttpClient` that SSRF-validates EVERY OAuth request URL before
-/// executing it. reqwest skips [`SsrfDnsResolver`] for literal-IP hosts, so a
-/// server that advertises a discovery / registration / token endpoint at a
-/// literal private IP would otherwise be reached — this closes that gap by
-/// checking each request's host up front, then running it through an
-/// SSRF-filtered client (hostname endpoints stay covered by the resolver).
+/// Per-OAuth-request timeout so a token/refresh/discovery endpoint that accepts
+/// the connection but never answers can't hang login/startup.
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validate an OAuth endpoint URL before we hit it: must be `https` (bearer
+/// tokens never travel cleartext) and must not resolve to a private/loopback/
+/// metadata host. Uses `url::Host` so bracketed IPv6 literals (`[::1]`) are
+/// handled, unlike a bare `Uri::host()` string.
+fn validate_oauth_uri(uri: &oauth2::http::Uri) -> std::result::Result<(), String> {
+    let s = uri.to_string();
+    let parsed = url::Url::parse(&s).map_err(|e| format!("invalid OAuth url '{s}': {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "OAuth endpoint '{s}' must be https — refusing cleartext bearer/credential exchange"
+        ));
+    }
+    let private = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => crate::tools::ssrf::is_private_host(d),
+        None => return Err(format!("OAuth endpoint '{s}' has no host")),
+    };
+    if private {
+        return Err(format!("SSRF blocked: OAuth endpoint '{s}' is private/loopback"));
+    }
+    Ok(())
+}
+
+/// An rmcp `OAuthHttpClient` that SSRF- and TLS-validates EVERY OAuth request
+/// URL before executing it — metadata discovery / registration / token /
+/// refresh — including literal-IP and IPv6 endpoints the DNS resolver skips.
+/// Redirects are refused (a followed hop would bypass the per-request check),
+/// and each request is timeout-bounded.
 pub(crate) struct SsrfOAuthHttpClient {
-    follow: reqwest_rmcp::Client,
-    stop: reqwest_rmcp::Client,
+    client: reqwest_rmcp::Client,
 }
 
 impl SsrfOAuthHttpClient {
     pub(crate) fn new() -> Result<Self> {
-        let empty = HashMap::new();
-        Ok(Self {
-            follow: build_ssrf_client_inner(&empty, true)?,
-            stop: build_ssrf_client_inner(&empty, false)?,
-        })
+        let client = reqwest_rmcp::Client::builder()
+            .redirect(reqwest_rmcp::redirect::Policy::none())
+            .timeout(OAUTH_HTTP_TIMEOUT)
+            .dns_resolver(std::sync::Arc::new(SsrfDnsResolver)
+                as std::sync::Arc<dyn reqwest_rmcp::dns::Resolve>)
+            .build()
+            .map_err(|e| eyre::eyre!("build OAuth http client: {e}"))?;
+        Ok(Self { client })
     }
 }
 
@@ -242,31 +256,13 @@ impl rmcp::transport::auth::OAuthHttpClient for SsrfOAuthHttpClient {
         &self,
         req: rmcp::transport::auth::OAuthHttpRequest,
     ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
-        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRedirectPolicy, OAuthHttpRequest};
-        let follow = self.follow.clone();
-        let stop = self.stop.clone();
+        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRequest};
+        let client = self.client.clone();
         Box::pin(async move {
-            let OAuthHttpRequest {
-                request,
-                redirect_policy,
-                ..
-            } = req;
-            // Reject literal private/loopback OAuth endpoint hosts (the DNS
-            // resolver is skipped for literal IPs).
-            if let Some(host) = request.uri().host()
-                && crate::tools::ssrf::is_private_host(host)
-            {
-                return Err(OAuthHttpClientError::new(format!(
-                    "SSRF blocked: OAuth endpoint host '{host}' is private/loopback"
-                )));
-            }
-            let client = match redirect_policy {
-                OAuthHttpRedirectPolicy::Follow => &follow,
-                OAuthHttpRedirectPolicy::Stop => &stop,
-                // `OAuthHttpRedirectPolicy` is non_exhaustive — default an
-                // unknown policy to the no-redirect (safer) client.
-                _ => &stop,
-            };
+            let OAuthHttpRequest { request, .. } = req;
+            // Redirects are refused (Policy::none), so the request URL is the
+            // only host we contact — validate it (https + non-private, IPv6-safe).
+            validate_oauth_uri(request.uri()).map_err(OAuthHttpClientError::new)?;
             let rq = reqwest_rmcp::Request::try_from(request)
                 .map_err(|e| OAuthHttpClientError::new(e.to_string()))?;
             let resp = client
