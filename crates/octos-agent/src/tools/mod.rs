@@ -754,6 +754,7 @@ pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
+pub mod memory_note;
 pub mod message;
 pub mod read_file;
 pub mod read_task_output;
@@ -812,6 +813,7 @@ pub use mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
+pub use memory_note::MemoryNoteTool;
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
@@ -1213,7 +1215,7 @@ pub fn is_symlink_error(e: &std::io::Error) -> bool {
 pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
@@ -1232,40 +1234,36 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
         }
         let mut file = opts.open(&path)?;
 
-        // Peek the first 5 bytes to detect a PDF (`%PDF-`). The symlink-safe
-        // open above is already done; the bytes we read here can't have
-        // followed a symlink. PDF content is binary so `read_to_string`
-        // would fail with a UTF-8 error — for those we route through
-        // `pdf-extract` to recover plain text. Pinned by the mini5 invoice
-        // upload regression (2026-05-12): the LLM couldn't summarize a PDF
-        // because read_to_string aborted immediately.
+        // Peek the first 5 bytes to detect a PDF (`%PDF-`). PDF content is
+        // binary so `read_to_string` would fail with a UTF-8 error — for
+        // those we route through `pdf-extract` to recover plain text. Pinned
+        // by the mini5 invoice upload regression (2026-05-12).
+        //
+        // Both branches read the REST from the SAME O_NOFOLLOW file
+        // descriptor (seek back to 0), never by re-opening the path. The
+        // previous PDF branch did `std::fs::read(&path)`, which follows
+        // symlinks and does no symlink re-check — a leaf swapped between the
+        // O_NOFOLLOW open (time-of-check) and that read (time-of-use) was
+        // followed, so an attacker could redirect the read to `/etc/passwd`
+        // or any file and feed its contents to the LLM. Reading from the
+        // held fd binds every byte to the inode we already validated.
         let mut magic = [0u8; 5];
-        match file.read(&mut magic) {
-            Ok(n) if n >= 5 && &magic == b"%PDF-" => {
-                // PDF detected — close the partial read, load whole bytes,
-                // hand to pdf-extract. Errors from extraction get wrapped
-                // as io::Error so callers see a single error type.
-                drop(file);
-                let bytes = std::fs::read(&path)?;
-                match pdf_extract::extract_text_from_mem(&bytes) {
-                    Ok(text) => Ok(text),
-                    Err(err) => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("pdf extraction failed: {err}"),
-                    )),
-                }
+        let n = file.read(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if n >= 5 && &magic == b"%PDF-" {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) => Ok(text),
+                Err(err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {err}"),
+                )),
             }
-            Ok(n) => {
-                // Not a PDF. Re-open at the start and read as UTF-8 text.
-                // (Seeking back works on regular files but we re-open for
-                // simplicity — the path is already known-safe.)
-                drop(file);
-                let mut file = opts.open(&path)?;
-                let mut content = String::with_capacity(n);
-                file.read_to_string(&mut content)?;
-                Ok(content)
-            }
-            Err(err) => Err(err),
+        } else {
+            let mut content = String::with_capacity(n);
+            file.read_to_string(&mut content)?;
+            Ok(content)
         }
     })
     .await
@@ -1389,6 +1387,45 @@ mod nofollow_tests {
 
         let err = read_no_follow(&link).await.unwrap_err();
         assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_reads_full_content_from_held_fd() {
+        // P2 (tri-repo #1529): both branches now read the rest of the file
+        // from the ALREADY-OPEN O_NOFOLLOW fd (seek back to 0) instead of
+        // re-opening the path. This guards the seek: after the 5-byte magic
+        // peek, the full content — INCLUDING the first 5 bytes — must be
+        // returned. A missing `seek(0)` would drop the leading 5 bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("plain.txt");
+        let content = "HELLO, this plaintext must round-trip in full.";
+        std::fs::write(&file, content).unwrap();
+
+        let read = read_no_follow(&file).await.unwrap();
+        assert_eq!(read, content, "full content must be read from the held fd");
+    }
+
+    #[tokio::test]
+    async fn test_read_no_follow_pdf_reads_whole_file_from_fd_not_path() {
+        // The PDF branch previously did `std::fs::read(&path)` — a re-open by
+        // path that follows a symlink swapped in after the O_NOFOLLOW open
+        // (TOCTOU). It now reads the whole file (magic + body) from the held
+        // fd. A PDF whose body extends well past the 5-byte magic must reach
+        // the extractor in full: pdf-extract fails on this junk body with
+        // InvalidData (proving the whole buffer, not a 5-byte truncation, was
+        // handed over — an empty/short buffer would surface differently).
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf = dir.path().join("doc.pdf");
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'X', 4096));
+        std::fs::write(&pdf, &bytes).unwrap();
+
+        let err = read_no_follow(&pdf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("pdf extraction failed"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

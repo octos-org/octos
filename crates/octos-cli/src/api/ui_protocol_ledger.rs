@@ -61,7 +61,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     Envelope, EnvelopeNotification, Payload, RpcError, RpcNotification, SessionOpened,
-    TurnCompletedEvent, UiCursor, UiNotification, UiProgressEvent, methods,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
+    UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -582,6 +583,17 @@ impl UiProtocolLedger {
                     if count > 0 {
                         sessions += 1;
                         events += count;
+                        // The process that wrote these events is gone; rows it
+                        // left non-terminal will never terminate on their own.
+                        let swept = ledger.reconcile_orphaned_rows(&session_key);
+                        if swept > 0 {
+                            info!(
+                                target = "octos::ledger",
+                                session_id = %session_key.0,
+                                swept,
+                                "recovery: synthesized terminal events for rows orphaned by restart"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -605,6 +617,104 @@ impl UiProtocolLedger {
             sessions_recovered: sessions,
             events_recovered: events,
         }
+    }
+
+    /// Boot-time reconciliation for one recovered session: any task, turn,
+    /// or agent row whose LAST replayed lifecycle event is non-terminal was
+    /// orphaned — the server process that owned it died before emitting the
+    /// terminal event, and no future event will ever close it. Replaying
+    /// such rows verbatim makes every client render phantom running work
+    /// forever (spinners for dead tasks, "Orchestrating…" for dead agents,
+    /// Esc mis-targeting ghost tasks). Append synthesized terminal events so
+    /// hydrate/replay converges to reality.
+    ///
+    /// Safe because recovery runs before this process serves any connection
+    /// (nothing genuinely live exists yet) and idempotent because swept rows
+    /// replay as terminal on the next boot.
+    fn reconcile_orphaned_rows(&self, session_id: &SessionKey) -> usize {
+        let Ok((events, _)) = self.snapshot_with_cursor(session_id, None) else {
+            return 0;
+        };
+        let mut tasks: std::collections::HashMap<
+            String,
+            octos_core::ui_protocol::TaskUpdatedEvent,
+        > = std::collections::HashMap::new();
+        let mut started_turns: std::collections::HashMap<
+            String,
+            (octos_core::TurnId, Option<String>),
+        > = std::collections::HashMap::new();
+        let mut terminal_turns: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut agents: std::collections::HashMap<
+            String,
+            octos_core::ui_protocol::AgentUpdatedEvent,
+        > = std::collections::HashMap::new();
+        for event in &events {
+            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+                continue;
+            };
+            match notification {
+                UiNotification::TaskUpdated(task) => {
+                    tasks.insert(task.task_id.to_string(), task.clone());
+                }
+                UiNotification::TurnStarted(turn) => {
+                    started_turns.insert(
+                        turn.turn_id.0.to_string(),
+                        (turn.turn_id.clone(), turn.topic.clone()),
+                    );
+                }
+                UiNotification::TurnCompleted(turn) => {
+                    terminal_turns.insert(turn.turn_id.0.to_string());
+                }
+                UiNotification::TurnError(turn) => {
+                    terminal_turns.insert(turn.turn_id.0.to_string());
+                }
+                UiNotification::AgentUpdated(agent) => {
+                    agents.insert(agent.agent.agent_id.clone(), agent.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut swept = 0usize;
+        for (_, mut task) in tasks {
+            if matches!(
+                task.state,
+                TaskRuntimeState::Pending | TaskRuntimeState::Running
+            ) {
+                task.state = TaskRuntimeState::Cancelled;
+                task.runtime_detail = Some("orphaned_by_restart".to_owned());
+                self.append_notification(UiNotification::TaskUpdated(task));
+                swept += 1;
+            }
+        }
+        for (key, (turn_id, topic)) in started_turns {
+            if terminal_turns.contains(&key) {
+                continue;
+            }
+            // Preserve the topic so topic-scoped replay filters still see the
+            // synthesized terminal for a topic-suffixed turn.
+            self.append_notification(UiNotification::TurnError(TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic,
+                turn_id,
+                code: "orphaned_by_restart".to_owned(),
+                message: "server restarted before this turn finished".to_owned(),
+            }));
+            swept += 1;
+        }
+        for (_, mut agent) in agents {
+            if matches!(
+                agent.agent.status.as_str(),
+                "completed" | "failed" | "cancelled" | "closed" | "interrupted"
+            ) {
+                continue;
+            }
+            agent.agent.status = "failed".to_owned();
+            agent.agent.summary = Some("orphaned by server restart".to_owned());
+            self.append_notification(UiNotification::AgentUpdated(agent));
+            swept += 1;
+        }
+        swept
     }
 
     fn recover_one_session(
@@ -2246,6 +2356,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::LoopFired(event) => &event.session_id,
         UiNotification::LoopCompleted(event) => &event.session_id,
         UiNotification::ContextCompactionCompleted(event) => &event.session_id,
+        UiNotification::ContextCompactionStarted(event) => &event.session_id,
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
         UiNotification::SessionOrchestration(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
@@ -2827,6 +2938,111 @@ mod tests {
             .snapshot_with_cursor(&session_id, None)
             .expect("from-beginning hydrate must succeed on a trimmed ring");
         assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
+    }
+
+    /// Boot recovery must synthesize terminal events for task/turn/agent
+    /// rows the dead server generation left non-terminal — otherwise every
+    /// hydrate replays phantom running work forever.
+    #[test]
+    fn recovery_sweeps_rows_orphaned_by_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:orphan-sweep".into());
+        let turn_id = octos_core::TurnId::new();
+        let ghost_task = octos_core::TaskId::new();
+        {
+            let config = LedgerConfig::durable(temp.path().into());
+            let ledger = UiProtocolLedger::with_config(config);
+            let task: octos_core::ui_protocol::TaskUpdatedEvent = serde_json::from_value(json!({
+                "session_id": session_id.0,
+                "task_id": ghost_task.to_string(),
+                "title": "astro dev server",
+                "state": "running",
+            }))
+            .expect("task event");
+            ledger.append_notification(UiNotification::TaskUpdated(task));
+            let started: octos_core::ui_protocol::TurnStartedEvent =
+                serde_json::from_value(json!({
+                    "session_id": session_id.0,
+                    "turn_id": turn_id.0,
+                    "timestamp": chrono::Utc::now(),
+                }))
+                .expect("turn started");
+            ledger.append_notification(UiNotification::TurnStarted(started));
+            let agent: octos_core::ui_protocol::AgentUpdatedEvent = serde_json::from_value(json!({
+                "session_id": session_id.0,
+                "agent": {
+                    "agent_id": "agent-ghost",
+                    "session_id": session_id.0,
+                    "path": "root/agent-ghost",
+                    "role": "worker",
+                    "nickname": "ghost",
+                    "backend_kind": "native",
+                    "status": "running",
+                    "profile_id": "dev",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                }
+            }))
+            .expect("agent event");
+            ledger.append_notification(UiNotification::AgentUpdated(agent));
+        } // process "dies" — no terminal events were emitted
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot");
+
+        let mut task_terminal = false;
+        let mut turn_terminal = false;
+        let mut agent_terminal = false;
+        for event in &events {
+            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+                continue;
+            };
+            match notification {
+                UiNotification::TaskUpdated(task)
+                    if task.state == octos_core::ui_protocol::TaskRuntimeState::Cancelled
+                        && task.runtime_detail.as_deref() == Some("orphaned_by_restart") =>
+                {
+                    task_terminal = true;
+                }
+                UiNotification::TurnError(error)
+                    if error.turn_id == turn_id && error.code == "orphaned_by_restart" =>
+                {
+                    turn_terminal = true;
+                }
+                UiNotification::AgentUpdated(agent)
+                    if agent.agent.agent_id == "agent-ghost" && agent.agent.status == "failed" =>
+                {
+                    agent_terminal = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            task_terminal,
+            "orphaned running task must be swept terminal"
+        );
+        assert!(turn_terminal, "orphaned started turn must error terminal");
+        assert!(
+            agent_terminal,
+            "orphaned running agent must be swept terminal"
+        );
+
+        // Idempotence: a second recovery must not append more sweep events.
+        let count_after_first = events.len();
+        drop(recovered);
+        let recovered_again = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events_again, _) = recovered_again
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot again");
+        assert_eq!(
+            events_again.len(),
+            count_after_first,
+            "second recovery must sweep nothing (rows already terminal)"
+        );
     }
 
     #[test]

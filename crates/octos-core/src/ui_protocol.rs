@@ -962,6 +962,10 @@ pub mod methods {
 
     /// UPCR-2026-009 `session/hydrate` — authoritative chat-state reload.
     pub const SESSION_HYDRATE: &str = "session/hydrate";
+    /// `session/rollback` — drop the last N user turns (conversation-only
+    /// rewind), persist an idempotent append-only marker, and return the
+    /// trimmed hydrated thread. MUTATING: changes persisted session state.
+    pub const SESSION_ROLLBACK: &str = "session/rollback";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
@@ -1153,6 +1157,7 @@ pub mod methods {
     pub const LOOP_COMPLETED: &str = "loop/completed";
     /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
     pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+    pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
     /// Session-level whole-job orchestration status notification.
@@ -1183,6 +1188,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
+    methods::SESSION_ROLLBACK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1263,6 +1269,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::LOOP_FIRED,
     methods::LOOP_COMPLETED,
     methods::CONTEXT_COMPACTION_COMPLETED,
+    methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
 ];
 
@@ -1282,6 +1289,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
+    methods::SESSION_ROLLBACK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1675,6 +1683,7 @@ pub enum UiResultKind {
     TaskArtifactList,
     TaskArtifactRead,
     SessionHydrate,
+    SessionRollback,
     ThreadGraphGet,
     TurnStateGet,
     UnsupportedCapability,
@@ -1698,6 +1707,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_ARTIFACT_LIST => Some(UiResultKind::TaskArtifactList),
         methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
+        methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         _ => None,
@@ -2705,6 +2715,24 @@ pub struct SessionHydrateResult {
     pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
 }
 
+/// Params for `session/rollback` — conversation-only rewind. Drops the last
+/// `num_turns` user turns from the session (persisted + in-memory). `num_turns`
+/// must be `>= 1`; the server rejects `0` with `invalid_params`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRollbackParams {
+    pub session_id: SessionKey,
+    pub num_turns: u32,
+}
+
+/// Result for `session/rollback`. `dropped_turns` is the number of user turns
+/// actually removed (clamped to the session's turn count), and `thread` is the
+/// trimmed session projected via the same shape as `session/hydrate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRollbackResult {
+    pub dropped_turns: u32,
+    pub thread: SessionHydrateResult,
+}
+
 // ----- UPCR-2026-010 `thread/graph/get` -----
 
 /// Params for `thread/graph/get` (UPCR-2026-010).
@@ -3583,6 +3611,7 @@ pub enum UiCommand {
     TaskArtifactList(TaskArtifactListParams),
     TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
+    SessionRollback(SessionRollbackParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
@@ -3624,6 +3653,7 @@ impl UiCommand {
             Self::TaskArtifactList(_) => methods::TASK_ARTIFACT_LIST,
             Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
+            Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
             Self::SessionList(_) => methods::SESSION_LIST,
@@ -3667,6 +3697,7 @@ impl UiCommand {
             Self::TaskArtifactList(params) => serde_json::to_value(params),
             Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
+            Self::SessionRollback(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
@@ -3736,6 +3767,7 @@ impl UiCommand {
                 Ok(Self::TaskArtifactRead(decode_params(method, params)?))
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
+            methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
@@ -4079,6 +4111,7 @@ pub enum UiRpcResult {
     TaskArtifactList(TaskArtifactListResult),
     TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
+    SessionRollback(SessionRollbackResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
@@ -4103,6 +4136,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(_) => UiResultKind::TaskArtifactList,
             Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
+            Self::SessionRollback(_) => UiResultKind::SessionRollback,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
@@ -4127,6 +4161,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(_) => Some(methods::TASK_ARTIFACT_LIST),
             Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
+            Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
@@ -4151,6 +4186,7 @@ impl UiRpcResult {
             Self::TaskArtifactList(result) => serde_json::to_value(result),
             Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
+            Self::SessionRollback(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
@@ -4206,6 +4242,7 @@ impl UiRpcResult {
                 Ok(Self::TaskArtifactRead(decode_result(method, result)?))
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
+            methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
@@ -5387,6 +5424,23 @@ pub struct ContextCompactionCompletedEvent {
     pub compaction: UiContextCompactionRecord,
 }
 
+/// UPCR-2026-026: emitted immediately BEFORE a context compaction pass so
+/// clients can show an in-progress state (spinner/bar). Always followed by
+/// `context/compaction_completed` for the same generation — today's serve
+/// compaction is synchronous, so both may arrive in one delivery batch;
+/// clients must tolerate a zero-duration window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionStartedEvent {
+    pub session_id: SessionKey,
+    /// Pre-compaction context state (token_estimate = the "before" size).
+    pub context_state: UiContextState,
+    /// Trigger label, mirrors the eventual completed record's trigger.
+    pub trigger: String,
+    /// The token threshold that tripped this compaction (context-window
+    /// derived) — lets clients render an honest fullness percentage.
+    pub threshold_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiContextNormalizationReport {
     pub generation: u64,
@@ -5652,6 +5706,7 @@ pub enum UiNotification {
     LoopCompleted(LoopCompletedEvent),
     /// M16: compact-context lifecycle event.
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
+    ContextCompactionStarted(ContextCompactionStartedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
     /// Session-level whole-job orchestration status. Emitted when the session's
@@ -5722,6 +5777,7 @@ impl UiNotification {
             Self::LoopFired(_) => methods::LOOP_FIRED,
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
+            Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
@@ -5769,6 +5825,7 @@ impl UiNotification {
             Self::LoopFired(event) => &event.session_id,
             Self::LoopCompleted(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
+            Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
@@ -5917,6 +5974,7 @@ impl UiNotification {
             Self::LoopFired(params) => serde_json::to_value(params),
             Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
+            Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
@@ -6040,6 +6098,9 @@ impl UiNotification {
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
             methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::CONTEXT_COMPACTION_STARTED => Ok(Self::ContextCompactionStarted(
+                decode_params(method, params)?,
+            )),
             methods::CONTEXT_COMPACTION_COMPLETED => Ok(Self::ContextCompactionCompleted(
                 decode_params(method, params)?,
             )),
@@ -6744,6 +6805,7 @@ mod tests {
                 "task/restart_from_node",
                 "task/output/read",
                 "session/hydrate",
+                "session/rollback",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6825,6 +6887,7 @@ mod tests {
                 "loop/fired",
                 "loop/completed",
                 "context/compaction_completed",
+                "context/compaction_started",
                 "context/normalization_reported",
             ]
         );
@@ -6845,6 +6908,7 @@ mod tests {
                 "task/restart_from_node",
                 "task/output/read",
                 "session/hydrate",
+                "session/rollback",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6918,6 +6982,7 @@ mod tests {
                     "task/restart_from_node",
                     "task/output/read",
                     "session/hydrate",
+                    "session/rollback",
                     "thread/graph/get",
                     "turn/state/get",
                     "agent/list",
@@ -6996,6 +7061,7 @@ mod tests {
                     "loop/fired",
                     "loop/completed",
                     "context/compaction_completed",
+                    "context/compaction_started",
                     "context/normalization_reported"
                 ],
                 "supported_features": [
@@ -9809,6 +9875,62 @@ mod tests {
         assert!(!object.contains_key("pending_questions"));
         // Bug C: a non-negotiated client never sees the new field.
         assert!(!object.contains_key("replayed_envelopes"));
+    }
+
+    #[test]
+    fn golden_session_rollback_params_serde() {
+        let params = SessionRollbackParams {
+            session_id: sample_session_id(),
+            num_turns: 2,
+        };
+        let value = serde_json::to_value(&params).expect("serialize rollback params");
+        assert_eq!(value, json!({ "session_id": "local:demo", "num_turns": 2 }));
+        let parsed: SessionRollbackParams =
+            serde_json::from_value(value).expect("deserialize rollback params");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn session_rollback_command_and_result_round_trip() {
+        // Command decodes from its wire method name.
+        let command = UiCommand::SessionRollback(SessionRollbackParams {
+            session_id: sample_session_id(),
+            num_turns: 1,
+        });
+        assert_eq!(command.method(), methods::SESSION_ROLLBACK);
+        let request = command.clone().into_rpc_request("r1").expect("encode");
+        assert_eq!(request.method, methods::SESSION_ROLLBACK);
+        let decoded = UiCommand::from_rpc_request(request).expect("decode command");
+        assert_eq!(decoded, command);
+
+        // Result carries the trimmed hydrate projection and round-trips through
+        // the method-keyed decode path.
+        let result = SessionRollbackResult {
+            dropped_turns: 1,
+            thread: SessionHydrateResult {
+                session_id: sample_session_id(),
+                cursor: sample_cursor(),
+                context: None,
+                context_state: None,
+                messages: Some(vec![]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+            },
+        };
+        let wire = UiRpcResult::SessionRollback(result.clone());
+        assert_eq!(wire.method(), Some(methods::SESSION_ROLLBACK));
+        assert_eq!(wire.kind(), UiResultKind::SessionRollback);
+        let value = wire.into_result_value().expect("encode result");
+        let decoded =
+            UiRpcResult::from_method_and_result(methods::SESSION_ROLLBACK, value).expect("decode");
+        assert_eq!(decoded, UiRpcResult::SessionRollback(result));
+        assert_eq!(
+            first_server_result_kind_for_method(methods::SESSION_ROLLBACK),
+            Some(UiResultKind::SessionRollback)
+        );
     }
 
     #[test]

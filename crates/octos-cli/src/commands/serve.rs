@@ -332,6 +332,21 @@ impl ServeCommand {
                 %error,
                 "failed to configure durable agent supervisor store; continuing with in-process supervision only"
             );
+        } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+        {
+            // Solo-boot loop safety: restored loops must not silently resume
+            // firing model turns on a single-operator box. Park them paused;
+            // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
+            for (loop_id, session_id) in
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .pause_restored_loops_for_solo_boot()
+            {
+                tracing::info!(
+                    loop_id = %loop_id,
+                    session_id = %session_id.0,
+                    "solo boot: restored loop parked as paused (resume with /loop resume)"
+                );
+            }
         }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
@@ -475,6 +490,7 @@ impl ServeCommand {
                 crate::runtime::BootstrapRole::Serve,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -511,7 +527,13 @@ impl ServeCommand {
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
                 // gateway's effective `plugins.require_signed`.
-                .with_host_plugins_require_signed(config.plugins.require_signed),
+                .with_host_plugins_require_signed(config.plugins.require_signed)
+                .with_host_max_inject_tokens(
+                    config.memory.as_ref().and_then(|m| m.max_inject_tokens),
+                )
+                .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
+                    config.memory.as_ref(),
+                )),
         );
         process_manager.set_self_ref();
 
@@ -692,6 +714,7 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            host_memory: config.memory.clone(),
             solo_login_enabled: self.solo
                 || std::env::var("OCTOS_SOLO_LOGIN")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

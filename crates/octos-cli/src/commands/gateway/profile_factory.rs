@@ -540,6 +540,12 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// can mandate strict signing even when individual profile JSONs omit
     /// the flag. Mirrors `ProfileRuntime::bootstrap_with_host_plugins`.
     pub(super) host_plugins: crate::config::PluginsConfig,
+    /// Host-level memory settings from the gateway's resolved config (which
+    /// already applied the config-beats-env precedence in
+    /// `Config::from_file`). Routed child profiles that omit `memory` fall
+    /// back to this, NOT to a re-read of the ambient env var, so they follow
+    /// the exact precedence of the main actor.
+    pub(super) host_memory: Option<crate::config::MemoryConfig>,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -569,6 +575,12 @@ impl ProfileActorFactoryBuilder {
         if self.host_plugins.require_signed {
             profile_config.plugins.require_signed = true;
         }
+        // Host memory settings apply field-by-field when the child profile
+        // doesn't override them (same pattern as bootstrap_with_host_plugins).
+        crate::config::merge_host_memory_into_profile(
+            &mut profile_config.memory,
+            self.host_memory.as_ref(),
+        );
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -580,18 +592,22 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
+        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
+            profile_config.memory.as_ref(),
+        );
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(profile_config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
             &self.project_dir,
-            &self.memory_store,
             &skills_loader,
             &self.tool_config,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            system_prompt.post_memory.push_str("\n\n");
+            system_prompt.post_memory.push_str(fragment);
         }
         let mut pipeline_factory = self.pipeline_factory.clone();
         let mut provider_policy = self.provider_policy.clone();
@@ -720,6 +736,9 @@ impl ProfileActorFactoryBuilder {
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
+            if memory_refresh_enabled {
+                tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
+            }
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);
             }
@@ -917,8 +936,8 @@ impl ProfileActorFactoryBuilder {
 
         if !child_plugin_prompt_fragments.is_empty() {
             for fragment in &child_plugin_prompt_fragments {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(fragment);
+                system_prompt.post_memory.push_str("\n\n");
+                system_prompt.post_memory.push_str(fragment);
             }
         }
 
@@ -939,6 +958,8 @@ impl ProfileActorFactoryBuilder {
             llm: llm.clone(),
             llm_for_compaction,
             memory: self.memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: Arc::new(std::sync::RwLock::new(system_prompt)),
             hooks,
             hook_context_template: Some(HookContext {
@@ -1232,6 +1253,7 @@ mod tests {
                 effective_octos_home.join("subagent-out"),
             )),
             host_plugins: Default::default(),
+            host_memory: None,
         };
 
         // The child-profile pipeline root MUST be effective_octos_home — the

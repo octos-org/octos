@@ -53,6 +53,16 @@ use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 
+// `large_enum_variant`: the `Inbound` variant carries an
+// `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
+// workspace crate enables serde_json's `preserve_order` feature (the `octos acp`
+// bridge's `agent-client-protocol` dependency requires it, and Cargo unifies
+// features workspace-wide), `Value::Object` switches from `BTreeMap` to
+// `IndexMap` and this enum grows past the lint threshold. This event is
+// constructed once per inbound message on a channel-bounded path where the size
+// delta is immaterial; boxing would churn every construction/match site for no
+// real benefit, so we allow it.
+#[allow(clippy::large_enum_variant)]
 enum GatewayLoopEvent {
     Wake,
     Shutdown,
@@ -168,11 +178,15 @@ pub(super) struct GatewayRuntime {
     actor_registry: ActorRegistry,
     session_dispatcher: crate::gateway_dispatcher::GatewayDispatcher,
     profile_factory_builder: Option<ProfileActorFactoryBuilder>,
+    /// Background memory-refresh sweep; must live on the runtime so the
+    /// flock + loop survive past construction (drop stops the sweep).
+    #[allow(dead_code)]
+    memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
     profile_store: Option<Arc<crate::profiles::ProfileStore>>,
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
 
     // Config / hot-reload
-    system_prompt: Arc<std::sync::RwLock<String>>,
+    system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     max_history: Arc<AtomicUsize>,
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
@@ -374,6 +388,7 @@ impl GatewayRuntime {
                 crate::runtime::BootstrapRole::Gateway,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -1095,6 +1110,9 @@ impl GatewayRuntime {
             // Memory bank tools
             tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+            if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+                tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+            }
 
             // Runtime model switching tool
             tools.register(crate::tools::SwitchModelTool::new(
@@ -1122,26 +1140,54 @@ impl GatewayRuntime {
         }
 
         // Build system prompt (always the full prompt with persona, memory, skills)
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+
+        // Background memory-refresh sweep: the flock arbitrates when a
+        // serve daemon also owns this profile dir. Stored on the runtime
+        // struct — a local binding would drop (and kill the sweep) the
+        // moment construction returns.
+        let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.clone(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
             &data_dir,
             &project_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
         )
         .await;
 
-        // Append skill prompt fragments
-        let system_prompt = if plugin_result.prompt_fragments.is_empty() {
-            system_prompt
-        } else {
-            let mut prompt = system_prompt;
+        // Append skill prompt fragments (post-memory tail: fragments came
+        // after the memory slot pre-refactor too).
+        let system_prompt = {
+            let mut parts = system_prompt;
             for fragment in &plugin_result.prompt_fragments {
-                prompt.push_str("\n\n");
-                prompt.push_str(fragment);
+                parts.post_memory.push_str("\n\n");
+                parts.post_memory.push_str(fragment);
             }
-            prompt
+            parts
         };
 
         // Shared system prompt for hot-reload (factory reads this at actor spawn time)
@@ -1299,6 +1345,8 @@ impl GatewayRuntime {
             llm: llm.clone(),
             llm_for_compaction: llm_for_compaction.clone(),
             memory: memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: system_prompt.clone(),
             hooks,
             hook_context_template,
@@ -1402,6 +1450,10 @@ impl GatewayRuntime {
                     // plugin policy so child profiles inherit the
                     // strict-signing gate even when their JSON omits it.
                     host_plugins: config.plugins.clone(),
+                    // The gateway's own config already encodes the correct
+                    // host precedence (explicit config beats the
+                    // ProcessManager env var via merge_env_memory_policy).
+                    host_memory: config.memory.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1609,7 +1661,6 @@ impl GatewayRuntime {
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
-            let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
             persona_service.start(
@@ -1618,13 +1669,12 @@ impl GatewayRuntime {
                     let base = base_prompt.clone();
                     let dd = data_dir_p.clone();
                     let pd = project_dir_p.clone();
-                    let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
                     let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
                         let sl = crate::skills_scope::build_account_skills_loader(&dd);
                         let new_prompt =
-                            build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
+                            build_system_prompt(base.as_deref(), &dd, &pd, &sl, &tc).await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;
                         info!("system prompt updated with new persona");
                     });
@@ -1676,6 +1726,7 @@ impl GatewayRuntime {
             actor_registry,
             session_dispatcher,
             profile_factory_builder,
+            memory_refresh,
             profile_store,
             active_sessions,
             system_prompt,
@@ -1737,10 +1788,13 @@ impl GatewayRuntime {
                             max_history: new_max,
                         } => {
                             if let Some(prompt) = system_prompt {
-                                *self
-                                    .system_prompt
+                                // A hot-reloaded config prompt replaces the
+                                // PRE-memory half only; the built post half
+                                // (skills/tool prefs) stays.
+                                self.system_prompt
                                     .write()
-                                    .unwrap_or_else(|e| e.into_inner()) = prompt;
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .pre_memory = prompt;
                                 info!(
                                     "System prompt updated via hot-reload (new actors will use it)"
                                 );

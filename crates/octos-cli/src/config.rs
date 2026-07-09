@@ -89,6 +89,10 @@ pub struct Config {
     #[serde(default)]
     pub embedding: Option<EmbeddingConfig>,
 
+    /// Memory subsystem configuration.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
+
     /// Fallback models for provider failover chain.
     /// When the primary provider fails with a retriable error, the next model is tried.
     #[serde(default)]
@@ -517,10 +521,184 @@ pub struct EmbeddingConfig {
     /// Custom base URL for the embedding API.
     #[serde(default)]
     pub base_url: Option<String>,
+
+    /// Embedding model id (default: text-embedding-3-small). Set for
+    /// OpenAI-compatible providers with their own catalogs (e.g.
+    /// DashScope `text-embedding-v4`).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// OpenAI-standard `dimensions` request field. The episodic HNSW
+    /// index is fixed at 1536 dims — set this when the model's native
+    /// output differs or its vectors are dropped to BM25-only.
+    #[serde(default)]
+    pub dimensions: Option<u32>,
 }
 
 fn default_embedding_provider() -> String {
     "openai".to_string()
+}
+
+/// Memory subsystem configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    /// Token budget for the memory block injected into the system prompt
+    /// (long-term memory + daily notes + bank summary combined). Defaults to
+    /// [`octos_memory::DEFAULT_MAX_INJECT_TOKENS`]. The budget is spent in
+    /// priority order (MEMORY.md, today's notes, bank abstracts, older daily
+    /// notes) and omissions are disclosed to the model with a marker.
+    #[serde(default)]
+    pub max_inject_tokens: Option<usize>,
+
+    /// Automatic memory refreshing (capture + consolidation pipeline).
+    #[serde(default)]
+    pub refresh: Option<MemoryRefreshConfig>,
+}
+
+/// Automatic memory-refresh settings. Default OFF: when disabled there is
+/// no `memory_note` tool, no capture policy in the prompt, no per-turn
+/// memory re-read, and no background sweep — behavior is identical to
+/// before the feature existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryRefreshConfig {
+    /// Master switch for the capture layer + read-side refresh + the
+    /// background extraction sweep. DEFAULT-ON: `None` means enabled —
+    /// automatic memory is the product behavior; set `false` (or
+    /// `OCTOS_MEMORY_REFRESH_ENABLED=0`) to opt out.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Model key for the extraction pass (unset → the profile's provider).
+    #[serde(default)]
+    pub extract_model: Option<String>,
+    /// Model key for the consolidation pass (unset → profile's provider).
+    #[serde(default)]
+    pub consolidate_model: Option<String>,
+    /// A session must be idle at least this long before it is swept.
+    #[serde(default)]
+    pub min_idle_minutes: Option<u64>,
+    /// Sessions idle longer than this are too old to sweep.
+    #[serde(default)]
+    pub max_session_age_days: Option<u64>,
+    /// Sessions extracted per pass.
+    #[serde(default)]
+    pub max_sessions_per_pass: Option<usize>,
+    /// Daily extraction-call budget per profile.
+    #[serde(default)]
+    pub max_extractions_per_day: Option<u32>,
+    /// Daily consolidation-run budget per profile (used by the
+    /// consolidator; reserved here so the config surface is complete).
+    #[serde(default)]
+    pub max_consolidations_per_day: Option<u32>,
+    /// Daily token budget per profile, shared by extraction+consolidation.
+    #[serde(default)]
+    pub max_daily_tokens: Option<u64>,
+    /// Background tick interval (extraction pass; consolidation piggybacks).
+    #[serde(default)]
+    pub consolidate_interval_minutes: Option<u64>,
+    /// Fast-lane debounce after a user note (consolidator; reserved).
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+    /// Entries unused/unrefreshed this long become archive candidates
+    /// (consolidator; reserved).
+    #[serde(default)]
+    pub unused_days: Option<u32>,
+    /// Durable MEMORY.md size cap enforced at consolidation (reserved).
+    #[serde(default)]
+    pub max_memory_file_tokens: Option<usize>,
+    /// Pending-confirm forget requests expire after this many days
+    /// (consolidator; reserved).
+    #[serde(default)]
+    pub pending_confirm_days: Option<u32>,
+    /// Hard input budget for one extraction call, tokens (CJK-aware
+    /// estimate). Provider metadata does not expose context windows, so
+    /// this is explicit.
+    #[serde(default)]
+    pub max_extract_input_tokens: Option<usize>,
+}
+
+impl MemoryRefreshConfig {
+    /// Resolve the sweep knobs, applying design defaults for unset fields.
+    pub fn knobs(config: Option<&MemoryConfig>) -> crate::memory_refresh::RefreshKnobs {
+        let refresh = config.and_then(|m| m.refresh.as_ref());
+        let get = |f: fn(&MemoryRefreshConfig) -> Option<u64>, default: u64| {
+            refresh.and_then(f).unwrap_or(default)
+        };
+        crate::memory_refresh::RefreshKnobs {
+            min_idle: std::time::Duration::from_secs(60 * get(|r| r.min_idle_minutes, 30)),
+            max_session_age: std::time::Duration::from_secs(
+                60 * 60 * 24 * get(|r| r.max_session_age_days, 10),
+            ),
+            max_sessions_per_pass: refresh.and_then(|r| r.max_sessions_per_pass).unwrap_or(2),
+            max_extractions_per_day: refresh
+                .and_then(|r| r.max_extractions_per_day)
+                .unwrap_or(20),
+            max_daily_tokens: get(|r| r.max_daily_tokens, 200_000),
+            interval: std::time::Duration::from_secs(
+                60 * get(|r| r.consolidate_interval_minutes, 30),
+            ),
+            max_extract_input_tokens: refresh
+                .and_then(|r| r.max_extract_input_tokens)
+                .unwrap_or(24_000),
+            max_inject_tokens: MemoryConfig::effective_max_inject_tokens(config),
+            max_consolidations_per_day: refresh
+                .and_then(|r| r.max_consolidations_per_day)
+                .unwrap_or(12),
+            debounce: std::time::Duration::from_secs(get(|r| r.debounce_seconds, 90)),
+            max_memory_file_tokens: refresh
+                .and_then(|r| r.max_memory_file_tokens)
+                .unwrap_or(8_000),
+            unused_days: refresh.and_then(|r| r.unused_days).unwrap_or(30),
+            pending_confirm_days: refresh.and_then(|r| r.pending_confirm_days).unwrap_or(7),
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Effective injection budget, applying the default when unset.
+    pub fn effective_max_inject_tokens(config: Option<&MemoryConfig>) -> usize {
+        config
+            .and_then(|m| m.max_inject_tokens)
+            .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
+    }
+
+    /// Whether automatic memory refreshing (capture + read refresh) is on.
+    /// DEFAULT-ON: an absent memory/refresh block (or an unset `enabled`)
+    /// means enabled; only an explicit `false` opts out.
+    pub fn refresh_enabled(config: Option<&MemoryConfig>) -> bool {
+        config
+            .and_then(|m| m.refresh.as_ref())
+            .and_then(|r| r.enabled)
+            .unwrap_or(true)
+    }
+}
+
+/// Field-level host→profile memory inheritance (in-process runtimes: the
+/// profile bootstrap and the actor factory). A profile that says nothing
+/// inherits the host block wholesale; a profile block present only for
+/// knobs (tri-state `enabled` unset) still inherits the host's
+/// enabled/disabled decision — under DEFAULT-ON semantics dropping it
+/// would bypass a host-level opt-out.
+pub fn merge_host_memory_into_profile(
+    config: &mut Option<MemoryConfig>,
+    host_memory: Option<&MemoryConfig>,
+) {
+    let Some(host) = host_memory else {
+        return;
+    };
+    let mem = config.get_or_insert_with(Default::default);
+    if mem.max_inject_tokens.is_none() {
+        mem.max_inject_tokens = host.max_inject_tokens;
+    }
+    if mem.refresh.is_none() {
+        mem.refresh = host.refresh.clone();
+    } else if let (Some(profile_refresh), Some(host_refresh)) =
+        (mem.refresh.as_mut(), host.refresh.as_ref())
+    {
+        if profile_refresh.enabled.is_none() {
+            profile_refresh.enabled = host_refresh.enabled;
+        }
+    }
 }
 
 /// Email sending configuration for the `send_email` tool.
@@ -1058,7 +1236,73 @@ impl Config {
 /// processes pick up the policy via env, even when the profile JSON they
 /// load omits the new `plugins` block.
 pub(crate) fn merge_env_plugin_policy_pub(config: &mut Config) {
-    merge_env_plugin_policy(config)
+    merge_env_plugin_policy(config);
+    merge_env_memory_policy(config);
+}
+
+/// Fill `memory.max_inject_tokens` from `OCTOS_MEMORY_MAX_INJECT_TOKENS`
+/// (set by `ProcessManager` from the host config.json) when the loaded
+/// config leaves it unset. Field-level merge: an explicit value in the
+/// loaded config always wins; the env var only fills the gap, so spawned
+/// gateways inherit the host budget even when their profile JSON omits it
+/// (or serializes an empty `memory: {}` block).
+fn merge_env_memory_policy(config: &mut Config) {
+    if config
+        .memory
+        .as_ref()
+        .and_then(|m| m.max_inject_tokens)
+        .is_none()
+    {
+        if let Ok(v) = std::env::var("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .max_inject_tokens = Some(n);
+            }
+        }
+    }
+    // Same field-level rule for the refresh switch: the env only fills the
+    // gap when the loaded config says nothing about `memory.refresh.enabled`
+    // (block absent OR the tri-state left unset). With the DEFAULT-ON
+    // semantics the OFF direction matters most: a host that disabled
+    // memory mirrors `OCTOS_MEMORY_REFRESH_ENABLED=0` to spawned
+    // subprocesses, and that must beat the child's default-on. An explicit
+    // `enabled` in the config file still wins over the env.
+    if config
+        .memory
+        .as_ref()
+        .and_then(|m| m.refresh.as_ref())
+        .and_then(|r| r.enabled)
+        .is_none()
+    {
+        if let Ok(v) = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED") {
+            // Recognized values only — an empty or misspelled variable
+            // (easy in shell/Docker) must not silently opt out of the
+            // default-on behavior.
+            let parsed = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                other => {
+                    if !other.is_empty() {
+                        tracing::warn!(
+                            value = %v,
+                            "ignoring unrecognized OCTOS_MEMORY_REFRESH_ENABLED"
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(on) = parsed {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .refresh
+                    .get_or_insert_with(Default::default)
+                    .enabled = Some(on);
+            }
+        }
+    }
 }
 
 fn merge_env_plugin_policy(config: &mut Config) {
@@ -1349,6 +1593,7 @@ impl Config {
         tracing::info!("no config.json found, using defaults");
         let mut config = Self::default();
         merge_env_plugin_policy(&mut config);
+        merge_env_memory_policy(&mut config);
         Ok((config, None))
     }
 
@@ -1375,8 +1620,11 @@ impl Config {
         // processes too. `ProcessManager` sets `OCTOS_PLUGINS_REQUIRE_SIGNED=1`
         // when the parent serve was launched with strict signing; we
         // OR-merge that into every Config so a profile JSON that omits
-        // the new block still inherits the strict policy.
+        // the new block still inherits the strict policy. The host memory
+        // budget rides the same mechanism via
+        // `OCTOS_MEMORY_MAX_INJECT_TOKENS`.
         merge_env_plugin_policy(&mut config);
+        merge_env_memory_policy(&mut config);
 
         // Log if migration changed something (don't silently rewrite user's config)
         if migrated {
@@ -1451,6 +1699,55 @@ impl Config {
     }
 
     /// Get the API key: auth store first, then environment variable.
+    /// [`Self::get_api_key`] with an explicit env-var override (e.g. the
+    /// embedding block's `api_key_env`): resolves through the SAME chain —
+    /// secret registration, auth store, `env_vars` (keychain-resolved),
+    /// process env — instead of a bare `std::env::var` read.
+    pub fn get_api_key_with_env(&self, provider: &str, env_var: Option<&str>) -> Result<String> {
+        match env_var {
+            // A CUSTOM var means "use this variable": the provider-scoped
+            // auth store must not win, or a stored `octos auth login -p
+            // openai` token would be sent to the custom OpenAI-compatible
+            // endpoint the override targets. But when the override IS the
+            // provider's default var name (a redundant-but-legal config),
+            // the full provider chain — auth store included — still
+            // applies, preserving pre-existing login-based setups.
+            Some(var) if Some(var) != Self::provider_default_env_var(provider).as_deref() => {
+                self.resolve_env_var_only(var)
+            }
+            // Default-name override: the FULL chain (auth store included)
+            // but with THE GIVEN var — get_api_key would re-apply the
+            // top-level Config.api_key_env, which in mixed-provider
+            // configs points at the PRIMARY provider's key (codex R4).
+            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            None => self.get_api_key(provider),
+        }
+    }
+
+    /// The env-var name the provider chain would use by default.
+    fn provider_default_env_var(provider: &str) -> Option<String> {
+        Some(
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase())),
+        )
+    }
+
+    /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
+    /// auth-store lookup: secret registration → `env_vars` map (keychain-
+    /// resolved) → process env.
+    fn resolve_env_var_only(&self, env_var: &str) -> Result<String> {
+        octos_agent::register_secret_env_names([env_var]);
+        if let Some(value) = self.env_vars.get(env_var).and_then(|value| {
+            crate::auth::keychain::resolve_value(env_var, value).filter(|value| !value.is_empty())
+        }) {
+            return Ok(value);
+        }
+        std::env::var(env_var)
+            .wrap_err_with(|| format!("{env_var} not set (explicit embedding api_key_env)"))
+    }
+
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Resolve the env var name we expect to hold this provider's key, and
         // mark it as a secret FIRST — before any early return — so the
@@ -1468,6 +1765,12 @@ impl Config {
                 .map(String::from)
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
+        self.resolve_api_key(provider, env_var)
+    }
+
+    /// Shared resolution body: auth store → env_vars (keychain) → process
+    /// env, with the var name secret-registered first.
+    fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
         octos_agent::register_secret_env_names([env_var.as_str()]);
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
@@ -2411,11 +2714,14 @@ mod tests {
     fn should_expand_env_vars_in_authorized_approvers() {
         // Use an env var reliably present in the test environment instead of
         // mutating the environment (workspace is `deny(unsafe_code)`, and
-        // std::env::set_var is unsafe under edition 2024).
-        let var = if std::env::var("HOME").is_ok() {
-            "HOME"
-        } else {
+        // std::env::set_var is unsafe under edition 2024). Prefer PATH: other
+        // tests in this module temporarily set_var("HOME", fake_home) and
+        // restore it, so snapshotting HOME here raced them under parallel
+        // test threads (flaky expected-vs-expanded mismatch).
+        let var = if std::env::var("PATH").is_ok() {
             "PATH"
+        } else {
+            "HOME"
         };
         let expected = std::env::var(var).unwrap();
         let mut config = Config {
@@ -2612,5 +2918,242 @@ mod tests {
             }));
         assert_eq!(overridden.tts_provider, "cloud");
         assert_eq!(overridden.cloud.unwrap().appid.as_deref(), Some("42"));
+    }
+
+    // --- memory refresh flag ---
+
+    #[test]
+    fn should_default_refresh_on_when_memory_absent_or_empty() {
+        // DEFAULT-ON: automatic memory is the product behavior; absence of
+        // config means enabled.
+        assert!(MemoryConfig::refresh_enabled(None));
+        let empty: MemoryConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&empty)));
+        let refresh_empty: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {}})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&refresh_empty)));
+    }
+
+    #[test]
+    fn should_disable_refresh_only_when_explicitly_false() {
+        let off: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": false}})).unwrap();
+        assert!(!MemoryConfig::refresh_enabled(Some(&off)));
+        let on: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": true}})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&on)));
+        // max_inject_tokens keeps its default independently.
+        assert_eq!(
+            MemoryConfig::effective_max_inject_tokens(Some(&on)),
+            octos_memory::DEFAULT_MAX_INJECT_TOKENS
+        );
+    }
+
+    #[test]
+    fn explicit_env_var_skips_provider_auth_store() {
+        // Even with provider-default resolution available, the explicit
+        // override must come from ITS variable only — never the
+        // provider-scoped auth store (codex R2: an OpenAI OAuth token
+        // must not be sent to a custom-endpoint embedder).
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("DASH_EMBED_KEY".to_string(), "dash-key".to_string());
+        // Provider-default path would resolve something else entirely;
+        // the explicit var wins regardless.
+        let key = config
+            .get_api_key_with_env("openai", Some("DASH_EMBED_KEY"))
+            .expect("explicit var resolves");
+        assert_eq!(key, "dash-key");
+        // And a MISSING explicit var is an error — no silent fallback to
+        // the provider chain.
+        assert!(
+            config
+                .get_api_key_with_env("openai", Some("NOPE_MISSING_VAR"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn default_name_override_ignores_top_level_api_key_env() {
+        // Mixed-provider config: primary provider pins the top-level
+        // api_key_env to ITS key; the embedding override naming the
+        // embedding provider's default var must still read THAT var.
+        // Auth-home isolated (codex R5): the default-name path consults
+        // the GLOBAL auth store first, so an ambient `octos auth login
+        // -p openai` on a dev/CI machine would shadow the env_vars
+        // assertion nondeterministically.
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_octos_home = std::env::var_os("OCTOS_HOME");
+        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        let mut config = Config {
+            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            ..Default::default()
+        };
+        config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
+        let key = config.get_api_key_with_env("openai", Some("OPENAI_API_KEY"));
+
+        // SAFETY: still inside HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_octos_home {
+                Some(v) => std::env::set_var("OCTOS_HOME", v),
+                None => std::env::remove_var("OCTOS_HOME"),
+            }
+            match original_octos_config {
+                Some(v) => std::env::set_var("OCTOS_CONFIG_DIR", v),
+                None => std::env::remove_var("OCTOS_CONFIG_DIR"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(
+            key.expect("resolves"),
+            "openai-key",
+            "must not read the primary provider's var"
+        );
+    }
+
+    #[test]
+    fn provider_default_env_var_name_keeps_full_chain() {
+        // api_key_env set to the provider's OWN default name is redundant
+        // but legal — it must keep the full provider chain (auth store
+        // included), not the custom-var-only path. Here the chain falls
+        // through to env_vars, same as get_api_key would.
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "from-chain".to_string());
+        let via_override = config
+            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
+            .expect("resolves");
+        let via_default = config.get_api_key("openai").expect("resolves");
+        assert_eq!(via_override, via_default);
+    }
+
+    #[test]
+    fn get_api_key_with_env_resolves_through_config_env_vars() {
+        // The override var must resolve through the same chain as normal
+        // keys — here via the config's env_vars map, NOT the process env.
+        let mut config = Config::default();
+        config.env_vars.insert(
+            "CUSTOM_EMBED_KEY".to_string(),
+            "from-config-map".to_string(),
+        );
+        let key = config
+            .get_api_key_with_env("openai", Some("CUSTOM_EMBED_KEY"))
+            .expect("resolves via env_vars map");
+        assert_eq!(key, "from-config-map");
+    }
+
+    #[test]
+    fn should_inherit_host_opt_out_when_profile_refresh_is_knobs_only() {
+        // Host explicitly disabled; profile block exists only for knobs.
+        let host = MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut profile = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                min_idle_minutes: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut profile, Some(&host));
+        assert!(
+            !MemoryConfig::refresh_enabled(profile.as_ref()),
+            "knobs-only profile blocks must inherit the host opt-out"
+        );
+        // The profile's own knob survives the merge.
+        assert_eq!(profile.unwrap().refresh.unwrap().min_idle_minutes, Some(5));
+
+        // An explicit profile decision beats the host.
+        let mut explicit = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut explicit, Some(&host));
+        assert!(MemoryConfig::refresh_enabled(explicit.as_ref()));
+
+        // Absent profile memory inherits the host block wholesale.
+        let mut absent: Option<MemoryConfig> = None;
+        merge_host_memory_into_profile(&mut absent, Some(&host));
+        assert!(!MemoryConfig::refresh_enabled(absent.as_ref()));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_let_env_disable_refresh_when_config_silent() {
+        // Host mirroring: OCTOS_MEMORY_REFRESH_ENABLED=0 must beat the
+        // child's default-on when the config file says nothing.
+        // Serialized: process-env mutation races every parallel test that
+        // loads a Config (same rule as the HOME-mutating tests).
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED").ok();
+        unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", "0") };
+
+        let mut config = Config::default();
+        merge_env_memory_policy(&mut config);
+        assert!(!MemoryConfig::refresh_enabled(config.memory.as_ref()));
+
+        // An explicit config value wins over the env.
+        let mut explicit = Config {
+            memory: Some(MemoryConfig {
+                refresh: Some(MemoryRefreshConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        merge_env_memory_policy(&mut explicit);
+        assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
+
+        // Malformed/empty values leave the default-on untouched.
+        for bad in ["", "banana"] {
+            unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", bad) };
+            let mut silent = Config::default();
+            merge_env_memory_policy(&mut silent);
+            assert!(
+                MemoryConfig::refresh_enabled(silent.memory.as_ref()),
+                "unrecognized env value {bad:?} must not opt out"
+            );
+        }
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", v) },
+            None => unsafe { std::env::remove_var("OCTOS_MEMORY_REFRESH_ENABLED") },
+        }
     }
 }

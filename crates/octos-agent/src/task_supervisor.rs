@@ -378,6 +378,17 @@ type OnFailureCallback = Box<dyn Fn(&SpawnOnlyFailureSignal) + Send + Sync>;
 /// Terminal outcome carried by a [`TerminalEvent`]. Distinguishes the
 /// success path (→ `ChildCompleted` re-entry) from the failure path
 /// (→ recovery re-entry, prompt-selected on `synth_ack_emitted`).
+//
+// `large_enum_variant`: the `Failed` variant carries a
+// [`SpawnOnlyFailureSignal`], which holds a `serde_json::Value`
+// (`tool_input`). When any workspace crate enables serde_json's
+// `preserve_order` feature (the `octos acp` bridge's `agent-client-protocol`
+// dependency requires it, and Cargo unifies features workspace-wide),
+// `Value::Object` switches from `BTreeMap` to `IndexMap` and the struct grows
+// past the lint's threshold. Boxing the payload here would ripple through the
+// `pub` API and every match site for a terminal (cold) event; the size
+// difference is immaterial on this non-hot path, so we allow it instead.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
     /// Task reached `Completed`. Drives the autonomous `ChildCompleted`
@@ -1938,12 +1949,18 @@ impl TaskSupervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(parent_session_key);
             if already_poisoned {
+                // Diagnostic count for the error payload — live children
+                // (status-active OR worker-still-running), matching the
+                // semantics of the gating count below.
                 let count = self
                     .tasks
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && (task.status.is_active() || is_task_live(&task.id))
+                    })
                     .count();
                 let error = RegisterTaskError::ChildFanoutExceeded {
                     parent_session_key: parent_session_key.to_string(),
@@ -1971,9 +1988,27 @@ impl TaskSupervisor {
             // continue to hit the cap path as before.
             let (current_count, parent_terminal_status) = {
                 let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Count LIVE children only. `tasks` is never pruned, so an
+                // unfiltered count is the session's lifetime total — a
+                // long-lived session that merely completed `cap` tasks over
+                // its life would trip the cap, poison the key forever, and
+                // force-fail its active work. The cap's job is to bound
+                // runaway CONCURRENT fan-out; terminal children are done and
+                // hold no resources this cap protects.
+                //
+                // "Live" is status-active OR worker-still-running (codex P2):
+                // `cancel` flips the STATUS to Cancelled immediately, but the
+                // detached worker keeps executing until it observes the token
+                // — status alone would let a spawn→cancel-all→spawn cycle run
+                // 2× the cap concurrently. The process-global live-set
+                // (armed by `TaskTerminalGuard::new`, cleared on its Drop at
+                // every worker exit path) tracks actual worker liveness.
                 let count = tasks
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && (task.status.is_active() || is_task_live(&task.id))
+                    })
                     .count();
                 let terminal = parent_terminal_check_tool_call_id
                     .filter(|tcid| !tcid.is_empty())
@@ -5585,6 +5620,71 @@ mod tests {
             .try_register_with_input("tts", "call-other-1", Some("api:other-parent"), None)
             .expect("other parents stay unaffected by a poisoned peer");
         assert!(!other.is_empty());
+    }
+
+    /// The fan-out cap bounds LIVE children, not the session's lifetime
+    /// total. Regression: the cap count had no `is_active()` filter and
+    /// `tasks` is never pruned, so a long-lived session that merely
+    /// COMPLETED `MAX_CHILDREN_PER_PARENT` background tasks over its life
+    /// (tts / podcast / pipeline nodes) tripped the cap on the next
+    /// register — poisoning the session key forever and force-failing
+    /// every currently-active legitimate task.
+    #[test]
+    fn completed_children_do_not_count_toward_fanout_cap() {
+        let parent_session = "api:long-lived-parent";
+        let supervisor = TaskSupervisor::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("tts", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Every child finishes cleanly — the session is long-lived,
+            // not runaway.
+            supervisor.mark_completed(&id, Vec::new());
+        }
+
+        let id = supervisor
+            .try_register_with_input("tts", "call-after-long-life", Some(parent_session), None)
+            .expect("a session with only COMPLETED children must not trip the fan-out cap");
+        assert!(!id.is_empty());
+
+        // And the session must not have been poisoned or had work
+        // force-failed by the register above.
+        let tasks = supervisor.get_tasks_for_session(parent_session);
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.error.as_deref().is_none_or(|e| !e.contains("fanout"))),
+            "no child may be force-failed with a fan-out reason on a healthy session"
+        );
+    }
+
+    /// codex P2 on the active-only cap count: `cancel` flips a task's STATUS
+    /// to Cancelled immediately, but the detached worker keeps running until
+    /// it observes the token — a status-only count would let a session spawn
+    /// the cap, cancel everything, and spawn another cap while the first
+    /// workers still execute. A child whose worker is still LIVE (in the
+    /// process-global live-set armed by [`TaskTerminalGuard::new`]) must keep
+    /// counting toward the cap until the guard drops.
+    #[test]
+    fn cancelled_but_still_live_children_still_count_toward_cap() {
+        let parent_session = "api:cancel-bypass-parent";
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let mut guards = Vec::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("busy", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Arm the production liveness guard (worker "running"), then
+            // cancel: status flips Cancelled but the worker is still live.
+            guards.push(TaskTerminalGuard::new(supervisor.clone(), id.clone()));
+            let _ = supervisor.cancel(&id);
+        }
+
+        let err = supervisor
+            .try_register_with_input("busy", "call-bypass", Some(parent_session), None)
+            .expect_err("cancelled-but-still-LIVE workers must still bound the fan-out cap");
+        assert!(matches!(err, RegisterTaskError::ChildFanoutExceeded { .. }));
+        drop(guards);
     }
 
     /// The legacy `register_with_input` entry point keeps returning a
