@@ -494,6 +494,53 @@ Split preference: paragraph boundary > newline > sentence end > space > hard cut
 
 ---
 
+## Autonomy & Session Control
+
+Beyond one-shot chat, the graphical clients (octos-web, octos-tui) drive longer-running behaviors over the [UI Protocol](./architecture.md). Each of these is gated by a negotiated capability flag (see [Capability Negotiation](#capability-negotiation)); when the client doesn't advertise the flag, the method is simply not offered.
+
+### Goals
+
+A **goal** is a persistent objective attached to a session. Once set, the agent keeps working toward it — re-firing turns as long as the goal's policy allows — instead of stopping after a single answer. Goals survive across turns and are cleared explicitly.
+
+- Protocol: `session/goal/set`, `session/goal/get`, `session/goal/clear` (notifications `session/goal/updated`, `session/goal/cleared`). Feature flag: `coding.goal_runtime.v1`.
+- Use it for "keep going until X is done" work; clear the goal to stop.
+
+### Loops
+
+A **loop** is a recurring agent run. Loops are either **fixed-interval** (fire every N seconds) or **self-paced** — the model decides its own next cadence by emitting a `<<loop-next-in: …>>` hint (default 15 minutes when it doesn't). A loop keeps firing until paused, deleted, or the fire cap (10,000) is reached.
+
+- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete` (notifications `loop/fired`, `loop/completed`, `loop/updated`). Feature flag: `coding.loop_runtime.v1`.
+- Use it for polling, monitoring, and self-paced background agents.
+
+### Rewind
+
+`session/rollback` rewinds a session to an earlier point (dropping the last N user turns), and `session/snapshot` captures the current session state (files, tasks, status). This backs the "rewind" / checkpoint UI in the clients.
+
+### Task & turn control
+
+- **Background tasks** (spawned work, deep-search, pipelines) can be listed, cancelled, and restarted: `task/list`, `task/cancel`, `task/restart_from_node`, with output/artifacts via `task/output/read` and `task/artifact/list`. Also reachable over REST at `POST /api/tasks/{id}/cancel` and `/restart-from-node`.
+- **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are cancelled and the partial turn is persisted).
+
+### Capability negotiation
+
+A client advertises which protocol features it supports when it connects (the `ui_feature` / `ui_features` query params or the `X-Octos-Ui-Features` header). The server only exposes methods and emits notifications for the features the client negotiated — so older clients keep working and new capabilities roll out without breaking them. Representative flags:
+
+| Flag | Unlocks |
+|------|---------|
+| `coding.goal_runtime.v1` | Goals (`session/goal/*`) |
+| `coding.loop_runtime.v1` | Loops (`loop/*`) |
+| `coding.autonomy.v1` | Autonomy loop/goal orchestration |
+| `harness.task_control.v1` | Task list/cancel/restart |
+| `harness.task_artifacts.v1` | Task artifacts |
+| `state.session_hydrate.v1` | `session/hydrate` resume |
+| `state.thread_graph.v1` | Thread/turn graph |
+| `context.lifecycle.v1` | Context-compaction events |
+| `approval.typed.v1` | Typed human-approval cards |
+| `user_question.v1` | Clarifying-question cards |
+| `auxiliary.rest_to_ws.v1` | The 13 auxiliary REST→WS methods (`session/list`, `content/list`, `session/snapshot`, …) |
+
+---
+
 ## Context Compaction
 
 When the conversation exceeds the LLM's context window, older messages are automatically compacted:

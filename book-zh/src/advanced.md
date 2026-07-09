@@ -494,6 +494,53 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 ---
 
+## 自主运行与会话控制
+
+除一次性对话外，图形客户端（octos-web、octos-tui）还通过 [UI Protocol](./architecture.md) 驱动一些更长时运行的行为。下列每项都由一个协商的能力标志门控（见[能力协商](#能力协商)）；当客户端未声明该标志时，对应方法就不会被提供。
+
+### 目标（Goals）
+
+**目标**是附加到会话上的持久化目标。一旦设定，agent 会持续朝其推进——只要目标策略允许就重新触发轮次——而不是在单次回答后停止。目标跨轮次存续，需显式清除。
+
+- 协议：`session/goal/set`、`session/goal/get`、`session/goal/clear`（通知 `session/goal/updated`、`session/goal/cleared`）。特性标志：`coding.goal_runtime.v1`。
+- 适用于「一直做到 X 完成」类工作；清除目标即停止。
+
+### 循环（Loops）
+
+**循环**是周期性的 agent 运行。循环分为**固定间隔**（每 N 秒触发）或**自定步调**——模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏（未指定时默认 15 分钟）。循环持续触发，直到被暂停、删除或达到触发上限（10,000 次）。
+
+- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`（通知 `loop/fired`、`loop/completed`、`loop/updated`）。特性标志：`coding.loop_runtime.v1`。
+- 适用于轮询、监控和自定步调的后台 agent。
+
+### 回退（Rewind）
+
+`session/rollback` 将会话回退到较早的点（丢弃最近 N 个用户轮次），`session/snapshot` 捕获当前会话状态（文件、任务、状态）。这支撑了客户端的「回退」/检查点 UI。
+
+### 任务与轮次控制
+
+- **后台任务**（派生工作、深度搜索、流水线）可被列出、取消与重启：`task/list`、`task/cancel`、`task/restart_from_node`，输出/产物通过 `task/output/read`、`task/artifact/list`。也可经 REST 的 `POST /api/tasks/{id}/cancel` 与 `/restart-from-node` 触达。
+- **运行中的轮次**可用 `turn/interrupt` 中途打断（取消进行中的 LLM 调用与工具，并持久化部分轮次）。
+
+### 能力协商
+
+客户端在连接时声明它支持哪些协议特性（`ui_feature` / `ui_features` 查询参数或 `X-Octos-Ui-Features` 头）。服务器只为客户端协商过的特性暴露方法与发送通知——因此旧客户端可继续工作，新能力也能在不破坏它们的前提下上线。代表性标志：
+
+| 标志 | 解锁 |
+|------|------|
+| `coding.goal_runtime.v1` | 目标（`session/goal/*`） |
+| `coding.loop_runtime.v1` | 循环（`loop/*`） |
+| `coding.autonomy.v1` | 自主循环/目标编排 |
+| `harness.task_control.v1` | 任务 列出/取消/重启 |
+| `harness.task_artifacts.v1` | 任务产物 |
+| `state.session_hydrate.v1` | `session/hydrate` 恢复 |
+| `state.thread_graph.v1` | 线程/轮次图 |
+| `context.lifecycle.v1` | 上下文压缩事件 |
+| `approval.typed.v1` | 类型化人工审批卡片 |
+| `user_question.v1` | 澄清提问卡片 |
+| `auxiliary.rest_to_ws.v1` | 13 个辅助 REST→WS 方法（`session/list`、`content/list`、`session/snapshot` 等） |
+
+---
+
 ## 上下文压缩
 
 当对话超出 LLM 的上下文窗口时，较旧的消息会被自动压缩：

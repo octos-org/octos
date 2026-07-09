@@ -1168,10 +1168,21 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 | Route | Method | Description |
 |---|---|---|
 | `/api/chat` | POST | Send message → response (sync; streaming runs over WS) |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 (chat stream + `session/list`, `session/messages_page`, `system/status.get`, ...) |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the sole chat transport and control plane (see below) |
 | `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
+
+**UI Protocol v1 method families** (`/api/ui-protocol/ws`, JSON-RPC 2.0): the WS endpoint is far more than a chat stream — it is the full control plane the web/TUI clients drive:
+
+- **Session/turn**: `session/open`, `session/hydrate`, `session/list`, `session/messages_page`, `session/status/read`, `turn/start`, `turn/interrupt`, `session/rollback`, `session/snapshot`.
+- **Autonomy**: `session/goal/set|get|clear` (goals) and `loop/create|list|pause|resume|delete` (recurring loops) — see [Autonomy & Session Control](./advanced.md#autonomy--session-control).
+- **Tasks**: `task/list`, `task/cancel`, `task/restart_from_node`, `task/output/read`, `task/artifact/list`.
+- **Approvals & questions**: `approval/respond`, `approval/scopes/list`, `user_question/respond`, `diff/preview/get`.
+- **Config/profile**: `profile/llm/*`, `profile/skills/*`, `permission/profile/*`, `content/list`, `config/capabilities/list`.
+- **Notifications** (server→client): `message/delta`, `message/persisted`, `tool/*`, `turn/spawn_complete`, `session/goal/updated`, `loop/fired`, `context/compaction_started`, etc.
+
+Each method/notification is gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) that the client advertises at connect time via `ui_feature`/`X-Octos-Ui-Features`; the server exposes only what the client negotiated, so older clients keep working as new capabilities ship.
 
 **Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 

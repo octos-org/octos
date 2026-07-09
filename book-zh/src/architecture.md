@@ -1167,12 +1167,23 @@ JSON 持久化位于 `.octos/cron.json`。
 | 路由 | 方法 | 说明 |
 |---|---|---|
 | `/api/chat` | POST | 发送消息 → 获取响应（同步；流式内容走 WS） |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1（聊天流、`session/list`、`session/messages_page`、`system/status.get` 等） |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1——唯一的聊天传输通道与控制平面（见下） |
 | `/health` | GET | 存活探针（原 `/api/status`；结构化状态已迁移到 WS `system/status.get`） |
 | `/metrics` | GET | Prometheus 文本指标（无需认证） |
 | `/*`（回退） | GET | 内嵌 Web UI（通过 rust-embed 提供静态文件） |
 | `/metrics` | GET | Prometheus 文本格式（无需认证） |
 | `/*`（回退） | GET | 嵌入式 Web UI（通过 rust-embed 的静态文件） |
+
+**UI Protocol v1 方法族**（`/api/ui-protocol/ws`，JSON-RPC 2.0）：该 WS 端点远不止是聊天流——它是 web/TUI 客户端驱动的完整控制平面：
+
+- **会话/轮次**：`session/open`、`session/hydrate`、`session/list`、`session/messages_page`、`session/status/read`、`turn/start`、`turn/interrupt`、`session/rollback`、`session/snapshot`。
+- **自主运行**：`session/goal/set|get|clear`（目标）与 `loop/create|list|pause|resume|delete`（周期循环）——见[自主运行与会话控制](./advanced.md#自主运行与会话控制)。
+- **任务**：`task/list`、`task/cancel`、`task/restart_from_node`、`task/output/read`、`task/artifact/list`。
+- **审批与提问**：`approval/respond`、`approval/scopes/list`、`user_question/respond`、`diff/preview/get`。
+- **配置/profile**：`profile/llm/*`、`profile/skills/*`、`permission/profile/*`、`content/list`、`config/capabilities/list`。
+- **通知**（服务器→客户端）：`message/delta`、`message/persisted`、`tool/*`、`turn/spawn_complete`、`session/goal/updated`、`loop/fired`、`context/compaction_started` 等。
+
+每个方法/通知都由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控；客户端在连接时通过 `ui_feature`/`X-Octos-Ui-Features` 声明，服务器只暴露其协商过的部分，因此旧客户端在新能力上线时仍可正常工作。
 
 **认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost 开发源加已配置的 base domain。**最大消息**：1MB。
 
