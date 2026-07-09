@@ -1715,7 +1715,12 @@ impl Config {
             Some(var) if Some(var) != Self::provider_default_env_var(provider).as_deref() => {
                 self.resolve_env_var_only(var)
             }
-            _ => self.get_api_key(provider),
+            // Default-name override: the FULL chain (auth store included)
+            // but with THE GIVEN var — get_api_key would re-apply the
+            // top-level Config.api_key_env, which in mixed-provider
+            // configs points at the PRIMARY provider's key (codex R4).
+            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            None => self.get_api_key(provider),
         }
     }
 
@@ -2966,6 +2971,28 @@ mod tests {
             config
                 .get_api_key_with_env("openai", Some("NOPE_MISSING_VAR"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn default_name_override_ignores_top_level_api_key_env() {
+        // Mixed-provider config: primary provider pins the top-level
+        // api_key_env to ITS key; the embedding override naming the
+        // embedding provider's default var must still read THAT var.
+        let mut config = Config::default();
+        config.api_key_env = Some("ANTHROPIC_API_KEY".to_string());
+        config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
+        let key = config
+            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
+            .expect("resolves");
+        assert_eq!(
+            key, "openai-key",
+            "must not read the primary provider's var"
         );
     }
 

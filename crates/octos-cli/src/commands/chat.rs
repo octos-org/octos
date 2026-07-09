@@ -1073,18 +1073,18 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
             );
         }
         e = e.with_dimensions(dimensions);
-    } else if e.dimension() != octos_memory::EPISODIC_INDEX_DIMENSION {
-        // A model whose native size differs from the fixed index (e.g.
-        // text-embedding-3-large @3072, DashScope v4 @1024) would have
-        // every vector silently dropped to BM25-only. Pin the request to
-        // the index dimension (OpenAI-standard `dimensions` truncation;
-        // compatible providers accept it — ones that don't will error
-        // visibly at request time instead of degrading silently).
+    } else if cfg.model.is_some() {
+        // ANY custom model pins to the index dimension when `dimensions`
+        // is unset: the native-size table only knows OpenAI's models, so
+        // an unknown OpenAI-compatible model (DashScope v4 is natively
+        // 1024-d) would silently drop every vector to BM25-only. Known
+        // 1536-native models tolerate the explicit param; providers that
+        // reject it error visibly at request time instead of degrading
+        // silently. The no-model default keeps the legacy request shape.
         tracing::info!(
             model = %e.model(),
-            native = e.dimension(),
             pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
-            "pinning embedding dimensions to the episodic index size"
+            "pinning custom embedding model to the episodic index dimension"
         );
         e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
     }
