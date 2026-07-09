@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -890,7 +890,15 @@ impl ServeLogTailState {
 }
 
 fn serve_log_path_for_now(octos_home: &FsPath) -> PathBuf {
-    serve_log_path_for_date(octos_home, Local::now().date_naive())
+    serve_log_path_for_instant(octos_home, Utc::now())
+}
+
+/// tracing_appender's DAILY rotation names files by the UTC date
+/// (`OffsetDateTime::now_utc()`), so the tail side must resolve the current
+/// log path with the same clock — using `Local` would tail a nonexistent
+/// `serve.<local-date>.log` for part of each day on non-UTC hosts.
+fn serve_log_path_for_instant(octos_home: &FsPath, now: DateTime<Utc>) -> PathBuf {
+    serve_log_path_for_date(octos_home, now.date_naive())
 }
 
 fn serve_log_path_for_date(octos_home: &FsPath, date: chrono::NaiveDate) -> PathBuf {
@@ -5547,6 +5555,33 @@ mod tests {
         assert!(!redacted.contains("abcdef0123456789ABCDEF0123"));
         assert!(!redacted.contains("secret123"));
         assert!(!redacted.contains("sk-testsecret12345"));
+    }
+
+    #[test]
+    fn serve_log_path_uses_utc_date_to_match_rolling_appender() {
+        let dir = tempfile::tempdir().unwrap();
+        // tracing_appender's DAILY rotation names files by the UTC date
+        // (OffsetDateTime::now_utc); an instant late in the UTC day maps to
+        // the previous local date on hosts west of UTC, so pinning the UTC
+        // date here catches any regression back to `Local`.
+        let instant = DateTime::parse_from_rfc3339("2026-05-25T00:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            serve_log_path_for_instant(dir.path(), instant),
+            dir.path().join("logs").join("serve.2026-05-25.log"),
+        );
+
+        // serve_log_path_for_now must resolve with the same UTC clock.
+        let before = Utc::now().date_naive();
+        let now_path = serve_log_path_for_now(dir.path());
+        let after = Utc::now().date_naive();
+        assert!(
+            [before, after]
+                .iter()
+                .any(|date| now_path == serve_log_path_for_date(dir.path(), *date)),
+            "serve_log_path_for_now must use the UTC date, got {now_path:?}"
+        );
     }
 
     #[tokio::test]
