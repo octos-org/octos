@@ -594,6 +594,23 @@ impl SessionAgentFactory for ConfigAgentFactory {
     }
 
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
+        // Normalize the client-supplied cwd (resolve `..` + symlinks) up front so
+        // the per-cwd cache key is stable and the session scope's `..`-rejecting
+        // resolvers accept normal relative reads like `read_file("Cargo.toml")`
+        // (codex P2). Falls back to an absolutized path if the dir doesn't exist.
+        let cwd = match std::fs::canonicalize(&cwd) {
+            Ok(c) => c,
+            Err(_) => {
+                if cwd.is_absolute() {
+                    cwd
+                } else if let Ok(d) = std::env::current_dir() {
+                    d.join(&cwd)
+                } else {
+                    cwd
+                }
+            }
+        };
+
         // Process-global stores (provider chain, redb episode store, memory) built
         // once, lazily, on the first session.
         let shared = self
@@ -639,20 +656,15 @@ impl SessionAgentFactory for ConfigAgentFactory {
 
         // Per-session filesystem scope (codex P1): contain file tools + plugins to
         // cwd, with skill read-zones so `read_file` reaches SKILL.md references.
-        let absolute_cwd = if cwd.is_absolute() {
-            cwd.clone()
-        } else {
-            std::env::current_dir()
-                .map(|d| d.join(&cwd))
-                .unwrap_or_else(|_| cwd.clone())
-        };
-        let session_scope = SessionScope::solo(absolute_cwd.clone(), Vec::new())
+        // `cwd` is already normalized above, so the scope's resolvers accept
+        // relative reads.
+        let session_scope = SessionScope::solo(cwd.clone(), Vec::new())
             .ok()
             .map(|base| {
                 base.with_skill_read_zones(b.skill_read_zones.clone())
                     .unwrap_or_else(|_| {
-                        SessionScope::solo(absolute_cwd.clone(), Vec::new())
-                            .expect("absolutized cwd is valid")
+                        SessionScope::solo(cwd.clone(), Vec::new())
+                            .expect("normalized cwd is valid")
                     })
             });
 
