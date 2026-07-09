@@ -13,6 +13,7 @@ mod docs;
 mod doctor;
 pub mod gateway;
 mod init;
+pub mod mcp;
 pub mod mcp_serve;
 mod memory;
 mod office;
@@ -47,6 +48,7 @@ pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
@@ -111,6 +113,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Manage OAuth-authenticated MCP servers (`login`/`logout`).
+    Mcp(McpCommand),
     /// Inspect and drive the memory-refresh pipeline.
     Memory(MemoryCommand),
     /// Portable profile export (QR) and payload inspection.
@@ -326,6 +330,7 @@ impl Executable for Command {
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Mcp(cmd) => cmd.execute(),
             Self::Profile(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
             #[cfg(feature = "api")]
