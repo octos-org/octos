@@ -189,17 +189,18 @@ fn mcp_http_router(
     use std::sync::Arc;
 
     use axum::extract::{Request, State};
-    use axum::http::{StatusCode, header::AUTHORIZATION};
+    use axum::http::StatusCode;
+    use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use axum::middleware::{self, Next};
     use axum::response::{IntoResponse, Response};
     use axum::{Router, body::Body};
 
     /// Single gate in front of the rmcp service: reject a missing/wrong bearer
-    /// token (401) before touching the body, then bound the body (413) before
-    /// rmcp reads it. Buffering the body here — rather than via a tower
-    /// body-limit layer — makes an over-limit *chunked* body (no
-    /// `Content-Length`) also surface as 413 instead of the 500 rmcp maps a
-    /// mid-read length-limit error to.
+    /// token (401) before touching the body, then bound the body. A *declared*
+    /// oversized `Content-Length` is rejected (413) before any bytes are read;
+    /// otherwise the body is buffered with a cap — which also makes an
+    /// over-limit *chunked* body (no `Content-Length`) surface as 413 instead of
+    /// the 500 rmcp would map a mid-read length-limit error to.
     async fn gate(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
         let provided = request
             .headers()
@@ -210,6 +211,19 @@ fn mcp_http_router(
         if !authorized {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         }
+        // Fast-reject a *declared* oversized body before reading any of it, so a
+        // bearer holder cannot pin a connection open by announcing a huge
+        // `Content-Length` and then trickling (or never sending) the body.
+        let declared_over_limit = request
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|len| len > MAX_HTTP_BODY_BYTES);
+        if declared_over_limit {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+        }
+        // Chunked / unknown-length bodies are still bounded during the read.
         let (parts, body) = request.into_parts();
         match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
             Ok(bytes) => {

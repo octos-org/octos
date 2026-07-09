@@ -351,7 +351,7 @@ impl ServerHandler for OctosMcpHandler {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if request.name.as_ref() != RUN_OCTOS_SESSION_TOOL {
             return Err(ErrorData::invalid_params(
@@ -371,7 +371,19 @@ impl ServerHandler for OctosMcpHandler {
             .map(Value::Object)
             .unwrap_or_else(|| Value::Object(Default::default()));
         let params = json!({ "name": RUN_OCTOS_SESSION_TOOL, "arguments": arguments });
-        let result = dispatch_run_octos_session(&*self.dispatch, &self.supervisor, &params).await;
+
+        // Run the session, but abort it if rmcp cancels this request: a client
+        // `notifications/cancelled`, a disconnect, or session teardown (e.g. the
+        // idle-timeout reaper firing on a pathological multi-hour call). Without
+        // this the dispatched agent would keep running with no client to receive
+        // its result. `context.ct` descends from the serve-loop token, so it
+        // fires on all three; dropping the dispatch future cancels the agent.
+        let result = tokio::select! {
+            result = dispatch_run_octos_session(&*self.dispatch, &self.supervisor, &params) => result,
+            _ = context.ct.cancelled() => Err(McpServerError::SessionFailed(
+                "run_octos_session cancelled by the client or session teardown".to_string(),
+            )),
+        };
 
         let sink = self.event_sink.read().await.clone();
         emit_call_outcome(&sink, self.transport_label, &result);
