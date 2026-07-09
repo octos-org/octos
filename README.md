@@ -9,8 +9,6 @@
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
 </pre>
 
-<b>Open Cognitive Tasks Orchestration System</b>
-
 </div>
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
@@ -65,7 +63,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 
 ---
 
-**Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
+A Rust-native, API-first Agentic OS.
 
 31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
 
