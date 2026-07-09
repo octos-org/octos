@@ -464,7 +464,7 @@ octos init                           # pick a provider + model, then paste that 
 }
 ```
 
-> The `--provider`/`--model` in `args` must match the provider you set up in steps 1–2 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
+> The `--provider`/`--model` in `args` must match the provider you set up in step 1 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
 
 **3. Play with it in Zed.**
 - **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).

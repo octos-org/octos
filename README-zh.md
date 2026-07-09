@@ -66,7 +66,7 @@ octos init                           # 选择提供者与模型，并粘贴该�
 }
 ```
 
-> `args` 中的 `--provider`/`--model` 必须与第 1–2 步配置的提供者一致（本指南以 DeepSeek 为例）。`octos acp` 会从你的 `octos init` 配置继承其余字段——`base_url`、`api_type`、`api_key_env`——因此用 `deepseek` 参数指向另一个已配置的提供者会把错误的 key/端点发出去，导致会话失败。
+> `args` 中的 `--provider`/`--model` 必须与第 1 步配置的提供者一致（本指南以 DeepSeek 为例）。`octos acp` 会从你的 `octos init` 配置继承其余字段——`base_url`、`api_type`、`api_key_env`——因此用 `deepseek` 参数指向另一个已配置的提供者会把错误的 key/端点发出去，导致会话失败。
 
 **3. 在 Zed 中使用。** 先**打开一个文件夹**（外部 Agent 需要工作区，否则 Agent 面板只显示 *"Open Project"*），打开 **Agent 面板**（右侧停靠栏），点击 **＋ New Thread** 下拉（或按 `⌥⌘⇧N`），选择 **Octos**，然后输入提示词。octos 会运行完整 Agent 循环，并把工具、思考与结果流式返回 Zed，还会通过你的 `MEMORY.md` 跨轮次记忆。
 
