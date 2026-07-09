@@ -1,16 +1,19 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useToast } from '../components/Toast'
 import { api } from '../api'
 
 export default function NewProfile() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { toast } = useToast()
+  const adminModeRequested = searchParams.get('adminMode') === 'true'
   const [loading, setLoading] = useState(false)
   const [id, setId] = useState('')
   const [name, setName] = useState('')
   const [publicSubdomain, setPublicSubdomain] = useState('')
   const [enabled, setEnabled] = useState(true)
+  const [adminMode, setAdminMode] = useState(adminModeRequested)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -21,6 +24,16 @@ export default function NewProfile() {
         name,
         public_subdomain: publicSubdomain.trim() || null,
         enabled,
+        ...(adminMode
+          ? {
+              config: {
+                channels: [],
+                gateway: {},
+                env_vars: {},
+                admin_mode: true,
+              },
+            }
+          : {}),
       })
       toast('Profile created')
       navigate(`/profile/${id}`)
@@ -91,6 +104,17 @@ export default function NewProfile() {
                 className="w-4 h-4 rounded bg-surface-dark border-gray-600 text-accent focus:ring-accent"
               />
               <span className="text-sm text-gray-400">Auto-start gateway when server starts</span>
+            </label>
+          </div>
+          <div>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={adminMode}
+                onChange={(e) => setAdminMode(e.target.checked)}
+                className="w-4 h-4 rounded bg-surface-dark border-gray-600 text-accent focus:ring-accent"
+              />
+              <span className="text-sm text-gray-400">Admin Mode</span>
             </label>
           </div>
           <div className="flex justify-end gap-3 pt-4 border-t border-gray-700/50">

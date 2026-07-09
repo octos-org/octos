@@ -178,7 +178,19 @@ export const api = {
     offset?: number
   }) => request<AdminAuditResponse>(queryPath('/audit', params ?? {})),
 
-  listProfiles: () => request<ProfileResponse[]>('/profiles'),
+  listProfiles: (params?: { offset?: number; limit?: number }) =>
+    request<ProfileResponse[]>(queryPath('/profiles', params ?? {})),
+
+  // Fetch every profile page (the endpoint defaults to limit=100).
+  listAllProfiles: async (): Promise<ProfileResponse[]> => {
+    const pageSize = 100
+    const all: ProfileResponse[] = []
+    for (let offset = 0; ; offset += pageSize) {
+      const page = await api.listProfiles({ offset, limit: pageSize })
+      all.push(...page)
+      if (page.length < pageSize) return all
+    }
+  },
 
   getProfile: (id: string) => request<ProfileResponse>(`/profiles/${id}`),
 
