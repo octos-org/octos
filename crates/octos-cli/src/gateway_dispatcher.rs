@@ -608,9 +608,17 @@ impl GatewayDispatcher {
         let soul_key = self.profiled_key(&inbound.channel, &inbound.chat_id, "");
 
         if arg.is_empty() || arg.eq_ignore_ascii_case("show") {
+            // Report the EFFECTIVE soul with its source: a per-chat override
+            // wins, otherwise the profile-wide soul (dashboard `/api/my/soul`)
+            // still reaches actors and must not be masked as "No custom soul".
             let reply = match crate::soul_service::read_soul_for_session(data_dir, &soul_key) {
-                Some(content) => format!("🪶 Current soul:\n\n{content}"),
-                None => "No custom soul set. Using default.".to_string(),
+                Some(content) => format!("🪶 Current soul (this chat):\n\n{content}"),
+                None => match crate::soul_service::read_soul(data_dir) {
+                    Some(content) => {
+                        format!("🪶 Current soul (profile-wide, no chat override):\n\n{content}")
+                    }
+                    None => "No custom soul set. Using default.".to_string(),
+                },
             };
             let _ = self
                 .out_tx
@@ -619,13 +627,17 @@ impl GatewayDispatcher {
         } else if arg.eq_ignore_ascii_case("reset") {
             match crate::soul_service::remove_soul_for_session(data_dir, &soul_key) {
                 Ok(()) => {
+                    // Only the per-chat override is removed; if a profile-wide
+                    // soul exists it remains effective — say so.
+                    let msg = if crate::soul_service::read_soul(data_dir).is_some() {
+                        "Chat soul override removed; the profile-wide soul still applies. \
+                         Takes effect in new sessions."
+                    } else {
+                        "Soul reset to default. Takes effect in new sessions."
+                    };
                     let _ = self
                         .out_tx
-                        .send(make_reply(
-                            reply_channel,
-                            reply_chat_id,
-                            "Soul reset to default. Takes effect in new sessions.",
-                        ))
+                        .send(make_reply(reply_channel, reply_chat_id, msg))
                         .await;
                 }
                 Err(e) => {
@@ -1312,6 +1324,49 @@ mod tests {
         disp.handle_soul_command("/soul", &inbound_b, "telegram", "200")
             .await;
         assert!(rx.try_recv().unwrap().content.contains("writing tutor"));
+    }
+
+    #[tokio::test]
+    async fn should_report_profile_wide_soul_when_no_chat_override() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let inbound = make_test_inbound("telegram", "100", "/soul");
+
+        // Profile-wide soul (set via the dashboard) lives at data_dir/soul.md
+        // and reaches actors even without a per-chat override.
+        crate::soul_service::write_soul(tmp.path(), "dashboard persona").unwrap();
+
+        // /soul show without a per-chat override must report the effective
+        // profile-wide soul with its source, not "No custom soul set".
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("dashboard persona"), "reply: {reply}");
+        assert!(reply.contains("profile-wide"), "reply: {reply}");
+
+        // A per-chat override takes precedence in the report.
+        disp.handle_soul_command("/soul chat persona", &inbound, "telegram", "100")
+            .await;
+        let _ = rx.try_recv().unwrap();
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("chat persona"), "reply: {reply}");
+        assert!(!reply.contains("profile-wide"), "reply: {reply}");
+
+        // /soul reset removes only the per-chat override; the message must
+        // say the profile-wide soul still applies.
+        disp.handle_soul_command("/soul reset", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("profile-wide"), "reply: {reply}");
+
+        // After reset the profile-wide soul is the effective one again.
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        let reply = rx.try_recv().unwrap().content;
+        assert!(reply.contains("dashboard persona"), "reply: {reply}");
     }
 
     #[tokio::test]
