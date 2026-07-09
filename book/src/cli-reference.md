@@ -321,7 +321,7 @@ Generate reference documentation for the built-in tools and providers.
 octos docs [--output <DIR>]
 ```
 
-With no `--output` the Markdown is written to stdout; otherwise it creates `<DIR>` and writes `<DIR>/TOOLS.md`. Useful for keeping downstream docs in sync with the compiled tool/provider set.
+With no `--output` the Markdown is written to stdout; otherwise it creates `<DIR>` and writes `<DIR>/TOOLS.md`. The output documents the built-in tools plus a provider list that is currently **hard-coded** in the command, so it can lag the actual provider registry.
 
 ---
 

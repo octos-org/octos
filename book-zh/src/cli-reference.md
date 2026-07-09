@@ -310,7 +310,7 @@ octos doctor [OPTIONS]
 octos docs [--output <DIR>]
 ```
 
-未指定 `--output` 时将 Markdown 写到标准输出；否则创建 `<DIR>` 并写入 `<DIR>/TOOLS.md`。可用于让下游文档与已编译的工具/供应商集合保持同步。
+未指定 `--output` 时将 Markdown 写到标准输出；否则创建 `<DIR>` 并写入 `<DIR>/TOOLS.md`。输出涵盖内置工具，以及一份**硬编码**在命令中的供应商列表，因此可能落后于实际的供应商注册表。
 
 ---
 

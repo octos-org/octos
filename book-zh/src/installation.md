@@ -28,8 +28,9 @@ git clone https://github.com/octos-org/octos
 cd octos
 
 # 推荐：规范特性集（与 scripts/milestone-ci.sh 一致）。
-# 包含 REST API + 仪表板（`octos serve`）以及所有消息渠道适配器。
-# 若不确定需要哪些特性，先编译这一套——它就是发布产物所用的组合。
+# 包含 REST API + 仪表板（`octos serve`）以及常用的消息渠道适配器——
+# 这正是 CI 与发布产物所构建的集合。如需其他渠道（slack、email、
+# matrix、line、qq-bot、wechat），从下方列表按需添加。
 cargo install --path crates/octos-cli \
     --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 

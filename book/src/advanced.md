@@ -533,7 +533,6 @@ When the conversation exceeds the LLM's context window, older messages are autom
 | `/soul` | View or edit the profile's SOUL (personality) |
 | `/skills` | List / install / remove skills inline |
 | `/status` | Show session/runtime status |
-| `/upload` | Attach a file to the conversation |
 | `/help` | List the commands available on the current transport |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
 
