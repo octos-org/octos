@@ -4,6 +4,8 @@
 //! - Episode storage (summaries of completed tasks)
 //! - Memory store (long-term, daily notes)
 
+pub mod guard;
+
 mod episode;
 mod hybrid_search;
 mod memory_store;
