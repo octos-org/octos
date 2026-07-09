@@ -3353,6 +3353,11 @@ impl ActorFactory {
             session_key.to_string(),
             task_state_path.clone(),
         )
+        // Embed-on-save + recall parity: without the profile's embedder
+        // spawn workers store their episodes vectorless and their
+        // episodic recall silently skips (same contract as the
+        // `agent.with_embedder` wiring below).
+        .with_optional_embedder(self.embedder.clone())
         // M8 Runtime Parity W2.B1: parent → child cache inheritance.
         // Without these the spawned child Agent observes
         // `file_state_cache: None` and `subagent_output_router: None`
@@ -3491,6 +3496,7 @@ impl ActorFactory {
             octos_agent::DelegateTool::new(self.llm.clone(), self.memory.clone(), self.cwd.clone())
                 .with_provider_policy(self.provider_policy.clone())
                 .with_agent_config(self.agent_config.clone())
+                .with_optional_embedder(self.embedder.clone())
                 .with_task_supervisor(supervisor.clone(), session_key.to_string())
                 .with_child_prompt_context_manager_factory(delegate_factory);
         if let Some(ref prompt) = self.worker_prompt {
