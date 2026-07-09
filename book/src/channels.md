@@ -480,8 +480,8 @@ In any gateway channel, the following commands manage conversation sessions:
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Create a new session (forks the last 10 messages from the current conversation) |
-| `/new <name>` | Create a named session |
+| `/new` | Clear the current session (bare `/new` wipes history, like `/clear`) |
+| `/new <name>` | Switch to (or create) a named session |
 | `/s <name>` | Switch to a named session |
 | `/s` | Switch to the default session |
 | `/sessions` | List all sessions for this chat |
