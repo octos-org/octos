@@ -644,6 +644,56 @@ impl SessionScope {
         &self.workspace
     }
 
+    /// Return a scope with the same root and mode policy but a different
+    /// per-session workspace.
+    ///
+    /// Spawn isolation uses this to inherit the parent's filesystem policy
+    /// while moving a child agent's CWD into its git worktree. The replacement
+    /// workspace must be absolute and remain under the existing root so
+    /// multi-tenant and solo boundaries are preserved.
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Result<Self, SessionScopeError> {
+        if !workspace.is_absolute() {
+            return Err(SessionScopeError::RootNotAbsolute(workspace));
+        }
+        // Reject `..` outright: `Path::starts_with` is purely lexical, so
+        // `<root>/../escape` passes it while resolving outside the root — and
+        // `canonicalize` can't catch that when the leaf doesn't exist yet (it
+        // falls back to the unresolved path).
+        if workspace
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(SessionScopeError::WorkspaceEscapesRoot {
+                root: self.root.clone(),
+                workspace,
+            });
+        }
+        // Resolve symlinks on both sides, walking existing ancestors when the
+        // workspace leaf doesn't exist yet (`canonicalize_lossy` requires the
+        // `..` guard above). The canonical workspace must stay under the
+        // canonical root: the canonical form is the security-relevant one — a
+        // symlinked component (e.g. `<root>/.octos/work` -> outside) only shows
+        // up after resolution, and the ancestor walk closes the missing-leaf
+        // hole that a raw `.canonicalize().unwrap_or(raw)` fallback would leave
+        // open. A lexical `starts_with` is NOT used — neither necessary (macOS
+        // `/var` vs `/private/var`) nor sufficient (the symlink escape bypassed
+        // it).
+        // Use the SAME ancestor-walking resolver on both sides so they resolve
+        // any shared existing ancestor identically (mixing a non-walking root
+        // resolver with a walking workspace resolver diverges for not-yet-created
+        // paths).
+        let canonical_root = canonicalize_lossy(&self.root);
+        let canonical_workspace = canonicalize_lossy(&workspace);
+        if !canonical_workspace.starts_with(&canonical_root) {
+            return Err(SessionScopeError::WorkspaceEscapesRoot {
+                root: self.root.clone(),
+                workspace,
+            });
+        }
+        self.workspace = workspace;
+        Ok(self)
+    }
+
     /// Return the declared cross-session shared zones (multi-tenant
     /// only). Empty slice for solo. Callers should prefer this over
     /// reaching into [`ScopeMode::MultiTenant::shared_zones`]
@@ -1115,6 +1165,74 @@ mod tests {
         assert_eq!(scope.root(), cwd);
         assert_eq!(scope.workspace(), cwd);
         assert!(scope.shared_zones().is_empty());
+    }
+
+    #[test]
+    fn with_workspace_preserves_root_and_mode_policy() {
+        let cwd = abs("/home/yc/my-project");
+        let child = cwd.join(".octos/work/subagent-0");
+        let scope = SessionScope::solo(cwd.clone(), vec![])
+            .unwrap()
+            .with_workspace(child.clone())
+            .unwrap();
+        assert_eq!(scope.root(), cwd);
+        assert_eq!(scope.workspace(), child);
+        assert!(matches!(scope.mode(), ScopeMode::Solo { .. }));
+    }
+
+    #[test]
+    fn with_workspace_rejects_workspace_escape() {
+        let cwd = abs("/home/yc/my-project");
+        let err = SessionScope::solo(cwd, vec![])
+            .unwrap()
+            .with_workspace(abs("/home/yc/other-project"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::WorkspaceEscapesRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn with_workspace_rejects_parent_dir_escape() {
+        // `<root>/../escape` lexically passes `starts_with(root)` but resolves
+        // outside; the `..` guard must reject it.
+        let cwd = abs("/home/yc/my-project");
+        let err = SessionScope::solo(cwd.clone(), vec![])
+            .unwrap()
+            .with_workspace(cwd.join("../other/subagent"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::WorkspaceEscapesRoot { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_workspace_rejects_symlinked_workspace_escape() {
+        // A workspace lexically under root but whose component is a symlink
+        // resolving OUTSIDE root must be rejected by the canonical check —
+        // the original lexical-only acceptance was a sandbox escape (#1250).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join(".octos")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // root/.octos/work -> outside  (symlinked component)
+        std::os::unix::fs::symlink(&outside, root.join(".octos/work")).unwrap();
+        // Lexically `<root>/.octos/work/subagent`; canonically `<outside>/subagent`.
+        let escaping = root.join(".octos/work/subagent");
+        std::fs::create_dir_all(&escaping).unwrap();
+        let root = root.canonicalize().unwrap();
+        let err = SessionScope::solo(root, vec![])
+            .unwrap()
+            .with_workspace(escaping)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::WorkspaceEscapesRoot { .. }
+        ));
     }
 
     #[test]
