@@ -94,11 +94,27 @@ where
             guard.push_str("\n--- stderr ---\n");
         }
         guard.push_str(&chunk);
-        if guard.len() > MAX_CAPTURE_BYTES * 2 {
-            let keep_from = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
-            let trimmed = guard[keep_from..].to_string();
-            *guard = format!("... (earlier output truncated)\n{trimmed}");
+        truncate_capture_in_place(&mut guard);
+    }
+}
+
+/// Trim an accumulating capture buffer to its last [`MAX_CAPTURE_BYTES`] once it
+/// grows past twice that, keeping the tail.
+///
+/// `len - MAX_CAPTURE_BYTES` is a raw BYTE offset that need not fall on a UTF-8
+/// char boundary — slicing there directly panics ("byte index N is not a char
+/// boundary") when a multibyte char (CJK/emoji) straddles it. Because this runs
+/// inside a `tokio::spawn`ed reader task, that panic silently kills the reader
+/// and the stream stops capturing. Advance the cut to the next char boundary
+/// first so the slice is always valid.
+fn truncate_capture_in_place(guard: &mut String) {
+    if guard.len() > MAX_CAPTURE_BYTES * 2 {
+        let mut keep_from = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
+        while keep_from < guard.len() && !guard.is_char_boundary(keep_from) {
+            keep_from += 1;
         }
+        let trimmed = guard[keep_from..].to_string();
+        *guard = format!("... (earlier output truncated)\n{trimmed}");
     }
 }
 
@@ -636,6 +652,14 @@ impl ExecCommandTool {
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Put the child in its own process group so the timeout path can
+        // signal the WHOLE tree (wrapper shell + grandchildren) with a
+        // negative-PID kill — mirrors the `bash` tool path. Without this the
+        // negative-PID kill targets a group the child was never placed in, so
+        // a backgrounded `sleep` survives the timeout and can mutate the
+        // workspace after the tool has reported failure.
+        #[cfg(unix)]
+        cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
         let child = match cmd.spawn() {
             Ok(child) => child,
@@ -647,6 +671,10 @@ impl ExecCommandTool {
                 });
             }
         };
+        // Capture the pid BEFORE `wait_with_output` consumes the child — the
+        // timeout arm needs it to kill the process tree (dropping the wait
+        // future does NOT kill a tokio child).
+        let child_pid = child.id();
         let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
         match result {
             Ok(Ok(output)) => {
@@ -677,11 +705,19 @@ impl ExecCommandTool {
                 success: false,
                 ..Default::default()
             }),
-            Err(_) => Ok(ToolResult {
-                output: format!("Command timed out after {timeout_secs} seconds"),
-                success: false,
-                ..Default::default()
-            }),
+            Err(_) => {
+                // Dropping the wait future does NOT kill a tokio child, so
+                // the wrapper shell and any grandchildren keep running. Kill
+                // the whole process group/tree (SIGTERM → 500ms grace →
+                // SIGKILL on Unix, `taskkill /F /T` on Windows) — the same
+                // helper the `bash` tool uses.
+                kill_timed_out_child(child_pid).await;
+                Ok(ToolResult {
+                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
         }
     }
 
@@ -3368,6 +3404,30 @@ mod tests {
     use super::*;
     use crate::tools::ToolRegistry;
 
+    #[test]
+    fn truncate_capture_does_not_panic_on_multibyte_boundary() {
+        // Regression: `guard[len - MAX_CAPTURE_BYTES..]` sliced at a raw byte
+        // offset. A multibyte char straddling that offset panicked, silently
+        // killing the spawned reader task. Build a buffer whose cut point falls
+        // mid-'世' (3 bytes) and confirm the trim succeeds and stays valid UTF-8.
+        // An all-3-byte-char buffer: char boundaries are multiples of 3, and
+        // MAX_CAPTURE_BYTES (50_000) is not ≡ 0 (mod 3), so the raw cut offset
+        // `len - MAX_CAPTURE_BYTES` is guaranteed to fall mid-char.
+        let mut guard = "世".repeat(40_000); // 120_000 bytes, over the 2× trigger
+        let cut = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
+        assert!(
+            !guard.is_char_boundary(cut),
+            "test precondition: the raw cut offset must fall mid-char"
+        );
+
+        truncate_capture_in_place(&mut guard); // must not panic
+        assert!(guard.starts_with("... (earlier output truncated)\n"));
+        assert!(
+            guard.contains('世'),
+            "the kept tail must remain valid UTF-8"
+        );
+    }
+
     const CODEX_P0: &[&str] = &[
         "apply_patch",
         "exec_command",
@@ -5685,6 +5745,72 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "child process must be killed on timeout — sentinel file at {} should NOT exist",
+            sentinel.display(),
+        );
+    }
+
+    /// P2 (tri-repo #1529): `exec_command`'s timeout path dropped the wait
+    /// future without killing the child, so the wrapper shell and any
+    /// grandchildren survived. Mirror of `bash_kills_grandchildren_...`: a
+    /// backgrounded grandchild touches a sentinel after a sleep longer than
+    /// the timeout; the process-group kill must stop it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_command_kills_grandchildren_via_process_group_on_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("exec-grandchild-late.txt");
+        let sentinel_path = sentinel.to_string_lossy().into_owned();
+        let cmd = format!("(sleep 3; touch {sentinel_path}) & wait");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let started = std::time::Instant::now();
+        let result = registry
+            .execute("exec_command", &json!({ "cmd": cmd, "timeout_secs": 1 }))
+            .await
+            .expect("exec_command runs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "exec_command must return within the timeout window (got {:?})",
+            started.elapsed()
+        );
+        assert!(!result.success, "{}", result.output);
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "grandchild must be killed via the exec_command process group on \
+             timeout — sentinel at {} should NOT exist",
+            sentinel.display(),
+        );
+    }
+
+    /// P2 (tri-repo #1529): the direct-child variant of the above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_command_kills_child_process_on_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("exec-late-write.txt");
+        let sentinel_path = sentinel.to_string_lossy().into_owned();
+        let cmd = format!("sleep 3; touch {sentinel_path}");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let started = std::time::Instant::now();
+        let result = registry
+            .execute("exec_command", &json!({ "cmd": cmd, "timeout_secs": 1 }))
+            .await
+            .expect("exec_command runs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "exec_command must return within the timeout window (got {:?})",
+            started.elapsed()
+        );
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("timed out"),
+            "exec_command must report timeout; got: {}",
+            result.output,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "child must be killed on timeout — sentinel at {} should NOT exist",
             sentinel.display(),
         );
     }

@@ -6,6 +6,9 @@ use eyre::{Result, WrapErr};
 use octos_bus::ChannelManager;
 use tracing::warn;
 
+#[cfg(feature = "matrix")]
+use crate::cron_tool::CronTool;
+
 use super::prompt::settings_str;
 
 #[cfg(all(feature = "matrix", test))]
@@ -37,6 +40,51 @@ pub(super) const MATRIX_MISSING_TOKENS_ERROR: &str =
     "matrix channel requires settings.as_token and settings.hs_token";
 #[cfg(feature = "matrix")]
 pub(super) const MATRIX_BOT_USER_ID_ENV_KEY: &str = "OCTOS_MATRIX_BOT_USER_ID";
+
+// ── User-mode (Matrix account login) settings ────────────────────────────────
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_MODE: &str = "mode";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_MODE_USER: &str = "user";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_MODE_APPSERVICE: &str = "appservice";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_USER_ID: &str = "user_id";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_ACCESS_TOKEN: &str = "access_token";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_PASSWORD: &str = "password";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_DEVICE_NAME: &str = "device_name";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_ROOMS: &str = "rooms";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_AUTO_JOIN: &str = "auto_join";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_AUTO_JOIN_CAMEL: &str = "autoJoin";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_AUTO_JOIN_ALLOWLIST: &str = "auto_join_allowlist";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_AUTO_JOIN_ALLOWLIST_CAMEL: &str = "autoJoinAllowlist";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_GROUP_POLICY: &str = "group_policy";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_GROUP_POLICY_CAMEL: &str = "groupPolicy";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_REQUIRE_MENTION: &str = "require_mention";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_REQUIRE_MENTION_CAMEL: &str = "requireMention";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_USER_MISSING_AUTH_ERROR: &str =
+    "matrix user channel requires settings.access_token or settings.user_id + settings.password";
+
+/// Returns `true` when the channel entry selects user-account (client) mode.
+/// Defaults to appservice mode when `mode` is unset.
+#[cfg(feature = "matrix")]
+pub(super) fn matrix_is_user_mode(entry: &crate::config::ChannelEntry) -> bool {
+    settings_str(&entry.settings, MATRIX_SETTING_MODE, MATRIX_MODE_APPSERVICE)
+        .eq_ignore_ascii_case(MATRIX_MODE_USER)
+}
 
 #[cfg(feature = "matrix")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +160,7 @@ impl MatrixChannelSettings {
                 shutdown,
             )
             .with_admin_allowed_senders(self.allowed_senders.clone())
+            .with_media_dir(data_dir.join("media"))
             .with_bot_router(data_dir),
         )
     }
@@ -146,6 +195,153 @@ pub(super) fn register_matrix_channel(
     channel
 }
 
+/// Settings for the user-account (client) Matrix channel.
+///
+/// Logs in as a regular Matrix account via an access token or password and
+/// long-polls `/sync` — no homeserver-side appservice registration needed.
+#[cfg(feature = "matrix")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MatrixUserChannelSettings {
+    pub(super) homeserver: String,
+    pub(super) user_id: Option<String>,
+    pub(super) access_token: Option<String>,
+    pub(super) password: Option<String>,
+    pub(super) device_name: Option<String>,
+    pub(super) rooms: Vec<String>,
+    pub(super) auto_join: octos_bus::MatrixAutoJoin,
+    pub(super) auto_join_allowlist: Vec<String>,
+    pub(super) group_policy: octos_bus::MatrixGroupPolicy,
+    pub(super) require_mention: bool,
+    pub(super) allowed_senders: Vec<String>,
+}
+
+#[cfg(feature = "matrix")]
+impl MatrixUserChannelSettings {
+    pub(super) fn from_entry(entry: &crate::config::ChannelEntry) -> Result<Self> {
+        let opt = |key: &str| {
+            let value = settings_str(&entry.settings, key, "");
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        };
+
+        let opt_any = |keys: &[&str]| {
+            keys.iter()
+                .map(|key| settings_str(&entry.settings, key, ""))
+                .find(|value| !value.trim().is_empty())
+        };
+
+        let access_token = opt(MATRIX_SETTING_ACCESS_TOKEN);
+        let user_id = opt(MATRIX_SETTING_USER_ID);
+        let password = opt(MATRIX_SETTING_PASSWORD);
+        if access_token.is_none() && (user_id.is_none() || password.is_none()) {
+            eyre::bail!(MATRIX_USER_MISSING_AUTH_ERROR);
+        }
+
+        let string_array = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| entry.settings.get(key))
+                .and_then(|value| {
+                    if let Some(arr) = value.as_array() {
+                        Some(
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        value.as_str().map(|raw| {
+                            raw.split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                    }
+                })
+                .unwrap_or_default()
+        };
+
+        let auto_join = opt_any(&[MATRIX_SETTING_AUTO_JOIN, MATRIX_SETTING_AUTO_JOIN_CAMEL])
+            .map(|raw| octos_bus::MatrixAutoJoin::parse(&raw))
+            .unwrap_or_default();
+        let group_policy = opt_any(&[
+            MATRIX_SETTING_GROUP_POLICY,
+            MATRIX_SETTING_GROUP_POLICY_CAMEL,
+        ])
+        .map(|raw| octos_bus::MatrixGroupPolicy::parse(&raw))
+        .unwrap_or_default();
+        let require_mention = entry
+            .settings
+            .get(MATRIX_SETTING_REQUIRE_MENTION)
+            .or_else(|| entry.settings.get(MATRIX_SETTING_REQUIRE_MENTION_CAMEL))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        Ok(Self {
+            homeserver: settings_str(
+                &entry.settings,
+                MATRIX_SETTING_HOMESERVER,
+                MATRIX_DEFAULT_HOMESERVER,
+            ),
+            user_id,
+            access_token,
+            password,
+            device_name: opt(MATRIX_SETTING_DEVICE_NAME),
+            rooms: string_array(&[MATRIX_SETTING_ROOMS]),
+            auto_join,
+            auto_join_allowlist: string_array(&[
+                MATRIX_SETTING_AUTO_JOIN_ALLOWLIST,
+                MATRIX_SETTING_AUTO_JOIN_ALLOWLIST_CAMEL,
+            ]),
+            group_policy,
+            require_mention,
+            allowed_senders: entry.allowed_senders.clone(),
+        })
+    }
+
+    fn build_channel(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        data_dir: &std::path::Path,
+        channel_index: usize,
+    ) -> Arc<octos_bus::MatrixUserChannel> {
+        Arc::new(
+            octos_bus::MatrixUserChannel::new(
+                &self.homeserver,
+                self.user_id.clone(),
+                self.access_token.clone(),
+                self.password.clone(),
+                self.device_name.clone(),
+                self.rooms.clone(),
+                self.auto_join,
+                self.auto_join_allowlist.clone(),
+                self.group_policy,
+                self.require_mention,
+                self.allowed_senders.clone(),
+                shutdown,
+            )
+            .with_channel_index(channel_index)
+            .with_invite_store(octos_bus::MatrixInviteStore::for_profile_data_dir(data_dir)),
+        )
+    }
+}
+
+#[cfg(feature = "matrix")]
+pub(super) fn register_matrix_user_channel(
+    channel_mgr: &mut ChannelManager,
+    settings: &MatrixUserChannelSettings,
+    shutdown: &Arc<AtomicBool>,
+    data_dir: &std::path::Path,
+    channel_index: usize,
+) -> Arc<octos_bus::MatrixUserChannel> {
+    let channel = settings.build_channel(shutdown.clone(), data_dir, channel_index);
+    channel_mgr.register(channel.clone());
+    channel
+}
+
 /// Bot lifecycle manager for slash commands in Matrix rooms.
 ///
 /// Operates inside the running gateway (async context), uses `MatrixChannel`
@@ -155,6 +351,7 @@ pub(super) struct GatewayBotManager {
     pub(super) store: Arc<crate::profiles::ProfileStore>,
     pub(super) channel: Arc<octos_bus::MatrixChannel>,
     pub(super) parent_profile_id: String,
+    pub(super) cron_service: Arc<octos_bus::CronService>,
 }
 
 #[cfg(feature = "matrix")]
@@ -374,5 +571,33 @@ impl octos_bus::BotManager for GatewayBotManager {
         }
 
         Ok(output.join("\n"))
+    }
+
+    async fn schedule_bot_task(
+        &self,
+        request: &str,
+        _sender: &str,
+        room_id: &str,
+    ) -> eyre::Result<String> {
+        Ok(CronTool::add_natural_language_for_context(
+            &self.cron_service,
+            "matrix",
+            room_id,
+            request,
+        )?
+        .output)
+    }
+
+    async fn list_schedules(&self, _sender: &str, room_id: &str) -> eyre::Result<String> {
+        Ok(CronTool::list_jobs_for_context(self.cron_service.as_ref(), "matrix", room_id).output)
+    }
+
+    async fn unschedule_bot_task(
+        &self,
+        job_id: &str,
+        _sender: &str,
+        room_id: &str,
+    ) -> eyre::Result<String> {
+        Ok(CronTool::remove_job_for_context(&self.cron_service, "matrix", room_id, job_id).output)
     }
 }

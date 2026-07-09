@@ -203,6 +203,23 @@ impl Tool for ReadFileTool {
             });
         }
 
+        // Reject an inverted range (start_line > end_line). Slicing
+        // `lines[start..end]` with start > end panics ("slice index starts at
+        // N but ends at M"), and that panic was crashing the session actor —
+        // taking its in-process sub-agents down with it (mini5 soak). Return a
+        // clear, recoverable error instead of slicing.
+        if start >= end {
+            return Ok(ToolResult {
+                output: format!(
+                    "Invalid line range: start_line {} is past end_line {}",
+                    start + 1,
+                    end
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Format with line numbers
         let mut output = String::new();
         let line_num_width = end.to_string().len();
@@ -343,6 +360,33 @@ mod tests {
         assert!(!result.output.contains("line 1"));
         assert!(!result.output.contains("line 6"));
         assert!(result.output.contains("showing lines 3-5 of 10"));
+    }
+
+    #[tokio::test]
+    async fn read_file_inverted_range_errors_without_panicking() {
+        // mini5 soak regression: start_line > end_line used to panic on
+        // `lines[start..end]` (start>end), crashing the session actor and
+        // orphaning its sub-agents. It must now return a clean error.
+        let dir = tempfile::tempdir().unwrap();
+        let content = (1..=500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        // 351 > 100 — the exact shape from the crash ("starts at 350 but ends at 100").
+        let result = tool
+            .execute(&serde_json::json!({"path": "big.txt", "start_line": 351, "end_line": 100}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "inverted range must be a clean failure");
+        assert!(
+            result.output.contains("Invalid line range") && result.output.contains("351"),
+            "should explain the bad range: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

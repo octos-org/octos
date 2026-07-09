@@ -19,7 +19,7 @@ VERSION="latest"
 PREFIX="${OCTOS_PREFIX:-$HOME/.octos/bin}"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
 PORT="8080"
-AUTH_TOKEN=""
+AUTH_TOKEN="${AUTH_TOKEN:-}"
 FRPS_TOKEN="${FRPS_TOKEN:-}"
 TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-}"
 FRPS_SERVER="${FRPS_SERVER:-}"
@@ -137,7 +137,7 @@ Options:
   --no-smtp              Disable SMTP for dashboard OTP emails
   --install-deps         Forward to install.sh to install missing runtime deps
   --uninstall            Remove octos serve, frps, and Caddy host services/config
-  --purge                Delete the data dir only (preserves bootstrap state)
+  --purge                Delete the data dir and bootstrap state
   --non-interactive      Fail instead of prompting for missing values
   --dry-run              Write config files but print commands instead of executing them
 
@@ -551,6 +551,49 @@ run_cmd_best_effort() {
     fi
 }
 
+run_install_host_tools() {
+    section "Installing host tools (tmux)"
+    # tmux hosts the attachable soak / interactive-TUI sessions on the fleet
+    # (e.g. the DeepSeek soak and the solo-onboarding TUI). Idempotent: skip
+    # when already present. Best-effort by design — a missing package manager
+    # warns rather than failing the whole deploy, since tmux is only needed
+    # for the manual soak workflow, not the production serve daemon.
+    if command -v tmux >/dev/null 2>&1; then
+        ok "tmux already installed ($(tmux -V 2>/dev/null))"
+        return 0
+    fi
+    # The install commands trail `|| warn` so a failed/aborted install does
+    # NOT kill the deploy under `set -eEuo pipefail` (the `||` exempts them
+    # from errexit) — tmux is non-critical host tooling, not the serve daemon.
+    case "$OS" in
+        Darwin)
+            if command -v brew >/dev/null 2>&1; then
+                run_cmd brew install tmux || warn "tmux install failed; install manually (brew install tmux)"
+            else
+                warn "Homebrew not found; install tmux manually (brew install tmux)"
+            fi
+            ;;
+        Linux)
+            if command -v apt-get >/dev/null 2>&1; then
+                run_cmd sudo apt-get install -y tmux || warn "tmux install failed; install manually (apt-get install -y tmux)"
+            elif command -v dnf >/dev/null 2>&1; then
+                run_cmd sudo dnf install -y tmux || warn "tmux install failed; install manually (dnf install -y tmux)"
+            elif command -v yum >/dev/null 2>&1; then
+                run_cmd sudo yum install -y tmux || warn "tmux install failed; install manually (yum install -y tmux)"
+            else
+                warn "no supported package manager (apt-get/dnf/yum); install tmux manually"
+            fi
+            ;;
+    esac
+    if [ "$DRY_RUN" = false ]; then
+        if command -v tmux >/dev/null 2>&1; then
+            ok "tmux installed ($(tmux -V 2>/dev/null))"
+        else
+            warn "tmux not available after install attempt; soak/TUI sessions need it installed manually"
+        fi
+    fi
+}
+
 run_install() {
     section "Installing octos serve"
     local cmd=("$INSTALL_SCRIPT" --version "$VERSION" --prefix "$PREFIX" --port "$PORT" --auth-token "$AUTH_TOKEN")
@@ -674,6 +717,7 @@ run_host_purge() {
     fi
 
     section "Purging local state"
+    run_cmd_best_effort sudo rm -f "$STATE_FILE"
     run_cmd_best_effort sudo rm -rf "$DATA_DIR"
 
     section "Complete"
@@ -684,7 +728,7 @@ run_host_purge() {
         echo "    Preserved installed services and binaries."
     fi
     echo "    Purged data dir:    $DATA_DIR"
-    echo "    Preserved bootstrap state: $STATE_FILE"
+    echo "    Purged bootstrap state: $STATE_FILE"
 }
 
 run_host_uninstall() {
@@ -877,8 +921,10 @@ section "Writing local state"
 write_cloud_config
 write_state_file
 
-run_install
+run_install_host_tools
 # Refresh sudo credentials between long-running steps (macOS default timeout is 5 min)
+[ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
+run_install
 [ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
 run_setup_frps
 [ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true

@@ -94,6 +94,7 @@ impl Channel for CliChannel {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             };
 
             if inbound_tx.send(msg).await.is_err() {

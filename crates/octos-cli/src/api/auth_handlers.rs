@@ -10,11 +10,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::AppState;
 use super::admin::ProfileResponse;
 use super::handlers::response_path_for_profile_file;
-use crate::profiles::mask_secrets;
+use crate::profiles::{ChannelCredentials, UserProfile, is_display_secret_value, mask_secrets};
 use crate::user_store::{User, UserRole};
 
 use super::router::AuthIdentity;
@@ -55,6 +56,40 @@ fn request_host(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     Some(strip_port_from_host(&raw).to_string())
+}
+
+/// The endpoint URL a scanning client should dial: original authority
+/// (host AND port — `request_host` strips the port, which would send
+/// scanners to :80/:443, codex P2) plus `X-Forwarded-Proto` when a
+/// reverse proxy supplies it, else https with a loopback http fallback.
+fn request_endpoint(headers: &HeaderMap) -> Option<String> {
+    let authority = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|p| p == "http" || p == "https");
+    let scheme = forwarded_proto.unwrap_or_else(|| {
+        let host_only = strip_port_from_host(&authority);
+        if host_only == "localhost" || host_only.starts_with("127.") || host_only == "::1" {
+            "http".to_string()
+        } else {
+            "https".to_string()
+        }
+    });
+    Some(format!("{scheme}://{authority}"))
 }
 
 fn strip_port_from_host(host: &str) -> &str {
@@ -667,7 +702,7 @@ pub async fn verify(
                 (None, Some(RootLoginTarget::Allowlisted)) => {
                     user_store.get_by_email(&requested_email).ok().flatten()
                 }
-                (None, None) => None,
+                (None, None) => user_store.get_by_email(&requested_email).ok().flatten(),
             };
 
             if matches!(root_login_target, Some(RootLoginTarget::Allowlisted)) {
@@ -922,6 +957,163 @@ pub async fn my_profile(
     }))
 }
 
+#[derive(Deserialize, Default)]
+pub struct MyProfileQrQuery {
+    #[serde(default)]
+    pub include_secrets: bool,
+    /// Endpoint URL to embed; defaults to the request host.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// Whether an env-var value may be resolved into a QR export for
+/// `profile_id`: plain values always; `keychain:` markers ONLY when they
+/// point at the profile's own scoped account (`VAR::profile_id`). Bare
+/// (`keychain:VAR`) and foreign-scoped markers are refused — both can
+/// address keychain items the profile does not own.
+pub(crate) fn marker_allowed_for_export(raw: &str, var: &str, profile_id: &str) -> bool {
+    if !crate::auth::keychain::is_marker(raw) {
+        return true;
+    }
+    raw == crate::auth::keychain::marker_for(&crate::auth::keychain::scoped_account(
+        var, profile_id,
+    ))
+}
+
+/// Build the QR wire payload from a stored [`crate::profiles::UserProfile`].
+///
+/// Secrets are the profile's OWN `env_vars` entries referenced by its
+/// LLM routes (`api_key_env` on primary + fallbacks) — never the host
+/// process env or auth store, so a tenant export can only ever carry
+/// tenant-scoped credentials. Sub-account inheritance is NOT resolved
+/// here: the payload mirrors the profile as stored.
+pub(crate) fn payload_from_user_profile(
+    profile: &crate::profiles::UserProfile,
+    include_secrets: bool,
+) -> eyre::Result<crate::profile_qr::ProfileQrPayload> {
+    use eyre::WrapErr;
+
+    let mut payload = crate::profile_qr::ProfileQrPayload::new(&profile.id);
+    payload.name = Some(profile.name.clone());
+    if let Some(ref llm) = profile.config.llm {
+        payload.llm = Some(serde_json::to_value(llm).wrap_err("serialize llm config")?);
+    }
+    if let Some(ref memory) = profile.config.memory {
+        payload.memory = Some(serde_json::to_value(memory).wrap_err("serialize memory config")?);
+    }
+    payload.voice_default = profile.config.voice_default.clone();
+
+    if include_secrets {
+        if let Some(ref llm) = profile.config.llm {
+            let routes = llm
+                .primary
+                .iter()
+                .chain(llm.fallbacks.iter())
+                .filter_map(|selection| selection.route.as_ref());
+            for route in routes {
+                let Some(ref var) = route.api_key_env else {
+                    continue;
+                };
+                let Some(raw) = profile.config.env_vars.get(var) else {
+                    continue;
+                };
+                if !marker_allowed_for_export(raw, var, &profile.id) {
+                    // A profile may persist an ARBITRARY keychain marker
+                    // suffix ("keychain:VERTEX_SA_JSON::admin"); resolving
+                    // it here would exfiltrate another tenant's (or the
+                    // host's) keychain item through the QR (codex P1).
+                    continue;
+                }
+                let Some(value) = crate::auth::keychain::resolve_value(var, raw)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                payload.secrets.entry(var.clone()).or_insert(value);
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+/// GET /api/my/profile/qr
+///
+/// Export the caller's profile as an `OCTOS1:`/`OCTOS1E:` payload for
+/// client-side QR rendering. With `include_secrets=true` the payload is
+/// ALWAYS PIN-wrapped (`OCTOS1E`) — there is no plain-secrets override
+/// over the API — and the one-time PIN is returned beside the payload,
+/// so a screenshotted or logged QR image alone reveals nothing.
+pub async fn my_profile_qr(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Query(query): Query<MyProfileQrQuery>,
+) -> Result<
+    (
+        axum::response::AppendHeaders<[(axum::http::HeaderName, &'static str); 2]>,
+        Json<serde_json::Value>,
+    ),
+    (StatusCode, String),
+> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "profile store not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+
+    let mut payload = payload_from_user_profile(&profile, query.include_secrets)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    payload.endpoint = query.endpoint.or_else(|| request_endpoint(&headers));
+
+    let (encoded, pin) = if payload.has_secrets() {
+        // The Argon2id profile is deliberately heavy (64 MiB, t=3) — run
+        // it OFF the async workers, and bound concurrent secret exports
+        // so parallel requests can't pin N×64 MiB + all Tokio workers
+        // (codex round-2 P2).
+        let _permit = SECRET_EXPORT_LIMIT.try_acquire().map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent secret exports; retry shortly".to_string(),
+            )
+        })?;
+        let pin = crate::profile_qr::generate_pin();
+        let sealed_payload = payload.clone();
+        let sealed_pin = pin.clone();
+        let encoded = tokio::task::spawn_blocking(move || {
+            crate::profile_qr::encode_encrypted(&sealed_payload, &sealed_pin)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, Some(pin))
+    } else {
+        let encoded = crate::profile_qr::encode_plain(&payload, false)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (encoded, None)
+    };
+
+    // The response body carries everything needed to decrypt the exported
+    // keys (payload + transfer secret) — it must never land in a shared
+    // cache or be persisted by an intermediary (codex round-2 P2).
+    Ok((
+        axum::response::AppendHeaders([
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ]),
+        Json(serde_json::json!({
+            "payload": encoded,
+            "pin": pin,
+            "profile_id": profile.id,
+        })),
+    ))
+}
+
+/// Bounded concurrency for PIN-wrapped profile exports: each runs a
+/// 64 MiB Argon2id derivation on the blocking pool.
+static SECRET_EXPORT_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// GET /api/my/profile/skills
 pub async fn my_profile_skills(
     State(state): State<Arc<AppState>>,
@@ -1041,7 +1233,48 @@ pub async fn remove_my_profile_skill(
     }))
 }
 
-/// PUT /api/my/profile
+/// Move a freshly-entered keychain-backed secret out of `env_vars` and into the
+/// OS keychain, replacing the stored value with the keychain marker so the
+/// secret never lands in the profile config on disk.
+///
+/// Only a raw, freshly-entered value (JSON object, i.e. starts with `{`) is
+/// relocated. A keychain marker, a masked display value, or an empty string all
+/// mean "unchanged" and are left untouched. Keychain-backed config is
+/// macOS-only: a raw secret on another OS is rejected rather than silently
+/// persisted in plaintext.
+///
+/// The secret is stored under a **profile-scoped** keychain account
+/// (`<key>::<profile_id>`) and the stored marker carries that account, so two
+/// profiles saving different secrets under the same env var never overwrite a
+/// single shared keychain item (each profile reads back its own credential).
+///
+/// `is_macos` and `set_secret` are injected for testability.
+pub(crate) fn relocate_secret_to_keychain(
+    env_vars: &mut HashMap<String, String>,
+    key: &str,
+    profile_id: &str,
+    is_macos: bool,
+    set_secret: impl Fn(&str, &str) -> eyre::Result<()>,
+) -> Result<(), String> {
+    let Some(value) = env_vars.get(key) else {
+        return Ok(());
+    };
+    let value = value.trim().to_string();
+    // Markers / masked / empty values mean "leave as configured".
+    if !value.starts_with('{') {
+        return Ok(());
+    }
+    if !is_macos {
+        return Err(format!(
+            "{key}: keychain-backed credential storage is only supported on macOS"
+        ));
+    }
+    let account = crate::auth::keychain::scoped_account(key, profile_id);
+    set_secret(&account, &value).map_err(|e| format!("failed to store {key} in keychain: {e}"))?;
+    env_vars.insert(key.to_string(), crate::auth::keychain::marker_for(&account));
+    Ok(())
+}
+
 pub async fn update_my_profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1083,9 +1316,13 @@ pub async fn update_my_profile(
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
     }
-    if let Some(config) = req.config {
-        profile.config = config;
-    }
+    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true);
+    // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA JSON,
+    // including a private key pasted under a custom env name) into the OS
+    // keychain before persisting. Uses the shared content-detecting helper so
+    // this path can't diverge from the others.
+    let profile_id = profile.id.clone();
+    super::admin::relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)?;
     profile.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut profile).map_err(|e| {
@@ -1110,6 +1347,1060 @@ pub async fn update_my_profile(
         profile: mask_secrets(&profile),
         status,
     }))
+}
+
+// ── Voice selection endpoints ────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct VoicesResponse {
+    /// Voices the engine can actually synthesize (ref audio present).
+    pub voices: Vec<octos_llm::ominix::VoiceInfo>,
+    /// This user's currently effective reply voice (live override > persisted
+    /// per-profile default > serve default).
+    pub current: String,
+}
+
+/// GET /api/voices — list synthesizable voices + this user's current choice.
+///
+/// Reads the platform registry (`~/.OminiX/models/voices.json`). A missing or
+/// unreadable registry degrades to a single-entry list of the current voice
+/// rather than failing the request.
+pub async fn list_voices(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<VoicesResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
+    let profile_id = profile.id.clone();
+
+    let registry_path = crate::api::voices::registry_path();
+    let (mut voices, registry_default) =
+        match octos_llm::ominix::VoicesRegistry::load(&registry_path) {
+            // Scope the listing to this tenant: shared presets + voices this
+            // profile owns. A clone cloned by another tenant must not appear.
+            Ok(reg) => (
+                reg.synthesizable_visible(|ref_audio| {
+                    crate::api::voices::voice_visible_to(&profile_id, ref_audio)
+                }),
+                reg.default_voice,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %registry_path.display(),
+                    "voices.json unavailable; returning current default only"
+                );
+                (Vec::new(), String::new())
+            }
+        };
+
+    // Fallback chain for the "current" voice when no live override is set: the
+    // bootstrapped per-profile default (already overlays the serve default),
+    // then the registry default, then the first listed voice.
+    let runtime_default = state
+        .profiles
+        .get(&profile_id)
+        .map(|r| r.voice.default_voice.clone())
+        .filter(|s| !s.is_empty());
+    let fallback = runtime_default
+        .or_else(|| {
+            profile
+                .config
+                .voice_default
+                .clone()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| Some(registry_default).filter(|s| !s.is_empty()))
+        .or_else(|| voices.first().map(|v| v.id.clone()))
+        .unwrap_or_default();
+    let current = crate::api::voices::resolve_reply_voice(&profile_id, &fallback);
+
+    // Degrade gracefully: an unreadable registry still shows the current voice.
+    if voices.is_empty() && !current.is_empty() {
+        voices.push(octos_llm::ominix::VoiceInfo {
+            id: current.clone(),
+            aliases: Vec::new(),
+        });
+    }
+
+    Ok(Json(VoicesResponse { voices, current }))
+}
+
+#[derive(Deserialize)]
+pub struct SetVoiceRequest {
+    pub voice: String,
+}
+
+#[derive(Serialize)]
+pub struct SetVoiceResponse {
+    pub ok: bool,
+    pub voice: String,
+}
+
+/// PUT /api/my/voice — set this user's sticky reply-voice default.
+///
+/// Validates the voice against the registry, persists the canonical id to the
+/// profile (sticky across restarts), and records a live override so the switch
+/// takes effect on the next turn without a runtime reload.
+pub async fn set_my_voice(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<SetVoiceRequest>,
+) -> Result<Json<SetVoiceResponse>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let mut profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+
+    // Validate + canonicalise (id or alias → canonical id) against the registry.
+    let registry_path = crate::api::voices::registry_path();
+    let registry = octos_llm::ominix::VoicesRegistry::load(&registry_path).map_err(|e| {
+        tracing::warn!(error = %e, path = %registry_path.display(), "voice registry unavailable");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "voice registry unavailable".into(),
+        )
+    })?;
+    // Resolve only within this tenant's visible set (shared presets + voices it
+    // owns), so a tenant can't select a voice cloned by another profile.
+    let canonical = registry
+        .resolve_visible(req.voice.trim(), |ref_audio| {
+            crate::api::voices::voice_visible_to(&profile.id, ref_audio)
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("unknown voice: {}", req.voice),
+        ))?;
+
+    // Persist (sticky per-user) then set the live override (instant effect).
+    profile.config.voice_default = Some(canonical.clone());
+    profile.updated_at = chrono::Utc::now();
+    ps.save_with_merge(&mut profile).map_err(|e| {
+        tracing::error!(profile = %profile.id, error = %e, "failed to persist voice choice");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    crate::api::voices::set_override(&profile.id, &canonical);
+
+    tracing::info!(profile = %profile.id, voice = %canonical, "reply voice updated");
+    Ok(Json(SetVoiceResponse {
+        ok: true,
+        voice: canonical,
+    }))
+}
+
+// ── Matrix invite review endpoints ────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct MatrixUserChannelConfig {
+    homeserver: String,
+    user_id: Option<String>,
+    access_token: Option<String>,
+    password: Option<String>,
+    device_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MatrixResolvedLogin {
+    access_token: String,
+    user_id: String,
+    device_id: Option<String>,
+    logout_after: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MatrixSyncProbe {
+    joined_rooms: usize,
+    pending_invites: usize,
+    has_next_batch: bool,
+    pending_invite_details: Vec<MatrixSyncInviteSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MatrixSyncInviteSummary {
+    room_id: String,
+    room_name: Option<String>,
+    canonical_alias: Option<String>,
+    inviter: Option<String>,
+    membership_event_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MatrixInviteActionRequest {
+    #[serde(default)]
+    pub channel_index: Option<usize>,
+    #[serde(default)]
+    pub add_to_allowed_rooms: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MatrixTestConnectionRequest {
+    #[serde(default)]
+    pub channel_index: Option<usize>,
+    #[serde(default)]
+    pub channel: Option<MatrixTestChannelDraft>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct MatrixTestChannelDraft {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub homeserver: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+}
+
+fn matrix_user_channel_config(
+    profile: &UserProfile,
+    channel_index: usize,
+) -> Result<MatrixUserChannelConfig, (StatusCode, String)> {
+    let Some(channel) = profile.config.channels.get(channel_index) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Matrix channel index {channel_index} not found"),
+        ));
+    };
+
+    let ChannelCredentials::Matrix {
+        homeserver,
+        mode,
+        user_id,
+        access_token,
+        password,
+        device_name,
+        ..
+    } = channel
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Channel index {channel_index} is not a Matrix channel"),
+        ));
+    };
+
+    if !mode.eq_ignore_ascii_case("user") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matrix invite review is only supported for user-account mode".into(),
+        ));
+    }
+
+    let has_token = !access_token.trim().is_empty();
+    let has_password_login = !user_id.trim().is_empty() && !password.trim().is_empty();
+    if !has_token && !has_password_login {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matrix user channel requires an access token or user_id + password".into(),
+        ));
+    }
+    if !has_token {
+        validate_matrix_user_id(user_id)?;
+    }
+
+    let homeserver = if homeserver.trim().is_empty() {
+        "http://localhost:6167".to_string()
+    } else {
+        homeserver.trim_end_matches('/').to_string()
+    };
+
+    Ok(MatrixUserChannelConfig {
+        homeserver,
+        user_id: non_empty_string(user_id),
+        access_token: non_empty_string(access_token),
+        password: non_empty_string(password),
+        device_name: non_empty_string(device_name),
+    })
+}
+
+fn matrix_test_channel_config(
+    profile: &UserProfile,
+    request: &MatrixTestConnectionRequest,
+) -> Result<MatrixUserChannelConfig, (StatusCode, String)> {
+    let draft = request.channel.as_ref();
+    if let Some(mode) = draft.and_then(|channel| non_empty_string_opt(channel.mode.as_deref())) {
+        if !mode.eq_ignore_ascii_case("user") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Matrix connection test is only supported for user-account mode".into(),
+            ));
+        }
+    }
+
+    let mut config = match request
+        .channel_index
+        .or_else(|| first_matrix_user_channel_index(profile))
+    {
+        Some(channel_index) => matrix_user_channel_config(profile, channel_index)?,
+        None => MatrixUserChannelConfig {
+            homeserver: "http://localhost:6167".into(),
+            user_id: None,
+            access_token: None,
+            password: None,
+            device_name: None,
+        },
+    };
+
+    if let Some(channel) = draft {
+        if let Some(value) = non_empty_string_opt(channel.homeserver.as_deref()) {
+            config.homeserver = value.trim_end_matches('/').to_string();
+        }
+        if let Some(value) = non_empty_string_opt(channel.user_id.as_deref()) {
+            config.user_id = Some(value);
+        }
+        apply_matrix_draft_secret(&mut config.access_token, channel.access_token.as_deref());
+        apply_matrix_draft_secret(&mut config.password, channel.password.as_deref());
+        if let Some(value) = non_empty_string_opt(channel.device_name.as_deref()) {
+            config.device_name = Some(value);
+        }
+    }
+
+    if config.access_token.is_none() && (config.user_id.is_none() || config.password.is_none()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Matrix user channel requires an access token or user_id + password".into(),
+        ));
+    }
+    if config.access_token.is_none() {
+        if let Some(user_id) = config.user_id.as_deref() {
+            validate_matrix_user_id(user_id)?;
+        }
+    }
+
+    Ok(config)
+}
+
+fn first_matrix_user_channel_index(profile: &UserProfile) -> Option<usize> {
+    profile
+        .config
+        .channels
+        .iter()
+        .enumerate()
+        .find_map(|(idx, channel)| match channel {
+            ChannelCredentials::Matrix { mode, .. } if mode.eq_ignore_ascii_case("user") => {
+                Some(idx)
+            }
+            _ => None,
+        })
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn non_empty_string_opt(value: Option<&str>) -> Option<String> {
+    value.and_then(non_empty_string)
+}
+
+fn apply_matrix_draft_secret(target: &mut Option<String>, draft: Option<&str>) {
+    let Some(value) = draft else {
+        return;
+    };
+    let trimmed = value.trim();
+    if is_display_secret_value(trimmed) {
+        return;
+    }
+    if trimmed.is_empty() {
+        *target = None;
+    } else {
+        *target = Some(trimmed.to_string());
+    }
+}
+
+fn validate_matrix_user_id(user_id: &str) -> Result<(), (StatusCode, String)> {
+    let trimmed = user_id.trim();
+    if is_matrix_full_user_id(trimmed) || is_matrix_login_localpart(trimmed) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Matrix login user must be a localpart like octos or a full Matrix ID like @octos:octos.meldry.com; do not use octos:octos.meldry.com without @.".into(),
+    ))
+}
+
+fn is_matrix_full_user_id(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('@') else {
+        return false;
+    };
+    let Some((localpart, server_name)) = rest.split_once(':') else {
+        return false;
+    };
+    !localpart.is_empty() && !server_name.trim().is_empty()
+}
+
+fn is_matrix_login_localpart(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(':')
+        && !value.starts_with('@')
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'.'
+                    | b'_'
+                    | b'='
+                    | b'-'
+                    | b'/'
+                    | b'+'
+            )
+        })
+}
+
+fn matrix_percent_encode_path(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+const MATRIX_ERROR_BODY_MAX_BYTES: usize = 2048;
+
+fn matrix_api_url(homeserver: &str, path: &str) -> String {
+    format!("{}{}", homeserver.trim_end_matches('/'), path)
+}
+
+/// HTTP client for Matrix admin calls (whoami/login/join/leave/sync?timeout=0).
+///
+/// All of these are immediate requests — unlike the gateway's long-poll `/sync`
+/// — so a bounded timeout keeps a slow or unreachable user-supplied homeserver
+/// from holding an axum worker open indefinitely.
+fn matrix_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build Matrix HTTP client")
+}
+
+async fn matrix_error_body(resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut truncated = resp
+        .content_length()
+        .map(|len| len > MATRIX_ERROR_BODY_MAX_BYTES as u64)
+        .unwrap_or(false);
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if buf.len() + chunk.len() > MATRIX_ERROR_BODY_MAX_BYTES {
+                    let remaining = MATRIX_ERROR_BODY_MAX_BYTES.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    sanitize_matrix_error_body(&String::from_utf8_lossy(&buf), truncated)
+}
+
+fn sanitize_matrix_error_body(raw: &str, truncated: bool) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in raw.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+
+    let mut out = out.trim().to_string();
+    if truncated {
+        if out.is_empty() {
+            out.push_str("[truncated]");
+        } else {
+            out.push_str(" ... [truncated]");
+        }
+    }
+    out
+}
+
+async fn resolve_matrix_login(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+) -> Result<MatrixResolvedLogin, (StatusCode, String)> {
+    if let Some(token) = config.access_token.as_deref() {
+        let url = matrix_api_url(&config.homeserver, "/_matrix/client/v3/account/whoami");
+        let resp = http
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = matrix_error_body(resp).await;
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Matrix whoami failed (status={status}): {body}"),
+            ));
+        }
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        let user_id = payload
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| config.user_id.clone())
+            .ok_or((
+                StatusCode::BAD_GATEWAY,
+                "Matrix whoami response missing user_id".into(),
+            ))?;
+        let device_id = payload
+            .get("device_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        return Ok(MatrixResolvedLogin {
+            access_token: token.to_string(),
+            user_id,
+            device_id,
+            logout_after: false,
+        });
+    }
+
+    let user_id = config
+        .user_id
+        .as_deref()
+        .ok_or((StatusCode::BAD_REQUEST, "Matrix user_id is required".into()))?;
+    let password = config.password.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "Matrix password is required".into(),
+    ))?;
+    let body = json!({
+        "type": "m.login.password",
+        "identifier": { "type": "m.id.user", "user": user_id },
+        "password": password,
+        "initial_device_display_name": config.device_name.as_deref().unwrap_or("octos"),
+    });
+    let url = matrix_api_url(&config.homeserver, "/_matrix/client/v3/login");
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = matrix_error_body(resp).await;
+        return Err((StatusCode::BAD_GATEWAY, matrix_login_error(status, &body)));
+    }
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let token = payload
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Matrix login response missing access_token".into(),
+        ))?;
+    let user_id = payload
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| user_id.to_string());
+    let device_id = payload
+        .get("device_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Ok(MatrixResolvedLogin {
+        access_token: token.to_string(),
+        user_id,
+        device_id,
+        logout_after: true,
+    })
+}
+
+fn matrix_login_error(status: reqwest::StatusCode, body: &str) -> String {
+    let server_error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| body.trim().to_string());
+    let lower = server_error.to_ascii_lowercase();
+    if lower.contains("delegated authentication") || lower.contains("oidc") {
+        return format!(
+            "Matrix password login is not available on this homeserver (status={status}): \
+             it uses delegated authentication/OIDC. Paste a valid Matrix access token in \
+             Access token, or enable password login on the homeserver."
+        );
+    }
+    if server_error.is_empty() {
+        format!("Matrix login failed (status={status})")
+    } else {
+        format!("Matrix login failed (status={status}): {server_error}")
+    }
+}
+
+async fn logout_matrix_login(
+    http: &reqwest::Client,
+    homeserver: &str,
+    login: &MatrixResolvedLogin,
+) {
+    if !login.logout_after {
+        return;
+    }
+    let url = matrix_api_url(homeserver, "/_matrix/client/v3/logout");
+    if let Err(e) = http
+        .post(&url)
+        .bearer_auth(&login.access_token)
+        .send()
+        .await
+    {
+        tracing::warn!(error = %e, "Matrix logout after invite action failed");
+    }
+}
+
+async fn matrix_join_room(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+    login: &MatrixResolvedLogin,
+    room_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/join",
+        matrix_percent_encode_path(room_id)
+    );
+    let url = matrix_api_url(&config.homeserver, &path);
+    let resp = http
+        .post(&url)
+        .bearer_auth(&login.access_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = matrix_error_body(resp).await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Matrix join room failed (status={status}): {body}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn matrix_leave_room(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+    login: &MatrixResolvedLogin,
+    room_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/leave",
+        matrix_percent_encode_path(room_id)
+    );
+    let url = matrix_api_url(&config.homeserver, &path);
+    let resp = http
+        .post(&url)
+        .bearer_auth(&login.access_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = matrix_error_body(resp).await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Matrix reject invite failed (status={status}): {body}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn matrix_probe_sync(
+    http: &reqwest::Client,
+    config: &MatrixUserChannelConfig,
+    login: &MatrixResolvedLogin,
+) -> Result<MatrixSyncProbe, (StatusCode, String)> {
+    let url = matrix_api_url(&config.homeserver, "/_matrix/client/v3/sync?timeout=0");
+    let resp = http
+        .get(&url)
+        .bearer_auth(&login.access_token)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = matrix_error_body(resp).await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Matrix sync probe failed (status={status}): {body}"),
+        ));
+    }
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let rooms = payload.get("rooms");
+    let joined_rooms = rooms
+        .and_then(|rooms| rooms.get("join"))
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    let invite_rooms = rooms
+        .and_then(|rooms| rooms.get("invite"))
+        .and_then(serde_json::Value::as_object);
+    let pending_invites = invite_rooms.map_or(0, serde_json::Map::len);
+    let pending_invite_details = invite_rooms
+        .map(|rooms| matrix_sync_invite_details(rooms, &login.user_id))
+        .unwrap_or_default();
+    let has_next_batch = payload
+        .get("next_batch")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    Ok(MatrixSyncProbe {
+        joined_rooms,
+        pending_invites,
+        has_next_batch,
+        pending_invite_details,
+    })
+}
+
+fn matrix_sync_invite_details(
+    invite_rooms: &serde_json::Map<String, serde_json::Value>,
+    self_user_id: &str,
+) -> Vec<MatrixSyncInviteSummary> {
+    invite_rooms
+        .iter()
+        .map(|(room_id, room)| matrix_sync_invite_detail(room_id, room, self_user_id))
+        .collect()
+}
+
+fn matrix_sync_invite_detail(
+    room_id: &str,
+    room: &serde_json::Value,
+    self_user_id: &str,
+) -> MatrixSyncInviteSummary {
+    let mut summary = MatrixSyncInviteSummary {
+        room_id: room_id.to_string(),
+        room_name: None,
+        canonical_alias: None,
+        inviter: None,
+        membership_event_id: None,
+    };
+
+    let Some(events) = room
+        .get("invite_state")
+        .and_then(|state| state.get("events"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return summary;
+    };
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str);
+        let content = event.get("content").unwrap_or(&serde_json::Value::Null);
+        match event_type {
+            Some("m.room.name") if summary.room_name.is_none() => {
+                summary.room_name = content
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            Some("m.room.canonical_alias") if summary.canonical_alias.is_none() => {
+                summary.canonical_alias = content
+                    .get("alias")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            Some("m.room.member") => {
+                let membership = content
+                    .get("membership")
+                    .and_then(serde_json::Value::as_str);
+                let state_key = event.get("state_key").and_then(serde_json::Value::as_str);
+                if membership == Some("invite")
+                    && (state_key.is_none() || state_key == Some(self_user_id))
+                {
+                    summary.inviter = event
+                        .get("sender")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    summary.membership_event_id = event
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+fn resolve_invite_channel_index(
+    profile: &UserProfile,
+    store: &octos_bus::MatrixInviteStore,
+    room_id: &str,
+    requested: Option<usize>,
+) -> Result<usize, (StatusCode, String)> {
+    if let Some(channel_index) = requested {
+        return Ok(channel_index);
+    }
+    let invites = store
+        .list(true)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(invite) = invites.iter().find(|invite| invite.room_id == room_id) {
+        return Ok(invite.channel_index);
+    }
+    first_matrix_user_channel_index(profile).ok_or((
+        StatusCode::NOT_FOUND,
+        "No Matrix user-account channel configured".into(),
+    ))
+}
+
+fn add_room_to_matrix_allowlist(
+    profile: &mut UserProfile,
+    channel_index: usize,
+    room_id: &str,
+) -> Result<bool, (StatusCode, String)> {
+    let Some(channel) = profile.config.channels.get_mut(channel_index) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Matrix channel index {channel_index} not found"),
+        ));
+    };
+    let ChannelCredentials::Matrix { rooms, .. } = channel else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Channel index {channel_index} is not a Matrix channel"),
+        ));
+    };
+    if rooms.iter().any(|room| room == room_id || room == "*") {
+        return Ok(false);
+    }
+    rooms.push(room_id.to_string());
+    Ok(true)
+}
+
+/// POST /api/my/profile/matrix/test
+pub async fn test_my_matrix_connection(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<MatrixTestConnectionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let config = matrix_test_channel_config(&profile, &req)?;
+
+    let http = matrix_http_client();
+    let login = resolve_matrix_login(&http, &config).await?;
+    let sync_result = matrix_probe_sync(&http, &config, &login).await;
+    logout_matrix_login(&http, &config.homeserver, &login).await;
+    let probe = sync_result?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Matrix connection is healthy",
+        "homeserver": config.homeserver,
+        "user_id": login.user_id,
+        "device_id": login.device_id,
+        "joined_rooms": probe.joined_rooms,
+        "pending_invites": probe.pending_invites,
+        "pending_invite_details": probe.pending_invite_details,
+        "sync": {
+            "ok": true,
+            "has_next_batch": probe.has_next_batch,
+        },
+    })))
+}
+
+/// GET /api/my/profile/matrix/invites
+pub async fn my_matrix_invites(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let invites = store
+        .list(false)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "invites": invites })))
+}
+
+/// POST /api/my/profile/matrix/invites/:room_id/accept
+pub async fn accept_my_matrix_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(room_id): Path<String>,
+    Json(req): Json<MatrixInviteActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let mut profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let channel_index =
+        resolve_invite_channel_index(&profile, &store, &room_id, req.channel_index)?;
+    let config = matrix_user_channel_config(&profile, channel_index)?;
+
+    let http = matrix_http_client();
+    let login = resolve_matrix_login(&http, &config).await?;
+    let join_result = matrix_join_room(&http, &config, &login, &room_id).await;
+    logout_matrix_login(&http, &config.homeserver, &login).await;
+    join_result?;
+
+    let add_to_allowed_rooms = req.add_to_allowed_rooms.unwrap_or(true);
+    let allowlist_updated = if add_to_allowed_rooms {
+        add_room_to_matrix_allowlist(&mut profile, channel_index, &room_id)?
+    } else {
+        false
+    };
+    if allowlist_updated {
+        profile.updated_at = chrono::Utc::now();
+        ps.save_with_merge(&mut profile).map_err(|e| {
+            tracing::error!(profile = %profile.id, error = %e, "failed to save Matrix room allowlist");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+    }
+    store
+        .remove(channel_index, &room_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": if allowlist_updated {
+            "Matrix invite accepted and room added to allowed rooms"
+        } else {
+            "Matrix invite accepted"
+        },
+        "allowlist_updated": allowlist_updated,
+    })))
+}
+
+/// POST /api/my/profile/matrix/invites/:room_id/reject
+pub async fn reject_my_matrix_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(room_id): Path<String>,
+    Json(req): Json<MatrixInviteActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let channel_index =
+        resolve_invite_channel_index(&profile, &store, &room_id, req.channel_index)?;
+    let config = matrix_user_channel_config(&profile, channel_index)?;
+
+    let http = matrix_http_client();
+    let login = resolve_matrix_login(&http, &config).await?;
+    let leave_result = matrix_leave_room(&http, &config, &login, &room_id).await;
+    logout_matrix_login(&http, &config.homeserver, &login).await;
+    leave_result?;
+
+    store
+        .remove(channel_index, &room_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Matrix invite rejected",
+    })))
+}
+
+/// POST /api/my/profile/matrix/invites/:room_id/dismiss
+pub async fn dismiss_my_matrix_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(room_id): Path<String>,
+    Json(req): Json<MatrixInviteActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let store = octos_bus::MatrixInviteStore::for_profile_data_dir(&data_dir);
+    let channel_index =
+        resolve_invite_channel_index(&profile, &store, &room_id, req.channel_index)?;
+    let dismissed = store
+        .dismiss(channel_index, &room_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "dismissed": dismissed,
+        "message": "Matrix invite dismissed locally",
+    })))
 }
 
 // ── Soul endpoints ───────────────────────────────────────────────────
@@ -1772,6 +3063,10 @@ pub async fn create_my_sub_account(
 
     if !req.env_vars.is_empty() {
         sub.config.env_vars = req.env_vars;
+        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
+        // persisting so a sub-account never writes a private key to disk.
+        let sub_id = sub.id.clone();
+        super::admin::relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
         sub.updated_at = chrono::Utc::now();
         ps.save(&sub)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1864,9 +3159,11 @@ pub async fn update_my_sub_account(
     if let Some(enabled) = req.enabled {
         sub.enabled = enabled;
     }
-    if let Some(config) = req.config {
-        sub.config = config;
-    }
+    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true);
+    // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
+    // persisting so a sub-account never writes a private key to disk.
+    let sub_id = sub.id.clone();
+    super::admin::relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
     sub.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut sub)
@@ -2052,7 +3349,7 @@ pub(crate) fn is_authorized_for_profile(
 ///
 /// For regular users, returns their user ID. For admin token, returns the admin's own profile ID
 /// (auto-creating the admin profile if it doesn't exist yet).
-fn resolve_my_profile_id(
+pub(crate) fn resolve_my_profile_id(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
     state: &AppState,
@@ -2347,6 +3644,270 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::Request;
 
+    // --- payload_from_user_profile (profile QR export) ---
+
+    fn qr_profile_fixture() -> crate::profiles::UserProfile {
+        let mut profile = crate::profiles::UserProfile {
+            id: "ada".into(),
+            name: "Ada".into(),
+            public_subdomain: None,
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-pro".into()),
+                route: Some(crate::profiles::LlmRouteConfig {
+                    route_id: None,
+                    label: None,
+                    base_url: None,
+                    api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                    api_type: None,
+                }),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: vec![],
+        });
+        profile
+            .config
+            .env_vars
+            .insert("DEEPSEEK_API_KEY".into(), "sk-profile-key".into());
+        profile.config.env_vars.insert(
+            "TELEGRAM_BOT_TOKEN".into(),
+            "bot-token-must-not-leak".into(),
+        );
+        profile
+    }
+
+    #[test]
+    fn qr_payload_without_secrets_masks_nothing_because_nothing_is_included() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, false).unwrap();
+        assert_eq!(payload.id, "ada");
+        assert_eq!(payload.name.as_deref(), Some("Ada"));
+        assert!(payload.llm.is_some());
+        assert!(payload.secrets.is_empty());
+        assert!(!payload.has_secrets());
+    }
+
+    #[test]
+    fn qr_payload_with_secrets_includes_only_llm_route_referenced_vars() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        assert_eq!(payload.secrets["DEEPSEEK_API_KEY"], "sk-profile-key");
+        assert!(
+            !payload.secrets.contains_key("TELEGRAM_BOT_TOKEN"),
+            "env vars not referenced by an LLM route must not ride along"
+        );
+    }
+
+    #[test]
+    fn qr_export_refuses_foreign_and_bare_keychain_markers() {
+        // plain values export
+        assert!(marker_allowed_for_export(
+            "sk-plain",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // own scoped marker exports
+        assert!(marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // ANOTHER tenant's scoped account: refuse (exfiltration vector)
+        assert!(!marker_allowed_for_export(
+            "keychain:VERTEX_SA_JSON::admin",
+            "VERTEX_SA_JSON",
+            "ada"
+        ));
+        // bare marker addresses a host-level item: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:DEEPSEEK_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+        // marker under a DIFFERENT var name than referenced: refuse
+        assert!(!marker_allowed_for_export(
+            "keychain:OTHER_VAR::ada",
+            "DEEPSEEK_API_KEY",
+            "ada"
+        ));
+    }
+
+    #[test]
+    fn qr_endpoint_keeps_port_and_honors_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://localhost:50080"),
+            "authority (incl. port) must survive; loopback defaults to http"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "ada.crew.example.com".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("https://ada.crew.example.com")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::1]:50080".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://[::1]:50080"),
+            "bracketed IPv6 loopback is local, not https"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            "ada.crew.example.com:8443".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            request_endpoint(&headers).as_deref(),
+            Some("http://ada.crew.example.com:8443"),
+            "reverse-proxy proto must win over the https default"
+        );
+    }
+
+    #[test]
+    fn qr_payload_secrets_round_trip_pin_wrapped() {
+        let profile = qr_profile_fixture();
+        let payload = payload_from_user_profile(&profile, true).unwrap();
+        let encoded = crate::profile_qr::encode_encrypted(&payload, "246810").unwrap();
+        let decoded = crate::profile_qr::decode(&encoded, Some("246810")).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(crate::profile_qr::decode(&encoded, Some("000000")).is_err());
+    }
+
+    // --- relocate_secret_to_keychain ---
+
+    use std::cell::RefCell;
+
+    fn env_with(key: &str, val: &str) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(key.to_string(), val.to_string());
+        m
+    }
+
+    #[test]
+    fn relocates_raw_json_to_keychain_on_macos() {
+        let mut env = env_with("VERTEX_SA_JSON", r#"{"private_key":"x","project_id":"p"}"#);
+        let stored: RefCell<Vec<(String, String)>> = RefCell::new(vec![]);
+        let res = relocate_secret_to_keychain(&mut env, "VERTEX_SA_JSON", "alice", true, |n, s| {
+            stored.borrow_mut().push((n.to_string(), s.to_string()));
+            Ok(())
+        });
+        assert!(res.is_ok());
+        // value replaced with a profile-scoped marker; raw JSON went to the
+        // keychain under a profile-scoped account.
+        assert_eq!(
+            env.get("VERTEX_SA_JSON").unwrap(),
+            "keychain:VERTEX_SA_JSON::alice"
+        );
+        assert_eq!(stored.borrow().len(), 1);
+        assert_eq!(stored.borrow()[0].0, "VERTEX_SA_JSON::alice");
+        assert!(stored.borrow()[0].1.contains("private_key"));
+    }
+
+    #[test]
+    fn two_profiles_get_distinct_keychain_accounts() {
+        // The core of the fix: two profiles saving a Vertex SA under the same
+        // env var must land in DISTINCT keychain accounts (and persist distinct
+        // markers), so neither overwrites nor resolves the other's private key.
+        let json = r#"{"private_key":"x"}"#;
+        let stored: RefCell<Vec<(String, String)>> = RefCell::new(vec![]);
+        let mut alice = env_with("VERTEX_SA_JSON", json);
+        let mut bob = env_with("VERTEX_SA_JSON", json);
+        relocate_secret_to_keychain(&mut alice, "VERTEX_SA_JSON", "alice", true, |n, s| {
+            stored.borrow_mut().push((n.to_string(), s.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        relocate_secret_to_keychain(&mut bob, "VERTEX_SA_JSON", "bob", true, |n, s| {
+            stored.borrow_mut().push((n.to_string(), s.to_string()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(stored.borrow()[0].0, "VERTEX_SA_JSON::alice");
+        assert_eq!(stored.borrow()[1].0, "VERTEX_SA_JSON::bob");
+        assert_eq!(
+            alice.get("VERTEX_SA_JSON").unwrap(),
+            "keychain:VERTEX_SA_JSON::alice"
+        );
+        assert_eq!(
+            bob.get("VERTEX_SA_JSON").unwrap(),
+            "keychain:VERTEX_SA_JSON::bob"
+        );
+        assert_ne!(alice.get("VERTEX_SA_JSON"), bob.get("VERTEX_SA_JSON"));
+    }
+
+    #[test]
+    fn rejects_raw_json_on_non_macos() {
+        let mut env = env_with("VERTEX_SA_JSON", r#"{"private_key":"x"}"#);
+        let called = RefCell::new(false);
+        let res =
+            relocate_secret_to_keychain(&mut env, "VERTEX_SA_JSON", "alice", false, |_, _| {
+                *called.borrow_mut() = true;
+                Ok(())
+            });
+        assert!(res.is_err());
+        assert!(!*called.borrow(), "must not write keychain off macOS");
+        // value left untouched (not persisted plaintext silently).
+        assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
+    }
+
+    #[test]
+    fn leaves_keychain_marker_untouched() {
+        let mut env = env_with("VERTEX_SA_JSON", crate::auth::KEYCHAIN_MARKER);
+        let called = RefCell::new(false);
+        let res = relocate_secret_to_keychain(&mut env, "VERTEX_SA_JSON", "alice", true, |_, _| {
+            *called.borrow_mut() = true;
+            Ok(())
+        });
+        assert!(res.is_ok());
+        assert!(
+            !*called.borrow(),
+            "marker means unchanged — no keychain write"
+        );
+        assert_eq!(
+            env.get("VERTEX_SA_JSON").unwrap(),
+            crate::auth::KEYCHAIN_MARKER
+        );
+    }
+
+    #[test]
+    fn is_noop_when_key_absent_or_masked() {
+        // absent key
+        let mut empty = HashMap::new();
+        assert!(
+            relocate_secret_to_keychain(&mut empty, "VERTEX_SA_JSON", "alice", true, |_, _| Ok(()))
+                .is_ok()
+        );
+        // masked / non-JSON value is treated as "unchanged"
+        let mut masked = env_with("VERTEX_SA_JSON", "abcd***xyz");
+        let called = RefCell::new(false);
+        let res =
+            relocate_secret_to_keychain(&mut masked, "VERTEX_SA_JSON", "alice", true, |_, _| {
+                *called.borrow_mut() = true;
+                Ok(())
+            });
+        assert!(res.is_ok());
+        assert!(!*called.borrow());
+        assert_eq!(masked.get("VERTEX_SA_JSON").unwrap(), "abcd***xyz");
+    }
+
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
         let dir = tempfile::tempdir().unwrap();
         let ps = ProfileStore::open(dir.path()).unwrap();
@@ -2451,6 +4012,325 @@ mod tests {
         headers.insert("Host", "localhost:3000".parse().unwrap());
         headers.insert("X-Profile-Id", profile_id.parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn matrix_percent_encode_path_encodes_room_ids() {
+        assert_eq!(
+            matrix_percent_encode_path("!room:example.org"),
+            "%21room%3Aexample.org"
+        );
+    }
+
+    #[test]
+    fn matrix_sync_invite_details_include_room_and_inviter() {
+        let invite_rooms = json!({
+            "!ops:example.org": {
+                "invite_state": {
+                    "events": [
+                        {
+                            "type": "m.room.name",
+                            "content": { "name": "Ops Room" }
+                        },
+                        {
+                            "type": "m.room.canonical_alias",
+                            "content": { "alias": "#ops:example.org" }
+                        },
+                        {
+                            "type": "m.room.member",
+                            "sender": "@alice:example.org",
+                            "state_key": "@octos:example.org",
+                            "event_id": "$invite1",
+                            "content": { "membership": "invite" }
+                        }
+                    ]
+                }
+            }
+        });
+        let invite_rooms = invite_rooms.as_object().unwrap();
+
+        let details = matrix_sync_invite_details(invite_rooms, "@octos:example.org");
+
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].room_id, "!ops:example.org");
+        assert_eq!(details[0].room_name.as_deref(), Some("Ops Room"));
+        assert_eq!(
+            details[0].canonical_alias.as_deref(),
+            Some("#ops:example.org")
+        );
+        assert_eq!(details[0].inviter.as_deref(), Some("@alice:example.org"));
+        assert_eq!(details[0].membership_event_id.as_deref(), Some("$invite1"));
+    }
+
+    #[test]
+    fn matrix_error_body_sanitizes_and_marks_truncation() {
+        let summary = sanitize_matrix_error_body("line1\nline2\t\u{0}secret", true);
+
+        assert_eq!(summary, "line1 line2 secret ... [truncated]");
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn matrix_http_client_does_not_follow_redirects() {
+        use axum::Router;
+        use axum::response::Redirect;
+        use axum::routing::get;
+
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { Redirect::temporary("/target") }),
+            )
+            .route("/target", get(|| async { "target" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = matrix_http_client()
+            .get(format!("http://{addr}/redirect"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[test]
+    fn matrix_accept_adds_room_to_allowlist_once() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_token".into(),
+            password: String::new(),
+            device_name: "octos".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        assert!(add_room_to_matrix_allowlist(&mut profile, 0, "!room:example.org").unwrap());
+        assert!(!add_room_to_matrix_allowlist(&mut profile, 0, "!room:example.org").unwrap());
+        let ChannelCredentials::Matrix { rooms, .. } = &profile.config.channels[0] else {
+            panic!("expected matrix channel");
+        };
+        assert_eq!(rooms, &vec!["!room:example.org".to_string()]);
+    }
+
+    #[test]
+    fn matrix_test_config_overlays_draft_values() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://old.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@old:example.org".into(),
+            access_token: "old_token".into(),
+            password: String::new(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://new.example.org/".into()),
+                user_id: Some("@new:example.org".into()),
+                access_token: Some("new_token".into()),
+                password: None,
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.homeserver, "https://new.example.org");
+        assert_eq!(config.user_id.as_deref(), Some("@new:example.org"));
+        assert_eq!(config.access_token.as_deref(), Some("new_token"));
+        assert_eq!(config.device_name.as_deref(), Some("old-device"));
+    }
+
+    #[test]
+    fn matrix_test_config_ignores_masked_draft_secrets() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_real_access_token".into(),
+            password: "real-password".into(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: None,
+                user_id: None,
+                access_token: Some("syt_***ken".into()),
+                password: Some("***".into()),
+                device_name: Some("new-device".into()),
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(
+            config.access_token.as_deref(),
+            Some("syt_real_access_token")
+        );
+        assert_eq!(config.password.as_deref(), Some("real-password"));
+        assert_eq!(config.device_name.as_deref(), Some("new-device"));
+    }
+
+    #[test]
+    fn matrix_test_config_empty_access_token_clears_saved_token() {
+        let mut profile = make_user_profile("matrix-user", "Matrix User");
+        profile.config.channels.push(ChannelCredentials::Matrix {
+            homeserver: "https://matrix.example.org".into(),
+            as_token: String::new(),
+            hs_token: String::new(),
+            server_name: String::new(),
+            sender_localpart: "octos".into(),
+            user_prefix: "octos_".into(),
+            port: 8009,
+            allowed_senders: Vec::new(),
+            mode: "user".into(),
+            user_id: "@bot:example.org".into(),
+            access_token: "syt_real_access_token".into(),
+            password: String::new(),
+            device_name: "old-device".into(),
+            rooms: Vec::new(),
+            auto_join: "off".into(),
+            auto_join_allowlist: Vec::new(),
+            group_policy: "allowlist".into(),
+            require_mention: true,
+        });
+
+        let request = MatrixTestConnectionRequest {
+            channel_index: Some(0),
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: None,
+                user_id: None,
+                access_token: Some(String::new()),
+                password: Some("new-password".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.access_token, None);
+        assert_eq!(config.password.as_deref(), Some("new-password"));
+    }
+
+    #[test]
+    fn matrix_test_config_accepts_password_login_localpart() {
+        let profile = make_user_profile("matrix-user", "Matrix User");
+        let request = MatrixTestConnectionRequest {
+            channel_index: None,
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://matrix.example.org".into()),
+                user_id: Some("octos".into()),
+                access_token: None,
+                password: Some("secret".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.user_id.as_deref(), Some("octos"));
+    }
+
+    #[test]
+    fn matrix_test_config_accepts_password_login_full_user_id() {
+        let profile = make_user_profile("matrix-user", "Matrix User");
+        let request = MatrixTestConnectionRequest {
+            channel_index: None,
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://matrix.example.org".into()),
+                user_id: Some("@octos:octos.meldry.com".into()),
+                access_token: None,
+                password: Some("secret".into()),
+                device_name: None,
+            }),
+        };
+
+        let config = matrix_test_channel_config(&profile, &request).unwrap();
+        assert_eq!(config.user_id.as_deref(), Some("@octos:octos.meldry.com"));
+    }
+
+    #[test]
+    fn matrix_test_config_rejects_password_login_bare_localpart_with_server() {
+        let profile = make_user_profile("matrix-user", "Matrix User");
+        let request = MatrixTestConnectionRequest {
+            channel_index: None,
+            channel: Some(MatrixTestChannelDraft {
+                mode: Some("user".into()),
+                homeserver: Some("https://matrix.example.org".into()),
+                user_id: Some("bot:example.org".into()),
+                access_token: None,
+                password: Some("secret".into()),
+                device_name: None,
+            }),
+        };
+
+        let err = matrix_test_channel_config(&profile, &request).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("localpart like octos"));
+        assert!(
+            err.1
+                .contains("do not use octos:octos.meldry.com without @")
+        );
+    }
+
+    #[test]
+    fn matrix_login_error_explains_oidc_password_login_rejection() {
+        let message = matrix_login_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"errcode":"M_FORBIDDEN","error":"This server uses delegated authentication. Use the OIDC provider to log in."}"#,
+        );
+
+        assert!(message.contains("password login is not available"));
+        assert!(message.contains("Access token"));
+        assert!(!message.contains("M_FORBIDDEN"));
     }
 
     #[test]
@@ -2839,6 +4719,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn my_profile_config_patch_preserves_existing_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        profile.config.home = Some(serde_json::json!({
+            "settings": {
+                "city": "Tokyo",
+                "clock_format": "24h"
+            },
+            "events": [
+                { "id": "dinner", "title": "Dinner" }
+            ]
+        }));
+        profile_store.save(&profile).unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "home": {
+                        "settings": {
+                            "city": "Osaka"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.profile.config.plugins.require_signed);
+        let home = resp.profile.config.home.expect("home config");
+        assert_eq!(home["settings"]["city"], "Osaka");
+        assert_eq!(home["settings"]["clock_format"], "24h");
+        assert_eq!(home["events"][0]["title"], "Dinner");
+    }
+
+    // The config merge preserves sections the client omits (above), but a
+    // provided `env_vars` map must still be able to DROP keys and clear the set
+    // — otherwise secrets could never be removed via self-service. `env_vars` is
+    // replaced wholesale when provided (see `merge_profile_config_from_body`).
+    #[tokio::test]
+    async fn my_profile_env_vars_can_drop_keys_and_clear() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = Arc::new(state);
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.env_vars.insert("KEEP".into(), "old".into());
+        profile.config.env_vars.insert("DROP".into(), "gone".into());
+        profile_store.save(&profile).unwrap();
+
+        // A smaller map: KEEP updated, DROP omitted → removed. (Assert on the
+        // persisted profile: the API response masks secret values.)
+        update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({ "config": { "env_vars": { "KEEP": "new" } } }).to_string(),
+        )
+        .await
+        .unwrap();
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert_eq!(
+            stored.config.env_vars.get("KEEP").map(String::as_str),
+            Some("new")
+        );
+        assert!(
+            !stored.config.env_vars.contains_key("DROP"),
+            "a key omitted from the provided env_vars map must be removed"
+        );
+
+        // An explicit empty map clears everything.
+        update_my_profile(
+            State(state),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({ "config": { "env_vars": {} } }).to_string(),
+        )
+        .await
+        .unwrap();
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert!(
+            stored.config.env_vars.is_empty(),
+            "an explicit empty env_vars map must clear all entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn my_profile_rejects_service_account_json_under_custom_env_off_macos() {
+        // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON
+        // pasted under a CUSTOM env name (VERTEX_API_KEY, not the whitelisted
+        // VERTEX_SA_JSON) via PUT /api/my/profile must never reach plaintext
+        // config. Off macOS it's rejected; on macOS it would be relocated to the
+        // keychain instead (skip — that hits the real keychain).
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let res = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": { "env_vars": {
+                    "VERTEX_API_KEY": "{\"type\":\"service_account\",\"private_key\":\"x\"}"
+                } }
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "raw SA JSON under a custom env name must be rejected off macOS"
+        );
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert!(
+            !stored.config.env_vars.contains_key("VERTEX_API_KEY"),
+            "the private key must never be persisted to plaintext config"
+        );
+    }
+
+    // Replacing `env_vars` wholesale must NOT clobber a real secret when the UI
+    // round-trips it masked: `save_with_merge` restores masked/empty values
+    // per-key from the stored profile. Sections absent from the patch are still
+    // preserved.
+    #[tokio::test]
+    async fn my_profile_env_vars_replace_preserves_masked_and_other_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile
+            .config
+            .env_vars
+            .insert("SECRET".into(), "realval".into());
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        profile_store.save(&profile).unwrap();
+
+        update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({ "config": { "env_vars": { "SECRET": "***" } } }).to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Assert on the persisted profile (the response masks secret values).
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        assert_eq!(
+            stored.config.env_vars.get("SECRET").map(String::as_str),
+            Some("realval"),
+            "a masked value round-tripped by the UI must not overwrite the real secret"
+        );
+        assert!(
+            stored.config.plugins.require_signed,
+            "sections omitted from the patch must still be preserved"
+        );
+    }
+
+    #[tokio::test]
     async fn sub_account_cannot_change_own_public_subdomain() {
         let (_dir, state, _user_store, profile_store) = temp_app_state();
         profile_store
@@ -2873,6 +4938,64 @@ mod tests {
             err.1,
             "sub-accounts cannot change their own public subdomain"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_sub_account_config_patch_preserves_existing_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        child.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        child.config.home = Some(serde_json::json!({
+            "settings": {
+                "city": "Tokyo",
+                "clock_format": "24h"
+            },
+            "events": [
+                { "id": "school", "title": "School pickup" }
+            ]
+        }));
+        profile_store.save(&child).unwrap();
+
+        let Json(resp) = update_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            Path("tenant--assistant".into()),
+            serde_json::json!({
+                "config": {
+                    "home": {
+                        "settings": {
+                            "city": "Kyoto"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.profile.config.plugins.require_signed);
+        let home = resp.profile.config.home.expect("home config");
+        assert_eq!(home["settings"]["city"], "Kyoto");
+        assert_eq!(home["settings"]["clock_format"], "24h");
+        assert_eq!(home["events"][0]["title"], "School pickup");
     }
 
     #[tokio::test]
@@ -3070,6 +5193,68 @@ mod tests {
         let allowlist_entry = allowlist_store.get("newuser@example.com").unwrap().unwrap();
         assert_eq!(allowlist_entry.claimed_user_id.as_deref(), Some("newuser"));
         assert!(allowlist_entry.claimed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn root_self_registration_can_complete_login_and_provision_profile() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+        auth_mgr.set_allow_self_registration(true);
+        let state = Arc::new(state);
+
+        let Json(send_resp) = send_code(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "selfreg@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(send_resp.ok);
+
+        let code = auth_mgr
+            .test_pending_code("selfreg@example.com", None)
+            .await
+            .expect("self-registration should create a global OTP");
+
+        let Json(verify_resp) = verify(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(VerifyRequest {
+                email: "selfreg@example.com".into(),
+                code,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(verify_resp.ok);
+        assert!(verify_resp.token.is_some());
+        let user = verify_resp
+            .user
+            .expect("verify should return the self-registered user");
+        assert_eq!(user.id, "selfreg");
+
+        let saved_user = user_store
+            .get_by_email("selfreg@example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_user.id, "selfreg");
+        assert!(profile_store.get("selfreg").unwrap().is_some());
+
+        let Json(me_resp) = me(
+            State(state),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "selfreg".into(),
+                role: UserRole::User,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(me_resp.user.id, "selfreg");
+        assert_eq!(me_resp.portal.home_profile_id, "selfreg");
     }
 
     #[tokio::test]

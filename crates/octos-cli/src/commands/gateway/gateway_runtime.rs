@@ -33,7 +33,7 @@ use super::profile_factory::{
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
-use crate::commands::{load_prompt, resolve_data_dir};
+use crate::commands::load_prompt;
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
@@ -53,6 +53,73 @@ use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 const CLI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+// `large_enum_variant`: the `Inbound` variant carries an
+// `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
+// workspace crate enables serde_json's `preserve_order` feature (the `octos acp`
+// bridge's `agent-client-protocol` dependency requires it, and Cargo unifies
+// features workspace-wide), `Value::Object` switches from `BTreeMap` to
+// `IndexMap` and this enum grows past the lint threshold. This event is
+// constructed once per inbound message on a channel-bounded path where the size
+// delta is immaterial; boxing would churn every construction/match site for no
+// real benefit, so we allow it.
+#[allow(clippy::large_enum_variant)]
+enum GatewayLoopEvent {
+    Wake,
+    Shutdown,
+    InboundClosed,
+    SessionDeleted(String),
+    Inbound(octos_core::InboundMessage),
+}
+
+fn handle_session_delete_recv(
+    session_id: Option<String>,
+    session_delete_rx_open: &mut bool,
+) -> Option<String> {
+    match session_id {
+        Some(id) => Some(id),
+        None => {
+            *session_delete_rx_open = false;
+            None
+        }
+    }
+}
+
+async fn next_gateway_loop_event(
+    agent_handle: &mut octos_bus::AgentHandle,
+    session_delete_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    session_delete_rx_open: &mut bool,
+    shutdown: &AtomicBool,
+    shutdown_notify: &Notify,
+) -> GatewayLoopEvent {
+    if shutdown.load(Ordering::Acquire) {
+        return GatewayLoopEvent::Shutdown;
+    }
+
+    tokio::select! {
+        biased;
+        _ = shutdown_notify.notified() => {
+            if shutdown.load(Ordering::Acquire) {
+                GatewayLoopEvent::Shutdown
+            } else {
+                GatewayLoopEvent::Wake
+            }
+        }
+        session_id = session_delete_rx.recv(), if *session_delete_rx_open => {
+            if let Some(id) = handle_session_delete_recv(session_id, session_delete_rx_open) {
+                GatewayLoopEvent::SessionDeleted(id)
+            } else {
+                GatewayLoopEvent::Wake
+            }
+        }
+        inbound = agent_handle.recv_inbound() => {
+            match inbound {
+                Some(inbound) => GatewayLoopEvent::Inbound(inbound),
+                None => GatewayLoopEvent::InboundClosed,
+            }
+        }
+    }
+}
 
 // `discover_ominix_url` and `push_runtime_plugin_env` live in
 // `crate::skills_scope` so the `serve` plugin loader can reuse them.
@@ -112,11 +179,15 @@ pub(super) struct GatewayRuntime {
     actor_registry: ActorRegistry,
     session_dispatcher: crate::gateway_dispatcher::GatewayDispatcher,
     profile_factory_builder: Option<ProfileActorFactoryBuilder>,
+    /// Background memory-refresh sweep; must live on the runtime so the
+    /// flock + loop survive past construction (drop stops the sweep).
+    #[allow(dead_code)]
+    memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
     profile_store: Option<Arc<crate::profiles::ProfileStore>>,
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
 
     // Config / hot-reload
-    system_prompt: Arc<std::sync::RwLock<String>>,
+    system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     max_history: Arc<AtomicUsize>,
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
@@ -154,7 +225,8 @@ impl GatewayRuntime {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
-        let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        let ctx = crate::commands::resolve_command_context(cmd.data_dir.clone())?;
+        let data_dir = ctx.data_dir.clone();
         #[cfg(feature = "api")]
         let metrics_handle = Some(crate::api::init_metrics());
         #[cfg(not(feature = "api"))]
@@ -215,7 +287,7 @@ impl GatewayRuntime {
         } else if let Some(config_path) = &cmd.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd, &data_dir)?
+            Config::load_with_context(&cwd, &ctx)?
         };
         // Section B (codex review round-5 P1.2): the `--profile` path
         // bypasses `Config::from_file`, so call the same env-var OR-merge
@@ -316,6 +388,8 @@ impl GatewayRuntime {
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
                 Some(&config.plugins),
+                config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -460,6 +534,21 @@ impl GatewayRuntime {
         if n > 0 {
             info!(count = n, "bootstrapped platform skills");
         }
+        // Gap 4.1 BLOCKER 2: bundle generic pipelines (deep_research) into
+        // <effective_octos_home>/bundled-pipelines so `run_pipeline` always
+        // discovers them even when the per-profile `mofa-research` skill has
+        // drifted. The invariant is bootstrap-dir == search-dir: the
+        // non-profile pipeline factory below calls
+        // `with_octos_home(effective_octos_home)` UNCONDITIONALLY, so the
+        // dir we bootstrap into here is exactly the dir discovery searches.
+        // (Previously bootstrap used `project_dir` = cwd/.octos while the
+        // factory only searched `<data_dir>/...` when `--octos-home` was set,
+        // so the bundle landed where the tool never looked.) Installed
+        // pipelines of the same name still win (bundled dir is searched last).
+        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&effective_octos_home);
+        if n > 0 {
+            info!(count = n, "bootstrapped bundled pipelines");
+        }
 
         // Voice transcription via voice platform skill binary (after bootstrap)
         let voice_binary_path = project_dir
@@ -560,7 +649,12 @@ impl GatewayRuntime {
         // are NOT registered in the base registry — they are created per-session
         // by the ActorFactory to eliminate the set_context() race condition.
 
-        // Store config needed for per-session tool creation
+        // Store config needed for per-session tool creation.
+        // Resolve the gateway's embedding provider ONCE; the pipeline
+        // factory and the ActorFactory share this handle (codex P3:
+        // duplicate resolves doubled keychain lookups and logs).
+        let gateway_embedder =
+            create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
         let provider_policy_for_factory: Option<octos_agent::ToolPolicy>;
         let worker_prompt_for_factory: Option<String>;
         let provider_router_for_factory: Option<Arc<ProviderRouter>>;
@@ -663,6 +757,11 @@ impl GatewayRuntime {
                     mcp_servers: Vec::new(),
                     hooks: rt.plugin_hooks.clone(),
                     prompt_fragments: rt.plugin_prompt_fragments.clone(),
+                    // RFC-1: the bootstrap path already registered the
+                    // dispatcher inside `ProfileRuntime`; the gateway
+                    // doesn't need to re-register, so the entries list
+                    // stays empty here (no double-registration).
+                    make_type_entries: Vec::new(),
                 };
                 plugin_dirs_for_spawn = rt.plugin_dirs.clone();
             } else {
@@ -929,7 +1028,14 @@ impl GatewayRuntime {
                 let policy_c = tools.provider_policy().cloned();
                 let plugins_c = plugin_dirs_for_spawn.clone();
                 let router_c = provider_router.clone();
-                let octos_home_c = cmd.octos_home.clone();
+                // Gap 4.1 BLOCKER 2: use `effective_octos_home` (always
+                // resolved: --octos-home > data_dir) — NOT the raw
+                // `cmd.octos_home` Option — so discovery searches the exact
+                // root the bundle was bootstrapped into above. With the raw
+                // Option, the default (no --octos-home) path skipped
+                // `with_octos_home` entirely and the bundled `deep_research`
+                // was never discoverable.
+                let octos_home_c = effective_octos_home.clone();
                 // Section B (codex review follow-up): capture the host's
                 // strict-signing flag so per-session `RunPipelineTool`
                 // instances honour the same `plugins.require_signed` gate.
@@ -943,7 +1049,13 @@ impl GatewayRuntime {
                     policy: Option<octos_agent::ToolPolicy>,
                     plugin_dirs: Vec<PathBuf>,
                     router: Option<Arc<ProviderRouter>>,
-                    octos_home: Option<PathBuf>,
+                    /// Gap 4.1 BLOCKER 2: always-resolved octos root
+                    /// (--octos-home > data_dir). `with_octos_home` is
+                    /// called UNCONDITIONALLY in `create`, so discovery
+                    /// searches the same root the bundle was bootstrapped
+                    /// into. Previously `Option<PathBuf>` from the raw flag,
+                    /// which skipped discovery on the default path.
+                    octos_home: PathBuf,
                     plugin_require_signed: bool,
                     /// NEW-06 fix: forwarded to every worker `Agent`
                     /// via `RunPipelineTool::with_embedder` so
@@ -963,12 +1075,13 @@ impl GatewayRuntime {
                         )
                         .with_provider_policy(self.policy.clone())
                         .with_plugin_dirs(self.plugin_dirs.clone())
-                        .with_plugin_require_signed(self.plugin_require_signed);
+                        .with_plugin_require_signed(self.plugin_require_signed)
+                        // BLOCKER 2: unconditional — registers
+                        // <octos_home>/{skills,pipelines} (installed) and
+                        // <octos_home>/bundled-pipelines (bundled, last).
+                        .with_octos_home(self.octos_home.clone());
                         if let Some(ref router) = self.router {
                             pt = pt.with_provider_router(router.clone());
-                        }
-                        if let Some(ref octos_home) = self.octos_home {
-                            pt = pt.with_octos_home(octos_home.clone());
                         }
                         if let Some(ref embedder) = self.embedder {
                             pt = pt.with_embedder(embedder.clone());
@@ -982,8 +1095,7 @@ impl GatewayRuntime {
                 // recall the gateway's own session agent gets via
                 // `ActorFactory::embedder` -> `with_embedder` (see
                 // session_actor.rs).
-                let embedder_c =
-                    create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+                let embedder_c = gateway_embedder.clone();
 
                 pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
                     llm: llm_c,
@@ -1003,6 +1115,9 @@ impl GatewayRuntime {
             // Memory bank tools
             tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+            if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+                tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+            }
 
             // Runtime model switching tool
             tools.register(crate::tools::SwitchModelTool::new(
@@ -1030,26 +1145,54 @@ impl GatewayRuntime {
         }
 
         // Build system prompt (always the full prompt with persona, memory, skills)
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+
+        // Background memory-refresh sweep: the flock arbitrates when a
+        // serve daemon also owns this profile dir. Stored on the runtime
+        // struct — a local binding would drop (and kill the sweep) the
+        // moment construction returns.
+        let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.clone(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
             &data_dir,
             &project_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
         )
         .await;
 
-        // Append skill prompt fragments
-        let system_prompt = if plugin_result.prompt_fragments.is_empty() {
-            system_prompt
-        } else {
-            let mut prompt = system_prompt;
+        // Append skill prompt fragments (post-memory tail: fragments came
+        // after the memory slot pre-refactor too).
+        let system_prompt = {
+            let mut parts = system_prompt;
             for fragment in &plugin_result.prompt_fragments {
-                prompt.push_str("\n\n");
-                prompt.push_str(fragment);
+                parts.post_memory.push_str("\n\n");
+                parts.post_memory.push_str(fragment);
             }
-            prompt
+            parts
         };
 
         // Shared system prompt for hot-reload (factory reads this at actor spawn time)
@@ -1070,6 +1213,14 @@ impl GatewayRuntime {
             // can run up to 30 minutes without the agent loop aborting early.
             max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
             chat_max_tokens: gw_config.max_output_tokens,
+            reasoning_effort: gw_config.reasoning_effort,
+            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): config-driven
+            // human-approval rules gate matching tool calls behind a
+            // suspend-and-resume approval on the gateway channel.
+            human_approval_rules: config
+                .approval_policy
+                .as_ref()
+                .map(|policy| policy.to_runtime_rules()),
             ..Default::default()
         };
 
@@ -1187,6 +1338,11 @@ impl GatewayRuntime {
         let subagent_output_router = Arc::new(octos_agent::SubAgentOutputRouter::new(
             data_dir.join("subagent-outputs"),
         ));
+        let usage_ledger = Arc::new(
+            crate::usage_ledger::PersistentUsageLedger::open(&data_dir)
+                .await
+                .wrap_err("failed to open usage ledger")?,
+        );
 
         // Build ActorFactory with all shared resources
         let actor_factory = ActorFactory {
@@ -1194,10 +1350,13 @@ impl GatewayRuntime {
             llm: llm.clone(),
             llm_for_compaction: llm_for_compaction.clone(),
             memory: memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: system_prompt.clone(),
             hooks,
             hook_context_template,
             data_dir: data_dir.clone(),
+            usage_ledger: Some(usage_ledger.clone()),
             session_mgr: session_mgr.clone(),
             out_tx: out_tx.clone(),
             spawn_inbound_tx,
@@ -1220,7 +1379,7 @@ impl GatewayRuntime {
             tool_policy: config.tool_policy.clone(),
             worker_prompt: worker_prompt_for_factory,
             provider_router: provider_router_for_factory,
-            embedder: create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: gateway_embedder.clone(),
             active_sessions: active_sessions.clone(),
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
@@ -1260,6 +1419,13 @@ impl GatewayRuntime {
                 .map(|store| ProfileActorFactoryBuilder {
                     profile_store: store.clone(),
                     project_dir: project_dir.clone(),
+                    // Gap 4.1 BLOCKER 1: thread the SAME `effective_octos_home`
+                    // the bundled pipelines were bootstrapped into (line ~473)
+                    // and the non-profile pipeline factory uses (line ~953) so
+                    // the child-profile `run_pipeline` discovers exactly that
+                    // dir. `project_dir` (= cwd/.octos when `--octos-home` is
+                    // absent) would search a dir bootstrap never wrote.
+                    effective_octos_home: effective_octos_home.clone(),
                     tool_config: tool_config.clone(),
                     memory: memory.clone(),
                     memory_store: memory_store.clone(),
@@ -1289,6 +1455,10 @@ impl GatewayRuntime {
                     // plugin policy so child profiles inherit the
                     // strict-signing gate even when their JSON omits it.
                     host_plugins: config.plugins.clone(),
+                    // The gateway's own config already encodes the correct
+                    // host precedence (explicit config beats the
+                    // ProcessManager env var via merge_env_memory_policy).
+                    host_memory: config.memory.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1299,13 +1469,19 @@ impl GatewayRuntime {
             } else if let Some(ref p) = cmd.config {
                 paths.push(p.clone());
             } else {
-                let local = project_dir.join("config.json");
-                if local.exists() {
-                    paths.push(local);
+                // Project-local config is watched ONLY in the default context,
+                // mirroring `Config::load_resolved`'s `is_default` gate. In an
+                // explicit/tenant gateway we must not hot-reload an ambient
+                // `cwd/.octos/config.json` (e.g. the host's), only config_home.
+                if ctx.is_default {
+                    let local = project_dir.join("config.json");
+                    if local.exists() {
+                        paths.push(local);
+                    }
                 }
-                let data_dir_config = Config::data_dir_config_path(&data_dir);
-                if data_dir_config.exists() {
-                    paths.push(data_dir_config);
+                let config_home_config = ctx.config_home.join("config.json");
+                if config_home_config.exists() {
+                    paths.push(config_home_config);
                 }
             }
             paths
@@ -1425,9 +1601,12 @@ impl GatewayRuntime {
                         parent_profile_id: profile_id
                             .clone()
                             .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
+                        cron_service: cron_service.clone(),
                     });
                     channel.set_bot_manager(bot_mgr);
-                    info!("matrix slash commands enabled (/createbot, /deletebot, /listbots)");
+                    info!(
+                        "matrix slash commands enabled (/createbot, /deletebot, /listbots, /schedule, /allbots)"
+                    );
                 }
             }
         }
@@ -1488,7 +1667,6 @@ impl GatewayRuntime {
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
-            let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
             persona_service.start(
@@ -1497,13 +1675,12 @@ impl GatewayRuntime {
                     let base = base_prompt.clone();
                     let dd = data_dir_p.clone();
                     let pd = project_dir_p.clone();
-                    let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
                     let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
                         let sl = crate::skills_scope::build_account_skills_loader(&dd);
                         let new_prompt =
-                            build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
+                            build_system_prompt(base.as_deref(), &dd, &pd, &sl, &tc).await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;
                         info!("system prompt updated with new persona");
                     });
@@ -1536,6 +1713,7 @@ impl GatewayRuntime {
             pending_messages.clone(),
             out_tx.clone(),
         )
+        .with_session_delete_tx(session_delete_tx.clone())
         .with_data_dir(data_dir.clone());
 
         // Drop the original out_tx — factory and registry hold their own clones.
@@ -1555,6 +1733,7 @@ impl GatewayRuntime {
             actor_registry,
             session_dispatcher,
             profile_factory_builder,
+            memory_refresh,
             profile_store,
             active_sessions,
             system_prompt,
@@ -1577,39 +1756,30 @@ impl GatewayRuntime {
     pub(super) async fn run(mut self) -> Result<()> {
         let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
         let shutdown_notify = self.shutdown_notify.clone();
+        let mut session_delete_rx_open = true;
 
         // Main loop: dispatch inbound messages to concurrent tasks
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let shutdown_notified = shutdown_notify.notified();
-            tokio::pin!(shutdown_notified);
-            if self.shutdown.load(Ordering::Acquire) {
-                break;
-            }
-
-            let mut inbound = tokio::select! {
-                biased;
-                _ = &mut shutdown_notified => {
-                    if self.shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
+            let mut inbound = match next_gateway_loop_event(
+                &mut self.agent_handle,
+                &mut self.session_delete_rx,
+                &mut session_delete_rx_open,
+                &self.shutdown,
+                &shutdown_notify,
+            )
+            .await
+            {
+                GatewayLoopEvent::Wake => continue,
+                GatewayLoopEvent::Shutdown | GatewayLoopEvent::InboundClosed => break,
+                GatewayLoopEvent::SessionDeleted(id) => {
+                    tracing::debug!(session = %id, "stopping actor for deleted session");
+                    self.actor_registry.remove_session(&id);
                     continue;
                 }
-                session_id = self.session_delete_rx.recv() => {
-                    if let Some(id) = session_id {
-                        tracing::debug!(session = %id, "stopping actor for deleted session");
-                        self.actor_registry.remove_session(&id);
-                    }
-                    continue;
-                }
-                inbound = self.agent_handle.recv_inbound() => {
-                    match inbound {
-                        Some(inbound) => inbound,
-                        None => break,
-                    }
-                }
+                GatewayLoopEvent::Inbound(inbound) => inbound,
             };
 
             if self.shutdown.load(Ordering::Acquire) {
@@ -1625,10 +1795,13 @@ impl GatewayRuntime {
                             max_history: new_max,
                         } => {
                             if let Some(prompt) = system_prompt {
-                                *self
-                                    .system_prompt
+                                // A hot-reloaded config prompt replaces the
+                                // PRE-memory half only; the built post half
+                                // (skills/tool prefs) stays.
+                                self.system_prompt
                                     .write()
-                                    .unwrap_or_else(|e| e.into_inner()) = prompt;
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .pre_memory = prompt;
                                 info!(
                                     "System prompt updated via hot-reload (new actors will use it)"
                                 );
@@ -2035,9 +2208,134 @@ impl GatewayRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use tokio::sync::mpsc;
 
     #[test]
     fn cli_shutdown_timeout_stays_prompt() {
         assert!(CLI_SHUTDOWN_TIMEOUT <= Duration::from_secs(1));
+    }
+
+    fn make_inbound(content: &str) -> octos_core::InboundMessage {
+        octos_core::InboundMessage {
+            channel: "email".into(),
+            sender_id: "sender@example.com".into(),
+            chat_id: "sender@example.com".into(),
+            content: content.into(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        }
+    }
+
+    #[test]
+    fn should_mark_session_delete_receiver_closed_when_sender_dropped() {
+        let mut session_delete_rx_open = true;
+
+        let session_id = handle_session_delete_recv(None, &mut session_delete_rx_open);
+
+        assert!(session_id.is_none());
+        assert!(
+            !session_delete_rx_open,
+            "closed session delete receiver must be disabled to avoid a busy gateway loop"
+        );
+    }
+
+    #[test]
+    fn should_keep_session_delete_receiver_open_when_session_id_received() {
+        let mut session_delete_rx_open = true;
+
+        let session_id = handle_session_delete_recv(
+            Some("session-123".to_string()),
+            &mut session_delete_rx_open,
+        );
+
+        assert_eq!(session_id.as_deref(), Some("session-123"));
+        assert!(
+            session_delete_rx_open,
+            "open session delete receiver must keep accepting future delete events"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_wake_does_not_starve_next_inbound_message() {
+        let (mut agent_handle, publisher) = octos_bus::create_bus();
+        let inbound_tx = publisher.inbound_sender();
+        let (_delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let mut session_delete_rx_open = true;
+        let shutdown = AtomicBool::new(false);
+        let shutdown_notify = Notify::new();
+
+        shutdown_notify.notify_one();
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &mut session_delete_rx_open,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Wake => {}
+            _ => panic!("expected a non-shutdown wake"),
+        }
+
+        inbound_tx.send(make_inbound("hello")).await.unwrap();
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &mut session_delete_rx_open,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Inbound(inbound) => assert_eq!(inbound.content, "hello"),
+            _ => panic!("expected inbound message after wake"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_session_delete_receiver_does_not_starve_next_inbound_message() {
+        let (mut agent_handle, publisher) = octos_bus::create_bus();
+        let inbound_tx = publisher.inbound_sender();
+        let (delete_tx, mut delete_rx) = mpsc::unbounded_channel::<String>();
+        let mut session_delete_rx_open = true;
+        let shutdown = AtomicBool::new(false);
+        let shutdown_notify = Notify::new();
+
+        drop(delete_tx);
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &mut session_delete_rx_open,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Wake => {}
+            _ => panic!("expected closed session delete receiver wake"),
+        }
+        assert!(
+            !session_delete_rx_open,
+            "closed session delete receiver must be disabled after one wake"
+        );
+
+        inbound_tx.send(make_inbound("hello")).await.unwrap();
+        match next_gateway_loop_event(
+            &mut agent_handle,
+            &mut delete_rx,
+            &mut session_delete_rx_open,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            GatewayLoopEvent::Inbound(inbound) => assert_eq!(inbound.content, "hello"),
+            _ => panic!("expected inbound message after closed delete receiver wake"),
+        }
     }
 }

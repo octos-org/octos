@@ -1,0 +1,13 @@
+{
+  "schema": "octos.ux.capabilities.v1",
+  "source": "provider-free M19 lanes validated in the 2026-05-26 TUI closure pass",
+  "capabilities": [
+    "approval/deny",
+    "approval/request",
+    "chat/receive_response",
+    "chat/send_prompt",
+    "onboarding/workspace_probe",
+    "permission/profile_select",
+    "runtime/policy_stamp"
+  ]
+}
