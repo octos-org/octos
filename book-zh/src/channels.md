@@ -419,7 +419,7 @@ Matrix 是一等公民频道，也是本章多处提到的「人工审批」与�
 }
 ```
 
-使用 `matrix` 特性标志编译。在 **appservice / 管理机器人**房间中，Matrix 会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并处理 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。而普通的 `mode: "user"` 账户渠道会把所有消息文本转发给 agent，本身并不解释这些管理命令。
+使用 `matrix` 特性标志编译。在 **appservice / 管理机器人**房间中，Matrix 会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并处理 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。而普通的 `mode: "user"` 账户渠道本身并不解释这些管理命令；它会把消息文本转发给 agent，但**默认仅在机器人被 @ 提及时**转发（`require_mention` 默认为 `true`——在其 settings 中设置 `"require_mention": false` 可转发每一条消息）。
 
 ---
 

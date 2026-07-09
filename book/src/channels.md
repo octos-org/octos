@@ -419,7 +419,7 @@ Log in with an `access_token` (preferred), or with `user_id` + `password` (both 
 }
 ```
 
-Build with the `matrix` feature flag. In **appservice / management-bot** rooms, Matrix renders native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and handles the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below). A plain `mode: "user"` account channel forwards all message text to the agent and does not itself interpret those management commands.
+Build with the `matrix` feature flag. In **appservice / management-bot** rooms, Matrix renders native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and handles the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below). A plain `mode: "user"` account channel does not interpret those management commands; it forwards message text to the agent, but **by default only when the bot is mentioned** (`require_mention` defaults to `true` — set `"require_mention": false` in its settings to forward every message).
 
 ---
 
