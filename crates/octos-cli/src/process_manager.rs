@@ -143,7 +143,9 @@ impl ProcessManager {
             self_ref: std::sync::Mutex::new(None),
             host_plugins_require_signed: false,
             host_max_inject_tokens: None,
-            host_memory_refresh_enabled: false,
+            // Matches the product default (memory refresh DEFAULT-ON);
+            // serve overwrites from the resolved host config.
+            host_memory_refresh_enabled: true,
         }
     }
 
@@ -466,7 +468,10 @@ impl ProcessManager {
         if self.host_memory_refresh_enabled {
             cmd.env("OCTOS_MEMORY_REFRESH_ENABLED", "1");
         } else {
-            cmd.env_remove("OCTOS_MEMORY_REFRESH_ENABLED");
+            // DEFAULT-ON semantics: an absent var means enabled, so a
+            // disabled host must mirror an explicit OFF — env_remove would
+            // let the child fall back to on.
+            cmd.env("OCTOS_MEMORY_REFRESH_ENABLED", "0");
         }
 
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");

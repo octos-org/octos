@@ -11,5 +11,8 @@ mod store;
 
 pub use episode::{Episode, EpisodeOutcome};
 pub use hybrid_search::{HybridIndex, HybridScore};
-pub use memory_store::{DEFAULT_MAX_INJECT_TOKENS, MemoryStore, NoteKind, NoteOrigin, StagingNote};
-pub use store::EpisodeStore;
+pub use memory_store::{
+    DEFAULT_MAX_INJECT_TOKENS, ExtractionItem, MemoryStore, NoteKind, NoteOrigin, StagingNote,
+    estimate_tokens,
+};
+pub use store::{DEFAULT_DIMENSION as EPISODIC_INDEX_DIMENSION, EpisodeStore};

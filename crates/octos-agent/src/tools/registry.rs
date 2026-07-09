@@ -1222,8 +1222,9 @@ impl ToolRegistry {
             .add_base_tools(names);
     }
 
-    /// Record that a tool was used (called from execute()).
-    fn record_usage(&self, name: &str) {
+    /// Record that a tool was used. Called from `execute()`; public so tool
+    /// lifecycle (alongside `tick`/`auto_evict`) can be driven in tests.
+    pub fn record_usage(&self, name: &str) {
         self.lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())

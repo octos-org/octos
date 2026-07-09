@@ -28,10 +28,10 @@ use octos_core::ui_protocol::{
     AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
-    ContentListParams, ContextCompactionCompletedEvent, ContextNormalizationReportedEvent,
-    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent,
-    MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor, Payload,
-    ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    ContentListParams, ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+    ContextNormalizationReportedEvent, EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn,
+    InputItem, MessageDeltaEvent, MessageMeta, MessagePersistedEvent, MessagePersistedSource,
+    OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
@@ -1996,6 +1996,17 @@ fn appui_context_history_for_agent(
     let policy = appui_context_prompt_policy(llm_provider);
     let state = manager.state();
     if state.token_estimate > threshold {
+        // UPCR-2026-026: the started event precedes the (synchronous) pass;
+        // clients render the in-progress state from it and must tolerate
+        // started/completed arriving in one delivery batch.
+        lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+            ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state: ui_context_state_for(session_id, &manager),
+                trigger: trigger.to_owned(),
+                threshold_tokens: threshold,
+            },
+        ));
         let before = manager.for_prompt(&policy);
         let summary_budget = threshold.clamp(256, 4096) as u32;
         let summary = octos_agent::compaction::compact_messages(&before.messages, summary_budget);
@@ -8882,6 +8893,7 @@ fn live_event_passes_capability_filter(
     if !features.context_lifecycle_available() {
         if let UiProtocolLedgerEvent::Notification(
             UiNotification::ContextCompactionCompleted(_)
+            | UiNotification::ContextCompactionStarted(_)
             | UiNotification::ContextNormalizationReported(_),
         ) = event
         {
@@ -9820,11 +9832,17 @@ async fn ensure_session_profile_runtime(
     }
 
     let profile_data_dir = store.resolve_data_dir(&profile);
-    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+    // Lazily-created profiles must honour host-level policy too — without
+    // host_memory, a host opt-out of (default-on) memory refresh would not
+    // bind profiles created after startup.
+    let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
         &profile,
         &profile_data_dir,
         Some(store.octos_home_dir()),
         crate::runtime::BootstrapRole::Serve,
+        None,
+        None,
+        state.host_memory.as_ref(),
     )
     .await
     .map_err(|error| {
@@ -15991,6 +16009,11 @@ async fn run_native_code_review_turn(
     let memory_store = session_runtime.profile.memory.clone();
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
+    // UPCR follow-up to #1561: refresh named prompt segments (memory) on
+    // the cached session agent BEFORE snapshotting — WS turns build a
+    // fresh request agent from this snapshot and never run the cached
+    // agent's own turn-start refresh.
+    session_runtime.agent.refresh_prompt_segments().await;
     let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
     let review_dispatch_policy = Arc::new(octos_agent::DispatchPolicy::from_agent_gates(
         profile_runtime.tool_policy.clone(),
@@ -17714,6 +17737,10 @@ async fn run_standalone_turn(
     // dynamic context — none of which the session prompt should
     // supplant. The session prompt is workflow-specific guidance that
     // augments rather than replaces.
+    // Same refresh-before-snapshot rule as the review path: the cached
+    // agent's memory segment must be current before the per-turn agent
+    // clones its prompt.
+    session_runtime.agent.refresh_prompt_segments().await;
     let agent_snapshot = session_runtime.agent.system_prompt_snapshot();
     let system_prompt_base = match session_id.topic().and_then(|topic| {
         crate::project_templates::read_session_prompt(&session_runtime.profile.data_dir, topic)
@@ -23478,6 +23505,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // hashes, not replay cursors. The durable ledger cursor is on
             // the surrounding LedgeredUiProtocolEvent.
             | UiNotification::ContextCompactionCompleted(_)
+            | UiNotification::ContextCompactionStarted(_)
             | UiNotification::ContextNormalizationReported(_)
             // Whole-job orchestration status is a stateless lifecycle push
             // (no durable cursor of its own).
@@ -23567,6 +23595,74 @@ mod tests {
         QuestionId, ReasoningDeltaEvent, SessionSandboxParams, approval_scopes, methods,
         rpc_error_codes,
     };
+
+    #[tokio::test]
+    async fn compaction_started_precedes_completed_in_lifecycle_batch() {
+        // UPCR-2026-026: when the threshold trips, the lifecycle batch must
+        // carry context/compaction_started BEFORE context/compaction_completed
+        // and the started event reports the pre-compaction estimate.
+        struct TinyContextProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for TinyContextProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                unreachable!("compaction never calls the provider")
+            }
+            fn model_id(&self) -> &str {
+                "tiny"
+            }
+            fn provider_name(&self) -> &str {
+                "tiny"
+            }
+            fn context_window(&self) -> u32 {
+                512
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let session: SessionKey = SessionKey("full:api:compact".to_string());
+        let mut history = Vec::new();
+        for i in 0..40 {
+            history.push(octos_core::Message {
+                role: octos_core::MessageRole::User,
+                content: format!("padding message {i}: {}", "x".repeat(400)),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        let provider = TinyContextProvider;
+        let (_messages, _manager, notifications) =
+            appui_context_history_for_agent(dir.path(), &session, &history, &provider, "preflight");
+
+        let started_pos = notifications
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionStarted(_)));
+        let completed_pos = notifications
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionCompleted(_)));
+        let (Some(started_pos), Some(completed_pos)) = (started_pos, completed_pos) else {
+            panic!("both compaction events must be emitted: {notifications:?}");
+        };
+        assert!(
+            started_pos < completed_pos,
+            "started must precede completed"
+        );
+        let UiNotification::ContextCompactionStarted(started) = &notifications[started_pos] else {
+            unreachable!()
+        };
+        assert!(started.context_state.token_estimate > started.threshold_tokens);
+        assert_eq!(started.trigger, "preflight");
+    }
 
     #[test]
     fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
@@ -40227,8 +40323,15 @@ ignore = []
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,

@@ -1,4 +1,13 @@
-# Octos 🐙
+```
+ ██████╗  ██████╗████████╗ ██████╗ ███████╗
+██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
+██║   ██║██║        ██║   ██║   ██║███████╗
+██║   ██║██║        ██║   ██║   ██║╚════██║
+╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
+ ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
+```
+
+**Open Cognitive Tasks Orchestration System**
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
@@ -10,7 +19,8 @@ The fastest way to a working assistant, on the supported platforms (macOS Apple 
 
 ```bash
 # 1. Install
-brew install octos-org/tap/octos        # or: npm install -g @octos-org/octos
+brew tap octos-org/octos https://github.com/octos-org/octos
+brew install octos-org/octos/octos      # or: npm install -g @octos-org/octos
 
 # 2. Choose your AI provider and a model (interactive — pick a real
 #    model name; some providers reject the "auto" default)
@@ -153,8 +163,9 @@ grep OCTOS_AUTH_TOKEN /etc/systemd/system/octos-serve.service
 Alternatively, install just the binaries (the `octos` server plus its bundled skills) via a package manager:
 
 ```bash
-# Homebrew (macOS Apple Silicon, Linux x86_64/ARM64)
-brew install octos-org/tap/octos
+# Homebrew (macOS Apple Silicon, Linux x86_64/ARM64) — this repo is its own tap
+brew tap octos-org/octos https://github.com/octos-org/octos
+brew install octos-org/octos/octos
 
 # npm (macOS Apple Silicon, Linux x86_64/ARM64, Windows x64)
 npm install -g @octos-org/octos
@@ -393,6 +404,7 @@ The full CLI surface (see `octos help`):
 | `auth` / `account` / `admin` | provider login (OAuth/PKCE), sub-accounts, tenant & tunnel admin |
 | `channels` / `cron` / `skills` | messaging channels, scheduled jobs, skill install/remove |
 | `mcp-serve` | run octos as an MCP server, so outer orchestrators can drive it as a sub-agent |
+| `acp` | run octos as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio, so editors like Zed drive it as their coding agent |
 | `office` | PPTX/DOCX/XLSX manipulation from the shell |
 | `update` / `clean` / `completions` / `docs` | release check, cache cleanup, shell completions, doc generation |
 
@@ -430,6 +442,47 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 - **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
 - **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
 - **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
+- **`octos acp`** — the editor-facing direction: octos as an **[Agent Client Protocol](https://agentclientprotocol.com) (ACP)** agent over stdio, so ACP-speaking editors (Zed and others) run octos as their coding agent — with the **same capabilities as `octos chat`** (your tools + sandbox, long-term memory + `MEMORY.md`, skills/plugins, MCP, hooks, context compaction, provider failover). It appears in the editor's agent picker alongside Claude Code and Gemini CLI. See [Use octos in Zed](#use-octos-in-zed-acp).
+
+### Use octos in Zed (ACP)
+
+`octos acp` turns octos into an **ACP server** that [Zed](https://zed.dev) (and other ACP editors) drive as a first-class coding agent. You get the same agent stack as `octos chat` — your tools + sandbox, long-term memory + `MEMORY.md` injection, bundled skills/plugins, MCP servers, hooks, and context compaction — but inside the editor.
+
+> **One gap today:** interactive tool-approval prompts and `ask_user_question` aren't surfaced to the editor yet — octos runs tools under its own (non-interactive) approval policy rather than ACP `session/request_permission`, so a tool that would pause for approval in `octos chat` won't prompt you in Zed. Everything else matches.
+
+**1. Install octos and initialize it** (skip if you already have it — see [Start here](#start-here) for all install options):
+
+```bash
+npm install -g @octos-org/octos      # or Homebrew / build from source — see Start here
+octos init                           # pick a provider + model, then paste that provider's API key
+```
+
+`octos init` walks you through choosing a provider + model (this guide uses **DeepSeek**) and then prompts you to **paste that provider's API key** — stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). Pressed Enter to skip it? Add the key later with `octos auth login --provider deepseek`. A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by an env var, put it in the `env` block below instead.
+
+**2. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
+
+```jsonc
+{
+  "agent_servers": {
+    "Octos": {
+      "command": "octos",
+      "args": ["acp", "--provider", "deepseek", "--model", "deepseek-chat"],
+      "env": {}
+    }
+  }
+}
+```
+
+> The `--provider`/`--model` in `args` must match the provider you set up in step 1 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
+
+**3. Play with it in Zed.**
+- **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
+- Open the **Agent Panel** (right dock), click the **＋ New Thread** dropdown (or press `⌥⌘⇧N`), and choose **Octos**.
+- Type a prompt. octos runs the agent loop and streams tools, thinking, and results back into Zed — and it remembers across turns via your `MEMORY.md`.
+
+> **Can't find Octos?** It lives in the **＋ New Thread** menu (external agents) — **not** the `⋯` → *MCP / Context Servers* list (that's a different feature). After editing `agent_servers`, fully quit and reopen Zed (`Cmd-Q`) so it reloads the config.
+
+Flags mirror `octos chat`: `--provider`, `--model`, `--base-url`, `--config`, `--data-dir`, `--cwd`, `--profile`, and `--max-iterations`. Zed sends a per-session working directory with `session/new`; that's where octos roots tools, skills, and the filesystem scope.
 
 ## Documentation
 

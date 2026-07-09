@@ -221,6 +221,10 @@ pub struct ProfileRuntime {
     /// the heavy work (memory context, skills summary, bootstrap
     /// files) off the per-request hot path.
     pub system_prompt: String,
+    /// The same prompt split at the memory slot — per-session agents
+    /// compose `pre → [memory segment] → post` to keep the pre-refactor
+    /// precedence (memory before skills/tool guidance).
+    pub prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts,
 
     /// Hook configurations contributed by loaded plugins (skill
     /// manifests can declare `before_tool_call` / `after_tool_call` /
@@ -251,6 +255,16 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    pub memory_inject_tokens: usize,
+    /// Resolved `memory.refresh.enabled` — gates the capture-policy text in
+    /// the memory segment and the per-turn refresh provider.
+    pub memory_refresh_enabled: bool,
+    /// Background memory-refresh sweep (extraction over idle sessions).
+    /// `Some` only when `memory.refresh.enabled` and this process won the
+    /// profile's refresh lock; dropping the runtime stops the sweep and
+    /// releases the lock.
+    pub memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
 
     /// Shared [`ToolConfigStore`] for the profile (per-tool
     /// runtime overrides, e.g. `deep_crawl.page_settle_ms`).
@@ -444,15 +458,7 @@ impl ProfileRuntime {
         // override them (same host-default pattern as plugins/voice). A
         // profile serialized with an empty `memory: {}` block must still
         // inherit the host budget.
-        if let Some(host) = host_memory {
-            let mem = config.memory.get_or_insert_with(Default::default);
-            if mem.max_inject_tokens.is_none() {
-                mem.max_inject_tokens = host.max_inject_tokens;
-            }
-            if mem.refresh.is_none() {
-                mem.refresh = host.refresh.clone();
-            }
-        }
+        crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
@@ -942,21 +948,20 @@ impl ProfileRuntime {
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let memory_refresh_enabled =
             crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
-        let mut system_prompt = build_system_prompt(
+        let mut prompt_parts = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
             data_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
-            max_inject_tokens,
-            memory_refresh_enabled,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            prompt_parts.post_memory.push_str("\n\n");
+            prompt_parts.post_memory.push_str(fragment);
         }
+        let system_prompt = prompt_parts.joined();
+        let prompt_parts_for_runtime = prompt_parts.clone();
 
         // M11-F regression fix REG-3: assemble the lifecycle hook
         // executor once per profile and propagate the `Arc` onto every
@@ -1008,6 +1013,30 @@ impl ProfileRuntime {
                 .wrap_err("invalid profile approval_policy")?;
         }
 
+        // Start the background memory-refresh sweep when enabled. The
+        // flock decides ownership when serve and gateway share a profile
+        // dir; the loser just logs and skips.
+        let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.to_path_buf(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -1034,8 +1063,12 @@ impl ProfileRuntime {
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
             system_prompt,
+            prompt_parts: prompt_parts_for_runtime,
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             memory,
             memory_store,
+            memory_refresh,
             tool_config,
             cron_service: Some(cron_service),
             pipeline_factory,

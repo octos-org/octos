@@ -32,7 +32,11 @@ struct MemorySections {
 
 /// Rough token estimate that stays honest for CJK-heavy content:
 /// ~4 ASCII chars per token, ~1 token per non-ASCII char.
-fn estimate_tokens(text: &str) -> usize {
+///
+/// Public so the memory-refresh pipeline (extraction input caps,
+/// consolidation output caps) shares one estimator with the injection
+/// budget.
+pub fn estimate_tokens(text: &str) -> usize {
     let mut ascii = 0usize;
     let mut non_ascii = 0usize;
     for c in text.chars() {
@@ -528,7 +532,13 @@ impl MemoryStore {
             .await
             .wrap_err("failed to create staging notes directory")?;
 
-        let slug_source: String = note.content.chars().take(48).collect();
+        // Sensitive notes must not leak their content into the FILENAME —
+        // paths outlive scrubs (shell history, logs, directory listings).
+        let slug_source: String = if note.sensitive {
+            "sensitive".to_string()
+        } else {
+            note.content.chars().take(48).collect()
+        };
         let file_name = format!(
             "{}-{}.md",
             uuid::Uuid::now_v7().simple(),
@@ -657,6 +667,109 @@ impl StagingNote {
         fm.push_str(&self.content);
         fm.push('\n');
         fm
+    }
+}
+
+/// One host-validated item extracted from an idle session transcript.
+///
+/// `evidence_kind` is HOST-COMPUTED from the transcript role at the cited
+/// message indices — the extraction model's own labels are ignored — so
+/// the consolidator (design PR-4) can treat it as trusted metadata while
+/// `content` stays untrusted text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExtractionItem {
+    /// fact | preference | correction | landmine
+    pub kind: String,
+    pub content: String,
+    /// user_said | tool_showed | assistant_claimed (host-computed).
+    pub evidence_kind: String,
+    /// Transcript message indices backing this item (host-validated).
+    pub evidence_idx: Vec<usize>,
+    /// Date of the source session (YYYY-MM-DD).
+    pub date: String,
+}
+
+impl MemoryStore {
+    /// Path to `staging/extract/`.
+    fn staging_extract_dir(&self) -> PathBuf {
+        self.memory_dir.join("staging").join("extract")
+    }
+
+    /// Write one extraction artifact for a session sweep; returns its path.
+    ///
+    /// Format (fixed contract with the consolidator): frontmatter
+    /// (`session_key` JSON-encoded, `extracted_at` RFC3339, `model`
+    /// JSON-encoded) then a body that is ONE JSON object
+    /// `{"items":[...]}`. `create_new` per file, uuidv7-prefixed name.
+    pub async fn write_staging_extraction(
+        &self,
+        session_key: Option<&str>,
+        model: &str,
+        items: &[ExtractionItem],
+    ) -> Result<PathBuf> {
+        let dir = self.staging_extract_dir();
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .wrap_err("failed to create staging extract directory")?;
+
+        let slug_source = session_key.unwrap_or("session");
+        let file_name = format!(
+            "{}-{}.md",
+            uuid::Uuid::now_v7().simple(),
+            octos_core::safe_filename(slug_source)
+        );
+        let path = dir.join(file_name);
+
+        let mut out = String::from("---\n");
+        if let Some(key) = session_key {
+            out.push_str(&format!(
+                "session_key: {}\n",
+                serde_json::to_string(key).unwrap_or_default()
+            ));
+        }
+        out.push_str(&format!(
+            "extracted_at: {}\n",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        out.push_str(&format!(
+            "model: {}\n",
+            serde_json::to_string(model).unwrap_or_default()
+        ));
+        out.push_str("---\n\n");
+        let body = serde_json::to_string_pretty(&serde_json::json!({ "items": items }))
+            .wrap_err("failed to serialize extraction items")?;
+        out.push_str(&body);
+        out.push('\n');
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .wrap_err("failed to create extraction file (name collision?)")?;
+        {
+            use tokio::io::AsyncWriteExt;
+            file.write_all(out.as_bytes())
+                .await
+                .wrap_err("failed to write extraction file")?;
+            file.flush()
+                .await
+                .wrap_err("failed to flush extraction file")?;
+        }
+        Ok(path)
+    }
+
+    /// Number of pending extraction artifacts (for status surfacing).
+    pub async fn count_staging_extractions(&self) -> usize {
+        let mut count = 0;
+        if let Ok(mut entries) = tokio::fs::read_dir(self.staging_extract_dir()).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().is_some_and(|e| e == "md") {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 }
 
@@ -1268,6 +1381,56 @@ mod tests {
         assert!(name.len() <= 255, "filename too long: {name}");
         let text = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(text.contains("用户偏好深色模式"));
+    }
+
+    #[tokio::test]
+    async fn should_write_extraction_artifact_with_fixed_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let items = vec![ExtractionItem {
+            kind: "preference".to_string(),
+            content: "prefers concise replies".to_string(),
+            evidence_kind: "user_said".to_string(),
+            evidence_idx: vec![3, 7],
+            date: "2026-07-08".to_string(),
+        }];
+        let path = store
+            .write_staging_extraction(Some("tg:123"), "haiku-4-5", &items)
+            .await
+            .unwrap();
+
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(text.starts_with("---\n"));
+        assert!(text.contains("session_key: \"tg:123\""));
+        assert!(text.contains("model: \"haiku-4-5\""));
+        // Body after the closing fence is one JSON object.
+        let body = text.split("---\n\n").nth(1).expect("body present");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["items"][0]["evidence_kind"], "user_said");
+        assert_eq!(parsed["items"][0]["evidence_idx"][1], 7);
+        assert_eq!(store.count_staging_extractions().await, 1);
+    }
+
+    #[tokio::test]
+    async fn should_use_opaque_filename_when_note_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let note = StagingNote {
+            origin: NoteOrigin::Host,
+            kind: NoteKind::Forget,
+            content: "forget my embarrassing secret hobby".to_string(),
+            session_key: None,
+            sensitive: true,
+            replaces_id: None,
+        };
+        let path = store.write_staging_note(&note).await.unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert!(
+            !name.contains("embarrassing") && !name.contains("hobby"),
+            "sensitive content must not leak into the filename: {name}"
+        );
+        assert!(name.contains("sensitive"));
     }
 
     #[tokio::test]

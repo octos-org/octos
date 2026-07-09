@@ -1,14 +1,26 @@
 {
   "provider": "anthropic",
   "model": "claude-sonnet-4-20250514",
-
   "memory": {
     "max_inject_tokens": 2500,
     "refresh": {
-      "enabled": false
+      "enabled": true,
+      "extract_model": null,
+      "min_idle_minutes": 30,
+      "max_session_age_days": 10,
+      "max_sessions_per_pass": 2,
+      "max_extractions_per_day": 20,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30,
+      "max_extract_input_tokens": 24000,
+      "consolidate_model": null,
+      "max_consolidations_per_day": 12,
+      "debounce_seconds": 90,
+      "unused_days": 30,
+      "max_memory_file_tokens": 8000,
+      "pending_confirm_days": 7
     }
   },
-
   "sub_providers": [
     {
       "key": "cheap",

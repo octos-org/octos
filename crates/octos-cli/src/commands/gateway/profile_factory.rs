@@ -577,15 +577,10 @@ impl ProfileActorFactoryBuilder {
         }
         // Host memory settings apply field-by-field when the child profile
         // doesn't override them (same pattern as bootstrap_with_host_plugins).
-        if let Some(host) = self.host_memory.as_ref() {
-            let mem = profile_config.memory.get_or_insert_with(Default::default);
-            if mem.max_inject_tokens.is_none() {
-                mem.max_inject_tokens = host.max_inject_tokens;
-            }
-            if mem.refresh.is_none() {
-                mem.refresh = host.refresh.clone();
-            }
-        }
+        crate::config::merge_host_memory_into_profile(
+            &mut profile_config.memory,
+            self.host_memory.as_ref(),
+        );
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -606,16 +601,13 @@ impl ProfileActorFactoryBuilder {
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
             &self.project_dir,
-            &self.memory_store,
             &skills_loader,
             &self.tool_config,
-            max_inject_tokens,
-            memory_refresh_enabled,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            system_prompt.post_memory.push_str("\n\n");
+            system_prompt.post_memory.push_str(fragment);
         }
         let mut pipeline_factory = self.pipeline_factory.clone();
         let mut provider_policy = self.provider_policy.clone();
@@ -944,8 +936,8 @@ impl ProfileActorFactoryBuilder {
 
         if !child_plugin_prompt_fragments.is_empty() {
             for fragment in &child_plugin_prompt_fragments {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(fragment);
+                system_prompt.post_memory.push_str("\n\n");
+                system_prompt.post_memory.push_str(fragment);
             }
         }
 
@@ -966,6 +958,8 @@ impl ProfileActorFactoryBuilder {
             llm: llm.clone(),
             llm_for_compaction,
             memory: self.memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: Arc::new(std::sync::RwLock::new(system_prompt)),
             hooks,
             hook_context_template: Some(HookContext {
