@@ -1,13 +1,17 @@
-```
+<div align="center">
+
+<pre>
  ██████╗  ██████╗████████╗ ██████╗ ███████╗
 ██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
 ██║   ██║██║        ██║   ██║   ██║███████╗
 ██║   ██║██║        ██║   ██║   ██║╚════██║
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
-```
+</pre>
 
-**Open Cognitive Tasks Orchestration System**
+<b>Open Cognitive Tasks Orchestration System</b>
+
+</div>
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
