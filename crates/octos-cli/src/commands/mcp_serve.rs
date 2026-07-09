@@ -48,7 +48,7 @@ use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{
     ValidatorInvocation, ValidatorPhase, ValidatorRunner, run_workspace_validators,
 };
-use octos_agent::{Agent, AgentConfig, HarnessEvent, ToolRegistry};
+use octos_agent::{Agent, AgentConfig, HarnessEvent, SandboxConfig, ToolRegistry, create_sandbox};
 use octos_core::{AgentId, Task, TaskContext, TaskKind};
 use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
@@ -118,12 +118,18 @@ impl McpServeCommand {
             Config::load_with_context(&cwd, &ctx)?
         };
 
+        // Capture the sandbox policy before `config` is moved into the LLM
+        // factory. The per-session tool registry uses it to confine
+        // shell/exec/file tools to the workspace (see the security note on
+        // `RealSessionDispatch`).
+        let sandbox = config.sandbox.clone();
         let factory = AgentLlmFactory::from_config(config)
             .wrap_err("failed to build LLM factory from config")?;
         let dispatch_config = SessionDispatchConfig {
             cwd: cwd.clone(),
             data_dir: data_dir.clone(),
             max_iterations: 20,
+            sandbox,
         };
         let dispatch: Arc<dyn McpSessionDispatch> =
             Arc::new(RealSessionDispatch::new(dispatch_config, factory));
@@ -189,6 +195,25 @@ pub struct SessionDispatchConfig {
     pub data_dir: PathBuf,
     /// Maximum number of tool-call iterations per MCP session.
     pub max_iterations: u32,
+    /// Sandbox policy applied to the per-session tool registry. Each MCP call
+    /// runs agent tool calls (shell/exec/file) on behalf of an outer
+    /// orchestrator that is only parent-trusted (stdio) or bearer-token
+    /// authenticated (http) — never fully trusted. Confining shell/exec to the
+    /// workspace via the OS sandbox is what stops `run_octos_session` from
+    /// reading, writing, or executing outside `cwd`. Defaults to
+    /// [`SandboxMode::Auto`](octos_agent::SandboxMode) via
+    /// [`SandboxConfig::default`].
+    pub sandbox: SandboxConfig,
+}
+
+impl SessionDispatchConfig {
+    /// Build the sandbox backend for this session's tool registry. Auto mode
+    /// resolves to `sandbox-exec` on macOS / `bwrap` on Linux and falls back
+    /// to `NoSandbox` only when no backend is available (matching chat and
+    /// gateway).
+    fn sandbox_backend(&self) -> Box<dyn octos_agent::Sandbox> {
+        create_sandbox(&self.sandbox)
+    }
 }
 
 /// Factory that yields a ready-to-use LLM provider for each session.
@@ -263,6 +288,18 @@ impl AgentLlmFactory {
 /// * Emits `Verifying`, resolves the contract artifact (either the
 ///   `expected_artifact` field from the MCP input or the workspace contract's
 ///   primary artifact), and transitions to `Ready`/`Failed`.
+///
+/// # Sandboxing
+///
+/// The per-session [`ToolRegistry`] is built with
+/// [`ToolRegistry::with_builtins_and_sandbox`] using the
+/// [`SessionDispatchConfig::sandbox`] policy (default
+/// [`SandboxMode::Auto`](octos_agent::SandboxMode)). This confines
+/// `shell`/`exec_command`/`bash` and the file tools to the workspace `cwd`,
+/// exactly as `octos chat`/`octos gateway` do. Without it the outer MCP caller
+/// — which is only parent-trusted (stdio) or bearer-authenticated (http) — can
+/// drive `run_octos_session` to read, write, and execute anywhere the octos
+/// process can reach.
 pub struct RealSessionDispatch {
     config: SessionDispatchConfig,
     factory: AgentLlmFactory,
@@ -319,7 +356,15 @@ impl McpSessionDispatch for RealSessionDispatch {
                     ))
                 })?,
         );
-        let tools = Arc::new(ToolRegistry::with_builtins(&self.config.cwd));
+        // Confine shell/exec/file tools to the workspace. `with_builtins`
+        // alone installs `NoSandbox`, which let an outer MCP caller drive
+        // `shell`/`exec_command` to read, write, or execute anywhere the octos
+        // process could (the M7.2 session-dispatch RCE). The OS sandbox
+        // restricts writes to `cwd`.
+        let tools = Arc::new(ToolRegistry::with_builtins_and_sandbox(
+            &self.config.cwd,
+            self.config.sandbox_backend(),
+        ));
         let agent_config = AgentConfig {
             max_iterations: self.config.max_iterations,
             // Skip episode persistence — MCP sessions are short-lived and
@@ -606,6 +651,40 @@ mod tests {
             config: None,
         };
         assert!(matches!(cmd.transport, McpTransport::Http));
+    }
+
+    #[test]
+    fn sandbox_backend_honors_config_and_defaults_to_auto() {
+        let mk = |sandbox: SandboxConfig| SessionDispatchConfig {
+            cwd: std::env::temp_dir(),
+            data_dir: std::env::temp_dir(),
+            max_iterations: 4,
+            sandbox,
+        };
+
+        // A disabled policy must produce a pass-through backend, proving the
+        // dispatch reads the configured policy rather than hardcoding one.
+        let disabled = mk(SandboxConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let program = disabled
+            .sandbox_backend()
+            .wrap_command("true", std::path::Path::new("."))
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            program == "sh" || program == "cmd",
+            "disabled sandbox must pass through, got {program:?}"
+        );
+
+        // The default policy is enabled + Auto — never NoSandbox by omission,
+        // which was the M7.2 dispatch RCE (`with_builtins` hardcoded NoSandbox).
+        let default = mk(SandboxConfig::default());
+        assert!(default.sandbox.enabled);
+        assert_eq!(default.sandbox.mode, octos_agent::SandboxMode::Auto);
     }
 
     #[test]
