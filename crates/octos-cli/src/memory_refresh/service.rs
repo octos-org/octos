@@ -780,15 +780,20 @@ async fn extract_one_session(
         .get_injectable_context(knobs.max_inject_tokens)
         .await;
     let session_date: chrono::DateTime<chrono::Local> = newest.into();
+    // The session key is attacker-controlled channel metadata (email
+    // sender/topic, API session ids) and would enter the provider prompt
+    // OUTSIDE transcript redaction — instructions there could induce
+    // regex-clean, user_said-authorized items (codex round-4 P1). The
+    // model doesn't need it; the real key rides only the scanned
+    // artifact frontmatter.
     let user_prompt = format!(
         "CURRENT MEMORY (do not re-extract; flag contradictions as kind=correction):\n{}\n\n\
-         TRANSCRIPT of session `{}` (last active {}):\n{}",
+         TRANSCRIPT of one session (last active {}):\n{}",
         if current_memory.is_empty() {
             "(empty)"
         } else {
             &current_memory
         },
-        key.0,
         session_date.format("%Y-%m-%d"),
         rendered
     );
@@ -1585,7 +1590,7 @@ mod tests {
         // not appear in the TRANSCRIPT slice. Assert on the transcript
         // portion only.
         let transcript_part = second
-            .split("TRANSCRIPT of session")
+            .split("TRANSCRIPT of one session")
             .nth(1)
             .unwrap_or("")
             .to_string();
@@ -1722,7 +1727,7 @@ mod tests {
             .await
             .unwrap();
         let prompts = provider.prompts.lock().unwrap().concat();
-        let transcript_part = prompts.split("TRANSCRIPT of session").nth(1).unwrap_or("");
+        let transcript_part = prompts.split("TRANSCRIPT of one session").nth(1).unwrap_or("");
         assert!(
             transcript_part.contains("fish") && !transcript_part.contains("oolong"),
             "post-backfill append is delta-only: {transcript_part}"
