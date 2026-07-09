@@ -437,7 +437,9 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 
 ### Use octos in Zed (ACP)
 
-`octos acp` turns octos into an **ACP server** that [Zed](https://zed.dev) (and other ACP editors) drive as a first-class coding agent. You get the full octos agent loop — your tools + sandbox, long-term memory + `MEMORY.md` injection, bundled skills/plugins, MCP servers, hooks, and context compaction — exactly like `octos chat`, but inside the editor.
+`octos acp` turns octos into an **ACP server** that [Zed](https://zed.dev) (and other ACP editors) drive as a first-class coding agent. You get the same agent stack as `octos chat` — your tools + sandbox, long-term memory + `MEMORY.md` injection, bundled skills/plugins, MCP servers, hooks, and context compaction — but inside the editor.
+
+> **One gap today:** interactive tool-approval prompts and `ask_user_question` aren't surfaced to the editor yet — octos runs tools under its own (non-interactive) approval policy rather than ACP `session/request_permission`, so a tool that would pause for approval in `octos chat` won't prompt you in Zed. Everything else matches.
 
 **1. Give the agent a provider credential.** Easiest is `octos auth login --provider deepseek` — it's stored in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass an API key by env var, put it in the `env` block below.
 
