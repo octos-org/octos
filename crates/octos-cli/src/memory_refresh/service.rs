@@ -1727,7 +1727,10 @@ mod tests {
             .await
             .unwrap();
         let prompts = provider.prompts.lock().unwrap().concat();
-        let transcript_part = prompts.split("TRANSCRIPT of one session").nth(1).unwrap_or("");
+        let transcript_part = prompts
+            .split("TRANSCRIPT of one session")
+            .nth(1)
+            .unwrap_or("");
         assert!(
             transcript_part.contains("fish") && !transcript_part.contains("oolong"),
             "post-backfill append is delta-only: {transcript_part}"
