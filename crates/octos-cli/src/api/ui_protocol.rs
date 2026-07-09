@@ -4164,7 +4164,14 @@ async fn ui_protocol_connection(
             serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
         );
         let id = request.id.clone();
-        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
+        if handle_client_hello_rpc(
+            &ws,
+            &state,
+            id.clone(),
+            &request,
+            &mut features,
+            session_ingress_scope.is_some(),
+        ) {
             continue;
         }
         // SECURITY (#1594): `handle_raw_appui_rpc` dispatches raw methods BEFORE
@@ -4262,6 +4269,7 @@ async fn ui_protocol_connection(
                     features,
                     id,
                     params,
+                    session_ingress_scope.is_some(),
                 )
                 .await;
                 if opened {
@@ -4803,7 +4811,8 @@ where
         #[cfg(test)]
         record_stdio_dispatch_for_test();
         let id = request.id.clone();
-        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
+        // stdio transport is never a session-ingress socket.
+        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features, false) {
             continue;
         }
         let connection_profile_id = connection_profile_id_owned.as_deref();
@@ -4861,6 +4870,7 @@ where
                     features,
                     id,
                     params,
+                    false,
                 )
                 .await;
                 if opened {
@@ -8283,6 +8293,7 @@ fn handle_client_hello_rpc(
     id: String,
     request: &RpcRequest<Value>,
     features: &mut ConnectionUiFeatures,
+    session_ingress: bool,
 ) -> bool {
     if request.method != APPUI_METHOD_CLIENT_HELLO {
         return false;
@@ -8315,7 +8326,13 @@ fn handle_client_hello_rpc(
     } else {
         "websocket"
     };
-    let capabilities = features.advertised_capabilities(state);
+    let mut capabilities = features.advertised_capabilities(state);
+    // #1594 follow-up: a session-ingress credential can only call the
+    // session-scoped surface, so don't advertise the raw/global methods it
+    // would be denied — keep advertised == callable.
+    if session_ingress {
+        filter_capabilities_for_session_ingress(&mut capabilities);
+    }
     let _ = send_rpc_result(
         ws,
         id,
@@ -8485,6 +8502,41 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             octos_core::ui_protocol::methods::CONTENT_LIST
                 | octos_core::ui_protocol::methods::CONTENT_DELETE
         )
+}
+
+/// Whether a session-ingress credential can actually CALL `method`. This is the
+/// inverse of the two ingress deny surfaces:
+///   - `raw_method_is_dispatched` (the whole raw surface is denied), and
+///   - the global (non-session-scoped) typed methods
+///     `validate_session_ingress_command_scope` rejects.
+///
+/// Used to filter advertised capabilities (#1594 follow-up) so the surface an
+/// ingress connection is TOLD about matches what it can invoke. The global list
+/// below must stay in lockstep with the reject arm of
+/// `validate_session_ingress_command_scope`; `session_ingress_capability_filter_matches_scope`
+/// pins the two together.
+fn session_ingress_callable_method(method: &str) -> bool {
+    if raw_method_is_dispatched(method, false) {
+        return false;
+    }
+    !matches!(
+        method,
+        APPUI_METHOD_PROFILE_LOCAL_CREATE
+            | octos_core::ui_protocol::methods::SESSION_LIST
+            | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
+            | octos_core::ui_protocol::methods::CONTENT_LIST
+            | octos_core::ui_protocol::methods::CONTENT_DELETE
+            | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+    )
+}
+
+/// Restrict advertised `supported_methods` to what a session-ingress credential
+/// can actually call, closing the advertised-vs-callable gap on the
+/// `client_hello` and `session/open` responses an ingress connection receives.
+fn filter_capabilities_for_session_ingress(capabilities: &mut UiProtocolCapabilities) {
+    capabilities
+        .supported_methods
+        .retain(|method| session_ingress_callable_method(method));
 }
 
 fn validate_session_ingress_command_scope(
@@ -8696,6 +8748,7 @@ async fn handle_session_open(
     features: ConnectionUiFeatures,
     id: String,
     mut params: SessionOpenParams,
+    session_ingress: bool,
 ) -> bool {
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
@@ -8710,7 +8763,7 @@ async fn handle_session_open(
     let session_id_for_subscribe = params.session_id.clone();
     let live_rx = ledger.subscribe(&session_id_for_subscribe);
 
-    let outcome = match open_session_result(
+    let mut outcome = match open_session_result(
         state,
         ledger,
         approvals,
@@ -8735,6 +8788,15 @@ async fn handle_session_open(
         }
     };
 
+    // #1594 follow-up: a session-ingress connection may only call the
+    // session-scoped surface, so the SessionOpened reply it receives must not
+    // advertise the raw/global methods it would be denied. Filter only this
+    // direct reply; the ledger-broadcast copy other connections observe is
+    // untouched (it reflects the session's negotiated features, not this
+    // credential's scope).
+    if session_ingress {
+        filter_capabilities_for_session_ingress(&mut outcome.result.opened.capabilities);
+    }
     let result = match serde_json::to_value(outcome.result) {
         Ok(result) => result,
         Err(error) => {
@@ -8835,6 +8897,19 @@ async fn handle_session_open(
         }
     }
 
+    // #1594 follow-up: the SessionOpened NOTIFICATION is a documented
+    // capability-discovery path (UPCR-2026-007), so an ingress connection's
+    // direct-sent copy must be filtered just like the RPC result was. This
+    // mutates only the per-connection clone in `outcome`; the shared ledger
+    // entry (already appended, broadcast to other connections) is untouched, and
+    // `send_ledger_event_durable` sends without re-appending.
+    if session_ingress {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
+            &mut outcome.opened_event.event
+        {
+            filter_capabilities_for_session_ingress(&mut opened.capabilities);
+        }
+    }
     let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
 
@@ -26502,7 +26577,8 @@ ignore = []
                         &state,
                         request.id.clone(),
                         &request,
-                        &mut negotiated
+                        &mut negotiated,
+                        false
                     ),
                     "{method} is advertised over stdio but client_hello dispatch did not handle it"
                 );
@@ -26607,6 +26683,7 @@ ignore = []
             features,
             "open-missing".into(),
             missing_params,
+            false,
         )
         .await;
         if opened {
@@ -26661,6 +26738,7 @@ ignore = []
             features,
             "open-grace".into(),
             grace_params,
+            false,
         )
         .await;
         if opened {
@@ -33035,6 +33113,112 @@ ignore = []
                 "{method} is raw-dispatched and MUST be denied for session-ingress creds"
             );
         }
+    }
+
+    #[test]
+    fn session_ingress_callable_method_matches_the_deny_surfaces() {
+        // Session-scoped typed methods an ingress credential CAN call:
+        for m in [
+            octos_core::ui_protocol::methods::TURN_START,
+            octos_core::ui_protocol::methods::SESSION_HYDRATE,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SESSION_STATUS_GET,
+        ] {
+            assert!(session_ingress_callable_method(m), "{m} must stay callable");
+        }
+        // Raw surface — denied wholesale (mirrors the deny gate):
+        for m in [
+            octos_core::ui_protocol::methods::SESSION_GOAL_SET,
+            octos_core::ui_protocol::methods::LOOP_CREATE,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            APPUI_METHOD_SESSION_STATUS_READ,
+        ] {
+            assert!(
+                !session_ingress_callable_method(m),
+                "{m} (raw) must be filtered from advertised caps"
+            );
+        }
+        // Global typed methods `validate_session_ingress_command_scope` rejects:
+        for m in [
+            APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            octos_core::ui_protocol::methods::CONTENT_DELETE,
+            octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                !session_ingress_callable_method(m),
+                "{m} (global) must be filtered from advertised caps"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_capabilities_for_session_ingress_keeps_only_callable_methods() {
+        let mut caps = UiProtocolCapabilities::new(
+            &[
+                octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE, // keep (session-scoped)
+                octos_core::ui_protocol::methods::TURN_START,            // keep (session-scoped)
+                octos_core::ui_protocol::methods::SESSION_LIST,          // drop (global typed)
+                octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,     // drop (global typed)
+                APPUI_METHOD_PROFILE_LLM_UPSERT,                         // drop (raw)
+                octos_core::ui_protocol::methods::SESSION_GOAL_SET,      // drop (raw)
+            ],
+            &[],
+        );
+        filter_capabilities_for_session_ingress(&mut caps);
+        assert_eq!(
+            caps.supported_methods,
+            vec![
+                octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE.to_string(),
+                octos_core::ui_protocol::methods::TURN_START.to_string(),
+            ]
+        );
+    }
+
+    // Regression guard for codex P1: `session/open` advertises capabilities on
+    // BOTH its RPC result AND the SessionOpened notification, so the ingress
+    // handler must filter the notification event too — not only the result.
+    // This exercises the exact `if let ... SessionOpened(opened)` branch the
+    // handler applies to `outcome.opened_event.event`.
+    #[test]
+    fn session_opened_notification_capabilities_are_filtered_for_ingress() {
+        let mut event =
+            UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
+                session_id: SessionKey("local:work-secret".into()),
+                active_profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                workspace_root: None,
+                context: None,
+                context_state: None,
+                cursor: None,
+                panes: None,
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+                        APPUI_METHOD_PROFILE_LLM_UPSERT,
+                        octos_core::ui_protocol::methods::SESSION_LIST,
+                    ],
+                    &[],
+                ),
+                reasoning_effort: None,
+            }));
+
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
+            &mut event
+        {
+            filter_capabilities_for_session_ingress(&mut opened.capabilities);
+        }
+
+        let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = event
+        else {
+            panic!("expected SessionOpened notification");
+        };
+        assert_eq!(
+            opened.capabilities.supported_methods,
+            vec![octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE.to_string()],
+            "raw/global methods must be filtered from the SessionOpened notification"
+        );
     }
 
     /// Codex review 2026-05-12 (BLOCK 1, companion): the legacy
