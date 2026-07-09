@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use super::router::AuthIdentity;
 use crate::login_allowlist::AllowedLogin;
+use crate::profiles::{ProfileStore, UserProfile};
 use crate::user_store::{User, UserRole};
 
 #[derive(Serialize)]
@@ -317,12 +318,17 @@ pub async fn delete_user(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let before_user = us.get(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    if before_user.is_none() {
+        tracing::warn!(user_id = %id, "delete_user: user not found");
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     if let Some(ref pm) = state.process_manager {
         let _ = pm.stop(&id).await;
     }
 
     if let Some(ref ps) = state.profile_store {
-        let _ = ps.delete(&id);
+        delete_user_profiles(&state, ps, &id).await?;
     }
 
     match us.delete(&id) {
@@ -355,12 +361,85 @@ pub async fn delete_user(
     }
 }
 
+async fn delete_user_profiles(
+    state: &AppState,
+    profile_store: &ProfileStore,
+    user_id: &str,
+) -> Result<(), StatusCode> {
+    let parent = profile_store
+        .get(user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sub_accounts = profile_store
+        .list_sub_accounts(user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    for sub in sub_accounts {
+        delete_profile_record(state, profile_store, &sub).await?;
+        // Sub-accounts can have their own login users (created with
+        // `id == sub.id` in admin.rs / auth_handlers.rs). Delete those rows
+        // too — a stale user row survives the parent otherwise, and with
+        // self-registration enabled `verify` would auto-create a fresh
+        // TOP-LEVEL profile for it, resurrecting the deleted sub-account
+        // with broken parentage.
+        if let Some(ref us) = state.user_store {
+            match us.delete(&sub.id) {
+                Ok(true) => {
+                    tracing::info!(user_id = %sub.id, "delete_user: cascaded sub-account login user");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %sub.id,
+                        error = %e,
+                        "delete_user: failed to delete sub-account login user"
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(parent) = parent {
+        delete_profile_record(state, profile_store, &parent).await?;
+    }
+
+    Ok(())
+}
+
+async fn delete_profile_record(
+    state: &AppState,
+    profile_store: &ProfileStore,
+    profile: &UserProfile,
+) -> Result<(), StatusCode> {
+    if let Some(ref pm) = state.process_manager {
+        let _ = pm.stop(&profile.id).await;
+    }
+
+    let data_dir = profile_store.resolve_data_dir(profile);
+    if data_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(
+                profile = %profile.id,
+                dir = %data_dir.display(),
+                error = %e,
+                "failed to clean up profile data directory"
+            );
+        }
+    }
+
+    profile_store
+        .delete(&profile.id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
     use crate::login_allowlist::LoginAllowlistStore;
+    use crate::profiles::ProfileConfig;
     use crate::user_store::{User, UserRole, UserStore};
 
     fn state_with_stores(
@@ -382,6 +461,20 @@ mod tests {
             role,
             created_at: Utc::now(),
             last_login_at: None,
+        }
+    }
+
+    fn test_profile(id: &str, parent_id: Option<&str>) -> UserProfile {
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: parent_id.map(ToString::to_string),
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -423,6 +516,76 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["message"], "not found");
+    }
+
+    #[tokio::test]
+    async fn delete_user_cascades_sub_account_profiles_and_data_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let parent = test_profile("alice", None);
+        let sub_account = test_profile("alice--bot", Some("alice"));
+        let parent_data_dir = profile_store.resolve_data_dir(&parent);
+        let sub_data_dir = profile_store.resolve_data_dir(&sub_account);
+
+        user_store
+            .save(&test_user("alice", UserRole::User))
+            .unwrap();
+        // Sub-accounts can carry their own login user (id == profile id,
+        // as created by the admin/my-account endpoints) — the cascade must
+        // remove it too, or self-registration `verify` can resurrect the
+        // deleted sub-account as a top-level profile.
+        user_store
+            .save(&test_user("alice--bot", UserRole::User))
+            .unwrap();
+        profile_store.save(&parent).unwrap();
+        profile_store.save(&sub_account).unwrap();
+        assert!(parent_data_dir.exists());
+        assert!(sub_data_dir.exists());
+
+        let state = Arc::new(AppState {
+            user_store: Some(user_store.clone()),
+            profile_store: Some(profile_store.clone()),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = delete_user(None, State(state), Path("alice".to_string()))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(response.ok);
+        assert!(user_store.get("alice").unwrap().is_none());
+        assert!(
+            user_store.get("alice--bot").unwrap().is_none(),
+            "sub-account login user must be cascaded with the parent"
+        );
+        assert!(profile_store.get("alice").unwrap().is_none());
+        assert!(profile_store.get("alice--bot").unwrap().is_none());
+        assert!(!parent_data_dir.exists());
+        assert!(!sub_data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_user_missing_user_does_not_delete_matching_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile = test_profile("alice", None);
+        let data_dir = profile_store.resolve_data_dir(&profile);
+        profile_store.save(&profile).unwrap();
+
+        let state = Arc::new(AppState {
+            user_store: Some(user_store),
+            profile_store: Some(profile_store.clone()),
+            ..AppState::empty_for_tests()
+        });
+
+        let result = delete_user(None, State(state), Path("alice".to_string())).await;
+
+        assert!(matches!(result, Err(StatusCode::NOT_FOUND)));
+        assert!(profile_store.get("alice").unwrap().is_some());
+        assert!(data_dir.exists());
     }
 
     #[test]
