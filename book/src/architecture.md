@@ -1167,7 +1167,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 | Route | Method | Description |
 |---|---|---|
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the sole **HTTP** chat ingress + control plane (legacy `POST /api/chat` retired). The same protocol is also served over `octos serve --stdio`. See below. |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the primary **HTTP** chat + control-plane endpoint (legacy `POST /api/chat` retired). The same protocol is also served over `octos serve --stdio`, and a scoped work-secret variant at `/v1/session_ingress/ws/{session_id}` for external CLI agents. See below. |
 | `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |

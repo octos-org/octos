@@ -507,7 +507,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 ### 循环（Loops）
 
-**循环**是周期性的 agent 运行，有三种模式：**固定间隔**（每 N 秒触发）、**自定步调**（模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏；未指定时默认 15 分钟）或**维护**（每次触发时重新解析并运行一段维护提示——优先 `.octos/loop.md`，其次 `~/.octos/loop.md`，否则内置默认）。循环持续触发，直到被暂停、删除、达到 10,000 次触发上限——**或到期**：每个循环都会被打上 `expires_at_ms = now + 7 天`，一旦过期，即使未达触发上限，到期扫描也会跳过它。
+**循环**是周期性的 agent 运行，有三种模式：**固定间隔**（每 N 秒触发）、**自定步调**（模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏；未指定时默认 15 分钟）或**维护**（每次触发时重新解析并运行一段维护提示——若找到 `loop.md` 覆盖文件则用之，否则用内置默认）。循环持续触发，直到被暂停、删除、达到 10,000 次触发上限——**或到期**：每个循环都会被打上 `expires_at_ms = now + 7 天`，一旦过期，即使未达触发上限，到期扫描也会跳过它。
 
 - 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`、`loop/fire_now`（**请求**立即触发——它会经过循环的触发策略，若循环已暂停/耗尽可能被拒绝或去重，因此应检查返回的 `fire.queued`/错误结果，而非假定一定触发了一次）——通知 `loop/fired`、`loop/completed`、`loop/updated`。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
 - 适用于轮询、监控和自定步调的后台 agent。
@@ -519,7 +519,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 ### 任务与轮次控制
 
 - **后台任务**（派生工作、深度搜索、流水线）可被列出与取消：`task/list`、`task/cancel`，输出/产物通过 `task/output/read`、`task/artifact/list`。取消也可经 REST 的 `POST /api/tasks/{id}/cancel` 触达。`task/restart_from_node` **已被接受但尚不能真正重新执行**——生产运行时未接入 relaunch 回调，因此它只会登记一个后继任务，而不会重新运行工作。
-- **运行中的轮次**可用 `turn/interrupt` 中途打断（中止进行中的 LLM 调用与工具）。只有生命周期状态（如 `turn/error`）会被持久化——**部分助手内容不会被提交**，因此重连的客户端无法恢复未完成的回复。`turn/start` 与 `turn/interrupt` **不**受能力门控——始终可用。而独立的**子 agent** 控制（`agent/list`、`agent/status/read`、`agent/interrupt`、`agent/close`）与任务产物（`task/artifact/list|read`）需要 `coding.autonomy.v1` + `coding.agent_control.v1`。
+- **运行中的轮次**可用 `turn/interrupt` 中途打断（中止进行中的 LLM 调用与工具）。已提交到会话的消息会保留（可通过回放/hydration 恢复）；只有被打断轮次中尚未提交的流式剩余部分会丢失。`turn/start` 与 `turn/interrupt` **不**受能力门控——始终可用。而独立的**子 agent** 控制（`agent/list`、`agent/status/read`、`agent/interrupt`、`agent/close`）与任务产物（`task/artifact/list|read`）需要 `coding.autonomy.v1` + `coding.agent_control.v1`。
 
 ### 能力协商
 
