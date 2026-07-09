@@ -674,14 +674,25 @@ impl ChatCommand {
             }
         }
 
+        // Resolve the embedding provider ONCE and share the handle across
+        // every consumer (spawn workers, pipeline workers, the chat agent)
+        // so they agree on the exact same embed-on-save + hybrid-recall
+        // behaviour — and the "pinning …" log fires once, not per site.
+        let embedder = create_embedder(&config);
+
         // Register spawn tool for sync sub-agent support in chat mode.
         // Background mode won't deliver results (dummy channel), but sync mode works fine.
         let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(1);
         let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
-        tools.register(
+        let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
-                .with_worker_prompt(worker_prompt),
-        );
+                .with_worker_prompt(worker_prompt);
+        if let Some(ref embedder) = embedder {
+            // Workers save episodes by default; without the embedder those
+            // episodes are stored vectorless and worker recall skips.
+            spawn_tool = spawn_tool.with_embedder(embedder.clone());
+        }
+        tools.register(spawn_tool);
 
         // Register research synthesis tool (map-reduce over deep_search source files)
         tools.register(octos_agent::SynthesizeResearchTool::new(
@@ -807,7 +818,7 @@ impl ChatCommand {
             tools.provider_policy().cloned(),
             plugin_dirs.clone(),
             config.plugins.require_signed,
-            create_embedder(&config),
+            embedder.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
@@ -1067,8 +1078,8 @@ impl ChatCommand {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
         }
 
-        if let Some(embedder) = create_embedder(&config) {
-            agent = agent.with_embedder(embedder);
+        if let Some(ref embedder) = embedder {
+            agent = agent.with_embedder(embedder.clone());
         }
 
         // Harness M6.3/M6.4: wire the declarative compaction runner when the

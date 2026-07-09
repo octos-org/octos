@@ -18375,6 +18375,10 @@ async fn run_standalone_turn(
             session_id.to_string(),
             task_state_path.clone(),
         )
+        // Embed-on-save + recall parity: spawn workers save episodes by
+        // default; without the profile's embedder those episodes are
+        // stored vectorless and worker episodic recall silently skips.
+        .with_optional_embedder(session_runtime.profile.embedder.clone())
         .with_plugin_dirs(
             session_runtime.profile.plugin_dirs.clone(),
             session_runtime.profile.plugin_env_template.clone(),
@@ -40329,6 +40333,7 @@ ignore = []
             },
             memory,
             memory_store,
+            embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: false,
             memory_refresh: None,

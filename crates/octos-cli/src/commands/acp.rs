@@ -400,7 +400,11 @@ impl AcpBootstrap {
         let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
         tools.register(
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
-                .with_worker_prompt(worker_prompt),
+                .with_worker_prompt(worker_prompt)
+                // Embed-on-save + recall parity: ACP spawn subagents save
+                // episodes; without the shared embedder they store them
+                // vectorless and their episodic recall silently skips.
+                .with_optional_embedder(shared.embedder.clone()),
         );
         tools.register(octos_agent::SynthesizeResearchTool::new(
             llm.clone(),

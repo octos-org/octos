@@ -456,6 +456,15 @@ pub struct SpawnTool {
     task_ledger_path: Option<PathBuf>,
     /// Optional agent config inherited from the parent session.
     worker_config: Option<AgentConfig>,
+    /// Parent's embedding provider, propagated onto worker Agents.
+    ///
+    /// Without this the spawn path was the only production surface that
+    /// both saves episodes (`AgentConfig::default().save_episodes`) and
+    /// lacked an embedder — workers stored episodes UNEMBEDDED and their
+    /// `build_initial_messages` recall silently skipped (the same NEW-06
+    /// class of gap `RunPipelineTool::with_embedder` closed for
+    /// pipeline workers).
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     /// Optional MCP-backed sub-agent used when callers pick
     /// `backend == "agent_mcp"`. Parent context stays small because the
     /// sub-agent's internal messages never leak back — only the final
@@ -525,6 +534,7 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
@@ -567,6 +577,7 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
@@ -661,6 +672,28 @@ impl SpawnTool {
     }
 
     /// Inherit the parent agent configuration for spawned workers.
+    /// Propagate the parent's embedding provider onto every spawned
+    /// worker Agent (embed-on-save + hybrid scored/filtered recall).
+    pub fn with_embedder(mut self, embedder: Arc<dyn octos_llm::EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Test-only visibility: whether an embedder was threaded through.
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn octos_llm::EmbeddingProvider>> {
+        self.embedder.as_ref()
+    }
+
+    /// Like [`Self::with_embedder`] but tolerates `None` — call-site
+    /// sugar for optional parent embedders.
+    pub fn with_optional_embedder(
+        mut self,
+        embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    ) -> Self {
+        self.embedder = embedder.or(self.embedder);
+        self
+    }
+
     pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
         self.worker_config = Some(config);
         self
@@ -2629,6 +2662,12 @@ impl Tool for SpawnTool {
             if let Some(ref summary_gen) = self.parent_subagent_summary_generator {
                 worker = worker.with_subagent_summary_generator(summary_gen.clone());
             }
+            // Embed-on-save + recall parity: workers save episodes by
+            // default, so without the parent's embedder those episodes
+            // are stored vectorless and worker recall skips entirely.
+            if let Some(ref embedder) = self.embedder {
+                worker = worker.with_embedder(embedder.clone());
+            }
 
             // Review A F-004: propagate the parent's declarative compaction
             // policy onto the child Agent so the child honours the same token
@@ -2860,6 +2899,7 @@ impl Tool for SpawnTool {
             let child_tool_factories = self.child_tool_factories.clone();
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
+            let worker_embedder = self.embedder.clone();
             let workflow_metadata = workflow.clone();
             let parent_session_key = self.session_key.clone();
             let worker_hooks = self.hooks.clone();
@@ -3131,6 +3171,13 @@ impl Tool for SpawnTool {
                 }
                 if let Some(ref summary_gen) = parent_subagent_summary_generator {
                     worker = worker.with_subagent_summary_generator(summary_gen.clone());
+                }
+                // Embed-on-save + recall parity (codex P1): the DEFAULT
+                // background mode builds its own worker inside this
+                // detached closure — mirror the sync-path propagation or
+                // background subagents keep storing vectorless episodes.
+                if let Some(ref embedder) = worker_embedder {
+                    worker = worker.with_embedder(embedder.clone());
                 }
                 if let Some(ref sink_path) = harness_event_sink_path {
                     worker = worker.with_harness_event_sink(sink_path.clone());
@@ -3742,6 +3789,62 @@ mod tests {
     use super::*;
     use crate::{HookConfig, HookEvent};
 
+    /// Stub embedder — never invoked; these tests only assert the Arc
+    /// is threaded through (mirrors
+    /// `octos-pipeline/tests/embedder_propagation.rs`).
+    struct StubEmbedder;
+
+    #[async_trait]
+    impl octos_llm::EmbeddingProvider for StubEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0_f32; 1]; texts.len()])
+        }
+
+        fn dimension(&self) -> usize {
+            1
+        }
+    }
+
+    async fn embedder_probe_tool() -> SpawnTool {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(dir.path().join("mem"))
+                .await
+                .expect("episode store"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        SpawnTool::new(
+            Arc::new(MockProvider) as Arc<dyn LlmProvider>,
+            memory,
+            std::env::temp_dir(),
+            tx,
+        )
+    }
+
+    /// Workers save episodes by default (`AgentConfig::default().save_episodes`),
+    /// so a spawn tool without embedder propagation stores them vectorless
+    /// and worker recall silently skips. `with_embedder` must persist the
+    /// handle so worker construction can forward it.
+    #[tokio::test]
+    async fn should_store_embedder_when_builder_provides_one() {
+        let embedder = Arc::new(StubEmbedder) as Arc<dyn octos_llm::EmbeddingProvider>;
+        let tool = embedder_probe_tool().await.with_embedder(embedder);
+        assert!(
+            tool.embedder_for_test().is_some(),
+            "SpawnTool::with_embedder must persist the handle so every \
+             worker Agent inherits embed-on-save + hybrid recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_default_to_no_embedder_when_not_provided() {
+        let tool = embedder_probe_tool().await;
+        assert!(
+            tool.embedder_for_test().is_none(),
+            "legacy callers without an embedder stay byte-for-byte identical"
+        );
+    }
+
     #[test]
     fn role_template_selection_applies_prompt_and_tool_budget() {
         let mut input: Input = serde_json::from_value(serde_json::json!({
@@ -3848,6 +3951,7 @@ mod tests {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
