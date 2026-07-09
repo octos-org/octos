@@ -441,9 +441,16 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 
 > **One gap today:** interactive tool-approval prompts and `ask_user_question` aren't surfaced to the editor yet — octos runs tools under its own (non-interactive) approval policy rather than ACP `session/request_permission`, so a tool that would pause for approval in `octos chat` won't prompt you in Zed. Everything else matches.
 
-**1. Give the agent a provider credential.** Easiest is `octos auth login --provider deepseek` — it's stored in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass an API key by env var, put it in the `env` block below.
+**1. Install octos and initialize it** (skip if you already have it — see [Start here](#start-here) for all install options):
 
-**2. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
+```bash
+npm install -g @octos-org/octos      # or Homebrew / build from source — see Start here
+octos init                           # interactive: pick a provider + model
+```
+
+**2. Provide your DeepSeek API key.** Run `octos auth login --provider deepseek` and **paste your key when prompted** (get one from the DeepSeek platform). It's stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by env var, put it in the `env` block below instead.
+
+**3. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
 
 ```jsonc
 {
@@ -457,7 +464,7 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 }
 ```
 
-**3. Play with it in Zed.**
+**4. Play with it in Zed.**
 - **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
 - Open the **Agent Panel** (right dock), click the **＋ New Thread** dropdown (or press `⌥⌘⇧N`), and choose **Octos**.
 - Type a prompt. octos runs the agent loop and streams tools, thinking, and results back into Zed — and it remembers across turns via your `MEMORY.md`.
