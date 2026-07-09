@@ -203,3 +203,74 @@ async fn work_secret_ws_denies_raw_surface_but_allows_typed() {
     server.abort();
     let _ = server.await;
 }
+
+/// #1594 follow-up: the `client_hello` handshake happens before the raw deny
+/// gate, so its advertised capabilities must not list the raw/global methods an
+/// ingress credential is denied — otherwise advertised ≠ callable.
+#[tokio::test]
+async fn work_secret_ws_client_hello_advertises_only_callable_methods() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "local:work-secret";
+    let token = "guest-token";
+    let (state, store) = state_with_work_secret_store(&dir);
+    store
+        .issue(
+            session_id,
+            token,
+            "http://127.0.0.1:50080",
+            Duration::minutes(5),
+            None,
+        )
+        .unwrap();
+    let (addr, server) = spawn_api(state).await;
+
+    let url = format!(
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?session_ingress_token={token}&ui_feature=auxiliary.rest_to_ws.v1"
+    );
+    let (mut ws, _response) = connect_async(url).await.unwrap();
+
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hello",
+            "method": "client_hello",
+            "params": {}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .expect("timed out waiting for server_hello")
+        .expect("websocket ended before server_hello")
+        .expect("failed to read server_hello");
+    let Message::Text(body) = response else {
+        panic!("expected JSON-RPC text response, got {response:?}");
+    };
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["result"]["type"], "server_hello");
+    let methods: Vec<String> = body["result"]["capabilities"]["supported_methods"]
+        .as_array()
+        .expect("supported_methods array")
+        .iter()
+        .map(|m| m.as_str().unwrap_or_default().to_string())
+        .collect();
+    // Denied surfaces must NOT be advertised to an ingress credential.
+    for denied in ["profile/llm/upsert", "session/list", "system/status.get"] {
+        assert!(
+            !methods.iter().any(|m| m == denied),
+            "ingress client_hello must not advertise {denied}; got {methods:?}"
+        );
+    }
+    // A session-scoped typed method the credential CAN call is still advertised.
+    assert!(
+        methods.iter().any(|m| m == "session/messages_page"),
+        "ingress client_hello must still advertise session-scoped methods; got {methods:?}"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
