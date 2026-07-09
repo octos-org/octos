@@ -415,14 +415,14 @@ pub fn resolve_reply_target(
             .metadata
             .get("deliver_to_channel")
             .and_then(|v| v.as_str())
-            .and_then(|s| if s.is_empty() { None } else { Some(s) })
+            .filter(|s| !s.is_empty())
             .unwrap_or(default_cron_channel)
             .to_string();
         let cid = inbound
             .metadata
             .get("deliver_to_chat_id")
             .and_then(|v| v.as_str())
-            .and_then(|s| if s.is_empty() { None } else { Some(s) })
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
                 if !default_cron_chat_id.is_empty() {
                     default_cron_chat_id

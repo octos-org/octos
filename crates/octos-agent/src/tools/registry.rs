@@ -18,10 +18,10 @@ use super::{
     ApplyPatchTool, AskUserQuestionTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool,
     ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
     ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
-    SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore,
-    ToolResult, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
-    WaitAgentTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
-    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
+    SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolResult,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
+    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
+    WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
