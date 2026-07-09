@@ -42,6 +42,7 @@ mod ui_protocol_approvals;
 // gateway approval path can write the same audit log without the `api`
 // feature; re-exported here so api-internal paths keep working.
 pub(crate) use crate::approvals_audit as ui_protocol_audit;
+pub mod acp_websocket;
 mod ui_protocol_diff;
 mod ui_protocol_ledger;
 pub(crate) mod ui_protocol_progress;
@@ -56,9 +57,8 @@ pub(crate) mod voice_turn;
 pub mod voices;
 pub mod webhook_proxy;
 pub mod ws_slash;
-pub mod acp_websocket;
-pub use events::EventBroadcaster;
 pub use acp_websocket::acp_websocket_handler;
+pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
 pub use preview_tokens::{
     DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewSweeperHandle,

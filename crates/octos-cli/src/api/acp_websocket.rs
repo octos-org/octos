@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::Response,
 };
@@ -132,8 +132,10 @@ async fn handle_acp_socket(socket: WebSocket, state: Arc<AppState>) {
     let session_key = SessionKey::new("acp", &Uuid::new_v4().to_string());
 
     // Unbounded sender keeps report() synchronous (ProgressReporter::report is not async).
-    let (tx, mut rx): (mpsc::UnboundedSender<AcpMessage>, mpsc::UnboundedReceiver<AcpMessage>) =
-        mpsc::unbounded_channel();
+    let (tx, mut rx): (
+        mpsc::UnboundedSender<AcpMessage>,
+        mpsc::UnboundedReceiver<AcpMessage>,
+    ) = mpsc::unbounded_channel();
 
     // Send welcome notification
     let welcome = AcpMessage::Notification(JsonRpcNotification {
@@ -315,10 +317,16 @@ async fn handle_chat_request(
 
     let session_id = Uuid::new_v4().to_string();
 
-    let reporter = Arc::new(WebSocketStreamReporter::new(session_id.clone(), sender.clone()));
+    let reporter = Arc::new(WebSocketStreamReporter::new(
+        session_id.clone(),
+        sender.clone(),
+    ));
     session_rt.agent.set_reporter(reporter);
 
-    let result = session_rt.agent.process_message(input, &history, vec![]).await;
+    let result = session_rt
+        .agent
+        .process_message(input, &history, vec![])
+        .await;
 
     match result {
         Ok(response) => {
@@ -374,10 +382,7 @@ async fn handle_status_request(id: String, state: &AppState) -> eyre::Result<Acp
 }
 
 /// Handle a list_sessions request
-async fn handle_list_sessions_request(
-    id: String,
-    state: &AppState,
-) -> eyre::Result<AcpMessage> {
+async fn handle_list_sessions_request(id: String, state: &AppState) -> eyre::Result<AcpMessage> {
     let sessions = state
         .sessions
         .as_ref()
