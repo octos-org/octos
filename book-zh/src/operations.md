@@ -17,12 +17,12 @@ git pull origin main
 如果以服务方式运行，升级后需要重启：
 
 ```bash
-# macOS (launchd):
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+# macOS（launchd 系统守护进程）：
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 
-# Linux (systemd):
-systemctl --user restart octos-serve
+# Linux (systemd)：
+sudo systemctl restart octos-serve
 ```
 
 ---
@@ -127,7 +127,7 @@ security set-keychain-settings ~/Library/Keychains/login.keychain-db
 | 现象 | 原因 | 解决方法 |
 |---------|-------|-----|
 | "User interaction is not allowed" | 钥匙串已锁定（SSH 会话） | `octos auth unlock --password <pw>` |
-| 钥匙串查找超时（3 秒） | 钥匙串已锁定（LaunchAgent） | 启用自动登录，重启 |
+| 钥匙串查找超时（3 秒） | 钥匙串已锁定（LaunchDaemon） | 启用自动登录，重启 |
 | "keychain marker found but no secret" | 密钥未存储或使用了错误的钥匙串 | 解锁后重新执行 `octos auth set-key` |
 | 网关启动时卡住 | 钥匙串查找阻塞 | 更新到最新的 octos 二进制文件 |
 
@@ -155,10 +155,10 @@ macOS 钥匙串是为桌面交互使用设计的。在无头服务器上，它�
 **为什么钥匙串在无头服务器上不可靠：**
 
 1. **需要 macOS 登录密码** -- 通过 SSH 解锁钥匙串需要用户的登录密码存储在某处，降低了安全收益。
-2. **重启/休眠后重新锁定** -- 启动 `octos serve` 的 LaunchAgent 在 GUI 登录之前运行，此时钥匙串处于锁定状态。
+2. **重启/休眠后重新锁定** -- 启动 `octos serve` 的 LaunchDaemon 在 GUI 登录之前运行，此时钥匙串处于锁定状态。
 3. **空闲超时后重新锁定** -- 即使解锁后，macOS 也可能重新锁定。`set-keychain-settings` 的变通方案可能被 macOS 更新重置。
 4. **ACL 弹窗阻断无头访问** -- 如果二进制文件不是最初存储密钥的那个，macOS 可能弹出一个无法回答的 GUI 对话框。
-5. **会话隔离** -- 从 SSH 解锁不会解锁 LaunchAgent 会话的钥匙串，反之亦然。
+5. **会话隔离** -- 从 SSH 解锁不会解锁 LaunchDaemon 会话的钥匙串，反之亦然。
 
 **服务器的明文设置：**
 
@@ -179,7 +179,7 @@ macOS 钥匙串是为桌面交互使用设计的。在无头服务器上，它�
 
 ```bash
 chmod 600 ~/.octos/profiles/*.json
-chmod 600 ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo chmod 600 /Library/LaunchDaemons/io.octos.serve.plist
 ```
 
 ---
@@ -188,17 +188,17 @@ chmod 600 ~/Library/LaunchAgents/io.octos.octos-serve.plist
 
 ### macOS (launchd)
 
-创建 LaunchAgent plist 将 octos 作为持久服务运行：
+部署脚本将 octos 安装为**系统 LaunchDaemon**，位于 `/Library/LaunchDaemons/io.octos.serve.plist`（因此登出后仍存活，并在 GUI 登录前启动）。使用 `sudo` 管理：
 
 ```bash
 # 加载服务
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 
 # 卸载服务
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
 
 # 检查状态
-launchctl list | grep octos
+sudo launchctl print system/io.octos.serve
 ```
 
 如果服务需要环境变量（例如 SMTP 凭据），将其添加到 plist 中：
@@ -215,18 +215,18 @@ launchctl list | grep octos
 
 ### Linux (systemd)
 
-使用 systemd 用户单元管理服务：
+部署脚本会在 `/etc/systemd/system/octos-serve.service` 安装**系统单元**。使用 `sudo` 管理：
 
 ```bash
 # 启动 / 停止 / 重启
-systemctl --user start octos-serve
-systemctl --user stop octos-serve
-systemctl --user restart octos-serve
+sudo systemctl start octos-serve
+sudo systemctl stop octos-serve
+sudo systemctl restart octos-serve
 
 # 设置开机自启
-systemctl --user enable octos-serve
+sudo systemctl enable octos-serve
 
 # 查看状态和日志
-systemctl --user status octos-serve
-journalctl --user -u octos-serve
+sudo systemctl status octos-serve
+sudo journalctl -u octos-serve -f
 ```

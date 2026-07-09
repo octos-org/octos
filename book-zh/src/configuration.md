@@ -152,6 +152,19 @@
   // 邮件（用于邮件渠道）
   "email": null,
 
+  // 记忆注入 + 自动刷新（见「记忆与技能」）
+  "memory": {
+    "max_inject_tokens": 2500,
+    "refresh": {
+      "enabled": true,          // 三态：缺省 = 开启（默认）
+      "extract_model": null,    // null = 使用 profile 服务商
+      "consolidate_model": null,
+      "max_extractions_per_day": 20,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30
+    }
+  },
+
   // 仪表板认证（仅 serve 模式）
   "dashboard_auth": null,
 
@@ -159,6 +172,35 @@
   "monitor": null
 }
 ```
+
+> `memory.refresh` 流水线**默认开启**。完整字段列表与 `octos memory` 命令见[记忆与技能 → 自动记忆刷新](./memory-skills.md)。通过 `"enabled": false` 或 `OCTOS_MEMORY_REFRESH_ENABLED=0` 退出。
+
+## 人工审批规则
+
+命中规则的工具调用会暂停当前轮次，直到授权的人在渠道上批准或拒绝（Matrix 优先；Robrix 等能力客户端渲染原生的 批准/拒绝 按钮，其他客户端显示文本回退）：
+
+```json
+{
+  "approval_policy": {
+    "default": "allow",
+    "rules": [{
+      "tools": ["shell", "write_file"],
+      "require_approval": true,
+      "risk_level": "critical",
+      "authorized_approvers": ["@alice:example.org"],
+      "expires_in_secs": 600,
+      "on_timeout": "notify"
+    }]
+  }
+}
+```
+
+- 规则按工具名精确匹配；第一条命中的规则生效。
+- 审批绑定到精确的工具参数（SHA-256 摘要）、发起房间以及 `authorized_approvers` 列表；每个请求只能被消费一次。
+- `expires_in_secs` 限定请求可应答的时长；到期后聊天会收到通知（`on_timeout: "notify"`）。
+- 待处理审批保存在内存中：网关重启会丢弃它们（审批卡片仍留在聊天中，但应答会报告该请求未知）。
+- 决策会追加到 `<data_dir>/audit/` 下的 JSONL 审计日志（`OCTOS_APPROVALS_AUDIT_*` 环境变量控制轮转/保留）。
+- 也可通过 `profile.config.approval_policy` 按 profile 配置。
 
 ## 环境变量
 

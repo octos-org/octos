@@ -1,6 +1,6 @@
 # LLM Providers & Routing
 
-Octos supports 14 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama).
+Octos supports 16 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama and Vertex AI, which uses a service-account JSON).
 
 ## Supported Providers
 
@@ -8,7 +8,8 @@ Octos supports 14 LLM providers out of the box. Each provider needs an API key s
 |----------|-------------|---------------|------------|---------|
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native Anthropic | -- |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | -- |
-| `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | Native Gemini | -- |
+| `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | `google` |
+| `vertex` | `VERTEX_SA_JSON` | gemini-2.5-flash | Vertex AI (Gemini) | `vertex-ai`, `vertexai` |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | -- |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | -- |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | -- |
@@ -16,10 +17,15 @@ Octos supports 14 LLM providers out of the box. Each provider needs an API key s
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | -- |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5 | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Auto (Anthropic/OpenAI) | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | -- |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | -- |
+
+**`vertex`** authenticates with a Google service-account JSON (resolved via `VERTEX_SA_JSON` — keychain marker, config value, or env) instead of an API key; the GCP project is read from the JSON and the region is fixed to `global`. It must be selected explicitly (`provider: "vertex"`) — bare `gemini-*` model names still resolve to the AI Studio `gemini` provider. **`r9s`** is a multi-protocol proxy that auto-detects the Anthropic Messages API for `claude-*` models and OpenAI Chat Completions otherwise.
+
+Any other OpenAI- or Anthropic-compatible endpoint (e.g. `wisemodel`, Together, Fireworks, Azure) is reachable by setting `base_url` on a provider — see [Custom Endpoints](#custom-endpoints).
 
 ## Configuration Methods
 
@@ -126,7 +132,7 @@ The `api_type` field forces a specific wire format when a provider uses a non-st
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
@@ -150,7 +156,7 @@ Configure a priority-ordered fallback chain. If the primary provider fails, the 
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]

@@ -12,19 +12,29 @@ Octos 面向那些需求超越个人助手的用户：需要在 WhatsApp 和 Tel
 
 ## 运行模式
 
-Octos 有两种主要运行模式：
+Octos 有三种主要运行模式：
 
 - **对话模式** (`octos chat`)：交互式多轮对话，支持工具调用；也可通过 `--message` 发送单条消息后退出。
 - **网关模式** (`octos gateway`)：常驻守护进程，同时服务多个消息渠道。
+- **服务模式** (`octos serve`)：Web 仪表板 + REST API + WS UI Protocol。承载多租户运维仪表板与内嵌的聊天/studio SPA，是所有图形客户端连接的后端。
+
+## 客户端
+
+`octos serve` 后端使用单一的带版本 **UI Protocol**（基于 WebSocket 或 stdio 的 JSON-RPC），因此多个前端共享同一个服务器：
+
+- **Web**（[octos-web](https://github.com/octos-org/octos-web)）：内嵌在 `/app/` 的 React SPA（聊天、Slides Studio、Sites、语音）。位于 `/admin/` 的运维**管理仪表板**是 octos 仓库中一个独立的内嵌应用（`dashboard/`）。
+- **终端**（[octos-tui](https://github.com/octos-org/octos-tui)）：通过 UI Protocol 连接的 Rust TUI（WebSocket 连到运行中的 `serve`，或拉起一个 `serve --stdio` 子进程），支持实时流式、审批、diff 与引导。
 
 ## 核心概念
 
 | 术语 | 说明 |
 |------|------|
 | **Agent（智能体）** | 使用工具执行任务的 AI |
+| **Profile** | 具名、隔离的智能体配置（提示词、模型、工具、渠道、数据目录）；多租户的基本单位 |
 | **Tool（工具）** | 一项能力（Shell、文件操作、搜索、消息发送等） |
 | **Provider（供应商）** | LLM API 服务（Anthropic、OpenAI 等） |
 | **Channel（渠道）** | 消息平台（CLI、Telegram、Slack 等） |
+| **UI Protocol** | `octos serve` 与其客户端（web、TUI）之间的带版本 JSON-RPC 契约（WS/stdio） |
 | **Session（会话）** | 按渠道和聊天 ID 划分的对话历史 |
 | **Sandbox（沙箱）** | 隔离的执行环境（bwrap、macOS sandbox-exec、Docker） |
 | **Tool Policy（工具策略）** | 控制可用工具的允许/拒绝规则 |

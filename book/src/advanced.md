@@ -227,7 +227,22 @@ Hooks are shell commands that run at agent lifecycle events. Each hook receives 
 
 ### Events
 
-Four lifecycle events, each with a specific payload:
+Ten lifecycle events. Only the three **`before_*`** events can deny (exit 1); every other event is observe-only (a non-zero exit is logged but does not block).
+
+| Event | When it fires | Can deny |
+|-------|---------------|----------|
+| `before_tool_call` | Before each tool execution | ✅ |
+| `after_tool_call` | After each tool execution | — |
+| `before_llm_call` | Before each LLM API call | ✅ |
+| `after_llm_call` | After each successful LLM response | — |
+| `before_spawn_verify` | Before a spawned sub-agent's verify step | ✅ |
+| `on_spawn_verify` | At a spawned sub-agent's verify step | — |
+| `on_spawn_complete` | When a spawned (background) task completes | — |
+| `on_spawn_failure` | When a spawned task fails | — |
+| `on_turn_end` | When an agent turn finishes | — |
+| `on_resume` | When a session/turn resumes (e.g. after a client reconnect) | — |
+
+The four core events carry the richest payloads (shown below); the spawn/turn/resume events carry the relevant task/session identifiers plus `event`, `session_id`, and `profile_id`.
 
 #### `before_tool_call`
 
@@ -326,7 +341,7 @@ In `config.json` or per-profile JSON:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `event` | yes | -- | One of the 4 event types |
+| `event` | yes | -- | One of the 10 event types (see Events above) |
 | `command` | yes | -- | Argv array (no shell interpretation) |
 | `timeout_ms` | no | 5000 | Kill hook process after this timeout |
 | `tool_filter` | no | all | Only trigger for these tool names (tool events only) |
@@ -447,15 +462,15 @@ Configure in `config.json`:
 
 ## Session Management
 
-### Session Forking
+### New & Named Sessions
 
-Send `/new` to create a branched conversation:
+Send bare `/new` (equivalent to `/clear`) to wipe the current session's history and start fresh:
 
 ```
 /new
 ```
 
-This creates a new session that copies the last 10 messages from the current conversation. The child session has a `parent_key` reference to the original. Each fork gets a unique key namespaced by sender and timestamp.
+Use `/new <name>` to switch to — or create — a **named** session (e.g. `/new research`), and `/new slides <name>` / `/new site <preset>` to scaffold a project session. Sessions are keyed by sender/channel; the session store additionally carries a `parent_key` field used for internally-forked child sessions (e.g. background spawns).
 
 ### Session Persistence
 
@@ -463,7 +478,7 @@ Each channel:chat_id pair maintains its own session (conversation history).
 
 - **Storage**: JSONL files in `.octos/sessions/`
 - **Max history**: Configurable via `gateway.max_history` (default: 50 messages)
-- **Session forking**: `/new` creates a branched conversation with parent_key tracking
+- **Sessions**: bare `/new` clears the current session; named sessions are keyed by sender/channel, with a `parent_key` field for internally-forked child sessions
 
 ### Config Hot-Reload
 
@@ -505,10 +520,23 @@ When the conversation exceeds the LLM's context window, older messages are autom
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Fork the conversation (creates a new session copying the last 10 messages) |
+| `/new [name]` | Bare `/new` clears the current session; `/new <name>` switches to (or creates) a named session; `/new slides <name>` / `/new site <preset>` scaffold a project |
+| `/clear` | Wipe the current session's history |
+| `/s`, `/switch <name>` | Switch to a named session |
+| `/sessions` | List sessions for this chat |
+| `/back`, `/b` | Switch to the previously active session |
+| `/delete`, `/d` | Delete the current session |
 | `/config` | View and modify tool configuration |
 | `/queue` | View or change queue mode |
+| `/thinking` | View or set the reasoning-effort level (transport-dependent) |
+| `/router`, `/adaptive` | View or change the routing/adaptive mode |
+| `/soul` | View or edit the profile's SOUL (personality) |
+| `/skills` | List / install / remove skills inline |
+| `/status` | Show session/runtime status |
+| `/help` | List the commands available on the current transport |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
+
+The exact set varies by transport (CLI, gateway channel, web, TUI). Matrix management rooms add scheduling (`/schedule`, `/schedules`, `/unschedule`) and multi-bot (`/createbot`, `/deletebot`, `/listbots`, `/allbots`, `/bothelp`) commands — see [Gateway & Channels](./channels.md).
 
 ### In-Chat Provider Switching
 
@@ -525,7 +553,7 @@ Bot: Current model: deepseek/deepseek-chat
        - anthropic (default: claude-sonnet-4-20250514) [ready]
        - openai (default: gpt-4o) [ready]
        - deepseek (default: deepseek-chat) [ready]
-       - gemini (default: gemini-2.0-flash) [ready]
+       - gemini (default: gemini-2.5-flash) [ready]
        ...
 ```
 
