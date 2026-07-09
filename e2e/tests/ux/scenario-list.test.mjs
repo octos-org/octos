@@ -285,6 +285,28 @@ test("capability gate promotes restart-reconnect without promoting task-subagent
   );
 });
 
+test("restart-reconnect manifest declares the validated reconnect evidence artifacts", () => {
+  // The runnable lane's artifact contract must stay in sync with what the
+  // in-repo runner/probe emit and ux-tmux-validate.mjs checks in
+  // restart_reconnect_visible_contract.
+  const manifest = loadManifest({ path: MANIFEST });
+  const scenario = manifest.scenarios.find((s) => s.id === "restart-reconnect");
+  assert.ok(scenario, "missing scenario restart-reconnect");
+  for (const artifact of [
+    "reconnect-events.jsonl",
+    "tui-capture-pre-restart.txt",
+    "tui-capture-post-reconnect.txt",
+    "pre-restart-snapshot.json",
+    "post-reconnect-snapshot.json",
+    "websocket-transcript.jsonl",
+  ]) {
+    assert.ok(
+      scenario.expectedArtifacts.includes(artifact),
+      `restart-reconnect manifest missing validated artifact ${artifact}`,
+    );
+  }
+});
+
 test("classifyRunnability honors quarantine flag", () => {
   const fakeScenario = {
     id: "q",
