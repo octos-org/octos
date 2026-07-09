@@ -2647,11 +2647,14 @@ mod tests {
     fn should_expand_env_vars_in_authorized_approvers() {
         // Use an env var reliably present in the test environment instead of
         // mutating the environment (workspace is `deny(unsafe_code)`, and
-        // std::env::set_var is unsafe under edition 2024).
-        let var = if std::env::var("HOME").is_ok() {
-            "HOME"
-        } else {
+        // std::env::set_var is unsafe under edition 2024). Prefer PATH: other
+        // tests in this module temporarily set_var("HOME", fake_home) and
+        // restore it, so snapshotting HOME here raced them under parallel
+        // test threads (flaky expected-vs-expanded mismatch).
+        let var = if std::env::var("PATH").is_ok() {
             "PATH"
+        } else {
+            "HOME"
         };
         let expected = std::env::var(var).unwrap();
         let mut config = Config {
@@ -2934,14 +2937,16 @@ mod tests {
         assert!(!MemoryConfig::refresh_enabled(config.memory.as_ref()));
 
         // An explicit config value wins over the env.
-        let mut explicit = Config::default();
-        explicit.memory = Some(MemoryConfig {
-            refresh: Some(MemoryRefreshConfig {
-                enabled: Some(true),
+        let mut explicit = Config {
+            memory: Some(MemoryConfig {
+                refresh: Some(MemoryRefreshConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
-        });
+        };
         merge_env_memory_policy(&mut explicit);
         assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
 
