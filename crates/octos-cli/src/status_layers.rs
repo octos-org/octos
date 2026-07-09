@@ -313,6 +313,7 @@ impl StatusComposer {
             user_config,
             sender_user_id,
             None,
+            true,
         )
     }
 
@@ -335,6 +336,7 @@ impl StatusComposer {
         user_config: &UserStatusConfig,
         sender_user_id: Option<String>,
         thread_id: Option<String>,
+        persist_visible_status: bool,
     ) -> ComposerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let status_msg_id = Arc::new(Mutex::new(None::<String>));
@@ -401,6 +403,7 @@ impl StatusComposer {
                 provider_visible,
                 sender_user_id_for_loop,
                 thread_id_for_loop,
+                persist_visible_status,
             )
             .await;
         });
@@ -631,6 +634,7 @@ async fn run_compose_loop(
     provider_visible: bool,
     sender_user_id: Option<String>,
     thread_id: Option<String>,
+    persist_visible_status: bool,
 ) {
     let start = Instant::now();
     let mut last_edit = Instant::now() - EDIT_THROTTLE;
@@ -650,9 +654,10 @@ async fn run_compose_loop(
     }
 
     // Compose and send initial message
-    if !channel.supports_edit() {
-        // Can't edit — skip status message entirely
-        // Just keep sending typing indicators
+    if !persist_visible_status || !channel.supports_edit() {
+        // Can't edit (or an app-reply card will replace the text reply, so a
+        // persistent status message would linger) — skip the status message
+        // entirely and just keep sending typing indicators
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if cancelled.load(Ordering::Acquire) {
@@ -1107,6 +1112,30 @@ mod tests {
             typing.first().and_then(|v| v.as_deref()),
             Some("@bot_mybot:localhost")
         );
+    }
+
+    #[tokio::test]
+    async fn should_skip_persisted_status_message_when_persist_visible_status_false() {
+        let channel = Arc::new(MockChannel::default());
+        let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
+        let tracker = Arc::new(TokenTracker::new());
+
+        let handle = composer.start_with_thread(
+            "!room:localhost".to_string(),
+            "今天天气怎么样",
+            tracker,
+            None,
+            &UserStatusConfig::default(),
+            Some("@bot_mybot:localhost".to_string()),
+            None,
+            false,
+        );
+
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        handle.stop().await;
+
+        assert!(channel.sent.lock().await.is_empty());
+        assert!(!channel.typing_senders.lock().await.is_empty());
     }
 
     #[tokio::test]

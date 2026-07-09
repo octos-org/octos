@@ -91,6 +91,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         }
     }
 

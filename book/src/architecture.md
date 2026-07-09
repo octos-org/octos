@@ -2,13 +2,14 @@
 
 ## Overview
 
-octos is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 26-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
-**Workspace members**:
-- **6 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli
-- **1 pipeline crate**: octos-pipeline
-- **7 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather
-- **1 platform-skill crate**: asr
+**Workspace members** (from `Cargo.toml`):
+- **Layered core** (7): `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API), plus `octos-bus` (14 channels, sessions, coalescing, cron) and `octos-diagnostics` (powers `octos doctor`).
+- **Agent-adjacent** (5): `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
+- **Bundled skill crates** (14): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
+
+(The web SPA and terminal client live in the separate `octos-web` and `octos-tui` repositories and talk to `octos serve` over the UI Protocol.)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -250,7 +251,7 @@ pub struct CreateParams {
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints (OpenAI provider)
 
@@ -807,14 +808,16 @@ Plugins extend the agent with external tools via standalone executables. Each pl
 #### Directory Layout
 
 ```
-.octos/plugins/           # local (project-level)
-~/.octos/plugins/         # global (user-level)
+<octos_home>/plugins/                 # deployment-scoped plugins
+<octos_home>/skills/                  # deployment-scoped skills
+<octos_home>/bundled-app-skills/      # bundled app skills
+~/.octos/profiles/<profile>/data/skills/
   └── my-plugin/
       ├── manifest.json  # plugin metadata + tool definitions
       └── my-plugin      # executable (or "main" as fallback)
 ```
 
-**Discovery order**: local `.octos/plugins/` first, then global `~/.octos/plugins/`. Both are scanned by `Config::plugin_dirs()`.
+**Discovery order**: `Config::plugin_dirs_from_project()` scans deployment-scoped `<octos_home>/plugins`, `<octos_home>/skills`, `<octos_home>/bundled-app-skills`, and `OCTOS_SKILLS_PATH`; managed profile gateways then layer platform skills and the active profile's `data/skills/` directory on top. Legacy HOME-rooted globals (`~/.octos/plugins`, `~/.octos/skills`) are no longer scanned except for a one-shot migration warning.
 
 #### PluginManifest
 
@@ -1047,6 +1050,7 @@ pub trait Channel: Send + Sync {
 | **CLI** | stdin/stdout | (always) | N/A | N/A |
 | **Telegram** | teloxide long-poll | `telegram` | Bot token (env) | teloxide built-in |
 | **Discord** | serenity gateway | `discord` | Bot token (env) | serenity built-in |
+| **DingTalk** | custom robot send + outgoing robot webhook | `dingtalk` | Webhook URL + signing secret | msgId |
 | **Slack** | Socket Mode (tokio-tungstenite) | `slack` | Bot token + App token | message_ts |
 | **WhatsApp** | WebSocket bridge (ws://localhost:3001) | `whatsapp` | Baileys bridge | HashSet (10K cap, clear on overflow) |
 | **Feishu** | WebSocket (tokio-tungstenite) | `feishu` | App ID + Secret → tenant token (TTL 6000s) | HashSet (10K cap, clear on overflow) |
@@ -1124,7 +1128,7 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 | `clean` | Remove .redb files with dry-run support |
 | `completions` | Shell completion generation (bash/zsh/fish) |
 | `docs` | Generate tool + provider documentation |
-| `serve` | REST API server (feature: api) — axum on 127.0.0.1:8080 (`--host` to override) |
+| `serve` | REST API server (feature: api) — axum on 127.0.0.1:50080 (`--host` to override) |
 
 ### Configuration
 
@@ -1169,9 +1173,9 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
 
-**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost:3000/8080. **Max message**: 1MB.
+**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 
-**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, SSE streaming, dark theme. Vanilla HTML/CSS/JS (no build tools).
+**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, UI Protocol WebSocket streaming, and dashboard/admin surfaces share the same `octos serve` process.
 
 **Prometheus Metrics**: `octos_tool_calls_total` (counter, labels: tool, success), `octos_tool_call_duration_seconds` (histogram, label: tool), `octos_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
 
@@ -1449,7 +1453,7 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 
 ## Testing
 
-1300+ tests across all crates. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
+5,000+ tests across the workspace. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
 
 - **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction, coalescing, BM25 scoring, L2 normalization, SSE parsing
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing (19 tests)

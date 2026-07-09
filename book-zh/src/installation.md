@@ -27,14 +27,27 @@
 git clone https://github.com/octos-org/octos
 cd octos
 
-# 基本功能（CLI、chat、run、gateway + CLI 渠道）
+# 推荐：规范特性集（与 scripts/milestone-ci.sh 一致）。
+# 包含 REST API + 仪表板（`octos serve`）以及常用的消息渠道适配器——
+# 这是 CI 所构建的集合。（发布工作流使用相近的集合；确切的发布特性
+# 请查看 .github/workflows。）如需其他渠道（slack、email、matrix、
+# line、qq-bot、wechat），从下方列表按需添加。
+cargo install --path crates/octos-cli \
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+
+# 最小：仅 CLI + chat + gateway（仅 CLI 渠道）。
+# 该二进制不含 `octos serve`（是 api 特性注册了该子命令），
+# 也不编译任何消息渠道适配器。
 cargo install --path crates/octos-cli
 
-# 启用消息渠道
-cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
-
-# 启用 Web 界面和 REST API
-cargo install --path crates/octos-cli --features api
+# 按需裁剪特性列表。可用的渠道特性：
+#   telegram、discord、dingtalk、slack、whatsapp、feishu、email、wecom、wecom-bot、
+#   matrix、line、qq-bot、twilio、wechat
+# `octos serve` 必需：api
+# 其他特性：git（gitoxide）、ast（tree-sitter）、
+#   audio_mp3（用于音频工作区契约校验的 MP3 解码）
+# 注意：浏览器工具（通过 CDP 的无头 Chrome）始终编译在内——没有 `browser` 特性。
+cargo install --path crates/octos-cli --features "api,telegram,slack"
 
 # 验证安装
 octos --version
@@ -173,10 +186,12 @@ Octos 支持在 Windows 上原生编译和运行。Shell 命令通过 `cmd /C` �
 # 1. 安装 Rust（从 https://rustup.rs 下载 rustup-init.exe）
 rustup-init.exe
 
-# 2. 克隆并编译
+# 2. 克隆并使用规范特性集编译
+#    （若只想要 `octos chat` 可省略特性；`octos serve` 需要 api 特性）
 git clone https://github.com/octos-org/octos.git
 cd octos
-cargo install --path crates/octos-cli
+cargo install --path crates/octos-cli `
+    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # 3. 设置 API 密钥并运行
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
@@ -200,7 +215,7 @@ wsl --install -d Ubuntu
 # 2. 打开 Ubuntu 终端，然后按照上方 Linux (Ubuntu) 的步骤操作
 ```
 
-在 WSL2 中运行 `octos serve` 时，可以通过 Windows 浏览器访问 `http://localhost:8080`（WSL2 自动转发端口）。
+在 WSL2 中运行 `octos serve` 时，可以通过 Windows 浏览器访问 `http://localhost:50080`（WSL2 自动转发端口）。
 
 ## Docker
 
@@ -296,7 +311,7 @@ sudo systemctl restart octos-serve
 | `octos: command not found` | 将 `~/.cargo/bin` 加入 PATH：`export PATH="$HOME/.cargo/bin:$PATH"` |
 | Linux 上编译失败 | 安装 `build-essential pkg-config libssl-dev` |
 | macOS 代码签名警告 | 执行：`codesign -s - ~/.cargo/bin/octos` |
-| 无法访问仪表板 | 检查端口：`octos serve --port 8080`，打开 `http://localhost:8080` |
+| 无法访问仪表板 | 检查端口：`octos serve --port 50080`，打开 `http://localhost:50080` |
 | WSL2 端口未转发 | 重启 WSL：`wsl --shutdown`，然后重新打开终端 |
 | 服务无法启动 | 检查日志：`tail -f ~/.octos/serve.log` 或 `journalctl --user -u octos-serve` |
 | 找不到 API 密钥 | 确保环境变量在服务环境中已设置，而不仅仅在你的 Shell 中 |

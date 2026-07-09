@@ -99,35 +99,203 @@ fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
         .env("npm_config_cache", &cache_dir);
 }
 
+/// True when `command` runs the `quarto` CLI as a command (not merely
+/// mentions it in a path). Splitting on shell separators means
+/// `cd sites/foo && quarto render` is detected via its `quarto render`
+/// segment.
+///
+/// A segment's leading `NAME=value` env-assignment prefixes are skipped
+/// before testing the command word, so `QUARTO_PROJECT_DIR=. quarto
+/// render` is still recognised — without this, the inline-env form left
+/// HOME unredirected and quarto's sass cache escaped the sandbox
+/// (`unable to open database file: …sass.kv`).
+fn command_invokes_quarto(command: &str) -> bool {
+    command
+        .split(['\n', ';', '&', '|'])
+        .map(str::trim)
+        .any(segment_runs_quarto)
+}
+
+/// True when the first command word of a single shell segment is
+/// `quarto`, after skipping any leading `NAME=value` env assignments.
+fn segment_runs_quarto(segment: &str) -> bool {
+    segment
+        .split_whitespace()
+        .find(|token| !is_env_assignment(token))
+        == Some("quarto")
+}
+
+/// True for a `NAME=value` shell env-assignment token (the form that may
+/// legally precede a command word, e.g. `FOO=bar cmd`).
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+        }
+        None => false,
+    }
+}
+
+/// Directory used as `$HOME` for quarto invocations. Quarto writes its
+/// sass cache to `$HOME/Library/Caches/quarto` and ignores
+/// `QUARTO_CACHE`/`XDG_CACHE_HOME` on macOS, so under the sandbox
+/// (writes confined to cwd) the default home cache is denied and
+/// `quarto render` fails with `unable to open database file: …sass.kv`.
+/// Pointing HOME at a dir inside the (writable) workspace keeps the
+/// cache contained without weakening sandbox isolation.
+fn quarto_home_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".octos-quarto-home")
+}
+
+fn apply_quarto_tool_env(cmd: &mut tokio::process::Command, command: &str, cwd: &Path) {
+    if !command_invokes_quarto(command) {
+        return;
+    }
+    let home = quarto_home_dir(cwd);
+    let _ = std::fs::create_dir_all(&home);
+    cmd.env("HOME", &home);
+}
+
 #[cfg(windows)]
 const NULL_DEVICE_PATH: &str = "NUL";
 #[cfg(not(windows))]
 const NULL_DEVICE_PATH: &str = "/dev/null";
 
 fn contains_git_invocation(command: &str) -> bool {
-    command
-        .split(['\n', ';'])
-        .flat_map(|segment| segment.split("&&"))
-        .flat_map(|segment| segment.split("||"))
-        .any(segment_invokes_git)
+    shell_command_segments(command)
+        .iter()
+        .any(|segment| segment_invokes_git(segment))
 }
 
-fn segment_invokes_git(segment: &str) -> bool {
-    let mut remaining = segment.trim_start();
-    loop {
-        if remaining == "git" || remaining.starts_with("git ") {
+fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut segment = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                quote = None;
+            } else if quote_ch == '"' && ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        token.push(chars.next().expect("peeked char exists"));
+                    } else {
+                        token.push(ch);
+                    }
+                } else {
+                    token.push(ch);
+                }
+            } else {
+                token.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    if is_shell_token_separator(next) || matches!(next, '\'' | '"' | '\\') {
+                        token.push(chars.next().expect("peeked char exists"));
+                    } else {
+                        token.push(ch);
+                    }
+                } else {
+                    token.push(ch);
+                }
+            }
+            '\n' | ';' | '&' | '|' | '(' | ')' => {
+                push_shell_token(&mut segment, &mut token);
+                push_shell_segment(&mut segments, &mut segment);
+            }
+            ch if ch.is_whitespace() => push_shell_token(&mut segment, &mut token),
+            _ => token.push(ch),
+        }
+    }
+
+    push_shell_token(&mut segment, &mut token);
+    push_shell_segment(&mut segments, &mut segment);
+    segments
+}
+
+fn is_shell_token_separator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')')
+}
+
+fn push_shell_token(segment: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        segment.push(std::mem::take(token));
+    }
+}
+
+fn push_shell_segment(segments: &mut Vec<Vec<String>>, segment: &mut Vec<String>) {
+    if !segment.is_empty() {
+        segments.push(std::mem::take(segment));
+    }
+}
+
+fn segment_invokes_git(segment: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(token) = segment.get(index) {
+        if token_invokes_git(token) {
             return true;
         }
-        let Some(token_end) = remaining.find(char::is_whitespace) else {
-            return false;
-        };
-        let token = &remaining[..token_end];
-        if token == "env" || looks_like_env_assignment(token) {
-            remaining = remaining[token_end..].trim_start();
+        if looks_like_env_assignment(token) {
+            index += 1;
+            continue;
+        }
+        if is_git_invocation_wrapper(token) {
+            index += 1;
+            while segment.get(index).is_some_and(|wrapped| {
+                wrapped.starts_with('-') || looks_like_env_assignment(wrapped)
+            }) {
+                index += 1;
+            }
             continue;
         }
         return false;
     }
+    false
+}
+
+fn token_invokes_git(token: &str) -> bool {
+    if looks_like_env_assignment(token) {
+        return false;
+    }
+    let basename = command_basename(token);
+    basename.eq_ignore_ascii_case("git") || basename.eq_ignore_ascii_case("git.exe")
+}
+
+fn is_git_invocation_wrapper(token: &str) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "env",
+        "env.exe",
+        "time",
+        "time.exe",
+        "sudo",
+        "sudo.exe",
+        "npx",
+        "npx.exe",
+        "command",
+        "command.exe",
+        "exec",
+        "exec.exe",
+    ];
+
+    let basename = command_basename(token);
+    WRAPPERS
+        .iter()
+        .any(|wrapper| basename.eq_ignore_ascii_case(wrapper))
+}
+
+fn command_basename(token: &str) -> &str {
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
 fn looks_like_env_assignment(token: &str) -> bool {
@@ -333,6 +501,7 @@ impl Tool for ShellTool {
         let mut cmd = self.sandbox.wrap_command(&input.command, effective_cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         apply_frontend_tool_env(&mut cmd, effective_cwd);
+        apply_quarto_tool_env(&mut cmd, &input.command, effective_cwd);
         apply_git_tool_env(&mut cmd, &input.command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
         apply_harness_event_sink_env(&mut cmd, ctx);
@@ -527,6 +696,86 @@ mod tests {
         assert!(!result.output.contains("without interactive approval"));
     }
 
+    #[test]
+    fn quarto_command_redirects_home_into_workspace() {
+        // Regression (2026-06-08): `quarto render` died under the sandbox
+        // with `unable to open database file:
+        // ~/Library/Caches/quarto/sass/sass.kv`. Quarto locates that cache
+        // via $HOME and ignores QUARTO_CACHE/XDG_CACHE_HOME on macOS, so we
+        // redirect HOME into the (sandbox-writable) workspace for quarto
+        // commands. No sandbox isolation is weakened — the cache lands
+        // inside cwd, which is already writable.
+        let cwd = std::env::temp_dir().join(format!("octos-quarto-env-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        apply_quarto_tool_env(&mut cmd, "cd sites/foo && quarto render", &cwd);
+
+        let home = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("HOME"))
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .expect("HOME must be set for quarto commands");
+        assert!(
+            home.starts_with(&cwd),
+            "quarto HOME must live inside the workspace, got {home:?}"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn quarto_command_with_inline_env_prefix_redirects_home() {
+        // Regression (2026-06-08): the model invoked quarto with an inline
+        // env-var assignment prefix:
+        //   `cd sites/foo && QUARTO_PROJECT_DIR=. quarto render index.qmd --to html`
+        // `command_invokes_quarto` only matched a segment that *starts with*
+        // `quarto `, so the `QUARTO_PROJECT_DIR=. quarto …` segment was not
+        // recognised, HOME was left unredirected, and quarto's sass cache
+        // escaped to ~/Library/Caches/quarto/sass/sass.kv — denied by the
+        // sandbox, breaking theme/syntax-highlight CSS in the rendered page.
+        let cwd = std::env::temp_dir().join(format!("octos-quarto-envpfx-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        apply_quarto_tool_env(
+            &mut cmd,
+            "cd sites/foo && QUARTO_PROJECT_DIR=. quarto render index.qmd --to html 2>&1",
+            &cwd,
+        );
+
+        let home = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("HOME"))
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .expect("HOME must be set for quarto invoked with an env-var prefix");
+        assert!(
+            home.starts_with(&cwd),
+            "quarto HOME must live inside the workspace, got {home:?}"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn non_quarto_command_does_not_redirect_home() {
+        // Least privilege: HOME is only redirected when quarto is invoked,
+        // so other tools keep their normal home.
+        let cwd = std::env::temp_dir();
+        let mut cmd = tokio::process::Command::new("sh");
+        apply_quarto_tool_env(&mut cmd, "echo hi && npm run build", &cwd);
+
+        let has_home = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k.to_str() == Some("HOME"));
+        assert!(!has_home, "non-quarto commands must not redirect HOME");
+    }
+
     #[tokio::test]
     async fn test_shell_sets_frontend_build_env() {
         let cwd = std::env::temp_dir().join(format!("octos-shell-env-{}", std::process::id()));
@@ -592,7 +841,40 @@ mod tests {
         ));
         assert!(contains_git_invocation("GIT_DIR=.git git status --short"));
         assert!(contains_git_invocation("env GIT_DIR=.git git status"));
+        assert!(contains_git_invocation("/usr/bin/git log --oneline"));
+        assert!(contains_git_invocation(r#""/usr/bin/git" log --oneline"#));
+        assert!(contains_git_invocation("time git status --short"));
+        assert!(contains_git_invocation("sudo -E git push"));
+        assert!(contains_git_invocation("npx git log --oneline"));
+        assert!(contains_git_invocation(
+            "printf ref | git hash-object --stdin"
+        ));
+        assert!(contains_git_invocation(
+            r#""C:\Program Files\Git\cmd\git.exe" status"#
+        ));
         assert!(!contains_git_invocation("printf 'git diff -- notes.txt'"));
+        assert!(!contains_git_invocation("grep git README.md"));
+        assert!(!contains_git_invocation("FOO=/usr/bin/git echo ok"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn applies_git_protection_to_wrapped_git_invocation() {
+        let tool = ShellTool::new(std::env::temp_dir());
+        let result = tool
+            .execute(&serde_json::json!({
+                "command": "time git --version >/dev/null 2>&1; printf 'global=%s\\nsystem=%s\\n' \"$GIT_CONFIG_GLOBAL\" \"$GIT_CONFIG_NOSYSTEM\""
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "shell command failed: {}", result.output);
+        assert!(
+            result.output.contains("global=/dev/null"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("system=1"), "{}", result.output);
     }
 
     // -----------------------------------------------------------------------

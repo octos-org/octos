@@ -66,6 +66,7 @@ pub enum RuleId {
     FanoutBound,
     HumanGateResolver,
     ReferenceResolution,
+    NoShell,
 }
 
 impl RuleId {
@@ -93,6 +94,7 @@ impl RuleId {
             Self::FanoutBound => 20,
             Self::HumanGateResolver => 21,
             Self::ReferenceResolution => 22,
+            Self::NoShell => 23,
         }
     }
 
@@ -227,7 +229,79 @@ pub fn diagnostics_with_context(
     rule_20_fanout_bound(graph, context, &mut diags);
     rule_21_human_gate_resolver(graph, context, &mut diags);
     rule_22_reference_resolution(graph, context, &mut diags);
+    rule_23_no_shell(graph, &mut diags);
     diags
+}
+
+/// Rule 23 — the `shell` handler and shell-family tools (`shell`/`bash`/`exec`/
+/// `exec_command`) are NOT permitted in ANY pipeline (LLM-authored or
+/// operator-authored DOT). Shell is arbitrary code execution; the unsafe DOT
+/// authoring surface is removed at the validation gate that every execution +
+/// pre-flight path runs through. Pipelines use the capability-locked handlers
+/// (codergen/gate/noop/parallel/dynamic_parallel) with explicit, non-shell tools.
+fn rule_23_no_shell(graph: &PipelineGraph, diags: &mut Vec<PipelineDiagnostic>) {
+    use crate::graph::HandlerKind;
+    for node in graph.nodes.values() {
+        if node.handler == HandlerKind::Shell {
+            push_diag(
+                diags,
+                RuleId::NoShell,
+                Severity::Error,
+                GraphLocation::Node(node.id.clone()),
+                format!(
+                    "node '{}' uses the `shell` handler, which is not permitted in pipelines",
+                    node.id
+                ),
+                Some(
+                    "shell is arbitrary code execution and is banned; use a codergen/gate/noop handler"
+                        .into(),
+                ),
+            );
+        }
+        if let Some(tool) = node.tools.iter().find(|t| tool_entry_grants_shell(t)) {
+            push_diag(
+                diags,
+                RuleId::NoShell,
+                Severity::Error,
+                GraphLocation::Node(node.id.clone()),
+                format!(
+                    "node '{}' grants shell access via the tool entry '{tool}', which is not permitted",
+                    node.id
+                ),
+                Some(
+                    "use explicit non-shell tool names; remove shell/bash/exec/exec_command/\
+                     write_stdin, wildcards (`*`), and `group:runtime`/`group:*`"
+                        .into(),
+                ),
+            );
+        }
+    }
+}
+
+/// True when a node's `tools` entry grants shell access — directly (a
+/// shell-family tool name) or INDIRECTLY through a policy entry the tool-policy
+/// layer expands to include shell: the runtime group (`group:runtime` /
+/// `group:*`), or a tool-name PREFIX wildcard (`ToolPolicy` treats `prefix*` as
+/// a prefix match) whose prefix matches a shell tool — `*`, `exec*`, `sh*`. Safe
+/// prefixes (`read_*`, `my_plugin_*`) and safe groups (`group:fs`/`search`/...)
+/// match no shell tool and stay allowed.
+fn tool_entry_grants_shell(entry: &str) -> bool {
+    let e = entry.trim();
+    if crate::profile::SHELL_TOOLS.contains(&e) {
+        return true;
+    }
+    if e.eq_ignore_ascii_case("group:runtime") || e == "group:*" {
+        return true;
+    }
+    if !e.starts_with("group:") {
+        if let Some(prefix) = e.strip_suffix('*') {
+            return prefix.is_empty()
+                || crate::profile::SHELL_TOOLS
+                    .iter()
+                    .any(|s| s.starts_with(prefix));
+        }
+    }
+    false
 }
 
 /// Check if any diagnostics are errors.
@@ -1115,7 +1189,7 @@ fn graph_checkpoint_names(graph: &PipelineGraph, context: &ValidationContext) ->
     names
 }
 
-fn detect_cycles_ignoring_marked_back_edges(graph: &PipelineGraph) -> Result<(), String> {
+pub fn detect_cycles_ignoring_marked_back_edges(graph: &PipelineGraph) -> Result<(), String> {
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in &graph.edges {
         if edge_allows_back_edge(edge, graph) {
@@ -1186,7 +1260,7 @@ fn edge_allows_back_edge(edge: &PipelineEdge, _graph: &PipelineGraph) -> bool {
     label_marker || condition_marker
 }
 
-fn has_back_edge_marker(value: &str) -> bool {
+pub(crate) fn has_back_edge_marker(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     value.contains("retry")
         || value.contains("back_edge")
@@ -1290,6 +1364,67 @@ mod tests {
 
     fn diagnostic_for(diags: &[PipelineDiagnostic], rule_id: RuleId) -> bool {
         diags.iter().any(|d| d.rule_id == rule_id)
+    }
+
+    #[test]
+    fn rule_23_rejects_shell_handler_and_shell_tools() {
+        // The `shell` handler is a rule-23 ERROR.
+        let g = parse_dot(
+            "digraph s { start [handler=codergen, tools=read_file]; \
+             danger [handler=shell, prompt=\"x\"]; start -> danger }",
+        )
+        .unwrap();
+        let diags = diagnostics(&g);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule_id == RuleId::NoShell && d.severity == Severity::Error),
+            "handler=shell must be a rule-23 Error; got {diags:?}"
+        );
+
+        // Shell-family tools (direct), write_stdin (session driver), wildcards,
+        // and the runtime group all grant shell → each a rule-23 Error.
+        for tools in [
+            "read_file,bash",
+            "write_stdin",
+            "*",
+            "exec*",
+            "group:runtime",
+        ] {
+            let g2 = parse_dot(&format!(
+                "digraph s {{ a [handler=codergen, tools=\"{tools}\"] }}"
+            ))
+            .unwrap();
+            assert!(
+                diagnostics(&g2)
+                    .iter()
+                    .any(|d| d.rule_id == RuleId::NoShell && d.severity == Severity::Error),
+                "tools=\"{tools}\" must be a rule-23 Error (grants shell)"
+            );
+        }
+
+        // Safe groups + safe prefix wildcards are NOT shell grants.
+        for tools in ["group:fs", "read_*", "my_plugin_*", "write_file"] {
+            let g3 = parse_dot(&format!(
+                "digraph s {{ a [handler=codergen, tools=\"{tools}\"] }}"
+            ))
+            .unwrap();
+            assert!(
+                !diagnostic_for(&diagnostics(&g3), RuleId::NoShell),
+                "tools=\"{tools}\" does not grant shell and must not be flagged"
+            );
+        }
+
+        // A safe pipeline is NOT flagged by rule 23.
+        let safe = parse_dot(
+            "digraph s { a [handler=codergen, tools=read_file]; \
+             b [handler=codergen, tools=write_file]; a -> b }",
+        )
+        .unwrap();
+        assert!(
+            !diagnostic_for(&diagnostics(&safe), RuleId::NoShell),
+            "a non-shell pipeline must not be flagged"
+        );
     }
 
     #[test]
