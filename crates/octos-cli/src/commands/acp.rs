@@ -75,7 +75,7 @@ use agent_client_protocol::{
 use octos_agent::{
     Agent, AgentConfig, ProgressEvent, ProgressReporter, ToolRegistry, create_sandbox,
 };
-use octos_core::AgentId;
+use octos_core::{AgentId, SessionScope, canonicalize_skill_read_zones};
 use octos_llm::{EmbeddingProvider, LlmProvider};
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::Mutex;
@@ -234,22 +234,34 @@ fn finalize_tool_registry(
     profile.apply_to_registry(tools);
 }
 
-/// Process-wide state assembled ONCE at `octos acp` startup and shared behind an
-/// `Arc` across every ACP `session/new`. Mirrors what `octos chat` builds for its
-/// single embedded agent — failover provider chain, episodic + long-term memory,
-/// the full tool registry (builtins + plugins + MCP + memory-bank + pipeline +
-/// policy + profile), embedder, system prompt, hooks, and compaction — so ACP is
-/// as capable as `octos chat` / a serve session. The expensive work (provider
-/// chain, plugin scan, MCP spawn, memory stores, redb episode store opened
-/// exactly once) happens here; per-session work in [`ConfigAgentFactory::build`]
-/// is only the cheap cwd rebind + agent construction.
-struct AcpBootstrap {
+/// Process-global, **cwd-independent** state, assembled ONCE per `octos acp`
+/// process (lazily, on the first `session/new`). The redb episode store is a
+/// single-writer resource, so it must live here — never rebuilt per cwd. Also
+/// carries the raw `Config` + resolved provider identity so per-cwd registries
+/// (which DO depend on cwd) can be built on top.
+struct AcpSharedStores {
     llm: Arc<dyn LlmProvider>,
     memory: Arc<EpisodeStore>,
     memory_store: Arc<MemoryStore>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
-    /// Base registry template — NOT bound to a session cwd. Each session clones +
-    /// rebinds it via `rebind_cwd_with_permissions`.
+    agent_config: AgentConfig,
+    memory_refresh_enabled: bool,
+    max_inject_tokens: usize,
+    data_dir: PathBuf,
+    config: Config,
+    provider_name: String,
+    model_id: String,
+}
+
+/// Per-cwd assembled state, cached per distinct `session/new` cwd (so a second
+/// project handled by the same process gets its OWN skills/agents/scope instead
+/// of the first cwd's). Holds the tool registry (plugins/MCP/skills rooted at
+/// THIS cwd), profile, agent defs, hooks, compaction, and the canonicalized
+/// skill dirs used to build the per-session filesystem `SessionScope`. Mirrors
+/// what `octos chat` assembles for its single embedded agent.
+struct AcpBootstrap {
+    /// Base registry template for this cwd. Each session clones + rebinds it via
+    /// `rebind_cwd_with_permissions`.
     tool_specs: Arc<ToolRegistry>,
     sandbox: octos_agent::SandboxConfig,
     /// System-prompt override from the profile template (None = keep the agent's
@@ -259,21 +271,17 @@ struct AcpBootstrap {
     hook_executor: Option<Arc<octos_agent::HookExecutor>>,
     agent_definitions: Arc<octos_agent::agents::AgentDefinitions>,
     profile: Arc<octos_agent::profile::ProfileDefinition>,
-    agent_config: AgentConfig,
     compaction: Option<(
         Arc<octos_agent::compaction::CompactionRunner>,
         octos_agent::WorkspacePolicy,
     )>,
-    memory_refresh_enabled: bool,
-    max_inject_tokens: usize,
-    data_dir: PathBuf,
+    /// Canonicalized skill dirs → `SessionScope` skill-read zones (fail-closed).
+    skill_read_zones: Vec<PathBuf>,
 }
 
-impl AcpBootstrap {
-    /// Assemble the full shared agent stack. Mirrors `octos chat`'s `run_async`
-    /// (crates/octos-cli/src/commands/chat.rs) step-for-step, minus the console
-    /// reporter / Ctrl-C / single-message REPL bits. All diagnostics go to stderr
-    /// (never stdout — ACP speaks JSON-RPC there).
+impl AcpSharedStores {
+    /// Open the process-global stores + build the failover provider chain. Runs
+    /// exactly once; the redb episode store is opened here and never re-opened.
     #[allow(clippy::too_many_arguments)]
     async fn build(
         config: Config,
@@ -281,11 +289,8 @@ impl AcpBootstrap {
         model: Option<String>,
         base_url: Option<String>,
         data_dir: PathBuf,
-        cwd: PathBuf,
         max_iterations: u32,
-        profile_arg: &Option<String>,
     ) -> Result<Self> {
-        // --- LLM provider (failover chain, same canonical helper serve/gateway use) ---
         let base_provider: Arc<dyn LlmProvider> =
             super::chat::create_provider(&provider_name, &config, model, base_url)?;
         let model_id = base_provider.model_id().to_string();
@@ -298,7 +303,6 @@ impl AcpBootstrap {
         );
         let llm = bundle.llm.clone();
 
-        // --- memory (episodic + long-term) ---
         let memory = Arc::new(
             EpisodeStore::open(&data_dir)
                 .await
@@ -309,10 +313,59 @@ impl AcpBootstrap {
                 .await
                 .wrap_err("failed to open memory store")?,
         );
+        let embedder = super::chat::create_embedder(&config);
         let memory_refresh_enabled =
             crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
         let max_inject_tokens =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let agent_config = AgentConfig {
+            max_iterations,
+            save_episodes: true,
+            chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
+            ..Default::default()
+        };
+
+        // NOTE(acp): the background `MemoryRefreshService` (auto-sweep of MEMORY.md)
+        // is intentionally NOT started. The memory-bank tools + MEMORY.md injection
+        // already give recall/save/capture (chat parity); the long-running sweep is
+        // a serve-only concern (flock-arbitrated), enable later behind config.
+
+        Ok(Self {
+            llm,
+            memory,
+            memory_store,
+            embedder,
+            agent_config,
+            memory_refresh_enabled,
+            max_inject_tokens,
+            data_dir,
+            config,
+            provider_name,
+            model_id,
+        })
+    }
+}
+
+impl AcpBootstrap {
+    /// Assemble the per-cwd agent state (tool registry rooted at `cwd`, profile,
+    /// agents, hooks, compaction, skill read-zones) on top of the process-global
+    /// [`AcpSharedStores`]. Mirrors `octos chat`'s assembly; the owned aliases
+    /// below keep the body identical. Diagnostics go to stderr (ACP owns stdout).
+    async fn build(
+        shared: &AcpSharedStores,
+        cwd: PathBuf,
+        profile_arg: &Option<String>,
+    ) -> Result<Self> {
+        // Owned aliases so the assembly body reads exactly like `octos chat`.
+        let config = shared.config.clone();
+        let data_dir = shared.data_dir.clone();
+        let llm = shared.llm.clone();
+        let memory = shared.memory.clone();
+        let memory_store = shared.memory_store.clone();
+        let memory_refresh_enabled = shared.memory_refresh_enabled;
+        let provider_name = shared.provider_name.clone();
+        let model_id = shared.model_id.clone();
 
         // --- profile (resolved now; applied to the registry LAST via finalize) ---
         let (profile, profile_source_label) = super::chat::resolve_profile(profile_arg)?;
@@ -389,7 +442,9 @@ impl AcpBootstrap {
                 &plugin_dirs,
                 &[],
                 octos_agent::PluginLoadOptions {
-                    work_dir: None,
+                    // P1 (codex): plugins execute in the SESSION cwd, not the
+                    // ACP process launch dir.
+                    work_dir: Some(cwd.as_path()),
                     synthesis_config: None,
                     require_signed: config.plugins.require_signed,
                     verified_cache_dir: None,
@@ -415,10 +470,12 @@ impl AcpBootstrap {
             memory.clone(),
             cwd.clone(),
             data_dir.clone(),
-            tools.provider_policy().cloned(),
+            // P3 (codex): resolve provider policy NOW (finalize runs later) so
+            // pipeline workers inherit tool_policy_by_provider denials.
+            super::chat::resolve_provider_policy(&config, &provider_name, &model_id),
             plugin_dirs.clone(),
             config.plugins.require_signed,
-            super::chat::create_embedder(&config),
+            shared.embedder.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
@@ -447,8 +504,6 @@ impl AcpBootstrap {
         profile
             .validate_against_registry(&agent_definitions)
             .wrap_err("profile references missing agent_definition ids")?;
-
-        let embedder = super::chat::create_embedder(&config);
 
         // System-prompt override from the profile template (bootstrap files +
         // memory segment are attached per session in `build`, since they are
@@ -495,49 +550,30 @@ impl AcpBootstrap {
             }
         };
 
-        let agent_config = AgentConfig {
-            max_iterations,
-            save_episodes: true,
-            chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
-            ..Default::default()
-        };
-
-        // NOTE(acp): the background `MemoryRefreshService` (auto-sweep of MEMORY.md)
-        // is intentionally NOT started here. The memory-bank tools + MEMORY.md
-        // injection above already give recall/save/capture (chat parity). The
-        // long-running sweep is a serve-only concern (flock-arbitrated); enable it
-        // later behind `memory.refresh.enabled` if wanted.
-
-        let profile = Arc::new(profile);
+        // Canonicalized skill dirs → per-session `SessionScope` read-zones (P1).
+        let skill_read_zones = canonicalize_skill_read_zones(&plugin_dirs);
 
         Ok(Self {
-            llm,
-            memory,
-            memory_store,
-            embedder,
             tool_specs: Arc::new(tools),
             sandbox,
             profile_system_prompt,
             plugin_prompt_fragments: plugin_result.prompt_fragments,
             hook_executor,
             agent_definitions,
-            profile,
-            agent_config,
+            profile: Arc::new(profile),
             compaction,
-            memory_refresh_enabled,
-            max_inject_tokens,
-            data_dir,
+            skill_read_zones,
         })
     }
 }
 
-/// Production agent factory: holds the raw config inputs plus a lazily-built
-/// shared [`AcpBootstrap`]. The heavy assembly runs ONCE on the first
-/// `session/new` (using the client's real project cwd); every session then only
-/// does a cheap cwd rebind. Building lazily keeps `initialize` cheap and turns a
-/// misconfiguration (e.g. missing provider key) into a `session/new` error
-/// response rather than a startup crash before the ACP handshake.
+/// Production agent factory: raw config inputs + a lazily-built process-global
+/// [`AcpSharedStores`] and a per-cwd cache of [`AcpBootstrap`]. The shared stores
+/// (provider chain, redb episode store, memory) build ONCE on the first
+/// `session/new`; each distinct session cwd builds its own tool
+/// registry/plugins/agents/scope on top. Lazy build keeps `initialize` cheap and
+/// turns a misconfiguration (e.g. missing provider key) into a `session/new`
+/// error rather than a startup crash before the ACP handshake.
 struct ConfigAgentFactory {
     config: Config,
     provider_name: String,
@@ -547,7 +583,8 @@ struct ConfigAgentFactory {
     default_cwd: PathBuf,
     max_iterations: u32,
     profile: Option<String>,
-    bootstrap: tokio::sync::OnceCell<Arc<AcpBootstrap>>,
+    shared: tokio::sync::OnceCell<Arc<AcpSharedStores>>,
+    cwd_cache: Mutex<HashMap<PathBuf, Arc<AcpBootstrap>>>,
 }
 
 #[async_trait::async_trait]
@@ -557,20 +594,18 @@ impl SessionAgentFactory for ConfigAgentFactory {
     }
 
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
-        // Assemble the shared stack once, lazily, on the first session (using the
-        // client's real project cwd for plugins/skills/policy/system-prompt).
-        let b = self
-            .bootstrap
+        // Process-global stores (provider chain, redb episode store, memory) built
+        // once, lazily, on the first session.
+        let shared = self
+            .shared
             .get_or_try_init(|| async {
-                AcpBootstrap::build(
+                AcpSharedStores::build(
                     self.config.clone(),
                     self.provider_name.clone(),
                     self.model.clone(),
                     self.base_url.clone(),
                     self.data_dir.clone(),
-                    cwd.clone(),
                     self.max_iterations,
-                    &self.profile,
                 )
                 .await
                 .map(Arc::new)
@@ -578,36 +613,78 @@ impl SessionAgentFactory for ConfigAgentFactory {
             .await?
             .clone();
 
-        // Per-session: rebind the shared base registry to the client's cwd so the
-        // cwd-bound tools (shell/read_file/…) run against the client's repo, and
-        // give this session its own Arc-able registry.
+        // Per-cwd assembled state (plugins/agents/hooks/compaction/scope rooted at
+        // THIS cwd), cached so a second project handled by the same process gets
+        // its own skills/agents/scope instead of the first cwd's (codex P2).
+        let b = {
+            let mut cache = self.cwd_cache.lock().await;
+            if let Some(existing) = cache.get(&cwd) {
+                existing.clone()
+            } else {
+                let built =
+                    Arc::new(AcpBootstrap::build(&shared, cwd.clone(), &self.profile).await?);
+                cache.insert(cwd.clone(), built.clone());
+                built
+            }
+        };
+
+        // Per-session: rebind this cwd's base registry so the cwd-bound tools
+        // (shell/read_file/…) run against the client's repo, and give this session
+        // its own Arc-able registry.
         let tools = b.tool_specs.rebind_cwd_with_permissions(
             &cwd,
             create_sandbox(&b.sandbox),
             octos_agent::EffectivePermissions::workspace_write(),
         );
 
+        // Per-session filesystem scope (codex P1): contain file tools + plugins to
+        // cwd, with skill read-zones so `read_file` reaches SKILL.md references.
+        let absolute_cwd = if cwd.is_absolute() {
+            cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(&cwd))
+                .unwrap_or_else(|_| cwd.clone())
+        };
+        let session_scope = SessionScope::solo(absolute_cwd.clone(), Vec::new())
+            .ok()
+            .map(|base| {
+                base.with_skill_read_zones(b.skill_read_zones.clone())
+                    .unwrap_or_else(|_| {
+                        SessionScope::solo(absolute_cwd.clone(), Vec::new())
+                            .expect("absolutized cwd is valid")
+                    })
+            });
+
         // Per-session sub-agent output routing + file-state cache (cheap).
         let subagent_output_router = Arc::new(octos_agent::SubAgentOutputRouter::new(
-            b.data_dir.join("subagent-outputs"),
+            shared.data_dir.join("subagent-outputs"),
         ));
         let supervisor_for_summary = (*tools.supervisor()).clone();
         let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
-            b.llm.clone(),
+            shared.llm.clone(),
             subagent_output_router.clone(),
             supervisor_for_summary,
         ));
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut agent = Agent::new(AgentId::new("acp"), b.llm.clone(), tools, b.memory.clone())
-            .with_config(b.agent_config.clone())
-            .with_agent_definitions(b.agent_definitions.clone())
-            .with_profile(b.profile.clone())
-            .with_file_state_cache(Arc::new(octos_agent::FileStateCache::new()))
-            .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator)
-            .with_shutdown(shutdown.clone());
-        if let Some(embedder) = &b.embedder {
+        let mut agent = Agent::new(
+            AgentId::new("acp"),
+            shared.llm.clone(),
+            tools,
+            shared.memory.clone(),
+        )
+        .with_config(shared.agent_config.clone())
+        .with_agent_definitions(b.agent_definitions.clone())
+        .with_profile(b.profile.clone())
+        .with_file_state_cache(Arc::new(octos_agent::FileStateCache::new()))
+        .with_subagent_output_router(subagent_output_router)
+        .with_subagent_summary_generator(subagent_summary_generator)
+        .with_shutdown(shutdown.clone());
+        if let Some(scope) = session_scope {
+            agent = agent.with_session_scope(Arc::new(scope));
+        }
+        if let Some(embedder) = &shared.embedder {
             agent = agent.with_embedder(embedder.clone());
         }
         if let Some(hooks) = &b.hook_executor {
@@ -629,18 +706,18 @@ impl SessionAgentFactory for ConfigAgentFactory {
         if !bootstrap_files.is_empty() {
             agent.append_system_prompt(&bootstrap_files);
         }
-        let memory_ctx = b
+        let memory_ctx = shared
             .memory_store
-            .get_injectable_context(b.max_inject_tokens)
+            .get_injectable_context(shared.max_inject_tokens)
             .await;
         agent.set_prompt_segment(
             octos_agent::MEMORY_SEGMENT_NAME,
-            octos_agent::compose_memory_segment(&memory_ctx, b.memory_refresh_enabled),
+            octos_agent::compose_memory_segment(&memory_ctx, shared.memory_refresh_enabled),
         );
-        if b.memory_refresh_enabled {
+        if shared.memory_refresh_enabled {
             agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-                b.memory_store.clone(),
-                b.max_inject_tokens,
+                shared.memory_store.clone(),
+                shared.max_inject_tokens,
                 true,
             )));
         }
@@ -854,7 +931,8 @@ impl AcpCommand {
             default_cwd: cwd,
             max_iterations: self.max_iterations,
             profile: self.profile.clone(),
-            bootstrap: tokio::sync::OnceCell::new(),
+            shared: tokio::sync::OnceCell::new(),
+            cwd_cache: Mutex::new(HashMap::new()),
         });
 
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
