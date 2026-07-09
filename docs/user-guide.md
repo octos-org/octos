@@ -765,8 +765,12 @@ This stops the gateway process (if running) and cascades to all sub-accounts.
 ### 8.5 Viewing Logs
 
 ```bash
-# SSE log stream (real-time)
+# Gateway subprocess SSE log stream (real-time)
 curl http://localhost:50080/api/admin/profiles/my-bot/logs
+
+# Main daemon SSE log stream with initial replay and optional filters
+curl -H "Authorization: Bearer $OCTOS_ADMIN_TOKEN" \
+  'http://localhost:50080/api/admin/serve/logs?tail_n=200&grep=.*error.*'
 
 # Provider metrics
 curl http://localhost:50080/api/admin/profiles/my-bot/metrics

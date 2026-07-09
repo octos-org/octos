@@ -695,8 +695,12 @@ curl -X DELETE http://localhost:50080/api/admin/profiles/my-bot
 ### 8.5 查看日志
 
 ```bash
-# SSE 日志流（实时）
+# Gateway 子进程 SSE 日志流（实时）
 curl http://localhost:50080/api/admin/profiles/my-bot/logs
+
+# 主 daemon SSE 日志流，支持初始回放和可选过滤
+curl -H "Authorization: Bearer $OCTOS_ADMIN_TOKEN" \
+  'http://localhost:50080/api/admin/serve/logs?tail_n=200&grep=.*error.*'
 
 # 提供商指标
 curl http://localhost:50080/api/admin/profiles/my-bot/metrics
