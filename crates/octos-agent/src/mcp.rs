@@ -155,6 +155,24 @@ impl reqwest_rmcp::dns::Resolve for SsrfDnsResolver {
     }
 }
 
+/// Reject a configured URL whose host is a literal private/loopback IP or
+/// `localhost`. reqwest/hyper skip [`SsrfDnsResolver`] for literal-IP hosts, so
+/// this closes the config-level vector the resolver can't see. (Hostname hosts
+/// are covered by the resolver at connect time.)
+pub(crate) fn reject_private_url_host(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).map_err(|e| eyre::eyre!("invalid MCP url '{url}': {e}"))?;
+    let blocked = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => crate::tools::ssrf::is_private_ip(&std::net::IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => crate::tools::ssrf::is_private_host(d),
+        None => eyre::bail!("MCP url '{url}' has no host"),
+    };
+    if blocked {
+        eyre::bail!("MCP url '{url}' targets a private/loopback host — refused (SSRF)");
+    }
+    Ok(())
+}
+
 /// Build a reqwest client (rmcp's 0.13 major) for talking to a remote MCP
 /// server: SSRF-filtered on every host via [`SsrfDnsResolver`], redirects
 /// refused (a 3xx must not smuggle us to a private/metadata host), carrying the
@@ -265,10 +283,18 @@ impl McpClient {
             match Self::connect(config).await {
                 Ok(service) => {
                     let concurrency_class = config.resolved_concurrency_class();
-                    let discovered = match service.list_all_tools().await {
-                        Ok(t) => t,
-                        Err(e) => {
+                    // Bound tool discovery: a server that completes `initialize`
+                    // but never answers `tools/list` must not wedge startup (and
+                    // block later servers) — fail-soft on timeout.
+                    let discovered = match timeout(HANDSHAKE_TIMEOUT, service.list_all_tools()).await
+                    {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => {
                             warn!(server = server_name, error = %e, "MCP tools/list failed, skipping server");
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(server = server_name, "MCP tools/list timed out, skipping server");
                             continue;
                         }
                     };
@@ -377,7 +403,9 @@ impl McpClient {
         }
 
         // SSRF-filtered + no-redirect client carrying the configured headers
-        // verbatim (no double `Bearer`, custom headers kept).
+        // verbatim (no double `Bearer`, custom headers kept). Reject literal
+        // private-IP hosts up front (the resolver is skipped for those).
+        reject_private_url_host(url)?;
         let client = build_ssrf_http_client(&config.headers)?;
         let transport = StreamableHttpClientTransport::with_client(
             client,
@@ -534,5 +562,17 @@ mod tests {
         let c = cfg();
         assert!(!c.oauth);
         assert!(c.scopes.is_empty());
+    }
+
+    #[test]
+    fn reject_private_url_host_blocks_private_allows_public() {
+        // Literal private/loopback/metadata hosts (resolver is skipped for these).
+        assert!(reject_private_url_host("http://127.0.0.1/mcp").is_err());
+        assert!(reject_private_url_host("http://localhost:8000/mcp").is_err());
+        assert!(reject_private_url_host("http://169.254.169.254/latest").is_err());
+        assert!(reject_private_url_host("http://[::1]/mcp").is_err());
+        assert!(reject_private_url_host("http://10.0.0.5/mcp").is_err());
+        // Public hostnames pass the up-front check (resolver enforces at connect).
+        assert!(reject_private_url_host("https://example.com/mcp").is_ok());
     }
 }

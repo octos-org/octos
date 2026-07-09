@@ -114,13 +114,19 @@ pub async fn connect_oauth(
     let token: OAuthTokenResponse = serde_json::from_value(stored.token_response.clone())
         .map_err(|e| eyre::eyre!("parse stored oauth token: {e}"))?;
 
-    // One SSRF-filtered, no-redirect client used for BOTH the OAuth HTTP
-    // operations (discovery / token / refresh, via OAuthState) and the MCP
-    // transport (via AuthClient) — so every host, including endpoints the
-    // server advertises, is SSRF-checked.
-    let client = crate::mcp::build_ssrf_http_client(&config.headers)?;
+    // Refuse a literal private/loopback host up front (the DNS resolver is
+    // skipped for literal IPs).
+    crate::mcp::reject_private_url_host(url)?;
 
-    let mut oauth_state = OAuthState::new(url.to_string(), Some(client.clone()))
+    // Two SSRF-filtered, no-redirect clients. The OAuth operations
+    // (discovery/registration/token/refresh) can hit a *different* authorization
+    // server than the MCP resource server, so they must NOT carry the resource
+    // server's static headers/secret — build that client header-free. The
+    // transport client keeps the configured headers.
+    let transport_client = crate::mcp::build_ssrf_http_client(&config.headers)?;
+    let oauth_client = crate::mcp::build_ssrf_http_client(&std::collections::HashMap::new())?;
+
+    let mut oauth_state = OAuthState::new(url.to_string(), Some(oauth_client))
         .await
         .map_err(|e| eyre::eyre!("oauth init for '{url}': {e}"))?;
     oauth_state
@@ -153,7 +159,7 @@ pub async fn connect_oauth(
         }
     }
 
-    let auth_client = AuthClient::new(client, manager);
+    let auth_client = AuthClient::new(transport_client, manager);
     let transport = StreamableHttpClientTransport::with_client(
         auth_client,
         StreamableHttpClientTransportConfig::with_uri(url.to_string()),
@@ -172,6 +178,7 @@ pub async fn connect_oauth(
 pub async fn login(url: &str, scopes: &[String]) -> Result<()> {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
+    crate::mcp::reject_private_url_host(url)?;
     // SSRF-filtered client so metadata discovery / dynamic registration / token
     // exchange during login can't be pointed at private/metadata endpoints.
     let client = crate::mcp::build_ssrf_http_client(&std::collections::HashMap::new())?;
