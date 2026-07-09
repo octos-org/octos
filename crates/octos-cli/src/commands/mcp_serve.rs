@@ -167,20 +167,91 @@ impl McpServeCommand {
     }
 }
 
-/// Spawn the HTTP listener on `bind`, using the bearer token for authentication.
+/// Serve the MCP Streamable HTTP transport on `bind`, gating every request
+/// behind the bearer token. The rmcp tower service (built in octos-agent) is
+/// mounted in axum here; bearer auth is an axum middleware in front of it.
+/// Requires the `api` feature (axum); the canonical install includes it.
+/// Build the axum router that serves the MCP Streamable HTTP transport: the
+/// rmcp tower service (from octos-agent) behind a bearer-token gate. Extracted
+/// from [`serve_http`] so the gate can be exercised by an integration test
+/// without binding a well-known port.
+#[cfg(feature = "api")]
+fn mcp_http_router(server: McpServer, token: String, allow_non_loopback: bool) -> axum::Router {
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::extract::{Request, State};
+    use axum::http::{StatusCode, header::AUTHORIZATION};
+    use axum::middleware::{self, Next};
+    use axum::response::{IntoResponse, Response};
+
+    /// Reject any request whose bearer token is missing or wrong before it
+    /// reaches the MCP service, using the same parser + constant-time compare
+    /// the hand-rolled transport used.
+    async fn bearer_gate(
+        State(token): State<Arc<String>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let provided = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        match octos_agent::mcp_server::parse_bearer_token(provided) {
+            Some(candidate)
+                if octos_agent::mcp_server::constant_time_eq(&candidate, &token) =>
+            {
+                next.run(request).await
+            }
+            _ => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+        }
+    }
+
+    let service = server.streamable_http_service(allow_non_loopback);
+    Router::new()
+        .fallback_service(service)
+        .layer(middleware::from_fn_with_state(Arc::new(token), bearer_gate))
+}
+
+#[cfg(feature = "api")]
 async fn serve_http(server: McpServer, bind: SocketAddr, token: String) -> Result<()> {
-    let handle = server
-        .serve_http(bind, token)
+    // A loopback bind keeps rmcp's DNS-rebinding Host guard. An explicit
+    // non-loopback bind opts into cross-host exposure, so disable the guard —
+    // the bearer token is then the sole authenticator.
+    let allow_non_loopback = !bind.ip().is_loopback();
+    if allow_non_loopback {
+        tracing::warn!(
+            %bind,
+            "octos mcp-serve http bound to a non-loopback address; the DNS-rebinding Host \
+             guard is disabled and the bearer token is the only authenticator"
+        );
+    }
+
+    let app = mcp_http_router(server, token, allow_non_loopback);
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
         .wrap_err_with(|| format!("failed to bind MCP server on {bind}"))?;
-    tracing::info!(addr = %handle.addr(), "octos mcp-serve http bound");
-    // Block on Ctrl+C or SIGTERM so the listener stays up for the process lifetime.
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    ctrl_c.await;
-    handle.shutdown().await;
+    let addr = listener.local_addr().unwrap_or(bind);
+    tracing::info!(%addr, "octos mcp-serve http bound (streamable HTTP, bearer required)");
+
+    // Serve until Ctrl+C / SIGTERM.
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .wrap_err("mcp-serve http server error")?;
     Ok(())
+}
+
+/// Builds without the `api` feature lack axum, so the HTTP transport is
+/// unavailable; stdio still works.
+#[cfg(not(feature = "api"))]
+async fn serve_http(_server: McpServer, _bind: SocketAddr, _token: String) -> Result<()> {
+    eyre::bail!(
+        "the http transport for `octos mcp-serve` requires building octos with the `api` \
+         feature (the canonical install includes it); use `--transport stdio` otherwise"
+    )
 }
 
 // ---- M7.2a: real session dispatch ----
@@ -743,5 +814,96 @@ mod tests {
         let path = dir.path().join("small.txt");
         std::fs::write(&path, b"hello").unwrap();
         assert_eq!(read_small_text_artifact(&path).as_deref(), Some("hello"));
+    }
+}
+
+#[cfg(all(test, feature = "api"))]
+mod http_transport_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_agent::mcp_server::{
+        McpServer, McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
+    };
+    use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
+    use serde_json::Value;
+
+    use super::mcp_http_router;
+
+    struct ReadyDispatch;
+
+    #[async_trait]
+    impl McpSessionDispatch for ReadyDispatch {
+        async fn run_session(
+            &self,
+            _contract: &str,
+            _input: &Value,
+            observer: &dyn SessionLifecycleObserver,
+        ) -> Result<McpSessionOutcome, McpServerError> {
+            observer.mark_state(TaskLifecycleState::Ready);
+            Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Ready,
+                artifact_path: None,
+                artifact_content: None,
+                validator_results: vec![],
+                cost: serde_json::json!({}),
+                error: None,
+            })
+        }
+    }
+
+    /// Bind the Streamable HTTP router on an ephemeral loopback port and return
+    /// its address. The server task is detached; it stops when the test's
+    /// runtime is dropped.
+    async fn spawn_http_server(token: &str) -> std::net::SocketAddr {
+        let server = McpServer::new(Arc::new(ReadyDispatch), Arc::new(TaskSupervisor::new()));
+        let app = mcp_http_router(server, token.to_string(), false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        addr
+    }
+
+    /// The bearer gate must reject missing/wrong tokens with 401 before the
+    /// request reaches the rmcp service, and let a correct token through.
+    #[tokio::test]
+    async fn http_transport_gates_on_bearer_token() {
+        let addr = spawn_http_server("super-secret").await;
+        let url = format!("http://{addr}/mcp");
+        let client = reqwest::Client::new();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        // No Authorization header -> 401.
+        let resp = client.post(&url).body(body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Wrong token -> 401.
+        let resp = client
+            .post(&url)
+            .header("Authorization", "Bearer nope")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Correct token passes the gate and reaches rmcp. rmcp may reject the
+        // bare body with a 4xx for missing MCP headers/session, but never 401.
+        let resp = client
+            .post(&url)
+            .header("Authorization", "Bearer super-secret")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a correct bearer token must pass the gate"
+        );
     }
 }

@@ -30,9 +30,7 @@
 //!    and increments the `octos_mcp_server_call_total{tool,outcome}` counter.
 //! 6. Zero new `unsafe`.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -40,17 +38,15 @@ use metrics::counter;
 use octos_core::{TASK_RESULT_SCHEMA_VERSION, TaskId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tracing::{info, warn};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler, serve_server};
 
 use crate::harness_events::HarnessEvent;
@@ -66,8 +62,6 @@ pub const RUN_OCTOS_SESSION_TOOL: &str = "run_octos_session";
 /// Environment variable name that the HTTP transport reads for its bearer token.
 pub const OCTOS_MCP_SERVER_TOKEN_ENV: &str = "OCTOS_MCP_SERVER_TOKEN";
 
-/// Maximum JSON-RPC request body size (1 MB), matching the MCP client.
-const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 /// Typed error kinds surfaced by the session-level dispatch flow.
 #[derive(Debug, Clone)]
@@ -206,52 +200,41 @@ impl McpServer {
         }
     }
 
-    /// Bind an HTTP listener on localhost (ephemeral port) for tests.
-    /// Production callers should use [`McpServer::serve_http`] with an
-    /// explicit [`SocketAddr`].
-    pub async fn spawn_http_on_local_port(self, token: String) -> std::io::Result<McpServerHandle> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        self.serve_http_on_listener(listener, token).await
-    }
-
-    /// Bind an HTTP listener on `addr` and spawn it as a background task,
-    /// returning a handle that observes the bound address and allows the
-    /// caller to shut the listener down. Production entry point.
-    pub async fn serve_http(
+    /// Build the rmcp Streamable HTTP tower service for this server.
+    ///
+    /// The service factory clones a fresh [`OctosMcpHandler`] (tagged `http`)
+    /// per MCP session. When `allow_non_loopback` is `false`, rmcp's default
+    /// config restricts requests to loopback `Host` values — a built-in
+    /// DNS-rebinding guard appropriate for a `127.0.0.1` bind. Pass `true` when
+    /// binding a non-loopback interface for cross-host orchestration; the guard
+    /// is then disabled and the bearer token is the sole authenticator.
+    ///
+    /// The caller (the CLI, which owns axum) mounts this into a router behind a
+    /// bearer-token layer and binds it — bearer authentication and TLS are the
+    /// caller's responsibility, not this service's.
+    pub fn streamable_http_service(
         self,
-        addr: SocketAddr,
-        token: String,
-    ) -> std::io::Result<McpServerHandle> {
-        let listener = TcpListener::bind(addr).await?;
-        self.serve_http_on_listener(listener, token).await
-    }
-
-    async fn serve_http_on_listener(
-        self,
-        listener: TcpListener,
-        token: String,
-    ) -> std::io::Result<McpServerHandle> {
-        let addr = listener.local_addr()?;
-        let server = Arc::new(self);
-        let token = Arc::new(token);
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let accept_shutdown = shutdown.clone();
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let accept_shutdown_requested = shutdown_requested.clone();
-        let handle = tokio::spawn(run_http_accept_loop(
-            listener,
-            server,
-            token,
-            accept_shutdown,
-            accept_shutdown_requested,
-        ));
-
-        Ok(McpServerHandle {
-            addr,
-            shutdown,
-            shutdown_requested,
-            handle,
-        })
+        allow_non_loopback: bool,
+    ) -> StreamableHttpService<OctosMcpHandler, LocalSessionManager> {
+        let dispatch = self.dispatch;
+        let supervisor = self.supervisor;
+        let event_sink = self.event_sink;
+        let mut config = StreamableHttpServerConfig::default();
+        if allow_non_loopback {
+            config = config.disable_allowed_hosts();
+        }
+        StreamableHttpService::new(
+            move || {
+                Ok(OctosMcpHandler {
+                    dispatch: dispatch.clone(),
+                    supervisor: supervisor.clone(),
+                    event_sink: event_sink.clone(),
+                    transport_label: "http",
+                })
+            },
+            Arc::new(LocalSessionManager::default()),
+            config,
+        )
     }
 
     /// Serve the single `run_octos_session` tool over the rmcp SDK on an
@@ -296,7 +279,7 @@ impl McpServer {
 /// [`dispatch_run_octos_session`] business logic, harness-event emission, and
 /// `octos_mcp_server_call_total` metric as the legacy JSON-RPC path.
 #[derive(Clone)]
-pub(crate) struct OctosMcpHandler {
+pub struct OctosMcpHandler {
     dispatch: Arc<dyn McpSessionDispatch>,
     supervisor: Arc<TaskSupervisor>,
     event_sink: Arc<RwLock<Option<EventSink>>>,
@@ -462,68 +445,6 @@ fn emit_call_outcome(
         "outcome" => outcome_label,
     )
     .increment(1);
-}
-
-/// Handle returned by [`McpServer::spawn_http_on_local_port`] so callers can
-/// observe the bound address and shut the listener down.
-pub struct McpServerHandle {
-    addr: SocketAddr,
-    shutdown: Arc<tokio::sync::Notify>,
-    shutdown_requested: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
-}
-
-impl McpServerHandle {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub async fn shutdown(self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        self.shutdown.notify_waiters();
-        let _ = self.handle.await;
-    }
-}
-
-async fn run_http_accept_loop(
-    listener: TcpListener,
-    server: Arc<McpServer>,
-    token: Arc<String>,
-    accept_shutdown: Arc<tokio::sync::Notify>,
-    accept_shutdown_requested: Arc<AtomicBool>,
-) {
-    loop {
-        if accept_shutdown_requested.load(Ordering::Acquire) {
-            break;
-        }
-        let shutdown_notified = accept_shutdown.notified();
-        tokio::pin!(shutdown_notified);
-        if accept_shutdown_requested.load(Ordering::Acquire) {
-            break;
-        }
-
-        tokio::select! {
-            biased;
-            _ = &mut shutdown_notified => break,
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, peer)) => {
-                        let server = server.clone();
-                        let token = token.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_http_connection(server, token, stream, peer).await {
-                                warn!(error = %err, "mcp-serve http connection error");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "mcp-serve accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Build the `initialize` response. Public so transports outside this module
@@ -791,146 +712,10 @@ impl SessionLifecycleObserver for SupervisorObserver<'_> {
     }
 }
 
-// ---- http transport (minimal HTTP/1.1, one request per connection) ----
-
-async fn handle_http_connection(
-    server: Arc<McpServer>,
-    token: Arc<String>,
-    mut stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-) -> Result<()> {
-    let (read, mut write) = stream.split();
-    let mut reader = BufReader::new(read);
-    let mut request_line = String::new();
-    let bytes = reader.read_line(&mut request_line).await?;
-    if bytes == 0 {
-        return Ok(());
-    }
-    let request_line = request_line.trim_end_matches(['\r', '\n']).to_string();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-
-    if method != "POST" {
-        return write_http_response(
-            &mut write,
-            405,
-            "Method Not Allowed",
-            "application/json",
-            br#"{"error":"method not allowed"}"#,
-        )
-        .await;
-    }
-    // We only accept requests on /, /mcp, or /mcp/jsonrpc to leave routing room
-    // but keep the surface tight.
-    if !matches!(path, "/" | "/mcp" | "/mcp/jsonrpc") {
-        return write_http_response(
-            &mut write,
-            404,
-            "Not Found",
-            "application/json",
-            br#"{"error":"not found"}"#,
-        )
-        .await;
-    }
-
-    let mut content_length: Option<usize> = None;
-    let mut authorization: Option<String> = None;
-    loop {
-        let mut header_line = String::new();
-        let n = reader.read_line(&mut header_line).await?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = header_line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            let name = name.trim();
-            let value = value.trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().ok();
-            } else if name.eq_ignore_ascii_case("authorization") {
-                authorization = Some(value.to_string());
-            }
-        }
-    }
-
-    let supplied = parse_bearer_token(authorization.as_deref());
-    if !supplied
-        .as_deref()
-        .is_some_and(|t| constant_time_eq(t, &token))
-    {
-        return write_http_response(
-            &mut write,
-            401,
-            "Unauthorized",
-            "application/json",
-            br#"{"error":"unauthorized"}"#,
-        )
-        .await;
-    }
-
-    let length = content_length.unwrap_or(0);
-    if length > MAX_REQUEST_BYTES {
-        return write_http_response(
-            &mut write,
-            413,
-            "Payload Too Large",
-            "application/json",
-            br#"{"error":"request body too large"}"#,
-        )
-        .await;
-    }
-    let mut body = vec![0_u8; length];
-    if length > 0 {
-        reader.read_exact(&mut body).await?;
-    }
-
-    let request: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(err) => {
-            let error_response = render_mcp_error(
-                Value::Null,
-                McpServerError::ProtocolError(format!("invalid JSON: {err}")),
-            );
-            let body = serde_json::to_vec(&error_response)?;
-            return write_http_response(&mut write, 400, "Bad Request", "application/json", &body)
-                .await;
-        }
-    };
-
-    let response = server.handle_request(&request, "http").await;
-    let body = serde_json::to_vec(&response)?;
-    write_http_response(&mut write, 200, "OK", "application/json", &body).await?;
-    info!(peer = %peer, "mcp-serve http: served request");
-    Ok(())
-}
-
-async fn write_http_response<W>(
-    stream: &mut W,
-    status_code: u16,
-    status_text: &str,
-    content_type: &str,
-    body: &[u8],
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let header = format!(
-        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
-        len = body.len(),
-    );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Constant-time comparison of two bytes buffers, used to avoid timing leaks
-/// on the bearer-token check.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+/// Constant-time comparison of two strings, used by the HTTP bearer-token
+/// check (in the CLI's axum middleware) to avoid timing leaks. Public so the
+/// serving layer can reuse the same comparison the parser is paired with.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
     if a.len() != b.len() {
@@ -1160,45 +945,4 @@ mod tests {
         assert!(error.is_none());
     }
 
-    struct NoopDispatch;
-
-    #[async_trait::async_trait]
-    impl McpSessionDispatch for NoopDispatch {
-        async fn run_session(
-            &self,
-            _contract: &str,
-            _input: &Value,
-            _observer: &dyn SessionLifecycleObserver,
-        ) -> Result<McpSessionOutcome, McpServerError> {
-            Ok(McpSessionOutcome {
-                final_state: TaskLifecycleState::Ready,
-                artifact_path: None,
-                artifact_content: None,
-                validator_results: Vec::new(),
-                cost: json!({}),
-                error: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn http_accept_loop_exits_when_shutdown_was_fired_before_poll() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = Arc::new(McpServer::new(
-            Arc::new(NoopDispatch),
-            Arc::new(TaskSupervisor::new()),
-        ));
-        let token = Arc::new("test-token".to_string());
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let shutdown_requested = Arc::new(AtomicBool::new(true));
-
-        shutdown.notify_waiters();
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            run_http_accept_loop(listener, server, token, shutdown, shutdown_requested),
-        )
-        .await
-        .expect("accept loop must exit when shutdown fired before it polls");
-    }
 }

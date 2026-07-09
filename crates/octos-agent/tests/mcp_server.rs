@@ -17,15 +17,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use octos_agent::harness_events::HarnessEventPayload;
 use octos_agent::mcp_server::{
-    McpServer, McpServerError, McpServerHandle, McpSessionDispatch, McpSessionOutcome,
-    SessionLifecycleObserver, build_initialize_response, build_tools_list_response,
+    McpServer, McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
+    build_initialize_response, build_tools_list_response, constant_time_eq,
     dispatch_run_octos_session, parse_bearer_token, render_mcp_error,
 };
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::{HarnessEvent, TASK_RESULT_SCHEMA_VERSION};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 /// A scripted session dispatch that a test can steer into Ready or Failed.
@@ -111,63 +109,28 @@ async fn should_expose_session_as_mcp_tool_via_stdio() {
     assert!(required.contains(&"input"));
 }
 
-#[tokio::test]
-async fn should_require_bearer_token_on_http_transport() {
-    // Missing bearer token => 401 synchronously, no session dispatched.
-    let dispatch = Arc::new(ScriptedDispatch::with_outcome(sample_ready_outcome()));
-    let supervisor = Arc::new(TaskSupervisor::new());
-    let server = McpServer::new(dispatch.clone(), supervisor);
-
+#[test]
+fn bearer_token_parsing_and_constant_time_comparison() {
+    // The HTTP transport's bearer gate is built from these two primitives (the
+    // CLI's axum middleware pairs them). The end-to-end 401/allow behavior of
+    // the mounted Streamable HTTP service is covered by the octos-cli HTTP
+    // integration test, where axum lives.
     assert_eq!(
         parse_bearer_token(Some("Bearer secret123")),
         Some("secret123".into())
     );
+    // Case-insensitive scheme, collapses extra whitespace (RFC 6750 §2.1).
     assert_eq!(
         parse_bearer_token(Some("bearer  secret123")),
         Some("secret123".into())
     );
     assert_eq!(parse_bearer_token(None), None);
     assert_eq!(parse_bearer_token(Some("Basic abc")), None);
+    assert_eq!(parse_bearer_token(Some("Bearer ")), None);
 
-    let handle: McpServerHandle = server
-        .spawn_http_on_local_port("super-secret".into())
-        .await
-        .expect("spawn http");
-
-    // No Authorization header -> 401
-    let response = http_request(
-        handle.addr(),
-        "POST",
-        "/mcp",
-        None,
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "got {response}");
-
-    // Wrong token -> 401
-    let response = http_request(
-        handle.addr(),
-        "POST",
-        "/mcp",
-        Some("Bearer nope"),
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "got {response}");
-
-    // Correct token -> 200
-    let response = http_request(
-        handle.addr(),
-        "POST",
-        "/mcp",
-        Some("Bearer super-secret"),
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 200"), "got {response}");
-
-    handle.shutdown().await;
+    assert!(constant_time_eq("super-secret", "super-secret"));
+    assert!(!constant_time_eq("super-secret", "super-secre"));
+    assert!(!constant_time_eq("super-secret", "wrong-secret"));
 }
 
 #[tokio::test]
@@ -410,26 +373,3 @@ async fn should_directly_dispatch_session_via_helper() {
     assert_eq!(body["schema_version"], TASK_RESULT_SCHEMA_VERSION);
 }
 
-// --- tiny HTTP client used by the bearer-auth test ---
-
-async fn http_request(
-    addr: std::net::SocketAddr,
-    method: &str,
-    path: &str,
-    auth: Option<&str>,
-    body: &str,
-) -> String {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
-    let auth_header = auth
-        .map(|value| format!("Authorization: {value}\r\n"))
-        .unwrap_or_default();
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{auth_header}Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len(),
-    );
-    stream.write_all(request.as_bytes()).await.unwrap();
-    stream.flush().await.unwrap();
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf).to_string()
-}
