@@ -114,3 +114,92 @@ async fn work_secret_ws_round_trip_and_revocation_close() {
     server.abort();
     let _ = server.await;
 }
+
+/// #1594: raw RPCs are dispatched before `route_rpc_command`, so they never
+/// reach the typed session-scope gate. A work-secret must NOT be able to reach
+/// the raw autonomy/profile surface (which resolves profile/session targets
+/// from request params independently of the credential). The typed surface —
+/// which IS scope-checked — must keep working over the same socket.
+#[tokio::test]
+async fn work_secret_ws_denies_raw_surface_but_allows_typed() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "local:work-secret";
+    let token = "guest-token";
+    let (state, store) = state_with_work_secret_store(&dir);
+    store
+        .issue(
+            session_id,
+            token,
+            "http://127.0.0.1:50080",
+            Duration::minutes(5),
+            None,
+        )
+        .unwrap();
+    let (addr, server) = spawn_api(state).await;
+
+    let url = format!(
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?session_ingress_token={token}&ui_feature=auxiliary.rest_to_ws.v1"
+    );
+    let (mut ws, _response) = connect_async(url).await.unwrap();
+
+    // A raw autonomy method — even naming the granted session_id — is refused.
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "raw-goal-set",
+            "method": "session/goal/set",
+            "params": { "session_id": session_id, "goal": { "text": "escalate" } }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .expect("timed out waiting for raw-method rejection")
+        .expect("websocket ended before rejection")
+        .expect("failed to read rejection");
+    let Message::Text(body) = response else {
+        panic!("expected JSON-RPC text response, got {response:?}");
+    };
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["id"], "raw-goal-set");
+    assert_eq!(
+        body["error"]["code"], -32600,
+        "raw method must be rejected with INVALID_REQUEST, got {body}"
+    );
+
+    // The typed, scope-checked surface still works on the same socket.
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "typed-status",
+            "method": "session/status.get",
+            "params": { "session_id": session_id }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .expect("timed out waiting for typed response")
+        .expect("websocket ended before typed response")
+        .expect("failed to read typed response");
+    let Message::Text(body) = response else {
+        panic!("expected JSON-RPC text response, got {response:?}");
+    };
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["id"], "typed-status");
+    assert!(
+        body["result"].is_object(),
+        "typed session/status.get must still succeed, got {body}"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
